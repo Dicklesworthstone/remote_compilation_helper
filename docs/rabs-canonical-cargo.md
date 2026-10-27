@@ -1109,6 +1109,13 @@ unchanged. These inputs authorize only an independently supervised compiler
 execution; they do not authorize local result capture or cache the script's
 execution, filesystem observations or side effects.
 
+The capture binding comes from the driver's retained mount capability, not from
+a canonical-path flag in a compiler plan. It binds both the physical tree and
+Cargo's recorded logical name through background capture and memo reuse. A
+request whose worker context names another generated root is refused before
+dispatch, and generated-input requests cannot recover local publication authority
+by bypassing the edge's ordinary admission path.
+
 Archive execution also excludes process information and entropy devices from
 the compiler's filesystem view. Its only null device is an independently checked
 real `/dev/null` character device. The action key covers the complete retained
@@ -1396,6 +1403,28 @@ generated input transfer, including a modified original tree, and ownership
 tests cover empty trees and writable-alias refusal. The workflow runs the exact
 native selectors above; adding them does not establish that an unsupported host
 has passed the full path.
+
+Two complementary cases place the generator in the leaf dependency itself:
+
+```sh
+RABS_CANONICAL_TEST_WRAPPER="$PWD/target/debug/rabs-wrap" \
+RABS_TEST_WORKER_BIN="$PWD/target/debug/rabs-wkr" \
+  cargo test -p rabsd --test canonical_check_local --locked \
+    canonical_cargo_offloads_generated_dependency_metadata_and_invalidates_generated_bytes \
+    -- --ignored --exact --nocapture
+
+RABS_CANONICAL_TEST_WRAPPER="$PWD/target/debug/rabs-wrap" \
+RABS_TEST_WORKER_BIN="$PWD/target/debug/rabs-wkr" \
+  cargo test -p rabsd --test canonical_check_local --locked \
+    canonical_cargo_build_offloads_generated_archives_and_delivers_current_generated_code \
+    -- --ignored --exact --nocapture
+```
+
+Only the script's workspace input changes; package source, exact stdout and
+`rustc-env` remain fixed. Both the generated leaf and its dependent must acquire
+new keys and execute remotely. This checks propagation through the dependency
+graph alongside the unchanged-leaf replay case above. The build case requires
+the delivered executable to use the new generated value.
 
 ### Select local Cargo units from the Cargo command line
 

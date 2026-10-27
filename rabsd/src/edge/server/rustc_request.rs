@@ -483,41 +483,46 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
         },
         None => plan.clone(),
     };
-    let (package, dependencies) =
-        match input_preparation::observe(&live.facts, &physical_plan, may_wait) {
-            Ok(observed) => observed,
-            Err(input_preparation::InputMiss::PackageAndDependenciesPending) => {
-                log(
-                    "preparing",
-                    &[
-                        ("crate", unit),
-                        ("reason", PendingFacts::Dependencies.reason()),
-                    ],
-                );
-                return preparing(unit, PendingFacts::Package);
-            }
-            Err(input_preparation::InputMiss::Package(FactsMiss::Pending)) if may_wait => {
-                return preparing(unit, PendingFacts::Package);
-            }
-            Err(input_preparation::InputMiss::Dependencies(FactsMiss::Pending)) if may_wait => {
-                return preparing(unit, PendingFacts::Dependencies);
-            }
-            Err(input_preparation::InputMiss::Package(miss)) => {
-                log(
-                    "pass-through",
-                    &[
-                        ("crate", unit),
-                        ("package", &plan.package_root),
-                        ("source", &plan.source_root),
-                        ("reason", &miss.to_string()),
-                    ],
-                );
-                return Decided::Reply(pass_through(&miss.to_string()));
-            }
-            Err(input_preparation::InputMiss::Dependencies(miss)) => {
-                return refuse(&miss.to_string());
-            }
-        };
+    let (package, dependencies) = match input_preparation::observe(
+        &live.facts,
+        &plan,
+        &physical_plan,
+        live.canonical.as_deref(),
+        may_wait,
+    ) {
+        Ok(observed) => observed,
+        Err(input_preparation::InputMiss::PackageAndDependenciesPending) => {
+            log(
+                "preparing",
+                &[
+                    ("crate", unit),
+                    ("reason", PendingFacts::Dependencies.reason()),
+                ],
+            );
+            return preparing(unit, PendingFacts::Package);
+        }
+        Err(input_preparation::InputMiss::Package(FactsMiss::Pending)) if may_wait => {
+            return preparing(unit, PendingFacts::Package);
+        }
+        Err(input_preparation::InputMiss::Dependencies(FactsMiss::Pending)) if may_wait => {
+            return preparing(unit, PendingFacts::Dependencies);
+        }
+        Err(input_preparation::InputMiss::Package(miss)) => {
+            log(
+                "pass-through",
+                &[
+                    ("crate", unit),
+                    ("package", &plan.package_root),
+                    ("source", &plan.source_root),
+                    ("reason", &miss.to_string()),
+                ],
+            );
+            return Decided::Reply(pass_through(&miss.to_string()));
+        }
+        Err(input_preparation::InputMiss::Dependencies(miss)) => {
+            return refuse(&miss.to_string());
+        }
+    };
     if let Err(reason) = package.verify_generated_disjoint(&physical_plan) {
         return refuse(&reason);
     }

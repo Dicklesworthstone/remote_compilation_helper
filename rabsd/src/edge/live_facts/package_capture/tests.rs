@@ -162,14 +162,7 @@ fn failure_backoff_is_scoped_to_exact_source_and_generated_inputs() {
     let root = Path::new(&plan.source_root);
     let generated = Path::new(plan.generated_root.as_ref().unwrap());
     let facts = LiveFacts::new();
-    let original = Arc::new(
-        Observation::read(
-            root,
-            plan.source_kind,
-            Some(GeneratedRoot::ordinary(generated)),
-        )
-        .unwrap(),
-    );
+    let original = Arc::new(Observation::read(root, plan.source_kind, Some(generated)).unwrap());
     reserve(&facts, &original).finish(Err("old capture failed".into()), true).unwrap_err();
     assert!(matches!(
         facts.package(root, plan.source_kind, Some(generated)),

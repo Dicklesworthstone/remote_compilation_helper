@@ -53,6 +53,10 @@ fn vendor(root: &Path, name: &str, files: BTreeMap<&str, &str>) -> String {
 }
 
 fn source(root: &Path, value: u32) {
+    source_with_generated(root, value, false);
+}
+
+fn source_with_generated(root: &Path, value: u32, generated: bool) {
     write(
         root,
         "Cargo.toml",
@@ -90,18 +94,37 @@ fn source(root: &Path, value: u32) {
         "[package]\nname='dev_macro'\nversion='1.0.0'\nedition='2021'\n[lib]\nproc-macro=true\n",
     );
     write(root, "dev-macro/src/lib.rs", "extern crate proc_macro;\n");
-    let leaf_source = format!("pub const fn answer()->u32 {{ {value} }}\n");
-    let leaf = vendor(
-        root,
-        "canonical_leaf",
-        BTreeMap::from([
-            (
-                "Cargo.toml",
-                "[package]\nname='canonical_leaf'\nversion='1.0.0'\nedition='2021'\n",
-            ),
-            ("src/lib.rs", leaf_source.as_str()),
-        ]),
-    );
+    let leaf_source = if generated {
+        "const _: &str = env!(\"CANONICAL_BUILD_MARKER\");\ninclude!(concat!(env!(\"OUT_DIR\"), \"/value.rs\"));\n".to_owned()
+    } else {
+        format!("pub const fn answer()->u32 {{ {value} }}\n")
+    };
+    let mut leaf_files = BTreeMap::from([
+        (
+            "Cargo.toml",
+            "[package]\nname='canonical_leaf'\nversion='1.0.0'\nedition='2021'\n",
+        ),
+        ("src/lib.rs", leaf_source.as_str()),
+    ]);
+    if generated {
+        // Only Cargo's build script can read this workspace input. The remote
+        // compiler receives the resulting OUT_DIR tree, not the outer workspace.
+        // Editing this input leaves every vendored package byte unchanged.
+        write(root, "generated-value.txt", value.to_string());
+        leaf_files.insert(
+            "build.rs",
+            r#"fn main() {
+    let value = std::fs::read_to_string("../../generated-value.txt").unwrap();
+    let value: u32 = value.trim().parse().unwrap();
+    let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    std::fs::write(out.join("value.rs"), format!("pub const fn answer()->u32 {{ {value} }}\n")).unwrap();
+    println!("cargo::rerun-if-changed=../../generated-value.txt");
+    println!("cargo::rustc-env=CANONICAL_BUILD_MARKER=generated");
+}
+"#,
+        );
+    }
+    let leaf = vendor(root, "canonical_leaf", leaf_files);
     let dep = vendor(
         root,
         "canonical_dep",
@@ -1072,38 +1095,64 @@ fn delivered_build(
 #[test]
 #[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual Cargo/TLS worker/cache execution"]
 fn canonical_cargo_offloads_real_dependency_samples_then_replays_across_worktrees() {
-    remote_dependency_replay("check", false);
+    remote_dependency_replay("check", GeneratedDependency::None);
 }
 
 #[test]
 #[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual Cargo build/TLS worker/archive cache and linked binary execution"]
 fn canonical_cargo_build_offloads_archives_replays_and_delivers_a_working_binary() {
-    remote_dependency_replay("build", false);
+    remote_dependency_replay("build", GeneratedDependency::None);
 }
 
 #[test]
 #[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual generated-input Cargo/TLS worker/cache execution"]
 fn canonical_cargo_offloads_generated_metadata_replays_and_invalidates_changed_out_dir() {
-    remote_dependency_replay("check", true);
+    remote_dependency_replay("check", GeneratedDependency::Consumer);
 }
 
 #[test]
 #[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual generated-input Cargo/TLS worker/archive execution"]
 fn canonical_cargo_build_offloads_generated_archives_and_delivers_changed_output() {
-    remote_dependency_replay("build", true);
+    remote_dependency_replay("build", GeneratedDependency::Consumer);
+}
+
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual generated-source Cargo/TLS worker/cache execution"]
+fn canonical_cargo_offloads_generated_dependency_metadata_and_invalidates_generated_bytes() {
+    remote_dependency_replay("check", GeneratedDependency::Leaf);
+}
+
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual generated-source archive cache and linked binary execution"]
+fn canonical_cargo_build_offloads_generated_archives_and_delivers_current_generated_code() {
+    remote_dependency_replay("build", GeneratedDependency::Leaf);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GeneratedDependency {
+    None,
+    Leaf,
+    Consumer,
 }
 
 /// Exercise the production native CLI, wrapper, remote executor, CAS sampling,
 /// exact delivery and invalidation using the same dependency graph in each mode.
-fn remote_dependency_replay(command: &str, with_generated: bool) {
+fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
     let (owner, mut profile) = native_fixture();
     profile["command"] = json!(command);
     let build = command == "build";
     let first = owner.path().join("source-a");
     let second = owner.path().join("source-b");
-    if with_generated {
-        generated_dependency(&first);
-        generated_dependency(&second);
+    match generated {
+        GeneratedDependency::None => {}
+        GeneratedDependency::Leaf => {
+            source_with_generated(&first, 40, true);
+            source_with_generated(&second, 40, true);
+        }
+        GeneratedDependency::Consumer => {
+            generated_dependency(&first);
+            generated_dependency(&second);
+        }
     }
     assert_answer(&first, 42, false);
     assert_answer(&second, 42, true);
@@ -1241,11 +1290,20 @@ fn remote_dependency_replay(command: &str, with_generated: bool) {
         before_replay
     );
 
-    if with_generated {
-        // The dependency package and its build script remain byte-identical.
-        // Only this captured workspace input changes the generated Rust bytes,
-        // so a distinct consumer key must come from the retained OUT_DIR tree.
-        write(&second, "generated-value.txt", "3\n");
+    if generated != GeneratedDependency::None {
+        // This edit changes only the build script's workspace input. Package
+        // source, Cargo stdout directives and rustc-env stay identical; the
+        // completed generated bytes must invalidate the selected action and
+        // its consumers while independent dependencies remain reusable.
+        write(
+            &second,
+            "generated-value.txt",
+            if generated == GeneratedDependency::Leaf {
+                "41"
+            } else {
+                "3\n"
+            },
+        );
     } else {
         source(&second, 41);
     }
@@ -1259,7 +1317,7 @@ fn remote_dependency_replay(command: &str, with_generated: bool) {
         let (target, archives) = delivered_build(owner.path(), 5, &events, 43);
         assert!(retained_targets.insert(target));
         let previous = first_archives.as_ref().unwrap();
-        if with_generated {
+        if generated == GeneratedDependency::Consumer {
             assert_eq!(
                 archives["canonical_leaf"], previous["canonical_leaf"],
                 "editing a generator input changed the independent leaf archive"
@@ -1267,7 +1325,7 @@ fn remote_dependency_replay(command: &str, with_generated: bool) {
         } else {
             assert_ne!(
                 archives["canonical_leaf"], previous["canonical_leaf"],
-                "changed source reused stale canonical_leaf archive bytes"
+                "changed source or generated input reused stale canonical_leaf archive bytes"
             );
         }
         assert_ne!(
@@ -1276,7 +1334,7 @@ fn remote_dependency_replay(command: &str, with_generated: bool) {
         );
     }
     let changed = decisions(&events, "remote-offer");
-    let changed_names: &[&str] = if with_generated {
+    let changed_names: &[&str] = if generated == GeneratedDependency::Consumer {
         &["canonical_dep"]
     } else {
         &["canonical_leaf", "canonical_dep"]
@@ -1301,7 +1359,7 @@ fn remote_dependency_replay(command: &str, with_generated: bool) {
         );
     }
     let hits = decisions(&events, "hit");
-    if with_generated {
+    if generated == GeneratedDependency::Consumer {
         assert_eq!(
             hits,
             BTreeMap::from([(

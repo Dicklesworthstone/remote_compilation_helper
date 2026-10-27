@@ -262,6 +262,24 @@ jobs:
           cargo test --release -p rabsd --test canonical_check_local --locked \
             canonical_cargo_build_offloads_generated_archives_and_delivers_changed_output \
             -- --ignored --exact --nocapture
+      - name: Canonical generated leaf metadata invalidates its dependent
+        timeout-minutes: 30
+        env:
+          RABS_CANONICAL_TEST_WRAPPER: ${{ github.workspace }}/target/release/rabs-wrap
+          RABS_TEST_WORKER_BIN: ${{ github.workspace }}/target/release/rabs-wkr
+        run: |
+          cargo test --release -p rabsd --test canonical_check_local --locked \
+            canonical_cargo_offloads_generated_dependency_metadata_and_invalidates_generated_bytes \
+            -- --ignored --exact --nocapture
+      - name: Canonical generated leaf archives deliver current transitive code
+        timeout-minutes: 30
+        env:
+          RABS_CANONICAL_TEST_WRAPPER: ${{ github.workspace }}/target/release/rabs-wrap
+          RABS_TEST_WORKER_BIN: ${{ github.workspace }}/target/release/rabs-wkr
+        run: |
+          cargo test --release -p rabsd --test canonical_check_local --locked \
+            canonical_cargo_build_offloads_generated_archives_and_delivers_current_generated_code \
+            -- --ignored --exact --nocapture
       - name: Closed archive isolation and authenticated mode selection
         run: |
           cargo test --release -p rabs-sandbox --lib dependency_context --locked

@@ -1220,6 +1220,20 @@ mod tests {
     #[test]
     fn canonical_generated_inputs_require_a_disjoint_cargo_target_and_exact_environment() {
         let generated = "/__rabs/out/cargo/debug/build/leaf-123/out";
+        let validate = |context: DependencyExecContext| {
+            DependencyExecContext::new_canonical_cargo_with_generated(
+                context.execution_mode,
+                context.source_root,
+                context.cwd,
+                context.out_dir,
+                context.dependency_dirs,
+                context.loader_dirs,
+                context.artifact_roots,
+                context.generated_root,
+                context.env,
+                context.runtime_cohort_sha256,
+            )
+        };
         for mode in [
             DependencyExecutionMode::Metadata,
             DependencyExecutionMode::Rlib,
@@ -1233,6 +1247,34 @@ mod tests {
                     .env()
                     .contains(&("OUT_DIR".into(), generated.into()))
             );
+            assert_eq!(validate(context.clone()).unwrap(), context);
+            for dependency in [
+                generated,
+                "/__rabs/out/cargo/debug/build",
+                "/__rabs/out/cargo/debug/build/leaf-123/out/deps",
+            ] {
+                let mut changed = context.clone();
+                changed.dependency_dirs.push(dependency.into());
+                assert!(validate(changed).is_err(), "dependency root {dependency}");
+            }
+            for loader in [generated, "/__rabs/out/cargo/debug/build/leaf-123/out/lib"] {
+                let mut changed = context.clone();
+                changed.loader_dirs.push(loader.into());
+                assert!(validate(changed).is_err(), "loader root {loader}");
+            }
+            for value in ["", "/__rabs/out/cargo/other-generated"] {
+                let mut changed = context.clone();
+                changed
+                    .env
+                    .iter_mut()
+                    .find(|(name, _)| name == "OUT_DIR")
+                    .unwrap()
+                    .1 = value.into();
+                assert!(validate(changed).is_err());
+            }
+            let mut missing_root = context.clone();
+            missing_root.generated_root = None;
+            assert!(validate(missing_root).is_err());
             let mut env = context.env.clone();
             env.retain(|(name, _)| name != "OUT_DIR");
             assert!(
@@ -1252,22 +1294,31 @@ mod tests {
             );
         }
         for root in [
+            "/__rabs",
             "/__rabs/out/cargo",
             "/__rabs/out/cargo/debug",
             CANONICAL_OUTPUT,
             "/__rabs/out/cargo/debug/deps/generated",
             "/__rabs/out/cargo/debug/build/../out",
+            "/__rabs/out/cargo/debug//out",
             "/__rabs/out/cargo-other/build/leaf/out",
+            CANONICAL_SOURCE,
             "/__rabs/workspace/generated",
             "/__rabs/cargo-home/generated",
             "/__rabs/toolchain/generated",
             "/__rabs/home/control",
             "/tmp/generated",
+            "relative/generated",
         ] {
-            assert!(
-                canonical_generated_context(root, DependencyExecutionMode::Metadata).is_err(),
-                "generated root escaped its closed canonical input contract: {root}"
-            );
+            for mode in [
+                DependencyExecutionMode::Metadata,
+                DependencyExecutionMode::Rlib,
+            ] {
+                assert!(
+                    canonical_generated_context(root, mode).is_err(),
+                    "generated root escaped its closed canonical input contract: {root}"
+                );
+            }
         }
     }
 
@@ -1297,7 +1348,14 @@ mod tests {
                 .iter()
                 .find(|bind| bind.visible == Path::new("/__rabs/out/cargo/debug"))
                 .unwrap();
-            assert!(parent.backing.join("build/leaf-123/out").is_dir());
+            assert!(parent.backing.starts_with(empty.path()));
+            let generated_mountpoint = parent.backing.join("build/leaf-123/out");
+            assert!(generated_mountpoint.is_dir());
+            assert_eq!(std::fs::read_dir(&generated_mountpoint).unwrap().count(), 0);
+            assert!(
+                spec.ro_binds
+                    .contains(&Bind::new("/private/bundle/generated", generated))
+            );
             let support = fixture_support(mode);
             let launch = build_dependency_argv(
                 &context,
@@ -1328,6 +1386,14 @@ mod tests {
                 .position(|row| row == ["--ro-bind", "/private/bundle/generated", generated])
                 .unwrap();
             assert!(parent_at < generated_at);
+            assert_eq!(
+                argv.contains(&"--proc"),
+                mode == DependencyExecutionMode::Metadata
+            );
+            assert_eq!(
+                argv.contains(&"--dev"),
+                mode == DependencyExecutionMode::Metadata
+            );
             assert!(
                 spec.rw_binds
                     .iter()
@@ -1341,6 +1407,26 @@ mod tests {
                 build_dependency_argv(
                     &context,
                     &missing,
+                    &runtime.runtime,
+                    &support,
+                    context.compiler(),
+                    &[],
+                )
+                .is_err()
+            );
+            let mut writable_only = spec.clone();
+            let generated_at = writable_only
+                .ro_binds
+                .iter()
+                .position(|bind| bind.visible == Path::new(generated))
+                .unwrap();
+            writable_only
+                .rw_binds
+                .push(writable_only.ro_binds.remove(generated_at));
+            assert!(
+                build_dependency_argv(
+                    &context,
+                    &writable_only,
                     &runtime.runtime,
                     &support,
                     context.compiler(),

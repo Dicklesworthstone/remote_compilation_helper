@@ -6,8 +6,10 @@
 //! singleflight work. Start them together, but do not retain an action, a
 //! waiter, or output ownership while either input set is incomplete.
 
+use crate::coord::live_dependency::canonical::CanonicalPaths;
 use crate::edge::live_facts::{DependencyFacts, FactsMiss, LiveFacts, PackageFacts};
 use rabs_key::live_dependency::DependencyActionPlan;
+use std::path::Path;
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -19,14 +21,32 @@ pub(super) enum InputMiss {
 
 pub(super) fn observe(
     facts: &Arc<LiveFacts>,
-    plan: &DependencyActionPlan,
+    logical: &DependencyActionPlan,
+    physical: &DependencyActionPlan,
+    canonical: Option<&CanonicalPaths>,
     may_wait: bool,
 ) -> Result<(Arc<PackageFacts>, Arc<DependencyFacts>), InputMiss> {
-    join_observations(
-        facts.package_for_plan(plan),
-        || facts.dependencies(plan),
-        may_wait,
-    )
+    let package = match canonical {
+        Some(paths) => {
+            let generated = paths
+                .generated_root(logical, physical)
+                .map_err(|reason| InputMiss::Package(FactsMiss::Refused(reason)))?;
+            facts.package_canonical(physical, generated.as_ref())
+        }
+        None => {
+            if logical.canonical_cargo || physical.canonical_cargo {
+                return Err(InputMiss::Package(FactsMiss::Refused(
+                    "canonical package observation lacks its retained driver mapping".into(),
+                )));
+            }
+            facts.package(
+                Path::new(&physical.source_root),
+                physical.source_kind,
+                physical.generated_root.as_deref().map(Path::new),
+            )
+        }
+    };
+    join_observations(package, || facts.dependencies(physical), may_wait)
 }
 
 /// A refusal is terminal, whereas Pending is only readiness. In particular,

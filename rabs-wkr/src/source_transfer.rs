@@ -1574,14 +1574,25 @@ mod tests {
             b"pub const VALUE:u32=73;".as_slice(),
             false,
         );
+        let binary = (
+            "generated/nested/data.bin",
+            b"captured binary bytes\n\0\xff".as_slice(),
+            false,
+        );
+        let executable = ("generated/helper", b"helper bytes".as_slice(), true);
         for mode in [
             DependencyExecutionMode::Metadata,
             DependencyExecutionMode::Rlib,
         ] {
-            for files in [vec![package], vec![package, generated]] {
+            for files in [
+                vec![package],
+                vec![package, generated],
+                vec![package, generated, binary, executable],
+            ] {
                 let (owner, context, mut spec, _runtime) =
                     generated_dependency_profile_fixture(&files, true);
                 let context = context.with_execution_mode(mode);
+                let original = spec.clone();
                 let guard = owner
                     .prepare_dependency_generated(91, &context, &mut spec)
                     .unwrap()
@@ -1605,11 +1616,48 @@ mod tests {
                 );
                 if files.len() == 1 {
                     assert_eq!(std::fs::read_dir(&guard.backing).unwrap().count(), 0);
+                    assert!(
+                        owner
+                            .receiver
+                            .sealed_root()
+                            .unwrap()
+                            .join("generated")
+                            .symlink_metadata()
+                            .is_err()
+                    );
+                    assert!(
+                        owner
+                            .prepare_dependency_generated(91, &context, &mut original.clone())
+                            .is_err(),
+                        "an empty generated owner cannot be silently reused"
+                    );
                 } else {
                     assert_eq!(
                         std::fs::read(guard.backing.join("nested/input.rs")).unwrap(),
                         generated.1
                     );
+                }
+                if files.len() == 4 {
+                    assert_eq!(
+                        std::fs::read(guard.backing.join("nested/data.bin")).unwrap(),
+                        binary.1
+                    );
+                    assert_eq!(
+                        std::fs::read(guard.backing.join("helper")).unwrap(),
+                        executable.1
+                    );
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        assert_ne!(
+                            std::fs::metadata(guard.backing.join("helper"))
+                                .unwrap()
+                                .permissions()
+                                .mode()
+                                & 0o111,
+                            0
+                        );
+                    }
                 }
                 let mut writable = spec.clone();
                 writable
@@ -1780,6 +1828,15 @@ mod tests {
 
     #[test]
     fn generated_mounts_refuse_shadowing_redirection_and_writable_aliases() {
+        assert_generated_mount_protection(false);
+    }
+
+    #[test]
+    fn canonical_generated_mounts_refuse_shadowing_redirection_and_writable_aliases() {
+        assert_generated_mount_protection(true);
+    }
+
+    fn assert_generated_mount_protection(canonical: bool) {
         use rabs_sandbox::canonical_namespace::Bind;
         use std::path::Path;
         for populated in [false, true] {
@@ -1787,7 +1844,8 @@ mod tests {
             if populated {
                 files.push(("generated/input.rs", b"generated".as_slice(), false));
             }
-            let (owner, context, mut spec, runtime) = generated_dependency_fixture(&files);
+            let (owner, context, mut spec, runtime) =
+                generated_dependency_profile_fixture(&files, canonical);
             let guard = owner
                 .prepare_dependency_generated(91, &context, &mut spec)
                 .unwrap()
@@ -1807,7 +1865,7 @@ mod tests {
             assert!(owner.protect_dependency(91, &context, &redirected).is_err());
             for shadow in [
                 visible.join("input.rs"),
-                Path::new("/target/build").to_path_buf(),
+                visible.parent().unwrap().parent().unwrap().to_path_buf(),
             ] {
                 let mut changed = spec.clone();
                 changed
@@ -1819,7 +1877,10 @@ mod tests {
                 Bind::new(&guard.backing, "/scratch"),
                 Bind::new(runtime.path().join("output"), visible),
                 Bind::new(runtime.path().join("output"), visible.join("child")),
-                Bind::new(runtime.path().join("output"), "/target/build"),
+                Bind::new(
+                    runtime.path().join("output"),
+                    visible.parent().unwrap().parent().unwrap(),
+                ),
             ] {
                 let mut changed = spec.clone();
                 changed.rw_binds.push(bind);

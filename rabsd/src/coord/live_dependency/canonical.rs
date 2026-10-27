@@ -40,6 +40,25 @@ pub struct CanonicalPaths {
     closed_dependency_execution_required: bool,
 }
 
+/// One generated tree's filesystem backing and Cargo-visible record spelling.
+/// Only a retained driver mapping can construct this binding. In particular,
+/// a wrapper cannot supply a replacement name for Cargo's `root-output` file.
+#[derive(Debug)]
+pub(crate) struct CanonicalGeneratedRoot {
+    physical: PathBuf,
+    logical: PathBuf,
+}
+
+impl CanonicalGeneratedRoot {
+    pub(crate) fn physical(&self) -> &Path {
+        &self.physical
+    }
+
+    pub(crate) fn logical(&self) -> &Path {
+        &self.logical
+    }
+}
+
 fn ordinary_absolute(path: &Path) -> bool {
     path.to_str().is_some_and(|text| {
         text.starts_with('/')
@@ -56,6 +75,41 @@ fn path_text(path: PathBuf) -> Result<String, String> {
     path.into_os_string()
         .into_string()
         .map_err(|_| "canonical backing path is not UTF-8".to_owned())
+}
+
+fn generated_layout(logical: &DependencyActionPlan) -> Result<Option<&Path>, String> {
+    let mut presented = logical
+        .execution_env
+        .iter()
+        .filter(|(name, _)| name == "OUT_DIR")
+        .map(|(_, value)| value.as_str());
+    if presented.next() != logical.generated_root.as_deref() || presented.next().is_some() {
+        return Err("canonical generated root differs from its compiler environment".into());
+    }
+    let Some(root) = &logical.generated_root else {
+        return Ok(None);
+    };
+    let generated = Path::new(root);
+    let target = Path::new("/__rabs/out/cargo");
+    if !logical.canonical_cargo
+        || !ordinary_absolute(generated)
+        || generated == target
+        || !generated.starts_with(target)
+        || generated.file_name().and_then(|name| name.to_str()) != Some("out")
+        || [&logical.source_root, &logical.out_dir]
+            .into_iter()
+            .chain(&logical.dependency_dirs)
+            .any(|other| {
+                let other = Path::new(other);
+                generated.starts_with(other) || other.starts_with(generated)
+            })
+    {
+        return Err(
+            "canonical generated inputs must bind a distinct Cargo OUT_DIR under the retained target mount"
+                .into(),
+        );
+    }
+    Ok(Some(generated))
 }
 
 impl CanonicalPaths {
@@ -204,33 +258,7 @@ impl CanonicalPaths {
         &self,
         logical: &DependencyActionPlan,
     ) -> Result<DependencyActionPlan, String> {
-        if let Some(generated) = &logical.generated_root {
-            let generated = Path::new(generated);
-            let target = Path::new("/__rabs/out/cargo");
-            let mut presented = logical
-                .execution_env
-                .iter()
-                .filter(|(name, _)| name == "OUT_DIR")
-                .map(|(_, value)| value.as_str());
-            if !logical.canonical_cargo
-                || generated == target
-                || !generated.starts_with(target)
-                || generated.file_name().and_then(|name| name.to_str()) != Some("out")
-                || presented.next() != generated.to_str()
-                || presented.next().is_some()
-                || std::iter::once(&logical.out_dir)
-                    .chain(&logical.dependency_dirs)
-                    .any(|other| {
-                        let other = Path::new(other);
-                        generated.starts_with(other) || other.starts_with(generated)
-                    })
-            {
-                return Err(
-                    "canonical generated inputs must bind a distinct Cargo OUT_DIR under the retained target mount"
-                        .into(),
-                );
-            }
-        }
+        generated_layout(logical)?;
         let translate = |value: &str| path_text(self.physical(Path::new(value))?);
         let mut physical = logical.clone();
         physical.compiler = translate(&logical.compiler)?;
@@ -238,9 +266,8 @@ impl CanonicalPaths {
         physical.out_dir = translate(&logical.out_dir)?;
         physical.package_root = translate(&logical.package_root)?;
         physical.source_root = translate(&logical.source_root)?;
-        // Cargo's root-output record and the compiler environment retain the
-        // visible OUT_DIR spelling. Only this I/O field selects the hidden
-        // backing; package observation validates the two names together.
+        // Cargo's root-output record and compiler environment retain the
+        // visible spelling. Only this I/O field selects the hidden backing.
         physical.generated_root = logical
             .generated_root
             .as_deref()
@@ -257,6 +284,40 @@ impl CanonicalPaths {
             }
         }
         Ok(physical)
+    }
+
+    /// Bind Cargo's exact logical OUT_DIR to the tree observed for this plan.
+    /// The I/O projection deliberately leaves compiler argv/environment alone:
+    /// Cargo's completed `root-output` record contains the logical name even
+    /// though the coordinator reads that record through a hidden backing.
+    pub(crate) fn generated_root(
+        &self,
+        logical: &DependencyActionPlan,
+        physical: &DependencyActionPlan,
+    ) -> Result<Option<CanonicalGeneratedRoot>, String> {
+        if !logical.canonical_cargo
+            || !physical.canonical_cargo
+            || logical.source_kind != physical.source_kind
+            || self.physical(Path::new(&logical.source_root))? != Path::new(&physical.source_root)
+            || logical.execution_env != physical.execution_env
+        {
+            return Err("generated observation differs from its canonical source mapping".into());
+        }
+        let Some(logical_root) = generated_layout(logical)? else {
+            return if physical.generated_root.is_none() {
+                Ok(None)
+            } else {
+                Err("canonical generated root has an unbound physical backing".into())
+            };
+        };
+        let backing = self.physical(logical_root)?;
+        if physical.generated_root.as_deref().map(Path::new) != Some(backing.as_path()) {
+            return Err("canonical generated root differs from its retained backing".into());
+        }
+        Ok(Some(CanonicalGeneratedRoot {
+            physical: backing,
+            logical: logical_root.to_path_buf(),
+        }))
     }
 
     pub(crate) fn dependency_facts(
@@ -530,6 +591,19 @@ mod tests {
             request.verify_read_closure().is_ok(),
             "metadata contract is locally admissible without project code"
         );
+        let ordinary_plan = request.plan.clone();
+        let generated = "/__rabs/out/cargo/debug/build/leaf/out";
+        request.plan.generated_root = Some(generated.into());
+        request
+            .plan
+            .execution_env
+            .push(("OUT_DIR".into(), generated.into()));
+        assert_eq!(
+            request.verify_read_closure().unwrap_err(),
+            "canonical-generated-inputs-require-isolated-dependency-execution"
+        );
+        assert!(request.verify_enforced_read_closure(None).is_err());
+        request.plan = ordinary_plan;
         let paths = request
             .canonical_paths
             .take()
@@ -570,133 +644,280 @@ mod tests {
         );
     }
 
-    fn generated_plan() -> DependencyActionPlan {
-        use rabs_key::live_dependency::{
-            LiveRustcRequest, plan_canonical_remote_dependency_action,
-        };
+    #[test]
+    fn canonical_mounts_cannot_select_ambient_or_overlapping_backing_paths() {
+        let (owner, _) = fixture();
+        let mut mappings: Vec<_> = ROOTS
+            .iter()
+            .enumerate()
+            .map(|(index, root)| (PathBuf::from(root), owner.path().join(index.to_string())))
+            .collect();
+        mappings[1].1 = owner.path().join("0/child");
+        std::fs::create_dir(&mappings[1].1).unwrap();
+        assert!(CanonicalPaths::new(Arc::clone(&owner), mappings.clone()).is_err());
+        mappings[1].1 = std::env::temp_dir();
+        assert!(CanonicalPaths::new(owner, mappings).is_err());
+    }
 
-        let package = "/__rabs/cargo-home/registry/src/fixture-index/generated-1.0.0";
-        let generated = "/__rabs/out/cargo/debug/build/generated-123/out";
-        let argv = vec![
-            "/__rabs/toolchain/bin/rustc".into(),
-            "--crate-name=generated".into(),
-            "--crate-type=lib".into(),
-            "--emit=dep-info,metadata".into(),
-            "--cap-lints=allow".into(),
-            "--error-format=json".into(),
-            "--out-dir=/__rabs/out/cargo/debug/deps".into(),
-            "-Ldependency=/__rabs/out/cargo/debug/deps".into(),
-            format!("{package}/lib.rs"),
-        ];
-        let env = vec![
-            ("CARGO_HOME".into(), "/__rabs/cargo-home".into()),
-            ("HOME".into(), "/__rabs/home".into()),
-            ("CARGO_MANIFEST_DIR".into(), package.into()),
-            ("CARGO_PKG_NAME".into(), "generated".into()),
-            ("OUT_DIR".into(), generated.into()),
-        ];
-        plan_canonical_remote_dependency_action(
-            LiveRustcRequest {
-                argv: &argv,
-                cwd: package,
-                env: &env,
-            },
-            "x86_64-unknown-linux-gnu",
-            None,
+    struct GeneratedFixture {
+        _owner: Arc<tempfile::TempDir>,
+        paths: Arc<CanonicalPaths>,
+        plan: DependencyActionPlan,
+        physical: DependencyActionPlan,
+        binding: CanonicalGeneratedRoot,
+        record: PathBuf,
+        stdout: PathBuf,
+    }
+
+    impl GeneratedFixture {
+        fn new(populated: bool, separate_run: bool) -> Self {
+            use rabs_key::live_dependency::{
+                LiveRustcRequest, plan_canonical_remote_dependency_action,
+            };
+
+            let (owner, paths) = fixture();
+            let package = "/__rabs/cargo-home/registry/src/fixture-index/generated-1.0.0";
+            let output = "/__rabs/out/cargo/debug/deps";
+            let generated = "/__rabs/out/cargo/debug/build/generated-unit/out";
+            let source = paths.physical(Path::new(package)).unwrap();
+            let generated_backing = paths.physical(Path::new(generated)).unwrap();
+            for directory in [
+                source.clone(),
+                paths.physical(Path::new(output)).unwrap(),
+                generated_backing.clone(),
+            ] {
+                std::fs::create_dir_all(directory).unwrap();
+            }
+            std::fs::write(
+                source.join("lib.rs"),
+                b"include!(concat!(env!(\"OUT_DIR\"), \"/value.rs\"));\n",
+            )
+            .unwrap();
+            if populated {
+                std::fs::write(
+                    generated_backing.join("value.rs"),
+                    b"pub const VALUE: u32 = 17;\n",
+                )
+                .unwrap();
+            }
+            let unit = generated_backing.parent().unwrap();
+            let run = if separate_run {
+                let run = unit.join("run");
+                std::fs::create_dir(&run).unwrap();
+                run
+            } else {
+                unit.to_path_buf()
+            };
+            let record = run.join("root-output");
+            let stdout = run.join(if separate_run { "stdout" } else { "output" });
+            std::fs::write(&record, generated.as_bytes()).unwrap();
+            std::fs::write(&stdout, b"cargo::rustc-env=BUILD_LABEL=pinned\n").unwrap();
+            let argv = vec![
+                "/__rabs/toolchain/bin/rustc".into(),
+                "--crate-name=generated".into(),
+                "--crate-type=lib".into(),
+                "--emit=dep-info,metadata".into(),
+                "--cap-lints=allow".into(),
+                "--error-format=json".into(),
+                format!("--out-dir={output}"),
+                format!("{package}/lib.rs"),
+            ];
+            let env = vec![
+                ("CARGO_HOME".into(), "/__rabs/cargo-home".into()),
+                ("HOME".into(), "/__rabs/home".into()),
+                ("CARGO_MANIFEST_DIR".into(), package.into()),
+                ("CARGO_PKG_NAME".into(), "generated".into()),
+                ("OUT_DIR".into(), generated.into()),
+                ("BUILD_LABEL".into(), "pinned".into()),
+            ];
+            let plan = plan_canonical_remote_dependency_action(
+                LiveRustcRequest {
+                    argv: &argv,
+                    cwd: package,
+                    env: &env,
+                },
+                "x86_64-unknown-linux-gnu",
+                None,
+            )
+            .unwrap();
+            let physical = paths.project_plan(&plan).unwrap();
+            let binding = paths.generated_root(&plan, &physical).unwrap().unwrap();
+            Self {
+                _owner: owner,
+                paths,
+                plan,
+                physical,
+                binding,
+                record,
+                stdout,
+            }
+        }
+
+        fn capture(
+            &self,
+            facts: &Arc<crate::edge::live_facts::LiveFacts>,
+        ) -> Result<Arc<crate::edge::live_facts::PackageFacts>, crate::edge::live_facts::FactsMiss>
+        {
+            facts.package_canonical(&self.physical, Some(&self.binding))
+        }
+    }
+
+    #[test]
+    fn canonical_generated_capture_keeps_cargo_records_and_visible_paths_exact() {
+        use crate::edge::live_facts::{GENERATED_ROOT, LiveFacts};
+
+        for populated in [false, true] {
+            for separate_run in [false, true] {
+                let fixture = GeneratedFixture::new(populated, separate_run);
+                let facts = LiveFacts::new();
+                let captured = fixture.capture(&facts).unwrap();
+                assert_eq!(
+                    captured.generated_files.len(),
+                    if populated { 1 } else { 0 }
+                );
+                assert_eq!(
+                    captured.snapshot.file_bytes(GENERATED_ROOT, "value.rs"),
+                    populated.then_some(b"pub const VALUE: u32 = 17;\n".as_slice())
+                );
+                assert_eq!(
+                    captured.build_script_output.as_deref(),
+                    Some(b"cargo::rustc-env=BUILD_LABEL=pinned\n".as_slice())
+                );
+                assert_eq!(fixture.physical.execution_env, fixture.plan.execution_env);
+                assert_eq!(fixture.physical.keyed_env, fixture.plan.keyed_env);
+                assert_eq!(
+                    fixture.physical.invocation.canonical_bytes(),
+                    fixture.plan.invocation.canonical_bytes()
+                );
+                assert_eq!(
+                    std::fs::read(&fixture.record).unwrap(),
+                    fixture.binding.logical().to_str().unwrap().as_bytes()
+                );
+                assert!(Arc::ptr_eq(&captured, &fixture.capture(&facts).unwrap()));
+                captured
+                    .verify_unchanged(Path::new(&fixture.physical.source_root))
+                    .unwrap();
+                captured
+                    .verify_generated_disjoint(&fixture.physical)
+                    .unwrap();
+                // A physical-path observer cannot borrow the canonical memo.
+                assert!(
+                    facts
+                        .package(
+                            Path::new(&fixture.physical.source_root),
+                            fixture.plan.source_kind,
+                            Some(fixture.binding.physical()),
+                        )
+                        .is_err()
+                );
+                std::fs::write(
+                    &fixture.record,
+                    fixture.binding.physical().to_str().unwrap().as_bytes(),
+                )
+                .unwrap();
+                assert!(
+                    captured
+                        .verify_unchanged(Path::new(&fixture.physical.source_root))
+                        .is_err()
+                );
+                assert!(fixture.capture(&facts).is_err());
+                facts
+                    .package(
+                        Path::new(&fixture.physical.source_root),
+                        fixture.plan.source_kind,
+                        Some(fixture.binding.physical()),
+                    )
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_generated_inputs_revalidate_bytes_members_records_and_aliases() {
+        use crate::edge::live_facts::LiveFacts;
+
+        for mutation in [
+            "file",
+            "member",
+            "stdout",
+            "record",
+            "root-symlink",
+            "file-symlink",
+        ] {
+            let fixture = GeneratedFixture::new(true, false);
+            let facts = LiveFacts::new();
+            let captured = fixture.capture(&facts).unwrap();
+            let root = fixture.binding.physical();
+            match mutation {
+                "file" => std::fs::write(root.join("value.rs"), b"pub const VALUE: u32 = 23;\n"),
+                "member" => std::fs::write(root.join("introduced.rs"), b"new member"),
+                "stdout" => {
+                    std::fs::write(&fixture.stdout, b"cargo::rustc-env=BUILD_LABEL=other\n")
+                }
+                "record" => std::fs::write(&fixture.record, b"/__rabs/out/cargo/other/out"),
+                "root-symlink" => {
+                    let moved = root.with_file_name("moved-out");
+                    std::fs::rename(root, &moved).unwrap();
+                    std::os::unix::fs::symlink(moved, root)
+                }
+                "file-symlink" => std::os::unix::fs::symlink("value.rs", root.join("alias.rs")),
+                _ => unreachable!(),
+            }
+            .unwrap();
+            assert!(
+                captured
+                    .verify_unchanged(Path::new(&fixture.physical.source_root))
+                    .is_err(),
+                "{mutation}"
+            );
+        }
+        let fixture = GeneratedFixture::new(true, false);
+        let captured = fixture.capture(&LiveFacts::new()).unwrap();
+        std::fs::hard_link(
+            fixture.binding.physical().join("value.rs"),
+            Path::new(&fixture.physical.out_dir).join(&fixture.plan.output_names()[0]),
         )
-        .unwrap()
+        .unwrap();
+        assert!(
+            captured
+                .verify_generated_disjoint(&fixture.physical)
+                .is_err()
+        );
     }
 
     #[test]
     fn generated_capture_binds_visible_cargo_records_to_retained_physical_inputs() {
-        use crate::edge::live_facts::{GENERATED_ROOT, LiveFacts};
+        use crate::edge::live_facts::LiveFacts;
 
-        let (_owner, paths) = fixture();
-        let paths = paths.require_closed_dependency_execution().unwrap();
-        let logical = generated_plan();
-        let physical = paths.project_plan(&logical).unwrap();
-        let source = Path::new(&physical.source_root);
-        let generated = Path::new(physical.generated_root.as_deref().unwrap());
-        let run = generated.parent().unwrap().join("run");
-        for directory in [
-            source,
-            generated,
-            run.as_path(),
-            Path::new(&physical.out_dir),
-        ] {
-            std::fs::create_dir_all(directory).unwrap();
-        }
-        std::fs::write(
-            source.join("lib.rs"),
-            b"include!(concat!(env!(\"OUT_DIR\"), \"/value.rs\"));\n",
-        )
-        .unwrap();
-        std::fs::write(generated.join("value.rs"), b"pub const VALUE:u32=17;\n").unwrap();
-        let record = b"cargo::rustc-env=GENERATED_VALUE=exact value\n";
-        std::fs::write(run.join("stdout"), record).unwrap();
-        let visible = logical.generated_root.as_deref().unwrap();
-        std::fs::write(run.join("root-output"), visible).unwrap();
-
-        // Projection changes only I/O locations. Cargo's exact argv, complete
-        // environment and recorded OUT_DIR are never rewritten to host paths.
-        assert_ne!(physical.generated_root, logical.generated_root);
-        assert_eq!(physical.execution_env, logical.execution_env);
-        assert_eq!(physical.invocation, logical.invocation);
+        let fixture = GeneratedFixture::new(true, true);
         let facts = LiveFacts::new();
-        assert!(
-            facts
-                .package(source, logical.source_kind, Some(generated))
-                .is_err()
-        );
-        let first = facts.package_for_plan(&physical).unwrap();
-        assert_eq!(
-            first.build_script_output.as_deref(),
-            Some(record.as_slice())
-        );
-        assert_eq!(
-            first.snapshot.file_bytes(GENERATED_ROOT, "value.rs"),
-            Some(b"pub const VALUE:u32=17;\n".as_slice())
-        );
-        assert_eq!(
-            std::fs::read(run.join("root-output")).unwrap(),
-            visible.as_bytes()
-        );
-        assert!(Arc::ptr_eq(
-            &first,
-            &facts.package_for_plan(&physical).unwrap()
-        ));
-        first.verify_unchanged(source).unwrap();
-        first.verify_generated_disjoint(&physical).unwrap();
-        assert!(paths.require_local_capture().is_err());
-
-        std::fs::write(generated.join("value.rs"), b"pub const VALUE:u32=23;\n").unwrap();
-        assert!(first.verify_unchanged(source).is_err());
-        let changed = facts.package_for_plan(&physical).unwrap();
-        assert_ne!(first.generated_files, changed.generated_files);
+        let source = Path::new(&fixture.physical.source_root);
+        let first = fixture.capture(&facts).unwrap();
         std::fs::write(
-            run.join("stdout"),
-            b"cargo::rustc-env=GENERATED_VALUE=changed\n",
+            fixture.binding.physical().join("value.rs"),
+            b"pub const VALUE:u32=23;\n",
         )
         .unwrap();
+        assert!(first.verify_unchanged(source).is_err());
+        let changed = fixture.capture(&facts).unwrap();
+        assert_ne!(first.generated_files, changed.generated_files);
+        std::fs::write(&fixture.stdout, b"cargo::rustc-env=BUILD_LABEL=changed\n").unwrap();
         assert!(changed.verify_unchanged(source).is_err());
-        let changed_record = facts.package_for_plan(&physical).unwrap();
+        let changed_record = fixture.capture(&facts).unwrap();
         assert_ne!(
             first.build_script_output,
             changed_record.build_script_output
         );
-        std::fs::write(
-            run.join("root-output"),
-            b"/__rabs/out/cargo/debug/build/other/out",
-        )
-        .unwrap();
+        std::fs::write(&fixture.record, b"/__rabs/out/cargo/debug/build/other/out").unwrap();
         assert!(changed_record.verify_unchanged(source).is_err());
-        assert!(facts.package_for_plan(&physical).is_err());
+        assert!(fixture.capture(&facts).is_err());
     }
 
     #[test]
     fn generated_projection_refuses_ambient_aliasing_and_mismatched_out_dir_names() {
-        let (owner, paths) = fixture();
-        let plan = generated_plan();
+        let fixture = GeneratedFixture::new(false, true);
+        let paths = &fixture.paths;
+        let plan = &fixture.plan;
         for invalid in [
             "/tmp/ambient/out",
             "/__rabs/workspace/vendor/generated/out",
@@ -713,6 +934,12 @@ mod tests {
                 }
             }
             assert!(paths.project_plan(&invalid_plan).is_err(), "{invalid}");
+            assert!(
+                paths
+                    .generated_root(&invalid_plan, &fixture.physical)
+                    .is_err(),
+                "{invalid}"
+            );
         }
         let mut mismatched = plan.clone();
         mismatched.generated_root = Some("/__rabs/out/cargo/debug/build/other/out".into());
@@ -732,25 +959,57 @@ mod tests {
             .push(("OUT_DIR".into(), plan.generated_root.clone().unwrap()));
         assert!(paths.project_plan(&duplicate).is_err());
 
-        let physical = paths.project_plan(&plan).unwrap();
-        let generated = Path::new(physical.generated_root.as_deref().unwrap());
-        std::fs::create_dir_all(generated.parent().unwrap()).unwrap();
-        std::os::unix::fs::symlink(owner.path().join("0"), generated).unwrap();
-        assert!(paths.project_plan(&plan).is_err());
+        let generated = fixture.binding.physical();
+        std::fs::rename(generated, generated.with_file_name("moved-out")).unwrap();
+        std::os::unix::fs::symlink(&fixture.physical.source_root, generated).unwrap();
+        assert!(paths.project_plan(plan).is_err());
+        assert!(paths.generated_root(plan, &fixture.physical).is_err());
     }
 
     #[test]
-    fn canonical_mounts_cannot_select_ambient_or_overlapping_backing_paths() {
-        let (owner, _) = fixture();
-        let mut mappings: Vec<_> = ROOTS
-            .iter()
-            .enumerate()
-            .map(|(index, root)| (PathBuf::from(root), owner.path().join(index.to_string())))
-            .collect();
-        mappings[1].1 = owner.path().join("0/child");
-        std::fs::create_dir(&mappings[1].1).unwrap();
-        assert!(CanonicalPaths::new(Arc::clone(&owner), mappings.clone()).is_err());
-        mappings[1].1 = std::env::temp_dir();
-        assert!(CanonicalPaths::new(owner, mappings).is_err());
+    fn generated_binding_cannot_select_another_plan_or_backing() {
+        let fixture = GeneratedFixture::new(false, false);
+        let mut wrong_backing = fixture.physical.clone();
+        wrong_backing.generated_root = Some(fixture.physical.source_root.clone());
+        assert!(
+            fixture
+                .paths
+                .generated_root(&fixture.plan, &wrong_backing)
+                .is_err()
+        );
+        let mut wrong_source = fixture.physical.clone();
+        wrong_source.source_root = fixture.physical.out_dir.clone();
+        assert!(
+            fixture
+                .paths
+                .generated_root(&fixture.plan, &wrong_source)
+                .is_err()
+        );
+        let mut wrong_env = fixture.physical.clone();
+        wrong_env
+            .execution_env
+            .retain(|(name, _)| name != "OUT_DIR");
+        assert!(
+            fixture
+                .paths
+                .generated_root(&fixture.plan, &wrong_env)
+                .is_err()
+        );
+        let mut duplicate = fixture.plan.clone();
+        duplicate
+            .execution_env
+            .push(("OUT_DIR".into(), "elsewhere".into()));
+        assert!(fixture.paths.project_plan(&duplicate).is_err());
+        assert!(
+            fixture
+                .paths
+                .generated_root(&duplicate, &fixture.physical)
+                .is_err()
+        );
+        assert!(
+            crate::edge::live_facts::LiveFacts::new()
+                .package_canonical(&wrong_backing, Some(&fixture.binding))
+                .is_err()
+        );
     }
 }
