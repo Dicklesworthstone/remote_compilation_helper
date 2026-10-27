@@ -8609,26 +8609,42 @@ fn test_layer0_pack_respects_profile_settings_the_project_declares() {
         "CARGO_PROFILE_DEV_DEBUG",
         "CARGO_PROFILE_TEST_DEBUG",
     ];
-    let temp = tempfile::tempdir().unwrap();
+    let temp = tempfile::Builder::new()
+        .prefix("rch-layer0-profile-")
+        .tempdir_in("/tmp")
+        .unwrap();
     let root = temp.path();
     let member = root.join("crates/member");
     std::fs::create_dir_all(member.join(".cargo")).unwrap();
     std::fs::write(
         member.join("Cargo.toml"),
-        "[package]\nname = \"member\"\n[profile.dev]\ndebug = 2\n",
+        "[package]\nname = \"member\"\n[workspace]\n[profile.dev]\ndebug = 2\n",
     )
     .unwrap();
-    // No workspace: the member is its own root, and its dev debug also
+    // Explicit standalone root (`[workspace]`): the member is its own root even
+    // when scratch lies beneath an enclosing workspace, and its dev debug also
     // covers test, which inherits dev.
     assert_eq!(keys(&member), every[..2]);
 
-    // With a workspace root, only the root's profiles count.
+    // Without its own `[workspace]`, a member inherits its enclosing workspace
+    // root's profiles and ignores member-level `[profile.*]`.
+    std::fs::write(
+        member.join("Cargo.toml"),
+        "[package]\nname = \"member\"\n[profile.dev]\ndebug = 2\n",
+    )
+    .unwrap();
     std::fs::write(
         root.join("Cargo.toml"),
         "[workspace]\nmembers = [\"crates/member\"]\n[profile.test]\ndebug = 0\n",
     )
     .unwrap();
     assert_eq!(keys(&member), every[..3]);
+
+    // A nested directory without its own `[workspace]` boundary also inherits
+    // the enclosing workspace root's declared profiles.
+    let nested = root.join("crates/nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    assert_eq!(keys(&nested), every[..3]);
 
     // A `.cargo/config.toml` inside the tree counts too.
     std::fs::write(
@@ -8644,10 +8660,16 @@ fn test_layer0_pack_respects_profile_settings_the_project_declares() {
         ]
     );
 
-    // Nothing declared: every enabled knob applies.
-    let bare = tempfile::tempdir().unwrap();
-    assert_eq!(keys(bare.path()), every);
-    assert!(layer0_env_for_lane(&all, true, Some(bare.path())).is_empty());
+    // Nothing declared in an explicit standalone boundary: every enabled knob applies.
+    let bare = root.join("standalone-bare");
+    std::fs::create_dir_all(&bare).unwrap();
+    std::fs::write(
+        bare.join("Cargo.toml"),
+        "[package]\nname = \"bare\"\n[workspace]\n",
+    )
+    .unwrap();
+    assert_eq!(keys(&bare), every);
+    assert!(layer0_env_for_lane(&all, true, Some(&bare)).is_empty());
 }
 
 /// bd-hoxgn: the Layer 0 pack must reach the command that actually runs. It

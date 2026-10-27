@@ -2120,7 +2120,10 @@ mod tests {
             OwnedSyncClosureLayout,
             Vec<PreparedSourceContentRoot>,
         ) {
-            let temp = tempfile::tempdir().unwrap();
+            let temp = tempfile::Builder::new()
+                .prefix("rch-owned-closure-")
+                .tempdir_in("/tmp")
+                .unwrap();
             let local = temp.path().join("local");
             fs::create_dir_all(&local).unwrap();
             let local = local.canonicalize().unwrap();
