@@ -104,7 +104,9 @@ use crate::extern_resolution::{
 use crate::hit_verification::{descriptor_canonical_bytes, descriptor_digest};
 use crate::invocation::{NormalizedRustcInvocation, SourceInput, parse};
 use crate::output_declarations::OutputDeclarationSet;
-use crate::output_derivation::derive_dependency_output_declarations;
+use crate::output_derivation::{
+    derive_dependency_output_declarations, derive_workspace_output_declarations,
+};
 use crate::output_platform::{CpuBaseline, OutputPlatformContract};
 use crate::path_policy::{BuildPathSemanticPolicy, policy_component_digest};
 use crate::toolchain::ToolchainContract;
@@ -875,8 +877,12 @@ fn plan_in_profile(
 
     let invocation = parse(request.argv, None)
         .map_err(|error| LiveRefusal::Unparseable(format!("{error:?}")))?;
-    let outputs = derive_dependency_output_declarations(&invocation, host_triple)
-        .map_err(|error| LiveRefusal::Outputs(format!("{error:?}")))?;
+    let outputs = if workspace_execution_only {
+        derive_workspace_output_declarations(&invocation, host_triple)
+    } else {
+        derive_dependency_output_declarations(&invocation, host_triple)
+    }
+    .map_err(|error| LiveRefusal::Outputs(format!("{error:?}")))?;
     if !workspace_execution_only && invocation.cap_lints.as_deref() != Some("allow") {
         return Err(LiveRefusal::NotDependencyCompile(
             "Cargo caps lints for external dependencies; this invocation does not",

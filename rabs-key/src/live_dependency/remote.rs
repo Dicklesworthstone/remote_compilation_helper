@@ -28,7 +28,9 @@ use crate::canonical::CanonicalEncoder;
 use crate::extern_resolution::DependencyArtifactKind;
 use crate::hit_verification::{descriptor_canonical_bytes, descriptor_digest};
 use crate::invocation::NormalizedRustcInvocation;
-use crate::output_derivation::derive_dependency_output_declarations;
+use crate::output_derivation::{
+    derive_dependency_output_declarations, derive_workspace_output_declarations,
+};
 use crate::output_platform::{CpuBaseline, OutputPlatformContract};
 use crate::typed_digest::compute;
 
@@ -542,8 +544,12 @@ pub(super) fn remote_execution_shape(
         return Err(RemoteDependencyRefusal::NativeInputs);
     }
     remote_dependency_output_class(&plan.invocation)?;
-    let derived = derive_dependency_output_declarations(&plan.invocation, &plan.host_triple)
-        .map_err(|error| LiveRefusal::Outputs(error.to_string()))?;
+    let derived = if plan.source_kind == DependencySourceKind::WorkspaceExecutionOnly {
+        derive_workspace_output_declarations(&plan.invocation, &plan.host_triple)
+    } else {
+        derive_dependency_output_declarations(&plan.invocation, &plan.host_triple)
+    }
+    .map_err(|error| LiveRefusal::Outputs(error.to_string()))?;
     if derived != plan.outputs {
         return Err(
             LiveRefusal::Facts("declared outputs differ from the invocation".into()).into(),

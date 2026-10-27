@@ -1,4 +1,4 @@
-//! Fresh, request-owned execution of canonical Cargo workspace libraries.
+//! Fresh, request-owned execution of canonical Cargo workspace compilations.
 //!
 //! This identity binds the complete retained workspace and generated trees,
 //! compiler environment and exact Rust dependency artifacts. It is transport
@@ -17,6 +17,7 @@ use crate::action_key::compute_action_key;
 use crate::canonical::CanonicalEncoder;
 use crate::hit_verification::{descriptor_canonical_bytes, descriptor_digest};
 use crate::invocation::SourceInput;
+use crate::output_derivation::derive_workspace_output_declarations;
 use crate::typed_digest::compute;
 use rabs_protocol::descriptor::ActionClass;
 use rabs_protocol::input_evidence::ActionInputManifest;
@@ -29,14 +30,16 @@ const TARGET: &str = "/__rabs/out/cargo";
 const POLICY_DOMAIN: &str = "rabs.canonical-workspace-execution.isolation.v1";
 pub(super) const WORKSPACE_EXECUTION_PROFILE: &str = "canonical-workspace-execution-only-v1: \
     canonical-workspace-exec-v1 explicitly negotiated; one fresh independently \
-    supervised worker rustc for a coordinator-retained Cargo-selected library; \
+    supervised worker rustc for a coordinator-retained Cargo-selected compilation; \
     exact canonical argv, working directory, manifest directory, complete \
     presented environment including primary-package and lint behavior; complete \
     immutable canonical workspace and generated OUT_DIR trees with exact file \
     identities and every immediate directory listing including empty directories; \
     independently retained toolchain and measured ELF runtime; exact read-only \
     Rust metadata/archive candidate inventories; fresh private output, HOME and \
-    temporary storage; metadata or closed pure-Rust archive mode, no native link \
+    temporary storage; library metadata or closed pure-Rust archive mode, binary \
+    and test-harness metadata with exact dep-info and required possibly empty rmeta, \
+    no binary/test linking or test execution; no native link \
     inputs, executable externs, incremental state or coordinator control socket; \
     authenticated request-owned receipt and drained process group required; \
     installation only into this live request's exact declared output paths; no \
@@ -92,6 +95,13 @@ pub(super) fn workspace_layout(plan: &DependencyActionPlan) -> Result<(), LiveRe
         plan.generated_root.as_deref(),
         false,
     )?;
+    let outputs = derive_workspace_output_declarations(&plan.invocation, &plan.host_triple)
+        .map_err(|error| LiveRefusal::Outputs(error.to_string()))?;
+    if outputs != plan.outputs {
+        return Err(LiveRefusal::Facts(
+            "workspace declared outputs differ from the exact compiler request".into(),
+        ));
+    }
     if !plan.canonical_cargo
         || plan.source_kind != DependencySourceKind::WorkspaceExecutionOnly
         || plan.source_root != WORKSPACE
@@ -155,7 +165,7 @@ pub(super) fn workspace_layout(plan: &DependencyActionPlan) -> Result<(), LiveRe
     Ok(())
 }
 
-/// Plan a fresh canonical workspace library compilation. The caller must match
+/// Plan a fresh canonical workspace compilation. The caller must match
 /// the resolved source, crate and selected mode against its driver-owned Cargo
 /// graph before observing or dispatching inputs. Canonical path spelling alone
 /// cannot select this entry point on the ordinary wrapper endpoint.
@@ -464,6 +474,105 @@ mod tests {
             key(&member, &inputs(&member)).unwrap().action_key,
             key(&plan, &inputs(&plan)).unwrap().action_key
         );
+    }
+
+    #[test]
+    fn binary_and_test_metadata_keep_exact_invocations_and_never_gain_cache_authority() {
+        let mut execution_keys = Vec::new();
+        for shape in [
+            vec!["--crate-type=bin"],
+            vec!["--test"],
+            vec!["--test", "--crate-type=lib"],
+            vec!["--test", "--crate-type=rlib"],
+            vec!["--test", "--crate-type=bin"],
+        ] {
+            let (mut argv, env) = request();
+            argv.retain(|arg| arg != "--crate-type=lib");
+            argv.extend(shape.iter().map(|arg| (*arg).to_owned()));
+            let plan = from_request(&argv, &env, WORKSPACE);
+            assert_eq!(
+                plan.invocation,
+                crate::invocation::parse(&argv, None).unwrap()
+            );
+            let inputs = inputs(&plan);
+            let directories = directories(&plan);
+            let key = key(&plan, &inputs).unwrap();
+            assert_eq!(
+                key.descriptor.action_class,
+                ActionClass::RustcWorkspaceCompile
+            );
+            assert!(!execution_keys.contains(&key.action_key));
+            execution_keys.push(key.action_key);
+            assert_eq!(plan.outputs.declarations.len(), 2);
+            assert!(
+                plan.outputs
+                    .declarations
+                    .iter()
+                    .all(|output| !output.optional)
+            );
+            assert!(
+                live_dependency_key(&plan, &toolchain(), &[], &directories, None, &inputs).is_err()
+            );
+            assert!(
+                canonical_cargo_dependency_key(
+                    &plan,
+                    &toolchain(),
+                    &[],
+                    &directories,
+                    None,
+                    &inputs
+                )
+                .is_err()
+            );
+            assert!(
+                remote::remote_dependency_key(
+                    &plan,
+                    &toolchain(),
+                    &directories,
+                    &inputs,
+                    None,
+                    TOOLCHAIN,
+                    &[39; 32],
+                    &compute(remote::RUNTIME_COHORT_DOMAIN, b"runtime"),
+                )
+                .is_err()
+            );
+            assert!(remote::remote_dependency_shape(&plan, &directories, TOOLCHAIN).is_err());
+            assert!(remote::remote_dependency_isolation_policy(&plan).is_err());
+        }
+    }
+
+    #[test]
+    fn mutated_workspace_metadata_cannot_gain_linking_or_invented_output_authority() {
+        let (mut argv, env) = request();
+        argv.retain(|arg| arg != "--crate-type=lib");
+        argv.push("--crate-type=bin".into());
+        let baseline = from_request(&argv, &env, WORKSPACE);
+        assert!(key(&baseline, &inputs(&baseline)).is_ok());
+        for mutation in 0..5 {
+            let mut changed = baseline.clone();
+            match mutation {
+                0 => changed.invocation.emit.push("link".into()),
+                1 => changed.invocation.crate_types = vec!["cdylib".into()],
+                2 => changed
+                    .invocation
+                    .passthrough
+                    .push("--print=file-names".into()),
+                3 => changed.outputs.declarations[0].optional = true,
+                4 => changed.outputs.declarations[0].virtual_path = "unrequested".into(),
+                _ => unreachable!(),
+            }
+            assert!(
+                remote_workspace_execution_shape(&changed, &directories(&changed), TOOLCHAIN)
+                    .is_err(),
+                "{mutation}"
+            );
+            assert!(
+                remote_workspace_execution_isolation_policy(&changed).is_err(),
+                "{mutation}"
+            );
+            assert!(key(&changed, &inputs(&changed)).is_err(), "{mutation}");
+        }
     }
 
     #[test]

@@ -18,7 +18,10 @@ use std::collections::BTreeSet;
 use std::process::Command;
 
 use rabs_key::invocation::parse;
-use rabs_key::output_derivation::derive_output_declarations;
+use rabs_key::output_derivation::{
+    derive_dependency_output_declarations, derive_output_declarations,
+    derive_workspace_output_declarations,
+};
 
 /// The host triple this rustc builds for by default.
 fn host_triple() -> String {
@@ -167,6 +170,68 @@ fn derived_outputs_equal_what_rustc_writes() {
              derived:  {derived:?}\n\
              produced: {produced:?}"
         );
+    }
+}
+
+#[test]
+fn workspace_binary_and_test_metadata_match_actual_empty_rmeta_and_dep_info() {
+    let owner = tempfile::tempdir().unwrap();
+    let source = owner.path().join("selected.rs");
+    std::fs::write(
+        &source,
+        "fn main() {}\n#[test] fn checked_without_running() { panic!(\"metadata must not run tests\"); }\n",
+    )
+    .unwrap();
+    let host = host_triple();
+    for (index, shape) in [
+        case(&["--crate-type=bin"]),
+        case(&["--test"]),
+        case(&["--test", "--crate-type=lib"]),
+        case(&["--test", "--crate-type=rlib"]),
+        case(&["--test", "--crate-type=bin"]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let output = owner.path().join(format!("metadata-{index}"));
+        let mut args = case(&[
+            "--crate-name=selected",
+            "--edition=2024",
+            "--emit=dep-info,metadata",
+            "-Cextra-filename=-checked",
+        ]);
+        args.extend(shape);
+        let produced = actually_produced(&args, &source, &output);
+        let argv = std::iter::once("rustc".to_owned())
+            .chain(args)
+            .chain(["--out-dir".into(), output.display().to_string()])
+            .chain([source.display().to_string()])
+            .collect::<Vec<_>>();
+        let invocation = parse(&argv, None).unwrap();
+        let expected = derive_workspace_output_declarations(&invocation, &host).unwrap();
+        assert_eq!(
+            produced,
+            expected
+                .declarations
+                .iter()
+                .map(|entry| entry.virtual_path.clone())
+                .collect::<BTreeSet<_>>(),
+            "actual compiler outputs differ for {argv:?}"
+        );
+        assert!(expected.declarations.iter().all(|entry| !entry.optional));
+        assert_eq!(
+            std::fs::metadata(output.join("libselected-checked.rmeta"))
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(
+            std::fs::metadata(output.join("selected-checked.d"))
+                .unwrap()
+                .len()
+                > 0
+        );
+        assert!(derive_dependency_output_declarations(&invocation, &host).is_err());
     }
 }
 
