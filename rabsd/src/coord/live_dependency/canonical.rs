@@ -9,7 +9,7 @@ use rabs_key::live_dependency::{
     DependencyActionPlan, DependencyDirectoryFact, DependencySourceKind, ExternFact,
     LiveRustcRequest, PlannedExtern,
 };
-use rabs_sandbox::cargo_check::CompilationLibraryUnit;
+use rabs_sandbox::cargo_check::{CompilationSelection, CompilationUnit};
 use std::collections::BTreeSet;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -41,7 +41,10 @@ pub struct CanonicalPaths {
     _owner: Arc<tempfile::TempDir>,
     mounts: Vec<Mount>,
     closed_dependency_execution_required: bool,
-    workspace_units: Vec<CompilationLibraryUnit>,
+    workspace_units: Vec<CompilationUnit>,
+    workspace_tests_selected: bool,
+    workspace_benches_selected: bool,
+    workspace_bulk_harnesses_selected: bool,
 }
 
 /// One generated tree's filesystem backing and Cargo-visible record spelling.
@@ -178,14 +181,18 @@ impl CanonicalPaths {
             mounts,
             closed_dependency_execution_required: false,
             workspace_units: Vec::new(),
+            workspace_tests_selected: false,
+            workspace_benches_selected: false,
+            workspace_bulk_harnesses_selected: false,
         }))
     }
 
-    /// Bind actual Cargo-selected path-package library units before the endpoint
+    /// Bind actual Cargo-selected path-package units before the endpoint
     /// becomes visible to project code. A wrapper frame cannot extend this set.
     pub(crate) fn with_workspace_units(
         mut self: Arc<Self>,
-        units: &[CompilationLibraryUnit],
+        units: &[CompilationUnit],
+        selection: Option<&CompilationSelection>,
     ) -> Result<Arc<Self>, String> {
         let selected = units
             .iter()
@@ -204,9 +211,22 @@ impl CanonicalPaths {
                 );
             }
         }
-        Arc::get_mut(&mut self)
-            .ok_or("workspace unit membership must be bound before sharing its capability")?
-            .workspace_units = selected;
+        let paths = Arc::get_mut(&mut self)
+            .ok_or("workspace unit membership must be bound before sharing its capability")?;
+        paths.workspace_units = selected;
+        paths.workspace_tests_selected =
+            selection.is_some_and(|selection| selection.tests && !selection.all_targets);
+        paths.workspace_benches_selected = selection.is_some_and(|selection| {
+            selection.benches
+                && !selection.all_targets
+                && !selection.lib
+                && !selection.bins
+                && !selection.examples
+                && selection.bin.is_empty()
+                && selection.example.is_empty()
+        });
+        paths.workspace_bulk_harnesses_selected = selection
+            .is_some_and(|selection| selection.tests || selection.benches || selection.all_targets);
         Ok(self)
     }
 
@@ -222,7 +242,7 @@ impl CanonicalPaths {
     }
 
     /// Membership is distinct from the pure planner's path/argument validation.
-    /// Match a selected ordinary library family, including target and features,
+    /// Match a selected ordinary compiler family, including target and features,
     /// before permitting fresh remote execution; this grants no cache authority.
     pub(crate) fn require_workspace_execution(
         &self,
@@ -251,11 +271,39 @@ impl CanonicalPaths {
             .collect::<BTreeSet<_>>();
         let mode =
             remote_dependency_output_class(&plan.invocation).map_err(|error| error.to_string())?;
+        let test_harness = plan
+            .invocation
+            .passthrough
+            .iter()
+            .any(|arg| arg == "--test");
         let selected = self.workspace_units.iter().any(|unit| {
+            // Cargo's unit graph serializes both Check { test: false } and
+            // Check { test: true } as "check". Its target.test field states
+            // eligibility, not which compiler invocation will run. For broad
+            // selectors that also include ordinary targets, retain distinct
+            // check-root multiplicity instead of blessing every root as a
+            // harness. Pure test/bench selectors and explicit test/bench target
+            // kinds establish selected families themselves. This is fresh
+            // execution of the exact invocation, never cache authority.
+            let harness_selected = unit.is_root()
+                && (unit
+                    .target_kinds()
+                    .iter()
+                    .any(|kind| matches!(kind.as_str(), "test" | "bench"))
+                    || (self.workspace_bulk_harnesses_selected && unit.has_multiple_check_roots())
+                    || (self.workspace_tests_selected && unit.testable())
+                    || self.workspace_benches_selected);
+            let output_shape = if test_harness {
+                mode == RemoteDependencyOutputClass::Metadata
+                    && harness_selected
+                    && (crate_types.is_empty() || unit.crate_types() == crate_types)
+            } else {
+                unit.crate_types() == crate_types
+            };
             workspace_manifest(unit) == Some(plan.package_root.as_str())
                 && unit.source_path() == source
                 && Some(unit.crate_name()) == plan.invocation.crate_name.as_deref()
-                && unit.crate_types() == crate_types
+                && output_shape
                 && unit.platform().unwrap_or(&plan.host_triple) == plan.target_triple
                 && unit
                     .features()
@@ -270,8 +318,7 @@ impl CanonicalPaths {
         });
         if !selected {
             return Err(
-                "workspace compiler request does not match a retained Cargo-selected library unit"
-                    .into(),
+                "workspace compiler request does not match a retained Cargo-selected unit".into(),
             );
         }
         let path = self.physical(Path::new(&source))?;
@@ -508,7 +555,7 @@ impl CanonicalPaths {
     }
 }
 
-fn workspace_manifest(unit: &CompilationLibraryUnit) -> Option<&str> {
+fn workspace_manifest(unit: &CompilationUnit) -> Option<&str> {
     let manifest = unit
         .package_id()
         .strip_prefix("path+file://")?
@@ -575,14 +622,19 @@ mod tests {
     }
 
     fn workspace_plan() -> DependencyActionPlan {
-        let argv = [
+        workspace_metadata_plan(Some("lib"), false)
+    }
+
+    fn workspace_metadata_plan(
+        crate_type: Option<&str>,
+        test_harness: bool,
+    ) -> DependencyActionPlan {
+        let mut argv = [
             "/__rabs/toolchain/bin/rustc",
             "--crate-name",
             "project_lib",
             "--edition=2024",
             "app/src/lib.rs",
-            "--crate-type",
-            "lib",
             "--emit=dep-info,metadata",
             "-Cmetadata=abc",
             "-Cextra-filename=-abc",
@@ -593,7 +645,14 @@ mod tests {
             "--cfg",
             "feature=\"base\"",
         ]
-        .map(str::to_owned);
+        .map(str::to_owned)
+        .to_vec();
+        if let Some(crate_type) = crate_type {
+            argv.extend(["--crate-type".into(), crate_type.into()]);
+        }
+        if test_harness {
+            argv.push("--test".into());
+        }
         let env = [
             ("CARGO_MANIFEST_DIR", "/__rabs/workspace/app"),
             ("CARGO_PKG_NAME", "project"),
@@ -613,6 +672,220 @@ mod tests {
         .unwrap()
     }
 
+    fn workspace_target_graph(
+        kind: &str,
+        crate_type: &str,
+        testable: bool,
+        is_root: bool,
+        multiple_check_roots: bool,
+    ) -> rabs_sandbox::cargo_check::CompilationUnitGraph {
+        use rabs_sandbox::cargo_check::{CompilationCommand, validate_compilation_unit_graph};
+        let unit = serde_json::json!({
+            "pkg_id":"path+file:///__rabs/workspace/app#project@0.1.0",
+            "target":{"kind":[kind],"crate_types":[crate_type],"name":"project-lib",
+                "src_path":"/__rabs/workspace/app/src/lib.rs","edition":"2024","test":testable},
+            "profile":{"name":"dev"},"platform":null,"mode":"check",
+            "features":["base"],"dependencies":[]
+        });
+        let mut graph = serde_json::json!({"version":1,"roots":[0],"units":[unit.clone()]});
+        if is_root && multiple_check_roots {
+            graph["units"].as_array_mut().unwrap().push(unit.clone());
+            graph["roots"] = serde_json::json!([0, 1]);
+        }
+        if !is_root {
+            let mut consumer = unit;
+            consumer["target"]["kind"] = serde_json::json!(["bin"]);
+            consumer["target"]["crate_types"] = serde_json::json!(["bin"]);
+            consumer["target"]["name"] = serde_json::json!("consumer");
+            consumer["target"]["src_path"] = serde_json::json!("/__rabs/workspace/app/src/main.rs");
+            consumer["dependencies"] =
+                serde_json::json!([{"index":0,"extern_crate_name":"project_lib"}]);
+            graph["units"].as_array_mut().unwrap().push(consumer);
+            graph["roots"] = serde_json::json!([1]);
+        }
+        validate_compilation_unit_graph(&graph, CompilationCommand::Check).unwrap()
+    }
+
+    fn workspace_target_paths(
+        kind: &str,
+        crate_type: &str,
+        testable: bool,
+        is_root: bool,
+        selection: Option<&CompilationSelection>,
+    ) -> Arc<CanonicalPaths> {
+        workspace_target_paths_with_check_roots(
+            kind, crate_type, testable, is_root, selection, false,
+        )
+    }
+
+    fn workspace_target_paths_with_check_roots(
+        kind: &str,
+        crate_type: &str,
+        testable: bool,
+        is_root: bool,
+        selection: Option<&CompilationSelection>,
+        multiple_check_roots: bool,
+    ) -> Arc<CanonicalPaths> {
+        let (owner, paths) = fixture();
+        std::fs::create_dir_all(owner.path().join("0/app/src")).unwrap();
+        std::fs::write(
+            owner.path().join("0/app/src/lib.rs"),
+            b"pub fn value() {}\n",
+        )
+        .unwrap();
+        std::fs::write(owner.path().join("0/app/src/main.rs"), b"fn main() {}\n").unwrap();
+        let graph =
+            workspace_target_graph(kind, crate_type, testable, is_root, multiple_check_roots);
+        paths
+            .with_workspace_units(graph.workspace_units(), selection)
+            .unwrap()
+    }
+
+    #[test]
+    fn selected_binary_example_test_and_bench_checks_preserve_metadata_output_shape() {
+        for kind in ["bin", "example", "test", "bench"] {
+            let paths = workspace_target_paths(kind, "bin", true, true, None);
+            let plan = workspace_metadata_plan(Some("bin"), false);
+            assert!(paths.require_workspace_execution(&plan).is_ok(), "{kind}");
+            assert!(
+                paths
+                    .require_workspace_execution(&workspace_plan())
+                    .is_err(),
+                "{kind}"
+            );
+            let mut wrong_source = plan.clone();
+            wrong_source.invocation.source = Some(rabs_key::invocation::SourceInput::Path(
+                "app/src/main.rs".into(),
+            ));
+            assert!(
+                paths.require_workspace_execution(&wrong_source).is_err(),
+                "{kind}"
+            );
+            let harness = workspace_metadata_plan(None, true);
+            assert_eq!(
+                paths.require_workspace_execution(&harness).is_ok(),
+                matches!(kind, "test" | "bench"),
+                "only selected integration/bench roots independently establish a harness family: {kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn library_and_binary_harnesses_require_trusted_selection_and_root_membership() {
+        let tests = CompilationSelection {
+            tests: true,
+            ..CompilationSelection::default()
+        };
+        let all_targets = CompilationSelection {
+            all_targets: true,
+            ..CompilationSelection::default()
+        };
+        let lib_only = CompilationSelection {
+            lib: true,
+            ..CompilationSelection::default()
+        };
+        for (kind, crate_type) in [("lib", "lib"), ("bin", "bin"), ("example", "bin")] {
+            let harness = workspace_metadata_plan(None, true);
+            for selection in [None, Some(&lib_only)] {
+                let paths = workspace_target_paths(kind, crate_type, true, true, selection);
+                assert!(
+                    paths.require_workspace_execution(&harness).is_err(),
+                    "{kind}"
+                );
+            }
+            for selection in [&tests, &all_targets] {
+                let paths = workspace_target_paths_with_check_roots(
+                    kind,
+                    crate_type,
+                    true,
+                    true,
+                    Some(selection),
+                    selection.all_targets,
+                );
+                assert!(
+                    paths.require_workspace_execution(&harness).is_ok(),
+                    "{kind}"
+                );
+                let prerequisite =
+                    workspace_target_paths(kind, crate_type, true, false, Some(selection));
+                assert!(
+                    prerequisite.require_workspace_execution(&harness).is_err(),
+                    "{kind}"
+                );
+            }
+            let disabled = workspace_target_paths(kind, crate_type, false, true, Some(&tests));
+            assert!(
+                disabled.require_workspace_execution(&harness).is_err(),
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn broad_selectors_cannot_turn_an_ordinary_only_root_into_a_harness() {
+        let selections = [
+            serde_json::json!({"all_targets":true}),
+            serde_json::json!({"all_targets":true,"tests":true,"benches":true}),
+            serde_json::json!({"benches":true,"lib":true}),
+            serde_json::json!({"benches":true,"bins":true}),
+            serde_json::json!({"benches":true,"examples":true}),
+            serde_json::json!({"benches":true,"bin":["project-lib"]}),
+            serde_json::json!({"benches":true,"example":["project-lib"]}),
+        ];
+        for value in selections {
+            let selection: CompilationSelection = serde_json::from_value(value).unwrap();
+            for (kind, crate_type) in [("lib", "lib"), ("bin", "bin"), ("example", "bin")] {
+                for testable in [false, true] {
+                    let harness = workspace_metadata_plan(None, true);
+                    let ordinary =
+                        workspace_target_paths(kind, crate_type, testable, true, Some(&selection));
+                    assert!(
+                        ordinary.require_workspace_execution(&harness).is_err(),
+                        "single {kind} root, testable={testable}, {selection:?}"
+                    );
+                    assert!(
+                        ordinary
+                            .require_workspace_execution(&workspace_metadata_plan(
+                                Some(crate_type),
+                                false,
+                            ))
+                            .is_ok()
+                    );
+                    let both = workspace_target_paths_with_check_roots(
+                        kind,
+                        crate_type,
+                        testable,
+                        true,
+                        Some(&selection),
+                        true,
+                    );
+                    assert!(
+                        both.require_workspace_execution(&harness).is_ok(),
+                        "two selected {kind} metadata roots, {selection:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pure_bench_selection_uses_selected_roots_without_inventing_target_bench_flags() {
+        let benches = CompilationSelection {
+            benches: true,
+            ..CompilationSelection::default()
+        };
+        let harness = workspace_metadata_plan(None, true);
+        for (kind, crate_type) in [("lib", "lib"), ("bin", "bin"), ("example", "bin")] {
+            let selected = workspace_target_paths(kind, crate_type, false, true, Some(&benches));
+            assert!(selected.require_workspace_execution(&harness).is_ok());
+            let dependency = workspace_target_paths(kind, crate_type, false, false, Some(&benches));
+            assert!(dependency.require_workspace_execution(&harness).is_err());
+            let unselected =
+                workspace_target_paths_with_check_roots(kind, crate_type, false, true, None, true);
+            assert!(unselected.require_workspace_execution(&harness).is_err());
+        }
+    }
+
     #[test]
     fn only_retained_cargo_selected_library_units_can_execute_as_workspace_requests() {
         let (owner, paths) = fixture();
@@ -623,7 +896,9 @@ mod tests {
         )
         .unwrap();
         let graph = workspace_graph("path+file:///__rabs/workspace/app#project@0.1.0");
-        let paths = paths.with_workspace_units(graph.library_units()).unwrap();
+        let paths = paths
+            .with_workspace_units(graph.workspace_units(), None)
+            .unwrap();
         let plan = workspace_plan();
         assert!(paths.require_workspace_execution(&plan).is_ok());
         assert_eq!(plan.cwd, "/__rabs/workspace");
@@ -648,7 +923,11 @@ mod tests {
             );
         }
         let retained = Arc::clone(&paths);
-        assert!(paths.with_workspace_units(graph.library_units()).is_err());
+        assert!(
+            paths
+                .with_workspace_units(graph.workspace_units(), None)
+                .is_err()
+        );
         assert!(retained.require_workspace_execution(&plan).is_ok());
     }
 
@@ -657,7 +936,9 @@ mod tests {
         let (_owner, paths) = fixture();
         let graph =
             workspace_graph("registry+https://github.com/rust-lang/crates.io-index#project@0.1.0");
-        let paths = paths.with_workspace_units(graph.library_units()).unwrap();
+        let paths = paths
+            .with_workspace_units(graph.workspace_units(), None)
+            .unwrap();
         assert!(
             paths
                 .require_workspace_execution(&workspace_plan())
@@ -835,6 +1116,35 @@ mod tests {
             "metadata contract is locally admissible without project code"
         );
         let ordinary_plan = request.plan.clone();
+        // Exercise the actual request output-contract boundary with real
+        // workspace plans. The rest of this request remains the dependency
+        // fixture; this does not establish workspace execution authority.
+        for workspace in [
+            workspace_metadata_plan(Some("bin"), false),
+            workspace_metadata_plan(None, true),
+        ] {
+            request.plan = workspace.clone();
+            assert!(request.verify_output_contract().is_ok());
+            assert_eq!(
+                request.verify_read_closure().unwrap_err(),
+                "workspace execution requires a fresh isolated remote compiler"
+            );
+            request.plan.outputs.declarations.pop();
+            assert!(request.verify_output_contract().is_err());
+            request.plan = workspace.clone();
+            request.plan.invocation.emit.push("link".into());
+            assert!(request.verify_output_contract().is_err());
+            for source_kind in [
+                DependencySourceKind::RegistryPackage,
+                DependencySourceKind::GitCheckout,
+                DependencySourceKind::DirectoryPackage,
+            ] {
+                request.plan = workspace.clone();
+                request.plan.source_kind = source_kind;
+                assert!(request.verify_output_contract().is_err());
+            }
+        }
+        request.plan = ordinary_plan.clone();
         let generated = "/__rabs/out/cargo/debug/build/leaf/out";
         request.plan.generated_root = Some(generated.into());
         request

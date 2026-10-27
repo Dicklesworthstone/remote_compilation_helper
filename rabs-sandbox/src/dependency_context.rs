@@ -29,7 +29,7 @@ pub const DEPENDENCY_CONTEXT_VERSION: &str = "dependency-exec-v8";
 /// a compiler view. Version 4 binds every generated subdirectory, including
 /// empty directories, alongside the sealed files at canonical Cargo OUT_DIR.
 pub const CANONICAL_DEPENDENCY_CONTEXT_VERSION: &str = "canonical-dependency-exec-v4";
-/// Fresh execution of a Cargo-selected workspace library. This separately
+/// Fresh execution of a Cargo-selected workspace compilation. This separately
 /// negotiated context carries the complete retained workspace directory tree;
 /// it grants no dependency-cache or workspace-result publication authority.
 pub const CANONICAL_WORKSPACE_CONTEXT_VERSION: &str = "canonical-workspace-exec-v1";
@@ -523,7 +523,7 @@ impl DependencyExecContext {
         .map(|context| context.with_execution_mode(mode))
     }
 
-    /// Execute one selected canonical workspace library against the complete
+    /// Execute one selected canonical workspace compilation against the complete
     /// retained workspace, exact dependency candidates and optional generated
     /// input tree. The caller must hold the driver's selected-unit capability;
     /// neither this path validator nor a peer's request establishes membership.
@@ -3094,6 +3094,140 @@ mod tests {
     #[ignore = "requires bubblewrap and RABS_TEST_TOOLCHAIN_ROOT naming an installed rustc toolchain"]
     fn real_rustc_archive_view_closes_assembler_inputs_missing_from_dep_info() {
         assert_real_archive_view_closes_assembler_inputs(false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the full Metadata bubblewrap namespace with private procfs and RABS_TEST_TOOLCHAIN_ROOT naming an installed rustc toolchain"]
+    fn real_workspace_binary_example_and_test_metadata_preserve_exact_empty_outputs() {
+        let toolchain = PathBuf::from(
+            std::env::var_os("RABS_TEST_TOOLCHAIN_ROOT")
+                .expect("set RABS_TEST_TOOLCHAIN_ROOT to the installed toolchain root"),
+        );
+        assert!(toolchain.is_absolute());
+        let support = DependencyIsolationSupport::probe(DependencyExecutionMode::Metadata);
+        assert!(support.is_supported(), "{support:?}");
+        let owner = tempfile::tempdir().unwrap();
+        let source = owner.path().join("bundle/package");
+        let output = owner.path().join("outputs");
+        let home = owner.path().join("home");
+        let empty = owner.path().join("empty");
+        let source_directories = [
+            "empty",
+            "member",
+            "member/examples",
+            "member/src",
+            "member/tests",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        for relative in &source_directories {
+            std::fs::create_dir_all(source.join(relative)).unwrap();
+        }
+        for directory in [&output, &home, &empty] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        std::fs::write(source.join("shared.txt"), "retained workspace input\n").unwrap();
+        for relative in [
+            "member/src/main.rs",
+            "member/examples/demo.rs",
+            "member/tests/check.rs",
+        ] {
+            std::fs::write(
+                source.join(relative),
+                "const _: &str = env!(\"CARGO_PRIMARY_PACKAGE\");\nconst _: &str = include_str!(\"../../shared.txt\");\n#[cfg(not(test))]\nfn main() {}\n#[test]\nfn metadata_only() { panic!(\"metadata checking must not execute tests\"); }\n",
+            )
+            .unwrap();
+        }
+        let runtime = crate::runtime_cohort::retain_runtime_cohort(
+            &toolchain.join("bin/rustc"),
+            &toolchain,
+            &[toolchain.join("lib")],
+            &output,
+            owner.path(),
+            || false,
+        )
+        .unwrap();
+        for (name, relative, crate_type, test) in [
+            ("workspace_bin", "member/src/main.rs", Some("bin"), false),
+            (
+                "workspace_example",
+                "member/examples/demo.rs",
+                Some("bin"),
+                false,
+            ),
+            ("workspace_integration", "member/tests/check.rs", None, true),
+            ("workspace_unit", "member/src/main.rs", Some("lib"), true),
+        ] {
+            let destination = output.join(name);
+            std::fs::create_dir(&destination).unwrap();
+            let mut context = workspace_context(
+                DependencyExecutionMode::Metadata,
+                source_directories.clone(),
+                None,
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap();
+            context.runtime_cohort_sha256 = runtime.cohort().bytes;
+            context.prepare_empty_backings(&empty).unwrap();
+            let spec = context
+                .namespace(&source, &toolchain, &destination, &empty, &home)
+                .unwrap();
+            let mut args = vec![
+                relative.into(),
+                format!("--crate-name={name}"),
+                "--edition=2024".into(),
+                "--emit=dep-info,metadata".into(),
+                "--error-format=json".into(),
+                "-Cextra-filename=-retained".into(),
+                format!("--out-dir={}", context.out_dir()),
+            ];
+            if let Some(kind) = crate_type {
+                args.push(format!("--crate-type={kind}"));
+            }
+            if test {
+                args.push("--test".into());
+            }
+            let launch = build_workspace_dependency_argv(
+                &context,
+                &spec,
+                &runtime,
+                &support,
+                context.compiler(),
+                &args,
+                &source,
+            )
+            .unwrap();
+            assert!(launch.boundary.proc_private);
+            assert!(launch.boundary.net_isolated && launch.boundary.mounts_closed_view);
+            let result = crate::canonical_namespace::command_for(&launch)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{name}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let metadata = format!("lib{name}-retained.rmeta");
+            let dep_info = format!("{name}-retained.d");
+            let names: BTreeSet<_> = std::fs::read_dir(&destination)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect();
+            assert_eq!(names, BTreeSet::from([metadata.clone(), dep_info.clone()]));
+            assert_eq!(
+                std::fs::metadata(destination.join(metadata)).unwrap().len(),
+                0
+            );
+            let dep_info = std::fs::read_to_string(destination.join(dep_info)).unwrap();
+            assert!(dep_info.contains(relative) && dep_info.contains("shared.txt"));
+            assert!(
+                !destination.join(name).exists(),
+                "checking must not link a binary"
+            );
+            runtime.verify(|| false).unwrap();
+        }
     }
 
     #[cfg(target_os = "linux")]

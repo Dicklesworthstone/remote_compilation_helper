@@ -10,7 +10,7 @@
 //! macros. Their presence, or a test/Clippy command, disables local compiler-result authority for the whole
 //! operation; eligible dependency caching requires isolated workers. Pure check/build graphs
 //! retain the existing evidence-gated metadata lane; archive codegen requires an
-//! isolated worker. Selected workspace libraries can execute freshly on workers;
+//! isolated worker. Selected workspace compilations can execute freshly on workers;
 //! unsupported rustc invocations compile normally in the namespace. Workspace
 //! results never gain action-cache publication or replay authority.
 
@@ -689,7 +689,7 @@ pub fn run_profile_with_release(
     )
     .map_err(io::Error::other)?;
     let paths = paths
-        .with_workspace_units(graph.library_units())
+        .with_workspace_units(graph.workspace_units(), profile.selection.as_ref())
         .map_err(io::Error::other)?;
     let paths = if graph.requires_closed_dependency_execution() {
         paths

@@ -14,7 +14,9 @@ use rabs_key::live_dependency::remote::{
 use rabs_key::live_dependency::{
     LiveRefusal, LiveRustcRequest, check_dependency_cache_read_closure,
 };
-use rabs_key::output_derivation::check_dependency_output_options;
+use rabs_key::output_derivation::{
+    check_dependency_output_options, check_workspace_output_options,
+};
 
 #[path = "sysroot_preflight.rs"]
 mod sysroot_preflight;
@@ -106,14 +108,15 @@ fn rejection_for(request: LiveRustcRequest<'_>, mode: PreflightMode) -> Option<L
     // producers. They are prerequisites of otherwise cacheable work, but
     // this lane cannot serve their output classes. Do not make them wait
     // behind a cold sysroot merely to discover that after hashing it.
-    // These checks mirror only the HOST-INDEPENDENT shape restrictions in
-    // derive_dependency_output_declarations; the full planner still owns
-    // target naming, option semantics and the complete output declaration.
-    if invocation.crate_types.is_empty()
-        || invocation
-            .crate_types
-            .iter()
-            .any(|kind| !matches!(kind.as_str(), "lib" | "rlib"))
+    // Workspace metadata checks also include selected binaries and test
+    // harnesses. Their separate option adapter below validates this bounded
+    // shape without granting final-link or dependency-cache authority.
+    if !workspace
+        && (invocation.crate_types.is_empty()
+            || invocation
+                .crate_types
+                .iter()
+                .any(|kind| !matches!(kind.as_str(), "lib" | "rlib")))
     {
         return Some(LiveRefusal::NotDependencyCompile(
             "dependency outputs require --crate-type lib or rlib",
@@ -180,7 +183,12 @@ fn rejection_for(request: LiveRustcRequest<'_>, mode: PreflightMode) -> Option<L
     // list or a fabricated host triple. Supported threaded compiles keep
     // going; incremental/save-temps/unknown modes never start cold hashing.
     .or_else(|| {
-        check_dependency_output_options(&invocation)
+        let options = if workspace {
+            check_workspace_output_options(&invocation)
+        } else {
+            check_dependency_output_options(&invocation)
+        };
+        options
             .err()
             .map(|error| LiveRefusal::Outputs(error.to_string()))
     })
@@ -332,6 +340,62 @@ mod tests {
             })
             .is_some()
         );
+    }
+
+    #[test]
+    fn workspace_metadata_bins_and_harnesses_do_not_borrow_dependency_or_link_authority() {
+        use rabs_key::live_dependency::workspace_execution::plan_canonical_workspace_execution;
+
+        for (crate_type, harness) in [
+            (Some("bin"), false),
+            (Some("bin"), true),
+            (Some("lib"), true),
+            (None, true),
+        ] {
+            let mut argv = vec![
+                "/__rabs/toolchain/bin/rustc".into(),
+                "--crate-name=app".into(),
+                "--emit=dep-info,metadata".into(),
+                "--out-dir=/__rabs/out/cargo/debug/deps".into(),
+                "--error-format=json".into(),
+                "member/src/main.rs".into(),
+            ];
+            if let Some(kind) = crate_type {
+                argv.push(format!("--crate-type={kind}"));
+            }
+            if harness {
+                argv.push("--test".into());
+            }
+            let env = vec![
+                ("HOME".into(), "/__rabs/home".into()),
+                ("CARGO_HOME".into(), "/__rabs/cargo-home".into()),
+                (
+                    "CARGO_MANIFEST_DIR".into(),
+                    "/__rabs/workspace/member".into(),
+                ),
+                ("CARGO_PKG_NAME".into(), "app".into()),
+                ("CARGO_PRIMARY_PACKAGE".into(), "1".into()),
+            ];
+            let candidate = LiveRustcRequest {
+                argv: &argv,
+                cwd: "/__rabs/workspace",
+                env: &env,
+            };
+            assert_eq!(workspace_rejection(candidate), None);
+            assert!(plan_canonical_workspace_execution(candidate, HOST).is_ok());
+            assert!(rejection(candidate).is_some());
+            assert!(remote_rejection(candidate).is_some());
+            assert!(canonical_remote_rejection(candidate).is_some());
+
+            argv[2] = "--emit=dep-info,metadata,link".into();
+            let linking = LiveRustcRequest {
+                argv: &argv,
+                cwd: "/__rabs/workspace",
+                env: &env,
+            };
+            assert!(workspace_rejection(linking).is_some());
+            assert!(plan_canonical_workspace_execution(linking, HOST).is_err());
+        }
     }
 
     #[test]

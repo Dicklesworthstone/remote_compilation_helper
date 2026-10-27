@@ -1364,6 +1364,16 @@ fn workspace_execution_feature(root: &Path) {
     fs::create_dir_all(root.join("empty-workspace/nested")).unwrap();
 }
 
+fn distinct_check_binary(root: &Path) {
+    // Keep one binary with an independently observable crate name. The build
+    // variants retain canonical_app as their linked executable.
+    write(
+        root,
+        "Cargo.toml",
+        "[package]\nname='canonical_app'\nversion='0.1.0'\nedition='2021'\nautobins=false\n[dependencies]\ncanonical_dep='=1.0.0'\noptional_build={path='optional-build',optional=true}\n[dev-dependencies]\ndev_macro={path='dev-macro'}\n[features]\nremote_workspace=[]\n[[bin]]\nname='canonical_cli'\npath='src/main.rs'\n",
+    );
+}
+
 /// Read the real production store only after the canonical driver has exited.
 /// A successful fresh workspace compile may retain CAS byte objects, but must
 /// never create an action publication, serving record or replay qualification.
@@ -1371,29 +1381,34 @@ fn assert_fresh_workspace_execution(
     root: &Path,
     events: &[Value],
     output: &str,
+    name: &str,
+    key: &str,
     observed: &mut BTreeMap<String, BTreeSet<String>>,
 ) -> String {
     use rabs_cas::metadata_store::{RabsMetadataStore, SqlValue};
 
-    let offered = decisions(events, "remote-offer");
-    let key = offered
-        .get("canonical_app")
-        .unwrap_or_else(|| {
-            panic!("the actual workspace library was not offered remotely: {output}")
-        })
-        .clone();
+    let key = key.to_owned();
+    assert!(
+        events.iter().any(|event| {
+            event["kind"] == "rabsd-live-dependency"
+                && event["decision"] == "remote-offer"
+                && event["crate"] == name
+                && event["key"] == key
+        }),
+        "the actual workspace unit {name} was not offered remotely: {output}"
+    );
     assert!(
         events.iter().any(|event| {
             event["kind"] == "rabsd-remote-dependency-executed" && event["key"] == key
         }),
-        "the workspace library did not complete through the worker: {output}"
+        "workspace unit {name} did not complete through the worker: {output}"
     );
     assert!(
-        !decisions(events, "hit").contains_key("canonical_app"),
+        !decisions(events, "hit").contains_key(name),
         "workspace result was replayed: {output}"
     );
     assert!(
-        !decisions(events, "execute").contains_key("canonical_app"),
+        !decisions(events, "execute").contains_key(name),
         "workspace result used local cache capture: {output}"
     );
     let cas =
@@ -1463,6 +1478,28 @@ fn assert_fresh_workspace_execution(
         );
     }
     key
+}
+
+fn assert_fresh_workspace_units(
+    root: &Path,
+    events: &[Value],
+    output: &str,
+    names: &[&str],
+    observed: &mut BTreeMap<String, BTreeSet<String>>,
+) -> BTreeMap<String, String> {
+    let offered = decisions(events, "remote-offer");
+    names
+        .iter()
+        .map(|name| {
+            let key = offered
+                .get(*name)
+                .unwrap_or_else(|| panic!("workspace unit {name} was not offered: {output}"));
+            (
+                name.to_string(),
+                assert_fresh_workspace_execution(root, events, output, name, key, observed),
+            )
+        })
+        .collect()
 }
 
 fn assert_local_native_workspace(events: &[Value], output: &str) {
@@ -1662,6 +1699,238 @@ fn canonical_cargo_build_bundles_generated_native_archives_replays_and_invalidat
     remote_dependency_replay("build", GeneratedDependency::NativeConsumer);
 }
 
+fn metadata_check_targets(root: &Path, leaf: u32) {
+    source(root, leaf);
+    // Keep the unused development-macro files in the snapshot, but select a
+    // plain graph so every requested compiler shape must reach the worker.
+    write(
+        root,
+        "Cargo.toml",
+        "[package]\nname='canonical_app'\nversion='0.1.0'\nedition='2021'\nautobins=false\n[dependencies]\ncanonical_dep='=1.0.0'\n[lib]\ntest=true\nbench=false\n[[bin]]\nname='canonical_cli'\npath='src/main.rs'\ntest=true\nbench=false\n[[example]]\nname='metadata_example'\npath='examples/metadata.rs'\ntest=false\nbench=false\n[[test]]\nname='metadata_integration'\npath='tests/metadata.rs'\n[[bench]]\nname='metadata_bench'\npath='benches/metadata.rs'\nharness=false\n",
+    );
+    let checksum = |name: &str| {
+        let value: Value = serde_json::from_slice(&read_bounded(
+            &root.join(format!("vendor/{name}/.cargo-checksum.json")),
+        ))
+        .unwrap();
+        value["package"].as_str().unwrap().to_owned()
+    };
+    write(
+        root,
+        "Cargo.lock",
+        format!(
+            "version=4\n\n[[package]]\nname='canonical_app'\nversion='0.1.0'\ndependencies=['canonical_dep']\n\n[[package]]\nname='canonical_dep'\nversion='1.0.0'\nsource='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='{}'\ndependencies=['canonical_leaf']\n\n[[package]]\nname='canonical_leaf'\nversion='1.0.0'\nsource='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='{}'\n",
+            checksum("canonical_dep"),
+            checksum("canonical_leaf")
+        ),
+    );
+    let expected = leaf + 2;
+    write(
+        root,
+        "src/lib.rs",
+        format!(
+            "const _: &str = env!(\"CARGO_PRIMARY_PACKAGE\");\nconst _: [(); {expected}] = [(); canonical_dep::answer() as usize];\npub const fn answer()->u32 {{ canonical_dep::answer() }}\n#[test]\nfn library_body_must_not_run() {{ panic!(\"RABS_CHECK_TARGET_EXECUTED\"); }}\n"
+        ),
+    );
+    let consumer = format!(
+        "#![allow(dead_code)]\nconst _: &str = env!(\"CARGO_PRIMARY_PACKAGE\");\nconst _: [(); {expected}] = [(); canonical_app::answer() as usize];\nfn main() {{ panic!(\"RABS_CHECK_TARGET_EXECUTED\"); }}\n#[test]\nfn body_must_not_run() {{ panic!(\"RABS_CHECK_TARGET_EXECUTED\"); }}\n"
+    );
+    for path in [
+        "src/main.rs",
+        "examples/metadata.rs",
+        "tests/metadata.rs",
+        "benches/metadata.rs",
+    ] {
+        write(root, path, &consumer);
+    }
+}
+
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual all-target Cargo checks, metadata installation and fresh workspace execution"]
+fn canonical_cargo_check_offloads_binary_example_and_test_harness_metadata_without_running_them() {
+    let (owner, mut profile) = native_fixture();
+    let first = owner.path().join("source-a");
+    let second = owner.path().join("source-b");
+    metadata_check_targets(&first, 40);
+    metadata_check_targets(&second, 40);
+    profile["command"] = json!("check");
+    profile["selection"] = json!({"all_targets":true});
+    let (mut worker, environment) = NativeWorker::start(owner.path());
+    let expected = BTreeMap::from([
+        ("canonical_app".to_owned(), 2_usize),
+        ("canonical_cli".to_owned(), 2),
+        ("metadata_example".to_owned(), 1),
+        ("metadata_integration".to_owned(), 1),
+        ("metadata_bench".to_owned(), 1),
+    ]);
+    let mut attempts = BTreeMap::new();
+    let mut previous_keys = BTreeSet::new();
+    let mut previous_receipt: Option<Value> = None;
+    for number in 1..=3 {
+        if number >= 2 {
+            profile["source_root"] = json!(second);
+        }
+        if number == 3 {
+            metadata_check_targets(&second, 41);
+            // Retain only the final, freshly compiled target so the test can
+            // inspect the actual installed empty metadata files after drain.
+            // No earlier run has a target seed that could satisfy compilation.
+            profile["target_cache"] =
+                json!({"runtime_epoch":"metadata-target-fixture-v1", "max_bytes":268435456});
+        }
+        let (code, events, output) =
+            run_with_environment(owner.path(), 400 + number, &profile, &environment);
+        assert_eq!(code, 0, "{output}\nworker: {:?}", worker.events());
+        assert!(
+            !output.contains("RABS_CHECK_TARGET_EXECUTED"),
+            "a program/test body ran: {output}"
+        );
+        assert!(
+            decisions(&events, "hit").is_empty() && decisions(&events, "execute").is_empty(),
+            "a workspace unit used cache authority or local fallback: {output}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event["kind"].as_str(),
+                Some(
+                    "rabsd-remote-dependency-failed"
+                        | "rabsd-remote-dependency-install-failed"
+                        | "canonical-build-completed"
+                )
+            )),
+            "{output}"
+        );
+        // A crate name is insufficient: a library/binary and its check-mode
+        // test harness are distinct requests with the same crate name.
+        let offered = events
+            .iter()
+            .filter(|event| {
+                event["kind"] == "rabsd-live-dependency" && event["decision"] == "remote-offer"
+            })
+            .map(|event| {
+                (
+                    event["key"].as_str().unwrap().to_owned(),
+                    event["crate"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            offered.len(),
+            9,
+            "two external dependencies and all seven workspace units must execute: {output}"
+        );
+        let completed = events
+            .iter()
+            .filter(|event| event["kind"] == "rabsd-remote-dependency-executed")
+            .map(|event| event["key"].as_str().unwrap().to_owned())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            completed,
+            offered.keys().cloned().collect::<BTreeSet<_>>(),
+            "not every offered unit installed successfully: {output}"
+        );
+        let mut observed = BTreeMap::new();
+        let mut workspace_keys = BTreeSet::new();
+        for (key, name) in &offered {
+            if expected.contains_key(name) {
+                *observed.entry(name.clone()).or_insert(0_usize) += 1;
+                workspace_keys.insert(assert_fresh_workspace_execution(
+                    owner.path(),
+                    &events,
+                    &output,
+                    name,
+                    key,
+                    &mut attempts,
+                ));
+            }
+        }
+        assert_eq!(
+            observed, expected,
+            "a selected target/harness stayed local: {output}"
+        );
+        if number == 3 {
+            assert!(
+                workspace_keys.is_disjoint(&previous_keys),
+                "changed retained inputs reused an earlier workspace identity"
+            );
+        }
+        previous_keys = workspace_keys;
+        let artifacts = output
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|event| event["reason"] == "compiler-artifact")
+            .collect::<Vec<_>>();
+        assert_eq!(artifacts.len(), 9, "{output}");
+        assert!(
+            artifacts
+                .iter()
+                .all(|event| event["fresh"] == false && event["executable"].is_null()),
+            "check must produce current metadata without a runnable target: {output}"
+        );
+        let receipt = worker.completed_receipt();
+        if let Some(previous) = &previous_receipt {
+            assert!(
+                receipt["request_id"].as_u64().unwrap()
+                    >= previous["request_id"].as_u64().unwrap() + 9,
+                "unchanged/changed checks must acquire fresh worker attempts"
+            );
+        }
+        previous_receipt = Some(receipt);
+        assert_eq!(
+            worker
+                .events()
+                .iter()
+                .filter(|event| event["kind"] == "worker-toolchain-acquired")
+                .count(),
+            9 * number as usize
+        );
+    }
+    let target = sole_retained_target(owner.path());
+    for (name, count) in &expected {
+        let prefix = format!("lib{name}-");
+        let directory = if name == "metadata_example" {
+            "debug/examples"
+        } else {
+            "debug/deps"
+        };
+        let metadata = fs::read_dir(target.join(directory))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_str()
+                    .is_some_and(|file| file.starts_with(&prefix) && file.ends_with(".rmeta"))
+            })
+            .map(|path| fs::symlink_metadata(path).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            metadata.len(),
+            *count,
+            "installed {name} metadata files are incomplete"
+        );
+        assert!(
+            metadata
+                .iter()
+                .all(|file| file.is_file() && file.permissions().mode() & 0o111 == 0)
+        );
+        let empty = metadata.iter().filter(|file| file.len() == 0).count();
+        assert_eq!(
+            empty,
+            if name == "canonical_app" { 1 } else { *count },
+            "empty rustc metadata must survive worker capture and installation for {name}"
+        );
+    }
+    assert!(
+        fs::read_dir(owner.path().join("ops"))
+            .unwrap()
+            .next()
+            .is_none(),
+        "checks must not retain an operation or deliver an executable"
+    );
+    worker.finish();
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GeneratedDependency {
     None,
@@ -1704,7 +1973,14 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
     // Cargo propagates the dependency's native search path to its consumers.
     // The workspace lane has no authority to capture another package's OUT_DIR.
     let workspace_remote = generated != GeneratedDependency::NativeConsumer;
-    let remote_unit_count = 2 + usize::from(workspace_remote);
+    let workspace_units: &[&str] = if !workspace_remote {
+        &[]
+    } else if build {
+        &["canonical_app"]
+    } else {
+        &["canonical_app", "canonical_cli"]
+    };
+    let remote_unit_count = 2 + workspace_units.len();
     let first = owner.path().join("source-a");
     let second = owner.path().join("source-b");
     match generated {
@@ -1725,6 +2001,10 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
     }
     workspace_execution_feature(&first);
     workspace_execution_feature(&second);
+    if !build {
+        distinct_check_binary(&first);
+        distinct_check_binary(&second);
+    }
     generated.assert_answer(&first, 42, false);
     generated.assert_answer(&second, 42, true);
     let (mut worker, environment) = NativeWorker::start(owner.path());
@@ -1793,10 +2073,11 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
             "{output}"
         );
         if workspace_remote {
-            assert_fresh_workspace_execution(
+            assert_fresh_workspace_units(
                 owner.path(),
                 &events,
                 &output,
+                workspace_units,
                 &mut workspace_attempts,
             );
         } else {
@@ -1804,7 +2085,7 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
         }
         let dependency_keys = offered
             .into_iter()
-            .filter(|(name, _)| name != "canonical_app")
+            .filter(|(name, _)| !workspace_units.contains(&name.as_str()))
             .collect::<BTreeMap<_, _>>();
         if let Some(expected) = &first_keys {
             assert_eq!(
@@ -1836,7 +2117,8 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
     );
     // Repeat the unchanged workload after the dependencies qualify for cache
     // serving, then relocate it and edit only the workspace library. Both must
-    // compile that library afresh while replaying exactly the same dependencies.
+    // compile every eligible workspace target afresh while replaying the same
+    // dependencies.
     for (number, source, answer) in [(4, &first, 42), (5, &second, 43)] {
         profile["source_root"] = json!(source);
         let (code, events, output) =
@@ -1865,16 +2147,17 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
             "{output}"
         );
         if workspace_remote {
-            let workspace_key = assert_fresh_workspace_execution(
+            let workspace_keys = assert_fresh_workspace_units(
                 owner.path(),
                 &events,
                 &output,
+                workspace_units,
                 &mut workspace_attempts,
             );
             assert_eq!(
                 decisions(&events, "remote-offer"),
-                BTreeMap::from([("canonical_app".to_owned(), workspace_key)]),
-                "only the workspace library must execute while dependencies replay: {output}"
+                workspace_keys,
+                "every eligible workspace unit must execute while dependencies replay: {output}"
             );
         } else {
             assert_local_native_workspace(&events, &output);
@@ -1905,8 +2188,8 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
                 .into_iter()
                 .filter(|event| event["kind"] == "worker-toolchain-acquired")
                 .count(),
-            before_replay + usize::from(workspace_remote) * (number as usize - 3),
-            "each warm workload must execute only its eligible workspace library"
+            before_replay + workspace_units.len() * (number as usize - 3),
+            "each warm workload must execute all eligible workspace units"
         );
     }
 
@@ -1927,6 +2210,9 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
     } else {
         source(&second, 41);
         workspace_execution_feature(&second);
+        if !build {
+            distinct_check_binary(&second);
+        }
     }
     generated.assert_answer(&second, 43, false);
     let (code, events, output) = run_with_environment(owner.path(), 6, &profile, &environment);
@@ -1962,11 +2248,17 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
     };
     assert_eq!(
         changed.len(),
-        changed_names.len() + usize::from(workspace_remote),
-        "changed dependencies and the eligible workspace library must execute remotely: {output}"
+        changed_names.len() + workspace_units.len(),
+        "changed dependencies and every eligible workspace unit must execute remotely: {output}"
     );
     if workspace_remote {
-        assert_fresh_workspace_execution(owner.path(), &events, &output, &mut workspace_attempts);
+        assert_fresh_workspace_units(
+            owner.path(),
+            &events,
+            &output,
+            workspace_units,
+            &mut workspace_attempts,
+        );
     } else {
         assert_local_native_workspace(&events, &output);
     }

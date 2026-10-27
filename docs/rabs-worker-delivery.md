@@ -247,7 +247,7 @@ searches, library modifiers/renaming, and native search paths belonging to a
 different package's `OUT_DIR` continue locally. In particular, a native search
 path propagated through a larger dependency graph is not implicitly included
 in the current package's captured generated tree. Fresh workspace execution is
-also outside this extension: a selected workspace library consuming such a
+also outside this extension: a selected workspace compilation consuming such a
 propagated path compiles locally without action-cache publication or replay.
 
 The worker keeps the original source, generated-input, output and toolchain

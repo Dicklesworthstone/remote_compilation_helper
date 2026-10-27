@@ -44,26 +44,30 @@ pub struct CompilationUnitGraph {
     /// Number of Cargo-selected root units.
     pub roots: usize,
     source_paths: Vec<String>,
-    library_units: Vec<CompilationLibraryUnit>,
+    workspace_units: Vec<CompilationUnit>,
     project_executors: bool,
     doctests: bool,
 }
 
-/// One ordinary library compilation selected by the captured Cargo graph.
+/// One ordinary compilation selected by the captured Cargo graph.
 /// The driver must bind its source to retained mounts before using it to admit
 /// workspace execution. This record never grants result-cache authority.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct CompilationLibraryUnit {
+pub struct CompilationUnit {
     package_id: String,
     source_path: String,
     crate_name: String,
     crate_types: Vec<String>,
+    target_kinds: Vec<String>,
     mode: String,
     platform: Option<String>,
     features: Vec<String>,
+    is_root: bool,
+    testable: bool,
+    multiple_check_roots: bool,
 }
 
-impl CompilationLibraryUnit {
+impl CompilationUnit {
     /// Cargo's opaque selected package identity.
     pub fn package_id(&self) -> &str {
         &self.package_id
@@ -76,11 +80,15 @@ impl CompilationLibraryUnit {
     pub fn crate_name(&self) -> &str {
         &self.crate_name
     }
-    /// Selected ordinary Rust library output kinds.
+    /// Selected ordinary Rust output kinds, before any test-harness override.
     pub fn crate_types(&self) -> &[String] {
         &self.crate_types
     }
-    /// Cargo selected check or build mode, excluding test harnesses.
+    /// Cargo target kinds, including binary, example, integration test or bench.
+    pub fn target_kinds(&self) -> &[String] {
+        &self.target_kinds
+    }
+    /// Cargo selected check or build mode; executable test mode is excluded.
     pub fn mode(&self) -> &str {
         &self.mode
     }
@@ -92,6 +100,20 @@ impl CompilationLibraryUnit {
     pub fn features(&self) -> &[String] {
         &self.features
     }
+    /// The selected command named this unit as a root rather than only as a prerequisite.
+    pub fn is_root(&self) -> bool {
+        self.is_root
+    }
+    /// Cargo's target test eligibility, not proof that this check uses `--test`.
+    pub fn testable(&self) -> bool {
+        self.testable
+    }
+    /// Distinct selected check roots share this family, target and profile.
+    /// Cargo omits Check's harness discriminator from JSON; retain multiplicity
+    /// before deduplication without claiming which root uses `--test`.
+    pub fn has_multiple_check_roots(&self) -> bool {
+        self.multiple_check_roots
+    }
 }
 
 impl CompilationUnitGraph {
@@ -102,10 +124,11 @@ impl CompilationUnitGraph {
         &self.source_paths
     }
 
-    /// Selected ordinary library compilations, retaining distinct features,
-    /// modes and target platforms even when several units share one source.
-    pub fn library_units(&self) -> &[CompilationLibraryUnit] {
-        &self.library_units
+    /// Selected ordinary library compiles and metadata-only checks of binaries,
+    /// examples, integration tests and benches. Distinct features, modes,
+    /// target platforms and root membership remain separate records.
+    pub fn workspace_units(&self) -> &[CompilationUnit] {
+        &self.workspace_units
     }
 
     /// Project code or a lint driver can run while Cargo compiles this graph. A cache endpoint
@@ -286,7 +309,9 @@ pub fn validate_compilation_unit_graph(
 
     let mut packages = BTreeSet::new();
     let mut source_paths = BTreeSet::new();
-    let mut library_units = BTreeSet::new();
+    let mut workspace_units = BTreeSet::new();
+    let mut check_roots = BTreeSet::new();
+    let mut multiple_check_roots = BTreeSet::new();
     // A lint driver is not rustc: it can inspect captured configuration beyond
     // compiler dep-info and must never acquire local rustc-result authority.
     let mut project_executors = matches!(
@@ -365,29 +390,59 @@ pub fn validate_compilation_unit_graph(
         let target_kinds = unit["target"]["kind"]
             .as_array()
             .expect("validated target kinds");
-        if class == TargetClass::Ordinary
-            && matches!(mode, "check" | "build")
-            && crate_types
-                .iter()
-                .all(|kind| matches!(kind.as_str(), Some("lib" | "rlib")))
+        let ordinary_library = crate_types
+            .iter()
+            .all(|kind| matches!(kind.as_str(), Some("lib" | "rlib")))
             && target_kinds
                 .iter()
-                .all(|kind| matches!(kind.as_str(), Some("lib" | "rlib")))
+                .all(|kind| matches!(kind.as_str(), Some("lib" | "rlib")));
+        let metadata_target = mode == "check"
+            && crate_types
+                .iter()
+                .all(|kind| matches!(kind.as_str(), Some("lib" | "rlib" | "bin")))
+            && target_kinds.iter().all(|kind| {
+                matches!(
+                    kind.as_str(),
+                    Some("lib" | "rlib" | "bin" | "example" | "test" | "bench")
+                )
+            });
+        if class == TargetClass::Ordinary
+            && ((ordinary_library && matches!(mode, "check" | "build")) || metadata_target)
         {
             let mut crate_types = crate_types
                 .iter()
                 .map(|kind| kind.as_str().unwrap().to_owned())
                 .collect::<Vec<_>>();
             crate_types.sort();
-            library_units.insert(CompilationLibraryUnit {
+            let mut target_kinds = target_kinds
+                .iter()
+                .map(|kind| kind.as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            target_kinds.sort();
+            let compilation = CompilationUnit {
                 package_id: text(&unit["pkg_id"], "package identity")?.to_owned(),
                 source_path: source.to_owned(),
                 crate_name: text(&unit["target"]["name"], "target name")?.replace('-', "_"),
                 crate_types,
+                target_kinds,
                 mode: mode.to_owned(),
                 platform: unit["platform"].as_str().map(str::to_owned),
                 features: feature_names.into_iter().map(str::to_owned).collect(),
-            });
+                is_root: selected.contains(&unit_index),
+                testable: unit["target"]["test"].as_bool().unwrap_or(false),
+                multiple_check_roots: false,
+            };
+            if compilation.is_root
+                && mode == "check"
+                && !check_roots.insert((
+                    compilation.clone(),
+                    unit["target"].to_string(),
+                    unit["profile"].to_string(),
+                ))
+            {
+                multiple_check_roots.insert(compilation.clone());
+            }
+            workspace_units.insert(compilation);
         }
         let edges = unit["dependencies"]
             .as_array()
@@ -437,7 +492,13 @@ pub fn validate_compilation_unit_graph(
         packages: packages.len(),
         roots: selected.len(),
         source_paths: source_paths.into_iter().collect(),
-        library_units: library_units.into_iter().collect(),
+        workspace_units: workspace_units
+            .into_iter()
+            .map(|mut unit| {
+                unit.multiple_check_roots = multiple_check_roots.contains(&unit);
+                unit
+            })
+            .collect(),
         project_executors,
         doctests,
     })
@@ -529,25 +590,25 @@ mod tests {
         let report = validate_compilation_unit_graph(&graph, CompilationCommand::Check).unwrap();
         assert_eq!((report.units, report.packages, report.roots), (2, 1, 1));
         assert_eq!(report.source_paths().len(), 1);
-        assert_eq!(report.library_units().len(), 2);
+        assert_eq!(report.workspace_units().len(), 2);
         assert_ne!(
-            report.library_units()[0].mode(),
-            report.library_units()[1].mode()
+            report.workspace_units()[0].mode(),
+            report.workspace_units()[1].mode()
         );
         assert_ne!(
-            report.library_units()[0].features(),
-            report.library_units()[1].features()
+            report.workspace_units()[0].features(),
+            report.workspace_units()[1].features()
         );
     }
 
     #[test]
-    fn workspace_execution_membership_retains_only_selected_ordinary_libraries() {
+    fn workspace_execution_membership_keeps_library_codegen_and_rejects_other_linking() {
         let mut selected = graph();
         selected["units"][0]["target"]["name"] = json!("project-library");
         selected["units"][0]["features"] = json!(["z-last", "a-first"]);
         let report = validate_compilation_unit_graph(&selected, CompilationCommand::Check).unwrap();
         let unit = report
-            .library_units()
+            .workspace_units()
             .iter()
             .find(|unit| unit.crate_name() == "project_library")
             .unwrap();
@@ -569,11 +630,11 @@ mod tests {
             let report =
                 validate_compilation_unit_graph(&excluded, CompilationCommand::Build).unwrap();
             assert_eq!(
-                report.library_units().len(),
+                report.workspace_units().len(),
                 1,
                 "{kind}/{crate_type}/{mode}"
             );
-            assert_eq!(report.library_units()[0].crate_name(), "dependency");
+            assert_eq!(report.workspace_units()[0].crate_name(), "dependency");
         }
     }
 
@@ -592,6 +653,93 @@ mod tests {
             graph["units"][0]["target"]["kind"] = json!([kind]);
             graph["units"][0]["target"]["crate_types"] = json!([crate_type]);
             validate_compilation_unit_graph(&graph, CompilationCommand::Check).unwrap();
+        }
+    }
+
+    #[test]
+    fn workspace_metadata_membership_retains_selected_target_kinds_and_root_boundaries() {
+        for (kind, crate_type) in [
+            ("bin", "bin"),
+            ("example", "bin"),
+            ("example", "rlib"),
+            ("test", "bin"),
+            ("bench", "bin"),
+        ] {
+            let mut graph = graph();
+            graph["units"][0]["target"]["kind"] = json!([kind]);
+            graph["units"][0]["target"]["crate_types"] = json!([crate_type]);
+            graph["units"][0]["target"]["test"] = json!(true);
+            let report =
+                validate_compilation_unit_graph(&graph, CompilationCommand::Check).unwrap();
+            assert_eq!(report.workspace_units().len(), 2, "{kind}/{crate_type}");
+            let selected = report
+                .workspace_units()
+                .iter()
+                .find(|unit| unit.is_root())
+                .unwrap();
+            assert_eq!(selected.source_path(), "/__rabs/workspace/app/src/lib.rs");
+            assert_eq!(selected.target_kinds(), [kind]);
+            assert_eq!(selected.crate_types(), [crate_type]);
+            assert_eq!(selected.mode(), "check");
+            assert!(selected.testable());
+            let dependency = report
+                .workspace_units()
+                .iter()
+                .find(|unit| !unit.is_root())
+                .unwrap();
+            assert_eq!(dependency.crate_name(), "dependency");
+        }
+    }
+
+    #[test]
+    fn identical_check_units_keep_root_membership_without_inventing_a_harness_flag() {
+        let mut graph = graph();
+        graph["units"][1] = graph["units"][0].clone();
+        graph["units"][1]["dependencies"] = json!([]);
+        let report = validate_compilation_unit_graph(&graph, CompilationCommand::Check).unwrap();
+        assert_eq!(report.workspace_units().len(), 2);
+        assert_eq!(
+            report.workspace_units()[0].source_path(),
+            report.workspace_units()[1].source_path()
+        );
+        assert_ne!(
+            report.workspace_units()[0].is_root(),
+            report.workspace_units()[1].is_root()
+        );
+        assert!(
+            report
+                .workspace_units()
+                .iter()
+                .all(|unit| !unit.has_multiple_check_roots())
+        );
+    }
+
+    #[test]
+    fn selected_check_family_multiplicity_survives_deduplication_without_merging_profiles() {
+        let root = unit("app", &[]);
+        let graph = json!({"version":1,"roots":[0,1],"units":[root.clone(),root]});
+        let report = validate_compilation_unit_graph(&graph, CompilationCommand::Check).unwrap();
+        assert_eq!(report.roots, 2);
+        assert_eq!(report.workspace_units().len(), 1);
+        assert!(report.workspace_units()[0].has_multiple_check_roots());
+
+        for (field, value) in [
+            ("profile", json!({"name":"dev", "debug_assertions":false})),
+            ("features", json!(["other"])),
+            ("platform", json!("aarch64-unknown-linux-gnu")),
+            ("mode", json!("build")),
+        ] {
+            let mut different = graph.clone();
+            different["units"][1][field] = value;
+            let report =
+                validate_compilation_unit_graph(&different, CompilationCommand::Check).unwrap();
+            assert!(
+                report
+                    .workspace_units()
+                    .iter()
+                    .all(|unit| !unit.has_multiple_check_roots()),
+                "distinct {field} cannot establish a duplicate selected metadata family"
+            );
         }
     }
 
@@ -897,7 +1045,7 @@ mod tests {
             assert!(!report.contains_doctests());
             let checked =
                 validate_compilation_unit_graph(&graph, CompilationCommand::Check).unwrap();
-            assert_eq!(report.library_units(), checked.library_units());
+            assert_eq!(report.workspace_units(), checked.workspace_units());
         }
         for mode in [
             "clippy",

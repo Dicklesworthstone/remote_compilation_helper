@@ -319,6 +319,78 @@ fn native_clippy_reports_current_lints_after_check_and_lint_option_changes() {
 }
 
 #[test]
+fn real_check_graph_retains_binary_example_test_and_bench_metadata_families() {
+    let fixture = Fixture::new();
+    for directory in ["examples", "tests", "benches"] {
+        fs::create_dir(fixture.root().join(directory)).unwrap();
+    }
+    for path in [
+        "examples/demo.rs",
+        "tests/integration.rs",
+        "tests/manual.rs",
+        "benches/timing.rs",
+    ] {
+        fs::write(
+            fixture.root().join(path),
+            "compile_error!(\"planning must not compile a check target\"); fn main() {}\n",
+        )
+        .unwrap();
+    }
+    let manifest = fs::read_to_string(fixture.root().join("Cargo.toml")).unwrap();
+    fs::write(
+        fixture.root().join("Cargo.toml"),
+        format!(
+            "{manifest}\n[[test]]\nname='manual'\nharness=false\n[[bench]]\nname='timing'\nharness=false\n"
+        ),
+    )
+    .unwrap();
+    let selected = fixture.graph(
+        Check,
+        CompilationSelection {
+            all_targets: true,
+            ..CompilationSelection::default()
+        },
+    );
+    let report = validate_compilation_unit_graph(&selected, Check).unwrap();
+    for (name, kind, crate_type) in [
+        ("selected_graph_app", "bin", "bin"),
+        ("demo", "example", "bin"),
+        ("integration", "test", "bin"),
+        ("manual", "test", "bin"),
+        ("timing", "bench", "bin"),
+    ] {
+        assert!(
+            report.workspace_units().iter().any(|unit| {
+                unit.crate_name() == name
+                    && unit.target_kinds() == [kind]
+                    && unit.crate_types() == [crate_type]
+                    && unit.mode() == "check"
+                    && unit.is_root()
+            }),
+            "missing selected {kind} metadata family {name}: {:?}",
+            report.workspace_units()
+        );
+    }
+    // The graph does not serialize Cargo's Check { test } discriminator.
+    // Preserve the selected family; the driver additionally binds the trusted
+    // command selectors before admitting an unmodified --test invocation.
+    let ordinary = fixture.graph(
+        Check,
+        CompilationSelection {
+            packages: vec!["ordinary".into()],
+            all_targets: true,
+            ..CompilationSelection::default()
+        },
+    );
+    let units = ordinary["units"].as_array().unwrap();
+    assert_eq!(units.len(), 2);
+    assert_eq!(units[0]["target"], units[1]["target"]);
+    assert_eq!(units[0]["mode"], "check");
+    assert_eq!(units[1]["mode"], "check");
+    fixture.assert_no_compilation_or_project_execution();
+}
+
+#[test]
 fn real_cargo_unit_graph_distinguishes_pure_checks_from_selected_project_executors() {
     let fixture = Fixture::new();
     // Metadata contains both executable packages even though this library

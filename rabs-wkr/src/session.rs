@@ -493,9 +493,12 @@ pub fn validate_dependency_execution(
         ("linux", "aarch64", true) => "aarch64-unknown-linux-musl",
         _ => return Err("remote archive execution requires a supported Linux worker".into()),
     };
-    let outputs =
+    let outputs = if context.workspace_execution_only() {
+        rabs_key::output_derivation::derive_workspace_output_declarations(&invocation, host)
+    } else {
         rabs_key::output_derivation::derive_dependency_output_declarations(&invocation, host)
-            .map_err(|error| format!("dependency archive outputs: {error}"))?;
+    }
+    .map_err(|error| format!("dependency execution outputs: {error}"))?;
     if request.program != context.compiler()
         || invocation.out_dir.as_deref() != Some(context.out_dir())
         || invocation

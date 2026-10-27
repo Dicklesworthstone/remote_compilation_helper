@@ -155,6 +155,61 @@ fn workspace_decoder_preserves_primary_environment_relative_argv_and_both_input_
 }
 
 #[test]
+fn workspace_metadata_decoder_accepts_bins_and_harnesses_with_exact_output_names() {
+    for (crate_type, harness) in [
+        (Some("bin"), false),
+        (Some("bin"), true),
+        (Some("lib"), true),
+        (None, true),
+    ] {
+        let mut wire = canonical_workspace_request(false);
+        let mut args = vec![
+            "--crate-name=leaf".to_owned(),
+            "--emit=dep-info,metadata".into(),
+            "--out-dir=/__rabs/out/cargo/debug/deps".into(),
+            "member/src/lib.rs".into(),
+        ];
+        if let Some(kind) = crate_type {
+            args.push(format!("--crate-type={kind}"));
+        }
+        if harness {
+            args.push("--test".into());
+        }
+        wire["args"] = json!(args);
+        let parsed = parse_exec_request(&wire).unwrap();
+        assert_eq!(parsed.args, args);
+        assert!(
+            parsed
+                .dependency_context
+                .unwrap()
+                .workspace_execution_only()
+        );
+
+        let mut missing_metadata = wire.clone();
+        missing_metadata["artifacts"]["files"] = json!(["leaf.d"]);
+        assert!(parse_exec_request(&missing_metadata).is_err());
+        let mut invented_binary = wire.clone();
+        invented_binary["artifacts"]["files"] = json!(["leaf.d", "libleaf.rmeta", "leaf"]);
+        assert!(parse_exec_request(&invented_binary).is_err());
+
+        // A metadata-only admission never permits a final binary or harness
+        // link, even when the namespace version and source remain unchanged.
+        args[1] = "--emit=dep-info,metadata,link".into();
+        wire["args"] = json!(args);
+        assert!(parse_exec_request(&wire).is_err());
+    }
+    let mut dependency = canonical_dependency_request();
+    dependency["args"] = json!([
+        "--crate-name=leaf",
+        "--crate-type=bin",
+        "--emit=dep-info,metadata",
+        "--out-dir=/__rabs/out/cargo/debug/deps",
+        "src/lib.rs",
+    ]);
+    assert!(parse_exec_request(&dependency).is_err());
+}
+
+#[test]
 fn workspace_decoder_requires_its_exact_profile_and_complete_directory_shape() {
     let valid = canonical_workspace_request(false);
     for (field, value) in [

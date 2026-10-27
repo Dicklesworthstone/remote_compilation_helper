@@ -1179,21 +1179,33 @@ fallback after dispatch still requires verified completion of remote execution.
 Selected project executors never authorize local dependency cache capture
 or replay, even after a worker refusal.
 
-### Execute selected workspace libraries remotely
+### Execute selected workspace compilations remotely
 
-The same configured worker pool can execute the project's own library units,
-including primary packages and local path dependencies, during canonical
-`check`, `build`, and the library-compilation portions of `test`. The coordinator
-matches each request to Cargo's retained selected unit graph: package, source,
-crate name/type, compilation mode, target and features must agree. Ordinary
-wrapper requests cannot enable this path by supplying canonical-looking names.
+The same configured worker pool can execute the project's own compilation
+units, including primary packages and local path dependencies. Canonical
+`build` and the library-compilation portions of `test` support ordinary Rust
+libraries. Canonical `check` additionally supports binaries, examples,
+integration tests, library and binary test harnesses, and benchmark targets:
+
+```sh
+cargo rabs --rabs-canonical-local ./canonical-compile.json -- check --workspace --all-targets
+```
+
+The coordinator matches each request to Cargo's retained selected unit graph:
+package, source, crate name/type, compilation mode, target and features must
+agree. Test harness checks additionally bind the trusted command's target
+selection and selected root units. Ordinary wrapper requests cannot enable
+this path by supplying canonical-looking names.
 
 This uses the separately negotiated `canonical-workspace-exec-v1` context.
 Workers must advertise that version and the requested `metadata` or `rlib`
 mode. Matching binaries and the worker setup above are sufficient; there is no
 new cache-enablement switch. Unsupported units continue through Cargo's
-ordinary compiler path. Native linking, procedural-macro consumers, test
-harnesses and incremental compiler state remain outside this per-library worker
+ordinary compiler path. Binary and harness checks require exactly metadata and
+dep-info outputs. Their legitimate empty `.rmeta` files are retained and
+installed; no executable is linked, and no test or benchmark body runs during
+these checks. Final binary/test linking, native linking, procedural-macro
+consumers and incremental compiler state remain outside this per-unit worker
 profile; build scripts execute through the existing canonical Cargo driver.
 
 Each accepted workspace request executes afresh. Its identity binds the entire
@@ -1219,7 +1231,7 @@ uncertain execution cannot authorize concurrent local fallback.
 
 Workspace results do not create an action-cache publication, serving entry,
 differential sample or replayable transcript index. This adds remote execution
-for eligible workspace libraries without granting workspace action-cache reuse.
+for eligible workspace compilations without granting workspace action-cache reuse.
 Cargo still owns command execution and freshness; the optional private target
 reuse described below has its existing independent rules and limits.
 

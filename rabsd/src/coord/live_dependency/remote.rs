@@ -1113,8 +1113,12 @@ impl PendingRemote {
 /// resources; implicit host thread counts still require another policy.
 fn dependency_execution_grant(plan: &DependencyActionPlan, argv: &[String]) -> Result<u32, String> {
     execution_mode(plan)?;
-    rabs_key::output_derivation::check_dependency_output_options(&plan.invocation)
-        .map_err(|error| error.to_string())?;
+    let options = if plan.source_kind == DependencySourceKind::WorkspaceExecutionOnly {
+        rabs_key::output_derivation::check_workspace_output_options(&plan.invocation)
+    } else {
+        rabs_key::output_derivation::check_dependency_output_options(&plan.invocation)
+    };
+    options.map_err(|error| error.to_string())?;
     let presented = rabs_key::invocation::parse(argv, None)
         .map_err(|error| format!("remote resource invocation: {error:?}"))?;
     if argv.first().map(String::as_str) != Some(plan.compiler.as_str())
@@ -2313,6 +2317,93 @@ mod execution_resource_tests {
                     bytes: 100,
                 },
             }
+        }
+
+        fn workspace_metadata(crate_type: Option<&str>, harness: bool) -> Self {
+            let mut argv = vec![
+                "/__rabs/toolchain/bin/rustc".into(),
+                "member/src/main.rs".into(),
+                "--crate-name=workspace_app".into(),
+                "--emit=dep-info,metadata".into(),
+                "--error-format=json".into(),
+                "--json=artifacts".into(),
+                "--out-dir=/__rabs/out/cargo/debug/deps".into(),
+                "-Ldependency=/__rabs/out/cargo/debug/deps".into(),
+                "-Zthreads=3".into(),
+            ];
+            if let Some(kind) = crate_type {
+                argv.push(format!("--crate-type={kind}"));
+            }
+            if harness {
+                argv.push("--test".into());
+            }
+            let env = vec![
+                ("HOME".into(), "/__rabs/home".into()),
+                ("CARGO_HOME".into(), "/__rabs/cargo-home".into()),
+                (
+                    "CARGO_MANIFEST_DIR".into(),
+                    "/__rabs/workspace/member".into(),
+                ),
+                ("CARGO_PKG_NAME".into(), "workspace_app".into()),
+                ("CARGO_PRIMARY_PACKAGE".into(), "1".into()),
+            ];
+            let plan =
+                rabs_key::live_dependency::workspace_execution::plan_canonical_workspace_execution(
+                    LiveRustcRequest {
+                        argv: &argv,
+                        cwd: "/__rabs/workspace",
+                        env: &env,
+                    },
+                    "x86_64-unknown-linux-gnu",
+                )
+                .unwrap();
+            let context = DependencyExecContext::new_canonical_workspace_execution(
+                DependencyExecutionMode::Metadata,
+                plan.cwd.clone(),
+                plan.out_dir.clone(),
+                plan.dependency_dirs.clone(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                vec!["member".into(), "member/src".into()],
+                Vec::new(),
+                plan.execution_env.clone(),
+                [0x11; 32],
+            )
+            .unwrap();
+            Self {
+                argv,
+                plan,
+                context,
+                toolchain: ToolchainIdentity {
+                    sha256: [0x22; 32],
+                    files: 2,
+                    bytes: 100,
+                },
+            }
+        }
+    }
+
+    #[test]
+    fn workspace_metadata_requests_preserve_harness_argv_outputs_and_frontend_grants() {
+        for (kind, harness) in [(Some("bin"), false), (Some("lib"), true), (None, true)] {
+            let mut fixture = Fixture::workspace_metadata(kind, harness);
+            let request = fixture.request().unwrap();
+            assert_eq!(request["args"], json!(fixture.argv[1..]));
+            assert_eq!(request["jobserver_grant"], 3);
+            assert_eq!(request["dependency_context"]["execution_mode"], "metadata");
+            assert_eq!(
+                request["dependency_context"]["version"],
+                rabs_sandbox::dependency_context::CANONICAL_WORKSPACE_CONTEXT_VERSION
+            );
+            assert_eq!(
+                request["artifacts"]["files"],
+                json!(["libworkspace_app.rmeta", "workspace_app.d"])
+            );
+            fixture.context = fixture
+                .context
+                .with_execution_mode(DependencyExecutionMode::Rlib);
+            assert!(fixture.request().is_err());
         }
     }
 

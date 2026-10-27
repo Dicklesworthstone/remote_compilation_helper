@@ -164,10 +164,17 @@ impl LiveDependencyRequest {
     }
 
     fn verify_output_contract(&self) -> Result<(), String> {
-        let expected = rabs_key::output_derivation::derive_dependency_output_declarations(
-            &self.plan.invocation,
-            &self.plan.host_triple,
-        )
+        let expected = if self.is_execution_only() {
+            rabs_key::output_derivation::derive_workspace_output_declarations(
+                &self.plan.invocation,
+                &self.plan.host_triple,
+            )
+        } else {
+            rabs_key::output_derivation::derive_dependency_output_declarations(
+                &self.plan.invocation,
+                &self.plan.host_triple,
+            )
+        }
         .map_err(|error| error.to_string())?;
         if expected.canonical_bytes() != self.plan.outputs.canonical_bytes() {
             return Err(
