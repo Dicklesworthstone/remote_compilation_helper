@@ -410,14 +410,44 @@ impl PackageFacts {
         &self,
         plan: &DependencyActionPlan,
     ) -> Result<Vec<DirectoryEnumeration>, String> {
-        let captured = match (
+        match (
             self.snapshot.manifest(GENERATED_ROOT),
             plan.generated_root.as_ref(),
         ) {
             (None, None) => return Ok(Vec::new()),
-            (Some(captured), Some(_)) => captured,
+            (Some(_), Some(_)) => {}
             _ => return Err("generated directory capture differs from the action plan".into()),
-        };
+        }
+        self.directory_enumerations(GENERATED_ROOT, &plan.generated_virtual_root())
+    }
+
+    /// Complete workspace membership from the exact sealed bytes used for this
+    /// fresh execution. Sibling packages and empty directories remain inputs.
+    pub fn source_directory_enumerations(
+        &self,
+        plan: &DependencyActionPlan,
+    ) -> Result<Vec<DirectoryEnumeration>, String> {
+        if self.source_kind != DependencySourceKind::WorkspaceExecutionOnly
+            || plan.source_kind != self.source_kind
+            || !plan.canonical_cargo
+            || plan.source_root != rabs_sandbox::layout::WORKSPACE
+        {
+            return Err(
+                "workspace directory capture requires its retained execution profile".into(),
+            );
+        }
+        self.directory_enumerations(PACKAGE_ROOT, &plan.source_virtual_root())
+    }
+
+    fn directory_enumerations(
+        &self,
+        root: &str,
+        virtual_root: &str,
+    ) -> Result<Vec<DirectoryEnumeration>, String> {
+        let captured = self
+            .snapshot
+            .manifest(root)
+            .ok_or("input root was not captured")?;
         let mut directories = BTreeMap::<String, Vec<RawBytes>>::new();
         directories.insert(String::new(), Vec::new());
         for (path, member) in &captured.members {
@@ -427,7 +457,7 @@ impl PackageFacts {
                 }
                 MemberKind::Regular { .. } => {}
                 MemberKind::Symlink { .. } => {
-                    return Err("generated directory capture contains a symlink".into());
+                    return Err("input directory capture contains a symlink".into());
                 }
             }
         }
@@ -438,21 +468,21 @@ impl PackageFacts {
                 .cloned()
                 .collect::<Vec<_>>(),
         )
-        .map_err(|error| format!("generated directory capture: {error}"))?;
+        .map_err(|error| format!("input directory capture: {error}"))?;
         for path in captured.members.keys() {
             let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
             directories
                 .get_mut(parent)
-                .ok_or("generated directory capture is missing a parent")?
+                .ok_or("input directory capture is missing a parent")?
                 .push(RawBytes::new(name.as_bytes().to_vec()));
         }
         Ok(directories
             .into_iter()
             .map(|(relative, entries)| DirectoryEnumeration {
                 virtual_path: RawBytes::new(if relative.is_empty() {
-                    plan.generated_virtual_root().into_bytes()
+                    virtual_root.as_bytes().to_vec()
                 } else {
-                    plan.generated_input_virtual_path(&relative).into_bytes()
+                    format!("{virtual_root}/{relative}").into_bytes()
                 }),
                 entries,
             })

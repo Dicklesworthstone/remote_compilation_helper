@@ -245,6 +245,7 @@ impl DependencyGeneratedInputs {
         backing: std::path::PathBuf,
         files: &[&SourceFile],
         directories: &[String],
+        prefix: &str,
     ) -> io::Result<Self> {
         use std::io::Read;
 
@@ -274,10 +275,7 @@ impl DependencyGeneratedInputs {
             guard.directories.insert(name.clone(), metadata);
         }
         for expected in files {
-            let name = expected
-                .path
-                .strip_prefix("generated/")
-                .ok_or_else(refuse)?;
+            let name = expected.path.strip_prefix(prefix).ok_or_else(refuse)?;
             for (offset, _) in name.match_indices('/') {
                 let parent = &name[..offset];
                 if !guard.directories.contains_key(parent) {
@@ -516,6 +514,22 @@ impl SourceOwner {
                 if relative.is_empty() {
                     return Err(refuse("dependency package member has no relative path"));
                 }
+                if context.workspace_execution_only() {
+                    let directories = context.source_directories();
+                    if directories
+                        .binary_search_by(|path| path.as_str().cmp(relative))
+                        .is_ok()
+                        || relative.match_indices('/').any(|(offset, _)| {
+                            directories
+                                .binary_search_by(|path| path.as_str().cmp(&relative[..offset]))
+                                .is_err()
+                        })
+                    {
+                        return Err(refuse(
+                            "workspace file conflicts with its complete directory inventory",
+                        ));
+                    }
+                }
                 package_present = true;
                 continue;
             }
@@ -607,11 +621,51 @@ impl SourceOwner {
         context: &rabs_sandbox::dependency_context::DependencyExecContext,
         spec: &mut rabs_sandbox::canonical_namespace::CanonicalNamespaceSpec,
     ) -> io::Result<Option<DependencyGeneratedInputs>> {
+        self.prepare_dependency_tree(request_id, context, spec, false)
+    }
+
+    /// Reconstruct the complete selected workspace independently of the sealed
+    /// file-only transfer. Empty directories and sibling packages are preserved;
+    /// no compiler write can alias a retained transfer or reusable cache inode.
+    pub(crate) fn prepare_dependency_source(
+        &self,
+        request_id: u64,
+        context: &rabs_sandbox::dependency_context::DependencyExecContext,
+        spec: &mut rabs_sandbox::canonical_namespace::CanonicalNamespaceSpec,
+    ) -> io::Result<Option<DependencyGeneratedInputs>> {
+        if !context.workspace_execution_only() {
+            return Ok(None);
+        }
+        self.prepare_dependency_tree(request_id, context, spec, true)
+    }
+
+    fn prepare_dependency_tree(
+        &self,
+        request_id: u64,
+        context: &rabs_sandbox::dependency_context::DependencyExecContext,
+        spec: &mut rabs_sandbox::canonical_namespace::CanonicalNamespaceSpec,
+        workspace: bool,
+    ) -> io::Result<Option<DependencyGeneratedInputs>> {
         use std::io::Read;
 
         let package = self.dependency_root(request_id, context)?;
-        let Some(visible) = context.generated_root() else {
-            return Ok(None);
+        let (visible, directories, prefix, backing) = if workspace {
+            (
+                context.source_root(),
+                context.source_directories(),
+                "package/",
+                self._directory.path().join("workspace-inputs/package"),
+            )
+        } else {
+            let Some(visible) = context.generated_root() else {
+                return Ok(None);
+            };
+            (
+                visible,
+                context.generated_directories(),
+                "generated/",
+                self._directory.path().join("generated-inputs"),
+            )
         };
         let bundle = package
             .parent()
@@ -622,10 +676,11 @@ impl SourceOwner {
             .filter(|bind| bind.visible == std::path::Path::new(visible));
         let binding = bindings
             .next()
-            .ok_or_else(|| io::Error::other("missing generated read-only mount"))?;
-        if bindings.next().is_some() || binding.backing != bundle.join("generated") {
+            .ok_or_else(|| io::Error::other("missing retained input read-only mount"))?;
+        if bindings.next().is_some() || binding.backing != bundle.join(prefix.trim_end_matches('/'))
+        {
             return Err(io::Error::other(
-                "generated mount differs from its declared bundle",
+                "input mount differs from its declared bundle",
             ));
         }
         let files: Vec<_> = self
@@ -633,7 +688,7 @@ impl SourceOwner {
             .manifest()
             .files()
             .iter()
-            .filter(|file| file.path.starts_with("generated/"))
+            .filter(|file| file.path.starts_with(prefix))
             .collect();
         // SourceReceiver creates only file parents. Hold that exact original
         // tree while copying; additional generated directories belong solely
@@ -643,30 +698,33 @@ impl SourceOwner {
         } else {
             let mut parents = std::collections::BTreeSet::new();
             for file in &files {
-                let relative = file.path.strip_prefix("generated/").unwrap();
+                let relative = file.path.strip_prefix(prefix).unwrap();
                 for (offset, _) in relative.match_indices('/') {
                     parents.insert(relative[..offset].to_owned());
                 }
             }
             Some(DependencyGeneratedInputs::capture(
-                bundle.join("generated"),
+                bundle.join(prefix.trim_end_matches('/')),
                 &files,
                 &parents.into_iter().collect::<Vec<_>>(),
+                prefix,
             )?)
         };
-        let backing = self._directory.path().join("generated-inputs");
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
             builder.mode(0o700);
         }
+        if workspace {
+            builder.create(self._directory.path().join("workspace-inputs"))?;
+        }
         builder.create(&backing)?;
-        for directory in context.generated_directories() {
+        for directory in directories {
             builder.create(backing.join(directory))?;
         }
         for expected in &files {
-            let relative = expected.path.strip_prefix("generated/").unwrap();
+            let relative = expected.path.strip_prefix(prefix).unwrap();
             let source = rabs_sandbox::regular_input::open(&bundle.join(&expected.path))?;
             let mut options = std::fs::OpenOptions::new();
             options.write(true).create_new(true);
@@ -679,7 +737,7 @@ impl SourceOwner {
             if std::io::copy(&mut source.take(expected.len + 1), &mut destination)? != expected.len
             {
                 return Err(io::Error::other(
-                    "generated input changed length during preparation",
+                    "retained input changed length during preparation",
                 ));
             }
             #[cfg(unix)]
@@ -693,8 +751,7 @@ impl SourceOwner {
         if let Some(source_guard) = source_guard {
             source_guard.verify()?;
         }
-        let guard =
-            DependencyGeneratedInputs::capture(backing, &files, context.generated_directories())?;
+        let guard = DependencyGeneratedInputs::capture(backing, &files, directories, prefix)?;
         binding.backing = guard.backing.clone();
         Ok(Some(guard))
     }
@@ -854,12 +911,22 @@ impl SourceOwner {
         use std::path::Path;
         let refuse = |message: &str| io::Error::new(io::ErrorKind::InvalidData, message);
         let root = self.dependency_root(request_id, context)?;
+        let source_backing = if context.workspace_execution_only() {
+            self._directory.path().join("workspace-inputs/package")
+        } else {
+            root.clone()
+        };
+        if !std::fs::symlink_metadata(&source_backing)?.is_dir()
+            || std::fs::canonicalize(&source_backing)? != source_backing
+        {
+            return Err(refuse("source inputs lack their private real directory"));
+        }
         let visible = Path::new(context.source_root());
         let overlap =
             |left: &Path, right: &Path| left.starts_with(right) || right.starts_with(left);
         let mut owned = 0;
         for bind in &spec.ro_binds {
-            if bind.visible == visible && bind.backing == root {
+            if bind.visible == visible && bind.backing == source_backing {
                 owned += 1;
             } else if overlap(&bind.visible, visible) {
                 return Err(refuse("mount shadows dependency source"));
@@ -979,6 +1046,7 @@ impl SourceOwner {
                             && bind.visible == Path::new(context.out_dir()))
                 })
                 || overlap(&std::fs::canonicalize(&bind.backing)?, &canonical_bundle)
+                || overlap(&std::fs::canonicalize(&bind.backing)?, &source_backing)
                 || generated_backing.as_ref().is_some_and(|generated| {
                     std::fs::canonicalize(&bind.backing)
                         .map_or(true, |backing| overlap(&backing, generated))
@@ -1538,6 +1606,408 @@ mod tests {
         }
         state.handle(&seal(&manifest, 91), true, false).unwrap();
         state.take_prepared(&request).unwrap().unwrap()
+    }
+
+    fn workspace_dependency_context(
+        files: &[(&str, &[u8], bool)],
+        source_directories: Vec<String>,
+        generated_directories: Vec<String>,
+    ) -> rabs_sandbox::dependency_context::DependencyExecContext {
+        use rabs_sandbox::dependency_context::{
+            DependencyArtifactRoot, DependencyExecContext, DependencyExecutionMode,
+        };
+        let output = "/__rabs/out/cargo/debug/deps";
+        let generated = files
+            .iter()
+            .any(|(path, _, _)| path.starts_with("generated/"))
+            .then_some("/__rabs/out/cargo/debug/build/member-123/out");
+        let artifacts = files
+            .iter()
+            .any(|(path, _, _)| path.starts_with("dependencies/0000/"))
+            .then(|| DependencyArtifactRoot {
+                path: output.into(),
+                prefix: "dependencies/0000".into(),
+            })
+            .into_iter()
+            .collect();
+        let mut env = vec![
+            ("HOME".into(), "/__rabs/home".into()),
+            ("CARGO_HOME".into(), "/__rabs/cargo-home".into()),
+            (
+                "CARGO_MANIFEST_DIR".into(),
+                "/__rabs/workspace/member".into(),
+            ),
+            ("CARGO_PKG_NAME".into(), "member".into()),
+            ("CARGO_PRIMARY_PACKAGE".into(), "1".into()),
+        ];
+        if let Some(root) = generated {
+            env.push(("OUT_DIR".into(), root.into()));
+        }
+        DependencyExecContext::new_canonical_workspace_execution(
+            DependencyExecutionMode::Metadata,
+            "/__rabs/workspace/member".into(),
+            output.into(),
+            vec![output.into()],
+            Vec::new(),
+            artifacts,
+            generated.map(str::to_owned),
+            source_directories,
+            generated_directories,
+            env,
+            [7; 32],
+        )
+        .unwrap()
+    }
+
+    fn workspace_source_directories() -> Vec<String> {
+        ["member", "member/src", "shared", "shared/empty"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn workspace_dependency_fixture(
+        files: &[(&str, &[u8], bool)],
+        generated_directories: Vec<String>,
+    ) -> (
+        SourceOwner,
+        rabs_sandbox::dependency_context::DependencyExecContext,
+        rabs_sandbox::canonical_namespace::CanonicalNamespaceSpec,
+        tempfile::TempDir,
+    ) {
+        let owner = uploaded_dependency_bundle(files);
+        let context = workspace_dependency_context(
+            files,
+            workspace_source_directories(),
+            generated_directories,
+        );
+        let runtime = tempfile::tempdir().unwrap();
+        for name in ["toolchain", "output", "empty", "home"] {
+            std::fs::create_dir(runtime.path().join(name)).unwrap();
+        }
+        context
+            .prepare_empty_backings(&runtime.path().join("empty"))
+            .unwrap();
+        let package = owner.dependency_root(91, &context).unwrap();
+        let spec = context
+            .namespace(
+                &package,
+                &runtime.path().join("toolchain"),
+                &runtime.path().join("output"),
+                &runtime.path().join("empty"),
+                &runtime.path().join("home"),
+            )
+            .unwrap();
+        (owner, context, spec, runtime)
+    }
+
+    /// Independently hash and retain the complete original transfer, including
+    /// dependency artifacts. SourceReceiver's sealed flag alone is not a second
+    /// content check; this guard also detects newly introduced empty directories.
+    fn retained_transfer_guard(owner: &SourceOwner) -> DependencyGeneratedInputs {
+        let files = owner.receiver.manifest().files().iter().collect::<Vec<_>>();
+        let mut directories = std::collections::BTreeSet::new();
+        for file in &files {
+            for (offset, _) in file.path.match_indices('/') {
+                directories.insert(file.path[..offset].to_owned());
+            }
+        }
+        DependencyGeneratedInputs::capture(
+            owner.receiver.sealed_root().unwrap().to_owned(),
+            &files,
+            &directories.into_iter().collect::<Vec<_>>(),
+            "",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn workspace_projection_runs_real_member_rustc_with_sibling_and_generated_directory_inputs() {
+        use std::os::unix::fs::MetadataExt;
+        let files = [
+            (
+                "package/member/src/lib.rs",
+                br#"
+                pub const PRIMARY: &str = env!("CARGO_PRIMARY_PACKAGE");
+                pub const SHARED: &str = include_str!("../../shared/empty/../value.txt");
+                include!(concat!(env!("OUT_DIR"), "/nested/empty/../constants.rs"));
+                pub fn value() -> (&'static str, &'static str) { (SHARED, GENERATED) }
+            "#
+                .as_slice(),
+                false,
+            ),
+            (
+                "package/shared/value.txt",
+                b"captured sibling value".as_slice(),
+                false,
+            ),
+            (
+                "generated/nested/constants.rs",
+                b"pub const GENERATED:&str=\"captured generated value\";".as_slice(),
+                false,
+            ),
+            (
+                "dependencies/0000/libleaf.rmeta",
+                b"unchanged retained dependency candidate".as_slice(),
+                false,
+            ),
+        ];
+        let (owner, context, mut spec, runtime) =
+            workspace_dependency_fixture(&files, vec!["nested".into(), "nested/empty".into()]);
+        let original = retained_transfer_guard(&owner);
+        let manifest_before = owner.receiver.manifest().clone();
+        let workspace = owner
+            .prepare_dependency_source(91, &context, &mut spec)
+            .unwrap()
+            .unwrap();
+        let generated = owner
+            .prepare_dependency_generated(91, &context, &mut spec)
+            .unwrap()
+            .unwrap();
+        let candidates = owner
+            .prepare_dependency_output(91, &context, &mut spec)
+            .unwrap();
+        owner.protect_dependency(91, &context, &spec).unwrap();
+        original.verify().unwrap();
+        assert_eq!(owner.receiver.manifest(), &manifest_before);
+        assert!(!original.backing.join("package/shared/empty").exists());
+        assert!(!original.backing.join("generated/nested/empty").exists());
+        assert!(workspace.backing.join("shared/empty").is_dir());
+        assert!(generated.backing.join("nested/empty").is_dir());
+        assert!(!workspace.backing.join("dependencies").exists());
+        for relative in ["member/src/lib.rs", "shared/value.txt"] {
+            let sealed =
+                std::fs::metadata(original.backing.join("package").join(relative)).unwrap();
+            let copied = std::fs::metadata(workspace.backing.join(relative)).unwrap();
+            assert_ne!((sealed.dev(), sealed.ino()), (copied.dev(), copied.ino()));
+            assert_eq!(copied.nlink(), 1);
+        }
+        let compile = |emit: &str| {
+            std::process::Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+                .args([
+                    "--crate-name=workspace_tree",
+                    "--crate-type=lib",
+                    "--edition=2021",
+                    "--error-format=json",
+                    "--json=artifacts",
+                    "--emit",
+                    emit,
+                    "--out-dir",
+                ])
+                .arg(runtime.path().join("output"))
+                .arg("src/lib.rs")
+                .current_dir(workspace.backing.join("member"))
+                .env("CARGO_PRIMARY_PACKAGE", "1")
+                .env("OUT_DIR", &generated.backing)
+                .output()
+                .expect("run the actual Rust compiler against the retained workspace")
+        };
+        for emit in ["dep-info,metadata", "dep-info,metadata,link"] {
+            let result = compile(emit);
+            assert!(
+                result.status.success(),
+                "rustc could not read the complete workspace/generated trees: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert!(
+                runtime
+                    .path()
+                    .join("output/libworkspace_tree.rmeta")
+                    .is_file()
+            );
+            if emit.contains("link") {
+                assert!(
+                    runtime
+                        .path()
+                        .join("output/libworkspace_tree.rlib")
+                        .is_file()
+                );
+            }
+            workspace.verify().unwrap();
+            generated.verify().unwrap();
+            original.verify().unwrap();
+            candidates.verify(&runtime.path().join("output")).unwrap();
+        }
+        std::fs::rename(
+            workspace.backing.join("shared/empty"),
+            runtime.path().join("held-empty"),
+        )
+        .unwrap();
+        assert!(
+            !compile("dep-info,metadata").status.success(),
+            "the actual compiler must fail if the required empty source directory is omitted"
+        );
+        assert!(workspace.verify().is_err());
+        original.verify().unwrap();
+        assert_eq!(
+            std::fs::read(original.backing.join("dependencies/0000/libleaf.rmeta")).unwrap(),
+            files[3].1
+        );
+    }
+
+    #[test]
+    fn workspace_projection_rejects_missing_file_parents_directory_collisions_and_changed_seals() {
+        use std::os::unix::fs::PermissionsExt;
+        let files = [
+            (
+                "package/member/src/lib.rs",
+                b"retained source".as_slice(),
+                false,
+            ),
+            (
+                "package/shared/value.txt",
+                b"shared bytes".as_slice(),
+                false,
+            ),
+        ];
+        let (owner, _context, spec, _runtime) = workspace_dependency_fixture(&files, Vec::new());
+        for directories in [
+            vec!["member".into(), "shared".into(), "shared/empty".into()],
+            vec![
+                "member".into(),
+                "member/src".into(),
+                "member/src/lib.rs".into(),
+                "shared".into(),
+                "shared/empty".into(),
+            ],
+        ] {
+            let context = workspace_dependency_context(&files, directories, Vec::new());
+            assert!(owner.dependency_root(91, &context).is_err());
+            assert!(
+                owner
+                    .prepare_dependency_source(91, &context, &mut spec.clone())
+                    .is_err()
+            );
+        }
+        for changed_membership in [false, true] {
+            let (owner, context, mut spec, _runtime) =
+                workspace_dependency_fixture(&files, Vec::new());
+            let root = owner.dependency_root(91, &context).unwrap();
+            if changed_membership {
+                std::fs::create_dir(root.join("unobserved-empty-directory")).unwrap();
+            } else {
+                let source = root.join("member/src/lib.rs");
+                std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o644)).unwrap();
+                std::fs::write(&source, b"modified source").unwrap();
+                std::fs::set_permissions(source, std::fs::Permissions::from_mode(0o444)).unwrap();
+            }
+            assert!(
+                owner
+                    .prepare_dependency_source(91, &context, &mut spec)
+                    .is_err(),
+                "the sealed flag cannot substitute for rechecking original bytes and exact membership"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_projection_guards_exact_membership_replacement_and_writable_aliases() {
+        use rabs_sandbox::canonical_namespace::Bind;
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let files = [
+            (
+                "package/member/src/lib.rs",
+                b"retained source".as_slice(),
+                false,
+            ),
+            (
+                "package/shared/value.txt",
+                b"shared bytes".as_slice(),
+                false,
+            ),
+        ];
+        for mutation in [
+            "bytes",
+            "replacement",
+            "hardlink",
+            "empty-directory",
+            "parent-symlink",
+            "new-member",
+        ] {
+            let (owner, context, mut spec, runtime) =
+                workspace_dependency_fixture(&files, Vec::new());
+            let original = retained_transfer_guard(&owner);
+            let guard = owner
+                .prepare_dependency_source(91, &context, &mut spec)
+                .unwrap()
+                .unwrap();
+            owner.protect_dependency(91, &context, &spec).unwrap();
+            let source = guard.backing.join("member/src/lib.rs");
+            match mutation {
+                "bytes" => {
+                    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o644))
+                        .unwrap();
+                    std::fs::write(source, b"modified source").unwrap();
+                }
+                "replacement" => {
+                    std::fs::rename(&source, runtime.path().join("held-source")).unwrap();
+                    std::fs::write(source, files[0].1).unwrap();
+                }
+                "hardlink" => std::fs::hard_link(source, runtime.path().join("alias")).unwrap(),
+                "empty-directory" => {
+                    std::fs::rename(
+                        guard.backing.join("shared/empty"),
+                        runtime.path().join("held-empty"),
+                    )
+                    .unwrap();
+                    std::fs::create_dir(guard.backing.join("shared/empty")).unwrap();
+                }
+                "parent-symlink" => {
+                    let retained = runtime.path().join("held-parent");
+                    std::fs::rename(guard.backing.join("member/src"), &retained).unwrap();
+                    symlink(retained, guard.backing.join("member/src")).unwrap();
+                }
+                "new-member" => {
+                    std::fs::write(guard.backing.join("unobserved"), b"extra bytes").unwrap()
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                guard.verify().is_err(),
+                "workspace mutation escaped its guard: {mutation}"
+            );
+            original.verify().unwrap();
+        }
+        let (owner, context, mut spec, runtime) = workspace_dependency_fixture(&files, Vec::new());
+        let guard = owner
+            .prepare_dependency_source(91, &context, &mut spec)
+            .unwrap()
+            .unwrap();
+        let visible = std::path::Path::new(context.source_root());
+        let alias = runtime.path().join("workspace-alias");
+        symlink(&guard.backing, &alias).unwrap();
+        for binding in [
+            Bind::new(&guard.backing, "/scratch"),
+            Bind::new(&alias, "/scratch"),
+            Bind::new(guard.backing.parent().unwrap(), "/scratch"),
+            Bind::new(runtime.path().join("output"), visible),
+            Bind::new(runtime.path().join("output"), visible.join("member")),
+        ] {
+            let mut changed = spec.clone();
+            changed.rw_binds.push(binding);
+            assert!(owner.protect_dependency(91, &context, &changed).is_err());
+        }
+        let mut redirected = spec.clone();
+        redirected
+            .ro_binds
+            .iter_mut()
+            .find(|binding| binding.visible == visible)
+            .unwrap()
+            .backing = owner.dependency_root(91, &context).unwrap();
+        assert!(owner.protect_dependency(91, &context, &redirected).is_err());
+        let mut shadowed = spec.clone();
+        shadowed.ro_binds.push(Bind::new(
+            runtime.path().join("output"),
+            visible.join("shared"),
+        ));
+        assert!(owner.protect_dependency(91, &context, &shadowed).is_err());
+        assert!(
+            owner
+                .prepare_dependency_source(91, &context, &mut spec)
+                .is_err(),
+            "a prepared source image cannot be silently reconstructed or rebound a second time"
+        );
+        guard.verify().unwrap();
     }
 
     fn generated_dependency_fixture(

@@ -322,6 +322,13 @@ fn loader_paths(
         if name != "LD_LIBRARY_PATH" {
             continue;
         }
+        // A wholly empty value is the loader's empty search list, as emitted
+        // by Cargo for a cold workspace unit. It is not an empty component in
+        // a nonempty colon-separated list: those can search cwd and still
+        // refuse below. Keep the exact presented binding in the action key.
+        if value.is_empty() {
+            continue;
+        }
         for entry in value.split(':') {
             if !plain_path_in_profile(entry, plan.canonical_cargo) {
                 return Err(RemoteDependencyRefusal::LoaderEnvironment(
@@ -2393,9 +2400,10 @@ mod tests {
             ["/work/target/debug", "/work/target/debug/deps"]
         );
         for value in [
-            "",
+            ":",
             ":/toolchain/lib",
             "/toolchain/lib:",
+            "/toolchain/lib::/toolchain/lib/rustlib",
             "lib",
             "/toolchain/lib/../other",
             "/usr/lib",
@@ -2422,5 +2430,81 @@ mod tests {
             remote_loader_search_paths(&plan, TOOLCHAIN).unwrap(),
             Vec::<String>::new()
         );
+    }
+
+    #[test]
+    fn empty_loader_list_preserves_environment_identity_in_both_dependency_profiles() {
+        for (mut plan, root) in [
+            (plan(OUTPUT), TOOLCHAIN),
+            (
+                canonical_plan("/__rabs/out/cargo/debug/deps"),
+                "/__rabs/toolchain",
+            ),
+        ] {
+            for env in [&mut plan.execution_env, &mut plan.keyed_env] {
+                env.iter_mut()
+                    .find(|(name, _)| name == "LD_LIBRARY_PATH")
+                    .unwrap()
+                    .1
+                    .clear();
+            }
+            assert!(remote_loader_search_paths(&plan, root).unwrap().is_empty());
+            assert!(
+                remote_empty_loader_directories(&plan, root)
+                    .unwrap()
+                    .is_empty()
+            );
+            let identity = |plan: &DependencyActionPlan| {
+                remote_dependency_key(
+                    plan,
+                    &toolchain(),
+                    &directories(plan),
+                    &inputs(plan),
+                    None,
+                    root,
+                    &[41; 32],
+                    &compute(RUNTIME_COHORT_DOMAIN, b"runtime"),
+                )
+                .unwrap()
+            };
+            let empty = identity(&plan);
+            assert!(
+                plan.execution_env
+                    .contains(&("LD_LIBRARY_PATH".into(), String::new()))
+            );
+            let mut absent = plan.clone();
+            absent
+                .execution_env
+                .retain(|(name, _)| name != "LD_LIBRARY_PATH");
+            absent
+                .keyed_env
+                .retain(|(name, _)| name != "LD_LIBRARY_PATH");
+            assert_ne!(
+                empty.descriptor.environment,
+                identity(&absent).descriptor.environment
+            );
+            for value in [
+                ":".to_owned(),
+                format!(":{root}/lib"),
+                format!("{root}/lib:"),
+                format!("{root}/lib::{root}/lib/rustlib"),
+            ] {
+                let mut invalid = plan.clone();
+                invalid
+                    .execution_env
+                    .iter_mut()
+                    .find(|(name, _)| name == "LD_LIBRARY_PATH")
+                    .unwrap()
+                    .1 = value;
+                assert!(remote_loader_search_paths(&invalid, root).is_err());
+                assert!(remote_empty_loader_directories(&invalid, root).is_err());
+            }
+            plan.execution_env
+                .push(("LD_PRELOAD".into(), String::new()));
+            assert!(
+                remote_loader_search_paths(&plan, root).is_err(),
+                "the empty list must not bypass other loader-control validation"
+            );
+        }
     }
 }

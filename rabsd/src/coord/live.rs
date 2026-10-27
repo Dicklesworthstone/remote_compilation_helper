@@ -25,6 +25,8 @@
 //! abandoned so nothing hides.
 
 mod output_install;
+mod request_owned_install;
+pub(super) use request_owned_install::RequestOwnedInstallError;
 #[cfg(test)]
 mod produced_result_tests;
 
@@ -329,6 +331,18 @@ pub enum ExpectedOutputs {
         paths: std::collections::BTreeSet<String>,
         /// Directory mappings; component boundaries and longest-prefix order
         /// are validated before deriving any subscriber output.
+        mappings: Vec<(Vec<u8>, Vec<u8>)>,
+    },
+    /// Canonical Cargo consumes the exact namespace-visible .d bytes. These
+    /// mappings translate validation and freshness I/O only; they never rewrite
+    /// the compiler's paths or the installed dep-info. The retained driver
+    /// capability constructs and revalidates the backing mappings.
+    CanonicalCargo {
+        /// Complete output names relative to the retained target directory.
+        paths: std::collections::BTreeSet<String>,
+        /// The compiler's absolute namespace-visible working directory.
+        working_directory: Vec<u8>,
+        /// Namespace roots and their private filesystem backings.
         mappings: Vec<(Vec<u8>, Vec<u8>)>,
     },
     /// The caller is not skipping any work and accepts whatever the
@@ -4869,6 +4883,58 @@ mod tests {
             incarnation: WorkerIncarnationId(incarnation),
             reenrollment_proof: None,
         }
+    }
+
+    #[test]
+    fn workspace_execution_retirement_allows_fresh_attempt_without_publishing() {
+        use crate::coord::live_dependency::settle_completed_dispatch;
+        use rabs_action::state_machines::AttemptState;
+
+        let (_state, coord) = submission_coordinator();
+        let (_source_root, source, manifest, mut descriptor) = source_fixture();
+        descriptor.action_class = ActionClass::RustcWorkspaceCompile;
+        let worker = worker_offer(1, 17);
+        coord.admit_worker_session(&worker).unwrap();
+        let mut attempts = Vec::new();
+        for operation in 1..=2 {
+            let submitted = coord
+                .submit_action(
+                    submission(&source, &manifest, &descriptor),
+                    request(operation, SubscriberKind::ForegroundAgent, 200),
+                    i64::try_from(operation).unwrap(),
+                    0,
+                )
+                .unwrap();
+            let key = submitted.action_key;
+            let serial = coord.claim_submitted_dispatch(&key).unwrap().unwrap();
+            let authority = coord
+                .begin_claimed_dispatch(&key, serial, &worker, 60_000)
+                .unwrap();
+            assert!(!attempts.contains(&authority.attempt_id));
+            attempts.push(authority.attempt_id);
+            // Explicit lifecycle fixture, not a claim that a compiler ran.
+            for state in [
+                AttemptState::LeaseAccepted,
+                AttemptState::AwaitingInputs,
+                AttemptState::Materializing,
+                AttemptState::Running,
+                AttemptState::ProcessExited,
+                AttemptState::HarvestingOutputs,
+                AttemptState::UploadingOutputs,
+                AttemptState::VerifyingOutputs,
+                AttemptState::PreparedResultOffered,
+            ] {
+                coord
+                    .advance_started_dispatch(&key, serial, &authority, state)
+                    .unwrap();
+            }
+            settle_completed_dispatch(&coord, &key, serial, &authority).unwrap();
+            assert!(coord.submitted_actor(&key).unwrap().is_none());
+            let mut store = coord.live_cas().unwrap().store().lock().unwrap();
+            assert!(store.published_manifest_key(&key).unwrap().is_none());
+            assert!(store.list_verification_samples(&key).unwrap().is_empty());
+        }
+        assert_eq!(attempts.len(), 2);
     }
 
     #[test]

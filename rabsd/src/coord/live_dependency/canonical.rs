@@ -6,9 +6,12 @@
 //! frame, and owns the operation directory until every request has drained.
 
 use rabs_key::live_dependency::{
-    DependencyActionPlan, DependencyDirectoryFact, ExternFact, PlannedExtern,
+    DependencyActionPlan, DependencyDirectoryFact, DependencySourceKind, ExternFact,
+    LiveRustcRequest, PlannedExtern,
 };
+use rabs_sandbox::cargo_check::CompilationLibraryUnit;
 use std::collections::BTreeSet;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -38,6 +41,7 @@ pub struct CanonicalPaths {
     _owner: Arc<tempfile::TempDir>,
     mounts: Vec<Mount>,
     closed_dependency_execution_required: bool,
+    workspace_units: Vec<CompilationLibraryUnit>,
 }
 
 /// One generated tree's filesystem backing and Cargo-visible record spelling.
@@ -173,7 +177,111 @@ impl CanonicalPaths {
             _owner: owner,
             mounts,
             closed_dependency_execution_required: false,
+            workspace_units: Vec::new(),
         }))
+    }
+
+    /// Bind actual Cargo-selected path-package library units before the endpoint
+    /// becomes visible to project code. A wrapper frame cannot extend this set.
+    pub(crate) fn with_workspace_units(
+        mut self: Arc<Self>,
+        units: &[CompilationLibraryUnit],
+    ) -> Result<Arc<Self>, String> {
+        let selected = units
+            .iter()
+            .filter(|unit| workspace_manifest(unit).is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        for unit in &selected {
+            let source = Path::new(unit.source_path());
+            if !source.starts_with("/__rabs/workspace")
+                || !std::fs::symlink_metadata(self.physical(source)?)
+                    .map_err(|error| error.to_string())?
+                    .is_file()
+            {
+                return Err(
+                    "selected workspace compiler source is not a retained ordinary file".into(),
+                );
+            }
+        }
+        Arc::get_mut(&mut self)
+            .ok_or("workspace unit membership must be bound before sharing its capability")?
+            .workspace_units = selected;
+        Ok(self)
+    }
+
+    pub(crate) fn workspace_request(&self, request: LiveRustcRequest<'_>) -> bool {
+        let manifest = request
+            .env
+            .iter()
+            .find(|(name, _)| name == "CARGO_MANIFEST_DIR")
+            .map(|(_, value)| value.as_str());
+        self.workspace_units
+            .iter()
+            .any(|unit| workspace_manifest(unit) == manifest && manifest.is_some())
+    }
+
+    /// Membership is distinct from the pure planner's path/argument validation.
+    /// Match a selected ordinary library family, including target and features,
+    /// before permitting fresh remote execution; this grants no cache authority.
+    pub(crate) fn require_workspace_execution(
+        &self,
+        plan: &DependencyActionPlan,
+    ) -> Result<(), String> {
+        use rabs_key::live_dependency::remote::{
+            RemoteDependencyOutputClass, remote_dependency_output_class,
+        };
+        if !plan.canonical_cargo
+            || plan.source_kind != DependencySourceKind::WorkspaceExecutionOnly
+            || plan.source_root != "/__rabs/workspace"
+        {
+            return Err(
+                "workspace execution requires the canonical driver's retained source scope".into(),
+            );
+        }
+        let source = rabs_key::live_dependency::workspace_source_path(plan)
+            .map_err(|error| error.to_string())?;
+        let mut crate_types = plan.invocation.crate_types.clone();
+        crate_types.sort();
+        let features = plan
+            .invocation
+            .features
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let mode =
+            remote_dependency_output_class(&plan.invocation).map_err(|error| error.to_string())?;
+        let selected = self.workspace_units.iter().any(|unit| {
+            workspace_manifest(unit) == Some(plan.package_root.as_str())
+                && unit.source_path() == source
+                && Some(unit.crate_name()) == plan.invocation.crate_name.as_deref()
+                && unit.crate_types() == crate_types
+                && unit.platform().unwrap_or(&plan.host_triple) == plan.target_triple
+                && unit
+                    .features()
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<BTreeSet<_>>()
+                    == features
+                && match mode {
+                    RemoteDependencyOutputClass::Metadata => unit.mode() == "check",
+                    _ => unit.mode() == "build",
+                }
+        });
+        if !selected {
+            return Err(
+                "workspace compiler request does not match a retained Cargo-selected library unit"
+                    .into(),
+            );
+        }
+        let path = self.physical(Path::new(&source))?;
+        if !std::fs::symlink_metadata(path)
+            .map_err(|error| error.to_string())?
+            .is_file()
+        {
+            return Err("selected workspace source is no longer an ordinary file".into());
+        }
+        Ok(())
     }
 
     /// Bind the selected Cargo graph's execution policy before sharing this
@@ -377,6 +485,21 @@ impl CanonicalPaths {
             .collect()
     }
 
+    /// I/O-only dep-info validation mappings. The compiler's canonical bytes
+    /// remain unchanged when installed for the retained Cargo namespace.
+    pub(crate) fn output_mappings(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+        self.mounts
+            .iter()
+            .map(|mount| {
+                Self::verify_mount(mount)?;
+                Ok((
+                    mount.visible.as_os_str().as_bytes().to_vec(),
+                    mount.backing.as_os_str().as_bytes().to_vec(),
+                ))
+            })
+            .collect()
+    }
+
     pub(crate) fn backing_roots(&self) -> Vec<String> {
         self.mounts
             .iter()
@@ -385,13 +508,23 @@ impl CanonicalPaths {
     }
 }
 
+fn workspace_manifest(unit: &CompilationLibraryUnit) -> Option<&str> {
+    let manifest = unit
+        .package_id()
+        .strip_prefix("path+file://")?
+        .split_once('#')?
+        .0;
+    (manifest == "/__rabs/workspace" || manifest.starts_with("/__rabs/workspace/"))
+        .then_some(manifest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::DirBuilderExt;
 
     fn fixture() -> (Arc<tempfile::TempDir>, Arc<CanonicalPaths>) {
-        let owner = Arc::new(tempfile::tempdir().unwrap());
+        let owner = Arc::new(crate::test_util::private_tempdir());
         let mappings = ROOTS
             .iter()
             .enumerate()
@@ -427,6 +560,116 @@ mod tests {
         ] {
             assert!(paths.physical(Path::new(path)).is_err(), "{path}");
         }
+    }
+
+    fn workspace_graph(package_id: &str) -> rabs_sandbox::cargo_check::CompilationUnitGraph {
+        use rabs_sandbox::cargo_check::{CompilationCommand, validate_compilation_unit_graph};
+        let graph = serde_json::json!({"version":1,"roots":[0],"units":[{
+            "pkg_id":package_id,
+            "target":{"kind":["lib"],"crate_types":["lib"],"name":"project-lib",
+                "src_path":"/__rabs/workspace/app/src/lib.rs","edition":"2024"},
+            "profile":{"name":"dev"},"platform":null,"mode":"check",
+            "features":["base"],"dependencies":[]
+        }]});
+        validate_compilation_unit_graph(&graph, CompilationCommand::Check).unwrap()
+    }
+
+    fn workspace_plan() -> DependencyActionPlan {
+        let argv = [
+            "/__rabs/toolchain/bin/rustc",
+            "--crate-name",
+            "project_lib",
+            "--edition=2024",
+            "app/src/lib.rs",
+            "--crate-type",
+            "lib",
+            "--emit=dep-info,metadata",
+            "-Cmetadata=abc",
+            "-Cextra-filename=-abc",
+            "--out-dir",
+            "/__rabs/out/cargo/debug/deps",
+            "--error-format=json",
+            "--json=diagnostic-rendered-ansi,artifacts",
+            "--cfg",
+            "feature=\"base\"",
+        ]
+        .map(str::to_owned);
+        let env = [
+            ("CARGO_MANIFEST_DIR", "/__rabs/workspace/app"),
+            ("CARGO_PKG_NAME", "project"),
+            ("CARGO_PRIMARY_PACKAGE", "1"),
+            ("CARGO_HOME", "/__rabs/cargo-home"),
+            ("HOME", "/__rabs/home"),
+        ]
+        .map(|(name, value)| (name.to_owned(), value.to_owned()));
+        rabs_key::live_dependency::plan_canonical_workspace_execution(
+            LiveRustcRequest {
+                argv: &argv,
+                cwd: "/__rabs/workspace",
+                env: &env,
+            },
+            "x86_64-unknown-linux-gnu",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn only_retained_cargo_selected_library_units_can_execute_as_workspace_requests() {
+        let (owner, paths) = fixture();
+        std::fs::create_dir_all(owner.path().join("0/app/src")).unwrap();
+        std::fs::write(
+            owner.path().join("0/app/src/lib.rs"),
+            b"pub fn value() {}\n",
+        )
+        .unwrap();
+        let graph = workspace_graph("path+file:///__rabs/workspace/app#project@0.1.0");
+        let paths = paths.with_workspace_units(graph.library_units()).unwrap();
+        let plan = workspace_plan();
+        assert!(paths.require_workspace_execution(&plan).is_ok());
+        assert_eq!(plan.cwd, "/__rabs/workspace");
+        assert_eq!(plan.package_root, "/__rabs/workspace/app");
+        for mutation in 0..6 {
+            let mut other = plan.clone();
+            match mutation {
+                0 => other.invocation.crate_name = Some("unselected".into()),
+                1 => other.invocation.features.clear(),
+                2 => other.target_triple = "aarch64-unknown-linux-gnu".into(),
+                3 => other.package_root = "/__rabs/workspace/other".into(),
+                4 => other.invocation.crate_types = vec!["rlib".into()],
+                _ => {
+                    other.invocation.source = Some(rabs_key::invocation::SourceInput::Path(
+                        "other/src/lib.rs".into(),
+                    ))
+                }
+            }
+            assert!(
+                paths.require_workspace_execution(&other).is_err(),
+                "mutation {mutation}"
+            );
+        }
+        let retained = Arc::clone(&paths);
+        assert!(paths.with_workspace_units(graph.library_units()).is_err());
+        assert!(retained.require_workspace_execution(&plan).is_ok());
+    }
+
+    #[test]
+    fn vendored_registry_bytes_cannot_borrow_path_package_execution_membership() {
+        let (_owner, paths) = fixture();
+        let graph =
+            workspace_graph("registry+https://github.com/rust-lang/crates.io-index#project@0.1.0");
+        let paths = paths.with_workspace_units(graph.library_units()).unwrap();
+        assert!(
+            paths
+                .require_workspace_execution(&workspace_plan())
+                .is_err()
+        );
+        let argv = Vec::new();
+        let env = vec![("CARGO_MANIFEST_DIR".into(), "/__rabs/workspace/app".into())];
+        assert!(!paths.workspace_request(LiveRustcRequest {
+            argv: &argv,
+            cwd: "/__rabs/workspace",
+            env: &env,
+        }));
     }
 
     #[test]

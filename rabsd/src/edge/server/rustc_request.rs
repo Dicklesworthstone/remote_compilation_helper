@@ -367,6 +367,11 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
     };
     let remote_requested =
         live.remote.is_some() && request.get("remote_protocol").and_then(Value::as_u64) == Some(1);
+    let workspace_requested = remote_requested
+        && live
+            .canonical
+            .as_ref()
+            .is_some_and(|paths| paths.workspace_request(candidate));
     // Project executors can connect to this operation-visible endpoint. Their
     // local completion claims cannot populate or serve the cache. A configured
     // worker protocol may proceed toward independent closed execution; without
@@ -378,7 +383,9 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
     if !remote_requested && let Err(reason) = &local_capture {
         return refuse(reason);
     }
-    let rejection = if remote_requested {
+    let rejection = if workspace_requested {
+        admission_preflight::workspace_rejection(candidate)
+    } else if remote_requested {
         admission_preflight::remote_rejection(candidate)
     } else {
         admission_preflight::rejection(candidate)
@@ -443,6 +450,15 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
         env: &parsed.env,
     };
     let planned = match &live.canonical {
+        Some(paths) if workspace_requested => {
+            rabs_key::live_dependency::plan_canonical_workspace_execution(planning_request, &host)
+                .and_then(|plan| {
+                    paths
+                        .require_workspace_execution(&plan)
+                        .map_err(rabs_key::live_dependency::LiveRefusal::Facts)?;
+                    Ok(plan)
+                })
+        }
         Some(paths) => directory_source::plan_canonical_dependency_action(
             planning_request,
             &host,
@@ -569,6 +585,12 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
                 symlink_resolution: Vec::new(),
             }),
     );
+    if workspace_requested {
+        match package.source_directory_enumerations(&plan) {
+            Ok(enumerations) => inputs.directory_enumerations.extend(enumerations),
+            Err(reason) => return refuse(&reason),
+        }
+    }
     let mut externs = Vec::new();
     for planned in &plan.externs {
         if let PlannedExtern::File { path, .. } = planned {
@@ -595,7 +617,9 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
     } else {
         dependencies.directories.clone()
     };
-    let key_result = if let Err(reason) = local_capture {
+    let key_result = if workspace_requested {
+        Err(rabs_key::live_dependency::LiveRefusal::Facts("workspace units require a fresh isolated execution and cannot use dependency cache authority".into()))
+    } else if let Err(reason) = local_capture {
         // Keep a refusal, not a usable local key, across every remote warming,
         // keying, worker-unavailable and execution-refusal fallback below.
         Err(rabs_key::live_dependency::LiveRefusal::Facts(reason))

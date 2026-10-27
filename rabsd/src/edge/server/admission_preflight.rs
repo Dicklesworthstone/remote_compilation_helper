@@ -21,7 +21,7 @@ mod sysroot_preflight;
 /// Keep this deliberately small; differential tests below require supported
 /// requests to continue to the full planner, not become false cache misses.
 pub(super) fn rejection(request: LiveRustcRequest<'_>) -> Option<LiveRefusal> {
-    rejection_for(request, false)
+    rejection_for(request, false, false)
 }
 
 /// A configured remote worker can enforce the archive read-closure profile.
@@ -30,10 +30,21 @@ pub(super) fn rejection(request: LiveRustcRequest<'_>) -> Option<LiveRefusal> {
 /// dispatch, publication or installation. An unavailable remote lane never
 /// turns this preliminary check into local codegen cache authority.
 pub(super) fn remote_rejection(request: LiveRustcRequest<'_>) -> Option<LiveRefusal> {
-    rejection_for(request, true)
+    rejection_for(request, true, false)
 }
 
-fn rejection_for(request: LiveRustcRequest<'_>, remote: bool) -> Option<LiveRefusal> {
+/// Only the retained canonical Cargo unit capability can select this preflight.
+/// Primary-package environment, original lint settings and workspace cwd remain
+/// compiler inputs; the later pure planner and unit matcher grant execution.
+pub(super) fn workspace_rejection(request: LiveRustcRequest<'_>) -> Option<LiveRefusal> {
+    rejection_for(request, true, true)
+}
+
+fn rejection_for(
+    request: LiveRustcRequest<'_>,
+    remote: bool,
+    workspace: bool,
+) -> Option<LiveRefusal> {
     let mut names: Vec<&str> = request.env.iter().map(|(name, _)| name.as_str()).collect();
     names.sort_unstable();
     if let Some(pair) = names.windows(2).find(|pair| pair[0] == pair[1]) {
@@ -45,7 +56,7 @@ fn rejection_for(request: LiveRustcRequest<'_>, remote: bool) -> Option<LiveRefu
         "LD_AUDIT",
         "DYLD_INSERT_LIBRARIES",
     ] {
-        if names.contains(&name) {
+        if names.contains(&name) && !(workspace && name == "CARGO_PRIMARY_PACKAGE") {
             return Some(LiveRefusal::RefusedEnv(name.to_owned()));
         }
     }
@@ -64,14 +75,14 @@ fn rejection_for(request: LiveRustcRequest<'_>, remote: bool) -> Option<LiveRefu
     if env_value("CARGO_HOME").is_none() && env_value("HOME").is_none() {
         return Some(LiveRefusal::MissingEnv("HOME"));
     }
-    if env_value("CARGO_MANIFEST_DIR") != Some(request.cwd) {
+    if !workspace && env_value("CARGO_MANIFEST_DIR") != Some(request.cwd) {
         return Some(LiveRefusal::WorkingDirectory(request.cwd.to_owned()));
     }
     let invocation = match parse(request.argv, None) {
         Ok(invocation) => invocation,
         Err(error) => return Some(LiveRefusal::Unparseable(format!("{error:?}"))),
     };
-    if invocation.cap_lints.as_deref() != Some("allow") {
+    if !workspace && invocation.cap_lints.as_deref() != Some("allow") {
         return Some(LiveRefusal::NotDependencyCompile(
             "Cargo caps lints for external dependencies; this invocation does not",
         ));
@@ -249,6 +260,31 @@ mod tests {
                 assert!(plan_dependency_action(request, HOST).is_ok());
             }
         }
+    }
+
+    #[test]
+    fn workspace_preflight_preserves_primary_lints_and_workspace_cwd_without_relaxing_dependency_admission()
+     {
+        let (mut argv, mut env) = fixture("/__rabs/workspace/member");
+        argv.retain(|arg| arg != "--cap-lints=allow");
+        env.push(("CARGO_PRIMARY_PACKAGE".into(), "1".into()));
+        let request = LiveRustcRequest {
+            argv: &argv,
+            cwd: "/__rabs/workspace",
+            env: &env,
+        };
+        assert!(rejection(request).is_some());
+        assert!(remote_rejection(request).is_some());
+        assert_eq!(workspace_rejection(request), None);
+        env.push(("LD_PRELOAD".into(), "/unretained.so".into()));
+        assert!(
+            workspace_rejection(LiveRustcRequest {
+                argv: &argv,
+                cwd: "/__rabs/workspace",
+                env: &env,
+            })
+            .is_some()
+        );
     }
 
     #[test]

@@ -1303,10 +1303,126 @@ fn assert_answer(root: &Path, answer: u32, workspace_edit: bool) {
         root,
         "src/lib.rs",
         format!(
-            "const _: [(); {answer}] = [(); canonical_dep::answer() as usize];\npub fn answer()->u32 {{ canonical_dep::answer()+{} }}\n",
+            "#[cfg(not(feature=\"remote_workspace\"))]\ncompile_error!(\"selected workspace feature was lost\");\nconst _: &str = env!(\"CARGO_PRIMARY_PACKAGE\");\nconst _: &str = include_str!(\"../workspace-readme.txt\");\nconst _: [(); {answer}] = [(); canonical_dep::answer() as usize];\npub fn answer()->u32 {{ canonical_dep::answer()+{} }}\n",
             u32::from(workspace_edit)
         ),
     );
+}
+
+fn workspace_execution_feature(root: &Path) {
+    let manifest = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    write(
+        root,
+        "Cargo.toml",
+        format!("{manifest}\n[features]\nremote_workspace=[]\n"),
+    );
+    write(
+        root,
+        "workspace-readme.txt",
+        "retained workspace input outside src\n",
+    );
+    fs::create_dir_all(root.join("empty-workspace/nested")).unwrap();
+}
+
+/// Read the real production store only after the canonical driver has exited.
+/// A successful fresh workspace compile may retain CAS byte objects, but must
+/// never create an action publication, serving record or replay qualification.
+fn assert_fresh_workspace_execution(
+    root: &Path,
+    events: &[Value],
+    output: &str,
+    observed: &mut BTreeMap<String, BTreeSet<String>>,
+) -> String {
+    use rabs_cas::metadata_store::{RabsMetadataStore, SqlValue};
+
+    let offered = decisions(events, "remote-offer");
+    let key = offered
+        .get("canonical_app")
+        .unwrap_or_else(|| {
+            panic!("the actual workspace library was not offered remotely: {output}")
+        })
+        .clone();
+    assert!(
+        events.iter().any(|event| {
+            event["kind"] == "rabsd-remote-dependency-executed" && event["key"] == key
+        }),
+        "the workspace library did not complete through the worker: {output}"
+    );
+    assert!(
+        !decisions(events, "hit").contains_key("canonical_app"),
+        "workspace result was replayed: {output}"
+    );
+    assert!(
+        !decisions(events, "execute").contains_key("canonical_app"),
+        "workspace result used local cache capture: {output}"
+    );
+    let cas =
+        rabsd::janitor::store::mount_and_reconcile(&root.join("state/canonical-compile-v1/cas"))
+            .unwrap();
+    let mut store = cas.store().lock().unwrap();
+    assert!(
+        store.published_manifest_key_str(&key).unwrap().is_none(),
+        "workspace result was published"
+    );
+    assert!(
+        !store.has_serving_state_key(&key).unwrap(),
+        "workspace gained a serving record"
+    );
+    assert!(
+        !store.has_evidence_key(&key).unwrap(),
+        "workspace gained publication evidence"
+    );
+    assert!(
+        store
+            .query(
+                "SELECT attempt_hex FROM verification_samples WHERE action_key = ?1",
+                &[SqlValue::Text(key.clone())],
+            )
+            .unwrap()
+            .is_empty(),
+        "workspace gained replay verification samples"
+    );
+    assert!(
+        store
+            .query(
+                "SELECT decision FROM decision_receipts WHERE kind = ?1 AND subject = ?2",
+                &[
+                    SqlValue::Text(rabsd::coord::live_dependency::LIVE_TRANSCRIPT_RECEIPT.into()),
+                    SqlValue::Text(key.clone()),
+                ],
+            )
+            .unwrap()
+            .is_empty(),
+        "workspace transcript was indexed for cache replay"
+    );
+    let attempts = store
+        .query(
+            "SELECT a.id_hex FROM action_attempts a JOIN action_generations g \
+         ON a.generation_hex = g.id_hex WHERE g.action_key = ?1 ORDER BY a.id_hex",
+            &[SqlValue::Text(key.clone())],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            let [SqlValue::Text(attempt)] = row.as_slice() else {
+                panic!("unexpected workspace execution attempt row: {row:?}");
+            };
+            attempt.clone()
+        })
+        .collect::<BTreeSet<_>>();
+    assert!(
+        !attempts.is_empty(),
+        "workspace completion lacks an actual admitted attempt"
+    );
+    if let Some(previous) = observed.insert(key.clone(), attempts.clone()) {
+        assert!(attempts.is_superset(&previous));
+        assert_eq!(
+            attempts.len(),
+            previous.len() + 1,
+            "an identical workspace request must acquire a fresh attempt"
+        );
+    }
+    key
 }
 
 /// Validate the delivered user output, including a real executable consuming
@@ -1491,6 +1607,7 @@ enum GeneratedDependency {
 fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
     let (owner, mut profile) = native_fixture();
     profile["command"] = json!(command);
+    profile["selection"] = json!({"features":["remote_workspace"]});
     let build = command == "build";
     let first = owner.path().join("source-a");
     let second = owner.path().join("source-b");
@@ -1505,6 +1622,8 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
             generated_dependency(&second);
         }
     }
+    workspace_execution_feature(&first);
+    workspace_execution_feature(&second);
     assert_answer(&first, 42, false);
     assert_answer(&second, 42, true);
     let (mut worker, environment) = NativeWorker::start(owner.path());
@@ -1512,6 +1631,7 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
     let mut receipt: Option<Value> = None;
     let mut first_archives = None;
     let mut retained_targets = BTreeSet::new();
+    let mut workspace_attempts = BTreeMap::new();
     for number in 1..=3 {
         let (code, events, output) =
             run_with_environment(owner.path(), number, &profile, &environment);
@@ -1540,8 +1660,8 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
         let offered = decisions(&events, "remote-offer");
         assert_eq!(
             offered.len(),
-            2,
-            "both dependency nodes must use the actual worker: {output}"
+            3,
+            "both dependencies and the workspace library must use the actual worker: {output}"
         );
         assert!(
             offered.contains_key("canonical_leaf") && offered.contains_key("canonical_dep"),
@@ -1571,20 +1691,25 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
             )),
             "{output}"
         );
+        assert_fresh_workspace_execution(owner.path(), &events, &output, &mut workspace_attempts);
+        let dependency_keys = offered
+            .into_iter()
+            .filter(|(name, _)| name != "canonical_app")
+            .collect::<BTreeMap<_, _>>();
         if let Some(expected) = &first_keys {
             assert_eq!(
-                &offered, expected,
+                &dependency_keys, expected,
                 "fresh canonical targets split the worker key"
             );
         } else {
-            first_keys = Some(offered);
+            first_keys = Some(dependency_keys);
         }
         let next = worker.completed_receipt();
         if let Some(previous) = &receipt {
             assert!(
                 next["request_id"].as_u64().unwrap()
-                    >= previous["request_id"].as_u64().unwrap() + 2,
-                "each dependency must advance actual worker admission"
+                    >= previous["request_id"].as_u64().unwrap() + 3,
+                "both dependencies and the workspace library must advance actual worker admission"
             );
         }
         receipt = Some(next);
@@ -1595,51 +1720,68 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
         .filter(|event| event["kind"] == "worker-toolchain-acquired")
         .count();
     assert_eq!(
-        before_replay, 6,
+        before_replay, 9,
         "every qualifying production must reach the native worker executor"
     );
-    profile["source_root"] = json!(second);
-    let (code, events, output) = run_with_environment(owner.path(), 4, &profile, &environment);
-    assert_eq!(code, 0, "{output}");
-    if build {
-        let (target, archives) = delivered_build(owner.path(), 4, &events, 43);
-        assert!(retained_targets.insert(target));
+    // Repeat the unchanged workload after the dependencies qualify for cache
+    // serving, then relocate it and edit only the workspace library. Both must
+    // compile that library afresh while replaying exactly the same dependencies.
+    for (number, source, answer) in [(4, &first, 42), (5, &second, 43)] {
+        profile["source_root"] = json!(source);
+        let (code, events, output) =
+            run_with_environment(owner.path(), number, &profile, &environment);
+        assert_eq!(code, 0, "{output}");
+        if build {
+            let (target, archives) = delivered_build(owner.path(), number, &events, answer);
+            assert!(retained_targets.insert(target));
+            assert_eq!(
+                Some(&archives),
+                first_archives.as_ref(),
+                "warm replay must deliver the exact remotely compiled dependency archives"
+            );
+        }
         assert_eq!(
-            Some(&archives),
-            first_archives.as_ref(),
-            "warm replay must deliver the exact remotely compiled dependency archives"
+            decisions(&events, "hit"),
+            first_keys.clone().unwrap(),
+            "canonical dependency replay failed: {output}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["decision"] == "served")
+                .count(),
+            2,
+            "{output}"
+        );
+        let workspace_key = assert_fresh_workspace_execution(
+            owner.path(),
+            &events,
+            &output,
+            &mut workspace_attempts,
+        );
+        assert_eq!(
+            decisions(&events, "remote-offer"),
+            BTreeMap::from([("canonical_app".to_owned(), workspace_key)]),
+            "only the workspace library must execute while dependencies replay: {output}"
+        );
+        assert!(decisions(&events, "execute").is_empty(), "{output}");
+        let next = worker.completed_receipt();
+        assert!(
+            next["request_id"].as_u64().unwrap()
+                > receipt.as_ref().unwrap()["request_id"].as_u64().unwrap(),
+            "workspace execution reused an earlier worker receipt"
+        );
+        receipt = Some(next);
+        assert_eq!(
+            worker
+                .events()
+                .into_iter()
+                .filter(|event| event["kind"] == "worker-toolchain-acquired")
+                .count(),
+            before_replay + (number as usize - 3),
+            "each successful warm workload must perform one fresh workspace execution"
         );
     }
-    assert_eq!(
-        decisions(&events, "hit"),
-        first_keys.clone().unwrap(),
-        "relocated dependency replay failed: {output}"
-    );
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| event["decision"] == "served")
-            .count(),
-        2,
-        "{output}"
-    );
-    assert!(
-        decisions(&events, "remote-offer").is_empty() && decisions(&events, "execute").is_empty(),
-        "{output}"
-    );
-    assert_eq!(
-        worker.completed_receipt(),
-        receipt.unwrap(),
-        "cache replay executed a worker"
-    );
-    assert_eq!(
-        worker
-            .events()
-            .into_iter()
-            .filter(|event| event["kind"] == "worker-toolchain-acquired")
-            .count(),
-        before_replay
-    );
 
     if generated != GeneratedDependency::None {
         // This edit changes only the build script's workspace input. Package
@@ -1657,15 +1799,16 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
         );
     } else {
         source(&second, 41);
+        workspace_execution_feature(&second);
     }
     assert_answer(&second, 43, false);
-    let (code, events, output) = run_with_environment(owner.path(), 5, &profile, &environment);
+    let (code, events, output) = run_with_environment(owner.path(), 6, &profile, &environment);
     assert_eq!(
         code, 0,
         "changed dependency metadata must satisfy the new const result: {output}"
     );
     if build {
-        let (target, archives) = delivered_build(owner.path(), 5, &events, 43);
+        let (target, archives) = delivered_build(owner.path(), 6, &events, 43);
         assert!(retained_targets.insert(target));
         let previous = first_archives.as_ref().unwrap();
         if generated == GeneratedDependency::Consumer {
@@ -1692,9 +1835,10 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
     };
     assert_eq!(
         changed.len(),
-        changed_names.len(),
-        "changed dependency inputs must execute remotely: {output}"
+        changed_names.len() + 1,
+        "changed dependencies and the workspace library must execute remotely: {output}"
     );
+    assert_fresh_workspace_execution(owner.path(), &events, &output, &mut workspace_attempts);
     let first_keys = first_keys.unwrap();
     for name in changed_names {
         assert_ne!(
@@ -1726,8 +1870,8 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
     // This fixture's selected script deliberately panics. Cargo must actually
     // run it and preserve that failure, while every dependency cache attempt
     // remains under worker authority rather than local wrapper claims.
-    profile["selection"] = json!({"lib":true,"features":["optional_build"]});
-    let (code, events, output) = run_with_environment(owner.path(), 6, &profile, &environment);
+    profile["selection"] = json!({"lib":true,"features":["remote_workspace","optional_build"]});
+    let (code, events, output) = run_with_environment(owner.path(), 7, &profile, &environment);
     assert_ne!(
         code, 0,
         "the selected failing build script was skipped: {output}"
