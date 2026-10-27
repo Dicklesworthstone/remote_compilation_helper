@@ -9,6 +9,8 @@
 
 mod cache;
 
+pub use cache::{DEFAULT_SOURCE_CACHE_BYTES, MAX_SOURCE_CACHE_BYTES, SourceCache};
+
 #[cfg(test)]
 use rabs_sandbox::cargo_home::CARGO_HOME_SOURCE_VERSION;
 use rabs_sandbox::cargo_home::{CargoHomeProjection, PreparedCargoHome};
@@ -1086,11 +1088,15 @@ impl SourceOwner {
 pub struct SourceTransferState {
     pending: Option<SourceOwner>,
     input_budget: Option<Duration>,
-    #[cfg(test)]
-    cache_override: Option<cache::SourceCache>,
+    cache: Option<SourceCache>,
 }
 
 impl SourceTransferState {
+    pub(crate) fn with_cache(mut self, cache: Option<SourceCache>) -> Self {
+        self.cache = cache;
+        self
+    }
+
     /// A selected full-toolchain upload follows the source upload before
     /// execution admission. Both inputs retain one fixed combined budget from
     /// source-begin; progress never renews it. Ordinary source-only sessions
@@ -1138,14 +1144,7 @@ impl SourceTransferState {
             }
             let deadline = Instant::now() + self.input_budget.unwrap_or(UPLOAD_BUDGET);
             let cache = if allow_cached_files {
-                #[cfg(test)]
-                let configured = self
-                    .cache_override
-                    .clone()
-                    .map_or_else(cache::SourceCache::configured, |cache| Ok(Some(cache)));
-                #[cfg(not(test))]
-                let configured = cache::SourceCache::configured();
-                configured.map_err(|error| format!("source cache configuration: {error}"))?
+                self.cache.clone().map(|cache| cache.before(deadline))
             } else {
                 None
             };
@@ -1169,19 +1168,13 @@ impl SourceTransferState {
                 if file.len == 0 {
                     continue;
                 }
-                if let Some(bytes) = cache.as_ref().and_then(|cache| cache.load(&file)) {
-                    // Read and verify the COMPLETE cached object first. A miss
-                    // must leave staging untouched, not poison it mid-copy.
-                    for (index, chunk) in bytes.chunks(MAX_SOURCE_CHUNK).enumerate() {
-                        receiver
-                            .write_chunk(
-                                &file.path,
-                                index as u64 * MAX_SOURCE_CHUNK as u64,
-                                chunk,
-                                Sha256::digest(chunk).into(),
-                            )
-                            .map_err(|error| error.to_string())?;
-                    }
+                if let Some(snapshot) = cache.as_ref().and_then(|cache| cache.load(&file)) {
+                    // Lookup verifies a complete anonymous snapshot before any
+                    // receiver write. Large archives use a fixed-size buffer,
+                    // and later cache corruption cannot change this snapshot.
+                    snapshot
+                        .install(&mut receiver)
+                        .map_err(|error| error.to_string())?;
                     reused_bytes += file.len;
                 } else {
                     missing_files.push(file.path);
@@ -1430,7 +1423,7 @@ mod tests {
             std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         SourceTransferState {
-            cache_override: Some(cache::SourceCache::open(parent).unwrap()),
+            cache: Some(SourceCache::open(parent, DEFAULT_SOURCE_CACHE_BYTES).unwrap()),
             ..SourceTransferState::default()
         }
     }
@@ -2507,17 +2500,18 @@ mod tests {
     }
 
     #[test]
-    fn cold_upload_then_reopened_cache_reuses_private_bytes_but_still_requires_seal() {
+    fn large_archive_upload_then_reopened_cache_reuses_private_bytes_but_still_requires_seal() {
         use std::os::unix::fs::MetadataExt;
         let cache = tempfile::tempdir().unwrap();
-        let bytes: Vec<_> = (0..MAX_SOURCE_CHUNK + 7).map(|i| (i % 251) as u8).collect();
-        let manifest = projection(&[("src/lib.rs", &bytes, false), ("empty", b"", false)]);
+        let bytes: Vec<_> = (0..5 * 1024 * 1024 + 7).map(|i| (i % 251) as u8).collect();
+        let archive = "dependencies/0000/liblarge.rlib";
+        let manifest = projection(&[(archive, &bytes, false), ("empty", b"", false)]);
         let mut cold = cached_state(cache.path());
         let reply = cold.handle(&begin(&manifest, 7), true, false).unwrap();
-        assert_eq!(reply["missing_files"], json!(["src/lib.rs"]));
+        assert_eq!(reply["missing_files"], json!([archive]));
         assert_eq!(reply["source_reused_bytes"], 0);
         assert!(cold.handle(&seal(&manifest, 7), true, false).is_err());
-        upload(&mut cold, &manifest, 7, "src/lib.rs", &bytes);
+        upload(&mut cold, &manifest, 7, archive, &bytes);
         assert_eq!(
             cold.handle(&seal(&manifest, 7), true, false).unwrap()["sealed"],
             true
@@ -2539,7 +2533,7 @@ mod tests {
         assert_eq!(warm.pending.as_ref().unwrap().deadline, until);
         warm.handle(&seal(&manifest, 8), true, false).unwrap();
         let root = std::path::PathBuf::from(warm.prepared_path(&request, true).unwrap().unwrap());
-        assert_eq!(std::fs::read(root.join("src/lib.rs")).unwrap(), bytes);
+        assert_eq!(std::fs::read(root.join(archive)).unwrap(), bytes);
         assert_eq!(std::fs::read(root.join("empty")).unwrap(), b"");
         let cached = cache
             .path()
@@ -2547,12 +2541,61 @@ mod tests {
             .join(format!("{}.src", hex(&Sha256::digest(&bytes))));
         assert_ne!(
             std::fs::metadata(cached).unwrap().ino(),
-            std::fs::metadata(root.join("src/lib.rs")).unwrap().ino()
+            std::fs::metadata(root.join(archive)).unwrap().ino()
         );
         let owner = warm.take_prepared(&request).unwrap().unwrap();
         assert!(warm.prepared_path(&request, true).is_err());
         assert!(root.exists());
         drop(owner);
+    }
+
+    #[test]
+    fn corrupt_large_archive_is_a_clean_miss_before_any_receiver_write() {
+        use std::io::{Seek, SeekFrom, Write};
+        use std::os::unix::fs::PermissionsExt;
+        let cache = tempfile::tempdir().unwrap();
+        let bytes = vec![b'A'; 5 * 1024 * 1024 + 19];
+        let archive = "dependencies/0000/liblarge.rlib";
+        let manifest = projection(&[(archive, &bytes, false)]);
+        let mut cold = cached_state(cache.path());
+        cold.handle(&begin(&manifest, 31), true, false).unwrap();
+        upload(&mut cold, &manifest, 31, archive, &bytes);
+        cold.handle(&seal(&manifest, 31), true, false).unwrap();
+        drop(cold);
+        let path = cache
+            .path()
+            .join("source-files-v1")
+            .join(format!("{}.src", hex(&Sha256::digest(&bytes))));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut corrupt = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        corrupt.seek(SeekFrom::End(-1)).unwrap();
+        corrupt.write_all(b"B").unwrap();
+        drop(corrupt);
+
+        let mut next = cached_state(cache.path());
+        let reply = next.handle(&begin(&manifest, 32), true, false).unwrap();
+        assert_eq!(reply["missing_files"], json!([archive]));
+        assert_eq!(reply["source_reused_bytes"], 0);
+        let owner = next.pending.as_ref().unwrap();
+        assert_eq!(
+            std::fs::metadata(owner._directory.path().join("workspace").join(archive))
+                .unwrap()
+                .len(),
+            0
+        );
+        // A late bad byte cannot poison the receiver: the entire correct upload
+        // remains usable and replaces the corrupt cache object after sealing.
+        upload(&mut next, &manifest, 32, archive, &bytes);
+        assert_eq!(
+            next.handle(&seal(&manifest, 32), true, false).unwrap()["sealed"],
+            true
+        );
+        assert_eq!(
+            cached_state(cache.path())
+                .handle(&begin(&manifest, 33), true, false)
+                .unwrap()["source_reused_bytes"],
+            bytes.len()
+        );
     }
 
     #[test]
