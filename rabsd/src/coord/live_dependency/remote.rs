@@ -36,8 +36,10 @@ use rabs_sandbox::dependency_context::{
 };
 use rabs_sandbox::loader_directories::{LoaderDirectoryWitness, observe_loader_directories};
 use rabs_sandbox::runtime_cohort::observe_runtime_cohort;
+#[cfg(test)]
+use rabs_sandbox::toolchain_dataset::capture_toolchain;
 use rabs_sandbox::toolchain_dataset::{
-    PreparedToolchain, ToolchainIdentity, ToolchainLimits, capture_toolchain,
+    PreparedToolchain, ToolchainIdentity, ToolchainLimits, capture_toolchain_with_cloner,
 };
 use rabs_sandbox::toolchain_transfer::TOOLCHAIN_TRANSFER_VERSION;
 use serde_json::{Value, json};
@@ -631,12 +633,13 @@ impl RemoteDependencies {
                     capture_guard.verify_unchanged(&capture_compiler)?;
                     let directory =
                         toolchain_staging_directory(&state).map_err(|error| error.to_string())?;
-                    let image = capture_toolchain(
+                    let image = capture_toolchain_with_cloner(
                         capture_guard.sysroot(),
                         &directory.path().join("tree"),
                         None,
                         &ToolchainLimits::default(),
                         || stopped.load(Ordering::Acquire),
+                        rabs_cas::materialization::try_verified_reflink,
                     )
                     .map_err(|error| format!("capture complete original toolchain: {error}"))?;
                     capture_guard.verify_unchanged(&capture_compiler)?;
