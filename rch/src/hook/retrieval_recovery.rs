@@ -1844,7 +1844,7 @@ impl RecoverySession {
     pub(super) async fn verify_publication_suitability_with<F>(
         &mut self,
         expected_uid: u32,
-        mut observe: F,
+        observe: F,
     ) -> anyhow::Result<()>
     where
         F: FnMut(&Path) -> anyhow::Result<()> + Send + 'static,

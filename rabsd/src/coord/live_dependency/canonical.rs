@@ -24,6 +24,8 @@ const ROOTS: [&str; 5] = [
     "/__rabs/home",
 ];
 
+type DirectoryMappings = Vec<(Vec<u8>, Vec<u8>)>;
+
 #[derive(Debug)]
 struct Mount {
     visible: PathBuf,
@@ -547,7 +549,7 @@ impl CanonicalPaths {
 
     /// I/O-only dep-info validation mappings. The compiler's canonical bytes
     /// remain unchanged when installed for the retained Cargo namespace.
-    pub(crate) fn output_mappings(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+    pub(crate) fn output_mappings(&self) -> Result<DirectoryMappings, String> {
         self.mounts
             .iter()
             .map(|mount| {
