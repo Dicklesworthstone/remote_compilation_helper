@@ -559,16 +559,20 @@ async fn publication_suitability_probes_nearest_existing_prefix_without_creating
     std::fs::create_dir_all(&existing).unwrap();
     let local = existing.join("missing/nested/target");
     let (_directory, mut session, pipeline) = prepared_suitability_session(&local);
-    let mut observed_parent = None;
+    let observed_parent = Arc::new(std::sync::Mutex::new(None));
+    let observed_parent_for_obs = Arc::clone(&observed_parent);
     let uid = rustix::process::geteuid().as_raw();
     session
-        .verify_publication_suitability_with(uid, |probe| {
-            observed_parent = probe.parent().map(Path::to_path_buf);
+        .verify_publication_suitability_with(uid, move |probe| {
+            *observed_parent_for_obs.lock().unwrap() = probe.parent().map(Path::to_path_buf);
             Ok(())
         })
         .await
         .unwrap();
-    assert_eq!(observed_parent, Some(existing.canonicalize().unwrap()));
+    assert_eq!(
+        *observed_parent.lock().unwrap(),
+        Some(existing.canonicalize().unwrap())
+    );
     assert!(!existing.join("missing").exists());
     assert!(find_probe_files(&existing).is_empty());
 
@@ -777,10 +781,8 @@ async fn publication_suitability_refuses_replaced_probe_name_and_preserves_repla
     let moved_for_obs = moved.clone();
     let (_directory, mut session, _pipeline) = prepared_suitability_session(&local);
     let uid = rustix::process::geteuid().as_raw();
-    let mut probe_path = PathBuf::new();
     let error = session
         .verify_publication_suitability_with(uid, move |probe| {
-            probe_path = probe.to_owned();
             std::fs::rename(probe, &moved_for_obs)?;
             std::fs::write(probe, b"unowned replacement")?;
             Ok(())
