@@ -98,7 +98,11 @@ fn assert_acknowledged(session: &RecoverySession) {
 }
 
 fn assert_docs(session: &RecoverySession, count: usize) {
-    let phase = &session.recipe.phases[0];
+    assert_phase_docs(session, 0, count);
+}
+
+fn assert_phase_docs(session: &RecoverySession, index: usize, count: usize) {
+    let phase = &session.recipe.phases[index];
     assert!(phase.complete);
     assert!(phase.pending.is_none());
     assert_eq!(phase.published.len(), count);

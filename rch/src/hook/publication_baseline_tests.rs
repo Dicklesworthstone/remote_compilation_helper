@@ -535,8 +535,15 @@ async fn publication_suitability_allows_current_owner_and_preserves_full_publica
     assert!(!session.recipe.execution_started);
     assert_acknowledged(&session);
 
+    // The fixture's Cargo-default project phase precedes the result phase.
+    let phase_index = session
+        .recipe
+        .phases
+        .iter()
+        .position(|phase| phase.name == "result:doc")
+        .unwrap();
     session.staging_pipeline("result:doc", &pipeline).unwrap();
-    let stage = session.stage(0);
+    let stage = session.stage(phase_index);
     std::fs::create_dir_all(stage.join("doc")).unwrap();
     std::fs::write(stage.join(relative(0)), bytes(0)).unwrap();
     session.starting_execution().unwrap();
@@ -544,7 +551,7 @@ async fn publication_suitability_allows_current_owner_and_preserves_full_publica
     let mut reopened = reload(&session);
     reopened.publish("result:doc").await.unwrap();
     reopened.returned(0).unwrap();
-    assert_docs(&reopened, 1);
+    assert_phase_docs(&reopened, phase_index, 1);
     assert_eq!(reopened.recipe.returned, Some(0));
 }
 
@@ -576,8 +583,14 @@ async fn publication_suitability_probes_nearest_existing_prefix_without_creating
     assert!(!existing.join("missing").exists());
     assert!(find_probe_files(&existing).is_empty());
 
+    let phase_index = session
+        .recipe
+        .phases
+        .iter()
+        .position(|phase| phase.name == "result:doc")
+        .unwrap();
     session.staging_pipeline("result:doc", &pipeline).unwrap();
-    let stage = session.stage(0);
+    let stage = session.stage(phase_index);
     std::fs::create_dir_all(stage.join("doc")).unwrap();
     std::fs::write(stage.join(relative(0)), bytes(0)).unwrap();
     std::fs::create_dir_all(&local).unwrap();
@@ -585,7 +598,7 @@ async fn publication_suitability_probes_nearest_existing_prefix_without_creating
     session.starting_execution().unwrap();
     session.completed(0).unwrap();
     session.publish("result:doc").await.unwrap();
-    assert_docs(&session, 1);
+    assert_phase_docs(&session, phase_index, 1);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -614,7 +627,17 @@ async fn publication_suitability_refuses_dangling_symlink_prefix_before_executio
         before_recipe
     );
     assert_eq!(std::fs::read(&session.writer.path).unwrap(), before_disk);
-    assert!(cancel_preparation(&session.writer).await.unwrap());
+    // The refused session is still cancellable preparation: the cancel path
+    // journals the cancellation before its remote half, which this fixture's
+    // unresolvable worker host must fail.
+    let error = cancel_preparation(&session.writer).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("cannot cancel durable source intent"),
+        "{error:#}"
+    );
+    assert!(load_recipe(&session.writer).unwrap().preparation_cancelled);
 }
 
 #[tokio::test(flavor = "current_thread")]
