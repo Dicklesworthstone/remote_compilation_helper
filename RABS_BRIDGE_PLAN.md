@@ -1,6 +1,200 @@
 # RABS Bridge Plan — From Proven Library to Living System
 
-## Reality check and execution order — October 14, 2026
+## Reality check and execution order — October 30, 2026
+
+**Source assessed:** `7ae3f5fe0cf4a4ca533c235e9e1d89dbfd413ff3`.
+This section supersedes the older assessments below. Its consumers are the
+operator deciding whether to enable RABS and agents implementing the original
+milestones. It addresses the observed mismatch between closed milestones and
+undelivered or unqualified product acceptance. Replace its current-state claims
+when a later dated, source-bound execution changes them; preserve the original
+requirements and historical evidence.
+
+**Verdict: RABS contains substantial runnable software, including actual
+dependency serving and canonical worker execution. It is not yet the finished,
+deployed, fleet-wide acceleration system in the master plan.** A closed task
+graph is particularly misleading here. At intake, `br stats --json` reported
+2,218 issues: 2,207 closed, six open and five in progress. All RABS program and
+milestone beads were closed. A full-status text search for RABS returned 598
+issues, 597 closed and one unrelated Darwin-routing issue in progress; this is
+a lexical search count, not a complete membership denominator.
+
+### What exists, and what that does not establish
+
+| # | Original testable goal | Current evidence and boundary | Status / owner |
+|---|---|---|---|
+| 1 | Conventional RCH offloads actual jobs and preserves ownership | Installed client and daemon are 2.1.34; the live Mac daemon reports 17 configured workers, 15 healthy, 43 effective slots and 35 available at observation. Three workers have critical disk pressure. A source-ownership refusal is an infrastructure refusal, not a RABS test result. | Operational, degraded fleet; existing conventional RCH issues remain |
+| 2 | Boot real wrapper, edge/coordinator and worker processes | `rabsd/src/main.rs`, the Asupersync runtime adapter and worker binaries are real. Ordinary daemon dependency serving defaults off. No RABS executables resolved on the Mac or the checked `trj` login PATH, and no RABS process was observed on that worker. This does not inventory every fleet host. | Implemented; deployed serving unestablished / S7 |
+| 3 | Earn automatic dependency hits from real compiler results | `edge/server/rustc_request.rs` drives consent, capture ACK, publication and installation through `coord/live_dependency.rs`. Local registry/vendor paths and canonical worker-produced metadata/archives have real Cargo acceptance fixtures. The ordinary local lane is explicitly unsandboxed and separately keyed. | Runnable opt-in class / M4 |
+| 4 | Execute canonical Cargo on an authenticated worker | `cargo-rabs --rabs-canonical`, prepared jobs, `secure_worker_delivery` and `rabs-wkr` implement capture, mTLS/ATP, execution and verified delivery. This whole-Cargo profile is explicitly execution-only. | Implemented; full acceptance unqualified / M9 |
+| 5 | Distribute dependency units to workers and replay their results | `coord/live_dependency/remote.rs` and `remote_dependency_transport.rs` bind pinned workers, closed inputs, execution and result installation. Real ignored fixtures cover a Cargo dependency DAG and a two-worker pool. A loopback authenticated worker process is real execution, but is not multi-host fleet proof. | Implemented; live qualification needed / M4, M6 |
+| 6 | Serve workspace rustc results across worktrees | `coord/canonical_local.rs` emits `workspace_cache:false`; supported workspace requests execute afresh. Private Cargo target restoration may make Cargo report Fresh, but does not publish a workspace action-cache result. | Partial: execution and private freshness / M10 |
+| 7 | Cache native subcompiles and final links | Native input/key modules and captured static-archive support exist. The documented per-unit lane excludes final linking; final linking through Cargo is not an exact-link cache. M5's close reason instead cites dependency offload. | Product integration gap / M5 |
+| 8 | Cache build-script runs with complete effects | Config-only reuse and generated-input capture have fixtures. They do not establish general BuildScriptRun interception, complete post-state replay, stable/beta/nightly parity or the observed-registry >80% target. `docs/rabs-n001-feasibility-matrix.md` retains adverse shim observations. | Restricted capability / M11 |
+| 9 | Serve admitted test results safely | The canonical driver explicitly reports `test_result_cache:false`, and Test/Run/Bench bodies execute on every request. Eligibility/runner libraries and compiling test binaries are not test-result serving. | Product integration gap / M12 |
+| 10 | Restore nearest compatible incremental ancestry with positive ROI | Private target seed capture/restoration is real. `edge/snapshot_lineage.rs` models requested/resolved source lineage; that is not the full portable incremental snapshot/ancestry program or its 3x branch gate. | Partial / M13 |
+| 11 | Watch edits/git events, prewarm and promote real actions | `CoordLive` exposes speculation/prewarm methods, but the searched call sites for `handle_git_prewarm_event`, `submit_default_on_speculation` and `publish_ci_canonical_prewarm` are definitions and tests. No production event source was found in the audited executable paths. | Library capabilities; wiring/ROI gap / M14 |
+| 12 | Explain live decisions and deliver `rch advise` | `rch why` accepts explicit prior/current JSON or a refusal code. `rch advise --help` is an unknown subcommand, and the source CLI has no Advise variant. Key-analysis libraries are not a delivered advice command. | Partial / M15 |
+| 13 | Fleet authority, cross-edge singleflight and root permits | Local coordinator actors, admission and pool ownership exist. Canonical-local operations construct their own coordinator. Two workers are not two edge hosts sharing one authoritative action lineage. | Cross-edge integration/proof gap / M6 |
+| 14 | Native transport cutover with control isolation and data advantage | `worker_transport.rs` uses real ATP frames over native Asupersync mutual TLS. QUIC reactor/batcher types cited by the M7-M9 closure occur in `rabs-protocol/object_transfer.rs` definitions/tests, not the audited worker transport. Full control-under-bulk, WAN recovery and rsync comparison acceptance remain necessary. | Partial / M7, M8 |
+| 15 | Meet the original quantitative performance gates | `benchmarks/GATE_LEDGER.md` still marks eight of eleven rows PENDING, including hit latency, miss overhead, agent loops, storm, branch ping-pong, cold workspace and served fraction. Layer-0/sccache numbers are baselines, not RABS wins. Its in-process metadata claim is not a substitute for a timed production lookup measurement. | Unproven / `bd-yb4ib`, `bd-hjhe3`, `bd-3wscg` |
+| 16 | Ship the tested RABS tools together | Main's release workflow and `install.sh --with-rabs` contain packaging support. The actual latest published v2.1.34 x86_64 GNU tarball lists only `rch`, `rchd`, `rch-wkr`. Its revision is `ff152a046086f26845cbd4e9b0541a7b782fc64f`, 415 commits behind the assessed source. Source packaging is not shipped packaging. | Release gap / S7 (`bd-n8qt3`) |
+| 17 | Qualify safety and rollout with production soak | S8's close reason cites seven chaos tests and component/Cargo suites, not its 24-hour shadow soak or the bridge's continuous shadow-week acceptance. No such new soak was performed by this audit. | Proof gap / S8 (`bd-rb754`) |
+| 18 | Pursue frontier features only after positive evidence | M16's closure cites an optional C/C++ compile plane, rather than its hypothesis/benchmark/proceed/kill review. Frontier candidates remain optional and must not block or replace core delivery. | Decision/evidence gap / M16 |
+
+The executable paths inspected are substantial implementations, not a collection
+of `todo!()` bodies. The central failure mode is **proof-class inflation**:
+component arithmetic, fixture outcomes, existing private Cargo freshness and
+closed descendants are repeatedly credited as full live product acceptance.
+For example, M12's close reason labels governed build scripts as M12, while
+the original bead is explicitly test-result caching. Preserve its original
+description and reopen its unmet acceptance rather than rename the vision.
+
+### Fresh execution and retained evidence
+
+The complete project AGENTS and README were read. The referenced local
+`/data/projects/AGENTS.md` is absent; the actual Mac parent guidance and the
+checked Linux worker's suite guidance were read. The Mac Data-volume
+`sbh check --need 20G` refused on its percentage threshold; the external
+`/Volumes/trj-data` and worker `/data` checks both passed. No heavy local
+compilation, deletion, daemon restart or installation was performed.
+
+The first strict-remote attempt to run `scripts/test_rabs_live.py` on `trj`
+ended with exit 103 before compilation because an existing durable source
+owner overlaps the ordinary mirror. Its claim was left intact. A second
+attempt combined `--clean-overlay` and `--job`; the CLI refused that combination
+with exit 2. Neither is a test pass or a product-test failure.
+
+The supported alternative uses the exact committed tree and an external local
+target destination:
+
+```sh
+CARGO_TARGET_DIR=/Volumes/trj-data/rabs-reality-20261030-target \
+RCH_REQUIRE_REMOTE=1 RCH_WORKER=trj RCH_BUILD_SLOTS=4 \
+  rch exec --base 7ae3f5fe0cf4a4ca533c235e9e1d89dbfd413ff3 \
+  --clean-overlay --no-overlay -- cargo test --locked \
+  -p rabs-wrap --test live_cargo_worktrees -- --nocapture --test-threads=2
+```
+
+Its transcript is retained at
+`/Volumes/trj-data/rabs-reality-20261030-cargo-worktrees.log`.
+Execution results will be recorded here after the terminal outcome; a running
+compiler is not a passed suite. The companion daemon is built by the suite's
+existing Cargo-artifact resolver at the same source/profile/target, rather
+than selected from PATH or a guessed installed binary.
+
+The independent launcher-contract selection was also executed against that
+frozen worker source:
+`python3 -I -S scripts/tests/test_cargo_rabs_canonical.py -v` completed
+**88/88 tests, exit 0, 323.675 seconds** on `trj`. This suite uses an explicit
+native-driver double: it proves exec/filesystem/argv/signal/recovery handoff,
+not Cargo compilation, TLS, namespace isolation or a cache hit. Transcript:
+`/Volumes/trj-data/rabs-reality-20261030-launcher-linux.log`, SHA-256
+`9edd77209e82beed3e6847f473d18fab471db9c9519d49ffe1f1bef88d7bcff6`.
+The earlier Mac run executed 88 tests and exited 1 (95 failing subcases and
+32 errors); its positive canonical cases hit the documented Linux-only
+preparation/recovery refusal. It is retained as
+`/Volumes/trj-data/rabs-reality-20261030-launcher.log`, not relabeled a Linux
+product regression or silently discarded.
+
+A matching three-binary build requested while the first lane held worker
+capacity refused with exit 103 / `queue_timeout`; it compiled nothing. A
+capacity refusal is not a failed RABS test. The test host reports substantial
+CPU contention, so elapsed times from this window cannot qualify performance.
+The same native suite was requested on `vmi1149989`: the first request refused
+before admission because its four-core estimate exceeded two slots; an explicit
+`-j 2` request then queued and timed out with exit 103. Neither ran tests. The
+original `trj` run remains owned as build `30087403704156295`; it was still
+compiling its pinned daemon dependencies at this observation. Observe that
+original job rather than submit another request to infer its outcome.
+
+During the audit, origin advanced to `665b3fe33de65c3d120678ca91a561285553389a`.
+Its native-input modeling adds retained foreign build-script roots and key/view
+validation, explicitly preserving execution-only workspace actions. Its commit
+reports library tests and says full namespace tests still require a capable
+host. That delta does not close exact-link, workspace/test-result serving,
+cross-edge, rollout or performance gaps above. The native test already running
+remains frozen to `7ae3f5fe`; it cannot qualify the added native-root feature.
+
+### Bridge order and original bead acceptance
+
+**Completing the 11 issues open at intake would not close the RABS vision.**
+They concern conventional RCH publication fixtures, native portability, Darwin
+placement and storage retention. Most RABS gaps have historical beads, but no
+open owner. Reopen the original milestones and probes with these observations;
+retain completed implementation children and every original acceptance clause.
+
+1. **Qualify the narrow dependency product first (M4, S7, S8).** Run unchanged
+   real Cargo cross-worktree checks, then the canonical metadata/archive worker
+   fixtures, source/env/toolchain/dependency invalidation and installed-output
+   parity. Bind matching binaries and source. A stock comparison must be in the
+   same invocation. Publish the complete tested toolset as an opt-in canary;
+   validate the actual downloaded archive, then fresh installed doctor and
+   execution, followed by the original soak. Preserve old active generations.
+2. **Connect edge hosts to one authority (M6), then qualify transport (M7/M8).**
+   Reuse `CoordLive` actors and the existing worker protocol; do not build a
+   second scheduler. Two independently launched edge hosts must join one key
+   and primary lineage, cancel independently, retain root/jobserver permits,
+   survive coordinator restart and reject stale offers. Then test bounded
+   control latency under congested source/artifact transfer, partition/resume,
+   corruption and ATP-versus-rsync equality/cost on actual distinct hosts.
+3. **Make each original W2 target an actual gate.** `bd-yb4ib` owns <50ms hit
+   and <2% admitted-action miss overhead; `bd-hjhe3` owns the 15-agent >=3x
+   storm; `bd-3wscg` owns >=3x median and >=2x p90 agent loops. Retain raw
+   A/A and paired incumbent/candidate results, equal outputs and diagnostics,
+   cold/warm placement, queue/transfer costs and a declared workload denominator.
+   An observed loss stays a loss. Do not weaken targets, change corpus after
+   seeing outcomes, or count self-speedup/Layer-0 data as a RABS win.
+4. **Expand served classes through their existing owners (M5, M10-M12).** Wire
+   native/header/link closure and complete result replay; then canonical
+   workspace minimal-closure publication and provisional lineage; then governed
+   build-script post-state and admitted test-result serving. Each class needs
+   earned compiler/runner evidence, source/data/negative-input miss twins,
+   cancellation/failure/partial-delivery tests and stock differential outputs.
+   A restricted execution-only lane remains useful, but does not close serving.
+5. **Earn state/intelligence/frontier authority (M13-M16).** Connect real
+   ancestry selection and immutable private snapshot clones to branch traces;
+   connect watcher/git/CI events to existing actors and measure saved latency
+   minus wasted work; expose receipt-backed `rch why`/`rch advise` with actual
+   compiler-second attribution. Use each frontier item's original proceed/kill
+   criteria. Explicit evidence-based deferral is valid; substituting an unrelated
+   implemented feature is not. These optional features never preempt core gates.
+
+Every implementation change includes its unit, negative and real E2E proof in
+the same original work item. Existing tests should be extended rather than
+adding another status framework. Logs must distinguish action identity,
+attempt, worker, publication, subscriber delivery and terminal exit; credentials
+and raw private environments stay out of public evidence.
+
+### Ambition and refinement decisions
+
+Two ambition passes strengthened the bridge without changing the vision:
+first, require one delivered vertical dependency slice rather than a green
+library graph; second, require two edge hosts and a live paired incumbent so
+local cache reuse cannot be mistaken for fleet acceleration. Five refinement
+passes cover (1) original milestone-to-evidence mismatches, (2) shipped versus
+main and host eligibility, (3) input invalidation and delivery/recovery twins,
+(4) earned sampling/soak and equal-work performance denominators, and (5)
+dependency cycles and redundant work. Keep existing original owners; no new
+parallel milestone hierarchy is needed. Final graph validation and fresh test
+outcomes belong to this section's execution update, not to a waived gate.
+
+Nineteen original issues were reopened with self-contained implementation and
+unit/negative/E2E acceptance notes; no new issue hierarchy was created. M4 also
+depends explicitly on its existing hit/miss-performance probe `bd-yb4ib`.
+`br dep cycles --json` reports zero active cycles. Validation with the current
+`~/.local/bin/bv`, explicitly selecting `.beads/issues.jsonl`, loaded all
+2,218 records with zero errors/skips and found 2,550 edges with no cycles.
+The older Homebrew `bv` silently omits the five `docs` records, so its 2,213-row
+view is not the authoritative denominator. The validated graph has 25 open,
+five in-progress and 2,188 closed issues; S7 is its top actionable RABS pick.
+`git diff --check` passes. Scoped UBS on the two changed Markdown/JSONL files
+returns 3 because it supports neither language and ran no scanner; this is
+not a code-scan pass. No Rust or other executable source was changed by the
+assessment. Concurrent conventional-RCH commits after the frozen source do
+not change the RABS files assessed or the source selected for the live test.
+
+## Previous assessment — October 14, 2026
 
 This dated assessment updates the September 26 one against `main` @ `a6df23de`
 and shipped `v2.1.22` (`96a144b50904`, October 13, 2026). It is written for the
