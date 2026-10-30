@@ -116,7 +116,10 @@ def finish(status, message=None):
 
 try:
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
-    signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
+    # Keep child notifications blocked only in the non-reaping observer.
+    # Timers, shells and tools in this new session must receive their own
+    # child-exit signals even if our SSH parent inherited a blocked mask.
+    signal.pthread_sigmask(signal.SIG_SETMASK, original_mask - {signal.SIGCHLD})
     os.setsid()
     group = os.getpid()
     if os.getpgrp() != group:

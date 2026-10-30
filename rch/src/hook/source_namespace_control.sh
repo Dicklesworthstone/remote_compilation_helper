@@ -1,14 +1,23 @@
 # Fixed command argument; the namespace program stays on stdin. This is only
-# pre-intent namespace setup or terminal cancellation metadata, never source
-# tree access or a build workload. Both require settled descendant teardown.
+# namespace setup or finite source-ownership metadata, never a build workload.
+# Every result requires settled descendant teardown, including empty replies.
 set -eu
 rch_control_ready=${1:-RCH_TOPOLOGY_OK}
 rch_control_alternate=
+rch_control_format='%s\n'
 case "$rch_control_ready" in
     RCH_TOPOLOGY_OK|RCH_SOURCE_CANCELLATION_SETTLED) ;;
     RCH_SOURCE_AUTHORITY_NAMESPACE)
         rch_control_ready='RCH_SOURCE_AUTHORITY_NAMESPACE current'
         rch_control_alternate='RCH_SOURCE_AUTHORITY_NAMESPACE legacy' ;;
+    RCH_SOURCE_INTENT_CANCEL)
+        rch_control_ready=owned; rch_control_alternate=unowned; rch_control_format='%s' ;;
+    RCH_SOURCE_INTENT_RELEASED)
+        rch_control_ready=released; rch_control_alternate=pending; rch_control_format='%s' ;;
+    RCH_SOURCE_INTENT_CANCELLED)
+        rch_control_ready=cancelled; rch_control_alternate=pending; rch_control_format='%s' ;;
+    RCH_SOURCE_INTENT_FINISHED)
+        rch_control_ready=; rch_control_format='%s' ;;
     *) printf '%s\n' 'RCH: invalid metadata control result marker' >&2; exit 73 ;;
 esac
 # Native fallback for workers without GNU coreutils (including stock macOS).
@@ -136,7 +145,9 @@ except (OSError, ValueError) as error:
 
 if timer == 0:
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
-    signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
+    # Only the observer blocks child notifications. An inherited blocked
+    # SIGCHLD must not leak into the timer or shells waiting on descendants.
+    signal.pthread_sigmask(signal.SIG_SETMASK, original_mask - {signal.SIGCHLD})
     try:
         os.execvp(sys.argv[2], sys.argv[2:])
     except OSError:
@@ -234,6 +245,7 @@ control=$1
 observer=$2
 ready=$3
 alternate=$4
+reply_format=$5
 # Prove that the direct parent leads a private process group BEFORE
 # installing a group-wide kill trap or reading any namespace program. A timer
 # wrapper using --foreground must not turn "kill 0" into a kill of the observer,
@@ -293,14 +305,14 @@ fi
 # An ordinary refusal may have printed readiness before failing. Preserve its
 # exit but never publish that marker. Successful evidence must match bytewise.
 [ "$status" -eq 0 ] || finish "$status"
-if ! printf "%s\n" "$ready" | cmp -s - "$control/stdout"; then
-    [ -n "$alternate" ] && printf "%s\n" "$alternate" | cmp -s - "$control/stdout" || {
+if ! printf "$reply_format" "$ready" | cmp -s - "$control/stdout"; then
+    [ -n "$alternate" ] && printf "$reply_format" "$alternate" | cmp -s - "$control/stdout" || {
         printf "%s\n" "RCH: namespace control returned invalid readiness" >&2
         exit 73
     }
 fi
 finish 0
-' rch-namespace-monitor "$control" "$$" "$rch_control_ready" "$rch_control_alternate" <&3 3<&- &
+' rch-namespace-monitor "$control" "$$" "$rch_control_ready" "$rch_control_alternate" "$rch_control_format" <&3 3<&- &
 monitor=$!
 exec 3<&-
 set +e
@@ -329,6 +341,7 @@ trap "while :; do sleep 1; done" HUP INT TERM PIPE
 control=$1
 ready=$2
 alternate=$3
+reply_format=$4
 IFS= read -r status < "$control/result" || exit 73
 case "$status" in ""|*[!0-9]*) exit 73 ;; esac
 [ "${#status}" -le 3 ] && [ "$status" -le 255 ] || exit 73
@@ -338,11 +351,11 @@ printf "%s\n" "$status" | cmp -s - "$control/result" || exit 73
 [ "$(wc -c < "$control/stderr")" -le 65536 ] || exit 73
 cat -- "$control/stderr" >&2 || exit 73
 [ "$status" -eq 0 ] || exit "$status"
-if ! printf "%s\n" "$ready" | cmp -s - "$control/stdout"; then
-    [ -n "$alternate" ] && printf "%s\n" "$alternate" | cmp -s - "$control/stdout" || exit 73
+if ! printf "$reply_format" "$ready" | cmp -s - "$control/stdout"; then
+    [ -n "$alternate" ] && printf "$reply_format" "$alternate" | cmp -s - "$control/stdout" || exit 73
 fi
 cat -- "$control/stdout"
-' rch-namespace-delivery "$control" "$rch_control_ready" "$rch_control_alternate" </dev/null &
+' rch-namespace-delivery "$control" "$rch_control_ready" "$rch_control_alternate" "$rch_control_format" </dev/null &
 delivery=$!
 set +e
 # A foreground timer killed during delivery makes the observer shell print

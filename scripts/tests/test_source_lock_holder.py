@@ -133,8 +133,15 @@ class Holder:
 
     def finish(self):
         if self.process.stdin is not None:
-            self.process.stdin.close()
-            self.process.stdin = None
+            try:
+                self.process.stdin.close()
+            except BrokenPipeError:
+                # Cancellation may close the remote reader while the last
+                # heartbeat is buffered. Still inspect its real exit status,
+                # output and retained ownership below.
+                pass
+            finally:
+                self.process.stdin = None
         return self.process.communicate(timeout=5)
 
     def failure(self):
@@ -827,6 +834,37 @@ class SourceLockHolderTests(unittest.TestCase):
                          (0, (release + "\n").encode(), b""))
         self.assertEqual(receipt.read_text(), release + "\n")
         self.assertEqual(claim.read_text(), "durable owner\n")
+        self.assertTrue(available(lock))
+
+    def test_session_descendant_receives_child_exit_after_inherited_blocked_sigchld(self):
+        env = self.session_python_environment(
+            "signal.signal(signal.SIGCHLD, signal.SIG_IGN)\n"
+            "signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGCHLD})")
+        lock = self.root / "child-signal.lock"
+        release = "RCH_SOURCE_AUTHORITY_RELEASE:abc-123"
+        program = (
+            "import os,signal,sys,time\n"
+            "observed=[]\n"
+            "signal.signal(signal.SIGCHLD,lambda *_: observed.append(True))\n"
+            "child=os.fork()\n"
+            "if child==0: os._exit(0)\n"
+            "deadline=time.monotonic()+1\n"
+            "while not observed and time.monotonic()<deadline: time.sleep(0.01)\n"
+            "os.waitpid(child,0)\n"
+            "if not observed: sys.exit('child completion signal remained blocked')\n"
+            "print('READY',flush=True)\n"
+            "request=sys.stdin.readline()\n"
+            "if request!={!r}: sys.exit(9)\n"
+            "print(request,end='',flush=True)\n"
+        ).format(release + "\n")
+        terminal = "exec " + shlex.join([sys.executable, "-I", "-S", "-c", program])
+        holder = self.start([("x", lock)], terminal=terminal, session_idle=90, env=env)
+        self.assertEqual(holder.line(), b"READY")
+        self.assertFalse(available(lock))
+        holder.send(release + "\n")
+        stdout, stderr = holder.finish()
+        self.assertEqual((holder.process.returncode, stdout, stderr),
+                         (0, (release + "\n").encode(), b""))
         self.assertTrue(available(lock))
 
     def test_session_monitor_stopped_before_setsid_is_killed_without_admission(self):

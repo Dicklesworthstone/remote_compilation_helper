@@ -210,9 +210,10 @@ class SourceNamespaceControlTests(unittest.TestCase):
                     "RCH_TIMER_CALLS": str(self.calls)}
         self.script = CONTROL.read_text()
 
-    def run_control(self, program):
+    def run_control(self, program, contract=None):
         started = time.monotonic()
-        result = subprocess.run([SHELL, "-c", self.script], input=program.encode(),
+        script = ("set -- " + shlex.quote(contract) + "\n" if contract else "") + self.script
+        result = subprocess.run([SHELL, "-c", script], input=program.encode(),
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 env=self.env, timeout=5, check=False)
         self.assertLess(time.monotonic() - started, 3, result.stderr)
@@ -279,6 +280,54 @@ class SourceNamespaceControlTests(unittest.TestCase):
         result = self.run_control(program)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, b"RCH_TOPOLOGY_OK\n")
+
+    def test_source_metadata_verdicts_preserve_exact_raw_bytes(self):
+        for contract, replies in (("RCH_SOURCE_INTENT_CANCEL", ("owned", "unowned")),
+                                  ("RCH_SOURCE_INTENT_RELEASED", ("released", "pending")),
+                                  ("RCH_SOURCE_INTENT_CANCELLED", ("cancelled", "pending")),
+                                  ("RCH_SOURCE_INTENT_FINISHED", ("",))):
+            for reply in replies:
+                with self.subTest(contract=contract, reply=reply):
+                    self.setUp()
+                    result = self.run_control("printf %s " + shlex.quote(reply) + "\n", contract)
+                    self.assertEqual((result.returncode, result.stdout, result.stderr),
+                                     (0, reply.encode(), b""))
+
+    def test_source_metadata_extra_missing_or_failed_verdict_never_acknowledges(self):
+        for contract, response in (("RCH_SOURCE_INTENT_CANCEL", ""),
+                                   ("RCH_SOURCE_INTENT_CANCEL", "owned\\n"),
+                                   ("RCH_SOURCE_INTENT_RELEASED", "released\\0"),
+                                   ("RCH_SOURCE_INTENT_CANCELLED", "cancelledpending"),
+                                   ("RCH_SOURCE_INTENT_FINISHED", "finished")):
+            with self.subTest(contract=contract, response=response):
+                self.setUp()
+                result = self.run_control("printf " + shlex.quote(response) + "\n", contract)
+                self.assertEqual((result.returncode, result.stdout), (73, b""), result.stderr)
+        self.setUp()
+        result = self.run_control("printf owned; exit 75\n", "RCH_SOURCE_INTENT_CANCEL")
+        self.assertEqual((result.returncode, result.stdout), (75, b""), result.stderr)
+        self.setUp()
+        result = self.run_control("exit 73\n", "RCH_SOURCE_INTENT_FINISHED")
+        self.assertEqual((result.returncode, result.stdout), (73, b""), result.stderr)
+
+    def test_cancel_waiter_cannot_publish_after_client_deadline_and_unlock(self):
+        lock = self.root / "activity.lock"
+        publication = self.root / "late-cancellation"
+        with lock.open("a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            program = ("echo $$ > " + shlex.quote(str(self.root / "cancel-waiter.pid")) +
+                       "\nexec " + FLOCK + " -x -- " + shlex.quote(str(lock)) + " sh -c " +
+                       shlex.quote("printf fenced > " + shlex.quote(str(publication)) +
+                                   "; printf owned"))
+            result = self.run_control(program, "RCH_SOURCE_INTENT_CANCEL")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, b"")
+            self.assertTrue((self.root / "cancel-waiter.pid").exists())
+            self.assert_no_control_processes()
+        time.sleep(0.2)
+        self.assertFalse(publication.exists())
+        with lock.open("a") as probe:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_missing_timer_refuses_before_the_program_runs(self):
         empty_path = self.root / "no-tools"
@@ -375,7 +424,10 @@ class SourceNamespaceControlTests(unittest.TestCase):
             with self.subTest(stdout=stdout, stderr=stderr):
                 self.setUp()
                 result = self.run_control(self.sleeper(stdout, stderr) +
-                                          " &\nprintf 'RCH_TOPOLOGY_OK\\n'\n")
+                                          " &\nwhile [ ! -s " +
+                                          shlex.quote(str(self.root / "sleeper.pid")) +
+                                          " ]; do sleep 0.01; done\n"
+                                          "printf 'RCH_TOPOLOGY_OK\\n'\n")
                 self.assertTrue((self.root / "sleeper.pid").exists(), "descendant must actually start")
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(result.stdout, b"")
