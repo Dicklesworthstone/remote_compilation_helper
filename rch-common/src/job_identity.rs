@@ -1412,6 +1412,55 @@ impl DurableJobLease {
     }
 }
 
+/// Check retirement of the resources declared by a source-recovery recipe.
+///
+/// Older recipes may omit retirement flags for a pair or tree they never
+/// owned. Treat those absent resources as requiring no release proof, without
+/// changing the original JSON. A declared resource still requires an exact
+/// boolean acknowledgement; malformed fields never establish its absence.
+/// This checks resource structure and applicability only. Callers must also
+/// validate the recipe identity, failed result, journal ownership and exact
+/// worker cancellation evidence before acknowledging settlement.
+#[must_use]
+pub fn source_recovery_resources_retired(recipe: &serde_json::Value) -> bool {
+    use serde_json::Value;
+
+    let Some(object) = recipe.as_object() else {
+        return false;
+    };
+    // Keep this independent of the dispatcher's native path syntax. Worker
+    // paths and tokens are checked semantically by their existing protocols.
+    let valid_text = |value: &Value| {
+        value
+            .as_str()
+            .is_some_and(|text| !text.is_empty() && !text.chars().any(char::is_control))
+    };
+    let Some(roots) = object.get("source_roots").and_then(Value::as_array) else {
+        return false;
+    };
+    if !roots.iter().all(valid_text) {
+        return false;
+    }
+    let has_pair = match object.get("pair") {
+        None | Some(Value::Null) => false,
+        Some(Value::Array(pair)) if pair.len() == 2 && pair.iter().all(valid_text) => true,
+        _ => return false,
+    };
+    let has_tree = match object.get("retire_root") {
+        None | Some(Value::Null) => false,
+        Some(root) if valid_text(root) => true,
+        _ => return false,
+    };
+    let acknowledged = |name: &str, required: bool| match object.get(name) {
+        Some(Value::Bool(retired)) => !required || *retired,
+        None => !required,
+        _ => false,
+    };
+    acknowledged("sources_released", !roots.is_empty())
+        && acknowledged("pair_released", has_pair)
+        && acknowledged("tree_retired", has_tree)
+}
+
 impl JobRecord {
     /// Build a record, deriving the lifecycle state from the identity +
     /// signals. `admitted` is taken from the identity so callers cannot pass a
@@ -1442,6 +1491,101 @@ impl JobRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_recovery_resources_retired_accepts_legacy_absent_resources() {
+        for recipe in [
+            serde_json::json!({"source_roots": []}),
+            serde_json::json!({
+                "source_roots": [], "pair": null, "retire_root": null,
+                "sources_released": false, "pair_released": false, "tree_retired": false
+            }),
+            serde_json::json!({"source_roots": ["/project"], "sources_released": true}),
+            serde_json::json!({
+                "source_roots": ["/project"], "sources_released": true,
+                "pair": null, "retire_root": null,
+                "pair_released": false, "tree_retired": false
+            }),
+        ] {
+            assert!(source_recovery_resources_retired(&recipe), "{recipe}");
+        }
+    }
+
+    #[test]
+    fn source_recovery_resources_retired_requires_proof_for_each_owned_resource() {
+        let recipe = serde_json::json!({
+            "source_roots": ["/project"], "pair": ["/project", "aa"],
+            "retire_root": "/project", "sources_released": true,
+            "pair_released": true, "tree_retired": true
+        });
+        assert!(source_recovery_resources_retired(&recipe));
+        for field in ["sources_released", "pair_released", "tree_retired"] {
+            let mut missing = recipe.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(!source_recovery_resources_retired(&missing), "{field}");
+            for value in [
+                serde_json::json!(false),
+                serde_json::Value::Null,
+                serde_json::json!("true"),
+                serde_json::json!(1),
+            ] {
+                let mut unconfirmed = recipe.clone();
+                unconfirmed[field] = value;
+                assert!(!source_recovery_resources_retired(&unconfirmed), "{field}");
+            }
+        }
+    }
+
+    #[test]
+    fn source_recovery_resources_retired_rejects_malformed_absence() {
+        for recipe in [
+            serde_json::Value::Null,
+            serde_json::json!([]),
+            serde_json::json!({}),
+            serde_json::json!({"source_roots": null}),
+            serde_json::json!({"source_roots": "/project", "sources_released": true}),
+            serde_json::json!({"source_roots": [null], "sources_released": true}),
+            serde_json::json!({"source_roots": [""], "sources_released": true}),
+            serde_json::json!({"source_roots": ["/project\n"], "sources_released": true}),
+            serde_json::json!({"source_roots": [], "pair": false, "pair_released": true}),
+            serde_json::json!({"source_roots": [], "pair": [], "pair_released": true}),
+            serde_json::json!({"source_roots": [], "pair": ["/pair"], "pair_released": true}),
+            serde_json::json!({"source_roots": [], "pair": ["/pair", "aa", "extra"], "pair_released": true}),
+            serde_json::json!({"source_roots": [], "pair": ["/pair", ""], "pair_released": true}),
+            serde_json::json!({"source_roots": [], "pair": ["/pair", 1], "pair_released": true}),
+            serde_json::json!({"source_roots": [], "retire_root": false, "tree_retired": true}),
+            serde_json::json!({"source_roots": [], "retire_root": "", "tree_retired": true}),
+            serde_json::json!({"source_roots": [], "retire_root": "/tree\u{0000}", "tree_retired": true}),
+        ] {
+            assert!(!source_recovery_resources_retired(&recipe), "{recipe}");
+        }
+        for field in ["sources_released", "pair_released", "tree_retired"] {
+            for invalid in [
+                serde_json::Value::Null,
+                serde_json::json!("false"),
+                serde_json::json!(0),
+            ] {
+                let mut absent = serde_json::json!({"source_roots": []});
+                absent[field] = invalid;
+                assert!(!source_recovery_resources_retired(&absent), "{absent}");
+            }
+        }
+    }
+
+    #[test]
+    fn source_recovery_resources_retired_keeps_worker_path_syntax_literal() {
+        for root in [
+            "/project with spaces/資料/",
+            r"C:\projects\source",
+            "/'$(literal)'",
+        ] {
+            let recipe = serde_json::json!({
+                "source_roots": [root], "pair": [root, "aa"], "retire_root": root,
+                "sources_released": true, "pair_released": true, "tree_retired": true
+            });
+            assert!(source_recovery_resources_retired(&recipe), "{recipe}");
+        }
+    }
 
     #[cfg(unix)]
     fn private_journal(path: &std::path::Path, bytes: &[u8]) {

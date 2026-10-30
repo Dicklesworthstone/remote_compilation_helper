@@ -439,27 +439,50 @@ cleanup. A torn record or any contradictory same-identity claim, cancellation,
 release or quarantine evidence remains refused. Normal cancellation or recovery
 must revalidate ownership and competing lexical/physical roots afterward.
 
-Explicit recovery of an acknowledged terminal legacy lease also checks for an
-unrecorded cancellation obligation. Before contacting the worker it requires
-exclusive verified journal ownership, an unchanged recipe, `state=finished`,
-matching failed delivery and outer exit results, complete source/tree/pair
-retirement, a valid complete source intent and exact pair binding where present.
+Detached recovery checks a retired failed legacy lease for an unrecorded
+cancellation obligation before daemon acknowledgement, and explicit recovery
+checks an already acknowledged terminal lease too. Historical cancellation
+could persist a failed return and resource retirement before its dispatcher
+died or daemon reconciliation failed. A retired shortcut must not acknowledge
+that lease and remove it from background recovery before checking the worker.
+Every detached recovery outcome now passes one completion boundary after
+resource retirement. Before contacting the worker it requires exclusive
+verified journal ownership, an unchanged retired recipe, a recorded matching
+failed delivery, a valid complete source intent and exact pair binding where
+present. An acknowledged lease additionally requires `state=finished` and an
+unchanged outer exit result. An unacknowledged lease can record its verified
+recovered delivery result, including successful recovery of an earlier transfer
+failure; the daemon's execution outcome remains a separate fact.
+
+Retirement proof applies to resources actually owned: nonempty source roots
+require source release, a present pair requires pair release, and a present
+retirement tree requires tree retirement. Missing legacy flags for an absent
+pair or tree do not invent an outstanding resource. Malformed flags or resource
+fields still refuse recovery. The hook and daemon use the same raw-recipe
+predicate, and daemon readback refuses a newly discovered pending cancellation
+even when the original candidate had no recorded obligation.
+
 The exit code alone proves no cancellation. If the namespace is unknown, a
 separate optional discovery operation reports exact `current`, `legacy` or
 `absent` evidence under the existing activity/metadata lock order. It preserves
 absent registries, pins existing registry parents and refuses malformed,
 ambiguous or changed evidence. An absent result grants no authority and leaves
-the original journal bytes unchanged; mandatory ownership location and
+the cancellation recipe unchanged; ordinary daemon reconciliation can proceed
+from independently verified retirement. Mandatory ownership location and
 settlement still refuse missing evidence.
 
 Only a positive exact cancellation-intent observation checkpoints the namespace
 and `source_cancellation_settled=false`, preserving original JSON custody fields
 and path spellings. The existing activity-drained settlement then completes that
-obligation, including after a lost reply or dispatcher restart. This terminal
-path neither reopens source/pair trees nor reconciles daemon accounting again,
-and it does not scan every historical failed job in the background. It retains
-the old-token fence and requires the same exact worker validation on every
-retry.
+obligation, including after a lost reply or dispatcher restart. A pending or
+unconfirmed observation keeps an unacknowledged lease eligible for recovery;
+daemon acknowledgement follows confirmed settlement. An already acknowledged
+terminal retry does not reconcile daemon accounting again. Both paths preserve
+retired source/pair trees, retain the old-token fence and require the same exact
+worker validation on every retry. This does not scan every historical failed
+job in the background. The final daemon checkpoint adds only its outcome or
+absence fact to the original JSON, retaining unknown custody fields, omitted
+legacy defaults and historical path spellings.
 
 The registry migration also changed hierarchy-lock paths. A read-only legacy
 scan does not prove safe admission across simultaneously active old and new
@@ -601,6 +624,27 @@ backing filesystem remained full with limited tmpfs space under the same 8 GiB
 memory constraint, so the already-failing heavy dependency build was not
 repeated. Native rsync results do not qualify openrsync, Darwin or Windows.
 
+The subsequent pre-acknowledgement correction passed 29 job-identity and journal
+tests in the actual default-feature `rch-common` crate, including four new
+resource-applicability and malformed-evidence cases. Default-feature common
+library/test Clippy passed with `-D warnings`. All 25 real loopback OpenSSH
+cases passed again with no skips, qualifying the unchanged worker protocols;
+they do not execute the changed Rust completion boundary. Pinned workspace
+formatting and `git diff --check` passed.
+
+Ten new RCH/daemon tests cover the retired pre-acknowledgement route, a concurrent
+journal owner, lost settlement replies and disk restart, optional absent or
+unconfirmed observations, legitimate transfer-failure recovery, applicable
+resource absence, pending or malformed daemon readback, and raw custody
+preservation through the final daemon checkpoint. These tests use the actual
+journal and completion functions with injected worker/daemon replies. They
+remain **uncompiled and unexecuted** here; successful common-crate compilation
+does not qualify those callers. The backing filesystem was still full and
+insufficient temporary build capacity remained for the mandatory heavy
+dependency graph, so the previous `asupersync 0.5.0` failure was not repeated.
+The earlier 313-case Linux result remains scoped to its recorded correction;
+only the 25-case SSH suite was rerun for this follow-up.
+
 The journal-custody correction passed 25 job-identity and journal tests in the
 actual default-feature `rch-common` crate using the pinned nightly toolchain.
 Default-feature `rch-common` Clippy with `--lib --tests -- -D warnings` also
@@ -663,6 +707,14 @@ the worker acceptance cases below:
 ```bash
 cargo check --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked -p rch-common --lib job_identity:: -- --test-threads=1
+cargo test --locked -p rch --bin rch retired_failed_recovery_ -- --test-threads=1
+cargo test --locked -p rch --bin rch recovered_delivery_can_replace_ -- --test-threads=1
+cargo test --locked -p rch --bin rch source_cancellation_retirement_tests -- --test-threads=1
+cargo test --locked -p rch --bin rch daemon_reconciliation_preserves_ -- --test-threads=1
+cargo test --locked -p rchd --bin rchd terminal_cancellation_recovery_preserves_ -- --test-threads=1
+cargo test --locked -p rchd --bin rchd retired_delivery_refuses_ -- --test-threads=1
+cargo test --locked -p rchd --bin rchd handoff_completion_refuses_ -- --test-threads=1
 cargo test --locked -p rch --bin rch namespace_preflight_ -- --test-threads=1
 cargo test --locked -p rch --bin rch paired_cancellation_recovery_ -- --test-threads=1
 cargo test --locked -p rch --bin rch completed_source_cancellation_ -- --test-threads=1
@@ -701,6 +753,14 @@ worker fixtures:
    and terminal legacy journals with no recorded cancellation obligation.
    Optional absent discovery must leave the terminal journal unchanged; exact
    cancellation evidence must survive loss on either side of its checkpoint.
+   Include a retired failed legacy journal interrupted before daemon
+   acknowledgement: recovery must discover and settle its worker cancellation
+   before acknowledging it, including a lost settlement reply and disk restart.
+   Cover absent pair/tree fields with omitted retirement flags, and require
+   proof when either resource is present. Confirm that the final daemon fact
+   preserves original custody fields and path spellings, and that a recovered
+   delivery can replace an unacknowledged transfer-failure result without
+   changing the separate daemon execution outcome.
 3. Exercise concurrent dispatchers and a still-running activity. Recovery must
    refuse while that activity owns its lock; an unrelated project must continue
    making progress. Corrupt, changed, absent and conflicting evidence must

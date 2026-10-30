@@ -114,6 +114,14 @@ pub(crate) struct RecoveryRecipe {
     retired: bool,
 }
 
+impl RecoveryRecipe {
+    fn source_resources_retired(&self) -> bool {
+        (self.source_roots.is_empty() || self.sources_released)
+            && (self.pair.is_none() || self.pair_released)
+            && (self.retire_root.is_none() || self.tree_retired)
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct RetainedCargoStdout {
     path: PathBuf,
@@ -2382,9 +2390,7 @@ impl RecoverySession {
         }
         anyhow::ensure!(
             self.recipe.returned.is_some_and(|exit| exit != 0)
-                && self.recipe.sources_released
-                && self.recipe.tree_retired
-                && self.recipe.pair_released,
+                && self.recipe.source_resources_retired(),
             "source cancellation settlement requires durable failed delivery and complete resource retirement"
         );
         let namespace = if self.recipe.source_roots.is_empty() {
@@ -2402,8 +2408,10 @@ impl RecoverySession {
     /// Older executed cancellations could finish without recording either
     /// preparation_cancelled or the newer settlement obligation. Explicit
     /// recovery may discover that obligation from exact worker evidence only
-    /// after the original journal proves complete retirement. This path never
-    /// grants source access or reopens a source/pair tree.
+    /// after the original journal proves complete retirement. This includes
+    /// the crash frontier before daemon acknowledgement: an acknowledgement
+    /// is not worker retirement evidence and must not hide this obligation.
+    /// This path never grants source access or reopens a source/pair tree.
     async fn discover_terminal_source_cancellation(&mut self) -> anyhow::Result<()> {
         self.discover_terminal_source_cancellation_with(
             async |worker, roots, identity, recorded_namespace| {
@@ -2460,17 +2468,18 @@ impl RecoverySession {
         ownership.verify()?;
         let before = self.writer.snapshot();
         anyhow::ensure!(
-            before.terminal_acknowledged
-                && before.state == rch_common::job_identity::JobLifecycleState::Finished
+            before.state != rch_common::job_identity::JobLifecycleState::FailedBeforeAdmission
+                && (!before.terminal_acknowledged
+                    || before.state == rch_common::job_identity::JobLifecycleState::Finished)
+                && self.recipe.build_id > 0
+                && !self.recipe.worker.id.as_str().is_empty()
                 && self.recipe.returned.is_some_and(|exit| exit != 0)
                 && before.exit_code == self.recipe.returned
                 && self.recipe.retired
-                && self.recipe.sources_released
-                && self.recipe.tree_retired
-                && self.recipe.pair_released
+                && self.recipe.source_resources_retired()
                 && serde_json::to_value(load_recipe(&self.writer)?)?
                     == serde_json::to_value(&self.recipe)?,
-            "terminal cancellation discovery lacks exact failed delivery and complete retirement"
+            "retired cancellation discovery lacks exact failed delivery and complete retirement"
         );
         super::super::ssh::validate_source_authority_intent(
             &self.recipe.source_roots,
@@ -2534,9 +2543,7 @@ impl RecoverySession {
         }
         anyhow::ensure!(
             self.recipe.returned.is_some_and(|exit| exit != 0)
-                && self.recipe.sources_released
-                && self.recipe.tree_retired
-                && self.recipe.pair_released,
+                && self.recipe.source_resources_retired(),
             "source cancellation settlement requires durable failed delivery and complete resource retirement"
         );
         let before = self.writer.snapshot();
@@ -3101,10 +3108,7 @@ fn load_recipe(writer: &DurableLeaseWriter) -> anyhow::Result<RecoveryRecipe> {
     );
     anyhow::ensure!(
         recipe.source_cancellation_settled != Some(true)
-            || (recipe.returned.is_some_and(|exit| exit != 0)
-                && recipe.sources_released
-                && recipe.tree_retired
-                && recipe.pair_released),
+            || (recipe.returned.is_some_and(|exit| exit != 0) && recipe.source_resources_retired()),
         "source cancellation settlement contradicts failed delivery or resource retirement evidence"
     );
     validate_retained_source_intent(
@@ -3493,23 +3497,17 @@ async fn recover_job_with_daemon(
 async fn retire_already_released_source_grant(
     session: &mut RecoverySession,
     writer: &DurableLeaseWriter,
-    daemon: &mut impl AsyncFnMut(&str) -> anyhow::Result<String>,
     observed_exit: Option<i32>,
 ) -> anyhow::Result<i32> {
-    retire_already_released_source_grant_with(
-        session,
-        writer,
-        daemon,
-        observed_exit,
-        async |session| session.reconcile_source_cancellation().await,
-    )
+    retire_already_released_source_grant_with(session, writer, observed_exit, async |session| {
+        session.reconcile_source_cancellation().await
+    })
     .await
 }
 
 async fn retire_already_released_source_grant_with(
     session: &mut RecoverySession,
     writer: &DurableLeaseWriter,
-    daemon: &mut impl AsyncFnMut(&str) -> anyhow::Result<String>,
     observed_exit: Option<i32>,
     mut reconcile: impl AsyncFnMut(&mut RecoverySession) -> anyhow::Result<()>,
 ) -> anyhow::Result<i32> {
@@ -3550,15 +3548,12 @@ async fn retire_already_released_source_grant_with(
     reconcile(session).await?;
     session.retired()?;
     session.discard_completion_receipts().await;
-    writer.record_exit(retired_exit)?;
-    recovery_completion::finish(writer, daemon).await?;
     Ok(retired_exit)
 }
 
 async fn settle_already_released_source_grant(
     session: &mut RecoverySession,
     writer: &DurableLeaseWriter,
-    daemon: &mut impl AsyncFnMut(&str) -> anyhow::Result<String>,
     observed_exit: Option<i32>,
 ) -> anyhow::Result<Option<i32>> {
     if session.recipe.returned.is_some()
@@ -3589,7 +3584,7 @@ async fn settle_already_released_source_grant(
     {
         return Ok(None);
     }
-    retire_already_released_source_grant(session, writer, daemon, observed_exit)
+    retire_already_released_source_grant(session, writer, observed_exit)
         .await
         .map(Some)
 }
@@ -3648,8 +3643,77 @@ fn publication_failure_is_terminal_in_recovery(error: &anyhow::Error) -> bool {
 
 async fn recover_owned_job_with_daemon(
     writer: &DurableLeaseWriter,
-    mut daemon: impl AsyncFnMut(&str) -> anyhow::Result<String>,
+    daemon: impl AsyncFnMut(&str) -> anyhow::Result<String>,
 ) -> anyhow::Result<i32> {
+    recover_owned_job_with_reconciliation(writer, daemon, async |session| {
+        session.discover_terminal_source_cancellation().await?;
+        session.reconcile_source_cancellation().await
+    })
+    .await
+}
+
+async fn recover_owned_job_with_reconciliation(
+    writer: &DurableLeaseWriter,
+    daemon: impl AsyncFnMut(&str) -> anyhow::Result<String>,
+    reconcile: impl AsyncFnMut(&mut RecoverySession) -> anyhow::Result<()>,
+) -> anyhow::Result<i32> {
+    let exit = Box::pin(recover_owned_job_until_retired(writer)).await?;
+    finish_recovered_delivery_with(writer, exit, daemon, reconcile).await
+}
+
+/// Every detached recovery outcome passes this boundary. A legacy cancellation
+/// can have retired its resources and returned a failure before its process
+/// died or daemon accounting failed. Discover/checkpoint that worker obligation
+/// before acknowledgement removes the lease from background recovery selection.
+/// Existing terminal retries use the same proof without reopening accounting.
+async fn finish_recovered_delivery_with(
+    writer: &DurableLeaseWriter,
+    exit: i32,
+    mut daemon: impl AsyncFnMut(&str) -> anyhow::Result<String>,
+    mut reconcile: impl AsyncFnMut(&mut RecoverySession) -> anyhow::Result<()>,
+) -> anyhow::Result<i32> {
+    let ownership = writer
+        .recovery_ownership
+        .as_ref()
+        .context("recovery completion has no journal owner")?;
+    ownership.verify()?;
+    let before = writer.snapshot();
+    let recipe = load_recipe(writer)?;
+    anyhow::ensure!(
+        recipe.retired
+            && recipe.returned == Some(exit)
+            && recipe.source_resources_retired()
+            && recipe.build_id > 0
+            && !recipe.worker.id.as_str().is_empty()
+            && before.state != rch_common::job_identity::JobLifecycleState::FailedBeforeAdmission
+            && (!before.terminal_acknowledged
+                || (before.state == rch_common::job_identity::JobLifecycleState::Finished
+                    && before.exit_code == Some(exit))),
+        "recovery completion contradicts exact delivery or applicable resource retirement"
+    );
+    writer.record_exit(exit)?;
+    let mut session = RecoverySession {
+        recipe,
+        writer: writer.clone(),
+    };
+    reconcile(&mut session).await?;
+    ownership.verify()?;
+    let after = writer.snapshot();
+    anyhow::ensure!(
+        after.identity == before.identity
+            && after.worker_id == before.worker_id
+            && after.exit_code == Some(exit)
+            && after.terminal_acknowledged == before.terminal_acknowledged,
+        "recovery completion changed during source reconciliation"
+    );
+    if !before.terminal_acknowledged {
+        recovery_completion::finish(writer, &mut daemon).await?;
+    }
+    ownership.verify()?;
+    Ok(exit)
+}
+
+async fn recover_owned_job_until_retired(writer: &DurableLeaseWriter) -> anyhow::Result<i32> {
     // Hold one journal owner across the ENTIRE detached recovery, including
     // worker probes, source release and final daemon reservation reconciliation.
     // claim reloads the latest disk state after acquisition and never mistakes
@@ -3692,32 +3756,33 @@ async fn recover_owned_job_with_daemon(
                 && (session.recipe.retire_root.is_none() || session.recipe.tree_retired),
             "terminal recovery contradicts its retained delivery/retirement evidence"
         );
-        session.discover_terminal_source_cancellation().await?;
-        session.reconcile_source_cancellation().await?;
         return Ok(exit);
+    }
+    if session.recipe.retired {
+        // Source/tree/pair work is already checkpointed. The common completion
+        // boundary validates that proof and settles remaining metadata before
+        // daemon acknowledgement, including a retry with a pending obligation.
+        return session
+            .recipe
+            .returned
+            .context("retired recovery lacks a delivery result");
     }
     if !session.recipe.execution_started {
         cancel_preparation(writer).await?;
-        writer.record_exit(EXIT_BUILD_ERROR)?;
-        recovery_completion::finish(writer, &mut daemon).await?;
         return Ok(EXIT_BUILD_ERROR);
     }
     if let Some(exit) = session.recipe.returned {
         session.retire_returned().await?;
-        writer.record_exit(exit)?;
-        recovery_completion::finish(writer, &mut daemon).await?;
         return Ok(exit);
     }
     if let Some(exit) = session.resume_retired_source_pair_cancellation().await? {
-        writer.record_exit(exit)?;
-        recovery_completion::finish(writer, &mut daemon).await?;
         return Ok(exit);
     }
     if session.recipe.sources_released
         && (session.recipe.pair.is_none() || session.recipe.pair_released)
         && (session.recipe.retained_root.is_none() || session.recipe.tree_retired)
     {
-        return retire_already_released_source_grant(&mut session, writer, &mut daemon, None).await;
+        return retire_already_released_source_grant(&mut session, writer, None).await;
     }
     let worker = session.recipe.worker.clone();
     let namespace = session.bind_source_namespace().await?;
@@ -3743,8 +3808,7 @@ async fn recover_owned_job_with_daemon(
             .await?
         {
             if let Some(retired_exit) =
-                settle_already_released_source_grant(&mut session, writer, &mut daemon, None)
-                    .await?
+                settle_already_released_source_grant(&mut session, writer, None).await?
             {
                 return Ok(retired_exit);
             }
@@ -3754,8 +3818,6 @@ async fn recover_owned_job_with_daemon(
                 "remote execution ended without a completion receipt; retiring it as failed"
             );
             cancel_source_grant(session).await?;
-            writer.record_exit(EXIT_BUILD_ERROR)?;
-            recovery_completion::finish(writer, &mut daemon).await?;
             return Ok(EXIT_BUILD_ERROR);
         }
         anyhow::bail!(
@@ -3782,12 +3844,10 @@ async fn recover_owned_job_with_daemon(
             "resuming source cancellation after execution; retiring it as failed without collecting outputs"
         );
         cancel_source_grant(session).await?;
-        writer.record_exit(EXIT_BUILD_ERROR)?;
-        recovery_completion::finish(writer, &mut daemon).await?;
         return Ok(EXIT_BUILD_ERROR);
     }
     if let Some(retired_exit) =
-        settle_already_released_source_grant(&mut session, writer, &mut daemon, Some(exit)).await?
+        settle_already_released_source_grant(&mut session, writer, Some(exit)).await?
     {
         return Ok(retired_exit);
     }
@@ -4061,8 +4121,6 @@ async fn recover_owned_job_with_daemon(
     session.sources_released()?;
     session.retired()?;
     session.discard_completion_receipts().await;
-    writer.record_exit(exit)?;
-    recovery_completion::finish(writer, &mut daemon).await?;
     Ok(exit)
 }
 
@@ -4338,6 +4396,299 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn retired_legacy_cancellation_fixture(
+        namespace: Option<SourceAuthorityNamespace>,
+        paired: bool,
+        recorded_exit: Option<i32>,
+    ) -> (tempfile::TempDir, DurableLeaseWriter) {
+        let (directory, writer) = terminal_legacy_cancellation_fixture(namespace, paired);
+        let mut original_owner = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let owner_pid = original_owner.id();
+        assert!(original_owner.wait().unwrap().success());
+        {
+            let mut lease = writer.lease.lock().unwrap();
+            lease.wrapper_pid = owner_pid;
+            lease.process_start_ticks = None;
+            lease.boot_id = None;
+            lease.process_birth = None;
+            lease.state = rch_common::job_identity::JobLifecycleState::Running;
+            lease.terminal_acknowledged = false;
+            lease.exit_code = recorded_exit;
+            lease.phase = "retired_before_daemon_ack".into();
+        }
+        writer.persist().unwrap();
+        if !paired {
+            let mut original = writer.snapshot().recovery.unwrap();
+            // Old recipes may omit these booleans because they never owned a
+            // pair or retirement tree. Preserve absence, not invented ACKs.
+            let fields = original.as_object_mut().unwrap();
+            fields.remove("tree_retired");
+            fields.remove("pair_released");
+            writer.set_recovery(original).unwrap();
+        }
+        (directory, writer)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retired_failed_recovery_settles_before_daemon_ack_and_survives_restart() {
+        let _guard = test_guard!();
+        for recorded in [
+            None,
+            Some(SourceAuthorityNamespace::Current),
+            Some(SourceAuthorityNamespace::Legacy),
+        ] {
+            for paired in [false, true] {
+                let (_directory, writer) = retired_legacy_cancellation_fixture(
+                    recorded,
+                    paired,
+                    paired.then_some(EXIT_ARTIFACT_TRANSFER_FAILED),
+                );
+                let original = writer.snapshot().recovery.unwrap();
+                let owned = recovery_owner::claim(&writer).await.unwrap();
+                let selected = recorded.unwrap_or(SourceAuthorityNamespace::Legacy);
+                let events = std::cell::RefCell::new(Vec::new());
+                let error = recover_owned_job_with_reconciliation(
+                    &owned,
+                    async |_request: &str| {
+                        panic!("daemon acknowledgement preceded exact worker settlement")
+                    },
+                    async |session| {
+                        assert!(!owned.snapshot().terminal_acknowledged);
+                        assert_eq!(owned.snapshot().exit_code, Some(EXIT_BUILD_ERROR));
+                        session
+                            .discover_terminal_source_cancellation_with(
+                                async |worker, roots, identity, namespace| {
+                                    assert_eq!(worker.id.as_str(), "source-recovery");
+                                    assert_eq!(roots, &["/data/projects/source-recovery"]);
+                                    assert_eq!(identity, "0123456789abcdef0123456789abcdef");
+                                    assert_eq!(namespace, recorded);
+                                    assert!(recovery_owner::claim(&writer).await.is_err());
+                                    events.borrow_mut().push("discover");
+                                    Ok(Some(selected))
+                                },
+                            )
+                            .await?;
+                        session
+                            .reconcile_source_cancellation_with(async |_, _, _| {
+                                let durable = DurableLeaseWriter::read_journal(
+                                    &writer.path,
+                                    &writer.wrapper_id(),
+                                )?;
+                                assert!(!durable.terminal_acknowledged);
+                                assert_eq!(durable.exit_code, Some(EXIT_BUILD_ERROR));
+                                assert_eq!(
+                                    durable.recovery.unwrap()["source_cancellation_settled"],
+                                    false
+                                );
+                                events.borrow_mut().push("lost settlement reply");
+                                anyhow::bail!("worker settlement reply was interrupted")
+                            })
+                            .await
+                    },
+                )
+                .await
+                .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("settlement reply was interrupted")
+                );
+                assert_eq!(*events.borrow(), ["discover", "lost settlement reply"]);
+                assert!(!owned.snapshot().terminal_acknowledged);
+                let mut pending = original.clone();
+                pending["source_authority_namespace"] = serde_json::to_value(selected).unwrap();
+                pending["source_cancellation_settled"] = serde_json::json!(false);
+                assert_eq!(owned.snapshot().recovery.unwrap(), pending);
+                drop(owned);
+
+                let reloaded = DurableLeaseWriter {
+                    path: writer.path.clone(),
+                    recovery_ownership: None,
+                    lease: Arc::new(Mutex::new(
+                        DurableLeaseWriter::read_journal(&writer.path, &writer.wrapper_id())
+                            .unwrap(),
+                    )),
+                };
+                let owned = recovery_owner::claim(&reloaded).await.unwrap();
+                let exit = recover_owned_job_with_reconciliation(
+                    &owned,
+                    async |request: &str| {
+                        assert!(request.starts_with("GET /builds/41?"));
+                        let current = owned.snapshot();
+                        assert!(!current.terminal_acknowledged);
+                        assert_eq!(
+                            current.recovery.unwrap()["source_cancellation_settled"],
+                            true
+                        );
+                        events.borrow_mut().push("daemon");
+                        Ok(format!(
+                            "HTTP/1.1 200 OK\r\n\r\n{}",
+                            serde_json::json!({
+                                "status": "completed",
+                                "local_wrapper_id": owned.wrapper_id(),
+                                "record": {"id": 41, "worker_id": "source-recovery", "exit_code": 1}
+                            })
+                        ))
+                    },
+                    async |session| {
+                        session
+                            .discover_terminal_source_cancellation_with(async |_, _, _, _| {
+                                panic!("restart lost its durable cancellation obligation")
+                            })
+                            .await?;
+                        session
+                            .reconcile_source_cancellation_with(async |_, _, _| {
+                                assert!(recovery_owner::claim(&reloaded).await.is_err());
+                                events.borrow_mut().push("settle");
+                                Ok(())
+                            })
+                            .await
+                    },
+                )
+                .await
+                .unwrap();
+                assert_eq!(exit, EXIT_BUILD_ERROR);
+                assert_eq!(
+                    *events.borrow(),
+                    ["discover", "lost settlement reply", "settle", "daemon"]
+                );
+                assert!(owned.snapshot().terminal_acknowledged);
+                pending["source_cancellation_settled"] = serde_json::json!(true);
+                pending["daemon_exit_code"] = serde_json::json!(1);
+                assert_eq!(owned.snapshot().recovery.unwrap(), pending);
+                assert_eq!(load_recipe(&owned).unwrap().exit_code, Some(137));
+                let finished = std::fs::read(&writer.path).unwrap();
+                assert_eq!(
+                    recover_owned_job_with_daemon(&owned, async |_request: &str| {
+                        panic!("settled terminal retry reopened daemon accounting")
+                    })
+                    .await
+                    .unwrap(),
+                    EXIT_BUILD_ERROR
+                );
+                assert_eq!(std::fs::read(&writer.path).unwrap(), finished);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retired_failed_recovery_preserves_absence_and_unconfirmed_discovery() {
+        let _guard = test_guard!();
+        for unconfirmed in [false, true] {
+            let (_directory, writer) =
+                retired_legacy_cancellation_fixture(None, false, Some(EXIT_BUILD_ERROR));
+            let original = writer.snapshot().recovery.unwrap();
+            let owned = recovery_owner::claim(&writer).await.unwrap();
+            let daemon_calls = std::cell::Cell::new(0);
+            let result = recover_owned_job_with_reconciliation(
+                &owned,
+                async |_request: &str| {
+                    assert!(
+                        !unconfirmed,
+                        "uncertain discovery must retain recovery scheduling"
+                    );
+                    daemon_calls.set(daemon_calls.get() + 1);
+                    assert_eq!(owned.snapshot().recovery.as_ref(), Some(&original));
+                    Ok(format!(
+                        "HTTP/1.1 200 OK\r\n\r\n{}",
+                        serde_json::json!({
+                            "status": "completed",
+                            "local_wrapper_id": owned.wrapper_id(),
+                            "record": {"id": 41, "worker_id": "source-recovery", "exit_code": 1}
+                        })
+                    ))
+                },
+                async |session| {
+                    session
+                        .discover_terminal_source_cancellation_with(async |_, _, _, _| {
+                            if unconfirmed {
+                                anyhow::bail!("worker cancellation evidence is incomplete");
+                            }
+                            Ok(None)
+                        })
+                        .await?;
+                    assert_eq!(owned.snapshot().recovery.as_ref(), Some(&original));
+                    session
+                        .reconcile_source_cancellation_with(async |_, _, _| {
+                            panic!("absent cancellation evidence grants no settlement authority")
+                        })
+                        .await
+                },
+            )
+            .await;
+            let mut expected = original;
+            if unconfirmed {
+                assert!(result.is_err());
+                assert_eq!(daemon_calls.get(), 0);
+                assert!(!owned.snapshot().terminal_acknowledged);
+            } else {
+                assert_eq!(result.unwrap(), EXIT_BUILD_ERROR);
+                assert_eq!(daemon_calls.get(), 1);
+                assert!(owned.snapshot().terminal_acknowledged);
+                expected["daemon_exit_code"] = serde_json::json!(1);
+            }
+            assert_eq!(owned.snapshot().recovery.unwrap(), expected);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recovered_delivery_can_replace_an_unacknowledged_transfer_failure() {
+        let _guard = test_guard!();
+        let (_directory, writer) =
+            retired_legacy_cancellation_fixture(None, false, Some(EXIT_ARTIFACT_TRANSFER_FAILED));
+        let mut recipe = writer.snapshot().recovery.unwrap();
+        recipe["exit_code"] = serde_json::json!(0);
+        recipe["returned"] = serde_json::json!(0);
+        writer.set_recovery(recipe.clone()).unwrap();
+        let owned = recovery_owner::claim(&writer).await.unwrap();
+        let exit = recover_owned_job_with_reconciliation(
+            &owned,
+            async |_request: &str| {
+                assert_eq!(owned.snapshot().exit_code, Some(0));
+                assert!(!owned.snapshot().terminal_acknowledged);
+                Ok(format!(
+                    "HTTP/1.1 200 OK\r\n\r\n{}",
+                    serde_json::json!({
+                        "status": "completed",
+                        "local_wrapper_id": owned.wrapper_id(),
+                        "record": {"id": 41, "worker_id": "source-recovery", "exit_code": EXIT_ARTIFACT_TRANSFER_FAILED}
+                    })
+                ))
+            },
+            async |session| {
+                session
+                    .discover_terminal_source_cancellation_with(async |_, _, _, _| {
+                        panic!("verified successful delivery must not discover cancellation")
+                    })
+                    .await?;
+                session
+                    .reconcile_source_cancellation_with(async |_, _, _| {
+                        panic!("verified successful delivery has no cancellation obligation")
+                    })
+                    .await
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(exit, 0);
+        let terminal = owned.snapshot();
+        assert!(terminal.terminal_acknowledged);
+        assert_eq!(terminal.exit_code, Some(0));
+        recipe["daemon_exit_code"] = serde_json::json!(EXIT_ARTIFACT_TRANSFER_FAILED);
+        assert_eq!(terminal.recovery.unwrap(), recipe);
+        let recovered = load_recipe(&owned).unwrap();
+        assert_eq!(recovered.exit_code, Some(0));
+        assert_eq!(recovered.returned, Some(0));
+        assert_eq!(
+            recovered.daemon_exit_code,
+            Some(EXIT_ARTIFACT_TRANSFER_FAILED)
+        );
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn terminal_legacy_cancellation_discovery_survives_lost_settlement_and_restart() {
         let _guard = test_guard!();
@@ -4538,7 +4889,7 @@ mod tests {
             "no-returned-outcome",
             "contradictory-exit",
             "wrong-state",
-            "unacknowledged",
+            "failed-before-admission",
             "invalid-source-intent",
             "other-pair-token",
             "missing-retirement-root",
@@ -4569,7 +4920,11 @@ mod tests {
                     "wrong-state" => {
                         lease.state = rch_common::job_identity::JobLifecycleState::Running
                     }
-                    "unacknowledged" => lease.terminal_acknowledged = false,
+                    "failed-before-admission" => {
+                        lease.terminal_acknowledged = false;
+                        lease.state =
+                            rch_common::job_identity::JobLifecycleState::FailedBeforeAdmission;
+                    }
                     _ => {}
                 }
             }
@@ -4717,6 +5072,9 @@ mod tests {
         ] {
             let (_directory, writer, worker) = preparation_fixture();
             let mut recipe = load_recipe(&writer).unwrap();
+            let root = recipe.source_roots[0].clone();
+            recipe.pair = Some((root.clone(), recipe.identity.clone()));
+            recipe.retire_root = Some(root);
             recipe.preparation_cancelled = true;
             recipe.source_cancellation_settled = Some(true);
             recipe.sources_released = true;
@@ -4847,6 +5205,9 @@ mod tests {
         for missing in ["sources", "tree", "pair", "returned"] {
             let (_directory, writer) = terminal_cancellation_fixture();
             let mut recipe = load_recipe(&writer).unwrap();
+            let root = recipe.source_roots[0].clone();
+            recipe.pair = Some((root.clone(), recipe.identity.clone()));
+            recipe.retire_root = Some(root);
             match missing {
                 "sources" => recipe.sources_released = false,
                 "tree" => recipe.tree_retired = false,
@@ -9625,7 +9986,6 @@ mod tests {
             let result = retire_already_released_source_grant_with(
                 &mut claimed_session,
                 &owned,
-                &mut daemon,
                 observed_exit,
                 async |session| {
                     // The worker boundary is a unit input here. Native worker
@@ -9651,7 +10011,6 @@ mod tests {
                 retire_already_released_source_grant_with(
                     &mut claimed_session,
                     &owned,
-                    &mut daemon,
                     None,
                     async |session| {
                         session
@@ -9669,6 +10028,22 @@ mod tests {
             };
             assert_eq!(worker_calls.get(), if pending_cancellation { 2 } else { 0 });
             assert_eq!(retired, expected_exit);
+            assert!(!owned.snapshot().terminal_acknowledged);
+            finish_recovered_delivery_with(&owned, retired, &mut daemon, async |session| {
+                // An exact released grant has no cancellation intent.
+                // Known cancellation was settled above. The common
+                // completion boundary still checks before daemon ACK.
+                session
+                    .discover_terminal_source_cancellation_with(async |_, _, _, _| Ok(None))
+                    .await?;
+                session
+                    .reconcile_source_cancellation_with(async |_, _, _| {
+                        panic!("retired release must not acquire a new cleanup obligation")
+                    })
+                    .await
+            })
+            .await
+            .unwrap();
             let settled_lease = owned.snapshot();
             assert!(settled_lease.terminal_acknowledged);
             assert_eq!(settled_lease.exit_code, Some(expected_exit));

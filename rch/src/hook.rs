@@ -2674,11 +2674,7 @@ impl DurableLeaseWriter {
                     .and_then(serde_json::Value::as_i64)
                     .and_then(|exit| i32::try_from(exit).ok())
                     .is_some_and(|exit| exit != 0)
-                    && ["sources_released", "tree_retired", "pair_released"]
-                        .iter()
-                        .all(|key| {
-                            recovery.get(*key).and_then(serde_json::Value::as_bool) == Some(true)
-                        })
+                    && rch_common::job_identity::source_recovery_resources_retired(recovery)
             }
             None | Some(serde_json::Value::Null) => {
                 // Existing acknowledged journals remain readable, but a
@@ -6965,6 +6961,136 @@ pub(crate) fn add_cargo_isolation(command: &str, worker_id: &WorkerId) -> String
         "sh -c {} rch-cargo-cache \"${{{base_var}:-}}\"",
         shell_escape::escape(script.into())
     )
+}
+
+#[cfg(test)]
+mod source_cancellation_retirement_tests {
+    use super::*;
+
+    fn settled_recipe() -> serde_json::Value {
+        serde_json::json!({
+            "returned": 137, "retired": true,
+            "source_roots": ["/source"], "sources_released": true,
+            "source_cancellation_settled": true,
+            "future_custody": {"keep": "original"},
+        })
+    }
+
+    fn lease(recipe: serde_json::Value) -> DurableJobLease {
+        let mut lease = DurableJobLease::new(
+            JobIdentity::new_local(),
+            11,
+            None,
+            None,
+            1,
+            false,
+            true,
+            "test".into(),
+        );
+        lease.admit(7, "worker1".into(), 1);
+        lease.exit_code = Some(137);
+        lease.recovery = Some(recipe);
+        lease
+    }
+
+    #[test]
+    fn settled_cancellation_preserves_absent_resource_defaults() {
+        for explicit_defaults in [false, true] {
+            let mut recipe = settled_recipe();
+            if explicit_defaults {
+                recipe["pair"] = serde_json::Value::Null;
+                recipe["retire_root"] = serde_json::Value::Null;
+                recipe["pair_released"] = serde_json::json!(false);
+                recipe["tree_retired"] = serde_json::json!(false);
+            }
+            let before = recipe.clone();
+            assert!(DurableLeaseWriter::cancellation_allows_retirement(&recipe));
+            let lease = lease(recipe);
+            DurableLeaseWriter::ensure_terminal_evidence(&lease, 137).unwrap();
+            assert_eq!(lease.recovery.as_ref(), Some(&before));
+
+            let mut no_source = before;
+            no_source["source_roots"] = serde_json::json!([]);
+            no_source
+                .as_object_mut()
+                .unwrap()
+                .remove("sources_released");
+            assert!(DurableLeaseWriter::cancellation_allows_retirement(
+                &no_source
+            ));
+        }
+    }
+
+    #[test]
+    fn cancellation_retirement_refuses_live_or_malformed_resource_evidence() {
+        for (key, value) in [
+            ("sources_released", serde_json::json!(false)),
+            ("sources_released", serde_json::Value::Null),
+            ("source_roots", serde_json::Value::Null),
+            ("source_roots", serde_json::json!("/source")),
+            ("source_roots", serde_json::json!([null])),
+            ("source_roots", serde_json::json!([""])),
+            ("source_roots", serde_json::json!(["/source\nother"])),
+            ("pair", serde_json::json!(["/source", "aa"])),
+            ("pair", serde_json::json!(["/source"])),
+            ("pair", serde_json::json!(["/source", 1])),
+            ("pair_released", serde_json::Value::Null),
+            ("pair_released", serde_json::json!("true")),
+            ("retire_root", serde_json::json!("/source")),
+            ("retire_root", serde_json::json!(false)),
+            ("tree_retired", serde_json::Value::Null),
+            ("returned", serde_json::json!(0)),
+            ("source_cancellation_settled", serde_json::json!(false)),
+            ("source_cancellation_settled", serde_json::json!("true")),
+        ] {
+            let mut recipe = settled_recipe();
+            recipe[key] = value;
+            let before = recipe.clone();
+            assert!(
+                !DurableLeaseWriter::cancellation_allows_retirement(&recipe),
+                "{key}"
+            );
+            let lease = lease(recipe);
+            assert!(
+                DurableLeaseWriter::ensure_terminal_evidence(&lease, 137).is_err(),
+                "{key}"
+            );
+            assert_eq!(lease.recovery.as_ref(), Some(&before));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovered_pending_cancellation_blocks_acknowledgement_and_readmission() {
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let mut recipe = settled_recipe();
+        recipe["source_cancellation_settled"] = serde_json::json!(false);
+        let writer = DurableLeaseWriter {
+            path: directory.path().join("lease.json"),
+            recovery_ownership: None,
+            lease: Arc::new(Mutex::new(lease(recipe))),
+        };
+        writer.persist().unwrap();
+        let before = writer.snapshot();
+        let bytes = std::fs::read(&writer.path).unwrap();
+        assert!(writer.acknowledge_terminal().is_err());
+        assert!(writer.ensure_released_for_retry().is_err());
+        assert!(writer.begin_retry_selection(true).is_err());
+        assert!(writer.admit(8, &WorkerId::new("worker2")).is_err());
+        assert_eq!(writer.snapshot(), before);
+        assert_eq!(std::fs::read(&writer.path).unwrap(), bytes);
+
+        let mut settled = before.recovery.unwrap();
+        settled["source_cancellation_settled"] = serde_json::json!(true);
+        writer.set_recovery(settled.clone()).unwrap();
+        writer.acknowledge_terminal().unwrap();
+        writer.ensure_released_for_retry().unwrap();
+        assert!(writer.snapshot().terminal_acknowledged);
+        assert_eq!(writer.snapshot().recovery.as_ref(), Some(&settled));
+    }
 }
 
 #[cfg(test)]

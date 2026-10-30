@@ -17,7 +17,9 @@
 use crate::api::is_process_alive;
 use crate::api::{lease_blocks_restart, lease_owns_unretired_source};
 use crate::events::EventBus;
-use rch_common::job_identity::{DurableJobLease, default_job_lease_directory};
+use rch_common::job_identity::{
+    DurableJobLease, default_job_lease_directory, source_recovery_resources_retired,
+};
 use rch_common::process_identity::{OwnerPresence, owner_presence};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -56,15 +58,12 @@ fn retired_delivery(lease: &DurableJobLease) -> Option<i32> {
     let recipe = lease.recovery.as_ref()?;
     let build_id = lease.identity.remote_build_id.filter(|id| *id > 0)?;
     let worker = lease.worker_id.as_deref().filter(|id| !id.is_empty())?;
-    let roots = recipe["source_roots"].as_array()?;
     if recipe["version"].as_u64() != Some(2)
         || recipe["wrapper_id"].as_str() != Some(lease.identity.local_wrapper_id.as_str())
         || recipe["build_id"].as_u64() != Some(build_id)
         || recipe["worker"]["id"].as_str() != Some(worker)
         || recipe["retired"].as_bool() != Some(true)
-        || (!roots.is_empty() && recipe["sources_released"].as_bool() != Some(true))
-        || (!recipe["pair"].is_null() && recipe["pair_released"].as_bool() != Some(true))
-        || (!recipe["retire_root"].is_null() && recipe["tree_retired"].as_bool() != Some(true))
+        || !source_recovery_resources_retired(recipe)
     {
         return None;
     }
@@ -73,22 +72,28 @@ fn retired_delivery(lease: &DurableJobLease) -> Option<i32> {
         .and_then(|code| i32::try_from(code).ok())
 }
 
+fn source_cancellation_pending(recipe: &serde_json::Value) -> Option<bool> {
+    let preparation_cancelled = match recipe.get("preparation_cancelled") {
+        None => false,
+        Some(serde_json::Value::Bool(cancelled)) => *cancelled,
+        _ => return None,
+    };
+    match recipe.get("source_cancellation_settled") {
+        None | Some(serde_json::Value::Null) => Some(preparation_cancelled),
+        Some(serde_json::Value::Bool(settled)) => Some(!settled),
+        _ => None,
+    }
+}
+
 fn terminal_cancellation_unsettled(lease: &DurableJobLease) -> bool {
-    let Some(recipe) = lease.recovery.as_ref() else {
-        return false;
-    };
-    let pending = match &recipe["source_cancellation_settled"] {
-        serde_json::Value::Null => recipe["preparation_cancelled"].as_bool() == Some(true),
-        serde_json::Value::Bool(false) => true,
-        _ => false,
-    };
-    pending
+    lease
+        .recovery
+        .as_ref()
+        .and_then(source_cancellation_pending)
+        == Some(true)
         && lease.terminal_acknowledged
         && lease.state == rch_common::job_identity::JobLifecycleState::Finished
         && retired_delivery(lease).is_some_and(|exit| exit != 0 && lease.exit_code == Some(exit))
-        && recipe["sources_released"].as_bool() == Some(true)
-        && recipe["tree_retired"].as_bool() == Some(true)
-        && recipe["pair_released"].as_bool() == Some(true)
 }
 
 /// Matches rchd's stuck-build hard cap (`should_remediate`) and the client's
@@ -137,6 +142,32 @@ fn verify_recovery_completion(
         || (!before_namespace.is_null() && before_namespace != after_namespace)
     {
         return Err("source ownership namespace changed or is malformed".into());
+    }
+    if let Some(recipe) = after.recovery.as_ref() {
+        // Discovery can add an obligation after this daemon selected an
+        // ordinary unacknowledged handoff. Re-read that obligation too: an
+        // acknowledged CLI result cannot conceal a pending cancellation.
+        match source_cancellation_pending(recipe) {
+            Some(false) => {}
+            Some(true) => {
+                return Err("recovery command left worker cancellation unsettled".into());
+            }
+            None => return Err("recovery command left malformed cancellation evidence".into()),
+        }
+        if recipe["source_cancellation_settled"].as_bool() == Some(true) {
+            if !retired_delivery(after).is_some_and(|exit| exit != 0) {
+                return Err(
+                    "worker cancellation settlement contradicts retired failed delivery".into(),
+                );
+            }
+            if recipe["source_roots"]
+                .as_array()
+                .is_some_and(|roots| !roots.is_empty())
+                && !matches!(after_namespace.as_str(), Some("current" | "legacy"))
+            {
+                return Err("worker cancellation settlement has no exact source namespace".into());
+            }
+        }
     }
     if terminal_cancellation_unsettled(before) {
         // This lease already completed daemon accounting. The only remaining
@@ -1024,6 +1055,7 @@ mod tests {
         settled.recovery.as_mut().unwrap()["source_cancellation_settled"] = serde_json::json!(true);
         let ordinary = completed_lease(&handoff_lease(stale, 11, 102), 102, 102);
         let mut incomplete = terminal_cancellation_lease(stale, 11);
+        incomplete.recovery.as_mut().unwrap()["retire_root"] = serde_json::json!("/unretired-tree");
         incomplete.recovery.as_mut().unwrap()["tree_retired"] = serde_json::json!(false);
         for candidate in [
             &legacy,
@@ -1062,6 +1094,148 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn terminal_cancellation_recovery_preserves_absent_resource_defaults_after_restart() {
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let now = 100 * 60 * 60 * 1000;
+        let stale = now - 60 * 60 * 1000;
+        let mut expected = Vec::new();
+        let mut journals = Vec::new();
+        for explicit_defaults in [false, true] {
+            for explicit_pending in [false, true] {
+                let mut before = terminal_cancellation_lease(stale, 11);
+                let recipe = before.recovery.as_mut().unwrap();
+                if explicit_defaults {
+                    recipe["pair"] = serde_json::Value::Null;
+                    recipe["retire_root"] = serde_json::Value::Null;
+                    recipe["pair_released"] = serde_json::json!(false);
+                    recipe["tree_retired"] = serde_json::json!(false);
+                } else {
+                    recipe.as_object_mut().unwrap().remove("pair_released");
+                    recipe.as_object_mut().unwrap().remove("tree_retired");
+                }
+                if explicit_pending {
+                    recipe["preparation_cancelled"] = serde_json::json!(false);
+                    recipe["source_cancellation_settled"] = serde_json::json!(false);
+                }
+                recipe["future_custody"] = serde_json::json!({"keep": "original"});
+                assert_eq!(retired_delivery(&before), Some(1));
+                assert!(terminal_cancellation_unsettled(&before));
+                assert!(verify_recovery_completion(&before, &before).is_err());
+
+                let mut after = before.clone();
+                after.recovery.as_mut().unwrap()["source_cancellation_settled"] =
+                    serde_json::json!(true);
+                after.recovery.as_mut().unwrap()["source_authority_namespace"] =
+                    serde_json::json!("current");
+                verify_recovery_completion(&before, &after).unwrap();
+                assert!(!terminal_cancellation_unsettled(&after));
+
+                let path = directory
+                    .path()
+                    .join(format!("{}.json", before.identity.local_wrapper_id));
+                let bytes = serde_json::to_vec(&before).unwrap();
+                std::fs::write(&path, &bytes).unwrap();
+                expected.push(before.identity.local_wrapper_id);
+                journals.push((path, bytes));
+            }
+        }
+        expected.sort();
+        for _restart in 0..2 {
+            assert_eq!(
+                recoverable_candidates(directory.path(), now, |_| OwnerPresence::Absent)
+                    .into_iter()
+                    .map(|candidate| candidate.wrapper_id)
+                    .collect::<Vec<_>>(),
+                expected,
+            );
+            for (path, bytes) in &journals {
+                assert_eq!(&std::fs::read(path).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn retired_delivery_refuses_live_and_malformed_resource_evidence() {
+        let before = handoff_lease(1, 11, 137);
+        let complete = completed_lease(&before, 137, 137);
+        verify_recovery_completion(&before, &complete).unwrap();
+        for (key, value) in [
+            ("source_roots", serde_json::Value::Null),
+            ("source_roots", serde_json::json!("/p")),
+            ("source_roots", serde_json::json!([null])),
+            ("source_roots", serde_json::json!([""])),
+            ("source_roots", serde_json::json!(["/p\nother"])),
+            ("sources_released", serde_json::json!(false)),
+            ("sources_released", serde_json::Value::Null),
+            ("pair", serde_json::json!(["/p", "aa"])),
+            ("pair", serde_json::json!(["/p"])),
+            ("pair", serde_json::json!(["/p", false])),
+            ("pair_released", serde_json::Value::Null),
+            ("pair_released", serde_json::json!("true")),
+            ("retire_root", serde_json::json!("/p")),
+            ("retire_root", serde_json::json!([])),
+            ("tree_retired", serde_json::Value::Null),
+        ] {
+            let mut after = complete.clone();
+            after.recovery.as_mut().unwrap()[key] = value;
+            let unchanged = after.clone();
+            assert!(retired_delivery(&after).is_none(), "{key}");
+            assert!(
+                verify_recovery_completion(&before, &after).is_err(),
+                "{key}"
+            );
+            assert_eq!(after, unchanged);
+        }
+    }
+
+    #[test]
+    fn handoff_completion_refuses_new_pending_or_malformed_cancellation() {
+        let before = handoff_lease(1, 11, 137);
+        let mut complete = completed_lease(&before, 137, 130);
+        complete.recovery.as_mut().unwrap()["preparation_cancelled"] = serde_json::json!(false);
+        complete.recovery.as_mut().unwrap()["source_authority_namespace"] =
+            serde_json::json!("current");
+        verify_recovery_completion(&before, &complete).unwrap();
+        for (key, value) in [
+            ("source_cancellation_settled", serde_json::json!(false)),
+            ("source_cancellation_settled", serde_json::json!("true")),
+            ("source_cancellation_settled", serde_json::json!(0)),
+            ("preparation_cancelled", serde_json::json!(true)),
+            ("preparation_cancelled", serde_json::Value::Null),
+            ("preparation_cancelled", serde_json::json!("false")),
+        ] {
+            let mut after = complete.clone();
+            after.recovery.as_mut().unwrap()[key] = value;
+            let unchanged = after.clone();
+            assert!(after.terminal_acknowledged);
+            assert!(
+                verify_recovery_completion(&before, &after).is_err(),
+                "{key}"
+            );
+            assert_eq!(after, unchanged);
+        }
+        complete.recovery.as_mut().unwrap()["source_cancellation_settled"] =
+            serde_json::json!(true);
+        verify_recovery_completion(&before, &complete).unwrap();
+        let mut unbound = complete.clone();
+        unbound.recovery.as_mut().unwrap()["source_authority_namespace"] = serde_json::Value::Null;
+        assert!(verify_recovery_completion(&before, &unbound).is_err());
+        let mut no_source_before = before.clone();
+        no_source_before.recovery.as_mut().unwrap()["source_roots"] = serde_json::json!([]);
+        let mut local_settlement = completed_lease(&no_source_before, 137, 130);
+        local_settlement.recovery.as_mut().unwrap()["source_cancellation_settled"] =
+            serde_json::json!(true);
+        verify_recovery_completion(&no_source_before, &local_settlement).unwrap();
+        let mut false_success = complete;
+        false_success.recovery.as_mut().unwrap()["returned"] = serde_json::json!(0);
+        false_success.exit_code = Some(0);
+        assert!(verify_recovery_completion(&before, &false_success).is_err());
     }
 
     #[test]
