@@ -41,8 +41,10 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: rabs-binaries-${{ github.ref }}
-  cancel-in-progress: true
+  # Keep an explicitly requested source qualification alive when main advances.
+  # Ordinary push/PR runs retain their existing replacement behavior.
+  group: rabs-binaries-${{ github.event_name }}-${{ github.event_name == 'workflow_dispatch' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 permissions:
   contents: read
