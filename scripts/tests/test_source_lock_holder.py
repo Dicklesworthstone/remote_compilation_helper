@@ -57,11 +57,104 @@ GNU_FLOCK = bool(FLOCK and b"--no-fork" in subprocess.run(
     timeout=5, check=False,
 ).stdout)
 BASH = shutil.which("bash")
+RSYNC = shutil.which("rsync")
 GNU_CANCELLABLE = bool(GNU_FLOCK and BASH and subprocess.run(
     [BASH, "--noprofile", "--norc", "-p", "-c",
      "(( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 1) ))"],
     stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5, check=False,
 ).returncode == 0)
+
+
+# A real rsync client starts this test-owned remote-shell transport. Preserve
+# the server arguments it actually sends, and run that server under the exact
+# production activity check. Deliberately retain a half-open pipe after client
+# failure: local timeout/SSH teardown alone must not make this test pass.
+RSYNC_ACTIVITY_PROXY = r'''
+import json, os, signal, subprocess, sys, threading, time
+from pathlib import Path
+
+config = json.loads(Path(sys.argv[1]).read_text())
+root = Path(config["fixture"])
+server_args = sys.argv[3:]
+(root / "server-argv.json").write_text(json.dumps(server_args))
+assert server_args[0] == "rsync", server_args
+started = time.monotonic()
+report = {"input_bytes": 0, "output_bytes": 0, "fixture_closed_input": False,
+          "fixture_killed_server": False, "client_signals": []}
+# rsync can signal its local remote-shell child on failure. This proxy also
+# observes the independent worker, so keep that observer alive like a remote
+# sshd after its local ssh client has gone. No signal reaches the server group.
+for signum in (signal.SIGUSR1, signal.SIGHUP, signal.SIGTERM):
+    signal.signal(signum, lambda signum, _frame: report["client_signals"].append(signum))
+stderr = open(root / "server.stderr", "wb")
+server = subprocess.Popen(
+    ["nohup", config["flock"], "-x", "--", config["activity"], "/bin/sh", "-c",
+     config["check"], "rch-source-activity", config["registry"], "aa", "active",
+     config["rsync"], *server_args[1:]],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr,
+    start_new_session=True,
+)
+channel_stalled = threading.Event()
+
+def forward_input():
+    try:
+        while True:
+            data = os.read(0, 65536)
+            if not data:
+                return  # Keep worker stdin OPEN despite client EOF.
+            if channel_stalled.is_set():
+                return  # Retain stdin, but do not deliver client keepalives.
+            report["input_bytes"] += len(data)
+            view = memoryview(data)
+            while view:
+                view = view[os.write(server.stdin.fileno(), view):]
+    except (BrokenPipeError, OSError):
+        pass
+
+def forward_output():
+    try:
+        while True:
+            data = os.read(server.stdout.fileno(), 8192)
+            if not data:
+                return
+            report["output_bytes"] += len(data)
+            if config["mode"] == "output-stall" and report["output_bytes"] >= 32768:
+                channel_stalled.set()
+                (root / "output-stalled").write_text("worker pipe retained, unread")
+                return  # Keep worker stdout OPEN, with no reader draining it.
+            view = memoryview(data)
+            while view:
+                view = view[os.write(1, view):]
+    except (BrokenPipeError, OSError):
+        pass
+
+try:
+    if config["mode"] != "input-stall":
+        threading.Thread(target=forward_input, daemon=True).start()
+    threading.Thread(target=forward_output, daemon=True).start()
+    if config["observe_unbounded"]:
+        # Only the explicit opt-out baseline closes a fixture channel. Every
+        # positive timeout case must end through rsync's own I/O deadline.
+        time.sleep(4)
+        report["alive_at_four_seconds"] = server.poll() is None
+        report["fixture_closed_input"] = True
+        server.stdin.close()
+    report["server_status"] = server.wait(timeout=14)
+except subprocess.TimeoutExpired:
+    report["server_status"] = 255
+    report["failure"] = "worker outlived the fixture's independent observation deadline"
+finally:
+    # Signal only this direct child's private group while its leader is still
+    # unreaped. Retain all fixture files, durable claims and registry evidence.
+    if server.poll() is None:
+        report["fixture_killed_server"] = True
+        os.killpg(server.pid, signal.SIGKILL)
+        server.wait(timeout=5)
+    report["elapsed"] = time.monotonic() - started
+    (root / "server-report.json").write_text(json.dumps(report, indent=2))
+    stderr.close()
+sys.exit(report["server_status"])
+'''
 
 
 def eventually(predicate, detail):
@@ -668,6 +761,110 @@ class SourceLockHolderTests(unittest.TestCase):
         process.stdin.close()
         process.stdin = None
         return process.communicate(timeout=5)
+
+    def run_rsync_activity(self, direction, mode, timeout=2):
+        fixture = self.root / f"rsync-{direction}-{mode}"
+        fixture.mkdir()
+        worker_root = fixture / "worker"
+        client_root = fixture / "client"
+        worker_root.mkdir()
+        client_root.mkdir()
+        sentinel = worker_root / "source-sentinel"
+        sentinel.write_bytes(b"durable source ownership must survive transport failure")
+        registry = self.release_registry(fixture.name + "-registry")
+        claim, _, content = self.claim_record(registry, "aa", [worker_root])
+        inode = claim.stat().st_ino
+        activity = registry / "aa.activity.lock"
+        payload = bytes(range(256)) * (512 if mode == "progress" else 1024)
+        source = (client_root if direction == "push" else worker_root) / "payload"
+        source.write_bytes(payload)
+        destination = (worker_root if direction == "push" else client_root) / "payload"
+        config = fixture / "proxy.json"
+        config.write_text(json.dumps({
+            "fixture": str(fixture), "flock": FLOCK, "rsync": RSYNC,
+            "activity": str(activity), "registry": str(registry),
+            "check": ACTIVITY_CHECK, "mode": mode,
+            "observe_unbounded": timeout == 0,
+        }))
+        proxy = fixture / "remote-shell"
+        proxy.write_text("#!{}\n{}".format(sys.executable, RSYNC_ACTIVITY_PROXY))
+        proxy.chmod(0o700)
+        command = [RSYNC, "-a", "-e", shlex.join([str(proxy), str(config)])]
+        if timeout:
+            command.append(f"--timeout={timeout}")
+        if mode == "progress":
+            command.append("--bwlimit=32")
+        if direction == "push":
+            command += [str(source), "fixture:" + str(destination)]
+        else:
+            command += ["fixture:" + str(source), str(destination)]
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   start_new_session=True, cwd=fixture)
+        self.activity_processes.append(process)
+        eventually(lambda: activity.exists() and not available(activity),
+                   "real rsync server never held source activity")
+        self.assertEqual((claim.stat().st_ino, claim.read_bytes()), (inode, content))
+        if mode == "output-stall":
+            eventually(lambda: (fixture / "output-stalled").exists(),
+                       "real rsync sender never reached the blocked-output frontier")
+        stdout, stderr = process.communicate(timeout=20)
+        eventually(lambda: (fixture / "server-report.json").exists(),
+                   "remote-shell fixture did not record the real server's exit")
+        report = json.loads((fixture / "server-report.json").read_text())
+        report["client_status"] = process.returncode
+        report["client_stderr"] = stderr.decode(errors="replace")
+        report["server_stderr"] = (fixture / "server.stderr").read_text()
+        args = json.loads((fixture / "server-argv.json").read_text())
+        self.assertEqual("--sender" in args, direction == "pull", args)
+        self.assertEqual([arg for arg in args if arg.startswith("--timeout=")],
+                         [f"--timeout={timeout}"] if timeout else [], args)
+        self.assertFalse(report["fixture_killed_server"], report)
+        self.assertEqual((claim.stat().st_ino, claim.read_bytes()), (inode, content))
+        self.assertEqual(sentinel.read_bytes(),
+                         b"durable source ownership must survive transport failure")
+        self.assertEqual(list(registry.glob("*.cancelling")), [])
+        self.assertEqual(list((registry / "released").iterdir()), [])
+        self.assertEqual(list((registry / "cancelled").iterdir()), [])
+        self.assertTrue(available(activity), report)
+        if mode == "progress":
+            self.assertEqual(destination.read_bytes(), payload)
+        (fixture / "qualification.json").write_text(json.dumps(report, indent=2))
+        return report
+
+    @unittest.skipUnless(FLOCK and RSYNC, "flock and rsync required for real activity I/O")
+    def test_rsync_receiver_times_out_half_open_input_without_releasing_claim(self):
+        report = self.run_rsync_activity("push", "input-stall")
+        self.assertEqual(report["server_status"], 30, report)
+        self.assertIn("timeout", report["server_stderr"].lower())
+        self.assertFalse(report["fixture_closed_input"], report)
+        self.assertLess(report["elapsed"], 10, report)
+        self.assertGreater(report["output_bytes"], 0, "no real protocol handshake")
+
+    @unittest.skipUnless(FLOCK and RSYNC, "flock and rsync required for real activity I/O")
+    def test_rsync_sender_times_out_blocked_output_without_releasing_claim(self):
+        report = self.run_rsync_activity("pull", "output-stall")
+        self.assertEqual(report["server_status"], 30, report)
+        self.assertIn("timeout", report["server_stderr"].lower())
+        self.assertFalse(report["fixture_closed_input"], report)
+        self.assertLess(report["elapsed"], 10, report)
+        self.assertGreater(report["input_bytes"], 0, "no real client/server negotiation")
+
+    @unittest.skipUnless(FLOCK and RSYNC, "flock and rsync required for real activity I/O")
+    def test_rsync_progress_renews_idle_budget_in_both_directions(self):
+        for direction in ("push", "pull"):
+            with self.subTest(direction=direction):
+                report = self.run_rsync_activity(direction, "progress")
+                self.assertEqual((report["client_status"], report["server_status"]), (0, 0), report)
+                self.assertFalse(report["fixture_closed_input"], report)
+                self.assertGreater(report["elapsed"], 2, "test must exceed its I/O idle budget")
+                self.assertLess(report["elapsed"], 10, report)
+
+    @unittest.skipUnless(FLOCK and RSYNC, "flock and rsync required for real activity I/O")
+    def test_rsync_explicit_opt_out_keeps_activity_until_fixture_input_eof(self):
+        report = self.run_rsync_activity("push", "input-stall", timeout=0)
+        self.assertTrue(report["alive_at_four_seconds"], report)
+        self.assertTrue(report["fixture_closed_input"], report)
+        self.assertEqual(report["server_status"], 12, report)
 
     @unittest.skipUnless(FLOCK, "flock required for real activity authority")
     def test_finite_activity_incomplete_eof_never_executes_or_acquires_authority(self):

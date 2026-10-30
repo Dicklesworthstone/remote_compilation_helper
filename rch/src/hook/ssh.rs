@@ -1349,6 +1349,45 @@ pub(super) async fn locate_remote_source_authority_namespace(
     }
 }
 
+/// Observe an optional namespace for explicit recovery of an already retired
+/// legacy lease. Confirmed absence grants no authority and must leave its
+/// journal unchanged; malformed or ambiguous evidence remains an error.
+/// Normal ownership recovery still uses the mandatory locator above.
+pub(super) async fn discover_remote_source_authority_namespace(
+    worker: &WorkerConfig,
+    roots: &[String],
+    identity: &str,
+) -> anyhow::Result<Option<SourceAuthorityNamespace>> {
+    let command = source_cancellation_settlement_command(
+        REMOTE_SOURCE_CLAIM_REGISTRY,
+        LEGACY_SOURCE_CLAIM_REGISTRY,
+        roots,
+        identity,
+        "discover",
+        "",
+    )?;
+    let output = run_source_metadata_rpc(
+        worker,
+        &command,
+        "RCH_SOURCE_AUTHORITY_DISCOVERY",
+        Duration::from_secs(30),
+    )
+    .await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "cannot discover terminal source ownership on {} (status {:?}): {}",
+        worker.id,
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr).trim(),
+    );
+    match output.stdout.as_slice() {
+        b"RCH_SOURCE_AUTHORITY_DISCOVERY current\n" => Ok(Some(SourceAuthorityNamespace::Current)),
+        b"RCH_SOURCE_AUTHORITY_DISCOVERY legacy\n" => Ok(Some(SourceAuthorityNamespace::Legacy)),
+        b"RCH_SOURCE_AUTHORITY_DISCOVERY absent\n" => Ok(None),
+        _ => anyhow::bail!("invalid terminal source ownership discovery response"),
+    }
+}
+
 /// Settle cancellation metadata only after the caller has validated its exact
 /// durable failed-result and source/tree/pair retirement evidence. Detached
 /// recovery must retain its journal ownership across this call. Independent
@@ -3093,18 +3132,27 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
             .join("cancelled")
             .join(format!("{identity}.{digest}.claim"));
         std::fs::write(&fence, &body).unwrap();
-        for attempt in 0..4 {
-            let locate = attempt == 0;
+        for attempt in 0..5 {
+            let discover = attempt == 0;
+            let locate = attempt == 1;
             let command = source_cancellation_settlement_command(
                 registry.to_str().unwrap(),
                 legacy.to_str().unwrap(),
                 &roots,
                 identity,
-                if locate { "locate" } else { "settle-cancel" },
-                if locate { "" } else { "current" },
+                if discover {
+                    "discover"
+                } else if locate {
+                    "locate"
+                } else {
+                    "settle-cancel"
+                },
+                if discover || locate { "" } else { "current" },
             )
             .unwrap();
-            let contract = if locate {
+            let contract = if discover {
+                "RCH_SOURCE_AUTHORITY_DISCOVERY"
+            } else if locate {
                 "RCH_SOURCE_AUTHORITY_NAMESPACE"
             } else {
                 "RCH_SOURCE_CANCELLATION_SETTLED"
@@ -3116,7 +3164,7 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
                     include_str!("source_namespace_control.sh")
                 ),
             );
-            if attempt == 3 {
+            if attempt == 4 {
                 std::fs::write(&fence, b"/incomplete\n").unwrap();
             }
             // Use the real generated upload, login-shell quoting and bounded
@@ -3139,7 +3187,7 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
                 .await
                 .expect("metadata controller did not terminate")
                 .unwrap();
-            if attempt < 3 {
+            if attempt < 4 {
                 assert!(
                     output.status.success(),
                     "{}",
@@ -3147,7 +3195,9 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
                 );
                 assert_eq!(
                     output.stdout,
-                    if locate {
+                    if discover {
+                        b"RCH_SOURCE_AUTHORITY_DISCOVERY current\n".as_slice()
+                    } else if locate {
                         b"RCH_SOURCE_AUTHORITY_NAMESPACE current\n".as_slice()
                     } else {
                         b"RCH_SOURCE_CANCELLATION_SETTLED\n".as_slice()
@@ -3163,7 +3213,7 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
                 );
                 assert_eq!(std::fs::read(&fence).unwrap(), b"/incomplete\n");
             }
-            if locate {
+            if discover || locate {
                 assert!(
                     !receipt.exists(),
                     "namespace discovery published a cancellation receipt"

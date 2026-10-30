@@ -1075,15 +1075,18 @@ class TerminalCancellationSettlementTests(unittest.TestCase):
         self.env["TMPDIR"] = str(self.tmp)
 
     def start_settlement(self, token="aa", roots=None, env=None, transaction=None,
-                         operation="settle-cancel", expected="current"):
+                         operation="settle-cancel", expected="current",
+                         current_registry=None, legacy_registry=None):
         roots = self.roots if roots is None else roots
         invocation = [sys.executable, "-I", "-S", "-c", self.coordinator,
-                      str(self.registry), str(self.legacy), token, digest(roots),
+                      str(self.registry if current_registry is None else current_registry),
+                      str(self.legacy if legacy_registry is None else legacy_registry), token, digest(roots),
                       transaction or self.script.read_text(), operation, expected]
         program = ("exec " + shlex.join(invocation) + " <<'RCH_SOURCE_CLAIM_ROOTS'\n"
                    + body(roots).decode() + "RCH_SOURCE_CLAIM_ROOTS\n")
-        contract = ("RCH_SOURCE_AUTHORITY_NAMESPACE" if operation == "locate"
-                    else "RCH_SOURCE_CANCELLATION_SETTLED")
+        contract = {"locate": "RCH_SOURCE_AUTHORITY_NAMESPACE",
+                    "discover": "RCH_SOURCE_AUTHORITY_DISCOVERY"}.get(
+                        operation, "RCH_SOURCE_CANCELLATION_SETTLED")
         process = subprocess.Popen([self.shell, "-c", "set -- " + contract + "\n" + self.control],
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, env=env or self.env)
@@ -1100,12 +1103,15 @@ class TerminalCancellationSettlementTests(unittest.TestCase):
     def locate(self, **arguments):
         return self.settle(operation="locate", expected="", **arguments)
 
+    def discover(self, **arguments):
+        return self.settle(operation="discover", expected="", **arguments)
+
     def make_legacy(self):
         self.legacy.mkdir()
         for name in ("released", "cancelled", "quarantine"):
             (self.legacy / name).mkdir()
 
-    def legacy_transaction(self, operation, token="aa", roots=None):
+    def legacy_transaction(self, operation, token="aa", roots=None, env=None):
         roots = self.roots if roots is None else roots
         command = [FLOCK, "--exclusive", *FLOCK_NO_FORK, "--",
                    str(self.legacy / (token + ".activity.lock")),
@@ -1116,7 +1122,7 @@ class TerminalCancellationSettlementTests(unittest.TestCase):
                    str(self.legacy), token, digest(roots), operation]
         return subprocess.run(command, input=body(roots), stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE,
-                              env={**self.env, "RCH_LEGACY_SOURCE_CLAIM_REGISTRY": str(self.registry)},
+                              env={**(env or self.env), "RCH_LEGACY_SOURCE_CLAIM_REGISTRY": str(self.registry)},
                               timeout=20, check=False)
 
     def assert_settled(self, result):
@@ -1246,14 +1252,13 @@ class TerminalCancellationSettlementTests(unittest.TestCase):
         self.assertEqual(self.records(), before)
 
     def test_namespace_locator_preserves_missing_incomplete_and_conflicting_evidence(self):
-        for state in ("absent", "pending", "torn", "wrong-roots", "active-and-cancelled",
+        for state in ("absent", "torn", "wrong-roots", "active-and-cancelled",
                       "quarantine", "duplicate", "misplaced", "corrupt-active"):
             with self.subTest(state=state):
                 self.setUp()
-                if state in ("pending", "torn"):
+                if state == "torn":
                     path = self.record("aa", self.roots, "pending")
-                    if state == "torn":
-                        path.write_bytes(b"interrupted")
+                    path.write_bytes(b"interrupted")
                 elif state != "absent":
                     path = self.record("aa", self.roots)
                     if state == "corrupt-active":
@@ -1272,6 +1277,256 @@ class TerminalCancellationSettlementTests(unittest.TestCase):
                 self.assert_refused(result)
                 self.assertEqual(result.stdout, b"")
                 self.assertEqual(self.records(), before)
+
+    def pending_namespace_fixture(self, namespace, shell):
+        self.setUp()
+        self.shell = shell
+        if shell != "/bin/sh":
+            # The coordinator intentionally invokes `sh`; exercise its exact
+            # transaction under Bash too, without replacing the coordinator.
+            self.env = self.tools_env({"sh": "exec " + shlex.quote(shell) + ' "$@"'})
+        if namespace == "legacy":
+            self.make_legacy()
+        registry = self.legacy if namespace == "legacy" else self.registry
+        pending = registry / ("aa." + digest(self.roots) + ".pending")
+
+        def transaction(operation, env=None):
+            if namespace == "legacy":
+                return self.legacy_transaction(operation, env=env)
+            return self.transact("aa", self.roots, operation, env=env)
+
+        # Real bytes and rename; inject only the failed directory fsync after
+        # atomic pending publication. No source grant or readiness was sent.
+        failed = transaction("acquire", self.fail_sync_after_move(pending))
+        self.assert_refused(failed)
+        self.assertEqual(failed.stdout, b"")
+        self.assertIn(b"RCH_SOURCE_REGISTRY_PUBLICATION_UNCONFIRMED", failed.stderr)
+        self.assertEqual(pending.read_bytes(), body(self.roots))
+        self.assertFalse(pending.with_suffix(".claim").exists())
+        return pending, transaction
+
+    def test_namespace_locator_recovers_complete_pending_without_promoting_it(self):
+        for shell in ("/bin/sh", shutil.which("bash")):
+            self.assertIsNotNone(shell, "Bash is required for this qualification")
+            for namespace in ("current", "legacy"):
+                with self.subTest(shell=shell, namespace=namespace):
+                    pending, transaction = self.pending_namespace_fixture(namespace, shell)
+                    inode = pending.stat().st_ino
+                    before = self.records()
+                    admission_env = {**self.env,
+                                     "RCH_LEGACY_SOURCE_CLAIM_REGISTRY": str(self.legacy)}
+                    blocked = self.transact("bb", self.roots, "try-acquire", env=admission_env)
+                    self.assertEqual(blocked.returncode, 75, blocked.stderr)
+                    for _ in range(2):
+                        # Treat the first exact reply as lost. Restart repeats
+                        # the read-only proof and retains the same record.
+                        located = self.locate()
+                        self.assert_granted(located)
+                        self.assertEqual(located.stdout,
+                                         f"RCH_SOURCE_AUTHORITY_NAMESPACE {namespace}\n".encode())
+                        self.assertEqual(self.records(), before)
+                        self.assertFalse(pending.with_suffix(".claim").exists())
+                    self.assert_refused(transaction("cancellation-state"))
+                    self.assert_refused(self.settle(expected=namespace))
+                    self.assertEqual(self.records(), before)
+
+                    # Location alone grants nothing. The existing checked
+                    # cancellation transaction is still required to promote
+                    # the pending record into an activity-drained cleanup grant.
+                    cancelled = transaction("cancel")
+                    self.assert_granted(cancelled)
+                    self.assertEqual(cancelled.stdout, b"owned")
+                    active = pending.with_suffix(".claim")
+                    self.assertEqual((active.stat().st_ino, active.read_bytes()),
+                                     (inode, body(self.roots)))
+                    self.assert_granted(transaction("finish-cancel"))
+                    self.assert_settled(self.settle(expected=namespace))
+                    self.assert_refused(transaction("recover"))
+                    admitted = self.transact("bb", self.roots, "try-acquire", env=admission_env)
+                    self.assert_granted(admitted)
+                    successor = self.registry / ("bb." + digest(self.roots) + ".claim")
+                    successor_before = successor.stat().st_ino, successor.read_bytes()
+                    self.assert_settled(self.settle(expected=namespace))
+                    self.assertEqual((successor.stat().st_ino, successor.read_bytes()), successor_before)
+
+    def test_namespace_locator_requires_pending_file_and_directory_durability(self):
+        for shell in ("/bin/sh", shutil.which("bash")):
+            self.assertIsNotNone(shell, "Bash is required for this qualification")
+            for namespace in ("current", "legacy"):
+                for failed_barrier in ("file", "directory"):
+                    with self.subTest(shell=shell, namespace=namespace, barrier=failed_barrier):
+                        pending, _ = self.pending_namespace_fixture(namespace, shell)
+                        before = self.records()
+                        barrier = pending if failed_barrier == "file" else pending.parent
+                        env = self.barrier_env('if [ "$1" = ' + shlex.quote(str(barrier))
+                                               + ' ]; then exit 91; fi')
+                        result = self.locate(env=env)
+                        self.assert_refused(result)
+                        self.assertEqual(result.stdout, b"")
+                        self.assertIn(b"RCH_SOURCE_REGISTRY_PUBLICATION_UNCONFIRMED", result.stderr)
+                        self.assertEqual(self.records(), before)
+                        self.assert_granted(self.locate())
+                        self.assertEqual(self.records(), before)
+
+    def test_namespace_locator_preserves_conflicting_or_foreign_pending_evidence(self):
+        for case in ("active", "cancelling", "released", "cancelled", "quarantine",
+                     "other-roots", "other-namespace", "unknown", "foreign-token",
+                     "wrong-request", "torn", "symlink"):
+            with self.subTest(case=case):
+                self.setUp()
+                pending = self.registry / ("aa." + digest(self.roots) + ".pending")
+                if case == "foreign-token":
+                    self.record("bb", self.roots, "pending")
+                elif case == "symlink":
+                    target = self.root / "foreign-pending"
+                    target.write_bytes(body(self.roots))
+                    pending.symlink_to(target)
+                else:
+                    pending.write_bytes(b"interrupted" if case == "torn" else body(self.roots))
+                if case in ("active", "cancelling"):
+                    self.record("aa", self.roots, "claim" if case == "active" else case)
+                if case in ("released", "cancelled", "quarantine"):
+                    suffix = ".pending" if case == "quarantine" else ".claim"
+                    (self.registry / case / pending.with_suffix(suffix).name).write_bytes(body(self.roots))
+                if case == "other-roots":
+                    self.record("aa", [self.root / "other-root"], "pending")
+                if case == "other-namespace":
+                    self.make_legacy()
+                    (self.legacy / pending.name).write_bytes(body(self.roots))
+                if case == "unknown":
+                    pending.with_suffix(".uncertain").write_bytes(body(self.roots))
+                before = self.records()
+                result = self.locate(roots=[self.root / "wrong"] if case == "wrong-request" else None)
+                self.assert_refused(result)
+                self.assertEqual(result.stdout, b"")
+                self.assertEqual(self.records(), before)
+
+    def test_pending_namespace_location_does_not_override_competing_source_owner(self):
+        pending, _ = self.pending_namespace_fixture("legacy", "/bin/sh")
+        # A current owner may predate conservative legacy-namespace scanning.
+        # Location identifies the old record; it never resolves this conflict.
+        other = self.record("bb", self.roots)
+        before = self.records()
+        self.assert_granted(self.locate())
+        cancelled = self.legacy_transaction("cancel")
+        self.assert_refused(cancelled)
+        self.assertEqual(cancelled.stdout, b"")
+        self.assertEqual(self.records(), before)
+        self.assertEqual(pending.read_bytes(), body(self.roots))
+        self.assertEqual(other.read_bytes(), body(self.roots))
+        self.assertFalse(pending.with_suffix(".claim").exists())
+
+    def test_optional_namespace_discovery_reports_only_verified_absence(self):
+        for state in ("missing-parents", "empty-parents", "one-registry",
+                      "two-registries", "foreign-evidence"):
+            with self.subTest(state=state):
+                self.setUp()
+                arguments = {}
+                if state in ("missing-parents", "empty-parents"):
+                    current = self.root / "absent-current-parent" / "registry"
+                    legacy = self.root / "absent-legacy-parent" / "registry"
+                    if state == "empty-parents":
+                        current.parent.mkdir()
+                        legacy.parent.mkdir()
+                    arguments = {"current_registry": current, "legacy_registry": legacy}
+                if state in ("two-registries", "foreign-evidence"):
+                    self.make_legacy()
+                if state == "foreign-evidence":
+                    self.record("bb", self.roots)
+                    (self.legacy / ("cc." + digest(self.roots) + ".pending")).write_bytes(body(self.roots))
+                before = self.records()
+                witness = self.root / "must-not-run-transaction"
+                forbidden = "printf invoked > " + shlex.quote(str(witness)) + "; exit 91"
+                for _ in range(2):
+                    result = self.discover(transaction=forbidden, **arguments)
+                    self.assert_granted(result)
+                    self.assertEqual(result.stdout, b"RCH_SOURCE_AUTHORITY_DISCOVERY absent\n")
+                    self.assertEqual(result.stderr, b"")
+                    self.assertFalse(witness.exists())
+                    self.assertEqual(self.records(), before)
+                # Optional observation never changes strict lookup semantics.
+                self.assert_refused(self.locate(**arguments))
+
+    def test_optional_namespace_discovery_validates_exact_existing_evidence(self):
+        for namespace in ("current", "legacy"):
+            for state in ("pending", "active", "cancelled", "released"):
+                with self.subTest(namespace=namespace, state=state):
+                    pending, transaction = self.pending_namespace_fixture(namespace, "/bin/sh")
+                    if state != "pending":
+                        self.assert_granted(transaction("recover"))
+                    if state == "cancelled":
+                        self.assertEqual(transaction("cancel").stdout, b"owned")
+                        self.assert_granted(transaction("finish-cancel"))
+                    if state == "released":
+                        self.assert_granted(transaction("release"))
+                    before = self.records()
+                    for _ in range(2):
+                        result = self.discover()
+                        self.assert_granted(result)
+                        self.assertEqual(result.stdout,
+                                         f"RCH_SOURCE_AUTHORITY_DISCOVERY {namespace}\n".encode())
+                        self.assertEqual(self.records(), before)
+                    if state == "pending":
+                        self.assertTrue(pending.exists())
+                        self.assertFalse(pending.with_suffix(".claim").exists())
+
+    def test_optional_namespace_discovery_never_turns_uncertain_evidence_into_absence(self):
+        for state in ("torn-pending", "bad-marker", "unknown", "duplicate",
+                      "wrong-roots", "unsafe-directory", "conflicting-pending"):
+            with self.subTest(state=state):
+                self.setUp()
+                if state == "torn-pending":
+                    self.record("aa", self.roots, "pending").write_bytes(b"interrupted")
+                elif state == "bad-marker":
+                    self.record("aa", self.roots, "cancelling").write_bytes(b"interrupted")
+                elif state == "unknown":
+                    (self.registry / ("aa." + digest(self.roots) + ".uncertain")).write_bytes(body(self.roots))
+                elif state == "unsafe-directory":
+                    self.registry.chmod(0o777)
+                else:
+                    claim = self.record("aa", self.roots)
+                    if state == "duplicate":
+                        self.make_legacy()
+                        (self.legacy / claim.name).write_bytes(body(self.roots))
+                    if state == "conflicting-pending":
+                        self.record("aa", self.roots, "pending")
+                before = self.records()
+                result = self.discover(roots=[self.root / "wrong"] if state == "wrong-roots" else None)
+                self.assert_refused(result)
+                self.assertEqual(result.stdout, b"")
+                self.assertEqual(self.records(), before)
+
+    def test_optional_discovery_refuses_replaced_absent_namespace_parent(self):
+        parent = self.root / "absent-legacy-parent"
+        parent.mkdir()
+        self.legacy = parent / "registry"
+        before = self.records()
+        with (self.registry / "metadata.lock").open("a") as metadata:
+            fcntl.flock(metadata, fcntl.LOCK_EX)
+            process = self.start_settlement(operation="discover", expected="")
+            activity = self.registry / "aa.activity.lock"
+            deadline = time.monotonic() + 3
+            observed = False
+            while time.monotonic() < deadline:
+                if activity.exists():
+                    with activity.open("a") as descriptor:
+                        try:
+                            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        except BlockingIOError:
+                            observed = True
+                            break
+                time.sleep(0.01)
+            self.assertTrue(observed, "discovery did not retain activity before waiting on metadata")
+            # Preserve the original directory and replace only this fixture's
+            # name. Its pinned parent must contradict the new empty directory.
+            parent.rename(self.root / "retained-absent-parent")
+            parent.mkdir()
+            fcntl.flock(metadata, fcntl.LOCK_UN)
+            stdout, stderr = process.communicate(timeout=10)
+        self.assertEqual((process.returncode, stdout), (73, b""), stderr)
+        self.assertIn(b"absent registry parent changed", stderr)
+        self.assertEqual(self.records(), before)
+        self.assertFalse(self.legacy.exists())
 
     def test_legacy_cleanup_refuses_current_lexical_and_physical_owner(self):
         for physical in (False, True):

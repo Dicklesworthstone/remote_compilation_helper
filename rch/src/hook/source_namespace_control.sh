@@ -4,12 +4,17 @@
 set -eu
 rch_control_ready=${1:-RCH_TOPOLOGY_OK}
 rch_control_alternate=
+rch_control_third=
 rch_control_format='%s\n'
 case "$rch_control_ready" in
     RCH_TOPOLOGY_OK|RCH_SOURCE_CANCELLATION_SETTLED) ;;
     RCH_SOURCE_AUTHORITY_NAMESPACE)
         rch_control_ready='RCH_SOURCE_AUTHORITY_NAMESPACE current'
         rch_control_alternate='RCH_SOURCE_AUTHORITY_NAMESPACE legacy' ;;
+    RCH_SOURCE_AUTHORITY_DISCOVERY)
+        rch_control_ready='RCH_SOURCE_AUTHORITY_DISCOVERY current'
+        rch_control_alternate='RCH_SOURCE_AUTHORITY_DISCOVERY legacy'
+        rch_control_third='RCH_SOURCE_AUTHORITY_DISCOVERY absent' ;;
     RCH_SOURCE_INTENT_CANCEL)
         rch_control_ready=owned; rch_control_alternate=unowned; rch_control_format='%s' ;;
     RCH_SOURCE_INTENT_RELEASED)
@@ -248,6 +253,7 @@ observer=$2
 ready=$3
 alternate=$4
 reply_format=$5
+third=$6
 # Prove that the direct parent leads a private process group BEFORE
 # installing a group-wide kill trap or reading any namespace program. A timer
 # wrapper using --foreground must not turn "kill 0" into a kill of the observer,
@@ -308,13 +314,16 @@ fi
 # exit but never publish that marker. Successful evidence must match bytewise.
 [ "$status" -eq 0 ] || finish "$status"
 if ! printf "$reply_format" "$ready" | cmp -s - "$control/stdout"; then
-    [ -n "$alternate" ] && printf "$reply_format" "$alternate" | cmp -s - "$control/stdout" || {
+    if { [ -n "$alternate" ] && printf "$reply_format" "$alternate" | cmp -s - "$control/stdout"; } ||
+       { [ -n "$third" ] && printf "$reply_format" "$third" | cmp -s - "$control/stdout"; }; then
+        :
+    else
         printf "%s\n" "RCH: namespace control returned invalid readiness" >&2
         exit 73
-    }
+    fi
 fi
 finish 0
-' rch-namespace-monitor "$control" "$$" "$rch_control_ready" "$rch_control_alternate" "$rch_control_format" <&3 3<&- &
+' rch-namespace-monitor "$control" "$$" "$rch_control_ready" "$rch_control_alternate" "$rch_control_format" "$rch_control_third" <&3 3<&- &
 monitor=$!
 exec 3<&-
 set +e
@@ -344,6 +353,7 @@ control=$1
 ready=$2
 alternate=$3
 reply_format=$4
+third=$5
 IFS= read -r status < "$control/result" || exit 73
 case "$status" in ""|*[!0-9]*) exit 73 ;; esac
 [ "${#status}" -le 3 ] && [ "$status" -le 255 ] || exit 73
@@ -354,10 +364,15 @@ printf "%s\n" "$status" | cmp -s - "$control/result" || exit 73
 cat -- "$control/stderr" >&2 || exit 73
 [ "$status" -eq 0 ] || exit "$status"
 if ! printf "$reply_format" "$ready" | cmp -s - "$control/stdout"; then
-    [ -n "$alternate" ] && printf "$reply_format" "$alternate" | cmp -s - "$control/stdout" || exit 73
+    if { [ -n "$alternate" ] && printf "$reply_format" "$alternate" | cmp -s - "$control/stdout"; } ||
+       { [ -n "$third" ] && printf "$reply_format" "$third" | cmp -s - "$control/stdout"; }; then
+        :
+    else
+        exit 73
+    fi
 fi
 cat -- "$control/stdout"
-' rch-namespace-delivery "$control" "$rch_control_ready" "$rch_control_alternate" "$rch_control_format" </dev/null &
+' rch-namespace-delivery "$control" "$rch_control_ready" "$rch_control_alternate" "$rch_control_format" "$rch_control_third" </dev/null &
 delivery=$!
 set +e
 # A foreground timer killed during delivery makes the observer shell print
