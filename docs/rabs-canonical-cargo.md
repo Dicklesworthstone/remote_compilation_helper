@@ -1466,10 +1466,14 @@ Each profile's `jobs` must be at most `jobs_per_root`, and a root retains its
 admission through process and stream drain. Independent roots can compile
 concurrently while sharing the same coordinator generation. Eligible identical
 dependency actions use the existing singleflight, sampling and replay gates.
-With isolated dependency workers configured, callers that overlap an active
-dependency compilation join one service-owned execution. Cancelling its first
-caller removes only that caller's interest; the worker continues while another
-subscriber remains. The final subscriber's departure requests cancellation,
+With isolated dependency workers configured, acknowledged dependency requests
+enter a bounded service-owned FIFO queue when the pool is busy or cooling down.
+Callers requesting the same queued or active action join one execution. Queued
+requests retain their captured inputs without occupying a worker or creating a
+compiler lease or a waiting producer thread. A dispatcher wakes on admission,
+worker release, cancellation or the next connection-cooldown deadline.
+Cancelling its first caller removes only that caller's interest; the worker
+continues while another subscriber remains. The final subscriber's departure requests cancellation,
 and the service keeps the transport owner until it returns verified completion
 or an explicitly uncertain outcome with retained recovery state. Service shutdown
 cancels and joins these owners before releasing coordinator authority.
@@ -1480,8 +1484,26 @@ completed manifest before its own bounded installer runs and revalidates its
 inputs. New callers cannot join a completed execution; they pass the ordinary
 cache and verification gates. Execution-only workspace units still require their
 own fresh worker execution. The service bounds active shared producers by the
-configured worker count and retains at most 256 subscriptions, including offers
-waiting for acknowledgment and completed results waiting for installation.
+configured worker count, retains at most 256 subscriptions, and admits at most
+256 distinct action claims across unacknowledged offers, queued requests and
+active work. Joined offers waiting for acknowledgment and completed results
+waiting for installation retain their subscription slots. Queued work has a
+five-minute admission budget. If that expires before dispatch, the caller gets
+an action-bound failure confirming that no execution began and may compile
+locally. Losing the final queued subscriber promptly releases the queued inputs;
+it never waits for a busy worker to become free. These scheduling bounds apply
+to the shared dependency lane; execution-only workspace requests still obtain
+their own worker reservation.
+
+Remote actions also reuse verified dependency input bytes across overlapping
+artifact inventories. The coordinator retains immutable bytes for the exact
+file generation and content digest, checks each caller's descriptor and complete
+inventory, and reuses the existing transfer digest. The process-wide byte cache
+retains at most 512 MiB and 4,096 entries, including captures in progress and
+objects held by active uploads. Active uploads prevent eviction. If the cache
+is full, ordinary verified capture proceeds within the existing per-upload
+bounds. Cancellation releases unfinished captures; worker-side verification of
+received bytes remains mandatory.
 
 Preparation's Cargo metadata, package selection, rustup and Git subprocesses use
 the same root broker, so preliminary work cannot exceed the configured process

@@ -54,8 +54,10 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::io;
 use std::net::SocketAddr;
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::Instant;
 
 mod recovery;
 mod shared;
@@ -72,6 +74,9 @@ const POOL_CONFIG_KEY: &str = "RABS_DEPENDENCY_WORKERS_JSON";
 const MAX_WORKER_CONFIG_BYTES: usize = 128 * 1024;
 /// One explicitly pinned worker per slot; the edge execution lane uses this bound.
 pub const MAX_DEPENDENCY_WORKERS: usize = 32;
+/// Includes unacknowledged offers, queued actions and running producers. A
+/// queued offer no longer owns a worker, so it needs its own service bound.
+const MAX_PENDING_ACTIONS: usize = 256;
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -188,10 +193,9 @@ impl WorkerConfiguration {
     }
 }
 
-/// A reservation prevents duplicate dispatch while the worker is connecting,
-/// before the authoritative coordinator can admit the authenticated attempt.
-/// Its lifetime covers the offer, execution and publication. It grants no
-/// execution authority and never replaces CoordLive's action ownership.
+/// A key claim prevents duplicate offers and queued dispatch before the
+/// authenticated coordinator attempt exists. It reserves no physical worker,
+/// request ID or execution lease, and survives through publication.
 #[derive(Debug)]
 struct PendingActionClaim {
     actions: Arc<Mutex<HashSet<TypedDigest>>>,
@@ -214,7 +218,79 @@ impl Drop for PendingActionClaim {
 struct DependencyWorkerPool {
     workers: Vec<Arc<RemoteDependencyTransport>>,
     next: AtomicUsize,
+    probes: Mutex<()>,
     pending: Arc<Mutex<HashSet<TypedDigest>>>,
+    availability: Arc<PoolAvailability>,
+}
+
+#[derive(Debug, Default)]
+struct PoolAvailability(Mutex<Vec<Weak<shared::QueueSignal>>>);
+
+impl PoolAvailability {
+    fn watch(&self, signal: &Arc<shared::QueueSignal>) {
+        let mut watchers = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        watchers.retain(|watcher| watcher.strong_count() != 0);
+        let watcher = Arc::downgrade(signal);
+        if !watchers.iter().any(|existing| existing.ptr_eq(&watcher)) {
+            watchers.push(watcher);
+        }
+    }
+
+    fn notify(&self) {
+        let signals = {
+            let mut watchers = self.0.lock().unwrap_or_else(|error| error.into_inner());
+            watchers.retain(|watcher| watcher.strong_count() != 0);
+            watchers
+                .iter()
+                .filter_map(Weak::upgrade)
+                .collect::<Vec<_>>()
+        };
+        for signal in signals {
+            signal.notify();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CapacityRelease(Arc<PoolAvailability>);
+
+impl Drop for CapacityRelease {
+    fn drop(&mut self) {
+        self.0.notify();
+    }
+}
+
+/// Fields drop in declaration order: release the actual persistent/in-process
+/// worker reservation BEFORE notifying queued work. The notifier belongs to
+/// the pool, so a queue registered later still sees an older affine job exit.
+#[derive(Debug)]
+struct PoolReservation {
+    // The transport's optional durable admission contains a full coordinator.
+    // Keep dormant queue entries and readiness results small while still
+    // dropping that actual owner before the availability notification.
+    reservation: Box<RemoteDependencyReservation>,
+    _release: CapacityRelease,
+}
+
+enum WorkerProbe {
+    Reserved(PoolReservation),
+    /// No actual worker or persistent admission is held. An absolute expiry
+    /// from this probe remains useful even if it passes before the queue waits.
+    Waiting(Option<Instant>),
+}
+
+impl Deref for PoolReservation {
+    type Target = RemoteDependencyReservation;
+
+    fn deref(&self) -> &Self::Target {
+        &self.reservation
+    }
+}
+
+impl DerefMut for PoolReservation {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.reservation
+    }
 }
 
 impl DependencyWorkerPool {
@@ -222,45 +298,97 @@ impl DependencyWorkerPool {
         Self {
             workers,
             next: AtomicUsize::new(0),
+            probes: Mutex::new(()),
             pending: Arc::new(Mutex::new(HashSet::new())),
+            availability: Arc::new(PoolAvailability::default()),
         }
     }
 
-    fn try_reserve(
-        &self,
-        key: &TypedDigest,
-    ) -> io::Result<(RemoteDependencyReservation, PendingActionClaim)> {
+    fn try_claim(&self, key: &TypedDigest) -> io::Result<PendingActionClaim> {
         let mut actions = self
             .pending
             .lock()
             .map_err(|_| io::Error::other("remote pending-action lock poisoned"))?;
-        if !actions.insert(key.clone()) {
+        if actions.contains(key) {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "another subscriber is preparing this remote action",
             ));
         }
-        let claim = PendingActionClaim {
+        if actions.len() >= MAX_PENDING_ACTIONS {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "remote action offer and queue capacity exhausted",
+            ));
+        }
+        actions.insert(key.clone());
+        Ok(PendingActionClaim {
             actions: Arc::clone(&self.pending),
             key: key.clone(),
-        };
-        drop(actions);
+        })
+    }
+
+    fn try_reserve(&self, key: &TypedDigest) -> io::Result<(PoolReservation, PendingActionClaim)> {
+        let claim = self.try_claim(key)?;
+        self.try_reserve_worker()
+            .map(|reservation| (reservation, claim))
+    }
+
+    fn try_reserve_worker(&self) -> io::Result<PoolReservation> {
+        match self.probe_worker()? {
+            WorkerProbe::Reserved(reservation) => Ok(reservation),
+            WorkerProbe::Waiting(_) => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "all remote dependency workers are busy or cooling down",
+            )),
+        }
+    }
+
+    fn probe_worker(&self) -> io::Result<WorkerProbe> {
+        // A failed transport probe can briefly own its occupied bit before
+        // discovering cooldown. Serialize only these short probes, so another
+        // caller cannot mistake that unnotified temporary guard for an active
+        // reservation and then sleep through the available capacity.
+        let _probe = self
+            .probes
+            .lock()
+            .map_err(|_| io::Error::other("remote worker probe lock poisoned"))?;
         if self.workers.is_empty() {
             return Err(invalid("remote dependency worker pool is empty"));
         }
+        // Capture time BEFORE any failed reservation. Querying with a newer
+        // time could forget the only expiry wake if cooldown ended between
+        // reservation refusal and the queue's wait calculation.
+        let observed = Instant::now();
+        let mut deadline = None;
+        let mut available_state = false;
         let start = self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len();
         for offset in 0..self.workers.len() {
             let worker = &self.workers[(start + offset) % self.workers.len()];
             match worker.try_reserve() {
-                Ok(reservation) => return Ok((reservation, claim)),
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Ok(reservation) => {
+                    return Ok(WorkerProbe::Reserved(PoolReservation {
+                        reservation: Box::new(reservation),
+                        _release: CapacityRelease(Arc::clone(&self.availability)),
+                    }));
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if let Ok(next) = worker.cooldown_deadline_at(observed) {
+                        available_state = true;
+                        if let Some(next) = next {
+                            deadline = Some(deadline.map_or(next, |at: Instant| at.min(next)));
+                        }
+                    }
+                }
                 Err(error) => return Err(error),
             }
         }
-        Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            "all remote dependency workers are busy",
-        ))
+        if !available_state {
+            return Err(io::Error::other(
+                "all remote worker connectivity states are unavailable",
+            ));
+        }
+        Ok(WorkerProbe::Waiting(deadline))
     }
 }
 
@@ -816,8 +944,9 @@ impl RemoteDependencies {
 }
 
 impl LiveDependencyLane {
-    /// A normal sampled cache hit may serve immediately. A miss reserves a
-    /// worker, but creates no fake local attempt under a remote isolation key.
+    /// A normal sampled cache hit may serve immediately. Shared misses claim
+    /// bounded queue admission; affine misses reserve their worker immediately.
+    /// Neither creates a local attempt under a remote isolation key.
     #[must_use]
     pub fn decide_remote(
         &self,
@@ -864,7 +993,18 @@ impl LiveDependencyLane {
             Ok(None) => {}
             Err(error) => return LiveDecision::PassThrough(format!("remote dispatch: {error:?}")),
         }
-        match remote.workers.try_reserve(&request.key.action_key) {
+        let admitted = if shared.is_some() {
+            remote
+                .workers
+                .try_claim(&request.key.action_key)
+                .map(|claim| (None, claim))
+        } else {
+            remote
+                .workers
+                .try_reserve(&request.key.action_key)
+                .map(|(reservation, claim)| (Some(reservation), claim))
+        };
+        match admitted {
             Ok((reservation, action_claim)) => {
                 let pending = PendingRemote {
                     lane: self.clone(),
@@ -887,14 +1027,15 @@ impl LiveDependencyLane {
     }
 }
 
-/// Private worker capacity and action ownership retained through publication.
+/// Action ownership retained through publication. Standalone/affine offers
+/// already own a worker; a shared queued offer receives one only at dispatch.
 #[derive(Debug)]
 pub struct PendingRemote {
     lane: LiveDependencyLane,
     request: LiveDependencyRequest,
     remote: Arc<RemoteDependencies>,
     invocation: RemoteInvocation,
-    reservation: RemoteDependencyReservation,
+    reservation: Option<PoolReservation>,
     action_claim: PendingActionClaim,
 }
 
@@ -927,10 +1068,12 @@ impl PendingRemote {
             request,
             remote,
             invocation,
-            mut reservation,
+            reservation,
             action_claim: _action_claim,
         } = self;
         let settled = |reason: String| (reason, true);
+        let mut reservation = reservation
+            .ok_or_else(|| settled("remote action has no admitted worker reservation".into()))?;
         if cancellation.is_cancelled() {
             return Err(settled(
                 "remote execution cancelled before preparation".into(),
@@ -1984,6 +2127,75 @@ mod worker_pool_tests {
             .map(|index| pool.try_reserve(&key(index)).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn queued_action_claims_are_bounded_without_reserving_workers() {
+        let pool = pool(Path::new("/private/queued-worker-pool"), 1);
+        let claims = (0..MAX_PENDING_ACTIONS)
+            .map(|index| pool.try_claim(&key(u8::try_from(index).unwrap())).unwrap())
+            .collect::<Vec<_>>();
+        let extra = compute("rabs.test.worker-pool.v1", b"overflow");
+        assert_eq!(
+            pool.try_claim(&extra).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        // Hundreds of retained offers own no worker, durable request ID or
+        // lease; the actual worker remains exclusively reservable at dispatch.
+        let worker = pool.try_reserve_worker().unwrap();
+        assert_eq!(worker.worker(), "worker-1");
+        assert_eq!(
+            pool.try_reserve_worker().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(worker);
+        drop(claims);
+        assert!(pool.pending.lock().unwrap().is_empty());
+        assert!(pool.try_claim(&extra).is_ok());
+    }
+
+    #[test]
+    fn older_affine_reservation_wakes_queue_only_after_actual_capacity_returns() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let pool = Arc::new(pool(Path::new("/private/queued-worker-pool"), 1));
+        let (reservation, claim) = pool.try_reserve(&key(1)).unwrap();
+        let signal = Arc::new(shared::QueueSignal::default());
+        // The queue did not exist when this affine workspace job reserved its
+        // slot. The pool's release guard must notify later observers too.
+        pool.availability.watch(&signal);
+        let observed = signal.version();
+        assert!(pool.try_reserve_worker().is_err());
+        assert_eq!(
+            signal.version(),
+            observed,
+            "failed probes must not self-wake"
+        );
+        let waiter_signal = Arc::clone(&signal);
+        let waiter_pool = Arc::clone(&pool);
+        let (ready, waiting) = mpsc::sync_channel(1);
+        let waiter = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            ready.send(()).unwrap();
+            waiter_signal.wait(observed, Some(deadline));
+            assert!(
+                Instant::now() < deadline,
+                "worker release did not wake the queue"
+            );
+            waiter_pool.try_reserve_worker().unwrap()
+        });
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(reservation);
+        assert_ne!(signal.version(), observed);
+        let next = waiter.join().unwrap();
+        assert_eq!(next.worker(), "worker-1");
+        assert!(
+            pool.try_claim(&key(1)).is_err(),
+            "release must retain the action claim"
+        );
+        drop((next, claim));
+        assert!(pool.try_claim(&key(1)).is_ok());
     }
 
     #[cfg(unix)]

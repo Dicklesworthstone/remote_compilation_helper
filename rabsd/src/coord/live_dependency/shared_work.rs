@@ -14,6 +14,9 @@
 //! nor work closures may retain or reenter their own supervisor. Actual process
 //! cancellation and drain belong to the worker closure; this supervisor retains
 //! its handle until that closure has returned, including during shutdown.
+//! Deferred flights retain bounded demand without a worker thread. Their opaque
+//! launch capability belongs to an independently owned dispatcher, which may
+//! acquire real executor capacity before starting exactly that flight.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -29,9 +32,13 @@ use std::thread::{self, JoinHandle};
 #[derive(Debug)]
 pub enum StartError {
     ShuttingDown,
+    #[cfg(test)]
     AtCapacity,
+    QueueCapacity,
     SubscriberCapacity,
     AlreadyRunning,
+    StaleDeferred,
+    PreparationPanicked,
     Spawn(io::Error),
 }
 
@@ -39,14 +46,24 @@ impl fmt::Display for StartError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ShuttingDown => formatter.write_str("shared execution admission is closed"),
+            #[cfg(test)]
             Self::AtCapacity => {
                 formatter.write_str("shared execution worker capacity is exhausted")
+            }
+            Self::QueueCapacity => {
+                formatter.write_str("shared execution deferred-flight capacity is exhausted")
             }
             Self::SubscriberCapacity => {
                 formatter.write_str("shared execution subscriber capacity is exhausted")
             }
             Self::AlreadyRunning => {
                 formatter.write_str("this action already has an owned shared execution")
+            }
+            Self::StaleDeferred => {
+                formatter.write_str("deferred launch does not own this unstarted flight")
+            }
+            Self::PreparationPanicked => {
+                formatter.write_str("shared execution readiness preparation panicked")
             }
             Self::Spawn(error) => write!(
                 formatter,
@@ -68,12 +85,18 @@ impl std::error::Error for StartError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkError {
     WorkerPanicked,
+    /// No worker closure was launched. This is a settled-before-execution
+    /// failure, unlike a panic after a producer acquired execution custody.
+    CancelledBeforeStart,
 }
 
 impl fmt::Display for WorkError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::WorkerPanicked => formatter.write_str("shared execution worker panicked"),
+            Self::CancelledBeforeStart => {
+                formatter.write_str("shared execution ended before its worker was started")
+            }
         }
     }
 }
@@ -160,6 +183,11 @@ struct Flight<R> {
     state: Mutex<FlightState<R>>,
     cancellation_changed: Condvar,
     cancel: Box<dyn Fn() + Send + Sync>,
+    notify: Arc<dyn Fn() + Send + Sync>,
+}
+
+fn notify(callback: &(dyn Fn() + Send + Sync)) {
+    let _ = catch_unwind(AssertUnwindSafe(callback));
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -210,6 +238,11 @@ impl<R: Send + Sync + 'static> Flight<R> {
         }
     }
 
+    fn cancel_deferred(&self) {
+        self.seal_and_cancel();
+        self.complete(Err(WorkError::CancelledBeforeStart));
+    }
+
     fn detach(&self, id: u64) {
         let (waker, cancel) = {
             let mut state = lock(&self.state);
@@ -243,6 +276,10 @@ impl<R: Send + Sync + 'static> Flight<R> {
         for waker in wakers {
             let _ = catch_unwind(AssertUnwindSafe(|| waker.wake()));
         }
+        // Notification follows result sealing and subscriber wakeups. A
+        // dispatcher may immediately join this completed worker's finishing
+        // handle, even before JoinHandle::is_finished observes thread exit.
+        notify(self.notify.as_ref());
     }
 
     fn report(&self, join_panicked: bool) -> ShutdownError {
@@ -321,9 +358,60 @@ impl<R: Send + Sync + 'static> Drop for Subscription<R> {
     }
 }
 
+/// Exclusive permission to start one particular deferred generation. Matching
+/// keys do not substitute for this capability: a cancelled queued entry may
+/// have been replaced by a new flight for the same action.
+pub struct DeferredLaunch<K, R: Send + Sync + 'static> {
+    key: K,
+    flight: Arc<Flight<R>>,
+    armed: bool,
+    _slot: SubscriberSlot,
+}
+
+impl<K, R: Send + Sync + 'static> fmt::Debug for DeferredLaunch<K, R> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DeferredLaunch")
+            .field("armed", &self.armed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<K, R: Send + Sync + 'static> DeferredLaunch<K, R> {
+    /// Whether this unconsumed capability still has live demand. Dispatchers
+    /// may discard cancelled entries without acquiring a worker reservation.
+    pub fn is_pending(&self) -> bool {
+        let state = lock(&self.flight.state);
+        self.armed && state.accepting && state.outcome.is_none() && !state.subscribers.is_empty()
+    }
+
+    fn cancel(&mut self) {
+        if self.armed {
+            self.armed = false;
+            self.flight.cancel_deferred();
+        }
+    }
+}
+
+impl<K, R: Send + Sync + 'static> Drop for DeferredLaunch<K, R> {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LaunchStatus {
+    Started,
+    /// Native capacity or the readiness callback is not ready. The capability
+    /// remains live, and no worker closure has been consumed by the supervisor.
+    Blocked,
+    CancelledBeforeStart,
+}
+
 struct Job<R> {
     flight: Arc<Flight<R>>,
     worker: Option<JoinHandle<()>>,
+    preparing: bool,
 }
 
 struct Registry<K, R> {
@@ -331,6 +419,8 @@ struct Registry<K, R> {
     shutdown_started: bool,
     shutdown_finished: bool,
     reapers: usize,
+    native_workers: usize,
+    preparing: usize,
     failures: ShutdownError,
 }
 
@@ -340,6 +430,8 @@ struct Registry<K, R> {
 pub struct SharedWork<K: Eq + Hash + Clone + Send, R: Send + Sync + 'static> {
     maximum_work: usize,
     budget: Arc<SubscriberBudget>,
+    deferred_budget: Arc<SubscriberBudget>,
+    notify: Arc<dyn Fn() + Send + Sync>,
     registry: Mutex<Registry<K, R>>,
     changed: Condvar,
 }
@@ -352,15 +444,60 @@ impl<K: Eq + Hash + Clone + Send, R: Send + Sync + 'static> SharedWork<K, R> {
                 maximum: max_subscribers,
                 registered: AtomicUsize::new(0),
             }),
+            deferred_budget: Arc::new(SubscriberBudget {
+                maximum: max_subscribers,
+                registered: AtomicUsize::new(0),
+            }),
+            notify: Arc::new(|| {}),
             registry: Mutex::new(Registry {
                 jobs: HashMap::new(),
                 shutdown_started: false,
                 shutdown_finished: false,
                 reapers: 0,
+                native_workers: 0,
+                preparing: 0,
                 failures: ShutdownError::default(),
             }),
             changed: Condvar::new(),
         }
+    }
+
+    /// Install a notification-only callback before admitting work. It must be
+    /// prompt and must not retain or reenter this supervisor. A weak handle to
+    /// the domain dispatcher's signal keeps ownership acyclic. Notifications
+    /// carry no result or execution authority and always run outside locks.
+    pub fn with_notify(mut self, callback: impl Fn() + Send + Sync + 'static) -> Self {
+        self.notify = Arc::new(callback);
+        self
+    }
+
+    fn flight(&self, cancel: impl Fn() + Send + Sync + 'static) -> Arc<Flight<R>> {
+        Arc::new(Flight {
+            state: Mutex::new(FlightState {
+                accepting: true,
+                outcome: None,
+                subscribers: HashMap::from([(1, None)]),
+                next_subscriber: 2,
+                cancellation: Cancellation::NotRequested,
+            }),
+            cancellation_changed: Condvar::new(),
+            cancel: Box::new(cancel),
+            notify: Arc::clone(&self.notify),
+        })
+    }
+
+    fn worker(
+        flight: &Arc<Flight<R>>,
+        work: impl FnOnce() -> R + Send + 'static,
+    ) -> io::Result<JoinHandle<()>> {
+        let flight = Arc::clone(flight);
+        thread::Builder::new()
+            .name("rabs-shared-work".to_owned())
+            .spawn(move || {
+                let outcome = catch_unwind(AssertUnwindSafe(|| Arc::new(work())))
+                    .map_err(|_| WorkError::WorkerPanicked);
+                flight.complete(outcome);
+            })
     }
 
     /// Join only an existing, still-open cohort. Capacity exhaustion and sealed
@@ -373,13 +510,15 @@ impl<K: Eq + Hash + Clone + Send, R: Send + Sync + 'static> SharedWork<K, R> {
         registry.jobs.get(key)?.flight.join(&self.budget)
     }
 
-    pub fn start(
+    /// Register demand without spawning or reserving a native worker. Both the
+    /// returned membership and the opaque dispatcher capability are bounded;
+    /// retaining cancelled capabilities cannot create an unbounded queue.
+    pub fn defer(
         &self,
         key: K,
         cancel: impl Fn() + Send + Sync + 'static,
-        work: impl FnOnce() -> R + Send + 'static,
-    ) -> Result<Subscription<R>, StartError> {
-        self.reap_finished();
+    ) -> Result<(Subscription<R>, DeferredLaunch<K, R>), StartError> {
+        self.reap_finished(false);
         let mut registry = lock(&self.registry);
         if registry.shutdown_started {
             return Err(StartError::ShuttingDown);
@@ -387,63 +526,228 @@ impl<K: Eq + Hash + Clone + Send, R: Send + Sync + 'static> SharedWork<K, R> {
         if registry.jobs.contains_key(&key) {
             return Err(StartError::AlreadyRunning);
         }
-        if registry.jobs.len() >= self.maximum_work {
-            return Err(StartError::AtCapacity);
-        }
+        let queued = self
+            .deferred_budget
+            .reserve()
+            .ok_or(StartError::QueueCapacity)?;
         let slot = self
             .budget
             .reserve()
             .ok_or(StartError::SubscriberCapacity)?;
-        let flight = Arc::new(Flight {
-            state: Mutex::new(FlightState {
-                accepting: true,
-                outcome: None,
-                subscribers: HashMap::from([(1, None)]),
-                next_subscriber: 2,
-                cancellation: Cancellation::NotRequested,
-            }),
-            cancellation_changed: Condvar::new(),
-            cancel: Box::new(cancel),
-        });
-        let worker_flight = Arc::clone(&flight);
-        // Registration and handle ownership happen under the registry lock, so
-        // shutdown cannot miss a successfully spawned worker. The worker only
-        // locks its own flight; it never accesses this registry or supervisor.
-        let worker = thread::Builder::new()
-            .name("rabs-shared-work".to_owned())
-            .spawn(move || {
-                let outcome = catch_unwind(AssertUnwindSafe(|| Arc::new(work())))
-                    .map_err(|_| WorkError::WorkerPanicked);
-                worker_flight.complete(outcome);
-            })
-            .map_err(StartError::Spawn)?;
+        let flight = self.flight(cancel);
         registry.jobs.insert(
-            key,
+            key.clone(),
             Job {
                 flight: Arc::clone(&flight),
-                worker: Some(worker),
+                worker: None,
+                preparing: false,
             },
         );
-        Ok(Subscription {
-            flight,
-            id: 1,
-            _slot: slot,
-        })
+        Ok((
+            Subscription {
+                flight: Arc::clone(&flight),
+                id: 1,
+                _slot: slot,
+            },
+            DeferredLaunch {
+                key,
+                flight,
+                armed: true,
+                _slot: queued,
+            },
+        ))
     }
 
-    fn join_jobs(jobs: &mut [Job<R>]) -> ShutdownError {
+    /// Try to launch exactly this deferred generation. `prepare` only acquires
+    /// bounded external resources and constructs a closure; it must not run the
+    /// workload. It runs outside locks and is never called without native
+    /// capacity and live demand. `None` retains the queued request in its owner.
+    ///
+    /// Cancellation and shutdown are rechecked after preparation. Resources in
+    /// a rejected closure are dropped before the preparation slot is released,
+    /// and shutdown waits for every such owner even though no worker started.
+    pub fn try_launch<F>(
+        &self,
+        permit: &mut DeferredLaunch<K, R>,
+        prepare: impl FnOnce() -> Option<F>,
+    ) -> Result<LaunchStatus, StartError>
+    where
+        F: FnOnce() -> R + Send + 'static,
+    {
+        if !permit.armed {
+            return Err(StartError::StaleDeferred);
+        }
+        // Completion notification precedes native thread exit. Join a sealed
+        // result's finishing handle here, outside all state locks, rather than
+        // waiting for another notification that will never arrive.
+        self.reap_finished(true);
+        let mut preparation = Preparation {
+            supervisor: self,
+            key: permit.key.clone(),
+            flight: Arc::clone(&permit.flight),
+            active: false,
+        };
+        {
+            let mut registry = lock(&self.registry);
+            if registry.shutdown_started {
+                drop(registry);
+                permit.cancel();
+                return Ok(LaunchStatus::CancelledBeforeStart);
+            }
+            let job = registry
+                .jobs
+                .get(&permit.key)
+                .ok_or(StartError::StaleDeferred)?;
+            if !Arc::ptr_eq(&job.flight, &permit.flight) || job.worker.is_some() || job.preparing {
+                return Err(StartError::StaleDeferred);
+            }
+            if !permit.is_pending() {
+                drop(registry);
+                permit.cancel();
+                return Ok(LaunchStatus::CancelledBeforeStart);
+            }
+            if registry.native_workers + registry.preparing >= self.maximum_work {
+                return Ok(LaunchStatus::Blocked);
+            }
+            registry.jobs.get_mut(&permit.key).unwrap().preparing = true;
+            registry.preparing += 1;
+            preparation.active = true;
+        }
+
+        let work = match catch_unwind(AssertUnwindSafe(prepare)) {
+            Ok(Some(work)) => work,
+            Ok(None) => {
+                drop(preparation);
+                if permit.is_pending() {
+                    return Ok(LaunchStatus::Blocked);
+                }
+                permit.cancel();
+                return Ok(LaunchStatus::CancelledBeforeStart);
+            }
+            Err(_) => {
+                drop(preparation);
+                permit.cancel();
+                return Err(StartError::PreparationPanicked);
+            }
+        };
+
+        let mut registry = lock(&self.registry);
+        if registry.shutdown_started {
+            drop(registry);
+            drop(work);
+            drop(preparation);
+            permit.cancel();
+            return Ok(LaunchStatus::CancelledBeforeStart);
+        }
+        if !registry.jobs.get(&permit.key).is_some_and(|job| {
+            Arc::ptr_eq(&job.flight, &permit.flight) && job.preparing && job.worker.is_none()
+        }) {
+            drop(registry);
+            drop(work);
+            drop(preparation);
+            permit.cancel();
+            return Err(StartError::StaleDeferred);
+        }
+        // Serialize actual launch with the last departure. A departure before
+        // this point starts no worker; a later departure signals the launched
+        // worker's retained cancellation token.
+        let state = lock(&permit.flight.state);
+        if !state.accepting || state.outcome.is_some() || state.subscribers.is_empty() {
+            drop(state);
+            drop(registry);
+            drop(work);
+            drop(preparation);
+            permit.cancel();
+            return Ok(LaunchStatus::CancelledBeforeStart);
+        }
+        match Self::worker(&permit.flight, work) {
+            Ok(worker) => {
+                let job = registry.jobs.get_mut(&permit.key).unwrap();
+                job.worker = Some(worker);
+                job.preparing = false;
+                registry.native_workers += 1;
+                registry.preparing -= 1;
+                preparation.active = false;
+                permit.armed = false;
+                drop(state);
+                drop(registry);
+                self.changed.notify_all();
+                Ok(LaunchStatus::Started)
+            }
+            Err(error) => {
+                drop(state);
+                drop(registry);
+                drop(preparation);
+                permit.cancel();
+                Err(StartError::Spawn(error))
+            }
+        }
+    }
+
+    /// Settle a domain-level refusal without launching any native work. Only
+    /// this exact unstarted generation can receive the supplied terminal result.
+    pub fn finish_deferred(
+        &self,
+        permit: &mut DeferredLaunch<K, R>,
+        result: R,
+    ) -> Result<(), StartError> {
+        if !permit.armed {
+            return Err(StartError::StaleDeferred);
+        }
+        let registry = lock(&self.registry);
+        if registry.shutdown_started {
+            drop(registry);
+            permit.cancel();
+            return Err(StartError::ShuttingDown);
+        }
+        if !registry.jobs.get(&permit.key).is_some_and(|job| {
+            Arc::ptr_eq(&job.flight, &permit.flight) && job.worker.is_none() && !job.preparing
+        }) {
+            return Err(StartError::StaleDeferred);
+        }
+        permit.armed = false;
+        drop(registry);
+        permit.flight.complete(Ok(Arc::new(result)));
+        Ok(())
+    }
+
+    /// Immediate admission retained for native ownership regression tests.
+    /// Production admission uses deferred capabilities and the fair dispatcher.
+    #[cfg(test)]
+    pub fn start(
+        &self,
+        key: K,
+        cancel: impl Fn() + Send + Sync + 'static,
+        work: impl FnOnce() -> R + Send + 'static,
+    ) -> Result<Subscription<R>, StartError> {
+        let (subscription, mut launch) = self.defer(key, cancel)?;
+        match self.try_launch(&mut launch, || Some(work))? {
+            LaunchStatus::Started => Ok(subscription),
+            LaunchStatus::Blocked => Err(StartError::AtCapacity),
+            LaunchStatus::CancelledBeforeStart => Err(StartError::ShuttingDown),
+        }
+    }
+
+    fn join_jobs(jobs: &mut [Job<R>]) -> (ShutdownError, usize) {
         let mut failures = ShutdownError::default();
+        let mut joined = 0;
         for job in jobs {
-            let panicked = job
-                .worker
-                .take()
-                .is_some_and(|worker| worker.join().is_err());
+            let panicked = match job.worker.take() {
+                Some(worker) => {
+                    joined += 1;
+                    worker.join().is_err()
+                }
+                None => {
+                    job.flight.cancel_deferred();
+                    false
+                }
+            };
             failures.add(job.flight.report(panicked));
         }
-        failures
+        (failures, joined)
     }
 
-    fn reap_finished(&self) {
+    fn reap_finished(&self, join_completed: bool) {
         let mut jobs = {
             let mut registry = lock(&self.registry);
             if registry.shutdown_started {
@@ -452,7 +756,22 @@ impl<K: Eq + Hash + Clone + Send, R: Send + Sync + 'static> SharedWork<K, R> {
             let finished = registry
                 .jobs
                 .iter()
-                .filter(|(_, job)| job.worker.as_ref().is_some_and(JoinHandle::is_finished))
+                .filter(|(_, job)| {
+                    if job.preparing {
+                        return false;
+                    }
+                    match &job.worker {
+                        Some(worker) => {
+                            worker.is_finished()
+                                || (join_completed && lock(&job.flight.state).outcome.is_some())
+                        }
+                        None => {
+                            let state = lock(&job.flight.state);
+                            state.outcome.is_some()
+                                || (!state.accepting && state.subscribers.is_empty())
+                        }
+                    }
+                })
                 .map(|(key, _)| key.clone())
                 .collect::<Vec<_>>();
             if finished.is_empty() {
@@ -464,15 +783,18 @@ impl<K: Eq + Hash + Clone + Send, R: Send + Sync + 'static> SharedWork<K, R> {
                 .filter_map(|key| registry.jobs.remove(&key))
                 .collect::<Vec<_>>()
         };
-        // Only handles observed finished are removed here. Even these joins
-        // occur outside the registry lock; subscription operations stay prompt.
-        let failures = Self::join_jobs(&mut jobs);
+        // Native capacity remains counted while a completed worker's finishing
+        // handle is being joined. Concurrent callers cannot exceed the bound
+        // simply because a reaper removed that handle from the key registry.
+        let (failures, joined) = Self::join_jobs(&mut jobs);
         {
             let mut registry = lock(&self.registry);
             registry.failures.add(failures);
+            registry.native_workers -= joined;
             registry.reapers -= 1;
         }
         self.changed.notify_all();
+        notify(self.notify.as_ref());
     }
 
     /// Seal admission, signal every unfinished flight, and join every owned
@@ -501,15 +823,19 @@ impl<K: Eq + Hash + Clone + Send, R: Send + Sync + 'static> SharedWork<K, R> {
         };
         for job in &jobs {
             job.flight.seal_and_cancel();
+            if job.worker.is_none() {
+                job.flight.complete(Err(WorkError::CancelledBeforeStart));
+            }
         }
-        let failures = Self::join_jobs(&mut jobs);
+        let (failures, joined) = Self::join_jobs(&mut jobs);
         let result = {
             let mut registry = lock(&self.registry);
             registry.failures.add(failures);
+            registry.native_workers -= joined;
             // A concurrent start can already be joining a completed worker it
             // removed before shutdown sealed admission. Include that ownership
             // before declaring the supervisor drained.
-            while registry.reapers != 0 {
+            while registry.reapers != 0 || registry.preparing != 0 {
                 registry = self
                     .changed
                     .wait(registry)
@@ -520,6 +846,33 @@ impl<K: Eq + Hash + Clone + Send, R: Send + Sync + 'static> SharedWork<K, R> {
         };
         self.changed.notify_all();
         result
+    }
+}
+
+/// Reserved native capacity while a readiness callback runs outside locks.
+/// Work/resources returned by that callback must be dropped before this guard.
+struct Preparation<'a, K: Eq + Hash + Clone + Send, R: Send + Sync + 'static> {
+    supervisor: &'a SharedWork<K, R>,
+    key: K,
+    flight: Arc<Flight<R>>,
+    active: bool,
+}
+
+impl<K: Eq + Hash + Clone + Send, R: Send + Sync + 'static> Drop for Preparation<'_, K, R> {
+    fn drop(&mut self) {
+        if self.active {
+            let mut registry = lock(&self.supervisor.registry);
+            if let Some(job) = registry.jobs.get_mut(&self.key)
+                && Arc::ptr_eq(&job.flight, &self.flight)
+            {
+                job.preparing = false;
+            }
+            registry.preparing -= 1;
+            drop(registry);
+            self.supervisor.changed.notify_all();
+            // A readiness miss is not a resource-availability event. Waking
+            // the dispatcher for its own unchanged miss would cause a spin.
+        }
     }
 }
 
@@ -582,6 +935,391 @@ mod tests {
         receiver
             .recv_timeout(TEST_TIMEOUT)
             .expect("native worker timed out")
+    }
+
+    #[test]
+    fn deferred_members_coalesce_without_a_thread_and_survive_origin_loss() {
+        let supervisor = SharedWork::new(1, 3);
+        let cancellations = Arc::new(AtomicUsize::new(0));
+        let cancelled = Arc::clone(&cancellations);
+        let (origin, mut launch) = supervisor
+            .defer("queued", move || {
+                cancelled.fetch_add(1, Ordering::SeqCst);
+            })
+            .unwrap();
+        let mut follower = supervisor.try_join(&"queued").unwrap();
+        assert!(matches!(
+            supervisor.defer("queued", || {}),
+            Err(StartError::AlreadyRunning)
+        ));
+        assert_eq!(lock(&supervisor.registry).native_workers, 0);
+        assert!(lock(&supervisor.registry).jobs[&"queued"].worker.is_none());
+        drop(origin);
+        assert!(launch.is_pending());
+        assert_eq!(cancellations.load(Ordering::SeqCst), 0);
+        let (started, worker) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        assert_eq!(
+            supervisor
+                .try_launch(&mut launch, || {
+                    Some(move || {
+                        started.send(thread::current().id()).unwrap();
+                        receive(&gate);
+                        String::from("one actual queued producer")
+                    })
+                })
+                .unwrap(),
+            LaunchStatus::Started
+        );
+        assert_ne!(receive(&worker), thread::current().id());
+        drop(launch);
+        assert_eq!(cancellations.load(Ordering::SeqCst), 0);
+        release.send(()).unwrap();
+        assert_eq!(
+            *wait(&mut follower, None).unwrap(),
+            "one actual queued producer"
+        );
+        assert!(supervisor.try_join(&"queued").is_none());
+        supervisor.shutdown().unwrap();
+    }
+
+    #[test]
+    fn deferred_readiness_does_not_consume_the_request_or_spin_on_unavailable_resources() {
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let notified = Arc::clone(&notifications);
+        let supervisor = SharedWork::new(1, 3).with_notify(move || {
+            notified.fetch_add(1, Ordering::SeqCst);
+        });
+        let (release, gate) = mpsc::channel();
+        let mut running = supervisor
+            .start(
+                "running",
+                || {},
+                move || {
+                    receive(&gate);
+                    1
+                },
+            )
+            .unwrap();
+        let (mut waiting, mut launch) = supervisor.defer("waiting", || {}).unwrap();
+        let mut body = Some(|| 2);
+        let preparations = AtomicUsize::new(0);
+        assert_eq!(
+            supervisor
+                .try_launch(&mut launch, || {
+                    preparations.fetch_add(1, Ordering::SeqCst);
+                    body.take()
+                })
+                .unwrap(),
+            LaunchStatus::Blocked
+        );
+        assert_eq!(preparations.load(Ordering::SeqCst), 0);
+        assert!(body.is_some());
+        release.send(()).unwrap();
+        assert_eq!(*wait(&mut running, None).unwrap(), 1);
+        // Native capacity is now available, but the domain's external worker
+        // may still be busy. A readiness miss leaves its original body intact.
+        assert_eq!(
+            supervisor
+                .try_launch(&mut launch, || None::<fn() -> u32>)
+                .unwrap(),
+            LaunchStatus::Blocked
+        );
+        let before = notifications.load(Ordering::SeqCst);
+        assert_eq!(
+            supervisor
+                .try_launch(&mut launch, || None::<fn() -> u32>)
+                .unwrap(),
+            LaunchStatus::Blocked
+        );
+        assert_eq!(notifications.load(Ordering::SeqCst), before);
+        assert!(body.is_some());
+        assert_eq!(
+            supervisor.try_launch(&mut launch, || body.take()).unwrap(),
+            LaunchStatus::Started
+        );
+        assert!(body.is_none());
+        assert_eq!(*wait(&mut waiting, None).unwrap(), 2);
+        supervisor.shutdown().unwrap();
+    }
+
+    #[test]
+    fn stale_deferred_capability_cannot_launch_or_finish_a_replacement_generation() {
+        let supervisor: SharedWork<u32, &'static str> = SharedWork::new(1, 3);
+        let cancellations = Arc::new(AtomicUsize::new(0));
+        let cancelled = Arc::clone(&cancellations);
+        let (origin, mut old) = supervisor
+            .defer(7, move || {
+                cancelled.fetch_add(1, Ordering::SeqCst);
+            })
+            .unwrap();
+        drop(origin);
+        assert!(!old.is_pending());
+        // Reap the cancelled dormant entry while its old capability is still
+        // held. Its same-key successor must not inherit that launch authority.
+        let (mut current, mut replacement) = supervisor.defer(7, || {}).unwrap();
+        let prepared = AtomicUsize::new(0);
+        assert!(matches!(
+            supervisor.try_launch(&mut old, || {
+                prepared.fetch_add(1, Ordering::SeqCst);
+                Some(|| "wrong generation")
+            }),
+            Err(StartError::StaleDeferred)
+        ));
+        assert!(matches!(
+            supervisor.finish_deferred(&mut old, "wrong terminal result"),
+            Err(StartError::StaleDeferred)
+        ));
+        assert_eq!(prepared.load(Ordering::SeqCst), 0);
+        drop(old);
+        assert!(replacement.is_pending());
+        supervisor
+            .finish_deferred(&mut replacement, "current generation")
+            .unwrap();
+        assert_eq!(*wait(&mut current, None).unwrap(), "current generation");
+        assert_eq!(cancellations.load(Ordering::SeqCst), 1);
+        supervisor.shutdown().unwrap();
+    }
+
+    #[test]
+    fn retained_deferred_capabilities_and_members_have_independent_finite_bounds() {
+        let supervisor: SharedWork<u32, u32> = SharedWork::new(1, 2);
+        let (first, first_launch) = supervisor.defer(1, || {}).unwrap();
+        let (second, second_launch) = supervisor.defer(2, || {}).unwrap();
+        assert!(supervisor.try_join(&1).is_none());
+        drop(first);
+        drop(second);
+        assert!(matches!(
+            supervisor.defer(3, || {}),
+            Err(StartError::QueueCapacity)
+        ));
+        assert_eq!(lock(&supervisor.registry).native_workers, 0);
+        drop(first_launch);
+        let (mut third, mut third_launch) = supervisor.defer(3, || {}).unwrap();
+        supervisor.finish_deferred(&mut third_launch, 3).unwrap();
+        assert_eq!(*wait(&mut third, None).unwrap(), 3);
+        drop(second_launch);
+        supervisor.shutdown().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn last_cancellation_during_readiness_releases_real_resources_without_starting_work() {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+
+        let supervisor = Arc::new(SharedWork::new(1, 2));
+        let cancellations = Arc::new(AtomicUsize::new(0));
+        let cancelled = Arc::clone(&cancellations);
+        let (subscriber, mut launch) = supervisor
+            .defer(1, move || {
+                cancelled.fetch_add(1, Ordering::SeqCst);
+            })
+            .unwrap();
+        let (prepared, resources) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let executions = Arc::new(AtomicUsize::new(0));
+        let executed = Arc::clone(&executions);
+        let owner = Arc::clone(&supervisor);
+        let launcher = thread::spawn(move || {
+            owner.try_launch(&mut launch, || {
+                let (retained, observer) = UnixStream::pair().unwrap();
+                prepared.send(observer).unwrap();
+                receive(&gate);
+                Some(move || {
+                    executed.fetch_add(1, Ordering::SeqCst);
+                    drop(retained);
+                    17
+                })
+            })
+        });
+        let mut observer = receive(&resources);
+        observer.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
+        let before = Instant::now();
+        drop(subscriber);
+        assert!(before.elapsed() < Duration::from_secs(1));
+        assert_eq!(cancellations.load(Ordering::SeqCst), 1);
+        // The readiness callback is deliberately paused. Neither membership
+        // operations nor cancellation may be waiting on its registry lock.
+        assert!(supervisor.try_join(&1).is_none());
+        assert!(matches!(
+            supervisor.start(2, || {}, || 2),
+            Err(StartError::AtCapacity)
+        ));
+        release.send(()).unwrap();
+        assert_eq!(
+            launcher.join().unwrap().unwrap(),
+            LaunchStatus::CancelledBeforeStart
+        );
+        assert_eq!(observer.read(&mut [0_u8; 1]).unwrap(), 0);
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        assert_eq!(lock(&supervisor.registry).preparing, 0);
+        supervisor.shutdown().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_waits_for_prepared_resource_release_without_spawning_a_late_worker() {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+
+        let supervisor = Arc::new(SharedWork::new(1, 2));
+        let (mut subscriber, mut launch) = supervisor.defer(1, || {}).unwrap();
+        let (prepared, resources) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let executions = Arc::new(AtomicUsize::new(0));
+        let executed = Arc::clone(&executions);
+        let owner = Arc::clone(&supervisor);
+        let launcher = thread::spawn(move || {
+            owner.try_launch(&mut launch, || {
+                let (retained, observer) = UnixStream::pair().unwrap();
+                prepared.send(observer).unwrap();
+                receive(&gate);
+                Some(move || {
+                    executed.fetch_add(1, Ordering::SeqCst);
+                    drop(retained);
+                    17
+                })
+            })
+        });
+        let mut observer = receive(&resources);
+        observer.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
+        let (done, completion) = mpsc::channel();
+        let owner = Arc::clone(&supervisor);
+        let shutdown = thread::spawn(move || {
+            let result = owner.shutdown();
+            done.send(()).unwrap();
+            result
+        });
+        assert_eq!(
+            wait(&mut subscriber, None),
+            Err(WorkError::CancelledBeforeStart)
+        );
+        assert!(matches!(
+            completion.recv_timeout(Duration::from_millis(30)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(!lock(&supervisor.registry).shutdown_finished);
+        release.send(()).unwrap();
+        assert_eq!(
+            launcher.join().unwrap().unwrap(),
+            LaunchStatus::CancelledBeforeStart
+        );
+        shutdown.join().unwrap().unwrap();
+        assert_eq!(observer.read(&mut [0_u8; 1]).unwrap(), 0);
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        assert_eq!(lock(&supervisor.registry).preparing, 0);
+    }
+
+    #[test]
+    fn completion_notification_reaps_the_real_finishing_thread_without_a_second_wakeup() {
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let notified = Arc::clone(&notifications);
+        let (completing, completion) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let gate = Mutex::new(gate);
+        let supervisor = Arc::new(SharedWork::new(1, 4).with_notify(move || {
+            if notified.fetch_add(1, Ordering::SeqCst) == 0 {
+                // Hold the actual native thread in its completion tail after
+                // result sealing, before is_finished can observe its exit.
+                completing.send(()).unwrap();
+                receive(&lock(&gate));
+            }
+        }));
+        let mut first = supervisor.start(1, || {}, || 1).unwrap();
+        receive(&completion);
+        assert_eq!(*wait(&mut first, None).unwrap(), 1);
+        let (mut second, mut launch) = supervisor.defer(2, || {}).unwrap();
+        let owner = Arc::clone(&supervisor);
+        let launcher = thread::spawn(move || owner.try_launch(&mut launch, || Some(|| 2)));
+        let deadline = Instant::now() + TEST_TIMEOUT;
+        while lock(&supervisor.registry).reapers == 0 {
+            assert!(Instant::now() < deadline, "completed worker was not joined");
+            thread::yield_now();
+        }
+        // A live native tail remains counted even after its handle leaves the
+        // map. Joining it holds neither the registry nor a flight lock.
+        assert!(matches!(
+            supervisor.start(3, || {}, || 3),
+            Err(StartError::AtCapacity)
+        ));
+        let another_member = supervisor.try_join(&2).unwrap();
+        drop(another_member);
+        release.send(()).unwrap();
+        assert_eq!(launcher.join().unwrap().unwrap(), LaunchStatus::Started);
+        assert_eq!(*wait(&mut second, None).unwrap(), 2);
+        supervisor.shutdown().unwrap();
+    }
+
+    #[test]
+    fn cancellation_racing_deferred_native_launch_never_reports_an_unstarted_running_worker() {
+        for _ in 0..24 {
+            let supervisor = Arc::new(SharedWork::new(1, 1));
+            let (cancelled, cancellation) = mpsc::channel();
+            let (subscriber, mut launch) = supervisor
+                .defer(1, move || {
+                    let _ = cancelled.send(());
+                })
+                .unwrap();
+            let (preparing, preparation) = mpsc::channel();
+            let gate = Arc::new(std::sync::Barrier::new(2));
+            let worker_gate = Arc::clone(&gate);
+            let executions = Arc::new(AtomicUsize::new(0));
+            let executed = Arc::clone(&executions);
+            let owner = Arc::clone(&supervisor);
+            let launcher = thread::spawn(move || {
+                owner.try_launch(&mut launch, || {
+                    preparing.send(()).unwrap();
+                    worker_gate.wait();
+                    Some(move || {
+                        executed.fetch_add(1, Ordering::SeqCst);
+                        receive(&cancellation);
+                    })
+                })
+            });
+            receive(&preparation);
+            gate.wait();
+            drop(subscriber);
+            let status = launcher.join().unwrap().unwrap();
+            supervisor.shutdown().unwrap();
+            match status {
+                LaunchStatus::CancelledBeforeStart => {
+                    assert_eq!(executions.load(Ordering::SeqCst), 0);
+                }
+                LaunchStatus::Started => {
+                    assert_eq!(executions.load(Ordering::SeqCst), 1);
+                }
+                LaunchStatus::Blocked => panic!("the only ready flight lost its launch slot"),
+            }
+        }
+    }
+
+    #[test]
+    fn dropped_or_panicked_deferred_admission_settles_members_before_execution() {
+        let supervisor: SharedWork<u32, u32> = SharedWork::new(1, 4);
+        let (mut first, first_launch) = supervisor.defer(1, || {}).unwrap();
+        let mut follower = supervisor.try_join(&1).unwrap();
+        drop(first_launch);
+        assert_eq!(wait(&mut first, None), Err(WorkError::CancelledBeforeStart));
+        assert_eq!(
+            wait(&mut follower, None),
+            Err(WorkError::CancelledBeforeStart)
+        );
+        let (mut second, mut second_launch) = supervisor.defer(2, || {}).unwrap();
+        assert!(matches!(
+            supervisor.try_launch(&mut second_launch, || -> Option<fn() -> u32> {
+                panic!("actual readiness callback panic");
+            }),
+            Err(StartError::PreparationPanicked)
+        ));
+        assert_eq!(
+            wait(&mut second, None),
+            Err(WorkError::CancelledBeforeStart)
+        );
+        assert_eq!(lock(&supervisor.registry).preparing, 0);
+        let (mut third, _third_launch) = supervisor.defer(3, || {}).unwrap();
+        supervisor.shutdown().unwrap();
+        assert_eq!(wait(&mut third, None), Err(WorkError::CancelledBeforeStart));
     }
 
     #[test]
@@ -728,7 +1466,7 @@ mod tests {
         assert!(supervisor.try_join(&1).is_none());
         assert!(matches!(
             supervisor.start(2, || {}, || 2),
-            Err(StartError::AtCapacity)
+            Err(StartError::SubscriberCapacity)
         ));
         drop(second_member);
         release.send(()).unwrap();
