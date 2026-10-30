@@ -42,6 +42,13 @@ a lexical search count, not a complete membership denominator.
 | 17 | Qualify safety and rollout with production soak | S8's close reason cites seven chaos tests and component/Cargo suites, not its 24-hour shadow soak or the bridge's continuous shadow-week acceptance. No such new soak was performed by this audit. | Proof gap / S8 (`bd-rb754`) |
 | 18 | Pursue frontier features only after positive evidence | M16's closure cites an optional C/C++ compile plane, rather than its hypothesis/benchmark/proceed/kill review. Frontier candidates remain optional and must not block or replace core delivery. | Decision/evidence gap / M16 |
 
+The live GitHub API also reports the **RABS Binaries workflow is
+`disabled_manually`**, last changed August 20. Its most recent listed successful
+run is August 12 at `42b50f317010c1715c0425cb5cadc06c5a2e73c0`
+([run 31627022560](https://github.com/Dicklesworthstone/remote_compilation_helper/actions/runs/31627022560)).
+Adding current native tests to the workflow does not mean they have run in CI.
+This audit did not change the workflow's enablement or the rollout policy.
+
 The executable paths inspected are substantial implementations, not a collection
 of `todo!()` bodies. The central failure mode is **proof-class inflation**:
 component arithmetic, fixture outcomes, existing private Cargo freshness and
@@ -97,6 +104,25 @@ preparation/recovery refusal. It is retained as
 `/Volumes/trj-data/rabs-reality-20261030-launcher.log`, not relabeled a Linux
 product regression or silently discarded.
 
+The Linux installer selection (`python3 -m unittest discover -s tests -p
+'test_install_rabs*.py' -v`) ran **78 tests, exit 1: two failures and one
+error, 360.703 seconds** on the frozen `trj` source. One mixed-fleet result was
+`unconfirmed` instead of `installed`; a parallel case lacked a `target` field;
+the lost-ACK case had not reached installation at its assertion. These tests
+exercise real local receiver/archive/generation processes with explicit SSH,
+platform and compiler-tool doubles, not actual fleet deployment or Rust.
+All three unchanged failing cases passed on `vmi1152480` (two fleet cases in
+2.096 seconds; the lost-ACK case in 0.380 seconds). Their installer/test source
+is identical between `7ae3f5fe` and `7f5901d4`. This host contrast supports a
+contention/deadline hypothesis, but does not identify the first run's exact
+refusal cause: its assertions omit the full deployment receipt. Keep the
+original 78-case run red and require captured refusal receipts for attribution;
+do not lengthen its deadlines or claim a 78/78 pass from three selected reruns.
+Transcripts: `/Volumes/trj-data/rabs-reality-20261030-install-linux.log`
+(SHA-256 `fb835890c62e558cfdf179ceebe56d5c9b8041f0ff1f53d69f5ba72850e40a56`),
+`rabs-reality-20261030-installer-failure-twins.log` and
+`rabs-reality-20261030-installer-lost-ack-twin.log` in the same directory.
+
 A matching three-binary build requested while the first lane held worker
 capacity refused with exit 103 / `queue_timeout`; it compiled nothing. A
 capacity refusal is not a failed RABS test. The test host reports substantial
@@ -115,6 +141,16 @@ reports library tests and says full namespace tests still require a capable
 host. That delta does not close exact-link, workspace/test-result serving,
 cross-edge, rollout or performance gaps above. The native test already running
 remains frozen to `7ae3f5fe`; it cannot qualify the added native-root feature.
+Origin subsequently advanced through `38d6d198` (complete retained directory
+admission) to `10407d76e1550ae7f119c2b2c7234278ebb6dc5c` (native-input
+propagation through capture, admission, transfer and worker execution). Those
+changes explicitly keep workspace execution fresh-only and require the new
+worker capability. Their reported isolated native-archive tests are narrower
+than full canonical Cargo tests; the latter remain host-dependent and were not
+reported passing in that commit. The assessment was rebased onto this source;
+the original native test remains pinned to its original revision. A fresh
+workspace/all-target check is running separately against assessment commit
+`7f5901d4725428f29b18095b55ee42654019a9c4`. Local `cargo fmt --check` passes.
 
 ### Bridge order and original bead acceptance
 
@@ -191,8 +227,8 @@ five in-progress and 2,188 closed issues; S7 is its top actionable RABS pick.
 `git diff --check` passes. Scoped UBS on the two changed Markdown/JSONL files
 returns 3 because it supports neither language and ran no scanner; this is
 not a code-scan pass. No Rust or other executable source was changed by the
-assessment. Concurrent conventional-RCH commits after the frozen source do
-not change the RABS files assessed or the source selected for the live test.
+assessment. Concurrent RABS native-input changes are distinguished above from
+the original source selected for the live test.
 
 ## Previous assessment — October 14, 2026
 
