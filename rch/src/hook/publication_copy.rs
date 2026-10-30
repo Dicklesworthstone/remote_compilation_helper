@@ -6,6 +6,9 @@
 //! prefix byte before appending; never truncate, overwrite that prefix, unlink
 //! evidence, or advance the journal. PreparedOutput still verifies the complete
 //! bytes, inode and mode before the ordinary pending/rename/published boundary.
+//! An empty private temporary may instead receive a whole-file CoW clone. Only
+//! a verified clone avoids the capacity requirement for a separate payload;
+//! unsupported cloning falls back only while the empty temporary is unchanged.
 
 use super::{File, Path, PreparedOutput};
 use anyhow::{Context, Result};
@@ -308,13 +311,17 @@ pub(super) fn prepare_output_temporary(
     temporary: &Path,
     expected: &str,
 ) -> Result<PreparedOutput> {
-    prepare_with_copier(
+    prepare_with_backend(
         source,
         temporary,
         expected,
-        |file, bytes, offset| file.write_at(bytes, offset),
-        File::sync_all,
-        kernel_copy::copy_range,
+        CopyBackend {
+            write: |file: &File, bytes: &[u8], offset| file.write_at(bytes, offset),
+            sync: File::sync_all,
+            copy_range: kernel_copy::copy_range,
+            clone_file: kernel_copy::clone_file,
+            check_space: check_copy_space,
+        },
     )
 }
 
@@ -369,17 +376,64 @@ fn copy_checkpoint(
     Ok(())
 }
 
-// A kernel copier reports None ONLY when no bytes were consumed and ordinary
-// positioned I/O should take over. Every positive partial result advances the
-// retained prefix; no fallback ever starts again from zero.
+/// Keep existing write/range fault injection independent of native reflink
+/// availability. These tests must still exercise their specified copy path.
+#[cfg(test)]
 fn prepare_with_copier(
     source_path: &Path,
     temporary: &Path,
     expected: &str,
-    mut write: impl FnMut(&File, &[u8], u64) -> io::Result<usize>,
-    mut sync: impl FnMut(&File) -> io::Result<()>,
-    mut copy_range: impl FnMut(&File, &File, u64, usize) -> io::Result<Option<usize>>,
+    write: impl FnMut(&File, &[u8], u64) -> io::Result<usize>,
+    sync: impl FnMut(&File) -> io::Result<()>,
+    copy_range: impl FnMut(&File, &File, u64, usize) -> io::Result<Option<usize>>,
 ) -> Result<PreparedOutput> {
+    prepare_with_backend(
+        source_path,
+        temporary,
+        expected,
+        CopyBackend {
+            write,
+            sync,
+            copy_range,
+            clone_file: |_: &File, _: &File| Ok(false),
+            check_space: check_copy_space,
+        },
+    )
+}
+
+/// I/O operations share one preparation path. Tests inject storage boundaries
+/// here while retaining the production ownership, content and journal rules.
+struct CopyBackend<W, S, R, C, B> {
+    write: W,
+    sync: S,
+    copy_range: R,
+    clone_file: C,
+    check_space: B,
+}
+
+// A range copier reports None ONLY when no bytes were consumed. A whole-file
+// cloner reports false only for unsupported operation; we independently prove
+// the empty temporary stayed unchanged before allowing allocation/copying.
+fn prepare_with_backend<W, S, R, C, B>(
+    source_path: &Path,
+    temporary: &Path,
+    expected: &str,
+    backend: CopyBackend<W, S, R, C, B>,
+) -> Result<PreparedOutput>
+where
+    W: FnMut(&File, &[u8], u64) -> io::Result<usize>,
+    S: FnMut(&File) -> io::Result<()>,
+    R: FnMut(&File, &File, u64, usize) -> io::Result<Option<usize>>,
+    C: FnMut(&File, &File) -> io::Result<bool>,
+    B: FnMut(&File, u64) -> Result<()>,
+{
+    let CopyBackend {
+        mut write,
+        mut sync,
+        mut copy_range,
+        mut clone_file,
+        mut check_space,
+    } = backend;
     super::publication_runtime::checkpoint()?;
     let parent = temporary
         .parent()
@@ -402,7 +456,6 @@ fn prepare_with_copier(
     let file = match rustix::fs::openat(directory.as_fd(), name, read_flags(), Mode::empty()) {
         Ok(file) => File::from(file),
         Err(rustix::io::Errno::NOENT) => {
-            check_copy_space(&directory, source_metadata.len())?;
             let file = File::from(rustix::fs::openat(
                 directory.as_fd(),
                 name,
@@ -449,7 +502,6 @@ fn prepare_with_copier(
     );
     verify_temporary(&directory, temporary, &file, &initial, prefix_length, mode)?;
     let remaining = source_metadata.len() - prefix_length;
-    check_copy_space(&directory, remaining)?;
     let file = if remaining > 0 {
         let writable = File::from(rustix::fs::openat(
             directory.as_fd(),
@@ -466,6 +518,55 @@ fn prepare_with_copier(
         file
     };
     let mut offset = prefix_length;
+    if prefix_length == 0 && remaining > 0 {
+        copy_checkpoint(&file, &directory, &mut sync)?;
+        verify_source(&source, source_path, &source_metadata)?;
+        verify_temporary(&directory, temporary, &file, &initial, 0, mode)?;
+        match clone_file(&source, &file) {
+            Ok(true) => {
+                // A successful syscall is only a copy mechanism. Validate the
+                // same source and exact private inode, then independently hash
+                // the whole clone below before chmod, sync or publication.
+                verify_source(&source, source_path, &source_metadata)?;
+                verify_temporary(
+                    &directory,
+                    temporary,
+                    &file,
+                    &initial,
+                    source_metadata.len(),
+                    mode,
+                )?;
+                offset = source_metadata.len();
+            }
+            Ok(false) => {
+                // Even an unsupported ioctl is not permission to truncate or
+                // overwrite a modified copy. Only the unchanged empty inode
+                // may proceed through the ordinary allocation budget.
+                verify_source(&source, source_path, &source_metadata)?;
+                anyhow::ensure!(
+                    same_version(&initial, &file.metadata()?),
+                    "unsupported publication clone changed its empty temporary; evidence retained"
+                );
+                verify_temporary(&directory, temporary, &file, &initial, 0, mode)?;
+            }
+            Err(error) => {
+                // A failed whole-file clone may have changed the destination.
+                // Keep any such bytes for a later validated-prefix retry; never
+                // retry the ioctl or hide its error behind a second copier.
+                let _ = sync(&file);
+                let _ = sync(&directory);
+                return Err(error).with_context(|| {
+                    format!(
+                        "publication clone failed at {}; copy retained for recovery",
+                        temporary.display()
+                    )
+                });
+            }
+        }
+    }
+    if offset < source_metadata.len() {
+        check_space(&directory, source_metadata.len() - offset)?;
+    }
     let mut buffer = Vec::new();
     let mut try_kernel = verified_source.is_none();
     while offset < source_metadata.len() {

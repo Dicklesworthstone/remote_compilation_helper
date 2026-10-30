@@ -559,6 +559,23 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
         let writer = DurableLeaseWriter::load(&wrapper_id)?;
         let lease = writer.snapshot();
         if lease.terminal_acknowledged {
+            if recover && lease.recovery.is_some() {
+                // A local terminal acknowledgement does not prove that the
+                // worker published the matching cancellation settlement.
+                // Re-enter identity-bound recovery under its journal gate;
+                // ordinary completed deliveries remain local and read-only.
+                let (code, recovered_writer) = within_job_deadline(
+                    deadline,
+                    "terminal source cancellation reconciliation (retry the same journal)",
+                    crate::hook::recover_job(&writer),
+                )
+                .await?;
+                emit(
+                    ctx,
+                    &recovered_writer.terminal_job_report(&wrapper_id, "recovered", Some(code))?,
+                )?;
+                return Ok(());
+            }
             // The daemon refused before admission: no remote command ran, so
             // there is no remote exit to report or recover.
             let report = if lease.state

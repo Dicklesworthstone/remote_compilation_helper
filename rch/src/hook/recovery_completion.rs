@@ -198,7 +198,11 @@ pub(super) async fn finish(
             && lease.exit_code == Some(exit)
             && (recipe.retire_root.is_none() || recipe.tree_retired)
             && (recipe.pair.is_none() || recipe.pair_released)
-            && (recipe.source_roots.is_empty() || recipe.sources_released),
+            && (recipe.source_roots.is_empty() || recipe.sources_released)
+            && recipe.source_cancellation_settled != Some(false)
+            && (!recipe.preparation_cancelled
+                || recipe.source_roots.is_empty()
+                || recipe.source_cancellation_settled == Some(true)),
         "recovery cannot release a reservation before exact delivery and source retirement"
     );
     let wrapper = recipe.wrapper_id.as_str();

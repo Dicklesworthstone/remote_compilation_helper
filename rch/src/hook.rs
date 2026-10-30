@@ -2221,7 +2221,8 @@ impl DurableLeaseWriter {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(recovery) = lease.recovery.as_ref() {
             anyhow::ensure!(
-                recovery.get("retired").and_then(serde_json::Value::as_bool) == Some(true),
+                recovery.get("retired").and_then(serde_json::Value::as_bool) == Some(true)
+                    && Self::cancellation_allows_retirement(recovery),
                 "previous remote source ownership is unresolved; recover this wrapper before another admission"
             );
         }
@@ -2241,7 +2242,8 @@ impl DurableLeaseWriter {
         let lease = self.snapshot();
         if let Some(recovery) = lease.recovery.as_ref() {
             anyhow::ensure!(
-                recovery.get("retired").and_then(serde_json::Value::as_bool) == Some(true),
+                recovery.get("retired").and_then(serde_json::Value::as_bool) == Some(true)
+                    && Self::cancellation_allows_retirement(recovery),
                 "remote source ownership is unresolved; run rch jobs recover {} before retrying",
                 lease.identity.local_wrapper_id
             );
@@ -2270,7 +2272,8 @@ impl DurableLeaseWriter {
         );
         if let Some(recovery) = lease.recovery.as_ref() {
             anyhow::ensure!(
-                recovery.get("retired").and_then(serde_json::Value::as_bool) == Some(true),
+                recovery.get("retired").and_then(serde_json::Value::as_bool) == Some(true)
+                    && Self::cancellation_allows_retirement(recovery),
                 "previous remote source ownership is unresolved; retry refused"
             );
         }
@@ -2494,6 +2497,42 @@ impl DurableLeaseWriter {
         self.publish_transition(&mut lease, next)
     }
 
+    fn cancellation_allows_retirement(recovery: &serde_json::Value) -> bool {
+        match recovery.get("source_cancellation_settled") {
+            Some(serde_json::Value::Bool(true)) => {
+                // A settlement receipt is valid only after the failed result
+                // and every cancellation resource were durably retired.
+                // Raw readmission/acknowledgement paths must enforce the
+                // same invariant as the typed recovery loader.
+                recovery
+                    .get("returned")
+                    .and_then(serde_json::Value::as_i64)
+                    .and_then(|exit| i32::try_from(exit).ok())
+                    .is_some_and(|exit| exit != 0)
+                    && ["sources_released", "tree_retired", "pair_released"]
+                        .iter()
+                        .all(|key| {
+                            recovery.get(*key).and_then(serde_json::Value::as_bool) == Some(true)
+                        })
+            }
+            None | Some(serde_json::Value::Null) => {
+                // Existing acknowledged journals remain readable, but a
+                // known legacy source cancellation cannot get a NEW ack or
+                // lose its current recovery authority through readmission.
+                recovery
+                    .get("preparation_cancelled")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true)
+                    || recovery
+                        .get("source_roots")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(Vec::is_empty)
+            }
+            // Explicitly pending and malformed evidence both fail closed.
+            _ => false,
+        }
+    }
+
     fn ensure_terminal_evidence(lease: &DurableJobLease, exit_code: i32) -> anyhow::Result<()> {
         anyhow::ensure!(
             !selection_is_pending(lease),
@@ -2515,6 +2554,10 @@ impl DurableLeaseWriter {
             );
         }
         if let Some(recovery) = lease.recovery.as_ref() {
+            anyhow::ensure!(
+                Self::cancellation_allows_retirement(recovery),
+                "worker source cancellation settlement is incomplete; terminal acknowledgement refused"
+            );
             anyhow::ensure!(
                 recovery.get("returned").and_then(serde_json::Value::as_i64)
                     == Some(i64::from(exit_code)),
