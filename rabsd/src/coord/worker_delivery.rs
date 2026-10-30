@@ -155,7 +155,7 @@ pub(crate) fn negotiated_dependency_context(
             );
         }
         let invocation = rabs_key::invocation::parse(&argv, None)
-            .map_err(|error| invalid(format!("dependency execution invocation: {error:?}")))?;
+            .map_err(|error| invalid(&format!("dependency execution invocation: {error:?}")))?;
         if !invocation.native_libs.is_empty()
             || invocation
                 .lib_search
