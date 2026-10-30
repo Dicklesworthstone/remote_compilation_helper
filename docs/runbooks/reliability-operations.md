@@ -160,14 +160,23 @@ and no conflicting records for that token. Receipt-only, malformed, symlinked,
 quarantined or contradictory evidence is preserved. In particular, an incomplete
 hard-linked quarantine fence cannot replace the complete receipt needed for
 later recovery. Failed fence or registry durability barriers preserve both
-records. Released receipts also remain whenever any other same-token evidence
-exists, apart from a regular nonsymlink activity-lock file. Otherwise an aged
-released receipt could be discarded first, hiding a contradiction from the
-cancellation check. Ordinary unambiguous released receipts still expire.
-Each collection pass validates at most 16 released and 16 cancelled candidates;
+records. Released receipts are retained even when they are old and unambiguous:
+they are the only durable restart proof if release succeeded on the worker but
+its reply or the dispatcher's local checkpoint was lost. Age cannot prove that
+the dispatcher acknowledged release. Removing that receipt also permits an old
+initial acquisition request to reuse the identity. Retaining the original
+receipt preserves both proofs without rewriting its bytes or inode.
+Each cancellation-receipt collection pass validates at most 16 candidates;
 this bounds the added checks, not directory enumeration or filesystem latency.
 Unresolved early candidates can defer later collection. Activity lock files are
-not collected, and this policy does not add permanent released-token fences.
+not collected. Released-receipt and activity-lock growth remain unresolved;
+safe collection needs a durable acknowledgement and identity-fencing protocol,
+not an age threshold.
+
+All dispatchers sharing a registry must run the corrected embedded transaction,
+or their old sessions must be quiesced. An older dispatcher can still collect
+released receipts needed by a newer one. This correction cannot reconstruct a
+receipt already collected: missing worker evidence remains unconfirmed.
 
 Preserve the original journal, cancellation records and lock files when
 diagnosing a refusal. Neither a terminal lease alone, an empty process listing,
@@ -273,13 +282,27 @@ both before and after worker `finish-cancel`. With exclusive verified journal
 ownership, it requires the exact bound recipe, a durable tree-retirement
 checkpoint, and either durable pair retirement or the exact worker pair-release
 receipt. It additionally requires a recorded cancellation obligation or an
-exact completed worker cancellation receipt for a legacy recipe. Those facts
+exact durable worker cancellation marker or receipt for a legacy recipe. The
+read-only `cancellation-state` probe distinguishes existing cancellation intent
+from the `cancelled` probe's completed receipt. It refuses incomplete pending,
+quarantined, unknown or contradictory same-identity evidence without repairing
+it. A positive intent probe is not source access or completed cleanup. Those facts
 authorize only cancellation metadata reconciliation and failed-job retirement.
 They authorize no new source or pair grant, source-content reads or tree
 mutation. Existing cancellation validation can inspect physical path topology.
 The worker still drains activity, checks the exact source closure and preserves
 the old-token cancellation fence. Journal changes, missing pair proof and
 conflicting worker records remain failures with the evidence retained.
+
+For a non-paired legacy job with an exact execution-completion receipt, recovery
+also recognizes a cancellation marker left before `finish-cancel` or after
+receipt collection. It checkpoints the observed command exit and cancellation
+obligation before invoking the existing activity-drained cancellation cleanup.
+The observation does not itself mark sources released, return a result, retire
+the journal or acknowledge the daemon. A lost cleanup reply leaves a durable
+obligation for the next recovery owner. Missing or conflicting intent remains
+unconfirmed. A legacy paired job without its required retirement proof remains
+refused rather than borrowing another owner's source pair.
 
 When cancellation started before tree or pair retirement completed, an exact
 execution-completion or execution-lost proof resumes the existing cancellation
@@ -386,27 +409,13 @@ publication after unlocking. Run it with
 `python3 scripts/tests/test_source_ownership_ssh.py` on an isolated Linux host
 where the test user may start `sshd`.
 
-The subsequent cancellation-retention repairs were qualified on native Linux
-with 90 comprehensive registry cases and 31 earlier registry cases, all passing.
-The first eight new cases (four methods under both `sh` and `bash`) reproduce missing
-fences, discarded recovery evidence, missing durability acknowledgements and
-unrestricted receipt-confirmation work against the unchanged `f22678a` registry.
-They pass with the repair, including interrupted receipt publication, historical
-receipt-only replay, conflicting records, quarantine recovery and old-token
-refusal after receipt collection. Six further cases reproduce aged released
-evidence being discarded before cancellation conflict detection. After the full
-90-case run, those six were strengthened and rerun successfully to check exact
-bytes and inodes across three separate collection admissions and preservation
-of ordinary activity-lock files during bounded receipt expiry. Shell syntax,
-Python syntax and whitespace checks passed.
-
-The real loopback OpenSSH suite was rerun against the corrected registry: all
-eight cases passed, including stopped/killed clients, heartbeat expiry,
-cancellation queued behind live activity and timer death. These isolated Linux
-tests exercise actual processes, locks and transport with injected durability
-failures; tmpfs qualification does not establish physical power-loss recovery
-or installed-worker acceptance. The earlier standalone controller results
-above remain scoped to their stated revision.
+The cancellation-retention repairs through `7ae3f5f` passed 90 comprehensive
+registry cases, 31 earlier registry cases and eight loopback SSH cases. Those
+historical results covered missing fences, lost durability acknowledgements,
+conflicting receipts and old-token refusal. The current registry and SSH
+qualification below supersedes those counts. These tests exercise actual
+processes, locks and transport with injected durability failures; tmpfs does
+not establish physical power-loss recovery or installed-worker acceptance.
 
 The subsequent source-pair publication qualification reproduced the previous
 failure with actual pair/metadata locks and a kernel file-size write limit:
@@ -425,6 +434,23 @@ Both new pair SSH cases also passed again after the final missing-owner
 refusal was added.
 These execute worker programs and real kernel locks; they do not compile the
 Rust command builders or execute the new Rust journal-recovery integration.
+
+The following legacy-cancellation and released-proof corrections reproduced
+the aged-release failure against the unchanged `358f0c6` registry under both
+`sh` and `bash`, and independently over real loopback SSH. After a lost release
+reply, another admission collected the aged receipt and the original release
+query incorrectly returned `pending`. Marker-only cancellation also left the
+completed-receipt query at `pending` while normal recovery remained refused.
+The corrected native registry suite passed all 98 cases, and the earlier
+registry/admission suite passed all 31. The expanded controller suite passed
+31 cases, the native fallback timer passed 11, and real pipe
+backpressure delivery passed three. All 12 loopback SSH cases passed, including
+lost release replies across retention, cancellation intent while independent
+activity remains live, and restart between pair release and `finish-cancel`.
+The probe preserved live claims and source bytes; successor admission and
+repeated old-token reconciliation remained safe. No skips occurred in these
+suites. The earlier holder/pair-custody results remain scoped to their prior
+revision; this correction did not change those programs.
 
 The journal-custody correction passed 25 job-identity and journal tests in the
 actual default-feature `rch-common` crate using the pinned nightly toolchain.
@@ -451,6 +477,13 @@ publication. They were independently source-reviewed but were also **not
 compiled or executed** here. The native worker-program results above do not
 replace this integration gate.
 
+Two `completed_source_cancellation_` Rust tests were added for the later legacy
+intent correction, and the four paired tests were strengthened. They exercise
+actual journal ownership and disk reload with injected worker observations,
+including a crash before cleanup, conflicting command outcomes and changed
+custody. All six remain **uncompiled and unexecuted** here. Native worker tests
+validate the registry observations separately from this dispatcher integration.
+
 The latest locked, default-feature `cargo check -p rch --all-targets` attempt
 again received SIGKILL while compiling the unchanged `asupersync 0.5.0`
 dependency, before reaching RCH. It used one Cargo job, one rustc thread, no
@@ -461,7 +494,9 @@ attempts establish no compiler verdict for the changed RCH integration. Full
 workspace check/Clippy and execution of the RCH recovery, lease and retry
 regressions remain required before release acceptance. Successful common-crate
 Clippy and Linux process/SSH qualifications do not replace those gates or the
-original affected worker's acceptance.
+original affected worker's acceptance. After the legacy-intent correction,
+both the backing filesystem and temporary filesystem had no free space; the
+heavy Rust gates were not repeated under the unchanged memory constraint.
 
 On a native host with sufficient build capacity, include these Rust gates with
 the worker acceptance cases below:
@@ -471,6 +506,7 @@ cargo check --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked -p rch --bin rch namespace_preflight_ -- --test-threads=1
 cargo test --locked -p rch --bin rch paired_cancellation_recovery_ -- --test-threads=1
+cargo test --locked -p rch --bin rch completed_source_cancellation_ -- --test-threads=1
 cargo test --locked -p rch --bin rch source_pair_ -- --test-threads=1
 cargo test --locked -p rch --bin rch retry_selection_ -- --test-threads=1
 cargo test --locked -p rch --bin rch retry_custody_ -- --test-threads=1
@@ -490,6 +526,8 @@ worker fixtures:
    Interrupt preflight before daemon release and race release against daemon
    cancellation. Exact failure receipts may retry; completed cancellation must
    remain terminal, with no replay and no invented conflicting local exit.
+   Include legacy marker-only journals and lost release replies aged past
+   retention, with all shared-registry dispatchers using the updated policy.
 3. Exercise concurrent dispatchers and a still-running activity. Recovery must
    refuse while that activity owns its lock; an unrelated project must continue
    making progress. Corrupt, changed, absent and conflicting evidence must

@@ -236,10 +236,19 @@ class SourceOwnershipSshTests(unittest.TestCase):
 
     def transaction(self, operation, token=None):
         command = self.invocation(operation, token)
-        if operation in ("cancel", "finish-cancel", "settle-cancel"):
-            command = shlex.join([FLOCK, "-x", "--", str(self.activity_lock)]) + " " + command
+        if operation in ("cancel", "finish-cancel", "settle-cancel", "release"):
+            activity_lock = self.registry / ((token or self.token) + ".activity.lock")
+            command = shlex.join([FLOCK, "-x", "--", str(activity_lock)]) + " " + command
         return subprocess.run([*self.argv, command], input=self.roots.encode(),
                               capture_output=True, timeout=8)
+
+    def cancellation_state(self, token=None):
+        program = (self.invocation("cancellation-state", token) +
+                   " <<'RCH_SOURCE_CLAIM_ROOTS'\n" + self.roots +
+                   "RCH_SOURCE_CLAIM_ROOTS\n")
+        client = self.start(program, "set -- RCH_SOURCE_INTENT_CANCELLATION_STATE\n" + CONTROL)
+        stdout, stderr = client.finish()
+        return client.process.returncode, stdout, stderr
 
     def pair_command(self, operation, source, token=None, after=""):
         token = token or self.token
@@ -405,6 +414,44 @@ class SourceOwnershipSshTests(unittest.TestCase):
         self.assertEqual((owner.stat().st_ino, owner.read_bytes(), sentinel.stat().st_ino,
                           sentinel.read_bytes()), before)
 
+    def test_lost_source_release_reply_survives_retention_and_later_dispatchers(self):
+        acquired = self.transaction("acquire")
+        self.assertEqual((acquired.returncode, acquired.stdout), (0, b""), acquired.stderr)
+        release = (shlex.join([FLOCK, "-x", "--", str(self.activity_lock)]) + " " +
+                   self.invocation("release"))
+        program = ("set -eu\n" + release +
+                   " <<'RCH_SOURCE_CLAIM_ROOTS'\n" + self.roots +
+                   "RCH_SOURCE_CLAIM_ROOTS\nprintf 'SOURCE_RELEASE_COMMITTED\\n'\nread -r reply\n")
+        client = self.start(program)
+        ready = client.line()
+        if ready is None:
+            stdout, stderr = client.finish()
+            self.fail("source release did not commit: status={} stdout={!r} stderr={!r}".format(
+                client.process.returncode, stdout, stderr))
+        self.assertEqual(ready, b"SOURCE_RELEASE_COMMITTED")
+        client.process.kill()
+        client.finish()
+        receipt = self.registry / "released" / self.active.name
+        original = (receipt.stat().st_ino, receipt.read_bytes())
+        old = time.time() - 3 * 24 * 60 * 60
+        os.utime(receipt, (old, old))
+
+        # A later dispatcher must still be admitted, while collection may not
+        # erase the only exact retirement proof needed by the old dispatcher.
+        for operation in ("acquire", "release"):
+            other = self.transaction(operation, token="bb-111")
+            self.assertEqual((other.returncode, other.stdout), (0, b""), other.stderr)
+        for _ in range(2):
+            released = self.transaction("released")
+            self.assertEqual((released.returncode, released.stdout),
+                             (0, b"released"), released.stderr)
+            self.assertEqual((receipt.stat().st_ino, receipt.read_bytes()), original)
+        delayed = self.transaction("acquire")
+        self.assertEqual((delayed.returncode, delayed.stdout), (73, b""), delayed.stderr)
+        self.assertIn(b"source grant already released", delayed.stderr)
+        self.assertFalse(self.active.exists())
+        self.assertEqual((self.source / "sentinel").read_text(), "source remains owned\n")
+
     def test_pair_cancellation_restart_releases_only_the_exact_old_grant(self):
         self.source = self.root / "cancelled-pair-source"
         self.roots = str(self.source) + "\n"
@@ -427,6 +474,11 @@ class SourceOwnershipSshTests(unittest.TestCase):
         # exact cancellation completes; free pair locks alone prove nothing.
         blocked = self.transaction("try-acquire", token="bb-111")
         self.assertEqual((blocked.returncode, blocked.stdout), (75, b""), blocked.stderr)
+        incomplete = self.transaction("cancelled")
+        self.assertEqual((incomplete.returncode, incomplete.stdout),
+                         (0, b"pending"), incomplete.stderr)
+        status, output, error = self.cancellation_state()
+        self.assertEqual((status, output), (0, b"cancellation"), error)
         confirmed = self.pair_transaction("released", self.source)
         self.assertEqual((confirmed.returncode, confirmed.stdout), (0, b"released"), confirmed.stderr)
         finished = self.transaction("finish-cancel")
@@ -452,6 +504,34 @@ class SourceOwnershipSshTests(unittest.TestCase):
                               for path in (owner, fresh, sentinel)], before)
         self.assertFalse(self.active.exists())
         self.assertEqual((self.registry / "cancelled" / self.active.name).read_text(), self.roots)
+
+    def test_cancellation_probe_does_not_release_a_live_activity_or_its_source_grant(self):
+        acquired = self.transaction("acquire")
+        self.assertEqual((acquired.returncode, acquired.stdout), (0, b""), acquired.stderr)
+        status, output, error = self.cancellation_state()
+        self.assertEqual((status, output), (0, b"pending"), error)
+        cancelled = self.transaction("cancel")
+        self.assertEqual((cancelled.returncode, cancelled.stdout), (0, b"owned"), cancelled.stderr)
+        fence = self.registry / (self.token + "." + self.digest + ".cancelling")
+        sentinel = self.source / "sentinel"
+        before = [(path.stat().st_ino, path.read_bytes()) for path in (self.active, fence, sentinel)]
+        activity = self.start_activity()
+        # A cancellation marker can coexist with already admitted activity or
+        # cancellation cleanup. The read-only probe must report intent without
+        # draining or retiring it; a positive answer is never cleanup proof.
+        for _ in range(2):
+            status, output, error = self.cancellation_state()
+            self.assertEqual((status, output), (0, b"cancellation"), error)
+            self.assertIsNone(activity.process.poll())
+            self.assertFalse(available(self.activity_lock))
+            self.assertEqual([(path.stat().st_ino, path.read_bytes())
+                              for path in (self.active, fence, sentinel)], before)
+            self.assert_owner_retained()
+        status, output, error = self.cancellation_state("bb-111")
+        self.assertEqual((status, output), (0, b"pending"), error)
+        self.finish_activity(activity)
+        self.assertEqual([(path.stat().st_ino, path.read_bytes())
+                          for path in (self.active, fence, sentinel)], before)
 
     def test_ssh_eof_releases_only_transient_locks_and_keeps_independent_activity(self):
         holder = self.start_holder(idle=90)

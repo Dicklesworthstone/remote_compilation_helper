@@ -285,6 +285,7 @@ class SourceNamespaceControlTests(unittest.TestCase):
         for contract, replies in (("RCH_SOURCE_INTENT_CANCEL", ("owned", "unowned")),
                                   ("RCH_SOURCE_INTENT_RELEASED", ("released", "pending")),
                                   ("RCH_SOURCE_INTENT_CANCELLED", ("cancelled", "pending")),
+                                  ("RCH_SOURCE_INTENT_CANCELLATION_STATE", ("cancellation", "pending")),
                                   ("RCH_SOURCE_INTENT_FINISHED", ("",))):
             for reply in replies:
                 with self.subTest(contract=contract, reply=reply):
@@ -298,6 +299,11 @@ class SourceNamespaceControlTests(unittest.TestCase):
                                    ("RCH_SOURCE_INTENT_CANCEL", "owned\\n"),
                                    ("RCH_SOURCE_INTENT_RELEASED", "released\\0"),
                                    ("RCH_SOURCE_INTENT_CANCELLED", "cancelledpending"),
+                                   ("RCH_SOURCE_INTENT_CANCELLATION_STATE", ""),
+                                   ("RCH_SOURCE_INTENT_CANCELLATION_STATE", "cancelled"),
+                                   ("RCH_SOURCE_INTENT_CANCELLATION_STATE", "cancellation\\n"),
+                                   ("RCH_SOURCE_INTENT_CANCELLATION_STATE", "cancellationpending"),
+                                   ("RCH_SOURCE_INTENT_CANCELLATION_STATE", "pending\\0"),
                                    ("RCH_SOURCE_INTENT_FINISHED", "finished")):
             with self.subTest(contract=contract, response=response):
                 self.setUp()
@@ -309,6 +315,50 @@ class SourceNamespaceControlTests(unittest.TestCase):
         self.setUp()
         result = self.run_control("exit 73\n", "RCH_SOURCE_INTENT_FINISHED")
         self.assertEqual((result.returncode, result.stdout), (73, b""), result.stderr)
+
+    def test_cancellation_state_failed_or_killed_probe_never_publishes_evidence(self):
+        # Observing a cancellation is distinct from completing it. Even that
+        # weaker evidence needs the exact successful reply and settled probe
+        # process group; a printed prefix cannot survive a failed fsync/signal.
+        for reply in ("cancellation", "pending"):
+            for ending, status in (("exit 73", 73), ("exit 75", 75),
+                                   ("kill -KILL $$", 137)):
+                with self.subTest(reply=reply, ending=ending):
+                    self.setUp()
+                    result = self.run_control("printf " + reply + "; " + ending + "\n",
+                                              "RCH_SOURCE_INTENT_CANCELLATION_STATE")
+                    self.assertEqual((result.returncode, result.stdout), (status, b""),
+                                     result.stderr)
+                    if status == 137:
+                        self.assertIn(b"RCH_SOURCE_NAMESPACE_PROCESS_TERMINATED", result.stderr)
+
+    def test_cancellation_state_drains_quiet_probe_children_before_reply(self):
+        lock = self.root / "metadata.lock"
+        sleeper = self.sleeper(stdout=False, stderr=False, lock=lock)
+        program = (sleeper + " &\nwhile [ ! -f " +
+                   shlex.quote(str(self.root / "lock-acquired")) +
+                   " ]; do sleep 0.01; done\nprintf cancellation\n")
+        result = self.run_control(program, "RCH_SOURCE_INTENT_CANCELLATION_STATE")
+        self.assertEqual((result.returncode, result.stdout, result.stderr),
+                         (0, b"cancellation", b""))
+        self.assertTrue((self.root / "lock-acquired").exists())
+        self.assert_no_control_processes()
+        with lock.open("a") as probe:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_cancellation_state_stalled_probe_cannot_leave_metadata_locked(self):
+        lock = self.root / "metadata.lock"
+        sleeper = self.sleeper(lock=lock)
+        program = (sleeper + " &\nwhile [ ! -f " +
+                   shlex.quote(str(self.root / "lock-acquired")) +
+                   " ]; do sleep 0.01; done\nprintf cancellation\n")
+        result = self.run_control(program, "RCH_SOURCE_INTENT_CANCELLATION_STATE")
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, b"")
+        self.assertTrue((self.root / "lock-acquired").exists())
+        self.assert_no_control_processes()
+        with lock.open("a") as probe:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_cancel_waiter_cannot_publish_after_client_deadline_and_unlock(self):
         lock = self.root / "activity.lock"

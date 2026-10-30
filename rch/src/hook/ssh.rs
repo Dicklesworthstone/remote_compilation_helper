@@ -1196,38 +1196,44 @@ pub(super) async fn remote_source_authority_was_released(
     }
 }
 
-/// Reconcile an exact cancellation receipt for a dead job (bd-ey7fr). Like
-/// the release probe, this grants no source read or mutation authority.
-pub(super) async fn remote_source_intent_was_cancelled(
+/// Locate an exact cancellation intent, including interruption before the
+/// completed receipt. This proves only that normal activity is fenced. It
+/// grants no source access and does not prove cleanup or source retirement;
+/// recovery must independently establish those obligations before finishing
+/// cancellation under the activity mutex.
+pub(super) async fn remote_source_intent_has_cancellation(
     worker: &WorkerConfig,
     roots: &[String],
     identity: &str,
     namespace: SourceAuthorityNamespace,
 ) -> anyhow::Result<bool> {
-    let command = source_intent_command(namespace.registry(), roots, identity, "cancelled")?;
+    let command =
+        source_intent_command(namespace.registry(), roots, identity, "cancellation-state")?;
     let output = run_source_metadata_rpc(
         worker,
         &command,
-        "RCH_SOURCE_INTENT_CANCELLED",
+        "RCH_SOURCE_INTENT_CANCELLATION_STATE",
         Duration::from_secs(30),
     )
     .await?;
     anyhow::ensure!(
         output.status.success(),
-        "cannot reconcile durable source cancellation: {}",
+        "cannot locate durable source cancellation: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     match output.stdout.as_slice() {
-        b"cancelled" => Ok(true),
+        b"cancellation" => Ok(true),
         b"pending" => Ok(false),
-        _ => anyhow::bail!("invalid durable source cancellation response"),
+        _ => anyhow::bail!("invalid durable source cancellation state response"),
     }
 }
 
-/// Begin cancellation of a persisted pre-execution intent, draining normal
+/// Begin or resume cancellation of an owned persisted intent, draining normal
 /// activity and fencing delayed acquisition. True retains the existing claim
-/// for cleanup; false grants no source authority. Execution must never have
-/// started. Cleanup must finish before `finish_cancel_remote_source_authority_intent`.
+/// for cleanup; false grants no source authority. The caller must prove either
+/// pre-execution intent, exact execution completion/loss, or already completed
+/// tree/pair retirement. Cleanup must finish before
+/// `finish_cancel_remote_source_authority_intent`.
 pub(super) async fn cancel_remote_source_authority_intent(
     worker: &WorkerConfig,
     roots: &[String],

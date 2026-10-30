@@ -2463,6 +2463,70 @@ impl RecoverySession {
         Ok(())
     }
 
+    /// The caller has read this attempt's exact durable completion. Observe
+    /// an old cancellation fence before normal recovery could reattach the
+    /// grant, and checkpoint its outstanding cleanup before the first RPC.
+    /// A fence is intent only: cancel_source_grant must still drain activity,
+    /// acquire the actual cleanup grant, and retire every owned resource.
+    async fn checkpoint_completed_source_cancellation_with(
+        &mut self,
+        exit: i32,
+        mut has_cancellation: impl AsyncFnMut(&WorkerConfig, &[String], &str) -> anyhow::Result<bool>,
+    ) -> anyhow::Result<bool> {
+        let cancellation_started = self.recipe.source_cancellation_settled == Some(false);
+        if !cancellation_started
+            && (self.recipe.pair.is_some() || self.recipe.source_roots.is_empty())
+        {
+            return Ok(false);
+        }
+        let ownership = self
+            .writer
+            .recovery_ownership
+            .as_ref()
+            .context("completed source cancellation has no journal owner")?;
+        ownership.verify()?;
+        let before = self.writer.snapshot();
+        anyhow::ensure!(
+            self.recipe.execution_started
+                && self.recipe.returned.is_none()
+                && !before.terminal_acknowledged
+                && self.recipe.source_authority_namespace.is_some()
+                && serde_json::to_value(load_recipe(&self.writer)?)?
+                    == serde_json::to_value(&self.recipe)?,
+            "completed source cancellation lacks its exact unfinished execution recipe"
+        );
+        let cancellation = cancellation_started
+            || has_cancellation(
+                &self.recipe.worker,
+                &self.recipe.source_roots,
+                &self.recipe.identity,
+            )
+            .await?;
+        ownership.verify()?;
+        anyhow::ensure!(
+            self.writer.snapshot() == before,
+            "recovery journal changed during completed cancellation discovery"
+        );
+        if !cancellation {
+            return Ok(false);
+        }
+        anyhow::ensure!(
+            self.recipe
+                .exit_code
+                .is_none_or(|observed| observed == exit),
+            "remote completion contradicts the recorded command outcome; ownership retained"
+        );
+        anyhow::ensure!(
+            before.exit_code != Some(0),
+            "source cancellation contradicts the recorded successful wrapper result"
+        );
+        let mut next = self.recipe.clone();
+        next.exit_code = Some(exit);
+        next.source_cancellation_settled = Some(false);
+        self.persist_next_recipe(next)?;
+        Ok(true)
+    }
+
     /// Resume cancellation after the tree was durably retired, without
     /// reacquiring source access or reading pooled source contents. A crash can leave the
     /// pair released while finish-cancel, its reply, or the local checkpoint
@@ -2479,7 +2543,7 @@ impl RecoverySession {
         let namespace = self.bind_source_namespace().await?;
         self.resume_retired_source_pair_cancellation_with(
             async |worker, roots, identity| {
-                super::super::ssh::remote_source_intent_was_cancelled(
+                super::super::ssh::remote_source_intent_has_cancellation(
                     worker, roots, identity, namespace,
                 )
                 .await
@@ -2514,7 +2578,7 @@ impl RecoverySession {
 
     async fn resume_retired_source_pair_cancellation_with(
         &mut self,
-        mut was_cancelled: impl AsyncFnMut(&WorkerConfig, &[String], &str) -> anyhow::Result<bool>,
+        mut has_cancellation: impl AsyncFnMut(&WorkerConfig, &[String], &str) -> anyhow::Result<bool>,
         mut pair_was_released: impl AsyncFnMut(&WorkerConfig, &str, &str) -> anyhow::Result<bool>,
         mut finish: impl AsyncFnMut(&WorkerConfig, &[String], &str) -> anyhow::Result<()>,
         mut reconcile: impl AsyncFnMut(&mut RecoverySession) -> anyhow::Result<()>,
@@ -2565,9 +2629,12 @@ impl RecoverySession {
         );
         let cancellation_started = self.recipe.source_cancellation_settled == Some(false);
         if !cancellation_started {
-            // Old journals did not persist the cancellation obligation. Their
-            // tree/pair flags alone cannot authorize a new cancellation.
-            let cancelled = was_cancelled(
+            // Old journals did not persist the cancellation obligation. An
+            // exact worker fence proves cancellation was requested even when
+            // finish-cancel never ran or its receipt was collected. That
+            // observation grants no cleanup or retirement: the durable tree
+            // checkpoint and exact pair release below are still required.
+            let cancellation = has_cancellation(
                 &self.recipe.worker,
                 &self.recipe.source_roots,
                 &self.recipe.identity,
@@ -2578,7 +2645,7 @@ impl RecoverySession {
                 self.writer.snapshot() == before,
                 "source-pair recovery journal changed during cancellation discovery"
             );
-            if !cancelled {
+            if !cancellation {
                 return Ok(None);
             }
         }
@@ -2600,7 +2667,7 @@ impl RecoverySession {
             }
             anyhow::ensure!(
                 released,
-                "cancelled source pair has no exact release receipt; ownership retained"
+                "source-pair cancellation has no exact release receipt; ownership retained"
             );
         }
         ownership.verify()?;
@@ -3539,22 +3606,18 @@ async fn recover_owned_job_with_daemon(
             "same-id remote execution has no durable completion yet; command was not replayed"
         );
     };
-    // The grant can be cancelled after execution completed: a wrapper that
-    // dies between finish-cancel and persisting its retirement leaves the
-    // worker receipt and this journal behind. Reattaching the cancelled grant
-    // is refused forever, so every recovery failed and the lease never
-    // settled (bd-ey7fr). finish-cancel ran only after the tree was retired,
-    // so no outputs remain to collect: retire the job as failed instead.
-    if session.recipe.source_cancellation_settled == Some(false)
-        || (session.recipe.pair.is_none()
-            && !session.recipe.source_roots.is_empty()
-            && super::super::ssh::remote_source_intent_was_cancelled(
-                &worker,
-                &session.recipe.source_roots,
-                &session.recipe.identity,
-                namespace,
+    // A legacy cancellation can stop before finish-cancel or lose its
+    // completed receipt to retention. Its exact marker still denies normal
+    // recovery. This completion proves the execution ended, but only the
+    // drained cancellation protocol below can grant cleanup and retire it.
+    if session
+        .checkpoint_completed_source_cancellation_with(exit, async |worker, roots, identity| {
+            super::super::ssh::remote_source_intent_has_cancellation(
+                worker, roots, identity, namespace,
             )
-            .await?)
+            .await
+        })
+        .await?
     {
         tracing::warn!(
             identity = %session.recipe.identity,
@@ -3562,7 +3625,6 @@ async fn recover_owned_job_with_daemon(
             remote_exit = exit,
             "resuming source cancellation after execution; retiring it as failed without collecting outputs"
         );
-        session.completed(exit)?;
         cancel_source_grant(session).await?;
         writer.record_exit(EXIT_BUILD_ERROR)?;
         recovery_completion::finish(writer, &mut daemon).await?;
@@ -4515,6 +4577,195 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn completed_cancellation_fixture() -> (PathBuf, DurableLeaseWriter) {
+        let (directory, writer, _) = preparation_fixture();
+        let directory = directory.keep();
+        let mut recipe = load_recipe(&writer).unwrap();
+        recipe.prepared = true;
+        recipe.execution_started = true;
+        recipe.source_authority_namespace = Some(SourceAuthorityNamespace::Legacy);
+        writer
+            .set_recovery(serde_json::to_value(recipe).unwrap())
+            .unwrap();
+        let mut wrapper = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let wrapper_pid = wrapper.id();
+        assert!(wrapper.wait().unwrap().success());
+        {
+            let mut lease = writer.lease.lock().unwrap();
+            lease.wrapper_pid = wrapper_pid;
+            lease.process_start_ticks = None;
+            lease.boot_id = None;
+            lease.process_birth = None;
+        }
+        writer.persist().unwrap();
+        (directory, writer)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn completed_source_cancellation_remains_pending_across_journal_restart() {
+        let _guard = test_guard!();
+        for (pending, paired) in [(false, false), (true, false), (true, true)] {
+            let (_directory, writer) = completed_cancellation_fixture();
+            let mut recipe = load_recipe(&writer).unwrap();
+            recipe.source_cancellation_settled = pending.then_some(false);
+            if paired {
+                let root = recipe.source_roots[0].clone();
+                recipe.pair = Some((root.clone(), recipe.identity.clone()));
+                recipe.retire_root = Some(root);
+            }
+            writer
+                .set_recovery(serde_json::to_value(recipe).unwrap())
+                .unwrap();
+            let owned = recovery_owner::claim(&writer).await.unwrap();
+            let mut session = RecoverySession {
+                recipe: load_recipe(&owned).unwrap(),
+                writer: owned.clone(),
+            };
+            let original = session.recipe.clone();
+            assert!(session.recipe.exit_code.is_none());
+            assert!(
+                session
+                    .checkpoint_completed_source_cancellation_with(
+                        0,
+                        async |worker, roots, token| {
+                            assert!(!pending, "an existing obligation needs no rediscovery");
+                            assert_eq!(worker.id, original.worker.id);
+                            assert_eq!(roots, original.source_roots);
+                            assert_eq!(token, original.identity);
+                            // A supplied exact marker, not a completed receipt.
+                            // The native registry tests exercise that distinction.
+                            Ok(true)
+                        }
+                    )
+                    .await
+                    .unwrap()
+            );
+            let checkpoint = load_recipe(&owned).unwrap();
+            assert_eq!(checkpoint.exit_code, Some(0));
+            assert_eq!(checkpoint.source_cancellation_settled, Some(false));
+            assert_eq!(
+                checkpoint.source_authority_namespace,
+                original.source_authority_namespace
+            );
+            assert!(checkpoint.returned.is_none());
+            assert!(!checkpoint.tree_retired && !checkpoint.pair_released);
+            assert!(!checkpoint.sources_released && !checkpoint.retired);
+            assert!(owned.snapshot().exit_code.is_none());
+            assert!(owned.acknowledge_terminal().is_err());
+            assert!(owned.ensure_released_for_retry().is_err());
+            assert!(recovery_owner::claim(&writer).await.is_err());
+            drop(session);
+            drop(owned);
+
+            // Crash before the first cancel RPC: the next owner must resume
+            // cleanup, even if discovery would now be unavailable. It cannot
+            // advertise return or retirement from this checkpoint alone.
+            let reloaded = DurableLeaseWriter {
+                path: writer.path.clone(),
+                recovery_ownership: None,
+                lease: Arc::new(Mutex::new(
+                    DurableLeaseWriter::read_journal(&writer.path, &writer.wrapper_id()).unwrap(),
+                )),
+            };
+            let owned = recovery_owner::claim(&reloaded).await.unwrap();
+            let mut session = RecoverySession {
+                recipe: load_recipe(&owned).unwrap(),
+                writer: owned.clone(),
+            };
+            assert!(
+                session
+                    .checkpoint_completed_source_cancellation_with(0, async |_, _, _| {
+                        panic!("restart must resume the durably pending cancellation")
+                    })
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(session.recipe.source_cancellation_settled, Some(false));
+            assert!(session.recipe.returned.is_none());
+            assert!(!session.recipe.sources_released && !session.recipe.retired);
+            assert!(!owned.snapshot().terminal_acknowledged);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn completed_source_cancellation_preserves_unconfirmed_and_changed_evidence() {
+        let _guard = test_guard!();
+        for case in [
+            "absent",
+            "unconfirmed",
+            "changed-journal",
+            "changed-owner",
+            "conflicting-completion",
+            "recorded-success",
+            "unstarted",
+            "paired-legacy",
+        ] {
+            let (directory, writer) = completed_cancellation_fixture();
+            let mut recipe = load_recipe(&writer).unwrap();
+            match case {
+                "conflicting-completion" => recipe.exit_code = Some(137),
+                "unstarted" => recipe.execution_started = false,
+                "paired-legacy" => {
+                    recipe.pair = Some((recipe.source_roots[0].clone(), recipe.identity.clone()));
+                }
+                _ => {}
+            }
+            writer
+                .set_recovery(serde_json::to_value(recipe).unwrap())
+                .unwrap();
+            if case == "recorded-success" {
+                writer.record_exit(0).unwrap();
+            }
+            let owned = recovery_owner::claim(&writer).await.unwrap();
+            let mut session = RecoverySession {
+                recipe: load_recipe(&owned).unwrap(),
+                writer: owned.clone(),
+            };
+            let before = std::fs::read(&writer.path).unwrap();
+            let changed = std::cell::RefCell::new(None);
+            let result = session
+                .checkpoint_completed_source_cancellation_with(0, async |_, _, _| {
+                    assert!(!matches!(case, "unstarted" | "paired-legacy"));
+                    match case {
+                        "absent" => return Ok(false),
+                        "unconfirmed" => anyhow::bail!("unconfirmed worker cancellation"),
+                        "changed-journal" => {
+                            let mut next = owned.snapshot().recovery.unwrap();
+                            next["identity"] = serde_json::json!("abcdef1234");
+                            owned.set_recovery(next)?;
+                            *changed.borrow_mut() = Some(std::fs::read(&writer.path)?);
+                        }
+                        "changed-owner" => {
+                            std::fs::hard_link(
+                                writer.path.with_extension("recovery.lock"),
+                                directory.join("changed-recovery-gate.lock"),
+                            )?;
+                        }
+                        _ => {}
+                    }
+                    Ok(true)
+                })
+                .await;
+            if matches!(case, "absent" | "paired-legacy") {
+                assert!(!result.unwrap(), "{case}");
+            } else {
+                assert!(result.is_err(), "{case}");
+            }
+            assert_eq!(
+                std::fs::read(&writer.path).unwrap(),
+                changed.borrow().as_ref().unwrap_or(&before).clone(),
+                "{case}"
+            );
+            assert_eq!(session.recipe.source_cancellation_settled, None);
+            assert!(session.recipe.returned.is_none());
+            assert!(!session.recipe.sources_released && !session.recipe.retired);
+            assert!(!owned.snapshot().terminal_acknowledged);
+        }
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn paired_cancellation_recovery_settles_before_acknowledgement_and_survives_reload() {
         let _guard = test_guard!();
@@ -4548,7 +4799,7 @@ mod tests {
                         assert_eq!(worker.id, original.worker.id);
                         assert_eq!(roots, original.source_roots);
                         assert_eq!(identity, original.identity);
-                        calls.borrow_mut().push("cancelled receipt");
+                        calls.borrow_mut().push("cancellation evidence");
                         Ok(true)
                     },
                     async |worker, root, token| {
@@ -4594,7 +4845,7 @@ mod tests {
             assert_eq!(result, Some(expected_exit));
             let mut expected_calls = Vec::new();
             if !started {
-                expected_calls.push("cancelled receipt");
+                expected_calls.push("cancellation evidence");
             }
             if !recorded_pair_release {
                 expected_calls.push("pair receipt");
@@ -4658,6 +4909,7 @@ mod tests {
         let _guard = test_guard!();
         for case in [
             "legacy-no-cancellation",
+            "legacy-unconfirmed-cancellation",
             "legacy-no-pair-receipt",
             "pending-live-pair",
             "pair-transport-error",
@@ -4701,8 +4953,15 @@ mod tests {
             let before = std::fs::read(&writer.path).unwrap();
             let result = session
                 .resume_retired_source_pair_cancellation_with(
-                    async |_, _, _| Ok(case != "legacy-no-cancellation"),
                     async |_, _, _| {
+                        if case == "legacy-unconfirmed-cancellation" {
+                            anyhow::bail!("worker cancellation evidence is unconfirmed")
+                        }
+                        Ok(case != "legacy-no-cancellation")
+                    },
+                    async |_, _, _| {
+                        assert_ne!(case, "legacy-no-cancellation");
+                        assert_ne!(case, "legacy-unconfirmed-cancellation");
                         if case == "pair-transport-error" {
                             anyhow::bail!("unconfirmed pair receipt")
                         }
@@ -4727,7 +4986,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn paired_cancellation_recovery_reloads_after_lost_worker_or_settlement_reply() {
+    async fn paired_cancellation_recovery_reloads_legacy_fence_after_lost_reply() {
         let _guard = test_guard!();
         for lost_reply in ["cancellation", "settlement"] {
             let (_directory, writer) = retired_pair_cancellation_fixture(false);
@@ -4736,21 +4995,44 @@ mod tests {
                 recipe: load_recipe(&owned).unwrap(),
                 writer: owned.clone(),
             };
+            assert!(
+                owned
+                    .snapshot()
+                    .recovery
+                    .as_ref()
+                    .unwrap()
+                    .get("source_cancellation_settled")
+                    .is_none(),
+                "the old journal has no cancellation-obligation checkpoint"
+            );
+            // The supplied worker observation is a matching marker without
+            // a completed receipt. Native registry/SSH tests exercise those
+            // bytes and locks; this test checks durable journal restart after
+            // discovery, and must not treat the marker as release authority.
+            let worker_finished = std::cell::Cell::new(false);
             let result = session
                 .resume_retired_source_pair_cancellation_with(
-                    async |_, _, _| Ok(true),
-                    async |_, _, _| Ok(true),
+                    async |_, _, _| {
+                        assert!(!worker_finished.get());
+                        Ok(true)
+                    },
+                    async |_, _, _| {
+                        assert!(!worker_finished.get());
+                        Ok(true)
+                    },
                     async |_, _, _| {
                         assert_eq!(
                             load_recipe(&owned)?.source_cancellation_settled,
                             Some(false)
                         );
+                        worker_finished.set(true);
                         if lost_reply == "cancellation" {
                             anyhow::bail!("worker cancelled but its reply was lost")
                         }
                         Ok(())
                     },
                     async |session| {
+                        assert!(worker_finished.get());
                         session
                             .reconcile_source_cancellation_with(async |_, _, _| {
                                 anyhow::bail!("worker settled but its reply was lost")
@@ -4762,6 +5044,7 @@ mod tests {
             assert!(result.is_err());
             let checkpoint = load_recipe(&owned).unwrap();
             assert_eq!(checkpoint.source_cancellation_settled, Some(false));
+            assert!(worker_finished.get());
             assert_eq!(checkpoint.returned.is_some(), lost_reply == "settlement");
             assert!(!checkpoint.retired && !owned.snapshot().terminal_acknowledged);
             drop(session);

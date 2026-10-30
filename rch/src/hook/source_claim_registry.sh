@@ -443,44 +443,13 @@ prune_terminal_claims() {
     case "$retention_minutes" in
         ''|*[!0-9]*) retention_minutes=1440 ;;
     esac
-    terminal_dir="$registry/released"
-    if [ ! -L "$terminal_dir" ] && [ -d "$terminal_dir" ] \
-        && [ ! -L "$registry/cancelled" ] && [ ! -L "$registry/quarantine" ]; then
-        # A released receipt may contradict another record for this identity.
-        # Preserve that evidence before cancellation GC inspects it: deleting
-        # the released half first could make ambiguous ownership look settled.
-        # Confirm at most 16 released candidates per transaction (in addition
-        # to at most 16 cancelled candidates below). This bounds validation
-        # work, not directory enumeration or individual filesystem latency.
-        find "$terminal_dir" -maxdepth 1 -type f -name '*.claim' \
-            ! -name "$token.*" -mmin +"$retention_minutes" -print 2>/dev/null |
-        (
-            gc_checked=0
-            while IFS= read -r gc_receipt; do
-                [ "$gc_checked" -lt 16 ] || break
-                gc_checked=$((gc_checked + 1))
-                [ "${gc_receipt%/*}" = "$terminal_dir" ] || continue
-                rch_claim_record_valid "$gc_receipt" || continue
-                gc_token=$__rch_token
-                gc_conflict=0
-                for gc_other in "$registry/$gc_token."* "$registry/released/$gc_token."* \
-                    "$registry/cancelled/$gc_token."* "$registry/quarantine/$gc_token."*; do
-                    [ -e "$gc_other" ] || [ -L "$gc_other" ] || continue
-                    [ "$gc_other" = "$gc_receipt" ] && continue
-                    if [ "$gc_other" = "$registry/$gc_token.activity.lock" ] \
-                        && [ ! -L "$gc_other" ] && [ -f "$gc_other" ]; then
-                        continue
-                    fi
-                    gc_conflict=1
-                    break
-                done
-                [ "$gc_conflict" -eq 0 ] || continue
-                find "$gc_receipt" -maxdepth 0 -type f -mmin +"$retention_minutes" \
-                    -delete 2>/dev/null || true
-            done
-        ) || true
-    fi
-
+    # A released claim is the only durable proof when the dispatcher loses
+    # the release reply before checkpointing sources_released. Its age does
+    # not prove the dispatcher acknowledged it: deleting it strands restart
+    # recovery and allows a delayed initial acquire to revive the same token.
+    # Unlike cancelled receipts, no permanent release fence remains elsewhere.
+    # Retain released/ until a separate durable acknowledgement/retention
+    # protocol can preserve both recovery proof and delayed-request fencing.
     terminal_dir="$registry/cancelled"
     [ ! -L "$terminal_dir" ] && [ -d "$terminal_dir" ] \
         && [ ! -L "$registry/released" ] && [ ! -L "$registry/quarantine" ] || return 0
@@ -602,7 +571,7 @@ for previous in "$registry/$token."*.claim "$registry/$token."*.pending \
     [ -e "$previous" ] || [ -L "$previous" ] || continue
     case "$previous" in *.pending)
         case "$operation" in
-            settle-cancel|locate) refuse 'unfinished claim transition during namespace reconciliation' ;;
+            settle-cancel|locate|cancellation-state) refuse 'unfinished claim transition during namespace reconciliation' ;;
         esac
         if ! rch_claim_record_valid "$previous"; then
             rch_claim_quarantine_pending "$registry" "$previous" || refuse 'cannot quarantine pending claim'
@@ -627,7 +596,7 @@ for previous in "$registry/quarantine/$token."*.pending; do
     [ -e "$previous" ] || [ -L "$previous" ] || continue
     [ ! -L "$previous" ] && [ -f "$previous" ] || refuse 'invalid quarantined claim'
     [ "$previous" = "$registry/quarantine/$token.$digest.pending" ] || refuse 'quarantined source identity roots changed'
-    case "$operation" in acquire|try-acquire|recover|topology) refuse 'source intent has an incomplete quarantined claim' ;; esac
+    case "$operation" in acquire|try-acquire|recover|topology|cancellation-state) refuse 'source intent has an incomplete quarantined claim' ;; esac
 done
 
 # Terminal replies retire the caller's recovery obligations. Validate the
@@ -648,6 +617,41 @@ if [ -e "$cancelled" ] || [ -L "$cancelled" ]; then
         [ ! -e "$unfinished" ] && [ ! -L "$unfinished" ] \
             || refuse 'cancelled source grant has conflicting ownership'
     done
+fi
+
+# Recovery must distinguish an already requested cancellation from a completed
+# one. A dispatcher can die after persisting its tree/pair retirement but before
+# finish-cancel, or the completed receipt can expire while its permanent fence
+# remains. Neither frontier may resume normal source activity. This observation
+# grants no cleanup authority: the caller still needs its owned durable journal
+# and exact retirement evidence before the normal cancel/finish-cancel protocol.
+# Do not repair, promote, quarantine or manufacture evidence during discovery.
+if [ "$operation" = cancellation-state ]; then
+    for record in "$registry/$token."* "$registry/released/$token."* \
+        "$registry/cancelled/$token."* "$registry/quarantine/$token."*; do
+        [ -e "$record" ] || [ -L "$record" ] || continue
+        case "$record" in
+            "$active"|"$released"|"$cancelled"|"$cancelling") ;;
+            "$registry/$token.activity.lock")
+                [ ! -L "$record" ] && [ -f "$record" ] \
+                    || refuse 'invalid activity lock during cancellation discovery'
+                ;;
+            *) refuse 'unrecognized source identity evidence during cancellation discovery' ;;
+        esac
+    done
+    cancellation_found=0
+    for record in "$cancelling" "$cancelled"; do
+        [ -e "$record" ] || [ -L "$record" ] || continue
+        matches_request "$record"
+        confirm_durable_record "$record"
+        cancellation_found=1
+    done
+    if [ "$cancellation_found" -eq 1 ]; then
+        printf cancellation
+    else
+        printf pending
+    fi
+    exit 0
 fi
 
 # Discovery binds an old dispatcher journal to existing worker evidence. It

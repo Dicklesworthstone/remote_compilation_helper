@@ -16,6 +16,8 @@ case "$rch_control_ready" in
         rch_control_ready=released; rch_control_alternate=pending; rch_control_format='%s' ;;
     RCH_SOURCE_INTENT_CANCELLED)
         rch_control_ready=cancelled; rch_control_alternate=pending; rch_control_format='%s' ;;
+    RCH_SOURCE_INTENT_CANCELLATION_STATE)
+        rch_control_ready=cancellation; rch_control_alternate=pending; rch_control_format='%s' ;;
     RCH_SOURCE_INTENT_FINISHED)
         rch_control_ready=; rch_control_format='%s' ;;
     *) printf '%s\n' 'RCH: invalid metadata control result marker' >&2; exit 73 ;;

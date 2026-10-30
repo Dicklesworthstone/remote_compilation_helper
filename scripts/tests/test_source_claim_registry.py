@@ -395,6 +395,36 @@ class SourceClaimRegistryTests(unittest.TestCase):
         self.assertEqual(next_owner.read_bytes(), body(roots))
         self.assert_refused(self.transact("cc", roots))
 
+    def test_lost_release_ack_keeps_aged_restart_proof_and_fences_same_token(self):
+        roots = [self.root / "project"]
+        roots[0].mkdir()
+        source = roots[0] / "source"
+        source.write_bytes(b"preserved source for the next owner")
+        source_before = source.stat().st_ino, source.read_bytes()
+        self.assert_granted(self.transact("aa", roots))
+        receipt = self.registry / "released" / ("aa." + digest(roots) + ".claim")
+        self.assert_unconfirmed(self.transact("aa", roots, "release",
+                                             self.fail_sync_after_move(receipt)))
+        before = receipt.stat().st_ino, receipt.read_bytes()
+        # The dispatcher cannot checkpoint an unsuccessful release. Age the
+        # worker's exact proof past retention before unrelated admissions run.
+        os.utime(receipt, (1_000_000, 1_000_000))
+        for token in ("ba", "bb", "bc"):
+            self.assert_granted(self.transact(token, [self.root / token]))
+        query = self.transact("aa", roots, "released")
+        self.assert_granted(query)
+        self.assertEqual(query.stdout, b"released", "restart must still prove the exact release")
+        self.assert_granted(self.transact("aa", roots, "release"))
+        for operation in ("acquire", "try-acquire", "recover", "cancel"):
+            self.assert_refused(self.transact("aa", roots, operation))
+        self.assert_granted(self.transact("cc", roots))
+        successor = self.registry / ("cc." + digest(roots) + ".claim")
+        successor_before = successor.stat().st_ino, successor.read_bytes()
+        self.assert_granted(self.transact("aa", roots, "release"))
+        self.assertEqual((receipt.stat().st_ino, receipt.read_bytes()), before)
+        self.assertEqual((successor.stat().st_ino, successor.read_bytes()), successor_before)
+        self.assertEqual((source.stat().st_ino, source.read_bytes()), source_before)
+
     def test_cancel_replay_rechecks_post_rename_durability_for_every_frontier(self):
         for frontier, token in [("active", "aa"), ("absent", "ab"), ("quarantine", "ac")]:
             with self.subTest(frontier=frontier):
@@ -588,6 +618,116 @@ class SourceClaimRegistryTests(unittest.TestCase):
         self.assert_refused(self.transact("aa", [roots[0] / "different"], "cancelled"))
         self.assert_refused(self.transact("cc", roots))
 
+    def test_cancellation_state_observes_interrupted_and_collected_cancellation(self):
+        for index, state in enumerate(("absent", "active", "active-fence", "marker-only",
+                                       "receipt-only", "released")):
+            with self.subTest(state=state):
+                token = "a" + format(index, "x")
+                roots = [self.root / token]
+                roots[0].mkdir()
+                source = roots[0] / "source"
+                source.write_bytes(b"source is not cancellation evidence")
+                source_before = source.stat().st_ino, source.read_bytes()
+                receipt = self.registry / "cancelled" / (token + "." + digest(roots) + ".claim")
+                if state in ("active", "active-fence", "released"):
+                    self.assert_granted(self.transact(token, roots))
+                if state == "active-fence":
+                    self.assertEqual(self.transact(token, roots, "cancel").stdout, b"owned")
+                elif state == "marker-only":
+                    self.assertEqual(self.transact(token, roots, "cancel").stdout, b"unowned")
+                    os.utime(receipt, (1_000_000, 1_000_000))
+                    self.assert_granted(self.transact("bb", [self.root / "receipt-gc-trigger"]))
+                    self.assertFalse(receipt.exists(), "exercise actual cancelled receipt collection")
+                elif state == "receipt-only":
+                    receipt.write_bytes(body(roots))  # An older unowned cancellation frontier.
+                elif state == "released":
+                    self.assert_granted(self.transact(token, roots, "release"))
+                before = {str(path): (path.stat().st_ino, path.read_bytes())
+                          for path in self.registry.rglob("*") if path.is_file() and path.name != ".lock"}
+                for _ in range(2):
+                    query = self.transact(token, roots, "cancellation-state")
+                    self.assert_granted(query)
+                    self.assertEqual(query.stdout, b"cancellation" if state in
+                                     ("active-fence", "marker-only", "receipt-only") else b"pending")
+                after = {str(path): (path.stat().st_ino, path.read_bytes())
+                         for path in self.registry.rglob("*") if path.is_file() and path.name != ".lock"}
+                self.assertEqual(after, before, "discovery cannot publish or retire ownership")
+                self.assertEqual((source.stat().st_ino, source.read_bytes()), source_before)
+                if state in ("active-fence", "marker-only"):
+                    completed = self.transact(token, roots, "cancelled")
+                    self.assert_granted(completed)
+                    self.assertEqual(completed.stdout, b"pending", "intent is not completed cancellation")
+                    for operation in ("acquire", "recover"):
+                        self.assert_refused(self.transact(token, roots, operation))
+
+    def test_cancellation_state_preserves_incomplete_conflicting_and_unknown_evidence(self):
+        states = ("pending", "torn-pending", "quarantine", "torn-marker", "changed-roots",
+                  "active-and-cancelled", "released-and-marker", "symlink-marker",
+                  "unknown", "unknown-released", "unknown-cancelled", "unknown-quarantine")
+        for index, state in enumerate(states):
+            with self.subTest(state=state):
+                token = "a" + format(index, "x")
+                roots = [self.root / token]
+                fence = self.record(token, roots, "cancelling")
+                if state in ("pending", "torn-pending"):
+                    pending = self.record(token, roots, "pending")
+                    if state == "torn-pending":
+                        pending.write_bytes(b"partial publication")
+                elif state == "quarantine":
+                    pending = self.registry / "quarantine" / fence.with_suffix(".pending").name
+                    pending.write_bytes(b"partial quarantined publication")
+                elif state == "torn-marker":
+                    fence.write_bytes(b"")
+                elif state == "changed-roots":
+                    self.record(token, [self.root / (token + "-different")], "cancelling")
+                elif state == "active-and-cancelled":
+                    self.record(token, roots)
+                    (self.registry / "cancelled" / fence.with_suffix(".claim").name).write_bytes(body(roots))
+                elif state == "released-and-marker":
+                    (self.registry / "released" / fence.with_suffix(".claim").name).write_bytes(body(roots))
+                elif state == "symlink-marker":
+                    saved = self.root / (token + "-original-marker")
+                    fence.rename(saved)
+                    fence.symlink_to(saved)
+                else:
+                    directory = self.registry if state == "unknown" else self.registry / state[8:]
+                    (directory / (token + ".unknown")).write_bytes(b"unrecognized same-identity state")
+
+                def inventory():
+                    return {str(path): (path.lstat().st_ino,
+                                        os.readlink(path) if path.is_symlink() else path.read_bytes())
+                            for path in self.registry.rglob("*")
+                            if (path.is_file() or path.is_symlink()) and path.name != ".lock"}
+
+                before = inventory()
+                query = self.transact(token, roots, "cancellation-state")
+                self.assert_refused(query)
+                self.assertEqual(query.stdout, b"")
+                self.assertEqual(inventory(), before, "read-only discovery cannot repair ambiguous state")
+
+    def test_cancellation_state_requires_exact_durability_before_reply(self):
+        roots = [self.root / "project"]
+        self.assert_granted(self.transact("aa", roots))
+        self.assert_granted(self.transact("aa", roots, "cancel"))
+        fence = self.registry / ("aa." + digest(roots) + ".cancelling")
+        receipt = self.registry / "cancelled" / fence.with_suffix(".claim").name
+        for completed in (False, True):
+            if completed:
+                self.assert_granted(self.transact("aa", roots, "finish-cancel"))
+            paths = (fence, self.registry, receipt, receipt.parent) if completed else (fence, self.registry)
+            before = {str(path): (path.stat().st_ino, path.read_bytes())
+                      for path in self.registry.rglob("*") if path.is_file()}
+            for path in paths:
+                with self.subTest(completed=completed, path=path):
+                    env = self.barrier_env('if [ "$1" = {} ]; then exit 91; fi'.format(shlex.quote(str(path))))
+                    self.assert_unconfirmed(self.transact("aa", roots, "cancellation-state", env))
+                    query = self.transact("aa", roots, "cancellation-state")
+                    self.assert_granted(query)
+                    self.assertEqual(query.stdout, b"cancellation")
+                    self.assertEqual({str(path): (path.stat().st_ino, path.read_bytes())
+                                      for path in self.registry.rglob("*") if path.is_file()}, before)
+        self.assert_refused(self.transact("aa", [roots[0] / "different"], "cancellation-state"))
+
     def test_registry_durability_syncs_records_and_directories_not_filesystems(self):
         trace = self.root / "barrier-paths"
         env = self.barrier_env('printf "%s\\000" "$1" >> {}'.format(shlex.quote(str(trace))))
@@ -652,7 +792,7 @@ class SourceClaimRegistryTests(unittest.TestCase):
         self.assert_granted(self.transact("bb", disjoint, "acquire", env=env))
         self.assert_granted(self.transact("bb", disjoint, "release", env=env))
 
-    def test_terminal_claim_retention_prunes_old_receipts_and_headroom_reserves_release(self):
+    def test_terminal_retention_preserves_release_proof_and_headroom_reserves_release(self):
         old_roots = [self.root / "old-project"]
         old_released = self.registry / "released" / ("01." + digest(old_roots) + ".claim")
         old_cancelled = self.registry / "cancelled" / ("02." + digest(old_roots) + ".claim")
@@ -666,7 +806,7 @@ class SourceClaimRegistryTests(unittest.TestCase):
 
         active_roots = [self.root / "active-project"]
         self.assert_granted(self.transact("aa", active_roots, "acquire"))
-        self.assertFalse(old_released.exists())
+        self.assertTrue(old_released.exists(), "age does not prove the dispatcher acknowledged release")
         self.assertFalse(old_cancelled.exists())
         self.assertTrue(fresh_released.exists())
 
@@ -882,7 +1022,7 @@ class SourceClaimRegistryTests(unittest.TestCase):
                         self.assertTrue(path.exists(), "same-identity evidence must survive GC")
                         self.assertEqual((path.stat().st_ino, path.read_bytes()), evidence)
 
-    def test_released_receipt_gc_bounds_confirmation_work_and_makes_progress(self):
+    def test_released_receipts_survive_retention_without_rewriting_evidence(self):
         receipts = []
         activity_locks = {}
         for index in range(40):
@@ -895,16 +1035,14 @@ class SourceClaimRegistryTests(unittest.TestCase):
             activity = self.registry / (token + ".activity.lock")
             activity.write_bytes(b"retained activity lock inode")
             activity_locks[activity] = activity.stat().st_ino, activity.read_bytes()
-        self.assert_granted(self.transact("ff", [self.root / "gc-first"]))
-        removed = sum(not path.exists() for path in receipts)
-        self.assertGreater(removed, 0, "unambiguous old receipts should still expire")
-        self.assertLessEqual(removed, 16, "one admission must bound released candidate checks")
-        for index in range(len(receipts)):
-            if not any(path.exists() for path in receipts):
-                break
-            token = "fa" + format(index, "x")
-            self.assert_granted(self.transact(token, [self.root / ("gc-next-" + token)]))
-        self.assertFalse(any(path.exists() for path in receipts))
+        before = {path: (path.stat().st_ino, path.read_bytes()) for path in receipts}
+        for token in ("ff", "fa", "fb"):
+            self.assert_granted(self.transact(token, [self.root / ("gc-trigger-" + token)]))
+        self.assertEqual({path: (path.stat().st_ino, path.read_bytes()) for path in receipts}, before)
+        query = self.transact("00", [self.root / "00"], "released")
+        self.assert_granted(query)
+        self.assertEqual(query.stdout, b"released")
+        self.assert_refused(self.transact("00", [self.root / "00"]))
         self.assertEqual({path: (path.stat().st_ino, path.read_bytes())
                           for path in activity_locks}, activity_locks)
 
