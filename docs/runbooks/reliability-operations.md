@@ -189,6 +189,8 @@ or the word `Killed` alone:
 | `RCH_SOURCE_CANCELLATION_FENCE` | An explicit same-token fence or an overlapping active cancelling owner caused refusal. Use the reported identity/record to find its owning journal. |
 | `RCH_SOURCE_REGISTRY_PUBLICATION_UNCONFIRMED` | A record transition or durability confirmation did not complete. A visible rename is insufficient acknowledgement; retry the same identity. |
 | `RCH_SOURCE_REGISTRY_INTERRUPTED` | A registry step exited unexpectedly; retain its `operation`, `stage`, `status` and identity. |
+| `RCH_SOURCE_PAIR_PUBLICATION_UNCONFIRMED` | A pair owner or exact release receipt could not complete publication or durability confirmation. Preserve its records and retry the owning lease; a visible record does not by itself acknowledge release. |
+| `RCH_SOURCE_PAIR_OWNERSHIP_UNCONFIRMED` | Pair custody is missing, malformed, changed or inconsistent with the requested identity. A free lock or an old receipt cannot replace conflicting owner evidence. |
 | `RCH_SOURCE_NAMESPACE_PROCESS_TERMINATED`, `RCH_SOURCE_NAMESPACE_CONTROL_UNSETTLED`, or `RCH_SOURCE_NAMESPACE_INTERRUPTED` | The program terminated, teardown was not confirmed, or the worker supplied no diagnostic. These do not establish whether the cause was an external signal, a deadline, OOM, or another infrastructure fault. |
 | `RCH_SOURCE_LOCK_HEARTBEAT_EXPIRED`, `RCH_SOURCE_LOCK_DISCONNECTED`, or `RCH_SOURCE_LOCK_RELEASE_TIMEOUT` | The control session expired or lost its release protocol. Durable ownership remains for recovery. |
 | `RCH_SOURCE_LOCK_PROCESS_TERMINATED` or `RCH_SOURCE_LOCK_SUPERVISOR_TERMINATED` | The holder or its supervisor terminated. A process exit alone does not authorize retiring the durable claim. |
@@ -241,6 +243,51 @@ group or others. Retained snapshots and publication temporaries remain private
 changed, symlinked, hard-linked or externally writable evidence is refused. The
 original journal is not chmodded or otherwise changed to satisfy snapshot
 validation.
+
+#### Interrupted source-pair publication and cancellation
+
+Clean-overlay source pairs have their own durable owner and per-identity
+release receipt, in addition to the source registry. Earlier pair operations
+wrote these final names in place. A failed write could truncate the owner to
+an empty file and make every later acquisition refuse the pool. Pair operations
+now write complete private temporary records, sync them, recheck the expected
+old inode and bytes, atomically publish the new record and confirm the file and
+parent-directory barriers before replying. All publishers retain the same pair
+lock; first acquisition also retains the registry metadata lock and checks its
+cancellation fences.
+
+The exact release receipt becomes durable before the owner changes to
+`released`. A retry can finish that interrupted transition when the old owner
+still matches and its source root is absent. An existing release receipt is
+immutable: its exact token is confirmed without rewriting it, and that token
+cannot acquire the pair again. Historical receipt confirmation preserves a
+different valid current owner and never inspects that successor's source tree.
+Owned regular records with one link and no group/other write permission are
+accepted, including safe legacy `0640`/`0644` records; new records use `0600`.
+Partial, symlinked, hard-linked, writable or contradictory records remain
+refused. The correction prevents new partial final records; it does not erase
+or guess the contents of malformed records already on a worker.
+
+Detached recovery also handles cancellation interrupted after pair release,
+both before and after worker `finish-cancel`. With exclusive verified journal
+ownership, it requires the exact bound recipe, a durable tree-retirement
+checkpoint, and either durable pair retirement or the exact worker pair-release
+receipt. It additionally requires a recorded cancellation obligation or an
+exact completed worker cancellation receipt for a legacy recipe. Those facts
+authorize only cancellation metadata reconciliation and failed-job retirement.
+They authorize no new source or pair grant, source-content reads or tree
+mutation. Existing cancellation validation can inspect physical path topology.
+The worker still drains activity, checks the exact source closure and preserves
+the old-token cancellation fence. Journal changes, missing pair proof and
+conflicting worker records remain failures with the evidence retained.
+
+When cancellation started before tree or pair retirement completed, an exact
+execution-completion or execution-lost proof resumes the existing cancellation
+cleanup path. An unretired paired tree requires the exact live cleanup pair
+guard. Recovery cannot substitute a free kernel lock, a terminal daemon lease
+or another owner's current source for that authority. A restarted operation
+then completes the existing worker and daemon acknowledgements without
+replaying the command.
 
 #### Bounded POSIX control-session liveness
 
@@ -358,8 +405,26 @@ eight cases passed, including stopped/killed clients, heartbeat expiry,
 cancellation queued behind live activity and timer death. These isolated Linux
 tests exercise actual processes, locks and transport with injected durability
 failures; tmpfs qualification does not establish physical power-loss recovery
-or installed-worker acceptance. The earlier standalone holder and controller
-results above describe their stated revision and were not rerun for this change.
+or installed-worker acceptance. The earlier standalone controller results
+above remain scoped to their stated revision.
+
+The subsequent source-pair publication qualification reproduced the previous
+failure with actual pair/metadata locks and a kernel file-size write limit:
+both `sh` and `bash`, with either an absent or previously released owner, left
+an empty owner that the next admission refused. Seven focused native tests of
+the new production custody program passed, covering interrupted writes and
+publication barriers, exact receipt replay, concurrent dispatchers, changed
+owners, readable legacy records, malformed evidence and successor preservation.
+The final frozen-source holder suite passed all 72 cases: 65 existing holder
+cases and these seven pair-custody cases, with no skips.
+The expanded real loopback OpenSSH suite passed all ten cases, including loss
+of the SSH client after pair release commits, and a restart between pair
+release and source cancellation completion. Repeated old-token reconciliation
+preserved the successor's owner, active claim and source bytes and inodes.
+Both new pair SSH cases also passed again after the final missing-owner
+refusal was added.
+These execute worker programs and real kernel locks; they do not compile the
+Rust command builders or execute the new Rust journal-recovery integration.
 
 The journal-custody correction passed 25 job-identity and journal tests in the
 actual default-feature `rch-common` crate using the pinned nightly toolchain.
@@ -372,12 +437,19 @@ and `0644` originals while still refusing writable or hard-linked originals,
 changed evidence and nonprivate retained snapshots. This qualification does not
 substitute for compilation and execution of the full RCH retry integration.
 
-Pinned workspace `cargo fmt --all -- --check` passed on current main with the
-admission correction. Eight focused `namespace_preflight_` tests were added for
+Pinned workspace `cargo fmt --all -- --check` passed with the admission and
+source-pair corrections. Eight focused `namespace_preflight_` tests were added for
 phase publication, exact terminal receipts over real Unix sockets, cancellation
 winning a release race, invalid/oversized replies, source-busy propagation,
 journal reload and concurrent completion. These new RCH tests were **not
 executed** in this environment.
+
+Four additional `paired_cancellation_recovery_` Rust tests exercise exact journal
+ownership, daemon outcome reconciliation, durable reload, lost cancellation and
+settlement replies, missing/conflicting pair evidence and failed journal
+publication. They were independently source-reviewed but were also **not
+compiled or executed** here. The native worker-program results above do not
+replace this integration gate.
 
 The latest locked, default-feature `cargo check -p rch --all-targets` attempt
 again received SIGKILL while compiling the unchanged `asupersync 0.5.0`
@@ -398,6 +470,8 @@ the worker acceptance cases below:
 cargo check --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked -p rch --bin rch namespace_preflight_ -- --test-threads=1
+cargo test --locked -p rch --bin rch paired_cancellation_recovery_ -- --test-threads=1
+cargo test --locked -p rch --bin rch source_pair_ -- --test-threads=1
 cargo test --locked -p rch --bin rch retry_selection_ -- --test-threads=1
 cargo test --locked -p rch --bin rch retry_custody_ -- --test-threads=1
 ```

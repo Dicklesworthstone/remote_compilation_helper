@@ -217,6 +217,223 @@ except (OSError, ValueError) as error:
     print("RCH: source release wait failed: {}".format(error), file=sys.stderr)
     sys.exit(73)
 "#;
+// Every caller holds the pair flock; claim additionally holds the registry
+// metadata mutex after checking its cancellation fences. Private same-directory
+// writes prevent a failed write or killed initializer from truncating the last
+// complete owner. A receipt is immutable and always durable before owner release.
+// This helper never removes or repairs ambiguous records, nor grants source access.
+const SOURCE_PAIR_CUSTODY: &str = r#"
+import os
+import re
+import stat
+import sys
+
+stage = "validation"
+descriptors = []
+
+def refuse(reason):
+    raise ValueError(reason)
+
+def safe(info, directory=False):
+    kind = stat.S_ISDIR if directory else stat.S_ISREG
+    if (not kind(info.st_mode) or info.st_uid != os.geteuid()
+            or info.st_mode & 0o022 or (not directory and info.st_nlink != 1)):
+        refuse("unsafe source pair record ownership, type or links")
+
+def stamp(info):
+    return (info.st_dev, info.st_ino, info.st_uid, info.st_gid, info.st_mode,
+            info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+def verify_parent():
+    current = os.fstat(directory)
+    safe(current, directory=True)
+    named = os.stat(parent, follow_symlinks=False)
+    if not os.path.samestat(current, named):
+        refuse("source pair parent changed during publication")
+
+def verify(record):
+    name, fd, content, before = record
+    current = os.fstat(fd)
+    safe(current)
+    named = os.stat(name, dir_fd=directory, follow_symlinks=False)
+    os.lseek(fd, 0, os.SEEK_SET)
+    if (stamp(current) != stamp(before) or stamp(named) != stamp(before)
+            or os.read(fd, 130) != content or stamp(os.fstat(fd)) != stamp(before)):
+        refuse("source pair record identity or exact bytes changed")
+    verify_parent()
+
+def read_record(name, receipt=False):
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    except FileNotFoundError:
+        return None
+    descriptors.append(fd)
+    before = os.fstat(fd)
+    safe(before)
+    content = os.read(fd, 130)
+    if not (1 < len(content) <= 129 and content.endswith(b"\n")
+            and (re.fullmatch(rb"[a-f0-9-]{1,128}\n", content)
+                 or (not receipt and content == b"released\n"))):
+        refuse("source pair has an unfinished owner or malformed release receipt")
+    record = name, fd, content, before
+    verify(record)
+    if receipt and content != token_bytes:
+        refuse("source pair release receipt belongs to another identity")
+    return record
+
+def confirm(record):
+    global stage
+    stage = "confirmation"
+    verify(record)
+    os.fsync(record[1])
+    os.fsync(directory)
+    verify(record)
+
+def publish(name, content, previous):
+    global stage
+    stage = "publication"
+    verify_parent()
+    temporary = ".pair-write." + os.urandom(16).hex()
+    fd = os.open(temporary, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                 0o600, dir_fd=directory)
+    descriptors.append(fd)
+    offset = 0
+    while offset < len(content):
+        written = os.write(fd, content[offset:])
+        if written <= 0:
+            refuse("incomplete private source pair publication")
+        offset += written
+    os.fsync(fd)
+    before = os.fstat(fd)
+    private = temporary, fd, content, before
+    verify(private)
+    if previous is None:
+        try:
+            os.stat(name, dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            refuse("source pair publication destination appeared")
+    else:
+        verify(previous)
+    # All legitimate publishers retain the same pair flock. Check the exact
+    # expected destination immediately before this indivisible replacement;
+    # immutable receipts only take the absent-destination arm above. A failed
+    # barrier keeps the new complete name and any private failure evidence.
+    os.replace(temporary, name, src_dir_fd=directory, dst_dir_fd=directory)
+    result = name, fd, content, os.fstat(fd)
+    confirm(result)
+    return result
+
+def receipt_or_publish():
+    if receipt_record is not None:
+        confirm(receipt_record)
+        return receipt_record
+    return publish(receipt_name, token_bytes, None)
+
+def require_root_absent():
+    try:
+        os.lstat(root)
+    except FileNotFoundError:
+        return
+    refuse("source pair has unretired source; refusing release or reuse")
+
+try:
+    operation, owner, receipt, token, root = sys.argv[1:]
+    if operation not in ("claim", "recover", "release", "cancel-owned", "cancel-unowned", "released"):
+        refuse("invalid source pair custody operation")
+    if re.fullmatch(r"[a-f0-9-]{1,128}", token) is None:
+        refuse("invalid source pair custody identity")
+    token_bytes = (token + "\n").encode("ascii")
+    parent, owner_name = os.path.split(owner)
+    receipt_parent, receipt_name = os.path.split(receipt)
+    if (not os.path.isabs(parent) or parent != receipt_parent or not owner_name
+            or not receipt_name or owner_name == receipt_name or not os.path.isabs(root)):
+        refuse("invalid source pair custody paths")
+    directory = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    descriptors.append(directory)
+    verify_parent()
+    receipt_record = read_record(receipt_name, receipt=True)
+    if operation == "released" and receipt_record is None:
+        print("pending", end="", flush=True)
+    else:
+        owner_record = read_record(owner_name)
+        owner_bytes = owner_record[2] if owner_record is not None else None
+        if receipt_record is not None and owner_record is None:
+            refuse("source pair release receipt has no owner record")
+        if operation == "claim":
+            if receipt_record is not None:
+                refuse("source pair identity already released")
+            if owner_bytes not in (None, b"released\n"):
+                refuse("source pair has an unfinished owner; refusing reuse")
+            require_root_absent()
+            publish(owner_name, token_bytes, owner_record)
+        elif operation == "recover":
+            if owner_bytes != token_bytes or receipt_record is not None:
+                refuse("source pair has an unfinished owner or a completed release")
+            confirm(owner_record)
+        elif operation == "release":
+            if owner_bytes == b"released\n" and receipt_record is not None:
+                confirm(receipt_record)
+                confirm(owner_record)
+            else:
+                if owner_bytes != token_bytes:
+                    refuse("source pair owner changed before release")
+                require_root_absent()
+                receipt_or_publish()
+                publish(owner_name, b"released\n", owner_record)
+        elif operation == "released":
+            # A historical receipt never authorizes touching a successor's
+            # source tree or changing its complete owner. Missing/malformed
+            # owner evidence is not silently repaired from an old receipt.
+            confirm(receipt_record)
+            if owner_bytes == token_bytes:
+                require_root_absent()
+                publish(owner_name, b"released\n", owner_record)
+            else:
+                confirm(owner_record)
+            print("released", end="", flush=True)
+        elif operation == "cancel-owned":
+            if owner_bytes == token_bytes:
+                if receipt_record is not None:
+                    # Release can stop after the durable receipt and before
+                    # replacing its exact owner. Finish only that frontier;
+                    # neither a partial owner nor a successor is repaired.
+                    require_root_absent()
+                    confirm(receipt_record)
+                    publish(owner_name, b"released\n", owner_record)
+                    print("unowned", end="", flush=True)
+                else:
+                    confirm(owner_record)
+                    print("owned", end="", flush=True)
+            else:
+                if receipt_record is not None:
+                    confirm(receipt_record)
+                if owner_record is not None:
+                    confirm(owner_record)
+                print("unowned", end="", flush=True)
+        else:
+            # The caller has independently proved the source intent unowned.
+            # A pair acquired before that intent can be retired, but this
+            # operation never inspects or grants access to its source path.
+            if owner_bytes == token_bytes:
+                receipt_or_publish()
+                publish(owner_name, b"released\n", owner_record)
+            else:
+                if receipt_record is not None:
+                    confirm(receipt_record)
+                if owner_record is not None:
+                    confirm(owner_record)
+            print("unowned", end="", flush=True)
+except (OSError, ValueError) as error:
+    diagnostic = ("RCH_SOURCE_PAIR_PUBLICATION_UNCONFIRMED" if stage != "validation"
+                  else "RCH_SOURCE_PAIR_OWNERSHIP_UNCONFIRMED")
+    print(diagnostic + " stage=" + stage + ": " + str(error), file=sys.stderr)
+    sys.exit(73)
+finally:
+    for fd in reversed(descriptors):
+        os.close(fd)
+"#;
 const SOURCE_CLAIM_REGISTRY: &str = include_str!("source_claim_registry.sh");
 const REMOTE_SOURCE_CLAIM_REGISTRY: &str = "/var/tmp/rch-source-authority-locks/claims-v1";
 const LEGACY_SOURCE_CLAIM_REGISTRY: &str = "/tmp/rch-source-authority-locks/claims-v1";
@@ -1360,21 +1577,10 @@ async fn recover_clean_overlay_source_pair_with_mode(
     let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
     let ready = format!("RCH_SOURCE_PAIR_READY:{token}");
     let release = format!("RCH_SOURCE_PAIR_RELEASE:{token}");
-    let owner = format!("{lock_path}.owner");
-    let receipt = format!(
-        "{lock_path}.released-{}",
-        blake3::hash(token.as_bytes()).to_hex()
-    );
     let script = format!(
-        "set -eu; owner={owner}; root={root}; token={token}; \
-         [ ! -L \"$owner\" ] && [ \"$(cat \"$owner\")\" = \"$token\" ]; \
-         printf '%s\\n' {ready}; {waiter}; [ \"$(cat \"$owner\")\" = \"$token\" ]; \
-         [ ! -e \"$root\" ] && [ ! -L \"$root\" ]; \
-         printf '%s\\n' {token} > {receipt}; {flush_receipt}; \
-         printf 'released\\n' > \"$owner\"; {flush_owner}; printf '%s\\n' {release}",
-        owner = quote(&owner),
-        root = quote(source_root),
-        token = quote(token),
+        "set -eu; {recover}; printf '%s\\n' {ready}; {waiter}; \
+         {retire}; printf '%s\\n' {release}",
+        recover = source_pair_custody_command("recover", &lock_path, source_root, token),
         ready = quote(&ready),
         waiter = source_release_waiter_command(
             match mode {
@@ -1389,9 +1595,7 @@ async fn recover_clean_overlay_source_pair_with_mode(
             &release,
         ),
         release = quote(&release),
-        receipt = quote(&receipt),
-        flush_receipt = source_pair_fsync(&receipt),
-        flush_owner = source_pair_fsync(&owner),
+        retire = source_pair_custody_command("release", &lock_path, source_root, token),
     );
     let command = format!(
         "exec flock -x {} sh -c {}",
@@ -1428,24 +1632,11 @@ pub(super) async fn cancel_clean_overlay_source_pair_intent(
          [ ! -e \"$active\" ] && [ ! -L \"$active\" ]; \
          set -- \"$registry/cancelled/$token.\"*.claim; \
          [ \"$#\" -eq 1 ] && [ ! -L \"$1\" ] && [ -f \"$1\" ]; fi; \
-         owner={owner}; [ ! -L \"$owner\" ]; \
-         if [ -f \"$owner\" ] && [ \"$(cat \"$owner\")\" = \"$token\" ]; \
-         then if [ \"$owned\" -eq 1 ]; then printf owned; else \
-         printf '%s\\n' \"$token\" > {receipt}; {flush_receipt}; \
-         printf 'released\\n' > \"$owner\"; {flush_owner}; printf unowned; fi; \
-         else printf unowned; fi",
+         if [ \"$owned\" -eq 1 ]; then {owned}; else {unowned}; fi",
         registry = quote(namespace.registry()),
         token = quote(token),
-        owner = quote(&format!("{lock}.owner")),
-        receipt = quote(&format!(
-            "{lock}.released-{}",
-            blake3::hash(token.as_bytes()).to_hex()
-        )),
-        flush_receipt = source_pair_fsync(&format!(
-            "{lock}.released-{}",
-            blake3::hash(token.as_bytes()).to_hex()
-        )),
-        flush_owner = source_pair_fsync(&format!("{lock}.owner")),
+        owned = source_pair_custody_command("cancel-owned", &lock, source_root, token),
+        unowned = source_pair_custody_command("cancel-unowned", &lock, source_root, token),
     );
     let command = format!("flock -x -- {} sh -c {}", quote(&lock), quote(&script));
     let output =
@@ -1484,25 +1675,7 @@ pub(super) async fn clean_overlay_source_pair_was_released(
 ) -> anyhow::Result<bool> {
     let lock_path = source_authority_lock_path_in(source_root, namespace);
     let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
-    let owner = format!("{lock_path}.owner");
-    let receipt = format!(
-        "{lock_path}.released-{}",
-        blake3::hash(token.as_bytes()).to_hex()
-    );
-    let script = format!(
-        "set -eu; [ ! -L {receipt} ]; \
-         if [ ! -f {receipt} ]; then printf pending; exit 0; fi; \
-         [ \"$(cat {receipt})\" = {token} ]; {flush_receipt}; [ ! -L {owner} ]; \
-         if [ \"$(cat {owner})\" = {token} ]; then \
-         [ ! -e {root} ] && [ ! -L {root} ]; \
-         printf 'released\\n' > {owner}; fi; {flush_owner}; printf released",
-        receipt = quote(&receipt),
-        token = quote(token),
-        owner = quote(&owner),
-        root = quote(source_root),
-        flush_receipt = source_pair_fsync(&receipt),
-        flush_owner = source_pair_fsync(&owner),
-    );
+    let script = source_pair_custody_command("released", &lock_path, source_root, token);
     let command = format!("flock -x {} sh -c {}", quote(&lock_path), quote(&script));
     let output = run_source_metadata_rpc(
         worker,
@@ -1525,13 +1698,27 @@ pub(super) async fn clean_overlay_source_pair_was_released(
     }
 }
 
-// Persist the record and its directory entry. A filesystem-wide sync can stall
-// behind unrelated builds; file-only fsync would lose a newly created name.
-fn source_pair_fsync(path: &str) -> String {
-    let parent = std::path::Path::new(path)
-        .parent()
-        .expect("source pair has a parent");
-    crate::transfer::file_fsync_command(&[path, &format!("{}/.", parent.display())])
+fn source_pair_custody_command(
+    operation: &str,
+    lock_path: &str,
+    source_root: &str,
+    token: &str,
+) -> String {
+    let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
+    let owner = format!("{lock_path}.owner");
+    let receipt = format!(
+        "{lock_path}.released-{}",
+        blake3::hash(token.as_bytes()).to_hex()
+    );
+    format!(
+        "python3 -I -S -c {program} {operation} {owner} {receipt} {token} {root}",
+        program = quote(SOURCE_PAIR_CUSTODY),
+        operation = quote(operation),
+        owner = quote(&owner),
+        receipt = quote(&receipt),
+        token = quote(token),
+        root = quote(source_root),
+    )
 }
 
 fn clean_overlay_source_pair_lock_command(
@@ -1542,38 +1729,19 @@ fn clean_overlay_source_pair_lock_command(
     release: &str,
 ) -> String {
     let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
-    let owner = format!("{lock_path}.owner");
-    let receipt = format!(
-        "{lock_path}.released-{}",
-        blake3::hash(token.as_bytes()).to_hex()
-    );
     let creation = format!(
-        "set -eu; owner={owner}; root={root}; token={token}; \
-         registry={registry}; \
+        "set -eu; token={token}; registry={registry}; \
          for cancelled in \"$registry/cancelled/$token.\"*.claim \"$registry/$token.\"*.cancelling; do \
          if [ -e \"$cancelled\" ] || [ -L \"$cancelled\" ]; then \
          echo 'RCH: source pair intent was cancelled' >&2; exit 1; fi; done; \
-         if [ -L \"$owner\" ] || {{ [ -e \"$owner\" ] && [ \"$(cat \"$owner\")\" != released ]; }}; then \
-         echo 'RCH: source pair has an unfinished owner; inspect the prior job or use RCH_DISABLE_TARGET_REUSE=1' >&2; exit 1; fi; \
-         if [ -e \"$root\" ] || [ -L \"$root\" ]; then \
-         echo 'RCH: source pair has unretired source; refusing reuse' >&2; exit 1; fi; \
-         printf '%s\\n' \"$token\" > \"$owner\"; {flush_owner}",
-        owner = quote(&owner),
-        root = quote(source_root),
+         {claim}",
         token = quote(token),
         registry = quote(REMOTE_SOURCE_CLAIM_REGISTRY),
-        flush_owner = source_pair_fsync(&owner),
+        claim = source_pair_custody_command("claim", lock_path, source_root, token),
     );
     let script = format!(
         "{setup}flock -x -- {metadata_lock} sh -c {creation}; \
-         owner={owner}; root={root}; token={token}; \
-         printf '%s\\n' {ready}; {waiter}; [ \"$(cat \"$owner\")\" = \"$token\" ]; \
-         [ ! -e \"$root\" ] && [ ! -L \"$root\" ]; \
-         printf '%s\\n' {token} > {receipt}; {flush_receipt}; \
-         printf 'released\\n' > \"$owner\"; {flush_owner}; printf '%s\\n' {release}",
-        owner = quote(&owner),
-        root = quote(source_root),
-        token = quote(token),
+         printf '%s\\n' {ready}; {waiter}; {retire}; printf '%s\\n' {release}",
         ready = quote(ready),
         waiter = source_release_waiter_command(
             "pair",
@@ -1583,12 +1751,10 @@ fn clean_overlay_source_pair_lock_command(
             release,
         ),
         release = quote(release),
-        receipt = quote(&receipt),
         setup = source_registry_setup(REMOTE_SOURCE_CLAIM_REGISTRY),
         metadata_lock = quote(&format!("{REMOTE_SOURCE_CLAIM_REGISTRY}/metadata.lock")),
         creation = quote(&creation),
-        flush_receipt = source_pair_fsync(&receipt),
-        flush_owner = source_pair_fsync(&owner),
+        retire = source_pair_custody_command("release", lock_path, source_root, token),
     );
     format!(
         "mkdir -p {} && exec flock -x {} sh -c {}",

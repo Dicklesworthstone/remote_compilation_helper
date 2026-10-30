@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Qualify source ownership over real, isolated loopback OpenSSH on Linux.
 
-This runs the exact production holder, release waiter, registry transaction
-and namespace controller. It uses fixture-owned host/client keys, strict host
+This runs the exact production holder, release waiter, pair custody, registry
+transaction and namespace controller. It uses fixture-owned host/client keys, strict host
 verification and a server listening only on 127.0.0.1. Heartbeat fault tests
 select a two-second worker lease through the production session argument;
 they do not alter the production protocol or kernel-lock implementation.
@@ -35,6 +35,7 @@ HOLDER = (REPO / "rch/src/hook/source_lock_holder.sh").read_text()
 CONTROL = (REPO / "rch/src/hook/source_namespace_control.sh").read_text()
 SSH_SOURCE = (REPO / "rch/src/hook/ssh.rs").read_text()
 WAITER = SSH_SOURCE.split('const SOURCE_AUTHORITY_RELEASE_WAITER: &str = r#"', 1)[1].split('"#;', 1)[0]
+PAIR_CUSTODY = SSH_SOURCE.split('const SOURCE_PAIR_CUSTODY: &str = r#"', 1)[1].split('"#;', 1)[0]
 HELPERS_SOURCE = (REPO / "rch-common/src/stale_target_reap.rs").read_text()
 HELPERS = HELPERS_SOURCE.split('pub const SOURCE_CLAIM_RECORD_HELPERS: &str = r#"', 1)[1].split('"#;', 1)[0]
 TRANSACTION = HELPERS + "\n" + (REPO / "rch/src/hook/source_claim_registry.sh").read_text()
@@ -235,9 +236,31 @@ class SourceOwnershipSshTests(unittest.TestCase):
 
     def transaction(self, operation, token=None):
         command = self.invocation(operation, token)
-        if operation in ("cancel", "finish-cancel"):
+        if operation in ("cancel", "finish-cancel", "settle-cancel"):
             command = shlex.join([FLOCK, "-x", "--", str(self.activity_lock)]) + " " + command
         return subprocess.run([*self.argv, command], input=self.roots.encode(),
+                              capture_output=True, timeout=8)
+
+    def pair_command(self, operation, source, token=None, after=""):
+        token = token or self.token
+        lock = self.root / "pair.lock"
+        # The Rust caller supplies the exact per-token receipt name. This
+        # fixture exercises that worker program and lock order over real SSH;
+        # it does not substitute for compiling Rust's command construction.
+        receipt = self.root / ("pair.lock.released-" + token)
+        command = [FLOCK, "-x", "--", str(lock)]
+        if operation == "claim":
+            command.extend([FLOCK, "-x", "--", str(self.registry / "metadata.lock")])
+        program = [sys.executable, "-I", "-S", "-c", PAIR_CUSTODY, operation,
+                   str(self.root / "pair.lock.owner"), str(receipt), token, str(source)]
+        if after:
+            command.extend(["sh", "-c", "set -eu\n" + shlex.join(program) + after])
+        else:
+            command.extend(program)
+        return shlex.join(command)
+
+    def pair_transaction(self, operation, source, token=None):
+        return subprocess.run([*self.argv, self.pair_command(operation, source, token)],
                               capture_output=True, timeout=8)
 
     def start(self, program, command="exec sh -s"):
@@ -341,6 +364,94 @@ class SourceOwnershipSshTests(unittest.TestCase):
         self.assertTrue(available(self.kernel_lock))
         fresh = self.transaction("try-acquire", token="bb-111")
         self.assertEqual((fresh.returncode, fresh.stdout), (0, b""), fresh.stderr)
+
+    def test_pair_release_after_lost_ssh_reply_preserves_a_successor_owner(self):
+        source = self.root / "pair-source"
+        claimed = self.pair_transaction("claim", source)
+        self.assertEqual((claimed.returncode, claimed.stdout), (0, b""), claimed.stderr)
+        source.mkdir()
+        (source / "original").write_bytes(b"old source evidence")
+        source.rename(self.root / "pair-retired")
+
+        # Stop the SSH client after the worker committed its release, before
+        # the fixture would send a release acknowledgment. The exact child is
+        # retained by Popen; no process-table lookup authorizes the kill.
+        release = self.start("exec " + self.pair_command(
+            "release", source, after="\nprintf 'PAIR_COMMITTED\\n'\nread -r reply\n"))
+        self.assertEqual(release.line(), b"PAIR_COMMITTED")
+        self.assertFalse(available(self.root / "pair.lock"))
+        release.process.kill()
+        release.finish()
+        eventually(lambda: available(self.root / "pair.lock"),
+                   "lost pair reply stranded its mutex")
+
+        successor = self.pair_transaction("claim", source, "bb-111")
+        self.assertEqual((successor.returncode, successor.stdout), (0, b""), successor.stderr)
+        source.mkdir()
+        sentinel = source / "successor"
+        sentinel.write_bytes(b"live successor source")
+        owner = self.root / "pair.lock.owner"
+        before = (owner.stat().st_ino, owner.read_bytes(), sentinel.stat().st_ino,
+                  sentinel.read_bytes())
+        for _ in range(2):
+            confirmed = self.pair_transaction("released", source)
+            self.assertEqual((confirmed.returncode, confirmed.stdout),
+                             (0, b"released"), confirmed.stderr)
+            self.assertEqual((owner.stat().st_ino, owner.read_bytes(), sentinel.stat().st_ino,
+                              sentinel.read_bytes()), before)
+        delayed = self.pair_transaction("claim", source)
+        self.assertNotEqual(delayed.returncode, 0, "retired identity acquired the successor pair")
+        self.assertEqual(delayed.stdout, b"")
+        self.assertEqual((owner.stat().st_ino, owner.read_bytes(), sentinel.stat().st_ino,
+                          sentinel.read_bytes()), before)
+
+    def test_pair_cancellation_restart_releases_only_the_exact_old_grant(self):
+        self.source = self.root / "cancelled-pair-source"
+        self.roots = str(self.source) + "\n"
+        self.digest = hashlib.sha256(self.roots.encode()).hexdigest()
+        self.active = self.registry / (self.token + "." + self.digest + ".claim")
+        pair = self.pair_transaction("claim", self.source)
+        self.assertEqual((pair.returncode, pair.stdout), (0, b""), pair.stderr)
+        acquired = self.transaction("acquire")
+        self.assertEqual((acquired.returncode, acquired.stdout), (0, b""), acquired.stderr)
+        self.source.mkdir()
+        (self.source / "original").write_bytes(b"cancelled source evidence")
+        cancelled = self.transaction("cancel")
+        self.assertEqual((cancelled.returncode, cancelled.stdout), (0, b"owned"), cancelled.stderr)
+        self.source.rename(self.root / "cancelled-pair-retired")
+        released = self.pair_transaction("release", self.source)
+        self.assertEqual((released.returncode, released.stdout), (0, b""), released.stderr)
+
+        # Simulate restart after pair retirement but before finish-cancel.
+        # Source ownership must still exclude another dispatcher until the
+        # exact cancellation completes; free pair locks alone prove nothing.
+        blocked = self.transaction("try-acquire", token="bb-111")
+        self.assertEqual((blocked.returncode, blocked.stdout), (75, b""), blocked.stderr)
+        confirmed = self.pair_transaction("released", self.source)
+        self.assertEqual((confirmed.returncode, confirmed.stdout), (0, b"released"), confirmed.stderr)
+        finished = self.transaction("finish-cancel")
+        self.assertEqual((finished.returncode, finished.stdout), (0, b""), finished.stderr)
+
+        successor = self.pair_transaction("claim", self.source, "bb-111")
+        self.assertEqual((successor.returncode, successor.stdout), (0, b""), successor.stderr)
+        admitted = self.transaction("try-acquire", token="bb-111")
+        self.assertEqual((admitted.returncode, admitted.stdout), (0, b""), admitted.stderr)
+        self.source.mkdir()
+        sentinel = self.source / "successor"
+        sentinel.write_bytes(b"successor owns this source")
+        owner = self.root / "pair.lock.owner"
+        fresh = self.registry / ("bb-111." + self.digest + ".claim")
+        before = [(path.stat().st_ino, path.read_bytes()) for path in (owner, fresh, sentinel)]
+        for _ in range(2):
+            settled = self.transaction("settle-cancel")
+            self.assertEqual((settled.returncode, settled.stdout), (0, b"settled"), settled.stderr)
+            pair_receipt = self.pair_transaction("released", self.source)
+            self.assertEqual((pair_receipt.returncode, pair_receipt.stdout),
+                             (0, b"released"), pair_receipt.stderr)
+            self.assertEqual([(path.stat().st_ino, path.read_bytes())
+                              for path in (owner, fresh, sentinel)], before)
+        self.assertFalse(self.active.exists())
+        self.assertEqual((self.registry / "cancelled" / self.active.name).read_text(), self.roots)
 
     def test_ssh_eof_releases_only_transient_locks_and_keeps_independent_activity(self):
         holder = self.start_holder(idle=90)

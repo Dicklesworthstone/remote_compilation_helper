@@ -12,6 +12,7 @@ import fcntl
 import hashlib
 import os
 from pathlib import Path
+import resource
 import selectors
 import shlex
 import shutil
@@ -28,6 +29,8 @@ HOLDER = (REPO / "rch/src/hook/source_lock_holder.sh").read_text()
 SSH_SOURCE = (REPO / "rch/src/hook/ssh.rs").read_text()
 RELEASE_WAITER = SSH_SOURCE.split(
     'const SOURCE_AUTHORITY_RELEASE_WAITER: &str = r#"', 1)[1].split('"#;', 1)[0]
+PAIR_CUSTODY = SSH_SOURCE.split(
+    'const SOURCE_PAIR_CUSTODY: &str = r#"', 1)[1].split('"#;', 1)[0]
 CLAIM_REGISTRY = (REPO / "rch/src/hook/source_claim_registry.sh").read_text()
 CLAIM_HELPER_SOURCE = (REPO / "rch-common/src/stale_target_reap.rs").read_text()
 CLAIM_HELPERS = CLAIM_HELPER_SOURCE.split(
@@ -154,6 +157,327 @@ class Holder:
         if self.process.poll() is None:
             self.process.kill()  # Only the exact child created by this fixture.
         self.process.communicate(timeout=5)
+
+
+@unittest.skipUnless(FLOCK, "real pair publication requires flock")
+class SourcePairCustodyTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="rch-source-pair-custody-"))
+
+    def paths(self, name):
+        directory = self.root / name
+        directory.mkdir()
+        return {
+            "directory": directory,
+            "lock": directory / "pair.lock",
+            "owner": directory / "pair.lock.owner",
+            "source": directory / "source",
+        }
+
+    def receipt(self, paths, token="aa"):
+        # The Rust caller derives this opaque name from the pair root/token;
+        # this native test exercises the exact production custody program.
+        return paths["directory"] / ("pair.lock.released-" + token)
+
+    def command(self, paths, operation, token="aa", fault=None):
+        program = PAIR_CUSTODY
+        if fault:
+            # Inject failures only at real filesystem syscall boundaries.
+            # The production state machine and bytes are executed unchanged.
+            injection = r'''
+import errno as _rch_errno
+import os as _rch_os
+import stat as _rch_stat
+import sys as _rch_sys
+_rch_replace = _rch_os.replace
+_rch_fsync = _rch_os.fsync
+_rch_last_destination = None
+_rch_owner_path = _rch_sys.argv[2]
+_rch_receipt_path = _rch_sys.argv[3]
+def _rch_test_replace(source, destination, *args, **kwargs):
+    global _rch_last_destination
+    role = "owner" if destination == _rch_os.path.basename(_rch_owner_path) else "receipt"
+    if _rch_fault == "before-" + role + "-rename":
+        _rch_os._exit(91)
+    _rch_replace(source, destination, *args, **kwargs)
+    _rch_last_destination = role
+    if _rch_fault == "after-" + role + "-rename":
+        _rch_os._exit(92)
+def _rch_test_fsync(fd):
+    global _rch_fault
+    is_directory = _rch_stat.S_ISDIR(_rch_os.fstat(fd).st_mode)
+    if _rch_fault == "private-sync" and not is_directory and _rch_last_destination is None:
+        raise OSError(_rch_errno.EIO, "injected private-file fsync failure")
+    if (is_directory and _rch_last_destination is not None
+            and _rch_fault == _rch_last_destination + "-directory-sync"):
+        raise OSError(_rch_errno.EIO, "injected containing-directory fsync failure")
+    if _rch_fault == "owner-changed-before-rename" and not is_directory:
+        with open(_rch_owner_path, "wb") as changed:
+            changed.write(b"bb\n")
+        _rch_fault = None
+    return _rch_fsync(fd)
+_rch_os.replace = _rch_test_replace
+_rch_os.fsync = _rch_test_fsync
+'''
+            program = "_rch_fault = " + repr(fault) + "\n" + injection + "\n" + program
+        return [FLOCK, "-x", "--", str(paths["lock"]), sys.executable,
+                "-I", "-S", "-c", program, operation, str(paths["owner"]),
+                str(self.receipt(paths, token)), token, str(paths["source"])]
+
+    def transact(self, paths, operation, token="aa", fault=None, limited=False):
+        def limit_writes():
+            signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+            resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
+        return subprocess.run(self.command(paths, operation, token, fault),
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=10, check=False,
+                              preexec_fn=limit_writes if limited else None)
+
+    def accepted(self, result, stdout=b""):
+        self.assertEqual((result.returncode, result.stdout), (0, stdout), result.stderr)
+
+    def refused(self, result):
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, b"", "incomplete custody must not acknowledge")
+
+    def test_pair_failed_private_write_preserves_owner_and_allows_safe_retry(self):
+        for initial in ("absent", "released"):
+            with self.subTest(initial=initial):
+                paths = self.paths("claim-" + initial)
+                if initial == "released":
+                    paths["owner"].write_bytes(b"released\n")
+                    before = paths["owner"].stat().st_ino
+                result = self.transact(paths, "claim", limited=True)
+                self.refused(result)
+                self.assertIn(b"RCH_SOURCE_PAIR_PUBLICATION_UNCONFIRMED", result.stderr)
+                if initial == "released":
+                    self.assertEqual(paths["owner"].read_bytes(), b"released\n")
+                    self.assertEqual(paths["owner"].stat().st_ino, before)
+                else:
+                    self.assertFalse(paths["owner"].exists())
+                evidence = list(paths["directory"].glob(".pair-write.*"))
+                self.assertTrue(evidence, "failed private bytes must be retained")
+                self.accepted(self.transact(paths, "claim"))
+                self.assertEqual(paths["owner"].read_bytes(), b"aa\n")
+                self.assertTrue(all(path.exists() for path in evidence))
+                self.assertEqual(paths["owner"].stat().st_mode & 0o777, 0o600)
+                self.assertFalse(paths["source"].exists())
+        for operation in ("release", "cancel-unowned"):
+            with self.subTest(operation=operation):
+                paths = self.paths(operation)
+                self.accepted(self.transact(paths, "claim"))
+                owner_inode = paths["owner"].stat().st_ino
+                self.refused(self.transact(paths, operation, limited=True))
+                self.assertEqual(paths["owner"].read_bytes(), b"aa\n")
+                self.assertEqual(paths["owner"].stat().st_ino, owner_inode)
+                self.assertFalse(self.receipt(paths).exists())
+                expected = b"unowned" if operation == "cancel-unowned" else b""
+                self.accepted(self.transact(paths, operation), expected)
+                self.assertEqual(paths["owner"].read_bytes(), b"released\n")
+                self.assertEqual(self.receipt(paths).read_bytes(), b"aa\n")
+
+    def test_pair_interrupted_claim_never_publishes_partial_or_unowned_authority(self):
+        for fault in ("private-sync", "before-owner-rename", "after-owner-rename",
+                      "owner-directory-sync"):
+            with self.subTest(fault=fault):
+                paths = self.paths(fault)
+                paths["owner"].write_bytes(b"released\n")
+                self.refused(self.transact(paths, "claim", fault=fault))
+                owner = paths["owner"].read_bytes()
+                if fault in ("private-sync", "before-owner-rename"):
+                    self.assertEqual(owner, b"released\n")
+                    self.accepted(self.transact(paths, "claim"))
+                else:
+                    self.assertEqual(owner, b"aa\n")
+                    self.refused(self.transact(paths, "claim", token="bb"))
+                    self.accepted(self.transact(paths, "recover"))
+                self.assertFalse(paths["source"].exists())
+                self.accepted(self.transact(paths, "cancel-unowned"), b"unowned")
+                self.accepted(self.transact(paths, "claim", token="bb"))
+
+    def test_pair_interrupted_release_reconciles_exact_receipt_before_readmission(self):
+        for fault in ("private-sync", "before-receipt-rename", "after-receipt-rename",
+                      "receipt-directory-sync", "before-owner-rename",
+                      "after-owner-rename", "owner-directory-sync"):
+            with self.subTest(fault=fault):
+                paths = self.paths(fault)
+                self.accepted(self.transact(paths, "claim"))
+                self.refused(self.transact(paths, "release", fault=fault))
+                receipt = self.receipt(paths)
+                self.assertIn(paths["owner"].read_bytes(), (b"aa\n", b"released\n"))
+                if receipt.exists():
+                    self.assertEqual(receipt.read_bytes(), b"aa\n")
+                    inode = receipt.stat().st_ino
+                    self.refused(self.transact(paths, "recover"))
+                    self.accepted(self.transact(paths, "released"), b"released")
+                    self.assertEqual(receipt.stat().st_ino, inode)
+                else:
+                    self.accepted(self.transact(paths, "released"), b"pending")
+                    self.refused(self.transact(paths, "claim", token="bb"))
+                    self.accepted(self.transact(paths, "release"))
+                self.assertEqual(paths["owner"].read_bytes(), b"released\n")
+                self.assertEqual(receipt.read_bytes(), b"aa\n")
+                self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
+                receipt_inode = receipt.stat().st_ino
+                self.accepted(self.transact(paths, "release"))
+                self.assertEqual(receipt.stat().st_ino, receipt_inode)
+                self.refused(self.transact(paths, "claim"))
+                self.accepted(self.transact(paths, "claim", token="bb"))
+                paths["source"].mkdir()
+                source = paths["source"] / "successor-owned"
+                source.write_bytes(b"live successor content")
+                owner_inode = paths["owner"].stat().st_ino
+                self.accepted(self.transact(paths, "released"), b"released")
+                self.assertEqual(paths["owner"].stat().st_ino, owner_inode)
+                self.assertEqual(paths["owner"].read_bytes(), b"bb\n")
+                self.assertEqual(source.read_bytes(), b"live successor content")
+
+    def test_pair_cancellation_replays_owned_and_unowned_publication_frontiers(self):
+        paths = self.paths("owned")
+        self.accepted(self.transact(paths, "claim"))
+        self.accepted(self.transact(paths, "cancel-owned"), b"owned")
+        self.assertFalse(self.receipt(paths).exists())
+        self.refused(self.transact(paths, "release", fault="after-receipt-rename"))
+        paths["source"].mkdir()
+        sentinel = paths["source"] / "still-owned"
+        sentinel.write_bytes(b"live source blocks receipt reconciliation")
+        self.refused(self.transact(paths, "cancel-owned"))
+        self.assertEqual(paths["owner"].read_bytes(), b"aa\n")
+        self.assertEqual(sentinel.read_bytes(), b"live source blocks receipt reconciliation")
+        paths["source"].rename(paths["directory"] / "retired-source")
+        self.accepted(self.transact(paths, "cancel-owned"), b"unowned")
+        self.accepted(self.transact(paths, "released"), b"released")
+        self.accepted(self.transact(paths, "claim", token="bb"))
+        self.accepted(self.transact(paths, "cancel-owned"), b"unowned")
+        self.assertEqual(paths["owner"].read_bytes(), b"bb\n")
+
+        for fault in ("after-receipt-rename", "before-owner-rename", "after-owner-rename"):
+            with self.subTest(fault=fault):
+                paths = self.paths("unowned-" + fault)
+                self.accepted(self.transact(paths, "claim"))
+                # This operation has no source authority. Even a path left by
+                # unrelated activity is neither inspected nor removed by it.
+                paths["source"].mkdir()
+                source = paths["source"] / "preserve"
+                source.write_bytes(b"outside unowned intent authority")
+                self.refused(self.transact(paths, "cancel-unowned", fault=fault))
+                self.accepted(self.transact(paths, "cancel-unowned"), b"unowned")
+                self.assertEqual(source.read_bytes(), b"outside unowned intent authority")
+                self.assertEqual(paths["owner"].read_bytes(), b"released\n")
+                self.assertEqual(self.receipt(paths).read_bytes(), b"aa\n")
+
+    def test_pair_malformed_conflicting_and_aliased_records_remain_fail_closed(self):
+        for index, malformed in enumerate((b"", b"aa", b"aa\n\n", b"aa\nbb\n", b"released")):
+            paths = self.paths("malformed-owner-" + str(index))
+            paths["owner"].write_bytes(malformed)
+            self.receipt(paths).write_bytes(b"aa\n")
+            inode = paths["owner"].stat().st_ino
+            for operation in ("claim", "recover", "release", "cancel-owned", "cancel-unowned", "released"):
+                with self.subTest(index=index, operation=operation):
+                    self.refused(self.transact(paths, operation))
+                    self.assertEqual(paths["owner"].read_bytes(), malformed)
+                    self.assertEqual(paths["owner"].stat().st_ino, inode)
+                    self.assertEqual(self.receipt(paths).read_bytes(), b"aa\n")
+        for index, malformed in enumerate((b"", b"aa", b"aa\n\n", b"bb\n", b"released\n")):
+            paths = self.paths("malformed-receipt-" + str(index))
+            paths["owner"].write_bytes(b"aa\n")
+            receipt = self.receipt(paths)
+            receipt.write_bytes(malformed)
+            inode = receipt.stat().st_ino
+            for operation in ("claim", "recover", "release", "cancel-owned", "cancel-unowned", "released"):
+                with self.subTest(index=index, operation=operation):
+                    self.refused(self.transact(paths, operation))
+                    self.assertEqual(receipt.read_bytes(), malformed)
+                    self.assertEqual(receipt.stat().st_ino, inode)
+                    self.assertEqual(paths["owner"].read_bytes(), b"aa\n")
+        for role in ("owner", "receipt"):
+            for corruption in ("symlink", "hardlink", "writable", "fifo", "directory"):
+                with self.subTest(role=role, corruption=corruption):
+                    paths = self.paths(role + "-" + corruption)
+                    target = paths["owner"] if role == "owner" else self.receipt(paths)
+                    other = paths["directory"] / "evidence"
+                    if corruption == "symlink":
+                        other.write_bytes(b"aa\n")
+                        target.symlink_to(other)
+                    elif corruption == "hardlink":
+                        other.write_bytes(b"aa\n")
+                        os.link(other, target)
+                    elif corruption == "fifo":
+                        os.mkfifo(target)
+                    elif corruption == "directory":
+                        target.mkdir()
+                    else:
+                        target.write_bytes(b"aa\n")
+                        target.chmod(0o666)
+                    if role == "owner":
+                        self.receipt(paths).write_bytes(b"aa\n")
+                    else:
+                        paths["owner"].write_bytes(b"aa\n")
+                    before = target.lstat()
+                    self.refused(self.transact(paths, "released"))
+                    self.refused(self.transact(paths, "cancel-unowned"))
+                    self.assertEqual(target.lstat().st_ino, before.st_ino)
+                    self.assertEqual(target.lstat().st_mode, before.st_mode)
+                    if other.exists():
+                        self.assertEqual(other.read_bytes(), b"aa\n")
+        paths = self.paths("receipt-without-owner")
+        self.receipt(paths).write_bytes(b"aa\n")
+        for operation in ("claim", "recover", "release", "cancel-owned", "cancel-unowned", "released"):
+            with self.subTest(operation=operation):
+                self.refused(self.transact(paths, operation))
+        self.assertFalse(paths["owner"].exists())
+
+    def test_pair_readable_legacy_records_and_changed_owner_are_handled_exactly(self):
+        for mode in (0o640, 0o644):
+            paths = self.paths("legacy-" + oct(mode))
+            paths["owner"].write_bytes(b"aa\n")
+            paths["owner"].chmod(mode)
+            receipt = self.receipt(paths)
+            receipt.write_bytes(b"aa\n")
+            receipt.chmod(mode)
+            receipt_inode = receipt.stat().st_ino
+            self.accepted(self.transact(paths, "released"), b"released")
+            self.assertEqual(paths["owner"].read_bytes(), b"released\n")
+            self.assertEqual(paths["owner"].stat().st_mode & 0o777, 0o600)
+            self.assertEqual(receipt.stat().st_ino, receipt_inode)
+            self.assertEqual(receipt.stat().st_mode & 0o777, mode)
+        paths = self.paths("changed-during-private-write")
+        paths["owner"].write_bytes(b"released\n")
+        self.refused(self.transact(paths, "claim", fault="owner-changed-before-rename"))
+        self.assertEqual(paths["owner"].read_bytes(), b"bb\n")
+        self.assertTrue(list(paths["directory"].glob(".pair-write.*")))
+        self.assertFalse(paths["source"].exists())
+
+    def test_pair_concurrent_dispatchers_preserve_one_owner_and_one_release_receipt(self):
+        paths = self.paths("concurrent")
+        commands = [("aa", self.command(paths, "claim", "aa")),
+                    ("bb", self.command(paths, "claim", "bb"))]
+        children = [(token, subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE))
+                    for token, command in commands]
+        results = []
+        for token, child in children:
+            output, error = child.communicate(timeout=10)
+            results.append((token, child.returncode, output, error))
+        winners = [row for row in results if row[1] == 0]
+        self.assertEqual(len(winners), 1, results)
+        token = winners[0][0]
+        self.assertEqual(paths["owner"].read_bytes(), (token + "\n").encode())
+        releases = [subprocess.Popen(self.command(paths, "release", token),
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    for _ in range(3)]
+        for child in releases:
+            output, error = child.communicate(timeout=10)
+            self.assertEqual((child.returncode, output), (0, b""), error)
+        receipt = self.receipt(paths, token)
+        self.assertEqual(receipt.read_bytes(), (token + "\n").encode())
+        self.assertEqual(receipt.stat().st_nlink, 1)
+        self.assertEqual(paths["owner"].read_bytes(), b"released\n")
+        self.refused(self.transact(paths, "claim", token))
+        self.accepted(self.transact(paths, "claim", "cc"))
+        owner_inode = paths["owner"].stat().st_ino
+        self.accepted(self.transact(paths, "released", token), b"released")
+        self.assertEqual(paths["owner"].read_bytes(), b"cc\n")
+        self.assertEqual(paths["owner"].stat().st_ino, owner_inode)
 
 
 class SourceLockHolderTests(unittest.TestCase):
