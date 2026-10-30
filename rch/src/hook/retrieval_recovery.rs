@@ -2880,11 +2880,12 @@ impl RecoverySession {
         let mut next_recipe = self.recipe.clone();
         next_recipe.retired = true;
         self.persist_next_recipe(next_recipe)?;
-        // Whole-stage removal also discards unpublished collector inputs.
-        // Retained custody needs an explicit owner-approved cleanup policy,
-        // even after successful retirement. Keep that evidence and failed
-        // required-output deliveries; ordinary jobs can release duplicates.
-        if !self.retain_source_lifecycle_evidence()
+        // Whole-stage removal also discards unpublished collector inputs. The
+        // owner decided (bd-ra5aw, 2026-10-30) that a retained-source job's
+        // local stage is not custody once a successful delivery is complete:
+        // the worker's retained tree stays and the caller holds the published
+        // bytes. Failed or unfinished deliveries keep their stage as evidence.
+        if (!self.retain_source_lifecycle_evidence() || self.successful_delivery_complete())
             && !self.retain_failed_delivery_evidence()
             && let Some(stages) = self.stage(0).parent()
         {
@@ -3023,6 +3024,19 @@ impl RecoverySession {
     /// permission to discard the invocation's delivery/completion evidence.
     fn retain_source_lifecycle_evidence(&self) -> bool {
         self.recipe.retained_root.is_some()
+    }
+
+    /// A successful delivery that no longer needs its local stage: the command
+    /// and the caller both saw exit 0, every phase is published with nothing
+    /// pending or missing, and any first caller Cargo reply is prepared.
+    fn successful_delivery_complete(&self) -> bool {
+        self.recipe.exit_code == Some(0)
+            && self.recipe.returned == Some(0)
+            && !self.recipe.phases.is_empty()
+            && self.recipe.phases.iter().all(|phase| {
+                phase.complete && phase.pending.is_none() && phase.missing_result.is_none()
+            })
+            && (self.recipe.caller_json_policy.is_none() || self.recipe.caller_delivery.is_some())
     }
 
     fn retain_failed_delivery_evidence(&self) -> bool {
@@ -7311,7 +7325,7 @@ mod tests {
     #[tokio::test]
     async fn terminal_cargo_json_recovery_uses_delivery_outside_original_stage() {
         let _guard = test_guard!();
-        let (directory, mut session) = caller_delivery_fixture(true, false);
+        let (_directory, mut session) = caller_delivery_fixture(true, false);
         let writer = session.writer.clone();
         let local = session.recipe.project_root.clone();
         let stage = session.stage(0);
@@ -7346,10 +7360,10 @@ mod tests {
             assert!(!retained.starts_with(&original_stage));
         }
         assert_eq!(delivery.files.len(), 2);
-        let preserved_stage = directory.join("preserved-original-stage");
-        // Preserve the fixture bytes while removing the entire stage from the
-        // namespace recorded by the recipe. This does not enable deletion.
-        std::fs::rename(&original_stage, &preserved_stage).unwrap();
+        // A successful retained delivery releases its local stage at
+        // retirement (bd-ra5aw, owner decision 2026-10-30), so recovery below
+        // must work from the copies outside it.
+        assert!(!original_stage.exists());
         for name in ["app", "helper"] {
             std::fs::write(
                 local.join("target/lean").join(name),
@@ -7372,16 +7386,8 @@ mod tests {
         assert_eq!(std::fs::read(producer).unwrap(), stdout);
         assert_eq!(std::fs::read(stderr_path).unwrap(), stderr);
         assert_eq!(std::fs::read(&delivery.path).unwrap(), expected_stdout);
-        assert_eq!(
-            std::fs::read(preserved_stage.join("0/collector-source.c")).unwrap(),
-            b"private collector input"
-        );
         for name in ["app", "helper"] {
             let relative = Path::new("target/lean").join(name);
-            assert_eq!(
-                std::fs::read(preserved_stage.join("0").join(&relative)).unwrap(),
-                name.as_bytes()
-            );
             assert_eq!(
                 std::fs::read(delivery.output_root.join(&relative)).unwrap(),
                 name.as_bytes()
@@ -8992,7 +8998,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retained_source_delivery_preserves_original_stages_through_retirement() {
+    async fn retained_source_retirement_releases_a_successful_stage_and_keeps_a_failed_one() {
         let _guard = test_guard!();
         for command_exit in [0, 7] {
             let (directory, writer, worker) = admitted_preparation_fixture();
@@ -9079,28 +9085,46 @@ mod tests {
             session.pair_released().unwrap();
             assert!(session.retired().is_err());
             session.sources_released().unwrap();
+            // Planted negative: every release flag is set, but the job has not
+            // retired, so its stage is still whole.
+            assert_eq!(
+                std::fs::read(stage.join("build/app")).unwrap(),
+                b"retained delivery bytes"
+            );
             session.retired().unwrap();
             let recovered = reload_publication(&session);
             assert!(recovered.recipe.retired);
             assert!(recovered.recipe.phases[0].complete);
             assert_eq!(recovered.recipe.returned, Some(command_exit));
             assert!(recovered.retain_source_lifecycle_evidence());
+            // The caller's source and its published output are never touched.
             for (path, bytes) in [
                 (local.join("source.c"), b"original caller source".as_slice()),
-                (
-                    stage.join("source.c"),
-                    b"private collector input".as_slice(),
-                ),
-                (
-                    stage.join("build/app"),
-                    b"retained delivery bytes".as_slice(),
-                ),
                 (
                     local.join("build/app"),
                     b"retained delivery bytes".as_slice(),
                 ),
             ] {
                 assert_eq!(std::fs::read(path).unwrap(), bytes);
+            }
+            // bd-ra5aw (owner decision 2026-10-30): a successful delivery
+            // releases the local stage; a failed command keeps all of it,
+            // unpublished collector input included.
+            if command_exit == 0 {
+                assert!(!stage.parent().unwrap().exists());
+            } else {
+                for (path, bytes) in [
+                    (
+                        stage.join("source.c"),
+                        b"private collector input".as_slice(),
+                    ),
+                    (
+                        stage.join("build/app"),
+                        b"retained delivery bytes".as_slice(),
+                    ),
+                ] {
+                    assert_eq!(std::fs::read(path).unwrap(), bytes);
+                }
             }
         }
     }
