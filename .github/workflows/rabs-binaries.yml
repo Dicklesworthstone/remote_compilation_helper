@@ -50,6 +50,8 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  CARGO_BUILD_JOBS: 2
+  RCH_BUILD_SOURCE: ${{ github.sha }}
 
 jobs:
   installation:
@@ -131,12 +133,22 @@ jobs:
   build:
     name: release build + gates
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - name: Install bubblewrap (worker capability + sandbox tests)
         run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - name: Workspace formatting, type checks and warnings before code generation
+        env:
+          CARGO_PROFILE_DEV_DEBUG: 0
+          CARGO_PROFILE_TEST_DEBUG: 0
+          CARGO_INCREMENTAL: 0
+        run: |
+          cargo fmt --check
+          cargo check --locked --workspace --all-targets
+          cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Release build the three spine binaries
-        run: cargo build --release -p rabsd -p rabs-wrap -p rabs-wkr
+        run: cargo build --locked --release -p rabsd -p rabs-wrap -p rabs-wkr
       - name: Worker-cache command assembly and opt-out parity
         run: cargo test --release -p rch-common --lib toolchain::worker_cache --locked
       - name: Coherent preparation to native worker-build handoff

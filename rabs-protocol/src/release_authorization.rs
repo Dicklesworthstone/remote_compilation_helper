@@ -200,6 +200,7 @@ pub fn authorization(
 /// Compile-time commit environment variables inspected in order when deriving
 /// [`default_build_identity`].
 pub const BUILD_COMMIT_ENV_VARS: &[&str] = &[
+    "RCH_BUILD_SOURCE",
     "RCH_GIT_COMMIT",
     "VERGEN_GIT_SHA",
     "GIT_COMMIT",
@@ -237,14 +238,16 @@ pub fn format_build_identity(version: &str, commit: Option<&str>) -> String {
 
 /// Derive the canonical build identity for the running RABS binary.
 ///
-/// Combines `CARGO_PKG_VERSION` with the first validated compile-time commit
-/// environment variable from [`BUILD_COMMIT_ENV_VARS`], if present. Because
-/// `rabsd` and `rch` link this crate from the same workspace build, both
+/// Combines `CARGO_PKG_VERSION` with the first validated compile-time source
+/// stamp from [`BUILD_COMMIT_ENV_VARS`], if present. The exact RCH source stamp
+/// takes priority over ambient commit aliases, including for clean overlays.
+/// Because `rabsd` and `rch` link this crate from the same workspace build, both
 /// derive the exact same default identity without an operator having to
 /// supply a string by hand (`bd-dockb`).
 #[must_use]
 pub fn default_build_identity() -> String {
     let commit = [
+        option_env!("RCH_BUILD_SOURCE"),
         option_env!("RCH_GIT_COMMIT"),
         option_env!("VERGEN_GIT_SHA"),
         option_env!("GIT_COMMIT"),
@@ -594,6 +597,31 @@ mod tests {
         assert!(
             derived.starts_with(&format!("rabs-{}", env!("CARGO_PKG_VERSION"))),
             "unexpected derived identity: {derived}"
+        );
+        if let Some(source) = option_env!("RCH_BUILD_SOURCE")
+            .map(str::trim)
+            .filter(|source| is_valid_commit_stamp(source))
+        {
+            assert_eq!(
+                derived,
+                format_build_identity(env!("CARGO_PKG_VERSION"), Some(source))
+            );
+        }
+    }
+
+    #[test]
+    fn release_proof_for_one_source_overlay_cannot_authorize_another() {
+        let first = format!("1e31c8ae-overlay-{}", "a".repeat(64));
+        let second = format!("1e31c8ae-overlay-{}", "b".repeat(64));
+        let proven = format_build_identity("2.1.34", Some(&first));
+        let running = format_build_identity("2.1.34", Some(&second));
+        assert_ne!(proven, running);
+        assert_eq!(
+            authorization(Some(&verdict(&proven, 42)), &running, 2_000, 7),
+            ReleaseAuthorization::BuildMismatch {
+                recorded: proven,
+                running,
+            }
         );
     }
 
