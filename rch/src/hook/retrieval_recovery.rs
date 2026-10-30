@@ -2287,9 +2287,13 @@ impl RecoverySession {
         let mut next_recipe = self.recipe.clone();
         next_recipe.retired = true;
         self.persist_next_recipe(next_recipe)?;
-        // Retained invocations and failed required-output deliveries keep
-        // staging for inspection. Ordinary retired jobs can release duplicates.
-        if !self.retain_source_lifecycle_evidence()
+        // A retained_root is remote source custody. It is not a lease on the
+        // local second copy of bytes already published to the caller. Release
+        // that duplicate once every phase is complete and nothing is pending.
+        // Incomplete, pending, and failed required-output deliveries stay.
+        let keep_unfinished_retained_stage =
+            self.retain_source_lifecycle_evidence() && !self.published_delivery_finished();
+        if !keep_unfinished_retained_stage
             && !self.retain_failed_delivery_evidence()
             && let Some(stages) = self.stage(0).parent()
         {
@@ -2411,6 +2415,15 @@ impl RecoverySession {
     /// permission to discard the invocation's delivery/completion evidence.
     fn retain_source_lifecycle_evidence(&self) -> bool {
         self.recipe.retained_root.is_some()
+    }
+
+    /// Every selected phase has its outputs at the destination and no journaled
+    /// rename or missing result still points at the stage.
+    fn published_delivery_finished(&self) -> bool {
+        !self.recipe.phases.is_empty()
+            && self.recipe.phases.iter().all(|phase| {
+                phase.complete && phase.pending.is_none() && phase.missing_result.is_none()
+            })
     }
 
     fn retain_failed_delivery_evidence(&self) -> bool {
@@ -6352,7 +6365,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retained_source_delivery_preserves_original_stages_through_retirement() {
+    async fn retired_retained_source_delivery_releases_a_finished_stage() {
         let _guard = test_guard!();
         for command_exit in [0, 7] {
             let (directory, writer, worker) = admitted_preparation_fixture();
@@ -6439,29 +6452,32 @@ mod tests {
             session.pair_released().unwrap();
             assert!(session.retired().is_err());
             session.sources_released().unwrap();
+            // Planted negative: an unretired job, including one whose remote
+            // release flags are already set, still has its stage.
+            assert_eq!(
+                std::fs::read(stage.join("build/app")).unwrap(),
+                b"retained delivery bytes"
+            );
+            assert!(session.published_delivery_finished());
             session.retired().unwrap();
             let recovered = reload_publication(&session);
             assert!(recovered.recipe.retired);
             assert!(recovered.recipe.phases[0].complete);
             assert_eq!(recovered.recipe.returned, Some(command_exit));
             assert!(recovered.retain_source_lifecycle_evidence());
-            for (path, bytes) in [
-                (local.join("source.c"), b"original caller source".as_slice()),
-                (
-                    stage.join("source.c"),
-                    b"private collector input".as_slice(),
-                ),
-                (
-                    stage.join("build/app"),
-                    b"retained delivery bytes".as_slice(),
-                ),
-                (
-                    local.join("build/app"),
-                    b"retained delivery bytes".as_slice(),
-                ),
-            ] {
-                assert_eq!(std::fs::read(path).unwrap(), bytes);
-            }
+            assert!(recovered.published_delivery_finished());
+            assert_eq!(
+                std::fs::read(local.join("source.c")).unwrap(),
+                b"original caller source"
+            );
+            assert_eq!(
+                std::fs::read(local.join("build/app")).unwrap(),
+                b"retained delivery bytes"
+            );
+            assert!(
+                !stage.exists(),
+                "a retired finished delivery must not keep the staging duplicate"
+            );
         }
     }
 
