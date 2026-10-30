@@ -218,35 +218,11 @@ fn retain_previous_journal(
     writer: &DurableLeaseWriter,
     expected: &DurableJobLease,
 ) -> anyhow::Result<PathBuf> {
-    use rustix::fs::{Mode, OFlags};
-    ownership.verify()?;
-    let bytes = crate::state::primitives::read_regular_file_at(
-        ownership.gate.directory().as_fd(),
-        ownership.gate.journal_name(),
-    )?;
     anyhow::ensure!(
-        DurableLeaseWriter::decode_journal(&bytes, &writer.wrapper_id())? == *expected,
-        "journal changed before artifact policy refinement; retry its latest evidence"
+        writer.wrapper_id() == expected.identity.local_wrapper_id,
+        "artifact policy snapshot names another wrapper"
     );
-    let name = std::ffi::CString::new(format!(
-        "artifact-policy-{}.before",
-        uuid::Uuid::new_v4().simple()
-    ))?;
-    let mut file = File::from(rustix::fs::openat(
-        ownership.gate.directory().as_fd(),
-        name.as_c_str(),
-        OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::RUSR | Mode::WUSR,
-    )?);
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    ownership.require_named_file(&file, &name)?;
-    crate::state::primitives::verify_atomic_write_bytes(&file, &bytes)?;
-    ownership.gate.directory().sync_all()?;
-    ownership.verify()?;
-    ownership.require_named_file(&file, &name)?;
-    crate::state::primitives::verify_atomic_write_bytes(&file, &bytes)?;
-    Ok(ownership.gate.parent().join(name.to_str()?))
+    ownership.retain_snapshot(expected)
 }
 
 fn prepare_fresh_stage(

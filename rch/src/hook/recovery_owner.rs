@@ -31,6 +31,15 @@ impl RecoveryOwnership {
         DurableLeaseWriter::decode_journal(&bytes, wrapper_id)
     }
 
+    /// Keep prior custody separately from the current attempt's authority.
+    /// The gate verifies exact current bytes before and after the durable copy.
+    pub(in crate::hook) fn retain_snapshot(
+        &self,
+        expected: &DurableJobLease,
+    ) -> anyhow::Result<PathBuf> {
+        self.gate.retain_snapshot(expected)
+    }
+
     /// The first lease must never replace an existing wrapper's evidence.
     /// Readers can refuse an incomplete initial file; daemon admission starts
     /// only after this write and its held directory have been synchronized.

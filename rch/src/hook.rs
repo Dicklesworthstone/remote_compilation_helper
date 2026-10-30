@@ -2533,12 +2533,34 @@ impl DurableLeaseWriter {
         next: DurableJobLease,
     ) -> anyhow::Result<()> {
         let bytes = serde_json::to_vec_pretty(&next)?;
+        let supersedes_recovery = lease.recovery.is_some() && next.recovery.is_none();
         #[cfg(unix)]
         if let Some(ownership) = &self.recovery_ownership {
+            if supersedes_recovery {
+                ownership.retain_snapshot(lease)?;
+            }
             ownership.publish(&bytes)?;
             *lease = next;
             return Ok(());
         }
+        #[cfg(unix)]
+        if supersedes_recovery {
+            // Loaded observations and older fixtures may not already own the
+            // gate. Preserve the same exact current epoch and publish its
+            // successor while holding one temporary exclusive owner, never
+            // skip custody preservation on this path.
+            let ownership =
+                transfer_orchestration::recovery::recovery_owner::acquire_gate(&self.path)?;
+            ownership.retain_snapshot(lease)?;
+            ownership.publish(&bytes)?;
+            *lease = next;
+            return Ok(());
+        }
+        #[cfg(not(unix))]
+        anyhow::ensure!(
+            !supersedes_recovery,
+            "cannot supersede recovery custody without descriptor-bound journal snapshots on this platform"
+        );
         atomic_write(&self.path, &bytes)?;
         // Unix atomic_write already synchronizes and verifies its held parent;
         // reopening the pathname here adds no durability to that publication.

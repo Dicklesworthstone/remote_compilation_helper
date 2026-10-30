@@ -3105,6 +3105,247 @@ fn assert_retry_pending(writer: &DurableLeaseWriter, previous: &DurableJobLease)
     assert!(!disk.terminal_acknowledged);
 }
 
+#[cfg(unix)]
+fn retry_custody_test_writer(directory: &Path, owned: bool) -> DurableLeaseWriter {
+    std::fs::create_dir_all(directory).unwrap();
+    let writer = if owned {
+        DurableLeaseWriter::create_in(directory, "cargo build", false, true).unwrap()
+    } else {
+        queued_selection_test_lease(directory.join("lease.json"))
+    };
+    writer.admit(41, &WorkerId::new("previous-worker")).unwrap();
+    let stage = directory.join("retained-stage");
+    std::fs::create_dir(&stage).unwrap();
+    std::fs::write(stage.join("collector-input"), b"retained original input").unwrap();
+    writer
+        .set_recovery(serde_json::json!({
+            "retired": true,
+            "returned": 137,
+            "wrapper_id": writer.wrapper_id(),
+            "build_id": 41,
+            "worker": {"id": "previous-worker"},
+            "retained_root": stage,
+            "phases": [{"complete": false, "pending": ["report", "original-hash"]}],
+        }))
+        .unwrap();
+    writer.record_exit(137).unwrap();
+    writer
+}
+
+#[cfg(unix)]
+fn retry_custody_snapshots(directory: &Path, wrapper: &str) -> Vec<(PathBuf, Vec<u8>)> {
+    let prefix = format!("{wrapper}.recovery-");
+    let mut snapshots: Vec<_> = std::fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".before"))
+        })
+        .map(|path| {
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+    snapshots.sort_by(|left, right| left.0.cmp(&right.0));
+    snapshots
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn retry_custody_survives_uncertain_selection_and_writer_loss() {
+    for owned in [false, true] {
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let writer = retry_custody_test_writer(directory.path(), owned);
+        let previous = writer.snapshot();
+        let original = std::fs::read(&writer.path).unwrap();
+        let wrapper = writer.wrapper_id();
+        let path = writer.path.clone();
+        let error = dispatch_retry_selection(&writer, true, async || {
+            assert_retry_pending(&writer, &previous);
+            let snapshots = retry_custody_snapshots(directory.path(), &wrapper);
+            assert_eq!(snapshots.len(), 1, "custody must precede query dispatch");
+            assert_eq!(snapshots[0].1, original);
+            anyhow::bail!(
+                anyhow::anyhow!("reply lost after selection dispatch")
+                    .context(daemon_ipc::SelectionOutcomeUnconfirmed)
+            );
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<daemon_ipc::SelectionOutcomeUnconfirmed>()
+                .is_some()
+        );
+        drop(writer);
+        let reloaded = DurableLeaseWriter::read_journal(&path, &wrapper).unwrap();
+        assert_eq!(reloaded.phase, "selection_unconfirmed");
+        assert!(reloaded.identity.remote_build_id.is_none());
+        assert!(reloaded.worker_id.is_none() && reloaded.recovery.is_none());
+        assert!(reloaded.exit_code.is_none() && !reloaded.terminal_acknowledged);
+        let snapshots = retry_custody_snapshots(directory.path(), &wrapper);
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].1, original);
+        let retained: DurableJobLease = serde_json::from_slice(&snapshots[0].1).unwrap();
+        assert_eq!(retained, previous);
+        assert_eq!(
+            std::fs::read(directory.path().join("retained-stage/collector-input")).unwrap(),
+            b"retained original input"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn retry_custody_deduplicates_refusals_and_cannot_complete_a_new_attempt() {
+    for owned in [false, true] {
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let writer = retry_custody_test_writer(directory.path(), owned);
+        let previous = writer.snapshot();
+        let original = std::fs::read(&writer.path).unwrap();
+        let wrapper = writer.wrapper_id();
+        for _ in 0..3 {
+            dispatch_retry_selection(&writer, true, async || {
+                assert_retry_pending(&writer, &previous);
+                Ok(retry_unassigned_response())
+            })
+            .await
+            .unwrap();
+            assert_eq!(writer.snapshot(), previous);
+            assert_eq!(std::fs::read(&writer.path).unwrap(), original);
+            let snapshots = retry_custody_snapshots(directory.path(), &wrapper);
+            assert_eq!(snapshots.len(), 1, "identical evidence must be reused");
+            assert_eq!(snapshots[0].1, original);
+        }
+        writer.begin_retry_selection(true).unwrap();
+        assert!(
+            writer
+                .acknowledge_observed_completion(&previous, 137)
+                .is_err()
+        );
+        assert!(writer.confirm_selection_cancelled().unwrap());
+        let cancelled = read_retry_lease(&writer);
+        assert_eq!(cancelled.exit_code, Some(130));
+        assert!(cancelled.terminal_acknowledged);
+        assert!(cancelled.identity.remote_build_id.is_none());
+        assert!(cancelled.recovery.is_none());
+        assert!(
+            writer
+                .acknowledge_observed_completion(&previous, 137)
+                .is_err()
+        );
+        assert_eq!(read_retry_lease(&writer), cancelled);
+        assert_eq!(
+            retry_custody_snapshots(directory.path(), &wrapper)[0].1,
+            original
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn retry_custody_preserves_direct_readmission_and_leaves_first_admission_unarchived() {
+    let directory = tempfile::Builder::new()
+        .disable_cleanup(true)
+        .tempdir()
+        .unwrap();
+    let first =
+        DurableLeaseWriter::create_in(directory.path(), "cargo check", false, true).unwrap();
+    first.admit(40, &WorkerId::new("first-worker")).unwrap();
+    assert!(retry_custody_snapshots(directory.path(), &first.wrapper_id()).is_empty());
+
+    for owned in [false, true] {
+        let attempt_directory = directory.path().join(format!("owned-{owned}"));
+        let writer = retry_custody_test_writer(&attempt_directory, owned);
+        let previous = writer.snapshot();
+        let original = std::fs::read(&writer.path).unwrap();
+        writer.admit(42, &WorkerId::new("next-worker")).unwrap();
+        let next = read_retry_lease(&writer);
+        assert_eq!(next.identity.remote_build_id, Some(42));
+        assert_eq!(next.worker_id.as_deref(), Some("next-worker"));
+        assert!(next.recovery.is_none() && next.exit_code.is_none());
+        assert!(
+            writer
+                .acknowledge_observed_completion(&previous, 137)
+                .is_err()
+        );
+        writer.record_exit(0).unwrap();
+        writer.acknowledge_terminal().unwrap();
+        let finished = read_retry_lease(&writer);
+        assert_eq!(finished.identity, next.identity);
+        assert_eq!(finished.exit_code, Some(0));
+        assert!(finished.terminal_acknowledged);
+        let snapshots = retry_custody_snapshots(&attempt_directory, &writer.wrapper_id());
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].1, original);
+        assert_eq!(
+            std::fs::read(attempt_directory.join("retained-stage/collector-input")).unwrap(),
+            b"retained original input"
+        );
+    }
+    // Real journal/dispatch transitions with supplied attempt receipts; this
+    // does not claim an actual worker compilation or daemon acknowledgment.
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn retry_custody_preservation_failure_blocks_dispatch_and_readmission() {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    for owned in [false, true] {
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let writer = retry_custody_test_writer(directory.path(), owned);
+        let previous = writer.snapshot();
+        let original = std::fs::read(&writer.path).unwrap();
+        let collision = directory.path().join(format!(
+            "{}.recovery-{}.before",
+            writer.wrapper_id(),
+            blake3::hash(&original).to_hex()
+        ));
+        let mut corrupt = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&collision)
+            .unwrap();
+        corrupt.write_all(b"incomplete retained evidence").unwrap();
+        corrupt.sync_all().unwrap();
+        let mut polled = false;
+        assert!(
+            dispatch_retry_selection(&writer, true, async || {
+                polled = true;
+                Ok(retry_unassigned_response())
+            })
+            .await
+            .is_err()
+        );
+        assert!(!polled, "failed custody preservation must precede dispatch");
+        assert!(writer.admit(42, &WorkerId::new("next-worker")).is_err());
+        assert_eq!(writer.snapshot(), previous);
+        assert_eq!(std::fs::read(&writer.path).unwrap(), original);
+        assert_eq!(
+            std::fs::read(collision).unwrap(),
+            b"incomplete retained evidence"
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join("retained-stage/collector-input")).unwrap(),
+            b"retained original input"
+        );
+    }
+}
+
 #[tokio::test]
 async fn retry_selection_unconfirmed_retains_new_intent_and_never_exhausts() {
     let directory = tempfile::tempdir().unwrap();

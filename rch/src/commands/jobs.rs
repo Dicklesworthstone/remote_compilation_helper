@@ -397,10 +397,12 @@ fn job_journal_error(path: &std::path::Path, error: String) -> Value {
 
 #[cfg(unix)]
 fn read_job_listing(directory: &std::path::Path) -> Result<Value> {
+    use rch_common::job_identity::journal::{read_retained_snapshot_at, retained_snapshot_kind};
     use rustix::fs::{Dir, Mode, OFlags};
     use std::os::unix::ffi::OsStrExt;
 
     let mut jobs = Vec::new();
+    let mut retained_evidence = Vec::new();
     let mut journal_errors = Vec::new();
     let descriptor = match rustix::fs::open(
         directory,
@@ -425,6 +427,30 @@ fn read_job_listing(directory: &std::path::Path) -> Result<Value> {
             };
             let name = std::ffi::OsStr::from_bytes(entry.file_name().to_bytes());
             let path = directory.join(name);
+            if retained_snapshot_kind(entry.file_name()).is_some() {
+                let observed = (|| read_retained_snapshot_at(entries.fd()?, entry.file_name()))();
+                match observed {
+                    Ok(snapshot) => {
+                        // A predecessor is inspection evidence, never the
+                        // wrapper's current attempt or replay authority. Its
+                        // old state/PID must not become a live job observation.
+                        let mut report = json!({
+                            "path": path.to_string_lossy(),
+                            "kind": snapshot.kind.as_str(),
+                            "digest": snapshot.digest,
+                            "lease": snapshot.lease,
+                        });
+                        if path.to_str().is_none() {
+                            report["path_bytes"] = json!(path.as_os_str().as_bytes());
+                        }
+                        retained_evidence.push(report);
+                    }
+                    Err(error) => {
+                        journal_errors.push(job_journal_error(&path, format!("{error:#}")));
+                    }
+                }
+                continue;
+            }
             if path.extension().and_then(|value| value.to_str()) != Some("json") {
                 continue;
             }
@@ -453,6 +479,7 @@ fn read_job_listing(directory: &std::path::Path) -> Result<Value> {
     }
     Ok(json!({
         "jobs": jobs,
+        "retained_evidence": retained_evidence,
         "complete": journal_errors.is_empty(),
         "journal_errors": journal_errors,
     }))
@@ -936,6 +963,239 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn write_private_job_evidence(path: &std::path::Path, bytes: &[u8]) {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    #[cfg(unix)]
+    fn retained_job_evidence_name(lease: &DurableJobLease, bytes: &[u8]) -> String {
+        format!(
+            "{}.recovery-{}.before",
+            lease.identity.local_wrapper_id,
+            blake3::hash(bytes).to_hex()
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn job_listing_discovers_retained_attempts_without_promoting_them_to_current_jobs() {
+        for current_present in [true, false] {
+            let retained = tempfile::tempdir().unwrap().keep();
+            let mut previous = queued_lease();
+            previous.admit(41, "previous-worker".into(), 1);
+            previous.exit_code = Some(137);
+            previous.recovery = Some(json!({
+                "retired": true,
+                "returned": 137,
+                "identity": "previous-retrieval-stage",
+                "retained_root": "/retained/previous-attempt",
+                "phases": [{"complete": false, "pending": ["report", "retained-hash"]}],
+            }));
+            let mut original = serde_json::to_value(&previous).unwrap();
+            original["producer_extension"] = json!({"future_receipt": "preserved in exact bytes"});
+            let previous_bytes = serde_json::to_vec_pretty(&original).unwrap();
+            let previous_path =
+                retained.join(retained_job_evidence_name(&previous, &previous_bytes));
+            write_private_job_evidence(&previous_path, &previous_bytes);
+
+            let mut legacy = previous.clone();
+            legacy.recovery = Some(json!({
+                "retired": false,
+                "identity": "older-artifact-policy-stage",
+                "transfer": {"retrieval_staging_dir": "/retained/original-stage"},
+            }));
+            let legacy_bytes = serde_json::to_vec_pretty(&legacy).unwrap();
+            let legacy_path = retained.join(format!(
+                "artifact-policy-{}.before",
+                uuid::Uuid::new_v4().simple()
+            ));
+            write_private_job_evidence(&legacy_path, &legacy_bytes);
+
+            let mut current = previous.clone();
+            current.admit(42, "current-worker".into(), 2);
+            current.recovery = None;
+            current.exit_code = Some(0);
+            current.acknowledge_terminal(3);
+            let current_path = retained.join(format!("{}.json", current.identity.local_wrapper_id));
+            let current_bytes = serde_json::to_vec(&current).unwrap();
+            if current_present {
+                write_private_job_evidence(&current_path, &current_bytes);
+            }
+            let unrelated = retained.join("operator-note.before");
+            write_private_job_evidence(&unrelated, b"unrelated non-JSON operator evidence");
+
+            let listing = read_job_listing(&retained).unwrap();
+            assert_eq!(listing["complete"], true);
+            assert_eq!(listing["journal_errors"], json!([]));
+            let jobs = listing["jobs"].as_array().unwrap();
+            if current_present {
+                assert_eq!(jobs.len(), 1);
+                assert_eq!(jobs[0]["lease"], serde_json::to_value(&current).unwrap());
+                assert_eq!(std::fs::read(&current_path).unwrap(), current_bytes);
+            } else {
+                assert!(
+                    jobs.is_empty(),
+                    "historical evidence cannot recreate a current job"
+                );
+                assert!(!current_path.exists());
+            }
+            let evidence = listing["retained_evidence"].as_array().unwrap();
+            assert_eq!(evidence.len(), 2);
+            for (path, kind, lease, bytes) in [
+                (&previous_path, "recovery", &previous, &previous_bytes),
+                (
+                    &legacy_path,
+                    "legacy_artifact_policy",
+                    &legacy,
+                    &legacy_bytes,
+                ),
+            ] {
+                let report = evidence
+                    .iter()
+                    .find(|item| item["path"] == json!(path))
+                    .unwrap();
+                assert_eq!(report["kind"], kind);
+                assert_eq!(report["digest"], blake3::hash(bytes).to_hex().to_string());
+                assert_eq!(report["lease"], serde_json::to_value(lease).unwrap());
+                assert!(report.get("owner_presence").is_none());
+                assert!(report.get("wrapper_alive").is_none());
+                assert_eq!(std::fs::read(path).unwrap(), *bytes);
+            }
+            assert_eq!(
+                std::fs::read(unrelated).unwrap(),
+                b"unrelated non-JSON operator evidence"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn job_listing_reports_invalid_retained_evidence_without_losing_current_jobs() {
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+        for change in [
+            "corrupt",
+            "digest",
+            "identity",
+            "schema",
+            "malformed-name",
+            "malformed-legacy-name",
+            "writable",
+            "hardlink",
+            "symlink",
+            "fifo",
+            "directory",
+        ] {
+            let retained = tempfile::tempdir().unwrap().keep();
+            let current = admitted_lease();
+            let current_path = retained.join(format!("{}.json", current.identity.local_wrapper_id));
+            let current_bytes = serde_json::to_vec(&current).unwrap();
+            write_private_job_evidence(&current_path, &current_bytes);
+            let mut previous = queued_lease();
+            previous.admit(41, "previous-worker".into(), 1);
+            previous.recovery = Some(json!({"retired": true, "returned": 137}));
+            if change == "schema" {
+                previous.schema_version = 2;
+            }
+            let bytes = if change == "corrupt" {
+                b"{\"identity\":".to_vec()
+            } else {
+                serde_json::to_vec(&previous).unwrap()
+            };
+            let name = match change {
+                "digest" => format!(
+                    "{}.recovery-{}.before",
+                    previous.identity.local_wrapper_id,
+                    "0".repeat(64)
+                ),
+                "identity" => retained_job_evidence_name(&queued_lease(), &bytes),
+                "malformed-name" => format!(
+                    "{}.recovery-not-a-digest.before",
+                    previous.identity.local_wrapper_id
+                ),
+                "malformed-legacy-name" => "artifact-policy-not-a-uuid.before".to_owned(),
+                _ => retained_job_evidence_name(&previous, &bytes),
+            };
+            let path = retained.join(name);
+            let other_name = retained.join("preserved-evidence");
+            match change {
+                "symlink" => {
+                    write_private_job_evidence(&other_name, &bytes);
+                    std::os::unix::fs::symlink(&other_name, &path).unwrap();
+                }
+                "fifo" => {
+                    assert!(
+                        std::process::Command::new("mkfifo")
+                            .args(["-m", "600"])
+                            .arg(&path)
+                            .status()
+                            .unwrap()
+                            .success()
+                    );
+                }
+                "directory" => std::fs::create_dir(&path).unwrap(),
+                _ => {
+                    write_private_job_evidence(&path, &bytes);
+                    if change == "writable" {
+                        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
+                            .unwrap();
+                    } else if change == "hardlink" {
+                        std::fs::hard_link(&path, &other_name).unwrap();
+                    }
+                }
+            }
+
+            let listing = if change == "fifo" {
+                let directory = retained.clone();
+                let (sender, receiver) = std::sync::mpsc::channel();
+                let reader = std::thread::spawn(move || {
+                    sender.send(read_job_listing(&directory)).unwrap();
+                });
+                let listing = receiver
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("retained evidence listing waited on a FIFO without a writer")
+                    .unwrap();
+                reader.join().unwrap();
+                listing
+            } else {
+                read_job_listing(&retained).unwrap()
+            };
+            assert_eq!(listing["complete"], false, "{change}");
+            assert!(listing["retained_evidence"].as_array().unwrap().is_empty());
+            assert_eq!(listing["jobs"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                listing["jobs"][0]["lease"],
+                serde_json::to_value(current).unwrap()
+            );
+            let errors = listing["journal_errors"].as_array().unwrap();
+            assert_eq!(errors.len(), 1, "{change}: {errors:?}");
+            assert_eq!(errors[0]["path"], json!(path));
+            assert!(!errors[0]["error"].as_str().unwrap().is_empty());
+            assert_eq!(std::fs::read(current_path).unwrap(), current_bytes);
+            let metadata = std::fs::symlink_metadata(&path).unwrap();
+            match change {
+                "symlink" => assert!(metadata.file_type().is_symlink()),
+                "fifo" => assert!(metadata.file_type().is_fifo()),
+                "directory" => assert!(metadata.is_dir()),
+                _ => assert_eq!(std::fs::read(&path).unwrap(), bytes),
+            }
+            if matches!(change, "symlink" | "hardlink") {
+                assert_eq!(std::fs::read(other_name).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn job_listing_preserves_jobs_and_exact_non_utf8_error_paths() {
         use std::os::unix::ffi::OsStrExt;
@@ -1310,7 +1570,7 @@ mod tests {
         let listing = read_job_listing(&absent).unwrap();
         assert_eq!(
             listing,
-            json!({"jobs": [], "complete": true, "journal_errors": []})
+            json!({"jobs": [], "retained_evidence": [], "complete": true, "journal_errors": []})
         );
         assert!(!absent.exists());
     }
