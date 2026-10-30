@@ -5194,6 +5194,7 @@ dependencies = [
  "parking_lot",
  "rabs-action",
  "rabs-protocol",
+ "rustix",
  "tempfile",
 ]
 
