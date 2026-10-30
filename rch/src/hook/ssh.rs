@@ -219,6 +219,43 @@ except (OSError, ValueError) as error:
 "#;
 const SOURCE_CLAIM_REGISTRY: &str = include_str!("source_claim_registry.sh");
 const REMOTE_SOURCE_CLAIM_REGISTRY: &str = "/var/tmp/rch-source-authority-locks/claims-v1";
+const LEGACY_SOURCE_CLAIM_REGISTRY: &str = "/tmp/rch-source-authority-locks/claims-v1";
+
+/// A source grant binds both durable records and kernel locks to one worker
+/// namespace. Old journals must discover this binding before changing either.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SourceAuthorityNamespace {
+    Current,
+    Legacy,
+}
+
+impl SourceAuthorityNamespace {
+    fn registry(self) -> &'static str {
+        match self {
+            Self::Current => REMOTE_SOURCE_CLAIM_REGISTRY,
+            Self::Legacy => LEGACY_SOURCE_CLAIM_REGISTRY,
+        }
+    }
+
+    fn lock_dir(self) -> &'static str {
+        match self {
+            Self::Current => REMOTE_SOURCE_AUTHORITY_LOCK_DIR,
+            Self::Legacy => "/tmp/rch-source-authority-locks",
+        }
+    }
+
+    fn wire_name(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Legacy => "legacy",
+        }
+    }
+
+    pub(crate) fn activity_prefix(self, identity: &str, cleanup: bool) -> anyhow::Result<String> {
+        source_authority_activity_prefix_for_mode(self.registry(), identity, cleanup)
+    }
+}
 
 /// Keeps the worker-side advisory locks for a mutable Cargo source closure alive.
 ///
@@ -237,6 +274,7 @@ pub(super) struct RemoteSourceAuthorityLock {
     heartbeat: Option<SourceLockHeartbeat>,
     release_request: Option<String>,
     pair_root: Option<String>,
+    namespace: SourceAuthorityNamespace,
 }
 
 /// The single stdin writer serializes complete heartbeat/release frames. In
@@ -435,11 +473,16 @@ async fn join_lock_drain(
 }
 
 fn source_authority_lock_path(root: &str) -> String {
+    source_authority_lock_path_in(root, SourceAuthorityNamespace::Current)
+}
+
+fn source_authority_lock_path_in(root: &str, namespace: SourceAuthorityNamespace) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"rch.remote_source_authority_lock.v1\0");
     hasher.update(root.as_bytes());
     format!(
-        "{REMOTE_SOURCE_AUTHORITY_LOCK_DIR}/{}.lock",
+        "{}/{}.lock",
+        namespace.lock_dir(),
         hasher.finalize().to_hex()
     )
 }
@@ -661,7 +704,7 @@ fn source_registry_invocation(
         rch_common::stale_target_reap::SOURCE_CLAIM_RECORD_HELPERS,
         SOURCE_CLAIM_REGISTRY,
     );
-    format!(
+    let command = format!(
         "flock -x -- {lock} sh -c {script} rch-source-registry {registry} {identity} {digest} {operation}",
         lock = quote(&format!("{registry}/metadata.lock")),
         script = quote(&script),
@@ -669,7 +712,29 @@ fn source_registry_invocation(
         identity = quote(identity),
         digest = quote(digest),
         operation = quote(operation),
-    )
+    );
+    if registry == LEGACY_SOURCE_CLAIM_REGISTRY {
+        // Current admission and GC publish/read under the current metadata
+        // mutex. Hold it before the legacy mutex throughout cleanup grants.
+        format!(
+            "env RCH_LEGACY_SOURCE_CLAIM_REGISTRY={peer} flock -x -- {lock} {command}",
+            peer = quote(REMOTE_SOURCE_CLAIM_REGISTRY),
+            lock = quote(&format!("{REMOTE_SOURCE_CLAIM_REGISTRY}/metadata.lock")),
+        )
+    } else {
+        command
+    }
+}
+
+fn source_registry_recovery_setup(registry: &str) -> String {
+    let mut setup = String::new();
+    if registry == LEGACY_SOURCE_CLAIM_REGISTRY {
+        // Only initialize the shared mutex namespace; no current claim or
+        // cancellation receipt may be manufactured for a legacy identity.
+        setup.push_str(&source_registry_setup(REMOTE_SOURCE_CLAIM_REGISTRY));
+    }
+    setup.push_str(&source_registry_setup(registry));
+    setup
 }
 
 fn source_authority_activity_prefix_at(registry: &str, identity: &str) -> anyhow::Result<String> {
@@ -721,12 +786,6 @@ fn source_authority_activity_prefix_for_mode(
 /// flock ordering is not permission to retry an uncertain mutator in place.
 pub(crate) fn source_authority_activity_prefix(identity: &str) -> anyhow::Result<String> {
     source_authority_activity_prefix_at(REMOTE_SOURCE_CLAIM_REGISTRY, identity)
-}
-
-/// Cleanup-only authority for an already owned, durably cancelling grant. It
-/// cannot start a new normal operation or recover an absent source claim.
-pub(crate) fn source_authority_cleanup_prefix(identity: &str) -> anyhow::Result<String> {
-    source_authority_activity_prefix_for_mode(REMOTE_SOURCE_CLAIM_REGISTRY, identity, true)
 }
 
 pub(crate) fn wrap_remote_source_activity(command: &str, identity: &str) -> anyhow::Result<String> {
@@ -799,7 +858,7 @@ fn build_durable_source_authority_lock_cmd(
     };
     Ok(format!(
         "{}exec 4<<'RCH_SOURCE_CLAIM_ROOTS'\n{roots}RCH_SOURCE_CLAIM_ROOTS\n{base} {terminal}",
-        source_registry_setup(registry),
+        source_registry_recovery_setup(registry),
         terminal = quote(&terminal),
     ))
 }
@@ -821,8 +880,27 @@ fn source_intent_command(
     }
     Ok(format!(
         "{}{invocation} <<'RCH_SOURCE_CLAIM_ROOTS'\n{roots}RCH_SOURCE_CLAIM_ROOTS\n",
-        source_registry_setup(registry),
+        source_registry_recovery_setup(registry),
     ))
+}
+
+/// Bound the worker process tree as well as the local SSH client. A client
+/// timeout alone can leave a queued flock transaction that wakes much later
+/// and publishes cancellation after its caller has gone. The controller
+/// validates the exact finite reply only after draining its private group.
+async fn run_source_metadata_rpc(
+    worker: &WorkerConfig,
+    command: &str,
+    contract: &str,
+    client_timeout: Duration,
+) -> anyhow::Result<Output> {
+    let controller = format!(
+        "set -- {}\n{}",
+        shell_escape::escape(contract.into()),
+        include_str!("source_namespace_control.sh"),
+    );
+    run_offload_ssh_command_with_stdin(worker, &controller, command.as_bytes(), client_timeout)
+        .await
 }
 
 /// Probe whether a started remote execution is gone for good. Every activity
@@ -857,8 +935,9 @@ pub(super) async fn remote_execution_lost(
     worker: &WorkerConfig,
     identity: &str,
     receipt: &str,
+    namespace: SourceAuthorityNamespace,
 ) -> anyhow::Result<bool> {
-    let script = remote_execution_probe_script(REMOTE_SOURCE_CLAIM_REGISTRY, identity, receipt)?;
+    let script = remote_execution_probe_script(namespace.registry(), identity, receipt)?;
     let output = run_offload_ssh_command_with_stdin(
         worker,
         "sh -s",
@@ -878,13 +957,14 @@ pub(super) async fn remote_source_authority_was_released(
     worker: &WorkerConfig,
     roots: &[String],
     identity: &str,
+    namespace: SourceAuthorityNamespace,
 ) -> anyhow::Result<bool> {
-    let command = source_intent_command(REMOTE_SOURCE_CLAIM_REGISTRY, roots, identity, "released")?;
-    let output = run_offload_ssh_command_with_stdin(
+    let command = source_intent_command(namespace.registry(), roots, identity, "released")?;
+    let output = run_source_metadata_rpc(
         worker,
-        "sh -s",
-        command.as_bytes(),
-        Duration::from_secs(15),
+        &command,
+        "RCH_SOURCE_INTENT_RELEASED",
+        Duration::from_secs(30),
     )
     .await?;
     anyhow::ensure!(
@@ -905,14 +985,14 @@ pub(super) async fn remote_source_intent_was_cancelled(
     worker: &WorkerConfig,
     roots: &[String],
     identity: &str,
+    namespace: SourceAuthorityNamespace,
 ) -> anyhow::Result<bool> {
-    let command =
-        source_intent_command(REMOTE_SOURCE_CLAIM_REGISTRY, roots, identity, "cancelled")?;
-    let output = run_offload_ssh_command_with_stdin(
+    let command = source_intent_command(namespace.registry(), roots, identity, "cancelled")?;
+    let output = run_source_metadata_rpc(
         worker,
-        "sh -s",
-        command.as_bytes(),
-        Duration::from_secs(15),
+        &command,
+        "RCH_SOURCE_INTENT_CANCELLED",
+        Duration::from_secs(30),
     )
     .await?;
     anyhow::ensure!(
@@ -935,12 +1015,13 @@ pub(super) async fn cancel_remote_source_authority_intent(
     worker: &WorkerConfig,
     roots: &[String],
     identity: &str,
+    namespace: SourceAuthorityNamespace,
 ) -> anyhow::Result<bool> {
-    let command = source_intent_command(REMOTE_SOURCE_CLAIM_REGISTRY, roots, identity, "cancel")?;
-    let output = run_offload_ssh_command_with_stdin(
+    let command = source_intent_command(namespace.registry(), roots, identity, "cancel")?;
+    let output = run_source_metadata_rpc(
         worker,
-        "sh -s",
-        command.as_bytes(),
+        &command,
+        "RCH_SOURCE_INTENT_CANCEL",
         Duration::from_secs(30),
     )
     .await?;
@@ -961,17 +1042,13 @@ pub(super) async fn finish_cancel_remote_source_authority_intent(
     worker: &WorkerConfig,
     roots: &[String],
     identity: &str,
+    namespace: SourceAuthorityNamespace,
 ) -> anyhow::Result<()> {
-    let command = source_intent_command(
-        REMOTE_SOURCE_CLAIM_REGISTRY,
-        roots,
-        identity,
-        "finish-cancel",
-    )?;
-    let output = run_offload_ssh_command_with_stdin(
+    let command = source_intent_command(namespace.registry(), roots, identity, "finish-cancel")?;
+    let output = run_source_metadata_rpc(
         worker,
-        "sh -s",
-        command.as_bytes(),
+        &command,
+        "RCH_SOURCE_INTENT_FINISHED",
         Duration::from_secs(30),
     )
     .await?;
@@ -988,6 +1065,8 @@ fn source_cancellation_settlement_command(
     legacy_registry: &str,
     roots: &[String],
     identity: &str,
+    operation: &str,
+    expected_namespace: &str,
 ) -> anyhow::Result<String> {
     validate_source_identity(identity)?;
     let (roots, digest) = source_claim_roots(roots)?;
@@ -998,7 +1077,7 @@ fn source_cancellation_settlement_command(
         SOURCE_CLAIM_REGISTRY,
     );
     Ok(format!(
-        "exec python3 -I -S -c {coordinator} {registry} {legacy} {identity} {digest} {transaction} \
+        "exec python3 -I -S -c {coordinator} {registry} {legacy} {identity} {digest} {transaction} {operation} {expected} \
          <<'RCH_SOURCE_CLAIM_ROOTS'\n{roots}RCH_SOURCE_CLAIM_ROOTS\n",
         coordinator = quote(include_str!("source_cancel_settlement.py")),
         registry = quote(registry),
@@ -1006,7 +1085,45 @@ fn source_cancellation_settlement_command(
         identity = quote(identity),
         digest = quote(&digest),
         transaction = quote(&transaction),
+        operation = quote(operation),
+        expected = quote(expected_namespace),
     ))
+}
+
+/// Discover exact legacy evidence without admitting activity or publishing
+/// cancellation. The caller must checkpoint this binding before any mutation.
+pub(super) async fn locate_remote_source_authority_namespace(
+    worker: &WorkerConfig,
+    roots: &[String],
+    identity: &str,
+) -> anyhow::Result<SourceAuthorityNamespace> {
+    let command = source_cancellation_settlement_command(
+        REMOTE_SOURCE_CLAIM_REGISTRY,
+        LEGACY_SOURCE_CLAIM_REGISTRY,
+        roots,
+        identity,
+        "locate",
+        "",
+    )?;
+    let output = run_source_metadata_rpc(
+        worker,
+        &command,
+        "RCH_SOURCE_AUTHORITY_NAMESPACE",
+        Duration::from_secs(30),
+    )
+    .await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "cannot locate exact source ownership on {} (status {:?}): {}",
+        worker.id,
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr).trim(),
+    );
+    match output.stdout.as_slice() {
+        b"RCH_SOURCE_AUTHORITY_NAMESPACE current\n" => Ok(SourceAuthorityNamespace::Current),
+        b"RCH_SOURCE_AUTHORITY_NAMESPACE legacy\n" => Ok(SourceAuthorityNamespace::Legacy),
+        _ => anyhow::bail!("invalid source ownership namespace response"),
+    }
 }
 
 /// Settle cancellation metadata only after the caller has validated its exact
@@ -1020,20 +1137,20 @@ pub(super) async fn settle_remote_source_cancellation(
     worker: &WorkerConfig,
     roots: &[String],
     identity: &str,
+    namespace: SourceAuthorityNamespace,
 ) -> anyhow::Result<()> {
     let command = source_cancellation_settlement_command(
         REMOTE_SOURCE_CLAIM_REGISTRY,
-        "/tmp/rch-source-authority-locks/claims-v1",
+        LEGACY_SOURCE_CLAIM_REGISTRY,
         roots,
         identity,
+        "settle-cancel",
+        namespace.wire_name(),
     )?;
-    let output = run_offload_ssh_command_with_stdin(
+    let output = run_source_metadata_rpc(
         worker,
-        &format!(
-            "set -- RCH_SOURCE_CANCELLATION_SETTLED\n{}",
-            include_str!("source_namespace_control.sh")
-        ),
-        command.as_bytes(),
+        &command,
+        "RCH_SOURCE_CANCELLATION_SETTLED",
         Duration::from_secs(30),
     )
     .await?;
@@ -1094,6 +1211,7 @@ pub(super) async fn acquire_remote_source_authority_lock(
         identity,
         "acquire",
         wait_timeout,
+        SourceAuthorityNamespace::Current,
     )
     .await
 }
@@ -1106,6 +1224,7 @@ pub(super) async fn recover_remote_source_authority_lock(
     source_pair: Option<&mut RemoteSourceAuthorityLock>,
     identity: &str,
     wait_timeout: Duration,
+    namespace: SourceAuthorityNamespace,
 ) -> anyhow::Result<RemoteSourceAuthorityLock> {
     source_authority_lock(
         worker,
@@ -1114,6 +1233,7 @@ pub(super) async fn recover_remote_source_authority_lock(
         identity,
         "recover",
         wait_timeout,
+        namespace,
     )
     .await
 }
@@ -1125,6 +1245,7 @@ async fn source_authority_lock(
     identity: &str,
     operation: &str,
     wait_timeout: Duration,
+    namespace: SourceAuthorityNamespace,
 ) -> anyhow::Result<RemoteSourceAuthorityLock> {
     // A validated clean-overlay pair already holds its container exclusively.
     // Its private descendants retain their exact locks; re-locking their parent
@@ -1134,8 +1255,8 @@ async fn source_authority_lock(
     let (include_ancestors, paired_root) = if let Some(pair) = source_pair {
         pair.ensure_held()?;
         anyhow::ensure!(
-            pair.pair_token().is_some(),
-            "source pair has no owner token"
+            pair.pair_token() == Some(identity) && pair.namespace == namespace,
+            "source pair identity or namespace does not match the source grant"
         );
         let root = pair
             .pair_root
@@ -1150,11 +1271,22 @@ async fn source_authority_lock(
         .filter(|root| paired_root.as_ref() != Some(*root))
         .cloned()
         .collect::<Vec<_>>();
-    let locks = source_authority_lock_plan(&lock_roots, include_ancestors)?;
+    let mut locks = source_authority_lock_plan(&lock_roots, include_ancestors)?;
+    if namespace == SourceAuthorityNamespace::Legacy {
+        for lock in &mut locks {
+            let name = Path::new(&lock.path)
+                .file_name()
+                .context("source lock has no file name")?;
+            lock.path = Path::new(namespace.lock_dir())
+                .join(name)
+                .display()
+                .to_string();
+        }
+    }
     let ready_marker = format!("RCH_SOURCE_AUTHORITY_READY:{}", uuid::Uuid::new_v4());
     let remote_cmd = build_durable_source_authority_lock_cmd(
-        REMOTE_SOURCE_AUTHORITY_LOCK_DIR,
-        REMOTE_SOURCE_CLAIM_REGISTRY,
+        namespace.lock_dir(),
+        namespace.registry(),
         &locks,
         authority_roots,
         identity,
@@ -1164,6 +1296,7 @@ async fn source_authority_lock(
     let mut guard =
         spawn_source_authority_lock(worker, &remote_cmd, &ready_marker, wait_timeout).await?;
     guard.release_request = Some(format!("RCH_SOURCE_AUTHORITY_RELEASE:{identity}"));
+    guard.namespace = namespace;
     Ok(guard)
 }
 
@@ -1196,6 +1329,7 @@ pub(super) async fn recover_clean_overlay_source_pair(
     source_root: &str,
     token: &str,
     wait_timeout: Duration,
+    namespace: SourceAuthorityNamespace,
 ) -> anyhow::Result<RemoteSourceAuthorityLock> {
     recover_clean_overlay_source_pair_with_mode(
         worker,
@@ -1203,6 +1337,7 @@ pub(super) async fn recover_clean_overlay_source_pair(
         token,
         wait_timeout,
         SourcePairRecoveryMode::Normal,
+        namespace,
     )
     .await
 }
@@ -1218,11 +1353,10 @@ async fn recover_clean_overlay_source_pair_with_mode(
     token: &str,
     wait_timeout: Duration,
     mode: SourcePairRecoveryMode,
+    namespace: SourceAuthorityNamespace,
 ) -> anyhow::Result<RemoteSourceAuthorityLock> {
     validate_source_identity(token)?;
-    let lock_path = source_authority_lock_paths(&[source_root.to_owned()])
-        .pop()
-        .expect("one source root");
+    let lock_path = source_authority_lock_path_in(source_root, namespace);
     let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
     let ready = format!("RCH_SOURCE_PAIR_READY:{token}");
     let release = format!("RCH_SOURCE_PAIR_RELEASE:{token}");
@@ -1249,7 +1383,7 @@ async fn recover_clean_overlay_source_pair_with_mode(
                 // Its existing fence must not discard the cleanup lock.
                 SourcePairRecoveryMode::CancellationCleanup => "cleanup-pair",
             },
-            REMOTE_SOURCE_CLAIM_REGISTRY,
+            namespace.registry(),
             token,
             &canonical_source_authority_root(source_root),
             &release,
@@ -1267,6 +1401,7 @@ async fn recover_clean_overlay_source_pair_with_mode(
     let mut guard = spawn_source_authority_lock(worker, &command, &ready, wait_timeout).await?;
     guard.release_request = Some(release);
     guard.pair_root = Some(source_root.to_owned());
+    guard.namespace = namespace;
     Ok(guard)
 }
 
@@ -1278,10 +1413,11 @@ pub(super) async fn cancel_clean_overlay_source_pair_intent(
     source_root: &str,
     token: &str,
     wait_timeout: Duration,
+    namespace: SourceAuthorityNamespace,
 ) -> anyhow::Result<Option<RemoteSourceAuthorityLock>> {
     validate_source_identity(token)?;
     let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
-    let lock = source_authority_lock_path(source_root);
+    let lock = source_authority_lock_path_in(source_root, namespace);
     let script = format!(
         "set -eu; registry={registry}; token={token}; \
          set -- \"$registry/$token.\"*.claim; active=$1; owned=0; \
@@ -1298,7 +1434,7 @@ pub(super) async fn cancel_clean_overlay_source_pair_intent(
          printf '%s\\n' \"$token\" > {receipt}; {flush_receipt}; \
          printf 'released\\n' > \"$owner\"; {flush_owner}; printf unowned; fi; \
          else printf unowned; fi",
-        registry = quote(REMOTE_SOURCE_CLAIM_REGISTRY),
+        registry = quote(namespace.registry()),
         token = quote(token),
         owner = quote(&format!("{lock}.owner")),
         receipt = quote(&format!(
@@ -1313,11 +1449,13 @@ pub(super) async fn cancel_clean_overlay_source_pair_intent(
     );
     let command = format!("flock -x -- {} sh -c {}", quote(&lock), quote(&script));
     let output =
-        run_offload_ssh_command_with_stdin(worker, "sh -s", command.as_bytes(), wait_timeout)
-            .await?;
+        run_source_metadata_rpc(worker, &command, "RCH_SOURCE_INTENT_CANCEL", wait_timeout).await?;
     anyhow::ensure!(
         output.status.success(),
-        "cannot reconcile cancelled source pair"
+        "cannot reconcile cancelled source pair on {} (status {:?}): {}",
+        worker.id,
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr).trim(),
     );
     match output.stdout.as_slice() {
         b"owned" => Ok(Some(
@@ -1327,6 +1465,7 @@ pub(super) async fn cancel_clean_overlay_source_pair_intent(
                 token,
                 wait_timeout,
                 SourcePairRecoveryMode::CancellationCleanup,
+                namespace,
             )
             .await?,
         )),
@@ -1341,10 +1480,9 @@ pub(super) async fn clean_overlay_source_pair_was_released(
     worker: &WorkerConfig,
     source_root: &str,
     token: &str,
+    namespace: SourceAuthorityNamespace,
 ) -> anyhow::Result<bool> {
-    let lock_path = source_authority_lock_paths(&[source_root.to_owned()])
-        .pop()
-        .expect("one source root");
+    let lock_path = source_authority_lock_path_in(source_root, namespace);
     let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
     let owner = format!("{lock_path}.owner");
     let receipt = format!(
@@ -1366,16 +1504,19 @@ pub(super) async fn clean_overlay_source_pair_was_released(
         flush_owner = source_pair_fsync(&owner),
     );
     let command = format!("flock -x {} sh -c {}", quote(&lock_path), quote(&script));
-    let output = run_offload_ssh_command_with_stdin(
+    let output = run_source_metadata_rpc(
         worker,
-        "sh -s",
-        command.as_bytes(),
-        Duration::from_secs(15),
+        &command,
+        "RCH_SOURCE_INTENT_RELEASED",
+        Duration::from_secs(30),
     )
     .await?;
     anyhow::ensure!(
         output.status.success(),
-        "cannot verify source-pair release receipt"
+        "cannot verify source-pair release receipt on {} (status {:?}): {}",
+        worker.id,
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr).trim(),
     );
     match output.stdout.as_slice() {
         b"released" => Ok(true),
@@ -1545,6 +1686,7 @@ async fn finish_source_authority_lock_acquisition(
         heartbeat: None,
         release_request: None,
         pair_root: None,
+        namespace: SourceAuthorityNamespace::Current,
     };
 
     let mut observed = String::new();
@@ -2773,22 +2915,30 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
             .join("cancelled")
             .join(format!("{identity}.{digest}.claim"));
         std::fs::write(&fence, &body).unwrap();
-        let command = source_cancellation_settlement_command(
-            registry.to_str().unwrap(),
-            legacy.to_str().unwrap(),
-            &roots,
-            identity,
-        )
-        .unwrap();
-        let remote = build_remote_shell_command(
-            WorkerPlatform::Posix,
-            &format!(
-                "set -- RCH_SOURCE_CANCELLATION_SETTLED\n{}",
-                include_str!("source_namespace_control.sh")
-            ),
-        );
-        for attempt in 0..3 {
-            if attempt == 2 {
+        for attempt in 0..4 {
+            let locate = attempt == 0;
+            let command = source_cancellation_settlement_command(
+                registry.to_str().unwrap(),
+                legacy.to_str().unwrap(),
+                &roots,
+                identity,
+                if locate { "locate" } else { "settle-cancel" },
+                if locate { "" } else { "current" },
+            )
+            .unwrap();
+            let contract = if locate {
+                "RCH_SOURCE_AUTHORITY_NAMESPACE"
+            } else {
+                "RCH_SOURCE_CANCELLATION_SETTLED"
+            };
+            let remote = build_remote_shell_command(
+                WorkerPlatform::Posix,
+                &format!(
+                    "set -- {contract}\n{}",
+                    include_str!("source_namespace_control.sh")
+                ),
+            );
+            if attempt == 3 {
                 std::fs::write(&fence, b"/incomplete\n").unwrap();
             }
             // Use the real generated upload, login-shell quoting and bounded
@@ -2811,13 +2961,20 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
                 .await
                 .expect("metadata controller did not terminate")
                 .unwrap();
-            if attempt < 2 {
+            if attempt < 3 {
                 assert!(
                     output.status.success(),
                     "{}",
                     String::from_utf8_lossy(&output.stderr)
                 );
-                assert_eq!(output.stdout, b"RCH_SOURCE_CANCELLATION_SETTLED\n");
+                assert_eq!(
+                    output.stdout,
+                    if locate {
+                        b"RCH_SOURCE_AUTHORITY_NAMESPACE current\n".as_slice()
+                    } else {
+                        b"RCH_SOURCE_CANCELLATION_SETTLED\n".as_slice()
+                    }
+                );
                 assert_eq!(std::fs::read(&fence).unwrap(), body.as_bytes());
             } else {
                 assert_eq!(output.status.code(), Some(73));
@@ -2828,7 +2985,14 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
                 );
                 assert_eq!(std::fs::read(&fence).unwrap(), b"/incomplete\n");
             }
-            assert_eq!(std::fs::read(&receipt).unwrap(), body.as_bytes());
+            if locate {
+                assert!(
+                    !receipt.exists(),
+                    "namespace discovery published a cancellation receipt"
+                );
+            } else {
+                assert_eq!(std::fs::read(&receipt).unwrap(), body.as_bytes());
+            }
             assert!(!source.exists(), "metadata recovery created a source root");
             assert!(!directory.path().join("expanded-dollar").exists());
             assert!(!directory.path().join("expanded-backtick").exists());
@@ -5644,6 +5808,7 @@ exec /bin/ln \"$@\"\n",
                 heartbeat: None,
                 release_request: None,
                 pair_root: None,
+                namespace: SourceAuthorityNamespace::Current,
             },
             writers,
             notices,

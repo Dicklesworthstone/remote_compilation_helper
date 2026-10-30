@@ -2787,6 +2787,7 @@ pub struct TransferPipeline {
     /// Worker-side activity lease bound to the persisted source grant. Every
     /// source operation checks the grant after joining its drain barrier.
     source_authority_prefix: Option<String>,
+    source_authority_namespace: crate::hook::SourceAuthorityNamespace,
     /// Cooperative collection-only cancellation; the sender never drops a live child future.
     retrieval_control: Option<(tokio::sync::watch::Receiver<bool>, TokioInstant)>,
 }
@@ -2905,6 +2906,7 @@ impl TransferPipeline {
             rsync_override: None,
             recovery_completion: None,
             source_authority_prefix: None,
+            source_authority_namespace: crate::hook::SourceAuthorityNamespace::Current,
             retrieval_control: None,
         }
     }
@@ -3026,18 +3028,31 @@ impl TransferPipeline {
     }
 
     #[cfg(unix)]
-    pub(crate) fn with_source_authority(mut self, identity: String) -> Result<Self> {
-        self.source_authority_prefix =
-            Some(crate::hook::source_authority_activity_prefix(&identity)?);
+    pub(crate) fn with_source_authority(self, identity: String) -> Result<Self> {
+        self.with_source_authority_in(identity, crate::hook::SourceAuthorityNamespace::Current)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn with_source_authority_in(
+        mut self,
+        identity: String,
+        namespace: crate::hook::SourceAuthorityNamespace,
+    ) -> Result<Self> {
+        self.source_authority_prefix = Some(namespace.activity_prefix(&identity, false)?);
+        self.source_authority_namespace = namespace;
         Ok(self)
     }
 
     /// Cleanup is admitted only while the exact active grant is cancelling.
     /// Final cancellation drains these operations before releasing its roots.
     #[cfg(unix)]
-    pub(crate) fn with_source_authority_cleanup(mut self, identity: String) -> Result<Self> {
-        self.source_authority_prefix =
-            Some(crate::hook::source_authority_cleanup_prefix(&identity)?);
+    pub(crate) fn with_source_authority_cleanup(
+        mut self,
+        identity: String,
+        namespace: crate::hook::SourceAuthorityNamespace,
+    ) -> Result<Self> {
+        self.source_authority_prefix = Some(namespace.activity_prefix(&identity, true)?);
+        self.source_authority_namespace = namespace;
         Ok(self)
     }
 
@@ -7694,7 +7709,9 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         control_dir: &str,
         attempt: &str,
     ) -> Result<()> {
-        let active = crate::hook::source_authority_activity_prefix(attempt)?;
+        let active = self
+            .source_authority_namespace
+            .activity_prefix(attempt, false)?;
         anyhow::ensure!(
             !self.worker_platform.is_windows()
                 && self.source_authority_prefix.as_deref() == Some(active.as_str()),
@@ -7725,7 +7742,9 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         control_dir: &str,
         attempt: &str,
     ) -> Result<()> {
-        let active = crate::hook::source_authority_activity_prefix(attempt)?;
+        let active = self
+            .source_authority_namespace
+            .activity_prefix(attempt, false)?;
         anyhow::ensure!(
             !self.worker_platform.is_windows()
                 && self.source_authority_prefix.as_deref() == Some(active.as_str()),
@@ -8324,8 +8343,12 @@ print('RCH_SOURCE_FRESHNESS_V2 unchanged=%d changed=%d' % (len(current) - len(ch
             !self.worker_platform.is_windows() && self.source_authority_prefix.is_some(),
             "retained source retirement requires an active Linux source grant"
         );
-        let active = crate::hook::source_authority_activity_prefix(identity)?;
-        let cleanup = crate::hook::source_authority_cleanup_prefix(identity)?;
+        let active = self
+            .source_authority_namespace
+            .activity_prefix(identity, false)?;
+        let cleanup = self
+            .source_authority_namespace
+            .activity_prefix(identity, true)?;
         anyhow::ensure!(
             self.source_authority_prefix.as_deref() == Some(active.as_str())
                 || self.source_authority_prefix.as_deref() == Some(cleanup.as_str()),
@@ -14190,7 +14213,10 @@ Number of files transferred: 42
                     let pipeline = match mode {
                         "active" => pipeline.with_source_authority("ab12".into()).unwrap(),
                         "cleanup" => pipeline
-                            .with_source_authority_cleanup("ab12".into())
+                            .with_source_authority_cleanup(
+                                "ab12".into(),
+                                crate::hook::SourceAuthorityNamespace::Current,
+                            )
                             .unwrap(),
                         _ => pipeline,
                     };

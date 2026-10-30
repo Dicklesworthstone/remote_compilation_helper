@@ -705,15 +705,17 @@ class TerminalCancellationSettlementTests(unittest.TestCase):
         self.tmp.mkdir()
         self.env["TMPDIR"] = str(self.tmp)
 
-    def start_settlement(self, token="aa", roots=None, env=None, transaction=None):
+    def start_settlement(self, token="aa", roots=None, env=None, transaction=None,
+                         operation="settle-cancel", expected="current"):
         roots = self.roots if roots is None else roots
         invocation = [sys.executable, "-I", "-S", "-c", self.coordinator,
                       str(self.registry), str(self.legacy), token, digest(roots),
-                      transaction or self.script.read_text()]
+                      transaction or self.script.read_text(), operation, expected]
         program = ("exec " + shlex.join(invocation) + " <<'RCH_SOURCE_CLAIM_ROOTS'\n"
                    + body(roots).decode() + "RCH_SOURCE_CLAIM_ROOTS\n")
-        process = subprocess.Popen([self.shell, "-c",
-                                    "set -- RCH_SOURCE_CANCELLATION_SETTLED\n" + self.control],
+        contract = ("RCH_SOURCE_AUTHORITY_NAMESPACE" if operation == "locate"
+                    else "RCH_SOURCE_CANCELLATION_SETTLED")
+        process = subprocess.Popen([self.shell, "-c", "set -- " + contract + "\n" + self.control],
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, env=env or self.env)
         process.stdin.write(program.encode())
@@ -725,6 +727,28 @@ class TerminalCancellationSettlementTests(unittest.TestCase):
         process = self.start_settlement(**arguments)
         stdout, stderr = process.communicate(timeout=25)
         return subprocess.CompletedProcess([], process.returncode, stdout, stderr)
+
+    def locate(self, **arguments):
+        return self.settle(operation="locate", expected="", **arguments)
+
+    def make_legacy(self):
+        self.legacy.mkdir()
+        for name in ("released", "cancelled", "quarantine"):
+            (self.legacy / name).mkdir()
+
+    def legacy_transaction(self, operation, token="aa", roots=None):
+        roots = self.roots if roots is None else roots
+        command = [FLOCK, "--exclusive", *FLOCK_NO_FORK, "--",
+                   str(self.legacy / (token + ".activity.lock")),
+                   FLOCK, "--exclusive", *FLOCK_NO_FORK, "--",
+                   str(self.registry / "metadata.lock"),
+                   FLOCK, "--exclusive", *FLOCK_NO_FORK, "--",
+                   str(self.legacy / "metadata.lock"), self.shell, str(self.script),
+                   str(self.legacy), token, digest(roots), operation]
+        return subprocess.run(command, input=body(roots), stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE,
+                              env={**self.env, "RCH_LEGACY_SOURCE_CLAIM_REGISTRY": str(self.registry)},
+                              timeout=20, check=False)
 
     def assert_settled(self, result):
         self.assert_granted(result)
@@ -807,19 +831,108 @@ class TerminalCancellationSettlementTests(unittest.TestCase):
                 self.assertEqual(self.records(), before)
 
     def test_legacy_registry_settles_exact_owner_but_duplicate_namespaces_refuse(self):
-        self.legacy.mkdir()
-        for name in ("released", "cancelled", "quarantine"):
-            (self.legacy / name).mkdir()
+        self.make_legacy()
         marker = self.legacy / ("aa." + digest(self.roots) + ".cancelling")
         marker.write_bytes(body(self.roots))
-        self.assert_settled(self.settle())
+        self.assert_settled(self.settle(expected="legacy"))
         self.assertTrue((self.legacy / "cancelled" / marker.with_suffix(".claim").name).exists())
         self.assertFalse(list(self.registry.glob("*.claim")))
         self.record("aa", self.roots, "cancelling")
         before = self.records()
-        result = self.settle()
+        result = self.settle(expected="legacy")
         self.assert_refused(result)
         self.assertIn(b"2 registries contain identity", result.stderr)
+        self.assertEqual(self.records(), before)
+
+    def test_legacy_binding_retries_cleanup_in_existing_namespace_without_second_receipt(self):
+        self.make_legacy()
+        active = self.legacy / ("aa." + digest(self.roots) + ".claim")
+        active.write_bytes(body(self.roots))
+        before = self.records()
+        for _ in range(2):
+            result = self.locate()
+            self.assert_granted(result)
+            self.assertEqual(result.stdout, b"RCH_SOURCE_AUTHORITY_NAMESPACE legacy\n")
+            self.assertEqual(self.records(), before, "location grants no cleanup authority")
+        result = self.legacy_transaction("cancel")
+        self.assert_granted(result)
+        self.assertEqual(result.stdout, b"owned")
+        self.assertEqual(active.read_bytes(), body(self.roots))
+        self.assert_granted(self.legacy_transaction("finish-cancel"))
+        self.assert_settled(self.settle(expected="legacy"))
+        self.assertFalse(list((self.registry / "cancelled").glob("*")))
+        self.assert_refused(self.legacy_transaction("recover"))
+        self.assert_granted(self.transact("bb", self.roots,
+                           env={**self.env, "RCH_LEGACY_SOURCE_CLAIM_REGISTRY": str(self.legacy)}))
+
+    def test_recorded_namespace_binding_cannot_follow_relocated_evidence(self):
+        self.make_legacy()
+        (self.legacy / ("aa." + digest(self.roots) + ".cancelling")).write_bytes(body(self.roots))
+        before = self.records()
+        result = self.settle(expected="current")
+        self.assert_refused(result)
+        self.assertIn(b"namespace changed from recorded binding", result.stderr)
+        self.assertEqual(self.records(), before)
+
+    def test_namespace_locator_preserves_missing_incomplete_and_conflicting_evidence(self):
+        for state in ("absent", "pending", "torn", "wrong-roots", "active-and-cancelled",
+                      "quarantine", "duplicate", "misplaced", "corrupt-active"):
+            with self.subTest(state=state):
+                self.setUp()
+                if state in ("pending", "torn"):
+                    path = self.record("aa", self.roots, "pending")
+                    if state == "torn":
+                        path.write_bytes(b"interrupted")
+                elif state != "absent":
+                    path = self.record("aa", self.roots)
+                    if state == "corrupt-active":
+                        path.write_bytes(b"invalid")
+                if state == "active-and-cancelled":
+                    (self.registry / "cancelled" / path.name).write_bytes(body(self.roots))
+                if state == "quarantine":
+                    (self.registry / "quarantine" / path.with_suffix(".pending").name).write_bytes(b"torn")
+                if state == "misplaced":
+                    (self.registry / "released" / path.with_suffix(".pending").name).write_bytes(body(self.roots))
+                if state == "duplicate":
+                    self.make_legacy()
+                    (self.legacy / path.name).write_bytes(body(self.roots))
+                before = self.records()
+                result = self.locate(roots=[self.root / "wrong"] if state == "wrong-roots" else None)
+                self.assert_refused(result)
+                self.assertEqual(result.stdout, b"")
+                self.assertEqual(self.records(), before)
+
+    def test_legacy_cleanup_refuses_current_lexical_and_physical_owner(self):
+        for physical in (False, True):
+            with self.subTest(physical=physical):
+                self.setUp()
+                self.make_legacy()
+                self.roots[0].mkdir()
+                other_roots = self.roots
+                if physical:
+                    alias = self.root / "alias"
+                    alias.symlink_to(self.roots[0])
+                    other_roots = [alias]
+                active = self.legacy / ("aa." + digest(self.roots) + ".claim")
+                active.write_bytes(body(self.roots))
+                other = self.record("bb", other_roots)
+                before = self.records()
+                self.assert_granted(self.locate())
+                self.assert_refused(self.legacy_transaction("cancel"))
+                self.assertEqual(self.records(), before)
+                # Terminal metadata reconciliation may coexist with a newer
+                # owner only after the caller proves retirement independently.
+                active.rename(self.legacy / "cancelled" / active.name)
+                self.assert_settled(self.settle(expected="legacy"))
+                self.assertEqual(other.read_bytes(), body(other_roots))
+
+    def test_legacy_cleanup_refuses_incomplete_current_publication_without_quarantine(self):
+        self.make_legacy()
+        (self.legacy / ("aa." + digest(self.roots) + ".claim")).write_bytes(body(self.roots))
+        pending = self.record("bb", self.roots, "pending")
+        pending.write_bytes(b"interrupted")
+        before = self.records()
+        self.assert_refused(self.legacy_transaction("cancel"))
         self.assertEqual(self.records(), before)
 
     def test_misplaced_same_identity_record_is_not_ignored(self):
@@ -899,6 +1012,109 @@ class TerminalCancellationSettlementTests(unittest.TestCase):
         self.assert_refused(result)
         self.assertFalse((self.root / "unrelated").exists())
         self.assertFalse(list((self.registry / "cancelled").glob("*.claim")))
+
+
+@unittest.skipUnless(FLOCK and REALPATH, "native flock and realpath required")
+class LegacyGcGuardTests(unittest.TestCase):
+    """Exercise the production GC admission gate without removing a tree."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="rch-legacy-gc-"))
+        self.current = self.root / "current"
+        self.legacy = self.root / "legacy"
+        for registry in (self.current, self.legacy):
+            registry.mkdir()
+            for name in ("released", "cancelled", "quarantine"):
+                (registry / name).mkdir()
+        self.candidate = self.root / "source-tree"
+        self.candidate.mkdir()
+        self.sentinel = self.candidate / "source.rs"
+        self.sentinel.write_bytes(b"owned source bytes\n")
+        retained = HELPER_SOURCE.split(
+            'pub const RETAINED_SOURCE_GC_GUARD: &str = r#"', 1)[1].split('"#;', 1)[0]
+        gate = HELPER_SOURCE.split(
+            'fn source_claim_gate_fragment(registry: &str) -> String {', 1)[1]
+        gate = gate.split('const GATE: &str = r#"', 1)[1].split('"#;', 1)[0]
+        self.script = "set -u\n" + HELPERS + retained + gate + '''
+__gc_source_registry=$1
+if __gc_source_begin "$2"; then
+    printf 'admitted\n'
+    # Keep the fixture's GC claim as evidence. No removal or retirement is
+    # needed to determine whether the production gate would allow mutation.
+    exit 0
+else
+    exit "$?"
+fi
+'''
+
+    def record(self, roots, suffix="claim", folder=None):
+        path = (folder or self.legacy) / ("aa." + digest(roots) + "." + suffix)
+        path.write_bytes(body(roots))
+        return path
+
+    def snapshot(self):
+        return {str(path.relative_to(self.legacy)):
+                ("link", str(path.readlink())) if path.is_symlink()
+                else ("file", path.read_bytes())
+                for path in self.legacy.rglob("*")
+                if path.is_symlink() or path.is_file()}
+
+    def admit(self):
+        before = self.snapshot()
+        result = subprocess.run(
+            ["/bin/sh", "-c", self.script, "legacy-gc", str(self.current),
+             str(self.candidate)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env={**os.environ, "LC_ALL": "C",
+                 "RCH_LEGACY_SOURCE_CLAIM_REGISTRY": str(self.legacy)},
+            timeout=20, check=False)
+        self.assertEqual(self.snapshot(), before, "legacy evidence must remain read-only")
+        self.assertEqual(self.sentinel.read_bytes(), b"owned source bytes\n")
+        return result
+
+    def test_malformed_legacy_active_claim_refuses_without_discarding_evidence(self):
+        for defect in ("empty", "truncated", "invalid-bytes", "symlink"):
+            with self.subTest(defect=defect):
+                self.setUp()
+                roots = [self.candidate]
+                if defect == "symlink":
+                    target = self.root / "saved-active-record"
+                    target.write_bytes(body(roots))
+                    record = self.legacy / ("aa." + digest(roots) + ".claim")
+                    record.symlink_to(target)
+                else:
+                    record = self.record(roots)
+                    record.write_bytes({"empty": b"", "truncated": body(roots)[:-1],
+                                        "invalid-bytes": b"\xff\x00\n"}[defect])
+                result = self.admit()
+                self.assertEqual(result.returncode, 2, (defect, result.stdout, result.stderr))
+                self.assertEqual(result.stdout, b"")
+                self.assertIn(b"RCH_GC_LEGACY_SOURCE_OWNERSHIP_UNKNOWN", result.stderr)
+                self.assertIn(os.fsencode(record), result.stderr)
+
+    def test_live_legacy_claim_and_activity_hold_candidate(self):
+        self.record([self.candidate])
+        with (self.legacy / "aa.activity.lock").open("a") as activity:
+            fcntl.flock(activity, fcntl.LOCK_EX)
+            result = self.admit()
+            self.assertEqual((result.returncode, result.stdout), (1, b""), result.stderr)
+
+    def test_complete_legacy_pending_record_holds_candidate(self):
+        self.record([self.candidate], "pending")
+        result = self.admit()
+        self.assertEqual((result.returncode, result.stdout), (1, b""), result.stderr)
+
+    def test_valid_disjoint_legacy_claim_allows_candidate(self):
+        self.record([self.root / "other-project"])
+        result = self.admit()
+        self.assertEqual((result.returncode, result.stdout), (0, b"admitted\n"), result.stderr)
+
+    def test_terminal_fences_and_incomplete_pending_do_not_grant_legacy_activity(self):
+        roots = [self.candidate]
+        self.record(roots, "cancelling")
+        self.record(roots, folder=self.legacy / "cancelled")
+        self.record(roots, "pending").write_bytes(b"interrupted publication")
+        result = self.admit()
+        self.assertEqual((result.returncode, result.stdout), (0, b"admitted\n"), result.stderr)
 
 
 if __name__ == "__main__":

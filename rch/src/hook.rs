@@ -5471,7 +5471,7 @@ mod repo_updater;
 // consumes the same items via `crate::hook::ssh`, so the module stays
 // crate-internal (`pub(crate)`) rather than fully private.
 pub(crate) mod ssh;
-pub(crate) use ssh::{source_authority_activity_prefix, source_authority_cleanup_prefix};
+pub(crate) use ssh::SourceAuthorityNamespace;
 
 /// Worker setup can change a shared ancestor of many source trees. Give each
 /// explicit mutation the same durable exclusion and activity draining as a
@@ -5509,9 +5509,21 @@ pub(crate) async fn run_owned_worker_topology_command(
             // its kernel locks. Fence that exact intent before reporting that
             // setup failed; a missing acknowledgment is not absent ownership.
             let cancellation = async {
-                if ssh::cancel_remote_source_authority_intent(worker, &roots, &identity).await? {
-                    ssh::finish_cancel_remote_source_authority_intent(worker, &roots, &identity)
-                        .await?;
+                if ssh::cancel_remote_source_authority_intent(
+                    worker,
+                    &roots,
+                    &identity,
+                    SourceAuthorityNamespace::Current,
+                )
+                .await?
+                {
+                    ssh::finish_cancel_remote_source_authority_intent(
+                        worker,
+                        &roots,
+                        &identity,
+                        SourceAuthorityNamespace::Current,
+                    )
+                    .await?;
                 }
                 Ok::<(), anyhow::Error>(())
             }

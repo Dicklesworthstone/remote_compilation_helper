@@ -41,6 +41,11 @@ pub(crate) struct RecoveryRecipe {
     identity: String,
     completion: String,
     source_roots: Vec<String>,
+    /// Current admissions record this before any worker request. Legacy
+    /// journals discover one exact registry and persist it before recovery
+    /// mutates a claim, pair, source tree, or cancellation receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_authority_namespace: Option<SourceAuthorityNamespace>,
     pair: Option<(String, String)>,
     retire_root: Option<String>,
     /// An owned source pair retires by moving to this exact sibling. Persist
@@ -958,6 +963,7 @@ impl RecoverySession {
             identity,
             completion,
             source_roots,
+            source_authority_namespace: Some(SourceAuthorityNamespace::Current),
             pair,
             retire_root,
             retained_root,
@@ -1025,6 +1031,7 @@ impl RecoverySession {
         anyhow::ensure!(
             intent.version == 2
                 && intent.identity == identity
+                && intent.source_authority_namespace == Some(SourceAuthorityNamespace::Current)
                 && intent.wrapper_id == lease.identity.local_wrapper_id
                 && Some(intent.build_id) == lease.identity.remote_build_id
                 && intent.worker.id == worker.id
@@ -1136,6 +1143,7 @@ impl RecoverySession {
             identity,
             completion,
             source_roots,
+            source_authority_namespace: Some(SourceAuthorityNamespace::Current),
             pair,
             retire_root,
             retained_root,
@@ -2275,9 +2283,94 @@ impl RecoverySession {
         next_recipe.sources_released = true;
         self.persist_next_recipe(next_recipe)
     }
+
+    async fn bind_source_namespace(&mut self) -> anyhow::Result<SourceAuthorityNamespace> {
+        self.bind_source_namespace_with(async |worker, roots, identity| {
+            super::super::ssh::locate_remote_source_authority_namespace(worker, roots, identity)
+                .await
+        })
+        .await
+    }
+
+    async fn bind_source_namespace_with(
+        &mut self,
+        mut locate: impl AsyncFnMut(
+            &WorkerConfig,
+            &[String],
+            &str,
+        ) -> anyhow::Result<SourceAuthorityNamespace>,
+    ) -> anyhow::Result<SourceAuthorityNamespace> {
+        if let Some(namespace) = self.recipe.source_authority_namespace {
+            return Ok(namespace);
+        }
+        anyhow::ensure!(
+            !self.recipe.source_roots.is_empty(),
+            "legacy source namespace has no complete source intent; refusing to guess from pair metadata"
+        );
+        let before = self.writer.snapshot();
+        anyhow::ensure!(
+            serde_json::to_value(load_recipe(&self.writer)?)?
+                == serde_json::to_value(&self.recipe)?,
+            "source recovery recipe changed before namespace discovery"
+        );
+        if let Some(owner) = &self.writer.recovery_ownership {
+            owner.verify()?;
+        }
+        let namespace = locate(
+            &self.recipe.worker,
+            &self.recipe.source_roots,
+            &self.recipe.identity,
+        )
+        .await?;
+        let mut latest = self.writer.snapshot();
+        latest.heartbeat_unix_ms = before.heartbeat_unix_ms;
+        latest.phase.clone_from(&before.phase);
+        anyhow::ensure!(
+            latest == before,
+            "journal changed during source namespace discovery"
+        );
+        if let Some(owner) = &self.writer.recovery_ownership {
+            owner.verify()?;
+        }
+        // Add only the discovered binding. Preserve unknown legacy custody
+        // fields and original path spellings rather than reserializing them.
+        let mut recovery = before
+            .recovery
+            .context("source recovery recipe disappeared")?;
+        recovery
+            .as_object_mut()
+            .context("source recovery recipe is not an object")?
+            .insert(
+                "source_authority_namespace".into(),
+                serde_json::to_value(namespace)?,
+            );
+        self.writer.set_recovery(recovery)?;
+        self.recipe.source_authority_namespace = Some(namespace);
+        Ok(namespace)
+    }
+
     async fn reconcile_source_cancellation(&mut self) -> anyhow::Result<()> {
+        if self.recipe.source_cancellation_settled == Some(true)
+            || (!self.recipe.preparation_cancelled
+                && self.recipe.source_cancellation_settled.is_none())
+        {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            self.recipe.returned.is_some_and(|exit| exit != 0)
+                && self.recipe.sources_released
+                && self.recipe.tree_retired
+                && self.recipe.pair_released,
+            "source cancellation settlement requires durable failed delivery and complete resource retirement"
+        );
+        let namespace = if self.recipe.source_roots.is_empty() {
+            SourceAuthorityNamespace::Current // No worker operation is performed.
+        } else {
+            self.bind_source_namespace().await?
+        };
         self.reconcile_source_cancellation_with(async |worker, roots, identity| {
-            super::super::ssh::settle_remote_source_cancellation(worker, roots, identity).await
+            super::super::ssh::settle_remote_source_cancellation(worker, roots, identity, namespace)
+                .await
         })
         .await
     }
@@ -2396,11 +2489,23 @@ impl RecoverySession {
             self.recipe.returned.is_some(),
             "cannot retire outputs before durable return"
         );
+        let namespace = if (!self.recipe.sources_released && !self.recipe.source_roots.is_empty())
+            || (!self.recipe.pair_released && self.recipe.pair.is_some())
+            || (!self.recipe.tree_retired && self.recipe.retire_root.is_some())
+        {
+            self.bind_source_namespace().await?
+        } else {
+            self.recipe
+                .source_authority_namespace
+                .unwrap_or(SourceAuthorityNamespace::Current)
+        };
         let worker = self.recipe.worker.clone();
         let mut pair = if !self.recipe.pair_released {
             if let Some((root, token)) = self.recipe.pair.clone() {
-                if super::super::ssh::clean_overlay_source_pair_was_released(&worker, &root, &token)
-                    .await?
+                if super::super::ssh::clean_overlay_source_pair_was_released(
+                    &worker, &root, &token, namespace,
+                )
+                .await?
                 {
                     self.pair_released()?;
                     None
@@ -2411,6 +2516,7 @@ impl RecoverySession {
                             &root,
                             &token,
                             Duration::from_secs(15),
+                            namespace,
                         )
                         .await?,
                     )
@@ -2427,6 +2533,7 @@ impl RecoverySession {
             &worker,
             &self.recipe.source_roots,
             &self.recipe.identity,
+            namespace,
         )
         .await?
         {
@@ -2446,6 +2553,7 @@ impl RecoverySession {
                     pair.as_mut(),
                     &self.recipe.identity,
                     Duration::from_secs(15),
+                    namespace,
                 )
                 .await?,
             )
@@ -2471,7 +2579,7 @@ impl RecoverySession {
                         self.recipe.identity.clone(),
                         self.recipe.transfer.clone(),
                     )
-                    .with_source_authority(self.recipe.identity.clone())?,
+                    .with_source_authority_in(self.recipe.identity.clone(), namespace)?,
                 );
                 self.collect_cargo_stderr(&pipeline, &worker).await?;
             }
@@ -2482,7 +2590,7 @@ impl RecoverySession {
                 self.recipe.identity.clone(),
                 self.recipe.transfer.clone(),
             )
-            .with_source_authority(self.recipe.identity.clone())?;
+            .with_source_authority_in(self.recipe.identity.clone(), namespace)?;
             self.retire_source_tree(&pipeline).await?;
         }
         if let Some(sources) = sources.take() {
@@ -2736,11 +2844,13 @@ async fn cancel_source_grant(mut session: RecoverySession) -> anyhow::Result<boo
     let mut next_recipe = session.recipe.clone();
     next_recipe.source_cancellation_settled = Some(false);
     session.persist_next_recipe(next_recipe)?;
+    let namespace = session.bind_source_namespace().await?;
     let worker = session.recipe.worker.clone();
     let owned = super::super::ssh::cancel_remote_source_authority_intent(
         &worker,
         &session.recipe.source_roots,
         &session.recipe.identity,
+        namespace,
     )
     .await?;
     let mut pair = if let Some((root, token)) = session.recipe.pair.clone() {
@@ -2749,6 +2859,7 @@ async fn cancel_source_grant(mut session: RecoverySession) -> anyhow::Result<boo
             &root,
             &token,
             Duration::from_secs(15),
+            namespace,
         )
         .await?
     } else {
@@ -2771,7 +2882,7 @@ async fn cancel_source_grant(mut session: RecoverySession) -> anyhow::Result<boo
             session.recipe.identity.clone(),
             session.recipe.transfer.clone(),
         )
-        .with_source_authority_cleanup(session.recipe.identity.clone())?;
+        .with_source_authority_cleanup(session.recipe.identity.clone(), namespace)?;
         session.retire_source_tree(&pipeline).await?;
         if let Some(pair) = pair.take() {
             pair.release().await?;
@@ -2780,6 +2891,7 @@ async fn cancel_source_grant(mut session: RecoverySession) -> anyhow::Result<boo
             &worker,
             &session.recipe.source_roots,
             &session.recipe.identity,
+            namespace,
         )
         .await?;
     }
@@ -2949,6 +3061,23 @@ async fn retire_already_released_source_grant(
     daemon: &mut impl AsyncFnMut(&str) -> anyhow::Result<String>,
     observed_exit: Option<i32>,
 ) -> anyhow::Result<i32> {
+    retire_already_released_source_grant_with(
+        session,
+        writer,
+        daemon,
+        observed_exit,
+        async |session| session.reconcile_source_cancellation().await,
+    )
+    .await
+}
+
+async fn retire_already_released_source_grant_with(
+    session: &mut RecoverySession,
+    writer: &DurableLeaseWriter,
+    daemon: &mut impl AsyncFnMut(&str) -> anyhow::Result<String>,
+    observed_exit: Option<i32>,
+    mut reconcile: impl AsyncFnMut(&mut RecoverySession) -> anyhow::Result<()>,
+) -> anyhow::Result<i32> {
     if let Some(exit) = observed_exit {
         session.completed(exit)?;
     }
@@ -2980,6 +3109,10 @@ async fn retire_already_released_source_grant(
         session.sources_released()?;
     }
     session.returned(retired_exit)?;
+    // Cancellation may have durably released the worker before the process
+    // died between sources_released and returned. Complete its remaining
+    // metadata obligation before the retirement/acknowledgement gates.
+    reconcile(session).await?;
     session.retired()?;
     session.discard_completion_receipts().await;
     writer.record_exit(retired_exit)?;
@@ -3000,11 +3133,13 @@ async fn settle_already_released_source_grant(
         return Ok(None);
     }
     let worker = session.recipe.worker.clone();
+    let namespace = session.bind_source_namespace().await?;
     if !session.recipe.sources_released
         && !super::super::ssh::remote_source_authority_was_released(
             &worker,
             &session.recipe.source_roots,
             &session.recipe.identity,
+            namespace,
         )
         .await?
     {
@@ -3012,8 +3147,10 @@ async fn settle_already_released_source_grant(
     }
     if !session.recipe.pair_released
         && let Some((root, token)) = session.recipe.pair.clone()
-        && !super::super::ssh::clean_overlay_source_pair_was_released(&worker, &root, &token)
-            .await?
+        && !super::super::ssh::clean_overlay_source_pair_was_released(
+            &worker, &root, &token, namespace,
+        )
+        .await?
     {
         return Ok(None);
     }
@@ -3142,6 +3279,7 @@ async fn recover_owned_job_with_daemon(
         return retire_already_released_source_grant(&mut session, writer, &mut daemon, None).await;
     }
     let worker = session.recipe.worker.clone();
+    let namespace = session.bind_source_namespace().await?;
     let base = TransferPipeline::new(
         session.recipe.project_root.clone(),
         "recovery".into(),
@@ -3159,6 +3297,7 @@ async fn recover_owned_job_with_daemon(
                 &worker,
                 &session.recipe.identity,
                 &session.recipe.completion,
+                namespace,
             )
             .await?
         {
@@ -3194,6 +3333,7 @@ async fn recover_owned_job_with_daemon(
             &worker,
             &session.recipe.source_roots,
             &session.recipe.identity,
+            namespace,
         )
         .await?
     {
@@ -3220,6 +3360,7 @@ async fn recover_owned_job_with_daemon(
                 root,
                 token,
                 Duration::from_secs(15),
+                namespace,
             )
             .await?,
         )
@@ -3232,9 +3373,10 @@ async fn recover_owned_job_with_daemon(
         pair.as_mut(),
         &session.recipe.identity,
         Duration::from_secs(15),
+        namespace,
     )
     .await?;
-    let base = base.with_source_authority(session.recipe.identity.clone())?;
+    let base = base.with_source_authority_in(session.recipe.identity.clone(), namespace)?;
     session.completed(exit)?;
     let command_exit = exit;
     session.collect_cargo_stderr(&base, &worker).await?;
@@ -3561,6 +3703,154 @@ mod tests {
         )
         .unwrap();
         (directory, writer, worker)
+    }
+
+    #[tokio::test]
+    async fn new_source_intent_is_bound_before_worker_admission() {
+        let (_directory, writer, _) = preparation_fixture();
+        assert_eq!(
+            writer.snapshot().recovery.as_ref().unwrap()["source_authority_namespace"],
+            "current"
+        );
+        let before = std::fs::read(&writer.path).unwrap();
+        let mut session = RecoverySession {
+            recipe: load_recipe(&writer).unwrap(),
+            writer: writer.clone(),
+        };
+        assert_eq!(
+            session
+                .bind_source_namespace_with(async |_, _, _| {
+                    panic!("a persisted admission binding must never rediscover another namespace")
+                })
+                .await
+                .unwrap(),
+            SourceAuthorityNamespace::Current
+        );
+        assert_eq!(std::fs::read(&writer.path).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_namespace_binding_preserves_original_evidence_and_survives_reload() {
+        for namespace in [
+            SourceAuthorityNamespace::Current,
+            SourceAuthorityNamespace::Legacy,
+        ] {
+            let (_directory, writer) = terminal_cancellation_fixture();
+            let mut original = writer.snapshot().recovery.unwrap();
+            original
+                .as_object_mut()
+                .unwrap()
+                .remove("source_authority_namespace");
+            original["source_roots"] = serde_json::json!(["/data//projects/source-recovery/"]);
+            original["future_custody"] = serde_json::json!({"keep": true});
+            writer.set_recovery(original.clone()).unwrap();
+            let owned = recovery_owner::claim(&writer).await.unwrap();
+            let mut session = RecoverySession {
+                recipe: load_recipe(&owned).unwrap(),
+                writer: owned.clone(),
+            };
+            assert_eq!(
+                session
+                    .bind_source_namespace_with(async |_, roots, identity| {
+                        assert_eq!(roots, &["/data/projects/source-recovery"]);
+                        assert_eq!(identity, "0123456789abcdef0123456789abcdef");
+                        Ok(namespace)
+                    })
+                    .await
+                    .unwrap(),
+                namespace
+            );
+            original["source_authority_namespace"] = serde_json::to_value(namespace).unwrap();
+            assert_eq!(owned.snapshot().recovery.unwrap(), original);
+            drop(session);
+            drop(owned);
+            let reloaded = DurableLeaseWriter {
+                path: writer.path.clone(),
+                recovery_ownership: None,
+                lease: Arc::new(Mutex::new(
+                    DurableLeaseWriter::read_journal(&writer.path, &writer.wrapper_id()).unwrap(),
+                )),
+            };
+            let owned = recovery_owner::claim(&reloaded).await.unwrap();
+            let mut session = RecoverySession {
+                recipe: load_recipe(&owned).unwrap(),
+                writer: owned.clone(),
+            };
+            assert_eq!(
+                session
+                    .bind_source_namespace_with(async |_, _, _| {
+                        panic!("restart must reuse the recorded namespace")
+                    })
+                    .await
+                    .unwrap(),
+                namespace
+            );
+            assert_eq!(owned.snapshot().recovery.unwrap(), original);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn namespace_binding_refuses_ambiguous_inventory_changed_journal_and_lost_owner() {
+        for failure in ["inventory", "journal", "owner"] {
+            let (directory, writer) = terminal_cancellation_fixture();
+            let mut original = writer.snapshot().recovery.unwrap();
+            original
+                .as_object_mut()
+                .unwrap()
+                .remove("source_authority_namespace");
+            writer.set_recovery(original.clone()).unwrap();
+            let owned = recovery_owner::claim(&writer).await.unwrap();
+            let before = std::fs::read(&writer.path).unwrap();
+            let mut session = RecoverySession {
+                recipe: load_recipe(&owned).unwrap(),
+                writer: owned.clone(),
+            };
+            let result = session
+                .bind_source_namespace_with(async |_, _, _| {
+                    match failure {
+                        "inventory" => anyhow::bail!("ambiguous worker identity"),
+                        "journal" => {
+                            let mut changed = original.clone();
+                            changed["identity"] = serde_json::json!("abcdef");
+                            owned.set_recovery(changed)?;
+                        }
+                        "owner" => {
+                            std::fs::hard_link(
+                                owned.path.with_extension("recovery.lock"),
+                                directory.path().join("extra-owner-link"),
+                            )?;
+                        }
+                        _ => unreachable!(),
+                    }
+                    Ok(SourceAuthorityNamespace::Legacy)
+                })
+                .await;
+            assert!(result.is_err(), "{failure}");
+            assert_eq!(session.recipe.source_authority_namespace, None);
+            assert!(
+                owned.snapshot().recovery.as_ref().unwrap()["source_authority_namespace"].is_null()
+            );
+            if failure != "journal" {
+                assert_eq!(std::fs::read(&writer.path).unwrap(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_source_namespace_never_enters_recovery() {
+        for value in [
+            serde_json::json!("tmp"),
+            serde_json::json!(true),
+            serde_json::json!({"current": true}),
+        ] {
+            let (_directory, writer, _) = preparation_fixture();
+            let mut recipe = writer.snapshot().recovery.unwrap();
+            recipe["source_authority_namespace"] = value;
+            writer.set_recovery(recipe).unwrap();
+            assert!(load_recipe(&writer).is_err());
+        }
     }
 
     fn terminal_cancellation_fixture() -> (tempfile::TempDir, DurableLeaseWriter) {
@@ -7429,10 +7719,11 @@ mod tests {
     #[tokio::test]
     async fn already_released_source_grant_settles_without_reopening_worker_paths() {
         let _guard = test_guard!();
-        for (observed_exit, expected_exit) in [
-            (None, EXIT_BUILD_ERROR),
-            (Some(0), EXIT_ARTIFACT_TRANSFER_FAILED),
-            (Some(101), 101),
+        for (observed_exit, expected_exit, pending_cancellation) in [
+            (None, EXIT_BUILD_ERROR, false),
+            (Some(0), EXIT_ARTIFACT_TRANSFER_FAILED, false),
+            (Some(101), 101, false),
+            (None, EXIT_BUILD_ERROR, true),
         ] {
             let mut wrapper = std::process::Command::new("/usr/bin/true").spawn().unwrap();
             let wrapper_pid = wrapper.id();
@@ -7445,6 +7736,12 @@ mod tests {
             };
             session.recipe.prepared = true;
             session.starting_execution().unwrap();
+            if pending_cancellation {
+                session.recipe.sources_released = true;
+                session.recipe.tree_retired = true;
+                session.recipe.pair_released = true;
+            }
+            session.recipe.source_cancellation_settled = pending_cancellation.then_some(false);
             {
                 let mut lease = session.writer.lease.lock().unwrap();
                 lease.wrapper_pid = wrapper_pid;
@@ -7474,14 +7771,53 @@ mod tests {
                     })
                 ))
             };
-            let retired = retire_already_released_source_grant(
+            let worker_calls = std::cell::Cell::new(0);
+            let result = retire_already_released_source_grant_with(
                 &mut claimed_session,
                 &owned,
                 &mut daemon,
                 observed_exit,
+                async |session| {
+                    // The worker boundary is a unit input here. Native worker
+                    // qualifications exercise the actual registry coordinator.
+                    assert_eq!(session.recipe.returned, Some(expected_exit));
+                    session
+                        .reconcile_source_cancellation_with(async |_, _, _| {
+                            worker_calls.set(worker_calls.get() + 1);
+                            anyhow::bail!("interrupted worker settlement reply")
+                        })
+                        .await
+                },
             )
-            .await
-            .unwrap();
+            .await;
+            let retired = if pending_cancellation {
+                assert!(result.is_err());
+                let checkpoint = load_recipe(&owned).unwrap();
+                assert_eq!(checkpoint.returned, Some(expected_exit));
+                assert_eq!(checkpoint.source_cancellation_settled, Some(false));
+                assert!(!checkpoint.retired);
+                assert!(!owned.snapshot().terminal_acknowledged);
+                claimed_session.recipe = checkpoint;
+                retire_already_released_source_grant_with(
+                    &mut claimed_session,
+                    &owned,
+                    &mut daemon,
+                    None,
+                    async |session| {
+                        session
+                            .reconcile_source_cancellation_with(async |_, _, _| {
+                                worker_calls.set(worker_calls.get() + 1);
+                                Ok(())
+                            })
+                            .await
+                    },
+                )
+                .await
+                .unwrap()
+            } else {
+                result.unwrap()
+            };
+            assert_eq!(worker_calls.get(), if pending_cancellation { 2 } else { 0 });
             assert_eq!(retired, expected_exit);
             let settled_lease = owned.snapshot();
             assert!(settled_lease.terminal_acknowledged);
@@ -7492,6 +7828,10 @@ mod tests {
             assert!(settled_recipe.sources_released);
             assert!(settled_recipe.retired);
             assert_eq!(settled_recipe.returned, Some(expected_exit));
+            assert_eq!(
+                settled_recipe.source_cancellation_settled,
+                pending_cancellation.then_some(true)
+            );
         }
     }
 

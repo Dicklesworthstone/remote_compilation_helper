@@ -1,9 +1,10 @@
-"""Lock and select an exact terminal source cancellation, including old workers.
+"""Locate exact source ownership or settle a terminal cancellation.
 
 The dispatcher calls this only under its durable recovery journal ownership,
-after validating the identity and completed source/tree/pair retirement. This
-program supplies the independent worker evidence; it never inspects source
-trees. The existing shell transaction is the sole registry state machine.
+before recording a missing namespace binding, or after validating completed
+source/tree/pair retirement. Location grants no source access. Settlement
+requires the previously recorded binding. This program never inspects source
+trees; the shell transaction remains the sole registry state machine.
 """
 import errno
 import fcntl
@@ -34,9 +35,13 @@ def private(info, directory=False):
 
 
 def main():
-    if len(sys.argv) != 6:
+    if len(sys.argv) != 8:
         refuse("invalid settlement request")
-    current, legacy, token, digest, transaction = sys.argv[1:]
+    current, legacy, token, digest, transaction, operation, expected = sys.argv[1:]
+    if ((operation == "locate" and expected != "")
+            or (operation == "settle-cancel" and expected not in ("current", "legacy"))
+            or operation not in ("locate", "settle-cancel")):
+        refuse("invalid source authority namespace request")
     if not re.fullmatch(r"[a-f0-9-]{1,128}", token) or not re.fullmatch(r"[a-f0-9]{64}", digest):
         refuse("invalid settlement identity")
     roots = sys.stdin.buffer.read(32 * 1024 * 1024 + 1)
@@ -141,13 +146,16 @@ def main():
             candidates.append(path)
     if len(candidates) != 1:
         refuse("{} registries contain identity={}; expected exactly one".format(len(candidates), token))
+    selected = "current" if candidates[0] == current else "legacy"
+    if operation == "settle-cancel" and selected != expected:
+        refuse("source authority namespace changed from recorded binding")
     verify()
     # The caller runs this program inside source_namespace_control's owned
     # process group. Its independent 15-second deadline kills ALL descendants
     # (including helpers inheriting these descriptors) before acknowledging
     # success or failure. A direct-child subprocess timeout would strand them.
     process = subprocess.Popen(
-        ["sh", "-c", transaction, "rch-source-settlement", candidates[0], token, digest, "settle-cancel"],
+        ["sh", "-c", transaction, "rch-source-settlement", candidates[0], token, digest, operation],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         pass_fds=tuple(item[2] for item in locks),
     )
@@ -156,13 +164,16 @@ def main():
     # One byte beyond the only valid response bounds memory and detects extra
     # output. Stderr is independently bounded by the outer metadata controller.
     reply = process.stdout.read(8)
-    if reply != b"settled":
+    if reply != (b"located" if operation == "locate" else b"settled"):
         refuse("invalid worker settlement response identity=" + token)
     status = process.wait()
     verify()
     if status != 0:
         refuse("worker transaction did not confirm exact cancellation identity=" + token)
-    sys.stdout.write("RCH_SOURCE_CANCELLATION_SETTLED\n")
+    if operation == "locate":
+        sys.stdout.write("RCH_SOURCE_AUTHORITY_NAMESPACE " + selected + "\n")
+    else:
+        sys.stdout.write("RCH_SOURCE_CANCELLATION_SETTLED\n")
 
 
 try:

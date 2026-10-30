@@ -113,6 +113,9 @@ New cancellations persist `source_cancellation_settled=false` before contacting
 the worker. Only an exact worker settlement reply allows the journal to record
 `true`; a failed journal publication remains retryable. A new terminal
 acknowledgement or readmission cannot discard an unresolved cancellation.
+Recovery also resumes settlement if source retirement reached the journal but
+the dispatcher stopped before recording the failed returned result. Persisted
+resource retirement does not bypass an outstanding cancellation obligation.
 Older preparation cancellations without this field also enter reconciliation.
 The daemon's existing recovery service considers eligible acknowledged
 cancellations normally after a 15-minute scheduling grace, retaining its
@@ -169,6 +172,7 @@ or the word `Killed` alone:
 | `RCH_SOURCE_LOCK_HEARTBEAT_EXPIRED`, `RCH_SOURCE_LOCK_DISCONNECTED`, or `RCH_SOURCE_LOCK_RELEASE_TIMEOUT` | The control session expired or lost its release protocol. Durable ownership remains for recovery. |
 | `RCH_SOURCE_LOCK_PROCESS_TERMINATED` or `RCH_SOURCE_LOCK_SUPERVISOR_TERMINATED` | The holder or its supervisor terminated. A process exit alone does not authorize retiring the durable claim. |
 | `RCH_SOURCE_CANCELLATION_UNSETTLED` | Worker evidence or its lock namespace could not be verified. The accompanying reason identifies what must be resolved before retrying. |
+| `RCH_GC_LEGACY_SOURCE_OWNERSHIP_UNKNOWN` | A legacy active claim is malformed or unsafe to read. GC cannot prove the candidate unowned and preserves both the record and source tree. |
 
 #### Bounded POSIX control-session liveness
 
@@ -185,6 +189,19 @@ does not require the [`os.waitid`](https://docs.python.org/3.13/library/os.html#
 interface missing from older macOS Python.
 Child notifications trigger teardown of the still-owned session, and only its
 completion receipt can establish a successful result.
+The child session unblocks `SIGCHLD` even when the invoking environment had it
+blocked; only the observer retains its blocked notification mask. Timer death
+is observed before reaping, so descendants cannot retain metadata locks after
+an acknowledged controller teardown. An exit code of 137 alone is not a
+teardown acknowledgement.
+
+Finite cancellation, cancellation-finish and release/receipt RPCs, including
+pair reconciliation, run inside the same bounded metadata controller as
+namespace initialization. Its worker-side execution budget is 15 seconds with
+one-second escalation; output delivery has its own two-second budget. A local
+SSH timeout alone is insufficient: a queued worker `flock` must not wake after
+the caller disappears and publish a late cancellation. Only the exact expected
+reply, including an empty finish reply, is accepted after confirmed teardown.
 
 Expiry releases control-session descriptors while retaining active claims,
 cancellation fences, pair ownership and receipts. Separately launched compiler
@@ -202,11 +219,28 @@ an older dispatcher's control-session behavior.
 
 #### Legacy registries and remaining acceptance
 
-Terminal recovery inspects existing current
+New journals persist `source_authority_namespace=current` before acquisition.
+An older journal without this field first locates exact evidence in the current
 `/var/tmp/rch-source-authority-locks/claims-v1` and legacy
-`/tmp/rch-source-authority-locks/claims-v1` registries. It does not initialize an
-absent registry to manufacture evidence. A matching identity in both registries
-is ambiguous and is retained for investigation. Old executed-but-lost
+`/tmp/rch-source-authority-locks/claims-v1` registries. Discovery takes the
+identity's activity locks before both metadata locks, validates and reconfirms
+the records, and grants no source access. Recovery checkpoints the discovered
+`current` or `legacy` binding under exclusive journal ownership before issuing
+cancellation, cleanup, pair recovery or release probes. The binding cannot
+change on a later retry. Source and pair hierarchy locks, activity checks and
+retention-prefix checks all use the recorded namespace.
+
+Discovery does not initialize an absent registry to manufacture ownership
+evidence. A matching identity in both registries, an incomplete pending write,
+missing evidence or changed binding is retained and refused. Legacy cleanup
+transactions take current metadata before legacy metadata and check competing
+lexical and physical claims before authorizing cleanup; the valid legacy active
+claim remains until cleanup finishes. Creating empty current lock-directory
+plumbing for this ordering does not create a claim or cancellation receipt.
+A legacy pair-only intent without a source-registry record remains refused:
+its namespace cannot be guessed from the present layout.
+
+Old executed-but-lost
 cancellations that recorded neither `preparation_cancelled` nor the new
 settlement field cannot safely be identified from their exit code alone.
 
@@ -225,6 +259,25 @@ the two reported terminal records alone do not explain a fresh identity's
 namespace refusal. Preserve that distinction when evaluating the repair.
 The separate retrieval-staging work tracked by `bd-ra5aw` does not resolve this
 incident by itself.
+
+The October 30 isolated Linux qualification passed 235 regressions: 76 source
+registry/legacy-GC cases, 31 earlier registry cases, 65 holder cases, 28 control
+cases, 11 native-timer cases, three delivery cases, 13 process-group cases and
+eight real loopback OpenSSH cases. The SSH suite uses fixture-owned keys and
+strict host verification; heartbeat fault cases select a two-second idle lease,
+while queued cancellation uses the shipped 15-second execution deadline. It
+checks retained claim bytes/inodes, independent activity and absence of late
+publication after unlocking. Run it with
+`python3 scripts/tests/test_source_ownership_ssh.py` on an isolated Linux host
+where the test user may start `sshd`.
+
+Pinned workspace `cargo fmt --check` passed. The full locked workspace check
+was terminated by SIGKILL while compiling the unchanged `asupersync 0.5.0`
+dependency in an environment limited to 8 GiB; it did not establish a compiler
+verdict for the changed Rust integration. Rust checks, Clippy and execution of
+the recovery/lease regressions remain required before release acceptance.
+The Linux process and SSH results do not stand in for those Rust gates or for
+the original affected worker's acceptance.
 
 Before calling the incident resolved on the fleet, record the exact dispatcher
 and worker revisions and complete these acceptance cases on isolated native

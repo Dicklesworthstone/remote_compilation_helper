@@ -626,6 +626,13 @@ marker may remain after success to fence delayed requests for the old token;
 its presence alone does not block a new token. Missing or conflicting evidence
 remains an error rather than permission to remove records.
 
+Recovery records the source registry namespace as part of its durable recipe.
+For older journals it first verifies exact worker evidence and checkpoints the
+current or legacy binding before cancellation or cleanup. This keeps recovery
+on the original registry and lock hierarchy instead of creating a contradictory
+receipt in a newer namespace. Ambiguous or incomplete evidence remains refused;
+cleanup also checks for competing lexical and physical owners.
+
 New POSIX source-lock sessions send heartbeats every 10 seconds and expire after
 90 seconds without a complete heartbeat, subject to worker process scheduling
 and termination. Expiry retains durable ownership and leaves separately running

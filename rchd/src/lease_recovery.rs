@@ -119,6 +119,25 @@ fn verify_recovery_completion(
     {
         return Err("recovery journal identity changed; completion not confirmed".into());
     }
+    let before_namespace =
+        before.recovery.as_ref().map_or(
+            &serde_json::Value::Null,
+            |recipe| &recipe["source_authority_namespace"],
+        );
+    let after_namespace =
+        after.recovery.as_ref().map_or(
+            &serde_json::Value::Null,
+            |recipe| &recipe["source_authority_namespace"],
+        );
+    let valid_namespace = |value: &serde_json::Value| {
+        value.is_null() || matches!(value.as_str(), Some("current" | "legacy"))
+    };
+    if !valid_namespace(before_namespace)
+        || !valid_namespace(after_namespace)
+        || (!before_namespace.is_null() && before_namespace != after_namespace)
+    {
+        return Err("source ownership namespace changed or is malformed".into());
+    }
     if terminal_cancellation_unsettled(before) {
         // This lease already completed daemon accounting. The only remaining
         // obligation is worker cancellation; a zero CLI exit with the old
@@ -128,6 +147,10 @@ fn verify_recovery_completion(
             return Err("terminal cancellation lost its recovery recipe".into());
         };
         if after_recipe["source_cancellation_settled"].as_bool() != Some(true)
+            || (after_recipe["source_roots"]
+                .as_array()
+                .is_some_and(|roots| !roots.is_empty())
+                && !matches!(after_namespace.as_str(), Some("current" | "legacy")))
             || !after.terminal_acknowledged
             || after.state != before.state
             || after.exit_code != before.exit_code
@@ -1047,10 +1070,15 @@ mod tests {
         assert!(verify_recovery_completion(&before, &before).is_err());
         let mut after = before.clone();
         after.recovery.as_mut().unwrap()["source_cancellation_settled"] = serde_json::json!(true);
+        after.recovery.as_mut().unwrap()["source_authority_namespace"] =
+            serde_json::json!("current");
         verify_recovery_completion(&before, &after).unwrap();
         for (key, value) in [
             ("source_cancellation_settled", serde_json::json!("true")),
             ("source_cancellation_settled", serde_json::json!(false)),
+            ("source_authority_namespace", serde_json::json!(null)),
+            ("source_authority_namespace", serde_json::json!("elsewhere")),
+            ("source_authority_namespace", serde_json::json!(false)),
             ("identity", serde_json::json!("another-attempt")),
             ("source_roots", serde_json::json!(["/another-project"])),
             (
@@ -1070,6 +1098,36 @@ mod tests {
         let mut changed = after;
         changed.exit_code = Some(0);
         assert!(verify_recovery_completion(&before, &changed).is_err());
+    }
+
+    #[test]
+    fn terminal_recovery_can_bind_legacy_namespace_but_never_change_it() {
+        for namespace in ["current", "legacy"] {
+            let before = terminal_cancellation_lease(1, 11);
+            let mut after = before.clone();
+            after.recovery.as_mut().unwrap()["source_cancellation_settled"] =
+                serde_json::json!(true);
+            after.recovery.as_mut().unwrap()["source_authority_namespace"] =
+                serde_json::json!(namespace);
+            verify_recovery_completion(&before, &after).unwrap();
+            let mut bound = before;
+            bound.recovery.as_mut().unwrap()["source_authority_namespace"] =
+                serde_json::json!(namespace);
+            verify_recovery_completion(&bound, &after).unwrap();
+            after.recovery.as_mut().unwrap()["source_authority_namespace"] =
+                serde_json::json!(if namespace == "current" {
+                    "legacy"
+                } else {
+                    "current"
+                });
+            assert!(verify_recovery_completion(&bound, &after).is_err());
+        }
+        let mut empty = terminal_cancellation_lease(1, 11);
+        empty.recovery.as_mut().unwrap()["source_roots"] = serde_json::json!([]);
+        let mut settled = empty.clone();
+        settled.recovery.as_mut().unwrap()["source_cancellation_settled"] = serde_json::json!(true);
+        verify_recovery_completion(&empty, &settled).unwrap();
+        assert!(settled.recovery.as_ref().unwrap()["source_authority_namespace"].is_null());
     }
 
     #[test]

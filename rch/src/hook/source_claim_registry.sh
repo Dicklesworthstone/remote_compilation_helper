@@ -299,6 +299,7 @@ check_held_claims() {
         [ -e "$held" ] || [ -L "$held" ] || continue
         case "$held" in *.pending)
             if ! rch_claim_record_valid "$held"; then
+                [ "$operation" != cancel ] || refuse 'incomplete competing source publication'
                 rch_claim_quarantine_pending "$registry" "$held" || refuse 'cannot quarantine pending claim'
                 continue
             fi
@@ -306,7 +307,7 @@ check_held_claims() {
         esac
         validate_record "$held"
         case "${held##*/}" in "$token".*)
-            [ "$operation" = recover ] || refuse 'source identity already claimed'
+            case "$operation" in recover|cancel) ;; *) refuse 'source identity already claimed' ;; esac
             [ "$held" = "$active" ] || [ "$held" = "$pending" ] || refuse 'source identity roots changed'
             matches_request "$held"
             continue
@@ -328,14 +329,15 @@ ${held##*/}"
         for held in "$legacy_registry"/*.claim "$legacy_registry"/*.pending; do
             [ -e "$held" ] || [ -L "$held" ] || continue
             case "$held" in *.pending)
-                rch_claim_record_valid "$held" || continue
+                if ! rch_claim_record_valid "$held"; then
+                    [ "$operation" != cancel ] || refuse 'incomplete competing source publication'
+                    continue
+                fi
                 ;;
             esac
             validate_record "$held"
             case "${held##*/}" in "$token".*)
-                [ "$operation" = recover ] || refuse 'source identity already claimed'
-                matches_request "$held"
-                continue
+                refuse 'source identity exists in conflicting registry namespace'
                 ;;
             esac
             if [ -z "$held_claim_names" ]; then
@@ -502,8 +504,9 @@ for previous in "$registry/$token."*.claim "$registry/$token."*.pending \
     "$registry/cancelled/$token."*.claim; do
     [ -e "$previous" ] || [ -L "$previous" ] || continue
     case "$previous" in *.pending)
-        [ "$operation" != settle-cancel ] \
-            || refuse 'unfinished claim transition during terminal cancellation'
+        case "$operation" in
+            settle-cancel|locate) refuse 'unfinished claim transition during namespace reconciliation' ;;
+        esac
         if ! rch_claim_record_valid "$previous"; then
             rch_claim_quarantine_pending "$registry" "$previous" || refuse 'cannot quarantine pending claim'
             continue
@@ -548,6 +551,32 @@ if [ -e "$cancelled" ] || [ -L "$cancelled" ]; then
         [ ! -e "$unfinished" ] && [ ! -L "$unfinished" ] \
             || refuse 'cancelled source grant has conflicting ownership'
     done
+fi
+
+# Discovery binds an old dispatcher journal to existing worker evidence. It
+# never promotes a pending write, grants cleanup, or changes a source path.
+# The caller holds both namespace metadata locks and persists the result before
+# requesting any worker mutation. A later authorizing transaction must still
+# revalidate ownership and competing lexical/physical roots under those locks.
+if [ "$operation" = locate ]; then
+    if [ -e "$registry/quarantine/$token.$digest.pending" ] \
+        || [ -L "$registry/quarantine/$token.$digest.pending" ]; then
+        [ -e "$cancelled" ] && rch_claim_quarantine_fence "$registry" "$cancelling" \
+            || refuse 'source namespace has incomplete quarantined ownership'
+    fi
+    located=0
+    for record in "$active" "$released" "$cancelled" "$cancelling"; do
+        [ -e "$record" ] || [ -L "$record" ] || continue
+        if [ "$record" != "$cancelling" ] \
+            || ! rch_claim_quarantine_fence "$registry" "$record"; then
+            matches_request "$record"
+        fi
+        confirm_durable_record "$record"
+        located=1
+    done
+    [ "$located" -eq 1 ] || refuse 'no exact source namespace evidence'
+    printf located
+    exit 0
 fi
 
 # The caller owns the exact retired dispatcher journal AND holds this token's
@@ -630,6 +659,20 @@ if [ "$operation" = cancel ]; then
         [ ! -e "$pending" ] && [ ! -L "$pending" ] || refuse 'duplicate source grant'
     elif [ -e "$pending" ] || [ -L "$pending" ]; then
         matches_request "$pending"
+    fi
+    if [ -e "$active" ] || [ -e "$pending" ]; then
+        # Cancellation authorizes cleanup access. A legacy claim alone cannot
+        # override a current writer admitted after a namespace migration.
+        # Check both namespaces before any promotion or cancellation write;
+        # keep the valid active blocker until cleanup finishes.
+        requested_physical=$(
+            physical_roots <<RCH_CANCELLATION_ROOTS
+$requested
+RCH_CANCELLATION_ROOTS
+        ) || refuse 'cannot resolve cancellation source roots'
+        check_held_claims
+    fi
+    if [ -e "$pending" ] || [ -L "$pending" ]; then
         # Complete only an already persisted identical pending claim. It has
         # already excluded competing owners, even if readiness was not sent.
         sync -f "$pending"

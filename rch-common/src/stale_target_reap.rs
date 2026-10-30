@@ -518,7 +518,18 @@ __gc_source_records_free() {
         && [ ! -L "$__gc_legacy_registry" ] && [ -d "$__gc_legacy_registry" ]; then
         for __gc_record in "$__gc_legacy_registry"/*.claim "$__gc_legacy_registry"/*.pending; do
             [ -e "$__gc_record" ] || [ -L "$__gc_record" ] || continue;
-            rch_claim_record_valid "$__gc_record" || continue;
+            if ! rch_claim_record_valid "$__gc_record"; then
+                # Legacy active records can still authorize source activity.
+                # Unknown ownership must stop GC, never disappear from its
+                # inventory. Pending publication grants no activity and is
+                # left untouched because this reader holds no legacy mutex.
+                case "$__gc_record" in
+                    *.claim)
+                        printf 'RCH_GC_LEGACY_SOURCE_OWNERSHIP_UNKNOWN %s\n' "$__gc_record" >&2;
+                        return 2;;
+                    *) continue;;
+                esac;
+            fi;
             while IFS= read -r __gc_root || [ -n "$__gc_root" ]; do
                 case "$__gc_root" in /*) ;; *) return 2;; esac;
                 case "$__gc_root" in *//*|*/./*|*/../*|*/.|*/..) return 2;; esac;
