@@ -34,13 +34,17 @@ try:
     idle = int(sys.argv[1])
     if len(sys.argv) != 2 or not 1 <= idle <= 3600:
         raise ValueError("invalid heartbeat deadline")
-    if not hasattr(os, "waitid") or not hasattr(os, "WNOWAIT"):
-        raise ValueError("non-reaping child observation is unavailable")
+    if not hasattr(signal, "pthread_sigmask") or not hasattr(signal, "sigwait"):
+        raise ValueError("non-reaping child notification is unavailable")
     with os.fdopen(3, "rb", closefd=True) as source:
         program = source.read(MAX_PROGRAM + 1)
     if not program or len(program) > MAX_PROGRAM or b"\x00" in program:
         raise ValueError("invalid bounded holder program")
-    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+    # Block before fork, and catch rather than ignore SIGCHLD: Darwin can
+    # discard default-ignored signals instead of making them pending for
+    # sigwait. This also clears inherited explicit ignore/auto-reap behavior.
+    original_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGCHLD})
+    signal.signal(signal.SIGCHLD, lambda _signum, _frame: None)
     receipt_read, receipt_write = os.pipe()
     monitor = os.fork()
 except (OSError, ValueError, IndexError) as error:
@@ -51,17 +55,31 @@ if monitor:
     # Fork before setsid: an ssh login shell can itself be a session leader.
     # This observer owns no source descriptors. Keep its direct child unreaped
     # while tearing down the group, including when the monitor itself is killed
-    # externally. A zombie child pins its PID; no saved/reused PID is authority.
+    # externally. SIGCHLD can also mean stop/continue or be sent explicitly;
+    # every notification revokes this owned session, never proves child exit.
+    # A never-reaped child pins its PID, which fork guaranteed did not match
+    # an existing process group. No saved/reused PID is authority.
     os.close(receipt_write)
     os.close(0)
-    os.waitid(os.P_PID, monitor, os.WEXITED | os.WNOWAIT)
-    if os.getpgid(monitor) == monitor:
-        try:
-            os.killpg(monitor, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+    signal.sigwait({signal.SIGCHLD})
+    # Revoke the exact child first, including one stopped before setsid.
+    # Then signal its still-pinned group unconditionally: inspecting getpgid
+    # first would race setup, and zombie getpgid is not portable. Only this
+    # child could have created a group with its never-reaped numeric identity.
+    try:
+        os.kill(monitor, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        os.killpg(monitor, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
     _, status = os.waitpid(monitor, 0)
-    receipt = os.read(receipt_read, 32)
+    os.set_blocking(receipt_read, False)
+    try:
+        receipt = os.read(receipt_read, 32)
+    except BlockingIOError:
+        receipt = b""
     os.close(receipt_read)
     if (os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL
             and receipt.endswith(b"\n") and receipt[:-1].isdigit()
@@ -97,6 +115,8 @@ def finish(status, message=None):
         os._exit(73)
 
 try:
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+    signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
     os.setsid()
     group = os.getpid()
     if os.getpgrp() != group:

@@ -177,8 +177,14 @@ New POSIX source and source-pair lock sessions carry complete heartbeats every
 bootstrap, acquisition and holding. Partial or invalid frames do not renew it.
 An explicit release has a separate 15-second completion budget. The supervisor
 owns a private process group and tears down its holders and inheriting helpers;
-the observer verifies teardown before accepting completion. Missing required
-Python process/locking capabilities fail before a source grant is acquired.
+the observer kills that group before reaping its direct child or accepting a
+completion receipt. Missing required Python process/locking capabilities fail
+before a source grant is acquired.
+The observer uses blocked `SIGCHLD` with `pthread_sigmask` and `sigwait`; it
+does not require the [`os.waitid`](https://docs.python.org/3.13/library/os.html#os.waitid)
+interface missing from older macOS Python.
+Child notifications trigger teardown of the still-owned session, and only its
+completion receipt can establish a successful result.
 
 Expiry releases control-session descriptors while retaining active claims,
 cancellation fences, pair ownership and receipts. Separately launched compiler
@@ -238,10 +244,13 @@ worker fixtures:
 4. Exercise a half-open/multiplexed SSH session and a stopped or dead client.
    Verify control locks are released after heartbeat loss under the stated
    scheduling assumptions, durable records remain, and separate build/transfer
-   activity is not killed. Include observer and supervisor termination.
+   activity is not killed. Include observer and supervisor termination, a
+   stopped supervisor and an explicit `SIGCHLD` sent to its observer.
 5. Qualify the deployed Linux toolchain, including GNU/uutils differences, and
-   native Darwin process/locking behavior where used. Linux subprocess tests
-   alone do not qualify Darwin or Windows.
+   native Darwin process/locking behavior where used, using the `python3` found
+   on the worker's noninteractive SSH `PATH`. Exercise an inherited ignored
+   `SIGCHLD` disposition and an inherited blocked mask. Linux subprocess tests,
+   including tests that remove `os.waitid`, do not qualify Darwin or Windows.
 6. Revisit the affected project and worker with the new diagnostics and original
    lease evidence. Establish the cause of the historical namespace refusal and
    verify repeated admissions after recovery. A passing isolated reproduction

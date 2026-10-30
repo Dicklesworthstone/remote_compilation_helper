@@ -195,6 +195,29 @@ class SourceLockHolderTests(unittest.TestCase):
         self.holders.append(holder)
         return holder
 
+    def session_python_environment(self, setup):
+        # Alter platform capabilities or the scheduling boundary before the
+        # exact embedded production program runs. Ordinary holder/terminal
+        # Python commands still exec the real interpreter unchanged.
+        env = self.environment()
+        directory = self.root / "session-python-bin"
+        directory.mkdir()
+        bootstrap = ("import os, signal, sys\n"
+                     "if (sys.argv[1:4] == ['-I', '-S', '-c'] and len(sys.argv) == 6\n"
+                     "        and 'RCH_SOURCE_LOCK_HEARTBEAT' in sys.argv[4]):\n"
+                     + "".join("    " + line + "\n" for line in setup.splitlines())
+                     + "    test_program = sys.argv[4]\n"
+                     "    sys.argv = ['-c', *sys.argv[5:]]\n"
+                     "    exec(compile(test_program, '<production source-lock session>', 'exec'))\n"
+                     "else:\n"
+                     "    os.execv(sys.executable, [sys.executable, *sys.argv[1:]])\n")
+        wrapper = directory / "python3"
+        wrapper.write_text("#!/bin/sh\nexec {} -I -S -c {} \"$@\"\n".format(
+            shlex.quote(sys.executable), shlex.quote(bootstrap)))
+        wrapper.chmod(0o700)
+        env["PATH"] = str(directory) + os.pathsep + env["PATH"]
+        return env
+
     def assert_waiting(self, holder, paths, detail):
         # The holder validates and opens the WHOLE plan before taking any
         # lock, then retries the closure non-blocking and releases every
@@ -232,7 +255,7 @@ class SourceLockHolderTests(unittest.TestCase):
         self.assertEqual((holder.process.returncode, stdout, stderr), (0, b"", b""))
         self.assertTrue(all(available(path) for path in paths))
 
-    def session_fixture(self, name="session", idle=1):
+    def session_fixture(self, name="session", idle=1, env=None):
         lock = self.root / (name + ".lock")
         claim = self.root / (name + ".claim")
         receipt = self.root / (name + ".released")
@@ -241,7 +264,7 @@ class SourceLockHolderTests(unittest.TestCase):
                     "IFS= read -r request; [ \"$request\" = {} ]; "
                     "printf '%s\\n' \"$request\" > {}; printf '%s\\n' \"$request\"").format(
                         shlex.quote(str(claim)), shlex.quote(release), shlex.quote(str(receipt)))
-        holder = self.start([("x", lock)], terminal=terminal, session_idle=idle)
+        holder = self.start([("x", lock)], terminal=terminal, session_idle=idle, env=env)
         self.assertEqual(holder.line(), b"READY")
         self.assertFalse(available(lock))
         return holder, lock, claim, receipt, release
@@ -410,6 +433,111 @@ class SourceLockHolderTests(unittest.TestCase):
         self.assertEqual(holder.process.returncode, 73)
         self.assertIn(b"RCH_SOURCE_LOCK_SUPERVISOR_TERMINATED", stderr)
         self.assertTrue(available(lock), "externally killed monitor left its child holding locks")
+
+    def test_session_does_not_require_waitid_or_wnowait(self):
+        injected = self.root / "old-python-capabilities"
+        env = self.session_python_environment(
+            "for test_feature in ('waitid', 'WNOWAIT'):\n"
+            "    if hasattr(os, test_feature):\n"
+            "        delattr(os, test_feature)\n"
+            "with open({!r}, 'w') as test_marker:\n"
+            "    test_marker.write('unavailable\\n')".format(str(injected)))
+        holder, lock, claim, receipt, release = self.session_fixture(idle=90, env=env)
+        self.assertEqual(injected.read_text(), "unavailable\n")
+        holder.send(release + "\n")
+        stdout, stderr = holder.finish()
+        self.assertEqual((holder.process.returncode, stdout, stderr),
+                         (0, (release + "\n").encode(), b""))
+        self.assertEqual(receipt.read_text(), release + "\n")
+        self.assertEqual(claim.read_text(), "durable owner\n")
+        self.assertTrue(available(lock))
+
+    def test_session_inherited_ignored_and_blocked_sigchld_cannot_auto_reap_monitor(self):
+        env = self.session_python_environment(
+            "signal.signal(signal.SIGCHLD, signal.SIG_IGN)\n"
+            "signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGCHLD})")
+        holder, lock, claim, receipt, release = self.session_fixture(idle=90, env=env)
+        holder.send(release + "\n")
+        stdout, stderr = holder.finish()
+        self.assertEqual((holder.process.returncode, stdout, stderr),
+                         (0, (release + "\n").encode(), b""))
+        self.assertEqual(receipt.read_text(), release + "\n")
+        self.assertEqual(claim.read_text(), "durable owner\n")
+        self.assertTrue(available(lock))
+
+    def test_session_monitor_stopped_before_setsid_is_killed_without_admission(self):
+        env = self.session_python_environment(
+            "test_setsid = os.setsid\n"
+            "def test_stop_before_setsid():\n"
+            "    print('BEFORE_SETSID', os.getpid(), flush=True)\n"
+            "    os.kill(os.getpid(), signal.SIGSTOP)\n"
+            "    return test_setsid()\n"
+            "os.setsid = test_stop_before_setsid")
+        lock = self.root / "pre-session.lock"
+        claim = self.root / "pre-session.claim"
+        claim.write_text("prior durable ownership\n")
+        publication = self.root / "unexpected-publication"
+        terminal = "printf 'unexpected admission\\n' > {}".format(
+            shlex.quote(str(publication)))
+        holder = self.start([("x", lock)], terminal=terminal, session_idle=90, env=env)
+        line = holder.line()
+        self.assertIsNotNone(line)
+        marker, monitor = line.split()
+        self.assertEqual(marker, b"BEFORE_SETSID")
+        try:
+            holder.process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            # Failure cleanup: the still-waiting observer has not reaped its
+            # stopped direct child, so this fixture identity remains pinned.
+            os.kill(int(monitor), signal.SIGKILL)
+            raise
+        stdout, stderr = holder.finish()
+        self.assertEqual((holder.process.returncode, stdout), (73, b""))
+        self.assertIn(b"RCH_SOURCE_LOCK_SUPERVISOR_TERMINATED", stderr)
+        self.assertEqual(claim.read_text(), "prior durable ownership\n")
+        self.assertFalse(publication.exists())
+        self.assertFalse(lock.exists(), "stopped pre-session monitor reached lock admission")
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int(monitor), 0)
+
+    def test_session_stopped_monitor_revokes_group_and_retains_durable_owner(self):
+        lock = self.root / "stopped-monitor.lock"
+        claim = self.root / "stopped-monitor.claim"
+        terminal = ("printf 'durable owner\\n' > {}; printf '%s\\n' \"$1\"; "
+                    "exec python3 -I -S -c {}").format(shlex.quote(str(claim)), shlex.quote(
+                        "import os,signal,time; print(os.getppid(), flush=True); "
+                        "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(120)"))
+        holder = self.start([("x", lock)], terminal=terminal, session_idle=90)
+        self.assertEqual(holder.line(), b"READY")
+        monitor = int(holder.line())
+        self.assertFalse(available(lock))
+        os.kill(monitor, signal.SIGSTOP)
+        try:
+            holder.process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            os.kill(monitor, signal.SIGKILL)  # Still pinned by our live observer.
+            raise
+        stdout, stderr = holder.finish()
+        self.assertEqual((holder.process.returncode, stdout), (73, b""))
+        self.assertIn(b"RCH_SOURCE_LOCK_SUPERVISOR_TERMINATED", stderr)
+        self.assertEqual(claim.read_text(), "durable owner\n")
+        self.assertTrue(available(lock), "stopped monitor stranded inherited source locks")
+
+    def test_session_synthetic_sigchld_revokes_only_its_owned_group(self):
+        other_lock = self.root / "unrelated.lock"
+        other = self.start([("x", other_lock)])
+        self.assertEqual(other.line(), b"READY")
+        holder, lock, claim, receipt, _ = self.session_fixture(idle=90)
+        os.kill(holder.process.pid, signal.SIGCHLD)
+        holder.process.wait(timeout=3)
+        stdout, stderr = holder.finish()
+        self.assertEqual((holder.process.returncode, stdout), (73, b""))
+        self.assertIn(b"RCH_SOURCE_LOCK_SUPERVISOR_TERMINATED", stderr)
+        self.assertEqual(claim.read_text(), "durable owner\n")
+        self.assertFalse(receipt.exists())
+        self.assertTrue(available(lock))
+        self.assertIsNone(other.process.poll(), "notification killed an unrelated process")
+        self.assertFalse(available(other_lock), "notification released an unrelated lock")
 
     def test_readiness_waits_for_the_complete_ordered_plan(self):
         first, last = self.root / "first", self.root / "last"
