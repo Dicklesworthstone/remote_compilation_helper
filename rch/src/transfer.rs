@@ -47,6 +47,41 @@ exec {prefix} sh -s <<'{delimiter}'
     )
 }
 
+/// Bound an already-finite source RPC on the worker as well as its client.
+/// A local SSH timeout cannot drain activity while the remote connection is
+/// half-open or its output is blocked. The supervisor owns only this RPC's
+/// process group; its exit never releases durable source ownership. Compiler
+/// execution uses the separate upload-only frame above and its own supervisor.
+pub(crate) fn source_activity_bounded_script(
+    prefix: &str,
+    script: &str,
+    timeout: Duration,
+) -> String {
+    let program = source_activity_finite_script(prefix, script);
+    let mut delimiter = format!("RCH_SOURCE_RPC_{}", uuid::Uuid::new_v4().simple());
+    while program.lines().any(|line| line == delimiter) {
+        delimiter.push('_');
+    }
+    // Both complete programs remain stdin data, including large closures.
+    // Parsing the outer compound precedes the supervisor and all activity.
+    // fd 3 contains the finite program; no heartbeat/release stream is needed.
+    // Keep the upload shell alive: some shells fork a large-heredoc writer.
+    // Its ordinary exit must notify that shell, not the supervisor's observer.
+    // Explicit status propagation prevents a tail-exec optimization here.
+    format!(
+        r#"{{
+sh -c {supervisor} rch-source-activity --rch-finite-rpc {timeout_ms} 3<<'{delimiter}'
+{program}
+{delimiter}
+rch_rpc_status=$?
+exit "$rch_rpc_status"
+}}
+"#,
+        supervisor = escape(Cow::Borrowed(include_str!("hook/source_lock_holder.sh"))),
+        timeout_ms = timeout.as_millis(),
+    )
+}
+
 fn artifact_header_probe_script(
     remote: &str,
     cargo_target_root: Option<&str>,
@@ -346,9 +381,23 @@ async fn run_source_content_rsync_capture(
     mut cmd: Command,
     operation: &str,
     operation_timeout: std::time::Duration,
+    program: Option<&[u8]>,
 ) -> Result<std::process::Output> {
+    if program.is_some() {
+        cmd.stdin(Stdio::piped());
+    }
     cmd.kill_on_drop(true);
     let mut child = cmd.spawn().with_context(|| format!("spawn {operation}"))?;
+    let stdin = if program.is_some() {
+        Some(
+            child
+                .stdin
+                .take()
+                .context("source RPC stdin was not piped")?,
+        )
+    } else {
+        None
+    };
     let stdout = child
         .stdout
         .take()
@@ -358,8 +407,16 @@ async fn run_source_content_rsync_capture(
         .take()
         .context("source-content rsync stderr was not piped")?;
 
+    let upload = async move {
+        if let (Some(program), Some(mut stdin)) = (program, stdin) {
+            stdin.write_all(program).await?;
+            stdin.shutdown().await?;
+        }
+        Ok::<_, std::io::Error>(())
+    };
     let collect = async {
-        let (stdout, stderr) = tokio::try_join!(
+        let ((), stdout, stderr) = tokio::try_join!(
+            upload,
             read_bounded_output_stream(stdout, MAX_SOURCE_CONTENT_RSYNC_OUTPUT_BYTES),
             read_bounded_output_stream(stderr, MAX_SOURCE_CONTENT_RSYNC_OUTPUT_BYTES),
         )?;
@@ -1558,6 +1615,7 @@ async fn collect_cargo_artifact_evidence(
     identity: &str,
     max_bytes: usize,
     deadline: Duration,
+    program: Option<&[u8]>,
 ) -> Result<CargoArtifactEvidence> {
     anyhow::ensure!(
         !identity.is_empty()
@@ -1571,13 +1629,22 @@ async fn collect_cargo_artifact_evidence(
         .checked_add(2 * MAX_CARGO_ARTIFACT_ROOT_BYTES + identity.len() + 32)
         .context("Cargo artifact evidence size limit overflow")?;
     command
-        .stdin(Stdio::null())
+        .stdin(if program.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     let mut child = command
         .spawn()
         .context("spawn Cargo artifact evidence reader")?;
+    let stdin = if program.is_some() {
+        Some(child.stdin.take().context("Cargo evidence stdin missing")?)
+    } else {
+        None
+    };
     let stdout = child
         .stdout
         .take()
@@ -1586,8 +1653,16 @@ async fn collect_cargo_artifact_evidence(
         .stderr
         .take()
         .context("Cargo evidence stderr missing")?;
+    let upload = async move {
+        if let (Some(program), Some(mut stdin)) = (program, stdin) {
+            stdin.write_all(program).await?;
+            stdin.shutdown().await?;
+        }
+        Ok::<_, std::io::Error>(())
+    };
     let collect = async {
-        let (stdout, stderr) = tokio::try_join!(
+        let ((), stdout, stderr) = tokio::try_join!(
+            upload,
             read_bounded_output_stream(stdout, framed_limit),
             read_bounded_output_stream(stderr, 64 * 1024),
         )?;
@@ -3118,6 +3193,13 @@ impl TransferPipeline {
         }
     }
 
+    fn source_activity_rpc_script<'a>(&self, script: &'a str, timeout: Duration) -> Cow<'a, str> {
+        match &self.source_authority_prefix {
+            Some(prefix) => Cow::Owned(source_activity_bounded_script(prefix, script, timeout)),
+            None => Cow::Borrowed(script),
+        }
+    }
+
     /// A durable source grant is not permission for opportunistic cache
     /// reclamation. Keep the pool and cache sweeps out of its activity; only
     /// its TMPDIR scratch is swept, under the guards of
@@ -3500,13 +3582,15 @@ impl TransferPipeline {
             expected_exit,
             log,
         );
-        let command =
-            self.worker_ssh_command(worker, &["sh", "-c", &escape(Cow::from(script.as_str()))]);
+        let deadline = Duration::from_secs(30);
+        let script = self.source_activity_rpc_script(&script, deadline);
+        let command = self.worker_ssh_command_with_activity(worker, &["sh", "-s"], false);
         collect_cargo_artifact_evidence(
             command,
             identity,
             MAX_CARGO_ARTIFACT_EVIDENCE_BYTES,
-            Duration::from_secs(30),
+            deadline,
+            Some(script.as_bytes()),
         )
         .await
     }
@@ -4574,6 +4658,7 @@ impl TransferPipeline {
             cmd,
             "source-content transfer-universe enumeration",
             self.source_sync_attempt_timeout(&effective_excludes),
+            None,
         )
         .await?;
         if !output.status.success() {
@@ -4706,6 +4791,7 @@ impl TransferPipeline {
             cmd,
             "source-content rsync no-delta barrier",
             self.source_sync_attempt_timeout(&effective_excludes),
+            None,
         )
         .await?;
         source_content_barrier::verify_output(&output).map_err(anyhow::Error::msg)
@@ -4734,6 +4820,7 @@ impl TransferPipeline {
             cmd,
             "owned source-content rsync no-delta barrier",
             self.source_sync_attempt_timeout(&effective_excludes),
+            None,
         )
         .await?;
         source_content_barrier::verify_output(&output).map_err(anyhow::Error::msg)
@@ -6018,7 +6105,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                             .await
                             .context("run resumable clean-overlay base rsync")?;
                         check_archive_upload_result(&output, worker, &remote_root)?;
-                        self.run_remote_sh(worker, &extraction_script)
+                        self.run_remote_sh(worker, &extraction_script, Some(attempt_timeout))
                             .await
                             .context("extract clean-overlay base archive")?;
                         Ok(())
@@ -6098,8 +6185,16 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
     /// default shell is `cmd.exe`, which re-parses and mangles quoted arguments
     /// (`mkdir: missing operand`). Feeding the script on stdin to `sh -s` — Git's
     /// POSIX shell — sidesteps that entirely, exactly as the exec path does.
-    async fn run_remote_sh(&self, worker: &WorkerConfig, script: &str) -> Result<()> {
-        let script = self.source_activity_script(script);
+    async fn run_remote_sh(
+        &self,
+        worker: &WorkerConfig,
+        script: &str,
+        rpc_timeout: Option<Duration>,
+    ) -> Result<()> {
+        let script = match rpc_timeout {
+            Some(deadline) => self.source_activity_rpc_script(script, deadline),
+            None => self.source_activity_script(script),
+        };
         let mut cmd = self.worker_ssh_command_with_activity(worker, &["sh", "-s"], false);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -6173,6 +6268,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                 "mkdir -p {}",
                 escape(Cow::from(remote_path.replace('\\', "/")))
             ),
+            None,
         )
         .await?;
         let mut archive = tokio::fs::File::open(archive_path)
@@ -6278,6 +6374,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         self.run_remote_sh(
             worker,
             &format!("mkdir -p {}", escape(Cow::from(remote_path))),
+            None,
         )
         .await?;
 
@@ -7586,7 +7683,8 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         // root. A missing/unreadable candidate is not evidence of compatibility.
         let cargo_target_root = self.remote_cargo_target_dir();
         let script = artifact_header_probe_script(&remote, Some(&cargo_target_root), &paths)?;
-        let script = self.source_activity_script(&script);
+        let deadline = Duration::from_secs(30);
+        let script = self.source_activity_rpc_script(&script, deadline);
         let mut command = self.worker_ssh_command_with_activity(worker, &["sh", "-s"], false);
         command
             .stdin(Stdio::piped())
@@ -7597,7 +7695,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             .stdin
             .take()
             .context("artifact header probe stdin missing")?;
-        let output = tokio::time::timeout(Duration::from_secs(30), async {
+        let output = tokio::time::timeout(deadline, async {
             stdin.write_all(script.as_bytes()).await?;
             drop(stdin);
             child.wait_with_output().await
@@ -7808,9 +7906,10 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             attempt,
             false,
         )?;
+        let deadline = Duration::from_secs(120);
         tokio::time::timeout(
-            Duration::from_secs(120),
-            self.run_remote_sh(worker, &command),
+            deadline,
+            self.run_remote_sh(worker, &command, Some(deadline)),
         )
         .await
         .context("timed out proving owned source-closure freshness")?
@@ -7841,16 +7940,15 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             attempt,
             true,
         )?;
-        let quoted = escape(Cow::from(script));
-        let mut command = self.worker_ssh_command(worker, &["sh", "-c", &quoted]);
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        let deadline = Duration::from_secs(120);
+        let script = self.source_activity_rpc_script(&script, deadline);
+        let mut command = self.worker_ssh_command_with_activity(worker, &["sh", "-s"], false);
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let output = run_source_content_rsync_capture(
             command,
             "owned source freshness qualification",
-            Duration::from_secs(120),
+            deadline,
+            Some(script.as_bytes()),
         )
         .await?;
         anyhow::ensure!(
@@ -8112,11 +8210,13 @@ sys.argv = sys.argv[:5]
         if use_mock_transport(worker) {
             return Ok(());
         }
+        let deadline = Duration::from_secs(120);
         tokio::time::timeout(
-            Duration::from_secs(120),
+            deadline,
             self.run_remote_sh(
                 worker,
                 &self.clean_overlay_source_refresh_command_at(identity, retirement_root)?,
+                Some(deadline),
             ),
         )
         .await
@@ -8444,16 +8544,15 @@ print('RCH_SOURCE_FRESHNESS_V2 unchanged=%d changed=%d' % (len(current) - len(ch
             identity,
             allow_absent_before_materialization,
         )?;
-        let quoted = escape(Cow::from(script));
-        let mut command = self.worker_ssh_command(worker, &["sh", "-c", &quoted]);
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        let deadline = Duration::from_secs(120);
+        let script = self.source_activity_rpc_script(&script, deadline);
+        let mut command = self.worker_ssh_command_with_activity(worker, &["sh", "-s"], false);
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let output = run_source_content_rsync_capture(
             command,
             "owned source retention",
-            Duration::from_secs(120),
+            deadline,
+            Some(script.as_bytes()),
         )
         .await?;
         anyhow::ensure!(
@@ -8668,9 +8767,14 @@ except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
         // The source can already have been retired by its owner. Avoid even
         // invoking removal in that case. A bounded owned SSH child also keeps
         // cleanup from holding a source-pair lease indefinitely on a lost link.
+        let deadline = Duration::from_secs(120);
         tokio::time::timeout(
-            Duration::from_secs(120),
-            self.run_remote_sh(worker, &Self::remote_tree_retirement_command(root)),
+            deadline,
+            self.run_remote_sh(
+                worker,
+                &Self::remote_tree_retirement_command(root),
+                Some(deadline),
+            ),
         )
         .await
         .context("timed out retiring clean-overlay source")?
@@ -10189,6 +10293,42 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
+    async fn source_rpc_upload_drains_both_streams_before_waiting_for_input() {
+        let mut command = Command::new("python3");
+        command.args([
+            "-I",
+            "-S",
+            "-c",
+            r#"import sys
+sys.stdout.buffer.write(b'o' * (128 * 1024))
+sys.stdout.buffer.flush()
+sys.stderr.buffer.write(b'e' * (128 * 1024))
+sys.stderr.buffer.flush()
+payload = sys.stdin.buffer.read()
+if payload != b'p' * (256 * 1024):
+    raise SystemExit(91)
+sys.stdout.buffer.write(b'complete')
+"#,
+        ]);
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let program = vec![b'p'; 256 * 1024];
+        let output = run_source_content_rsync_capture(
+            command,
+            "finite source RPC upload",
+            Duration::from_secs(5),
+            Some(&program),
+        )
+        .await
+        .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let mut expected = vec![b'o'; 128 * 1024];
+        expected.extend_from_slice(b"complete");
+        assert_eq!(output.stdout, expected);
+        assert_eq!(output.stderr, vec![b'e'; 128 * 1024]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
     async fn cargo_artifact_evidence_reads_complete_log_and_worker_canonical_root() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("actual target");
@@ -10213,12 +10353,14 @@ mod tests {
             CargoOutputLog::Stdout,
         );
         let mut command = Command::new("sh");
-        command.arg("-c").arg(script);
+        command.arg("-s");
+        let script = source_activity_bounded_script("env", &script, Duration::from_secs(10));
         let evidence = collect_cargo_artifact_evidence(
             command,
             "job_id",
             MAX_CARGO_ARTIFACT_EVIDENCE_BYTES,
             Duration::from_secs(10),
+            Some(script.as_bytes()),
         )
         .await
         .unwrap();
@@ -10245,6 +10387,7 @@ mod tests {
             "job_id",
             MAX_CARGO_ARTIFACT_EVIDENCE_BYTES,
             Duration::from_secs(10),
+            None,
         )
         .await
         .unwrap();
@@ -10277,11 +10420,16 @@ mod tests {
             );
             let mut command = Command::new("sh");
             command.arg("-c").arg(script);
-            let error =
-                collect_cargo_artifact_evidence(command, "job", limit, Duration::from_secs(3))
-                    .await
-                    .err()
-                    .expect("invalid immutable receipt must be rejected");
+            let error = collect_cargo_artifact_evidence(
+                command,
+                "job",
+                limit,
+                Duration::from_secs(3),
+                None,
+            )
+            .await
+            .err()
+            .expect("invalid immutable receipt must be rejected");
             assert!(
                 error.is::<CargoArtifactEvidenceRejected>(),
                 "accepted completion={completion:?}, limit={limit}"
@@ -10296,10 +10444,11 @@ mod tests {
             command
                 .arg("-c")
                 .arg(format!("printf 'job 4\\n/target\\nab'; exit {status}"));
-            let error = collect_cargo_artifact_evidence(command, "job", 64, Duration::from_secs(3))
-                .await
-                .err()
-                .expect("partial evidence must not be accepted");
+            let error =
+                collect_cargo_artifact_evidence(command, "job", 64, Duration::from_secs(3), None)
+                    .await
+                    .err()
+                    .expect("partial evidence must not be accepted");
             assert_eq!(
                 error.is::<CargoArtifactEvidenceRejected>(),
                 terminal,
@@ -10337,7 +10486,7 @@ mod tests {
                 CargoOutputLog::Stdout,
             ));
             assert!(
-                collect_cargo_artifact_evidence(command, "job", 64, Duration::from_secs(3))
+                collect_cargo_artifact_evidence(command, "job", 64, Duration::from_secs(3), None)
                     .await
                     .is_err()
             );
@@ -10390,10 +10539,11 @@ mod tests {
             "read -r reader_pid rest < /proc/self/stat; printf '%s\\n' \"$reader_pid\" > {}; while :; do :; done",
             escape(Cow::from(pid_file.to_str().unwrap()))
         ));
-        let error = collect_cargo_artifact_evidence(command, "job", 64, Duration::from_millis(100))
-            .await
-            .err()
-            .expect("stalled evidence reader must time out");
+        let error =
+            collect_cargo_artifact_evidence(command, "job", 64, Duration::from_millis(100), None)
+                .await
+                .err()
+                .expect("stalled evidence reader must time out");
         assert!(error.to_string().contains("timed out"), "{error:#}");
         let pid: u32 = std::fs::read_to_string(pid_file)
             .unwrap()
@@ -13589,24 +13739,31 @@ Number of files transferred: 42
             &script,
             delimiter.to_owned(),
         );
-        let mut child = std::process::Command::new("sh")
-            .args(["-s"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        // No program bytes travel through argv, even beyond MAX_ARG_STRLEN.
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(framed.as_bytes())
-            .unwrap();
-        let output = child.wait_with_output().unwrap();
-        assert!(output.status.success(), "{output:?}");
-        assert_eq!(output.stdout, literal.as_bytes());
-        assert!(output.stderr.is_empty(), "{output:?}");
+        let bounded = source_activity_bounded_script(
+            "env RCH_ACTIVITY_TEST=owned",
+            &script,
+            Duration::from_secs(10),
+        );
+        for program in [framed, bounded] {
+            let mut child = std::process::Command::new("sh")
+                .args(["-s"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            // No program bytes travel through argv, even beyond MAX_ARG_STRLEN.
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(program.as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(output.stdout, literal.as_bytes());
+            assert!(output.stderr.is_empty(), "{output:?}");
+        }
     }
 
     #[cfg(unix)]

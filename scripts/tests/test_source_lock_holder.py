@@ -46,6 +46,10 @@ ACTIVITY_CHECK = json.loads(re.sub(r'\\\n[ \t]*', '', ACTIVITY_LITERAL))
 TRANSFER_SOURCE = (REPO / "rch/src/transfer.rs").read_text()
 FINITE_ACTIVITY_TEMPLATE = TRANSFER_SOURCE.split(
     'pub(crate) fn source_activity_finite_script(', 1)[1].split('r#"', 1)[1].split('"#', 1)[0]
+FINITE_RPC_TEMPLATE = TRANSFER_SOURCE.split(
+    'pub(crate) fn source_activity_bounded_script(', 1)[1].split('r#"', 1)[1].split('"#', 1)[0]
+ARTIFACT_HEADER_TEMPLATE = TRANSFER_SOURCE.split(
+    'fn artifact_header_probe_script(', 1)[1].split('r#"', 1)[1].split('"#', 1)[0]
 FIDELITY_SOURCE = (REPO / "rch/src/hook/source_fidelity.rs").read_text()
 MANIFEST_TEMPLATE = FIDELITY_SOURCE.split(
     'fn remote_manifest_verifier_script(', 1)[1].split('r#"', 1)[1].split('"#', 1)[0]
@@ -761,6 +765,276 @@ class SourceLockHolderTests(unittest.TestCase):
         process.stdin.close()
         process.stdin = None
         return process.communicate(timeout=5)
+
+    def bounded_activity_script(self, registry, command, budget_ms, token="aa"):
+        program, _ = self.finite_activity_script(registry, command, token)
+        delimiter = "RCH_TEST_FINITE_RPC"
+        self.assertNotIn(delimiter, program.splitlines())
+        return FINITE_RPC_TEMPLATE.format(
+            supervisor=shlex.quote(HOLDER), timeout_ms=budget_ms,
+            delimiter=delimiter, program=program), delimiter
+
+    def finite_rpc_fixture(self, name="finite-rpc"):
+        source = self.root / (name + "-source")
+        source.mkdir()
+        (source / "sentinel").write_bytes(b"source remains owned")
+        registry = self.release_registry(name + "-registry")
+        claim, _, content = self.claim_record(registry, "aa", [source])
+        return source, registry, claim, content, claim.stat().st_ino
+
+    def assert_rpc_custody_retained(self, source, registry, claim, content, inode):
+        self.assertEqual(claim.read_bytes(), content)
+        self.assertEqual(claim.stat().st_ino, inode)
+        self.assertEqual((source / "sentinel").read_bytes(), b"source remains owned")
+        for name in ("released", "cancelled", "quarantine"):
+            self.assertEqual(list((registry / name).iterdir()), [])
+
+    @unittest.skipUnless(FLOCK, "flock required for real finite RPC activity")
+    def test_finite_rpc_blocked_artifact_headers_release_activity_without_releasing_claim(self):
+        source, registry, claim, content, inode = evidence = self.finite_rpc_fixture()
+        header = source / "header"
+        header.write_bytes(bytes(range(64)))
+        paths = []
+        # The real artifact-header RPC emits more than a pipe buffer while
+        # holding activity. Only its reader stalls; no helper is substituted.
+        for index in range(512):
+            name = "executable-{:04}-{}".format(index, "x" * 100)
+            os.link(header, source / name)
+            paths.append(name)
+        payload = json.dumps([str(source), None, paths], separators=(",", ":")).encode().hex()
+        command = ARTIFACT_HEADER_TEMPLATE.replace("{payload}", payload)
+        script, _ = self.bounded_activity_script(registry, command, 800)
+        started = time.monotonic()
+        process = self.start_finite_activity(script)
+        process.stdin.close()
+        process.stdin = None
+        eventually(lambda: not available(registry / "aa.activity.lock"),
+                   "artifact-header RPC never acquired source activity")
+        # Do not consume stdout until the worker has timed itself out.
+        process.wait(timeout=4)
+        self.assertLess(time.monotonic() - started, 3)
+        stdout, stderr = process.communicate(timeout=2)
+        self.assertEqual(process.returncode, 124, stderr)
+        self.assertIn(b"RCH_SOURCE_ACTIVITY_TIMEOUT: budget_ms=800", stderr)
+        self.assertGreater(len(stdout), 0)
+        self.assertLess(len(stdout), 156162, "fixture did not stall the actual reply")
+        self.assertTrue(available(registry / "aa.activity.lock"))
+        self.assert_rpc_custody_retained(*evidence)
+
+    @unittest.skipUnless(FLOCK, "flock required for real finite RPC activity")
+    def test_finite_rpc_queued_activity_expires_without_late_execution(self):
+        source, registry, claim, content, inode = evidence = self.finite_rpc_fixture()
+        activity = registry / "aa.activity.lock"
+        entered = source / "unexpected-late-work"
+        fd = os.open(activity, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            script, _ = self.bounded_activity_script(
+                registry, "printf late > " + shlex.quote(str(entered)), 250)
+            process = self.start_finite_activity(script)
+            process.wait(timeout=3)
+            stdout, stderr = self.finish_finite_activity(process)
+            self.assertEqual((process.returncode, stdout), (124, b""), stderr)
+            self.assertIn(b"RCH_SOURCE_ACTIVITY_TIMEOUT: budget_ms=250", stderr)
+            self.assertFalse(available(activity), "expired RPC changed the independent owner")
+            self.assertFalse(entered.exists())
+        finally:
+            os.close(fd)
+        time.sleep(0.1)
+        self.assertTrue(available(activity))
+        self.assertFalse(entered.exists(), "expired waiter executed after the lock was released")
+        self.assert_rpc_custody_retained(*evidence)
+
+    @unittest.skipUnless(FLOCK, "flock required for real finite RPC activity")
+    def test_finite_rpc_preserves_large_program_progress_output_and_nonzero_exit(self):
+        for exit_code in (0, 23):
+            with self.subTest(exit_code=exit_code):
+                source, registry, claim, content, inode = evidence = self.finite_rpc_fixture(
+                    "complete-" + str(exit_code))
+                program = (
+                    "import os,sys,time\n"
+                    "assert sys.stdin.buffer.read()==b''\n"
+                    "for _ in range(8):\n"
+                    "    os.write(1,b'x'*65536)\n"
+                    "    time.sleep(0.02)\n"
+                    "os.write(2,b'ordinary diagnostic\\n')\n"
+                    "sys.exit({})\n".format(exit_code))
+                # A large here-document can have its own shell writer child.
+                # Its ordinary exit must not notify the RPC observer as if
+                # the independently supervised monitor had terminated.
+                command = ("#" + "x" * (256 * 1024) + "\nexec "
+                           + shlex.join([sys.executable, "-I", "-S", "-c", program]))
+                script, _ = self.bounded_activity_script(registry, command, 3000)
+                process = self.start_finite_activity(script)
+                stdout, stderr = self.finish_finite_activity(process)
+                self.assertEqual((process.returncode, stdout, stderr),
+                                 (exit_code, b"x" * (8 * 65536), b"ordinary diagnostic\n"))
+                self.assertTrue(available(registry / "aa.activity.lock"))
+                self.assert_rpc_custody_retained(*evidence)
+
+    @unittest.skipUnless(FLOCK, "flock required for real finite RPC activity")
+    def test_finite_rpc_accepts_program_above_holder_bootstrap_limit(self):
+        source, registry, claim, content, inode = evidence = self.finite_rpc_fixture()
+        marker = "RCH_TEST_LARGE_RPC_PROGRAM"
+        script, _ = self.bounded_activity_script(registry, marker + "\nprintf exact", 10000)
+        before, after = script.split(marker)
+        process = self.start_finite_activity(before)
+        # Send the actual two production frames without retaining a giant
+        # fixture or copying its program into an exec argument. Valid source
+        # manifests alone can reach 32 MiB, excluding their shell wrappers.
+        chunk = b"#" + b"x" * (65536 - 2) + b"\n"
+        count = (33 * 1024 * 1024) // len(chunk)
+        self.assertGreater(count * len(chunk), 32 * 1024 * 1024)
+        for _ in range(count):
+            process.stdin.write(chunk)
+        stdout, stderr = self.finish_finite_activity(process, after)
+        self.assertEqual((process.returncode, stdout, stderr), (0, b"exact", b""))
+        self.assertTrue(available(registry / "aa.activity.lock"))
+        self.assert_rpc_custody_retained(*evidence)
+
+    @unittest.skipUnless(FLOCK, "flock required for real finite RPC activity")
+    def test_finite_rpc_partial_upload_has_no_activity_and_late_completion_observes_cancel(self):
+        for finish_upload in (False, True):
+            with self.subTest(finish_upload=finish_upload):
+                source, registry, claim, content, inode = evidence = self.finite_rpc_fixture(
+                    "partial-" + str(finish_upload))
+                entered = source / "unexpected-work"
+                script, delimiter = self.bounded_activity_script(
+                    registry, "printf late > " + shlex.quote(str(entered)), 500)
+                boundary = script.rindex("\n" + delimiter + "\n")
+                process = self.start_finite_activity(script[:boundary])
+                time.sleep(0.2)
+                self.assertIsNone(process.poll())
+                self.assertTrue(available(registry / "aa.activity.lock"))
+                self.assertFalse(entered.exists())
+                if finish_upload:
+                    cancelled = self.registry_transaction(registry, "aa", [source], "cancel")
+                    self.assertEqual((cancelled.returncode, cancelled.stdout), (0, b"owned"),
+                                     cancelled.stderr)
+                    stdout, stderr = self.finish_finite_activity(process, script[boundary:])
+                    self.assertEqual((process.returncode, stdout), (73, b""), stderr)
+                    self.assertIn(b"source grant is cancelling", stderr)
+                else:
+                    stdout, stderr = self.finish_finite_activity(process)
+                    self.assertNotEqual(process.returncode, 0, stderr)
+                    self.assertEqual(stdout, b"")
+                self.assertTrue(available(registry / "aa.activity.lock"))
+                self.assertFalse(entered.exists())
+                self.assertEqual(claim.read_bytes(), content)
+                self.assertEqual(claim.stat().st_ino, inode)
+
+    @unittest.skipUnless(FLOCK, "flock required for real finite RPC activity")
+    def test_finite_rpc_subsecond_and_long_budgets_do_not_use_heartbeat_policy(self):
+        source, registry, claim, content, inode = evidence = self.finite_rpc_fixture()
+        for budget in (0, -1, "invalid", 18446744073709551616000):
+            with self.subTest(invalid_budget=budget):
+                script, _ = self.bounded_activity_script(registry, "printf forbidden", budget)
+                process = self.start_finite_activity(script)
+                stdout, stderr = self.finish_finite_activity(process)
+                self.assertEqual((process.returncode, stdout), (73, b""), stderr)
+                self.assertIn(b"RCH_SOURCE_ACTIVITY_LIVENESS_UNAVAILABLE", stderr)
+        for budget in (300, 3600001, 18446744073709551615999):
+            with self.subTest(valid_budget=budget):
+                script, _ = self.bounded_activity_script(registry, "printf exact", budget)
+                process = self.start_finite_activity(script)
+                stdout, stderr = self.finish_finite_activity(process)
+                self.assertEqual((process.returncode, stdout, stderr), (0, b"exact", b""))
+        command = "exec " + shlex.join([sys.executable, "-c", "import time; time.sleep(120)"])
+        script, _ = self.bounded_activity_script(registry, command, 200)
+        started = time.monotonic()
+        process = self.start_finite_activity(script)
+        stdout, stderr = self.finish_finite_activity(process)
+        self.assertEqual((process.returncode, stdout), (124, b""), stderr)
+        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertIn(b"budget_ms=200", stderr)
+        self.assertTrue(available(registry / "aa.activity.lock"))
+        self.assert_rpc_custody_retained(*evidence)
+
+    def finite_rpc_process_fixture(self, name, budget=3000):
+        source, registry, claim, content, inode = evidence = self.finite_rpc_fixture(name)
+        identities = self.root / (name + "-processes.json")
+        command = "exec " + shlex.join([sys.executable, "-I", "-S", "-c",
+            "import json,os,signal,time; "
+            "open({!r},'w').write(json.dumps([os.getppid(),os.getpgrp()])); "
+            "signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(120)".format(str(identities))])
+        script, _ = self.bounded_activity_script(registry, command, budget)
+        process = self.start_finite_activity(script)
+        eventually(lambda: identities.exists() and identities.stat().st_size,
+                   "finite RPC did not publish fixture process identities")
+        return process, evidence, json.loads(identities.read_text())
+
+    @unittest.skipUnless(FLOCK, "flock required for real finite RPC activity")
+    def test_finite_rpc_killed_child_and_stopped_or_killed_monitor_drain_activity(self):
+        for target, signum in (("child", signal.SIGKILL),
+                               ("monitor", signal.SIGKILL),
+                               ("monitor", signal.SIGSTOP)):
+            with self.subTest(target=target, signum=signum):
+                process, evidence, (child, monitor) = self.finite_rpc_process_fixture(
+                    target + str(signum))
+                os.kill(child if target == "child" else monitor, signum)
+                process.wait(timeout=3)
+                stdout, stderr = self.finish_finite_activity(process)
+                self.assertEqual((process.returncode, stdout),
+                                 (137 if target == "child" else 73, b""), stderr)
+                marker = (b"RCH_SOURCE_ACTIVITY_PROCESS_TERMINATED: signal=9"
+                          if target == "child" else b"RCH_SOURCE_ACTIVITY_SUPERVISOR_TERMINATED")
+                self.assertIn(marker, stderr)
+                self.assertTrue(available(evidence[1] / "aa.activity.lock"))
+                self.assert_rpc_custody_retained(*evidence)
+
+    @unittest.skipUnless(FLOCK and shutil.which("ps"), "flock and ps required for owned RPC faults")
+    def test_finite_rpc_observer_loss_still_expires_only_its_owned_activity(self):
+        source, registry, claim, content, inode = evidence = self.finite_rpc_fixture("independent")
+        command = "exec " + shlex.join([sys.executable, "-c", "import time; time.sleep(120)"])
+        script, _ = self.finite_activity_script(registry, command)
+        independent = self.start_finite_activity(script)
+        eventually(lambda: not available(registry / "aa.activity.lock"),
+                   "independent activity never acquired its lock")
+        for signum in (signal.SIGKILL, signal.SIGSTOP):
+            with self.subTest(observer_signal=signum):
+                process, expired_evidence, (_, monitor) = self.finite_rpc_process_fixture(
+                    "expired-" + str(signum), budget=800)
+                # The outer upload shell owns any here-document writer. Find
+                # only this live fixture monitor's parent, not the launcher.
+                observer = int(subprocess.check_output(
+                    ["ps", "-o", "ppid=", "-p", str(monitor)], timeout=2))
+                self.assertNotEqual(observer, process.pid)
+                os.kill(observer, signum)
+                eventually(lambda: available(expired_evidence[1] / "aa.activity.lock"),
+                           "unavailable observer stranded finite activity")
+                if signum == signal.SIGSTOP:
+                    self.assertIsNone(process.poll())
+                    os.kill(observer, signal.SIGCONT)
+                stdout, stderr = self.finish_finite_activity(process)
+                self.assertEqual((process.returncode, stdout),
+                                 (128 + signal.SIGKILL if signum == signal.SIGKILL else 124,
+                                  b""), stderr)
+                self.assertIn(b"RCH_SOURCE_ACTIVITY_TIMEOUT", stderr)
+                self.assertIsNone(independent.poll())
+                self.assertFalse(available(registry / "aa.activity.lock"))
+                self.assert_rpc_custody_retained(*evidence)
+                self.assert_rpc_custody_retained(*expired_evidence)
+
+    @unittest.skipUnless(FLOCK, "flock required for real finite RPC activity")
+    def test_finite_rpc_success_drains_background_activity_before_acknowledgement(self):
+        source, registry, claim, content, inode = evidence = self.finite_rpc_fixture()
+        lock = self.root / "descendant-activity.lock"
+        command = ("python3 -I -S -c {} &\n"
+                   "while [ ! -e {} ]; do :; done\n"
+                   "printf exact\n").format(shlex.quote(
+                       "import fcntl,os,time; "
+                       "fd=os.open({!r},os.O_RDWR|os.O_CREAT,0o600); "
+                       "fcntl.flock(fd,fcntl.LOCK_EX); "
+                       "open({!r},'w').write('held'); time.sleep(120)".format(
+                           str(lock), str(self.root / "descendant-ready"))),
+                       shlex.quote(str(self.root / "descendant-ready")))
+        script, _ = self.bounded_activity_script(registry, command, 3000)
+        process = self.start_finite_activity(script)
+        stdout, stderr = self.finish_finite_activity(process)
+        self.assertEqual((process.returncode, stdout, stderr), (0, b"exact", b""))
+        self.assertTrue(available(lock), "successful parent left a descendant holding activity")
+        self.assertTrue(available(registry / "aa.activity.lock"))
+        self.assert_rpc_custody_retained(*evidence)
 
     def run_rsync_activity(self, direction, mode, timeout=2):
         fixture = self.root / f"rsync-{direction}-{mode}"

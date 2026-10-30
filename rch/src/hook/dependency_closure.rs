@@ -1246,23 +1246,20 @@ pub(super) async fn verify_remote_dependency_manifests(
     let mut probe_failure: Option<String> = None;
 
     if let Some(verify_cmd) = build_remote_dependency_preflight_command(&synced_checks) {
+        let timeout = dependency_preflight_timeout(synced_checks.len());
         let verify_cmd = match source_identity {
-            Some(identity) => crate::transfer::source_activity_finite_script(
+            Some(identity) => crate::transfer::source_activity_bounded_script(
                 &super::ssh::source_authority_activity_prefix(identity)?,
                 &verify_cmd,
+                timeout,
             ),
             None => verify_cmd,
         };
         // Stdin transport has no argv-size limit. Probe the entire closure in
         // one SSH session instead of paying a handshake and login-shell startup
         // for every 128 paths. Retain the former batches' total timeout budget.
-        match run_offload_ssh_command_with_stdin(
-            worker,
-            "sh -s",
-            verify_cmd.as_bytes(),
-            dependency_preflight_timeout(synced_checks.len()),
-        )
-        .await
+        match run_offload_ssh_command_with_stdin(worker, "sh -s", verify_cmd.as_bytes(), timeout)
+            .await
         {
             Ok(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();

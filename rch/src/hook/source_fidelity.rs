@@ -1426,9 +1426,10 @@ async fn verify_remote_root(
     let (command, payload) = match source_identity {
         Some(identity) => {
             let script = remote_manifest_verifier_script(&command, &payload)?;
-            let script = crate::transfer::source_activity_finite_script(
+            let script = crate::transfer::source_activity_bounded_script(
                 &super::ssh::source_authority_activity_prefix(identity)?,
                 &script,
+                REMOTE_VERIFY_TIMEOUT,
             );
             ("sh -s".to_owned(), script.into_bytes())
         }
@@ -2691,27 +2692,37 @@ mod tests {
                 .into_bytes(),
         ] {
             let verifier = remote_manifest_verifier_script("/bin/cat", &payload).unwrap();
-            // Actual registry/activity authority is qualified separately. This
-            // control executes both finite-input shell layers and checks the
-            // exact bytes delivered to the verifier, including empty input.
-            let script = crate::transfer::source_activity_finite_script("/usr/bin/env", &verifier);
-            let mut child = std::process::Command::new("/bin/sh")
-                .arg("-s")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap();
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(script.as_bytes())
-                .unwrap();
-            let output = child.wait_with_output().unwrap();
-            assert!(output.status.success(), "{output:?}");
-            assert!(output.stderr.is_empty(), "{output:?}");
-            assert_eq!(output.stdout, payload);
+            // Actual registry/activity authority is qualified separately. Both
+            // framing modes must deliver exact bytes, including empty input;
+            // the finite RPC mode also executes the shipped worker supervisor.
+            for bounded in [false, true] {
+                let script = if bounded {
+                    crate::transfer::source_activity_bounded_script(
+                        "/usr/bin/env",
+                        &verifier,
+                        REMOTE_VERIFY_TIMEOUT,
+                    )
+                } else {
+                    crate::transfer::source_activity_finite_script("/usr/bin/env", &verifier)
+                };
+                let mut child = std::process::Command::new("/bin/sh")
+                    .arg("-s")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                child
+                    .stdin
+                    .take()
+                    .unwrap()
+                    .write_all(script.as_bytes())
+                    .unwrap();
+                let output = child.wait_with_output().unwrap();
+                assert!(output.status.success(), "bounded={bounded}: {output:?}");
+                assert!(output.stderr.is_empty(), "bounded={bounded}: {output:?}");
+                assert_eq!(output.stdout, payload, "bounded={bounded}");
+            }
         }
         for payload in [
             b"missing-final-newline".as_slice(),

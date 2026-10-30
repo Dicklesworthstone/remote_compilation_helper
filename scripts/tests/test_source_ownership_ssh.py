@@ -49,6 +49,8 @@ ACTIVITY_CHECK = json.loads(re.sub(r'\\\n[ \t]*', '', ACTIVITY_LITERAL))
 TRANSFER_SOURCE = (REPO / "rch/src/transfer.rs").read_text()
 RETENTION = TRANSFER_SOURCE.split("fn remote_tree_retention_program() -> &'static str {", 1)[1].split('r#"', 1)[1].split('"#', 1)[0]
 FINITE_ACTIVITY = TRANSFER_SOURCE.split('pub(crate) fn source_activity_finite_script(', 1)[1].split('r#"', 1)[1].split('"#', 1)[0]
+BOUNDED_ACTIVITY = TRANSFER_SOURCE.split('pub(crate) fn source_activity_bounded_script(', 1)[1].split('r#"', 1)[1].split('"#', 1)[0]
+ARTIFACT_HEADERS = TRANSFER_SOURCE.split('fn artifact_header_probe_script(', 1)[1].split('r#"', 1)[1].split('"#', 1)[0]
 HELPERS_SOURCE = (REPO / "rch-common/src/stale_target_reap.rs").read_text()
 HELPERS = HELPERS_SOURCE.split('pub const SOURCE_CLAIM_RECORD_HELPERS: &str = r#"', 1)[1].split('"#;', 1)[0]
 TRANSACTION = HELPERS + "\n" + (REPO / "rch/src/hook/source_claim_registry.sh").read_text()
@@ -447,6 +449,52 @@ class SourceOwnershipSshTests(unittest.TestCase):
 
     def activity_command(self, program, mode="cleanup", token=None, registry=None):
         return self.activity_prefix(mode, token, registry) + " " + shlex.join(["sh", "-c", program])
+
+    def start_bounded_activity(self, script, budget_ms=2000, prefix=None):
+        # Both frames are the actual Rust format strings. Only the literal
+        # fixture delimiter and budget differ; activity is acquired inside
+        # the production supervisor's private group, after complete upload.
+        program = FINITE_ACTIVITY.format(
+            prefix=prefix or self.activity_prefix(mode="active"), script=script,
+            delimiter="RCH_SOURCE_ACTIVITY_SSH_RPC_FIXTURE")
+        framed = BOUNDED_ACTIVITY.format(
+            supervisor=QUOTE(HOLDER), timeout_ms=budget_ms, program=program,
+            delimiter="RCH_SOURCE_RPC_SSH_FIXTURE")
+        client = self.start(framed)
+        client.close_input()
+        return client
+
+    def prepare_rpc_authority(self):
+        acquired = self.transaction("acquire")
+        self.assertEqual((acquired.returncode, acquired.stdout, acquired.stderr), (0, b"", b""))
+        # Retain real cancellation evidence for another identity as well as
+        # this active grant. RPC expiry must not collect or settle either.
+        cancelled = self.transaction("cancel", token="cc-111")
+        self.assertEqual((cancelled.returncode, cancelled.stdout, cancelled.stderr),
+                         (0, b"unowned", b""))
+        self.assertTrue(available(self.activity_lock))
+        return self.authority_records(), self.activity_lock.stat().st_ino
+
+    def assert_rpc_authority_retained(self, before):
+        records, activity_inode = before
+        self.assertEqual(self.authority_records(), records)
+        self.assertEqual(self.activity_lock.stat().st_ino, activity_inode)
+        self.assert_owner_retained()
+
+    def artifact_header_program(self, count):
+        # The production probe accepts these real regular files unchanged.
+        # Hardlinks keep the fixture small; the workload still opens and
+        # validates each selected path and emits every actual header result.
+        seed = self.source / "artifact-header-seed"
+        contents = b"\x7fELF" + bytes(range(60))
+        seed.write_bytes(contents)
+        paths = []
+        for number in range(count):
+            path = "executable-{:04d}-{}".format(number, "x" * 100)
+            os.link(seed, self.source / path)
+            paths.append(path)
+        payload = json.dumps([str(self.source), None, paths], separators=(",", ":")).encode().hex()
+        return ARTIFACT_HEADERS.replace("{payload}", payload), paths, contents
 
     def retention_command(self, identity=None, root=None, retained=None):
         return shlex.join([
@@ -1145,6 +1193,105 @@ class SourceOwnershipSshTests(unittest.TestCase):
         self.assertTrue(available(self.activity_lock))
         self.assertEqual((self.active.stat().st_ino, self.active.read_bytes()), before)
         self.assert_owner_retained()
+
+    def test_finite_rpc_stopped_ssh_reader_releases_activity_and_preserves_ownership(self):
+        probe, paths, contents = self.artifact_header_program(8192)
+        before = self.prepare_rpc_authority()
+        seed = self.source / "artifact-header-seed"
+        source_before = (self.source.stat().st_ino, seed.stat().st_ino, seed.stat().st_nlink,
+                         seed.read_bytes())
+        entered = self.root / "finite-probe-entered"
+        proceed = self.root / "finite-probe-proceed"
+        completed = self.root / "finite-probe-completed"
+        # This gate only schedules the transport fault after the real source
+        # activity check. The blocked output below comes from the unchanged
+        # artifact-header program and exceeds OpenSSH's channel window.
+        script = ("set -eu\nprintf entered > " + QUOTE(str(entered)) +
+                  "\nwhile [ ! -e " + QUOTE(str(proceed)) + " ]; do sleep 0.01; done\n" +
+                  probe + "\nprintf complete > " + QUOTE(str(completed)) + "\n")
+        started = time.monotonic()
+        client = self.start_bounded_activity(script)
+        eventually(lambda: entered.exists(), "finite header probe did not acquire activity")
+        self.assertFalse(available(self.activity_lock))
+        client.process.send_signal(signal.SIGSTOP)
+        client.stopped = True
+        proceed.write_bytes(b"continue\n")
+        time.sleep(0.25)
+        self.assertFalse(completed.exists(), "probe did not reach a blocked-output frontier")
+        self.assertFalse(available(self.activity_lock), "probe exited before exercising backpressure")
+        eventually(lambda: available(self.activity_lock),
+                   "stopped SSH reader retained finite source activity beyond its worker deadline")
+        self.assertLess(time.monotonic() - started, 6)
+        self.assertIsNone(client.process.poll(), "fault must retain the stopped SSH client")
+        self.assertFalse(completed.exists(), "timed-out probe reached its completion continuation")
+        self.assert_rpc_authority_retained(before)
+        self.assertEqual((self.source.stat().st_ino, seed.stat().st_ino, seed.stat().st_nlink,
+                          seed.read_bytes()), source_before)
+        self.assertEqual(len(list(self.source.glob("executable-*"))), len(paths))
+        self.assertEqual((self.source / paths[-1]).read_bytes(), contents)
+        client.process.send_signal(signal.SIGCONT)
+        client.stopped = False
+        stdout, stderr = client.finish()
+        self.assertEqual(client.process.returncode, 124, stderr)
+        self.assertIn(b"RCH_SOURCE_ACTIVITY_TIMEOUT: budget_ms=2000", stderr)
+        self.assertTrue(stdout, "actual header output must reach the blocked SSH channel")
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(stdout)
+        self.assert_rpc_authority_retained(before)
+
+    @unittest.skipUnless(hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"),
+                         "requires Linux pidfds for exact queued RPC observation")
+    def test_finite_rpc_disconnected_waiter_expires_without_late_source_access(self):
+        before = self.prepare_rpc_authority()
+        activity = self.start_checked_activity()
+        self.assertEqual(activity.line(), b"ACTIVITY_READY")
+        waiter_pid = self.root / "finite-rpc-waiter.pid"
+        ran = self.root / "finite-rpc-late-work"
+        # Record the actual waiter before exec into the unchanged activity
+        # prefix. The independent session keeps that real flock unavailable.
+        observed_prefix = shlex.join([
+            "sh", "-c", "printf '%s\\n' \"$$\" > " + QUOTE(str(waiter_pid)) +
+            '; exec "$@"', "rch-finite-rpc-waiter"]) + " " + self.activity_prefix(mode="active")
+        client = self.start_bounded_activity("printf ran > " + QUOTE(str(ran)),
+                                             prefix=observed_prefix)
+        eventually(lambda: waiter_pid.exists() and waiter_pid.stat().st_size,
+                   "finite RPC did not reach the activity wait")
+        descriptor = os.pidfd_open(int(waiter_pid.read_text()))
+        self.pidfds.append(descriptor)
+        ended = select.poll()
+        ended.register(descriptor, select.POLLIN)
+        self.assertFalse(ended.poll(0), "queued RPC must still own its exact process")
+        client.process.kill()
+        client.finish()
+        self.assertTrue(ended.poll(5000), "abandoned finite RPC waiter outlived its worker budget")
+        self.assertFalse(ran.exists())
+        self.assert_rpc_authority_retained(before)
+        self.finish_activity(activity)
+        time.sleep(0.2)
+        self.assertFalse(ran.exists(), "expired SSH RPC ran after independent activity unlocked")
+        self.assertTrue(available(self.activity_lock))
+        self.assert_rpc_authority_retained(before)
+
+    def test_finite_rpc_preserves_large_complete_artifact_header_output(self):
+        probe, paths, contents = self.artifact_header_program(512)
+        before = self.prepare_rpc_authority()
+        client = self.start_bounded_activity(probe, budget_ms=10000)
+        stdout, stderr = client.finish()
+        self.assertEqual((client.process.returncode, stderr), (0, b""))
+        self.assertGreater(len(stdout), 65536)
+        self.assertEqual(json.loads(stdout), [[path, list(contents)] for path in paths])
+        self.assertTrue(available(self.activity_lock))
+        self.assert_rpc_authority_retained(before)
+
+    def test_finite_rpc_preserves_nonzero_exit_and_exact_output(self):
+        before = self.prepare_rpc_authority()
+        client = self.start_bounded_activity(
+            "printf 'unfinished evidence\\n'; printf 'explicit refusal\\n' >&2; exit 37")
+        stdout, stderr = client.finish()
+        self.assertEqual((client.process.returncode, stdout, stderr),
+                         (37, b"unfinished evidence\n", b"explicit refusal\n"))
+        self.assertTrue(available(self.activity_lock))
+        self.assert_rpc_authority_retained(before)
 
     def test_cancellation_probe_does_not_release_a_live_activity_or_its_source_grant(self):
         acquired = self.transaction("acquire")

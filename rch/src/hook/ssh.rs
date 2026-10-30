@@ -2518,20 +2518,18 @@ pub(super) async fn ensure_worker_projects_topology(
     let canonical_display = topology_policy.canonical_root().display().to_string();
     let alias_display = topology_policy.alias_root().display().to_string();
     let topology_cmd = build_worker_projects_topology_cmd(topology_policy, allow_initialization);
+    let timeout = Duration::from_secs(20);
     let topology_cmd = match source_identity {
-        Some(identity) => crate::transfer::source_activity_finite_script(
+        Some(identity) => crate::transfer::source_activity_bounded_script(
             &source_authority_activity_prefix(identity)?,
             &topology_cmd,
+            timeout,
         ),
         None => topology_cmd,
     };
-    let output = run_offload_ssh_command_with_stdin(
-        worker,
-        "sh -s",
-        topology_cmd.as_bytes(),
-        Duration::from_secs(20),
-    )
-    .await?;
+    let output =
+        run_offload_ssh_command_with_stdin(worker, "sh -s", topology_cmd.as_bytes(), timeout)
+            .await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -2619,10 +2617,12 @@ async fn repair_worker_mirror_ownership(
         return Ok(0);
     }
     let cmd = build_worker_ownership_repair_cmd(roots, &worker.user);
+    let timeout = Duration::from_secs(600);
     let cmd = match source_identity {
-        Some(identity) => crate::transfer::source_activity_finite_script(
+        Some(identity) => crate::transfer::source_activity_bounded_script(
             &source_authority_activity_prefix(identity)?,
             &cmd,
+            timeout,
         ),
         None => cmd,
     };
@@ -2631,13 +2631,8 @@ async fn repair_worker_mirror_ownership(
     // 60s budget did once mirrors grew past multi-GB.
     // rch#71: keep the closure-sized script off argv. The existing stdin
     // executor retains the timeout, concurrent output drains and kill-on-drop.
-    let output = run_offload_ssh_command_with_stdin(
-        worker,
-        "sh -s",
-        cmd.as_bytes(),
-        Duration::from_secs(600),
-    )
-    .await?;
+    let output =
+        run_offload_ssh_command_with_stdin(worker, "sh -s", cmd.as_bytes(), timeout).await?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
