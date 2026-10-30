@@ -659,6 +659,7 @@ class SourceClaimRegistryTests(unittest.TestCase):
         fresh_released = self.registry / "released" / ("03." + digest(old_roots) + ".claim")
         for path in (old_released, old_cancelled, fresh_released):
             path.write_bytes(body(old_roots))
+        self.record("02", old_roots, "cancelling")
         two_days_ago = 1_000_000
         os.utime(old_released, (two_days_ago, two_days_ago))
         os.utime(old_cancelled, (two_days_ago, two_days_ago))
@@ -676,6 +677,153 @@ class SourceClaimRegistryTests(unittest.TestCase):
         self.assertIn(b"below reserved headroom", refused.stderr)
         # In-flight claims can still release using the reserved headroom.
         self.assert_granted(self.transact("aa", active_roots, "release", env=low_headroom_env))
+
+    def test_unowned_cancellation_fence_survives_gc_before_dispatcher_settlement(self):
+        for index, interrupted in enumerate((False, True)):
+            with self.subTest(interrupted=interrupted):
+                token = "a" + format(index, "x")
+                roots = [self.root / token]
+                roots[0].mkdir()
+                source = roots[0] / "keep-source"
+                source.write_bytes(b"source owned by a later job")
+                receipt = self.registry / "cancelled" / (token + "." + digest(roots) + ".claim")
+                env = self.fail_sync_after_move(receipt) if interrupted else self.env
+                result = self.transact(token, roots, "cancel", env=env)
+                if interrupted:
+                    self.assert_unconfirmed(result)
+                else:
+                    self.assert_granted(result)
+                    self.assertEqual(result.stdout, b"unowned")
+                fence = self.registry / receipt.with_suffix(".cancelling").name
+                before = fence.stat().st_ino, fence.read_bytes()
+                self.assertEqual(before[1], body(roots))
+                os.utime(receipt, (1_000_000, 1_000_000))
+
+                # The dispatcher never reaches settle-cancel. Another real
+                # admission runs receipt retention after its interrupted start.
+                other = "b" + format(index, "x")
+                self.assert_granted(self.transact(other, [self.root / (other + "-other")]))
+                self.assertFalse(receipt.exists())
+                self.assertEqual((fence.stat().st_ino, fence.read_bytes()), before)
+                for operation in ("acquire", "try-acquire", "recover"):
+                    self.assert_refused(self.transact(token, roots, operation))
+                replacement = "c" + format(index, "x")
+                self.assert_granted(self.transact(replacement, roots))
+                self.assert_refused(self.transact(token, roots))
+                self.assertEqual(source.read_bytes(), b"source owned by a later job")
+                settled = self.transact(token, roots, "settle-cancel")
+                self.assert_granted(settled)
+                self.assertEqual(settled.stdout, b"settled")
+                replacement_claim = self.registry / (replacement + "." + digest(roots) + ".claim")
+                self.assertEqual(replacement_claim.read_bytes(), body(roots))
+
+    def test_legacy_cancellation_replay_requires_durable_fence_and_gc_retains_failed_barrier(self):
+        for index, operation in enumerate(("cancel", "finish-cancel")):
+            with self.subTest(operation=operation):
+                token = "a" + format(index, "x")
+                roots = [self.root / token]
+                receipt = self.registry / "cancelled" / (token + "." + digest(roots) + ".claim")
+                receipt.write_bytes(body(roots))
+                os.utime(receipt, (1_000_000, 1_000_000))
+                before = receipt.stat().st_ino, receipt.read_bytes()
+                fence = self.registry / receipt.with_suffix(".cancelling").name
+                env = self.barrier_env('if [ "$1" = {} ]; then\n'
+                                       '  printf "injected fence fsync failure\\n" >&2\n'
+                                       '  exit 91\nfi'.format(shlex.quote(str(fence))))
+                # An old receipt-only cancellation must reconstruct its exact
+                # fence before either terminal replay can acknowledge success.
+                self.assert_unconfirmed(self.transact(token, roots, operation, env=env))
+                fence_before = fence.stat().st_ino, fence.read_bytes()
+                self.assertEqual(fence_before[1], body(roots))
+                other = "b" + format(index, "x")
+                other_roots = [self.root / (other + "-other")]
+                result = self.transact(other, other_roots, env=env)
+                self.assert_granted(result)
+                self.assertIn(b"injected fence fsync failure", result.stderr)
+                self.assertIn(b"RCH_SOURCE_CLAIM_RETENTION_DEFERRED", result.stderr)
+                self.assertEqual((receipt.stat().st_ino, receipt.read_bytes()), before)
+                self.assertEqual((fence.stat().st_ino, fence.read_bytes()), fence_before)
+                result = self.transact(token, roots, operation)
+                self.assert_granted(result)
+                self.assertEqual(result.stdout, b"unowned" if operation == "cancel" else b"")
+                self.assert_granted(self.transact(other, other_roots, "release"))
+                self.assertFalse(receipt.exists())
+                self.assertEqual((fence.stat().st_ino, fence.read_bytes()), fence_before)
+                self.assert_refused(self.transact(token, roots))
+                self.assert_granted(self.transact("c" + format(index, "x"), roots))
+
+    def test_cancelled_receipt_gc_preserves_incomplete_and_conflicting_evidence(self):
+        cases = ("missing", "incomplete", "changed", "symlink", "quarantine",
+                 "active", "pending", "released", "other-closure", "unknown")
+        for index, state in enumerate(cases):
+            with self.subTest(state=state):
+                token = "a" + format(index, "x")
+                roots = [self.root / token]
+                receipt = self.registry / "cancelled" / (token + "." + digest(roots) + ".claim")
+                receipt.write_bytes(body(roots))
+                os.utime(receipt, (1_000_000, 1_000_000))
+                fence = self.registry / receipt.with_suffix(".cancelling").name
+                if state == "incomplete":
+                    fence.write_bytes(b"interrupted marker")
+                elif state == "changed":
+                    fence.write_bytes(body([self.root / "different-roots"]))
+                elif state == "symlink":
+                    preserved = self.root / "preserved-fence"
+                    preserved.write_bytes(body(roots))
+                    fence.symlink_to(preserved)
+                elif state == "quarantine":
+                    pending = self.registry / "quarantine" / receipt.with_suffix(".pending").name
+                    pending.write_bytes(b"interrupted source publication")
+                    os.link(pending, fence)
+                elif state != "missing":
+                    fence.write_bytes(body(roots))
+                    if state in ("active", "pending"):
+                        self.record(token, roots, "claim" if state == "active" else "pending")
+                    elif state == "released":
+                        (self.registry / "released" / receipt.name).write_bytes(body(roots))
+                    elif state == "other-closure":
+                        self.record(token, [self.root / "other-closure"], "cancelling")
+                    else:
+                        (self.registry / (token + ".unknown")).write_bytes(b"unknown history")
+                records = [path for path in self.registry.rglob(token + ".*")
+                           if path.is_file() or path.is_symlink()]
+                before = {path: (path.lstat().st_ino, path.read_bytes(), path.is_symlink())
+                          for path in records}
+                self.assert_granted(self.transact("f" + format(index, "x"),
+                                                 [self.root / ("gc-trigger-" + token)]))
+                self.assertEqual({path: (path.lstat().st_ino, path.read_bytes(), path.is_symlink())
+                                  for path in records}, before)
+                if state == "quarantine":
+                    result = self.transact(token, roots, "settle-cancel")
+                    self.assert_granted(result)
+                    self.assertEqual(result.stdout, b"settled")
+                    self.assert_granted(self.transact("bb", roots))
+                    self.assert_refused(self.transact(token, roots))
+
+    def test_cancelled_receipt_gc_bounds_confirmation_work_and_makes_progress(self):
+        receipts = []
+        fences = {}
+        for index in range(40):
+            token = format(index, "02x")
+            roots = [self.root / token]
+            fence = self.record(token, roots, "cancelling")
+            fences[fence] = fence.stat().st_ino, fence.read_bytes()
+            receipt = self.registry / "cancelled" / fence.with_suffix(".claim").name
+            receipt.write_bytes(body(roots))
+            os.utime(receipt, (1_000_000, 1_000_000))
+            receipts.append(receipt)
+        self.assert_granted(self.transact("ff", [self.root / "gc-first"]))
+        remaining = [path for path in receipts if path.exists()]
+        self.assertGreater(len(remaining), 0, "one admission must not confirm the entire backlog")
+        self.assertLess(len(remaining), len(receipts), "verified old receipts should make progress")
+        for index in range(len(receipts)):
+            if not any(path.exists() for path in receipts):
+                break
+            token = "fa" + format(index, "x")
+            self.assert_granted(self.transact(token, [self.root / ("gc-next-" + token)]))
+        self.assertFalse(any(path.exists() for path in receipts))
+        self.assertEqual({path: (path.stat().st_ino, path.read_bytes()) for path in fences}, fences)
+        self.assert_refused(self.transact("00", [self.root / "00"]))
 
 
 @unittest.skipUnless(shutil.which("bash"), "bash is unavailable")
@@ -792,8 +940,10 @@ class TerminalCancellationSettlementTests(unittest.TestCase):
         self.assert_refused(self.transact("aa", self.roots))
 
     def test_receipt_only_creates_permanent_fence_before_acknowledgement(self):
-        self.assertEqual(self.transact("aa", self.roots, "cancel").stdout, b"unowned")
         receipt = self.registry / "cancelled" / ("aa." + digest(self.roots) + ".claim")
+        # Preserve the historical receipt-only frontier: new unowned
+        # cancellations now retain their fence before replying.
+        receipt.write_bytes(body(self.roots))
         before = receipt.stat().st_ino, receipt.read_bytes()
         self.assert_settled(self.settle())
         self.assertEqual((receipt.stat().st_ino, receipt.read_bytes()), before)

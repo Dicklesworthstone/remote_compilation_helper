@@ -149,6 +149,23 @@ or complete pending claims, not by an unrelated terminal marker. A successfully
 settled old token must remain refused while a new token can acquire the released
 closure.
 
+Unowned cancellation retains its durable fence before independently publishing
+the completed receipt or returning `unowned`. It does not depend on the
+dispatcher reaching a later settlement call. Replaying `cancel`, `finish-cancel`
+or `settle-cancel` against an exact historical receipt-only cancellation restores
+and confirms its fence before acknowledging success.
+
+Cancellation-receipt retention requires a complete, byte-identical durable fence
+and no conflicting records for that token. Receipt-only, malformed, symlinked,
+quarantined or contradictory evidence is preserved. In particular, an incomplete
+hard-linked quarantine fence cannot replace the complete receipt needed for
+later recovery. Failed fence or registry durability barriers preserve both
+records. Each collection pass validates at most 16 eligible cancellation
+receipts; this bounds the added confirmations, not directory enumeration or
+filesystem latency. Unresolved early candidates can defer later collection.
+The existing released-receipt policy is unchanged, and activity lock files are
+not collected.
+
 Preserve the original journal, cancellation records and lock files when
 diagnosing a refusal. Neither a terminal lease alone, an empty process listing,
 a free metadata lock, nor record age authorizes deleting them. Unlinking an
@@ -172,6 +189,7 @@ or the word `Killed` alone:
 | `RCH_SOURCE_LOCK_HEARTBEAT_EXPIRED`, `RCH_SOURCE_LOCK_DISCONNECTED`, or `RCH_SOURCE_LOCK_RELEASE_TIMEOUT` | The control session expired or lost its release protocol. Durable ownership remains for recovery. |
 | `RCH_SOURCE_LOCK_PROCESS_TERMINATED` or `RCH_SOURCE_LOCK_SUPERVISOR_TERMINATED` | The holder or its supervisor terminated. A process exit alone does not authorize retiring the durable claim. |
 | `RCH_SOURCE_CANCELLATION_UNSETTLED` | Worker evidence or its lock namespace could not be verified. The accompanying reason identifies what must be resolved before retrying. |
+| `RCH_SOURCE_CLAIM_RETENTION_DEFERRED` | Receipt collection could not confirm the retained cancellation fence's durability. Both records remain; this does not grant cleanup authority. |
 | `RCH_GC_LEGACY_SOURCE_OWNERSHIP_UNKNOWN` | A legacy active claim is malformed or unsafe to read. GC cannot prove the candidate unowned and preserves both the record and source tree. |
 
 #### Bounded POSIX control-session liveness
@@ -260,7 +278,7 @@ namespace refusal. Preserve that distinction when evaluating the repair.
 The separate retrieval-staging work tracked by `bd-ra5aw` does not resolve this
 incident by itself.
 
-The October 30 isolated Linux qualification passed 235 regressions: 76 source
+The October 30 isolated Linux qualification at `5b1eee2` passed 235 regressions: 76 source
 registry/legacy-GC cases, 31 earlier registry cases, 65 holder cases, 28 control
 cases, 11 native-timer cases, three delivery cases, 13 process-group cases and
 eight real loopback OpenSSH cases. The SSH suite uses fixture-owned keys and
@@ -270,6 +288,19 @@ checks retained claim bytes/inodes, independent activity and absence of late
 publication after unlocking. Run it with
 `python3 scripts/tests/test_source_ownership_ssh.py` on an isolated Linux host
 where the test user may start `sshd`.
+
+The subsequent cancellation-retention repair was qualified on native Linux with
+84 comprehensive registry cases and 31 earlier registry cases, all passing.
+The eight new cases (four methods under both `sh` and `bash`) reproduce missing
+fences, discarded recovery evidence, missing durability acknowledgements and
+unrestricted receipt-confirmation work against the unchanged `f22678a` registry.
+They pass with the repair, including interrupted receipt publication, historical
+receipt-only replay, conflicting records, quarantine recovery and old-token
+refusal after receipt collection. Shell syntax, Python syntax and whitespace
+checks passed. These isolated tmpfs tests exercise real processes and locks with
+injected durability failures; they do not qualify physical power-loss recovery
+or an installed production worker. The earlier holder, controller and SSH
+results above describe their stated revision and were not rerun for this change.
 
 Pinned workspace `cargo fmt --check` passed. The full locked workspace check
 was terminated by SIGKILL while compiling the unchanged `asupersync 0.5.0`

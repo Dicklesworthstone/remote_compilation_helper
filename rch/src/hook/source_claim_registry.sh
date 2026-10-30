@@ -105,6 +105,24 @@ confirm_durable_record() {
     fi
 }
 
+# Call only after confirming the exact completed cancellation receipt. Older
+# unowned cancellations moved their only fence into cancelled/. A retry must
+# restore its permanent fence before acknowledging that terminal state again.
+# Quarantined intents retain their original hard-link evidence unchanged.
+confirm_cancellation_fence() {
+    if [ -e "$cancelling" ] || [ -L "$cancelling" ]; then
+        if ! rch_claim_quarantine_fence "$registry" "$cancelling"; then
+            matches_request "$cancelling"
+        fi
+    else
+        rch_claim_stage=publication
+        rch_claim_write_atomic "$registry" "$cancelling" "$digest" "$requested" \
+            || refuse 'cannot persist settled cancellation fence'
+        matches_request "$cancelling"
+    fi
+    confirm_durable_record "$cancelling"
+}
+
 # A mutator's exit status is not proof that the requested alias was established:
 # ln -s can succeed inside a raced-in destination directory. Nor is a visible
 # namespace necessarily durable after a lost acknowledgement. Revalidate and
@@ -425,11 +443,58 @@ prune_terminal_claims() {
     case "$retention_minutes" in
         ''|*[!0-9]*) retention_minutes=1440 ;;
     esac
-    for terminal_dir in "$registry/released" "$registry/cancelled"; do
-        [ ! -L "$terminal_dir" ] && [ -d "$terminal_dir" ] || continue
+    terminal_dir="$registry/released"
+    if [ ! -L "$terminal_dir" ] && [ -d "$terminal_dir" ]; then
         find "$terminal_dir" -maxdepth 1 -type f -name '*.claim' \
             ! -name "$token.*" -mmin +"$retention_minutes" -delete 2>/dev/null || true
-    done
+    fi
+
+    terminal_dir="$registry/cancelled"
+    [ ! -L "$terminal_dir" ] && [ -d "$terminal_dir" ] \
+        && [ ! -L "$registry/released" ] && [ ! -L "$registry/quarantine" ] || return 0
+    # A cancelled receipt may be the last complete evidence after a dispatcher
+    # crash. Age never proves that its delayed acquire cannot still arrive.
+    # Bound the added validation work under this metadata mutex; unknown early
+    # candidates can defer later collection. This bounds candidate confirmations,
+    # not filesystem latency or the existing directory enumeration.
+    find "$terminal_dir" -maxdepth 1 -type f -name '*.claim' \
+        ! -name "$token.*" -mmin +"$retention_minutes" -print 2>/dev/null |
+    (
+        gc_checked=0
+        while IFS= read -r gc_receipt; do
+            [ "$gc_checked" -lt 16 ] || break
+            gc_checked=$((gc_checked + 1))
+            [ "${gc_receipt%/*}" = "$terminal_dir" ] || continue
+            rch_claim_record_valid "$gc_receipt" || continue
+            gc_token=$__rch_token
+            gc_fence="$registry/$__rch_token.$__rch_digest.cancelling"
+            rch_claim_record_valid "$gc_fence" || continue
+            cmp -s "$gc_receipt" "$gc_fence" || continue
+            gc_conflict=0
+            for gc_other in "$registry/$gc_token."* "$registry/released/$gc_token."* \
+                "$registry/cancelled/$gc_token."* "$registry/quarantine/$gc_token."*; do
+                [ -e "$gc_other" ] || [ -L "$gc_other" ] || continue
+                [ "$gc_other" = "$gc_receipt" ] || [ "$gc_other" = "$gc_fence" ] || {
+                    if [ "$gc_other" = "$registry/$gc_token.activity.lock" ] \
+                        && [ ! -L "$gc_other" ] && [ -f "$gc_other" ]; then
+                        continue
+                    fi
+                    gc_conflict=1
+                    break
+                }
+            done
+            [ "$gc_conflict" -eq 0 ] || continue
+            # Incomplete quarantine fences need the full receipt for recovery.
+            # Only a complete matching fence, durably retained in this registry,
+            # can replace it. A failed barrier preserves every existing record.
+            if ! sync -f "$gc_fence" || ! sync -f "$registry"; then
+                printf 'RCH_SOURCE_CLAIM_RETENTION_DEFERRED %s\n' "$gc_receipt" >&2
+                continue
+            fi
+            find "$gc_receipt" -maxdepth 0 -type f -mmin +"$retention_minutes" \
+                -delete 2>/dev/null || true
+        done
+    ) || true
 }
 
 df_available() {
@@ -594,22 +659,7 @@ if [ "$operation" = settle-cancel ]; then
     if [ -e "$cancelled" ] || [ -L "$cancelled" ]; then
         matches_request "$cancelled"
         confirm_durable_record "$cancelled"
-        if [ -e "$cancelling" ] || [ -L "$cancelling" ]; then
-            # A hard-linked quarantine fence has intentionally incomplete
-            # bytes; the matching receipt proves no source rights were granted.
-            if ! rch_claim_quarantine_fence "$registry" "$cancelling"; then
-                matches_request "$cancelling"
-            fi
-            confirm_durable_record "$cancelling"
-        else
-            # Unowned cancellation used to move its only marker to cancelled/.
-            # Preserve an anti-replay fence before allowing receipt retention GC.
-            rch_claim_stage=publication
-            rch_claim_write_atomic "$registry" "$cancelling" "$digest" "$requested" \
-                || refuse 'cannot persist settled cancellation fence'
-            matches_request "$cancelling"
-            confirm_durable_record "$cancelling"
-        fi
+        confirm_cancellation_fence
         printf settled
         exit 0
     fi
@@ -642,6 +692,7 @@ if [ "$operation" = cancel ]; then
     if [ -e "$cancelled" ] || [ -L "$cancelled" ]; then
         matches_request "$cancelled"
         confirm_durable_record "$cancelled"
+        confirm_cancellation_fence
         printf unowned
         exit 0
     fi
@@ -685,7 +736,7 @@ RCH_CANCELLATION_ROOTS
         rch_claim_write_atomic "$registry" "$cancelling" "$digest" "$requested" || refuse 'cannot persist source cancellation'
         matches_request "$cancelling"
     fi
-    sync -f "$cancelling"
+    confirm_durable_record "$cancelling"
     if [ -e "$active" ]; then
         # Keep the active record as a durable overlap blocker through cleanup.
         # Normal activity refuses this marker; cleanup gets its own checked
@@ -695,7 +746,12 @@ RCH_CANCELLATION_ROOTS
     else
         # An absent intent never acquired source rights. Its tombstone fences
         # delayed acquisition but grants no authority to inspect/remove a tree.
-        mv -- "$cancelling" "$cancelled"
+        # Keep that fence before the reply: the dispatcher can disappear before
+        # settlement, and receipt retention must never revive its queued acquire.
+        rch_claim_stage=publication
+        rch_claim_write_atomic "$registry" "$cancelled" "$digest" "$requested" \
+            || refuse 'cannot persist unowned source cancellation'
+        matches_request "$cancelled"
         confirm_durable_record "$cancelled"
         printf unowned
     fi
@@ -706,6 +762,7 @@ if [ "$operation" = finish-cancel ]; then
     if [ -e "$cancelled" ] || [ -L "$cancelled" ]; then
         matches_request "$cancelled"
         confirm_durable_record "$cancelled"
+        confirm_cancellation_fence
         exit 0
     fi
     matches_request "$cancelling"
