@@ -6,6 +6,7 @@
 //! writers can roll back each other's durable retirement or failure evidence.
 
 use super::*;
+use rch_common::job_identity::journal::JobJournalGate;
 use std::future::Future;
 use std::os::unix::fs::MetadataExt;
 
@@ -15,58 +16,18 @@ mod artifact_policy;
 /// The inode stays on disk. Unlinking it on release would let a waiting opener
 /// lock the old inode while a new recovery command locks its replacement.
 pub(in crate::hook) struct RecoveryOwnership {
-    _gate: File,
-    directory: File,
-    parent: PathBuf,
-    gate_name: std::ffi::CString,
-    journal_name: std::ffi::CString,
+    gate: JobJournalGate,
 }
 
 impl RecoveryOwnership {
     /// Both the persistent gate and journal must still name the held directory.
     /// Reads/writes use that descriptor even if a rename races this check.
     pub(in crate::hook) fn verify(&self) -> anyhow::Result<()> {
-        use rustix::fs::{Mode, OFlags};
-        use std::os::fd::AsFd;
-
-        let held_directory = self.directory.metadata()?;
-        let named_directory = std::fs::symlink_metadata(&self.parent)?;
-        anyhow::ensure!(
-            named_directory.is_dir()
-                && held_directory.dev() == named_directory.dev()
-                && held_directory.ino() == named_directory.ino(),
-            "recovery journal directory changed; retry the retained same wrapper"
-        );
-        let named_gate = File::from(rustix::fs::openat(
-            self.directory.as_fd(),
-            self.gate_name.as_c_str(),
-            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY,
-            Mode::empty(),
-        )?);
-        let held = self._gate.metadata()?;
-        let named = named_gate.metadata()?;
-        anyhow::ensure!(
-            named.is_file()
-                && held.is_file()
-                && named.dev() == held.dev()
-                && named.ino() == held.ino()
-                && named.uid() == held.uid()
-                && named.nlink() == 1
-                && held.nlink() == 1
-                && named.mode() & 0o077 == 0,
-            "recovery lock changed; no journal mutation acknowledged"
-        );
-        Ok(())
+        self.gate.verify()
     }
 
     pub(in crate::hook) fn read(&self, wrapper_id: &str) -> anyhow::Result<DurableJobLease> {
-        use std::os::fd::AsFd;
-        self.verify()?;
-        let bytes = crate::state::primitives::read_regular_file_at(
-            self.directory.as_fd(),
-            &self.journal_name,
-        )?;
-        self.verify()?;
+        let (_, bytes) = self.gate.read_snapshot()?;
         DurableLeaseWriter::decode_journal(&bytes, wrapper_id)
     }
 
@@ -82,18 +43,20 @@ impl RecoveryOwnership {
 
         self.verify()?;
         let mut file = File::from(rustix::fs::openat(
-            self.directory.as_fd(),
-            self.journal_name.as_c_str(),
+            self.gate.directory().as_fd(),
+            self.gate.journal_name(),
             OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
             Mode::RUSR | Mode::WUSR,
         )?);
         if let Err(error) = file.write_all(bytes) {
             if file.metadata().is_ok_and(|metadata| metadata.len() == 0)
-                && self.require_named_file(&file, &self.journal_name).is_ok()
+                && self
+                    .require_named_file(&file, self.gate.journal_name())
+                    .is_ok()
             {
                 let _ = rustix::fs::unlinkat(
-                    self.directory.as_fd(),
-                    self.journal_name.as_c_str(),
+                    self.gate.directory().as_fd(),
+                    self.gate.journal_name(),
                     rustix::fs::AtFlags::empty(),
                 );
             }
@@ -105,14 +68,15 @@ impl RecoveryOwnership {
 
     fn finish_initialization(&self, file: &File, expected: &[u8]) -> anyhow::Result<()> {
         self.verify()?;
-        self.require_named_file(file, &self.journal_name)?;
+        self.require_named_file(file, self.gate.journal_name())?;
         crate::state::primitives::verify_atomic_write_bytes(file, expected)
             .context("verify initial journal bytes before admission")?;
-        self.directory
+        self.gate
+            .directory()
             .sync_all()
             .context("sync initial held job journal directory before admission")?;
         self.verify()?;
-        self.require_named_file(file, &self.journal_name)?;
+        self.require_named_file(file, self.gate.journal_name())?;
         crate::state::primitives::verify_atomic_write_bytes(file, expected)
             .context("verify synchronized initial journal bytes before admission")
     }
@@ -133,7 +97,7 @@ impl RecoveryOwnership {
         let temporary =
             std::ffi::CString::new(format!(".recovery-{}.tmp", uuid::Uuid::new_v4().simple(),))?;
         let mut file = File::from(rustix::fs::openat(
-            self.directory.as_fd(),
+            self.gate.directory().as_fd(),
             temporary.as_c_str(),
             OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
             Mode::RUSR | Mode::WUSR,
@@ -149,7 +113,7 @@ impl RecoveryOwnership {
         use std::os::fd::AsFd;
 
         let named = File::from(rustix::fs::openat(
-            self.directory.as_fd(),
+            self.gate.directory().as_fd(),
             name,
             OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY,
             Mode::empty(),
@@ -181,104 +145,27 @@ impl RecoveryOwnership {
         crate::state::primitives::verify_atomic_write_bytes(file, expected)
             .context("verify recovery journal bytes before publication")?;
         rustix::fs::renameat(
-            self.directory.as_fd(),
+            self.gate.directory().as_fd(),
             temporary,
-            self.directory.as_fd(),
-            self.journal_name.as_c_str(),
+            self.gate.directory().as_fd(),
+            self.gate.journal_name(),
         )?;
-        self.require_named_file(file, &self.journal_name)?;
-        self.directory
+        self.require_named_file(file, self.gate.journal_name())?;
+        self.gate
+            .directory()
             .sync_all()
             .context("sync held recovery journal directory before advancing ownership")?;
         self.verify()?;
-        self.require_named_file(file, &self.journal_name)?;
+        self.require_named_file(file, self.gate.journal_name())?;
         crate::state::primitives::verify_atomic_write_bytes(file, expected)
             .context("verify synchronized recovery journal bytes before acknowledgment")
     }
 }
 
 pub(in crate::hook) fn acquire_gate(lease_path: &Path) -> anyhow::Result<RecoveryOwnership> {
-    use rustix::fs::{Mode, OFlags};
-    use std::os::fd::AsFd;
-    use std::os::unix::ffi::OsStrExt;
-
-    let path = lease_path.with_extension("recovery.lock");
-    let parent = path.parent().context("recovery lock has no parent")?;
-    let name = std::ffi::CString::new(
-        path.file_name()
-            .context("recovery lock has no name")?
-            .as_bytes(),
-    )?;
-    let directory = File::from(rustix::fs::open(
-        parent,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
-        Mode::empty(),
-    )?);
-    // Gate acquisition is also used by the synchronous live constructor.
-    // It must not allocate a Tokio socket or require a running reactor.
-    let uid = rustix::process::geteuid().as_raw();
-    let safe = |metadata: &std::fs::Metadata| {
-        metadata.file_type().is_file()
-            && metadata.uid() == uid
-            && metadata.nlink() == 1
-            && metadata.mode() & 0o077 == 0
-    };
-    match std::fs::symlink_metadata(&path) {
-        Ok(metadata) => anyhow::ensure!(safe(&metadata), "unsafe recovery lock file"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    // A replaced parent cannot redirect creation. The leaf is never followed
-    // or truncated, and the persistent inode remains the cross-recovery gate.
-    let flags = OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY;
-    let gate = File::from(rustix::fs::openat(
-        directory.as_fd(),
-        name.as_c_str(),
-        OFlags::RDWR | OFlags::CREATE | flags,
-        Mode::RUSR | Mode::WUSR,
-    )?);
-    anyhow::ensure!(safe(&gate.metadata()?), "unsafe recovery lock file");
-    let held = gate.metadata()?;
-    let named_gate = File::from(rustix::fs::openat(
-        directory.as_fd(),
-        name.as_c_str(),
-        OFlags::RDONLY | flags,
-        Mode::empty(),
-    )?);
-    let named = named_gate.metadata()?;
-    let held_directory = directory.metadata()?;
-    let named_directory = std::fs::symlink_metadata(parent)?;
-    anyhow::ensure!(
-        safe(&held)
-            && safe(&named)
-            && held.dev() == named.dev()
-            && held.ino() == named.ino()
-            && named_directory.is_dir()
-            && held_directory.dev() == named_directory.dev()
-            && held_directory.ino() == named_directory.ino(),
-        "recovery lock path changed during acquisition"
-    );
-    match gate.try_lock() {
-        Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => return Err(JobJournalBusy.into()),
-        Err(std::fs::TryLockError::Error(error)) => {
-            return Err(error).context("cannot inspect exclusive job journal ownership");
-        }
-    }
-    let ownership = RecoveryOwnership {
-        _gate: gate,
-        directory,
-        parent: parent.to_owned(),
-        gate_name: name,
-        journal_name: std::ffi::CString::new(
-            lease_path
-                .file_name()
-                .context("journal has no name")?
-                .as_bytes(),
-        )?,
-    };
-    ownership.verify()?;
-    Ok(ownership)
+    Ok(RecoveryOwnership {
+        gate: JobJournalGate::try_acquire(lease_path)?.ok_or(JobJournalBusy)?,
+    })
 }
 
 fn validate_same_owner(observed: &DurableJobLease, latest: &DurableJobLease) -> anyhow::Result<()> {
@@ -531,7 +418,7 @@ mod tests {
                     .unwrap();
                 let path = directory.path().join("lease.json");
                 let ownership = acquire_gate(&path).unwrap();
-                let gate_inode = ownership._gate.metadata().unwrap().ino();
+                let gate_inode = ownership.gate.lock_metadata().unwrap().ino();
                 let mut lease = DurableJobLease::new(
                     JobIdentity::new_local(),
                     12345,
@@ -622,7 +509,7 @@ mod tests {
                         std::io::ErrorKind::NotFound
                     );
                 }
-                assert_eq!(ownership._gate.metadata().unwrap().ino(), gate_inode);
+                assert_eq!(ownership.gate.lock_metadata().unwrap().ino(), gate_inode);
                 ownership.verify().unwrap();
             }
         }
@@ -1157,8 +1044,8 @@ mod tests {
                 .recovery_ownership
                 .as_ref()
                 .unwrap()
-                ._gate
-                .metadata()
+                .gate
+                .lock_metadata()
                 .unwrap()
                 .ino()
         );

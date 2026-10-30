@@ -20,6 +20,7 @@ use crate::workers::{
 use anyhow::{Context, Result, anyhow};
 use chrono::{Duration as ChronoDuration, Utc};
 use rch_common::RestartAdmissionResponse;
+use rch_common::job_identity::journal::{JobJournalGate, read_lease_bytes};
 use rch_common::job_identity::{
     DurableJobLease, LOCAL_WRAPPER_ID_PREFIX, default_job_lease_directory,
 };
@@ -3715,6 +3716,13 @@ fn nonterminal_client_lease_ids() -> Result<Vec<String>> {
 /// The scan behind [`nonterminal_client_lease_ids`], parameterized on the
 /// directory so tests exercise it against a temp dir without env games.
 fn scan_client_leases(lease_dir: &std::path::Path) -> Result<Vec<String>> {
+    scan_client_leases_with(lease_dir, |_| Ok(()))
+}
+
+fn scan_client_leases_with(
+    lease_dir: &std::path::Path,
+    mut before_reap: impl FnMut(&std::path::Path) -> Result<()>,
+) -> Result<Vec<String>> {
     let entries = match std::fs::read_dir(lease_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -3733,36 +3741,69 @@ fn scan_client_leases(lease_dir: &std::path::Path) -> Result<Vec<String>> {
         {
             continue;
         }
-        let bytes = std::fs::read(entry.path())
-            .map_err(|error| anyhow!("cannot read {}: {error}", entry.path().display()))?;
+        let path = entry.path();
+        let bytes =
+            read_lease_bytes(&path).with_context(|| format!("cannot read {}", path.display()))?;
         let lease: DurableJobLease = serde_json::from_slice(&bytes)
-            .map_err(|error| anyhow!("cannot parse {}: {error}", entry.path().display()))?;
+            .map_err(|error| anyhow!("cannot parse {}: {error}", path.display()))?;
         if lease_blocks_restart(&lease, now_unix_ms, || {
             owner_presence(lease.wrapper_pid, lease.owner_identity().as_ref())
         }) {
             blocked.push(lease.identity.local_wrapper_id);
-        } else if now_unix_ms.saturating_sub(lease.heartbeat_unix_ms) >= LEASE_REAP_RETENTION_MS
-            && !lease_owns_unretired_source(&lease)
-            && (!lease_waits_for_restart_admission(&lease)
-                || owner_presence(lease.wrapper_pid, lease.owner_identity().as_ref())
-                    == OwnerPresence::Absent)
-        {
-            // Reap the file: it no longer blocks restart (terminal+acked, or
-            // provably dead and stale) and its last heartbeat is over the
-            // retention window, so it is pure history. Nothing else ever
-            // removed these — 18k of them accumulated in days and made every
-            // admission re-scan (and re-probe) all of them (bd-daspu). Best
-            // effort: a remove that fails just means we scan it again.
-            let _ = std::fs::remove_file(entry.path());
+        } else if lease_reap_candidate(&path, &lease, now_unix_ms) {
+            // Writers and detached recovery own this same persistent gate.
+            // The first read only identifies candidates; it cannot authorize
+            // unlinking a later journal epoch or an active owner's evidence.
+            before_reap(&path)?;
+            let Some(gate) = JobJournalGate::try_acquire(&path)? else {
+                continue;
+            };
+            let (snapshot, current_bytes) = gate.read_snapshot()?;
+            let current: DurableJobLease = serde_json::from_slice(&current_bytes)
+                .with_context(|| format!("cannot reload {}", path.display()))?;
+            if lease_blocks_restart(&current, now_unix_ms, || {
+                owner_presence(current.wrapper_pid, current.owner_identity().as_ref())
+            }) {
+                blocked.push(current.identity.local_wrapper_id);
+            } else if current == lease && lease_reap_candidate(&path, &current, now_unix_ms) {
+                // Retain the old bounded-history policy only for leases with
+                // no current recipe. The gate and exact opened inode/bytes
+                // remain bound through this best-effort unlink. Never remove
+                // the gate, source trees, retrieval stages or caller sidecars.
+                let _ = gate.remove_journal_if_unchanged(&snapshot, &current_bytes)?;
+            }
         }
     }
     blocked.sort();
     Ok(blocked)
 }
 
-/// How long a non-blocking lease is kept after its last heartbeat before the
-/// scan reaps its file. Long enough for post-mortem inspection of a just
-/// finished job; short enough that the directory stays bounded.
+/// Scheduling release does not release evidence custody. Recovery is an opaque
+/// hook-owned recipe: even a retired one can name retained staging, failed
+/// delivery, original Cargo replay evidence or a predecessor journal. Keep its
+/// durable index until the hook has an explicit custody-release protocol.
+/// Unacknowledged no-recipe leases also remain inputs to background daemon
+/// settlement, whose abandoned-build threshold is longer than this history TTL.
+/// This predicate must not be used for restart blocking or source fencing.
+fn lease_reap_candidate(path: &std::path::Path, lease: &DurableJobLease, now_unix_ms: u64) -> bool {
+    // A renamed/copied journal must not select a gate different from the
+    // wrapper's canonical writer. Unknown identities remain evidence.
+    let wrapper = &lease.identity.local_wrapper_id;
+    let canonical_identity = wrapper
+        .strip_prefix(LOCAL_WRAPPER_ID_PREFIX)
+        .is_some_and(|suffix| Uuid::parse_str(suffix).is_ok_and(|uuid| uuid.to_string() == suffix));
+    lease.schema_version == 1
+        && canonical_identity
+        && path.file_stem().and_then(|stem| stem.to_str()) == Some(wrapper.as_str())
+        && lease.state.is_terminal()
+        && lease.terminal_acknowledged
+        && lease.recovery.is_none()
+        && now_unix_ms.saturating_sub(lease.heartbeat_unix_ms) >= LEASE_REAP_RETENTION_MS
+}
+
+/// How long an acknowledged terminal lease is kept after its last heartbeat
+/// before the scan may reap its file if it has no current recovery recipe.
+/// This bounds ordinary history, not evidence-carrying leases or their payloads.
 const LEASE_REAP_RETENTION_MS: u64 = 60 * 60 * 1000;
 
 /// Heartbeat age past which a lease whose wrapper owner is provably absent is
@@ -3790,8 +3831,9 @@ const DEAD_WRAPPER_HEARTBEAT_STALE_MS: u64 = 15 * 60 * 1000;
 /// can release its worker-side source claim (`rch jobs recover`). Reaping it
 /// after its wrapper died stranded the claim forever and fenced every
 /// overlapping build on that worker (bd-dmg2k: 69 such claims fleet-wide).
-/// Only a recipe that names worker-side ownership (source roots, a source
-/// pair, or a tree to retire) needs keeping.
+/// Worker source fencing applies to unretired recipes that name source roots,
+/// a source pair, or a tree to retire. Journal custody has a separate, broader
+/// retention predicate.
 /// Workers this project must not be placed on: one running build per project
 /// per worker, workers whose failed build's client lease still owns worker
 /// source (their registry would refuse the same root, bd-jqhno), and workers
@@ -7414,62 +7456,65 @@ mod tests {
 
     #[test]
     fn scan_reaps_only_nonblocking_stale_leases_and_reports_blockers() {
-        let dir = std::env::temp_dir().join(format!("rch-lease-scan-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let dir = directory.path();
         let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
-        let write = |name: &str, lease: &DurableJobLease| {
-            std::fs::write(dir.join(name), serde_json::to_vec(lease).unwrap()).unwrap();
+        let write = |lease: &DurableJobLease| {
+            let path = dir.join(format!("{}.json", lease.identity.local_wrapper_id));
+            std::fs::write(&path, serde_json::to_vec(lease).unwrap()).unwrap();
+            path
         };
 
         // Blocking: fresh heartbeat — must be reported, never reaped.
         let fresh = make_test_lease(now, 1);
-        write("fresh.json", &fresh);
+        let fresh_path = write(&fresh);
         // Non-blocking and past retention: terminal + acknowledged, ancient
         // heartbeat — must be reaped.
         let mut done = make_test_lease(now - LEASE_REAP_RETENTION_MS - 1, 1);
         done.acknowledge_terminal(now - LEASE_REAP_RETENTION_MS - 1);
-        write("done-old.json", &done);
+        let done_path = write(&done);
         // Non-blocking but INSIDE retention: terminal + acknowledged, recent
         // heartbeat — kept for post-mortem, not reaped, not reported.
         let mut recent = make_test_lease(now - 1000, 1);
         recent.acknowledge_terminal(now - 1000);
-        write("done-recent.json", &recent);
+        let recent_path = write(&recent);
         // Not a lease: never touched.
         std::fs::write(dir.join("README.txt"), b"not a lease").unwrap();
 
-        let blocked = scan_client_leases(&dir).unwrap();
-        assert_eq!(blocked.len(), 1, "only the fresh lease blocks: {blocked:?}");
-        assert!(
-            !dir.join("done-old.json").exists(),
-            "stale non-blocker reaped"
-        );
-        assert!(
-            dir.join("done-recent.json").exists(),
-            "recent non-blocker kept"
-        );
-        assert!(dir.join("fresh.json").exists(), "blocker kept");
+        let blocked = scan_client_leases(dir).unwrap();
+        assert_eq!(blocked, vec![fresh.identity.local_wrapper_id]);
+        assert!(!done_path.exists(), "stale non-blocker reaped");
+        assert!(recent_path.exists(), "recent non-blocker kept");
+        assert!(fresh_path.exists(), "blocker kept");
         assert!(dir.join("README.txt").exists(), "non-json untouched");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn scan_never_reaps_a_dead_lease_that_still_owns_worker_source() {
-        let dir = tempfile::tempdir().unwrap();
+    fn scan_retains_current_recovery_after_worker_source_is_released() {
+        let dir = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
         let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
         let stale = now - LEASE_REAP_RETENTION_MS - 1;
         // A PID beyond pid_max: provably dead.
         let dead_pid = 4_194_304 * 2;
-        let write = |name: &str, pid: u32, recipe: serde_json::Value| {
+        let write = |pid: u32, recipe: serde_json::Value| {
             let mut lease = make_test_lease(stale, pid);
             lease.recovery = Some(recipe);
-            std::fs::write(dir.path().join(name), serde_json::to_vec(&lease).unwrap()).unwrap();
+            let path = dir
+                .path()
+                .join(format!("{}.json", lease.identity.local_wrapper_id));
+            std::fs::write(&path, serde_json::to_vec(&lease).unwrap()).unwrap();
+            path
         };
         let owning = |retired: bool| serde_json::json!({ "source_roots": ["/p"], "pair": null, "retire_root": null, "retired": retired });
-        write("owns-source.json", dead_pid, owning(false));
-        write("retired.json", dead_pid, owning(true));
-        write(
-            "owns-nothing.json",
+        let owns_source = write(dead_pid, owning(false));
+        let retired = write(dead_pid, owning(true));
+        let owns_nothing = write(
             dead_pid,
             serde_json::json!({ "source_roots": [], "pair": null, "retire_root": null, "retired": false }),
         );
@@ -7478,16 +7523,227 @@ mod tests {
 
         assert!(blocked.is_empty(), "{blocked:?}");
         assert!(
-            dir.path().join("owns-source.json").exists(),
+            owns_source.exists(),
             "the only authority able to release a worker claim was reaped"
         );
         assert!(
-            !dir.path().join("retired.json").exists(),
-            "retired history is reaped"
+            retired.exists(),
+            "source release does not release recovery evidence custody"
         );
         assert!(
-            !dir.path().join("owns-nothing.json").exists(),
-            "a recipe owning nothing on the worker is plain history"
+            owns_nothing.exists(),
+            "worker ownership is not a complete index of recovery evidence"
+        );
+    }
+
+    #[test]
+    fn scan_retains_opaque_recovery_and_unknown_schema_without_blocking_restart() {
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
+        let stale = now - LEASE_REAP_RETENTION_MS - 1;
+        let recipes = [
+            serde_json::json!({"version": 2, "retired": true, "retained_root": "/retained", "exit_code": 0, "returned": 0, "phases": [{"complete": true}]}),
+            serde_json::json!({"version": 2, "retired": true, "exit_code": 7, "returned": 102, "phases": [{"complete": false, "pending": ["report", "hash"]}]}),
+            serde_json::json!({"version": 2, "retired": true, "caller_json_policy": "/caller", "caller_delivery": {"path": "/delivery"}}),
+            serde_json::json!({"version": 2, "retired": true, "phases": [{"complete": true}]}),
+            serde_json::json!({"version": 999, "retired": true}),
+            serde_json::json!("unrecognized recovery custody"),
+            serde_json::json!([]),
+        ];
+        let mut retained = Vec::new();
+        for recipe in recipes {
+            let mut lease = make_test_lease(stale, 1);
+            lease.acknowledge_terminal(stale);
+            lease.recovery = Some(recipe);
+            let path = directory
+                .path()
+                .join(format!("{}.json", lease.identity.local_wrapper_id));
+            let bytes = serde_json::to_vec(&lease).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            retained.push((path, bytes));
+        }
+        let mut future = make_test_lease(stale, 1);
+        future.acknowledge_terminal(stale);
+        future.schema_version = 2;
+        let path = directory
+            .path()
+            .join(format!("{}.json", future.identity.local_wrapper_id));
+        let bytes = serde_json::to_vec(&future).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        retained.push((path, bytes));
+        let stage = directory.path().join("retrieval/identity/0");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("source.c"), b"private retained collector input").unwrap();
+        let sidecar = directory.path().join("original.cargo-delivery-receipt");
+        std::fs::write(&sidecar, b"original caller delivery").unwrap();
+
+        assert!(scan_client_leases(directory.path()).unwrap().is_empty());
+        for (path, bytes) in retained {
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
+        assert_eq!(
+            std::fs::read(stage.join("source.c")).unwrap(),
+            b"private retained collector input"
+        );
+        assert_eq!(std::fs::read(sidecar).unwrap(), b"original caller delivery");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scan_keeps_unacknowledged_no_recipe_for_background_settlement() {
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
+        // Background recovery needs this same no-recipe journal after 24h.
+        // Neither the one-hour history TTL nor a dead wrapper settles it.
+        for age in [LEASE_REAP_RETENTION_MS + 1, 25 * 60 * 60 * 1000] {
+            let lease = make_test_lease(now - age, 4_194_304 * 2);
+            let path = directory
+                .path()
+                .join(format!("{}.json", lease.identity.local_wrapper_id));
+            let bytes = serde_json::to_vec(&lease).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(scan_client_leases(directory.path()).unwrap().is_empty());
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn scan_retains_journals_that_do_not_match_the_canonical_writer_identity() {
+        for case in ["alias", "mismatched", "malformed", "noncanonical"] {
+            let directory = tempfile::Builder::new()
+                .disable_cleanup(true)
+                .tempdir()
+                .unwrap();
+            let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
+            let stale = now - LEASE_REAP_RETENTION_MS - 1;
+            let mut lease = make_test_lease(stale, 1);
+            lease.acknowledge_terminal(stale);
+            match case {
+                "malformed" => lease.identity.local_wrapper_id = "rchw-not-a-uuid".to_string(),
+                "noncanonical" => {
+                    lease.identity.local_wrapper_id =
+                        "rchw-AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA".to_string();
+                }
+                _ => {}
+            }
+            let stem = match case {
+                "alias" => "archived-copy".to_string(),
+                "mismatched" => rch_common::job_identity::JobIdentity::new_local().local_wrapper_id,
+                _ => lease.identity.local_wrapper_id.clone(),
+            };
+            let path = directory.path().join(format!("{stem}.json"));
+            let bytes = serde_json::to_vec(&lease).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            let mut ordinary = make_test_lease(stale, 1);
+            ordinary.acknowledge_terminal(stale);
+            let ordinary_path = directory
+                .path()
+                .join(format!("{}.json", ordinary.identity.local_wrapper_id));
+            std::fs::write(&ordinary_path, serde_json::to_vec(&ordinary).unwrap()).unwrap();
+
+            assert!(scan_client_leases(directory.path()).unwrap().is_empty());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "{case}");
+            assert!(
+                !path.with_extension("recovery.lock").exists(),
+                "must not select an alias gate for {case}"
+            );
+            assert!(
+                !ordinary_path.exists(),
+                "canonical acknowledged history still reaps"
+            );
+        }
+    }
+
+    #[test]
+    fn scan_reloads_changed_evidence_under_gate_and_reports_new_blockers() {
+        for change in ["recovery", "running", "heartbeat"] {
+            let directory = tempfile::Builder::new()
+                .disable_cleanup(true)
+                .tempdir()
+                .unwrap();
+            let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
+            let stale = now - LEASE_REAP_RETENTION_MS - 1;
+            let mut initial = make_test_lease(stale, 1);
+            initial.acknowledge_terminal(stale);
+            let path = directory
+                .path()
+                .join(format!("{}.json", initial.identity.local_wrapper_id));
+            std::fs::write(&path, serde_json::to_vec(&initial).unwrap()).unwrap();
+            let mut current = initial.clone();
+            match change {
+                "recovery" => {
+                    current.recovery =
+                        Some(serde_json::json!({"retired": true, "retained_root": "/new-custody"}))
+                }
+                "running" => {
+                    current.state = rch_common::job_identity::JobLifecycleState::Running;
+                    current.terminal_acknowledged = false;
+                    current.heartbeat("retrieving", now);
+                }
+                "heartbeat" => current.heartbeat("finished", now),
+                _ => unreachable!(),
+            }
+            let expected = serde_json::to_vec(&current).unwrap();
+            let mut observed = false;
+            let blocked = scan_client_leases_with(directory.path(), |candidate| {
+                assert_eq!(candidate, path);
+                assert!(!observed);
+                observed = true;
+                // A real cooperating writer wins the gate after the scan's
+                // first read and atomically installs its new journal epoch.
+                let gate = JobJournalGate::try_acquire(candidate)?.unwrap();
+                let temporary = directory.path().join("updated-journal");
+                std::fs::write(&temporary, &expected)?;
+                std::fs::rename(temporary, candidate)?;
+                gate.verify()?;
+                Ok(())
+            })
+            .unwrap();
+            assert!(observed);
+            assert_eq!(std::fs::read(&path).unwrap(), expected);
+            if change == "running" {
+                assert_eq!(blocked, vec![current.identity.local_wrapper_id]);
+            } else {
+                assert!(blocked.is_empty());
+            }
+            assert!(path.with_extension("recovery.lock").is_file());
+        }
+    }
+
+    #[test]
+    fn scan_does_not_reap_a_journal_held_by_the_shared_writer_gate() {
+        use std::os::unix::fs::MetadataExt;
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
+        let stale = now - LEASE_REAP_RETENTION_MS - 1;
+        let mut lease = make_test_lease(stale, 1);
+        lease.acknowledge_terminal(stale);
+        let bytes = serde_json::to_vec(&lease).unwrap();
+        let path = directory
+            .path()
+            .join(format!("{}.json", lease.identity.local_wrapper_id));
+        std::fs::write(&path, &bytes).unwrap();
+        let gate = JobJournalGate::try_acquire(&path).unwrap().unwrap();
+        let inode = gate.lock_metadata().unwrap().ino();
+        assert!(scan_client_leases(directory.path()).unwrap().is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        drop(gate);
+        assert!(scan_client_leases(directory.path()).unwrap().is_empty());
+        assert!(!path.exists(), "acknowledged no-recipe history still reaps");
+        assert_eq!(
+            std::fs::metadata(path.with_extension("recovery.lock"))
+                .unwrap()
+                .ino(),
+            inode
         );
     }
 

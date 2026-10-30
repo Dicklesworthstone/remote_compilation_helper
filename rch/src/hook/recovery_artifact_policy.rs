@@ -221,8 +221,8 @@ fn retain_previous_journal(
     use rustix::fs::{Mode, OFlags};
     ownership.verify()?;
     let bytes = crate::state::primitives::read_regular_file_at(
-        ownership.directory.as_fd(),
-        &ownership.journal_name,
+        ownership.gate.directory().as_fd(),
+        ownership.gate.journal_name(),
     )?;
     anyhow::ensure!(
         DurableLeaseWriter::decode_journal(&bytes, &writer.wrapper_id())? == *expected,
@@ -233,7 +233,7 @@ fn retain_previous_journal(
         uuid::Uuid::new_v4().simple()
     ))?;
     let mut file = File::from(rustix::fs::openat(
-        ownership.directory.as_fd(),
+        ownership.gate.directory().as_fd(),
         name.as_c_str(),
         OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::RUSR | Mode::WUSR,
@@ -242,11 +242,11 @@ fn retain_previous_journal(
     file.sync_all()?;
     ownership.require_named_file(&file, &name)?;
     crate::state::primitives::verify_atomic_write_bytes(&file, &bytes)?;
-    ownership.directory.sync_all()?;
+    ownership.gate.directory().sync_all()?;
     ownership.verify()?;
     ownership.require_named_file(&file, &name)?;
     crate::state::primitives::verify_atomic_write_bytes(&file, &bytes)?;
-    Ok(ownership.parent.join(name.to_str()?))
+    Ok(ownership.gate.parent().join(name.to_str()?))
 }
 
 fn prepare_fresh_stage(

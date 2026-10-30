@@ -54,6 +54,254 @@ pub fn default_job_lease_directory() -> PathBuf {
     state_dir.join("job-leases")
 }
 
+/// Descriptor-bound journal ownership shared by live writers, recovery and
+/// the daemon's history reaper. The persistent lock inode is never unlinked.
+#[cfg(unix)]
+pub mod journal {
+    use anyhow::{Context, Result, ensure};
+    use rustix::fs::{Mode, OFlags};
+    use std::ffi::{CStr, CString};
+    use std::fs::{File, Metadata};
+    use std::io::Read;
+    use std::os::fd::AsFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::{Path, PathBuf};
+
+    const READ_FLAGS: OFlags = OFlags::RDONLY
+        .union(OFlags::CLOEXEC)
+        .union(OFlags::NOFOLLOW)
+        .union(OFlags::NONBLOCK)
+        .union(OFlags::NOCTTY);
+
+    fn open_directory(parent: &Path) -> Result<File> {
+        Ok(File::from(rustix::fs::open(
+            parent,
+            OFlags::RDONLY
+                | OFlags::DIRECTORY
+                | OFlags::CLOEXEC
+                | OFlags::NOFOLLOW
+                | OFlags::NONBLOCK,
+            Mode::empty(),
+        )?))
+    }
+
+    fn verify_directory(directory: &File, parent: &Path) -> Result<()> {
+        let held = directory.metadata()?;
+        let named = std::fs::symlink_metadata(parent)?;
+        ensure!(
+            named.is_dir() && held.dev() == named.dev() && held.ino() == named.ino(),
+            "recovery journal directory changed; retry the retained same wrapper"
+        );
+        Ok(())
+    }
+
+    fn read_regular_at(directory: &File, name: &CStr) -> Result<(File, Vec<u8>)> {
+        let mut file = File::from(rustix::fs::openat(
+            directory.as_fd(),
+            name,
+            READ_FLAGS,
+            Mode::empty(),
+        )?);
+        ensure!(file.metadata()?.is_file(), "journal is not a regular file");
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .context("journal read failed")?;
+        Ok((file, bytes))
+    }
+
+    /// Observe a journal without taking ownership. Reject symlinks and special
+    /// files without waiting for a FIFO writer, and retain the directory binding.
+    pub fn read_lease_bytes(path: &Path) -> Result<Vec<u8>> {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let name = CString::new(path.file_name().context("journal has no name")?.as_bytes())?;
+        let directory = open_directory(parent)?;
+        let (_, bytes) = read_regular_at(&directory, &name)?;
+        verify_directory(&directory, parent)?;
+        Ok(bytes)
+    }
+
+    /// One exclusive journal owner. Dropping it releases the lock, not its inode.
+    pub struct JobJournalGate {
+        gate: File,
+        directory: File,
+        parent: PathBuf,
+        gate_name: CString,
+        journal_name: CString,
+    }
+
+    impl JobJournalGate {
+        /// `None` means another handle owns this journal. Callers must not wait
+        /// inside admission scans or continue a destructive operation unlocked.
+        pub fn try_acquire(lease_path: &Path) -> Result<Option<Self>> {
+            let path = lease_path.with_extension("recovery.lock");
+            let parent = path.parent().context("recovery lock has no parent")?;
+            let name = CString::new(
+                path.file_name()
+                    .context("recovery lock has no name")?
+                    .as_bytes(),
+            )?;
+            let directory = open_directory(parent)?;
+            let uid = rustix::process::geteuid().as_raw();
+            let safe = |metadata: &Metadata| {
+                metadata.file_type().is_file()
+                    && metadata.uid() == uid
+                    && metadata.nlink() == 1
+                    && metadata.mode() & 0o077 == 0
+            };
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => ensure!(safe(&metadata), "unsafe recovery lock file"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            let flags = OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY;
+            let gate = File::from(rustix::fs::openat(
+                directory.as_fd(),
+                name.as_c_str(),
+                OFlags::RDWR | OFlags::CREATE | flags,
+                Mode::RUSR | Mode::WUSR,
+            )?);
+            ensure!(safe(&gate.metadata()?), "unsafe recovery lock file");
+            let named_gate = File::from(rustix::fs::openat(
+                directory.as_fd(),
+                name.as_c_str(),
+                READ_FLAGS,
+                Mode::empty(),
+            )?);
+            let held = gate.metadata()?;
+            let named = named_gate.metadata()?;
+            let held_directory = directory.metadata()?;
+            let named_directory = std::fs::symlink_metadata(parent)?;
+            ensure!(
+                safe(&held)
+                    && safe(&named)
+                    && held.dev() == named.dev()
+                    && held.ino() == named.ino()
+                    && named_directory.is_dir()
+                    && held_directory.dev() == named_directory.dev()
+                    && held_directory.ino() == named_directory.ino(),
+                "recovery lock path changed during acquisition"
+            );
+            match gate.try_lock() {
+                Ok(()) => {}
+                Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+                Err(std::fs::TryLockError::Error(error)) => {
+                    return Err(error).context("cannot inspect exclusive job journal ownership");
+                }
+            }
+            let ownership = Self {
+                gate,
+                directory,
+                parent: parent.to_owned(),
+                gate_name: name,
+                journal_name: CString::new(
+                    lease_path
+                        .file_name()
+                        .context("journal has no name")?
+                        .as_bytes(),
+                )?,
+            };
+            ownership.verify()?;
+            Ok(Some(ownership))
+        }
+
+        /// Names must still refer to the held directory and persistent lock.
+        pub fn verify(&self) -> Result<()> {
+            verify_directory(&self.directory, &self.parent)?;
+            let named_gate = File::from(rustix::fs::openat(
+                self.directory.as_fd(),
+                self.gate_name.as_c_str(),
+                READ_FLAGS,
+                Mode::empty(),
+            )?);
+            let held = self.gate.metadata()?;
+            let named = named_gate.metadata()?;
+            ensure!(
+                named.is_file()
+                    && held.is_file()
+                    && named.dev() == held.dev()
+                    && named.ino() == held.ino()
+                    && named.uid() == held.uid()
+                    && named.nlink() == 1
+                    && held.nlink() == 1
+                    && named.mode() & 0o077 == 0,
+                "recovery lock changed; no journal mutation acknowledged"
+            );
+            Ok(())
+        }
+
+        pub fn directory(&self) -> &File {
+            &self.directory
+        }
+
+        pub fn parent(&self) -> &Path {
+            &self.parent
+        }
+
+        pub fn journal_name(&self) -> &CStr {
+            &self.journal_name
+        }
+
+        pub fn lock_metadata(&self) -> std::io::Result<Metadata> {
+            self.gate.metadata()
+        }
+
+        /// Keep the opened inode with the bytes used for a reap decision.
+        pub fn read_snapshot(&self) -> Result<(File, Vec<u8>)> {
+            self.verify()?;
+            let snapshot = read_regular_at(&self.directory, &self.journal_name)?;
+            self.verify()?;
+            Ok(snapshot)
+        }
+
+        /// The caller supplies its history-retention policy. This operation
+        /// only removes the exact unchanged journal inspected under this gate;
+        /// it never removes staging, sidecars, source trees or the gate itself.
+        /// An ordinary unlink failure is best effort (`false`), while changed
+        /// evidence or an unsafe namespace is an error and must be retained.
+        pub fn remove_journal_if_unchanged(
+            &self,
+            snapshot: &File,
+            expected: &[u8],
+        ) -> Result<bool> {
+            self.verify()?;
+            let (named_file, bytes) = read_regular_at(&self.directory, &self.journal_name)?;
+            let held = snapshot.metadata()?;
+            let named = named_file.metadata()?;
+            ensure!(
+                held.is_file()
+                    && named.is_file()
+                    && held.dev() == named.dev()
+                    && held.ino() == named.ino()
+                    && held.uid() == rustix::process::geteuid().as_raw()
+                    && named.uid() == held.uid()
+                    && held.nlink() == 1
+                    && named.nlink() == 1
+                    && named.mode() & 0o022 == 0
+                    && bytes == expected,
+                "job journal changed before history reaping"
+            );
+            self.verify()?;
+            if rustix::fs::unlinkat(
+                self.directory.as_fd(),
+                self.journal_name.as_c_str(),
+                rustix::fs::AtFlags::empty(),
+            )
+            .is_err()
+            {
+                return Ok(false);
+            }
+            // Reappearing disposable history after a failed directory sync is
+            // harmless; a later scan can repeat the same policy and checks.
+            let _ = self.directory.sync_all();
+            Ok(true)
+        }
+    }
+}
+
 /// Mint a fresh, unique local wrapper id.
 #[must_use]
 pub fn new_local_wrapper_id() -> LocalWrapperId {
@@ -345,6 +593,216 @@ impl JobRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn private_journal(path: &std::path::Path, bytes: &[u8]) {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_gate_preserves_its_inode_across_exclusive_owners() {
+        use std::os::unix::fs::MetadataExt;
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let path = directory.path().join("lease.json");
+        private_journal(&path, b"original journal");
+        let first = journal::JobJournalGate::try_acquire(&path)
+            .unwrap()
+            .unwrap();
+        let inode = first.lock_metadata().unwrap().ino();
+        assert!(
+            journal::JobJournalGate::try_acquire(&path)
+                .unwrap()
+                .is_none()
+        );
+        drop(first);
+        let next = journal::JobJournalGate::try_acquire(&path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.lock_metadata().unwrap().ino(), inode);
+        next.verify().unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"original journal");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_reap_requires_the_exact_unchanged_regular_snapshot() {
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+        for change in [
+            "unchanged",
+            "rewrite",
+            "replace",
+            "hardlink",
+            "writable",
+            "symlink",
+            "fifo",
+        ] {
+            let directory = tempfile::Builder::new()
+                .disable_cleanup(true)
+                .tempdir()
+                .unwrap();
+            let path = directory.path().join("lease.json");
+            let preserved = directory.path().join("preserved-journal");
+            let unrelated = directory.path().join("unrelated-source.c");
+            private_journal(&path, b"original journal");
+            private_journal(&unrelated, b"unrelated retained source");
+            let gate = journal::JobJournalGate::try_acquire(&path)
+                .unwrap()
+                .unwrap();
+            let (snapshot, bytes) = gate.read_snapshot().unwrap();
+            match change {
+                "unchanged" => {}
+                "rewrite" => std::fs::write(&path, b"updated journal").unwrap(),
+                "replace" => {
+                    std::fs::rename(&path, &preserved).unwrap();
+                    private_journal(&path, &bytes);
+                }
+                "hardlink" => std::fs::hard_link(&path, &preserved).unwrap(),
+                "writable" => {
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap()
+                }
+                "symlink" => {
+                    std::fs::rename(&path, &preserved).unwrap();
+                    std::os::unix::fs::symlink(&unrelated, &path).unwrap();
+                }
+                "fifo" => {
+                    std::fs::rename(&path, &preserved).unwrap();
+                    assert!(
+                        std::process::Command::new("mkfifo")
+                            .arg(&path)
+                            .status()
+                            .unwrap()
+                            .success()
+                    );
+                }
+                _ => unreachable!(),
+            }
+            let result = gate.remove_journal_if_unchanged(&snapshot, &bytes);
+            if change == "unchanged" {
+                assert!(result.unwrap());
+                assert!(!path.exists());
+            } else {
+                assert!(result.is_err(), "accepted changed journal: {change}");
+                match change {
+                    "rewrite" => assert_eq!(std::fs::read(&path).unwrap(), b"updated journal"),
+                    "symlink" => assert!(
+                        std::fs::symlink_metadata(&path)
+                            .unwrap()
+                            .file_type()
+                            .is_symlink()
+                    ),
+                    "fifo" => assert!(
+                        std::fs::symlink_metadata(&path)
+                            .unwrap()
+                            .file_type()
+                            .is_fifo()
+                    ),
+                    _ => assert_eq!(std::fs::read(&path).unwrap(), bytes),
+                }
+            }
+            if matches!(change, "replace" | "hardlink" | "symlink" | "fifo") {
+                assert_eq!(std::fs::read(preserved).unwrap(), bytes);
+            }
+            assert!(path.with_extension("recovery.lock").is_file());
+            assert_eq!(
+                std::fs::read(unrelated).unwrap(),
+                b"unrelated retained source"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_reap_rejects_replaced_parent_and_gate_namespaces() {
+        use std::os::unix::fs::MetadataExt;
+        for change in ["parent", "gate"] {
+            let directory = tempfile::Builder::new()
+                .disable_cleanup(true)
+                .tempdir()
+                .unwrap();
+            let jobs = directory.path().join("jobs");
+            std::fs::create_dir(&jobs).unwrap();
+            let path = jobs.join("lease.json");
+            private_journal(&path, b"original journal");
+            let gate = journal::JobJournalGate::try_acquire(&path)
+                .unwrap()
+                .unwrap();
+            let gate_inode = gate.lock_metadata().unwrap().ino();
+            let (snapshot, bytes) = gate.read_snapshot().unwrap();
+            let preserved = directory.path().join("preserved");
+            if change == "parent" {
+                std::fs::rename(&jobs, &preserved).unwrap();
+                std::fs::create_dir(&jobs).unwrap();
+                private_journal(&path, b"replacement journal");
+                private_journal(&path.with_extension("recovery.lock"), b"replacement gate");
+            } else {
+                std::fs::rename(path.with_extension("recovery.lock"), &preserved).unwrap();
+                private_journal(&path.with_extension("recovery.lock"), b"replacement gate");
+            }
+            assert!(gate.remove_journal_if_unchanged(&snapshot, &bytes).is_err());
+            if change == "parent" {
+                assert_eq!(std::fs::read(preserved.join("lease.json")).unwrap(), bytes);
+                assert_eq!(std::fs::read(&path).unwrap(), b"replacement journal");
+                assert_eq!(
+                    std::fs::metadata(preserved.join("lease.recovery.lock"))
+                        .unwrap()
+                        .ino(),
+                    gate_inode
+                );
+            } else {
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+                assert_eq!(std::fs::metadata(&preserved).unwrap().ino(), gate_inode);
+            }
+            assert_eq!(
+                std::fs::read(path.with_extension("recovery.lock")).unwrap(),
+                b"replacement gate"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_observation_refuses_symlink_fifo_and_redirected_parent() {
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let real = directory.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let path = real.join("lease.json");
+        private_journal(&path, b"original journal");
+        let link = directory.path().join("linked.json");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(journal::read_lease_bytes(&link).is_err());
+        let fifo = directory.path().join("fifo.json");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(journal::read_lease_bytes(&fifo).is_err());
+        let redirected = directory.path().join("redirected");
+        std::os::unix::fs::symlink(&real, &redirected).unwrap();
+        assert!(journal::read_lease_bytes(&redirected.join("lease.json")).is_err());
+        assert_eq!(
+            journal::read_lease_bytes(&path).unwrap(),
+            b"original journal"
+        );
+    }
 
     #[test]
     fn local_wrapper_ids_are_prefixed_and_unique() {
