@@ -21,6 +21,114 @@ a lexical search count, not a complete membership denominator.
 
 ### What exists, and what that does not establish
 
+### Execution checklist — user-authorized implementation and live qualification
+
+Consumer: the implementing agent and operator running the original milestones.
+This checklist prevents losing implementation or acceptance work during long
+native builds. Update it in place; retire it when the original milestones have
+their cited acceptance, retaining their evidence in Beads. A checked step is
+only the stated step, never closure of the surrounding milestone.
+
+- [x] Read the complete AGENTS/README and audit original plan against code.
+- [x] Restore 19 existing unmet program/milestone/probe owners without changing goals.
+- [x] Run the original frozen-source Cargo suite and workspace check to terminal outcomes.
+  The check exited 101 with two daemon compiler errors; the Cargo suite's
+  companion build failed and its outer command subsequently hit the 7,200s
+  deadline (137). Neither establishes a native passing suite.
+- [x] Correct the missing source-delivery `BTreeMap` import and borrow the
+  formatted dependency-negotiation error passed to `invalid(&str)`.
+- [ ] Compile a mutually matching current wrapper, coordinator and worker on Linux.
+  - [ ] Bind the exact source/overlay, toolchain, profile, Cargo artifacts and binary hashes.
+  - [ ] Include validated `RCH_BUILD_SOURCE` in the default release/service identity;
+    test that a verdict for one overlay cannot authorize another.
+  - [ ] Keep strict remote execution, disk preflight and existing ownership intact.
+  - [ ] Resolve every compiler error; rerun workspace/all-target check and strict Clippy.
+- [ ] Run real Cargo cross-worktree dependency acceptance to a terminal result (M4).
+  - [ ] Cold compiler execution, two comparisons, later compiler skip and stock byte parity.
+  - [ ] Registry and vendored inputs, source mutation/unlisted files, large packages/artifacts.
+  - [ ] Cargo Fresh rebuild and workspace-only edit; restricted build-script cases.
+  - [ ] Retain complete failures/refusals and distinguish support tests from Cargo tests.
+- [ ] Run canonical namespace and authenticated worker acceptance unchanged (M4/M9).
+  - [ ] Full production namespace probe, retained toolchain/runtime and private target roots.
+  - [ ] Local canonical dependency reuse and source invalidation across worktrees.
+  - [ ] Real mutual TLS worker metadata execution, earned replay and no dispatch on hits.
+  - [ ] Real archive execution, final delivered executable and observed program output.
+  - [ ] Generated/native roots, propagated consumers, archive-byte and directory invalidation.
+  - [ ] Pool occupancy/bypass, both worker slots and independent delivery ownership.
+  - [ ] Wrong capability/pin, corrupt/partial output, lost ACK, cancellation and result-only recovery.
+- [ ] Qualify shared canonical service and cross-edge authority (M6).
+  - [ ] Compile the new persistent service and run its real concurrent Cargo fixture.
+  - [ ] Two overlapping roots, third-root refusal, independent caller cancellation.
+  - [ ] One authority with independent edges; root permits and C-1 jobserver accounting.
+  - [ ] Delivered binary, Cargo Fresh state, source invalidation and stopped-service refusal.
+  - [ ] Two distinct edge hosts join one action lineage; coordinator restart/stale-offer fencing.
+  - [ ] Final-subscriber drain and no leaked process, token, lease, pin or partial destination.
+- [ ] Repair and qualify distribution, then opt-in canary (S7/S8).
+  - [x] Add complete receipts to the three failing assertions without changing deadlines
+    or acceptance; preserve the original red 78-case run. Exact old failure cause remains unknown.
+  - [x] Run all 78 installer regressions, including corrupt/mixed bundles and lost
+    acknowledgments: exit 0, 121.445s on trj, transcript
+    `/Volumes/trj-data/rabs-execute-20261030-installer-complete-inputs.log`, SHA-256
+    `0f5819cfcf1a79a0a96a2c5669c2ff6785be71b19114e3ce92b149bcb4aeaabe`.
+    A preceding copied test bundle omitted the launcher and exited 1 with 14
+    setup errors; its transcript is retained as `rabs-execute-20261030-installer.log`.
+  - [ ] Build correct wrapper/daemon release profiles; validate actual complete archives.
+  - [ ] Clean private install/upgrade on capable Linux hosts; version/hash/doctor checks.
+  - [ ] Real-repository Cargo canary compared with stock/current RCH in the same invocation.
+  - [ ] Source/env/toolchain/dependency/negative-input invalidation and output/diagnostic parity.
+  - [ ] Deliberately qualify/re-enable CI under resource policy; do not equate YAML with a run.
+  - [ ] Publish tested matching tools; verify downloaded archive and fresh installed execution.
+  - [ ] Sustained shadow/soak, incident-free cleanup and explicit rollback per original gates.
+- [ ] Deliver native/header/final-link serving (M5), not just retained archive execution.
+  - [ ] Wire CC/CXX/AR interception and exact ordered inputs/toolchain/environment.
+  - [ ] Close header, script, response-file, native search and negative-input dependencies.
+  - [ ] Earn publication/replay; stock differential outputs, changed-input misses and failures.
+- [ ] Deliver workspace action serving with canonical minimal closure and lineage (M10).
+  - [ ] Publish selected workspace results through existing actors and trust gates.
+  - [ ] Preserve Cargo events/pipelining, provisional ancestor gating and private destinations.
+  - [ ] Large shadow corpus and source/env/toolchain/dependency/negative-input twins.
+- [ ] Deliver governed build-script post-state replay (M11).
+  - [ ] Preserve exact Cargo directives, environment, jobserver, pre-state and post-state.
+  - [ ] Stage complete generated trees including deletions; prove channel/toolchain compatibility.
+  - [ ] Corpus coverage, side-effect/network/secret refusals and stock differential acceptance.
+- [ ] Deliver admitted test-result serving (M12).
+  - [ ] Wire actual runner, exact binary/data/environment identity and isolated effects.
+  - [ ] Stable-pass/failure evidence; flaky/time/network/side-effect classifications.
+  - [ ] Real skipped test bodies with replay parity and changed-input reruns; release bypass.
+- [ ] Deliver incremental ancestry and private state reuse (M13).
+  - [ ] Exact/nearest-compatible state selection and toolchain/platform fencing.
+  - [ ] Quiescent immutable capture, private writable clones, retention and crash safety.
+  - [ ] Branch ping-pong comparison and transfer/storage ROI; keep losses visible.
+- [ ] Connect edit/git/CI prewarming to existing actors (M14).
+  - [ ] Coherent snapshots, supersession, foreground promotion and bounded optional resources.
+  - [ ] Actual event-source integration and saved latency minus wasted-work measurement.
+- [ ] Deliver receipt-backed explanation and advice (M15).
+  - [ ] Live action/build identity queries for why, fragmentation and worker decisions.
+  - [ ] Actual `rch advise` command with compiler-second attribution and evidence limits.
+  - [ ] Real repeated Cargo workload with planted splits; stable JSON and no automatic edits.
+- [ ] Qualify native ATP control/data and every original quantitative gate (M7/M8/W2).
+  - [ ] Cancellation/control under bulk congestion, partition/resume and corruption.
+  - [ ] Paired ATP/current SSH-rsync correctness and cost on distinct hosts.
+  - [ ] <50ms hit and <1-2% admitted miss overhead with declared floors and denominators.
+  - [ ] Agent median >=3x/p90 >=2x; 15-agent useful-throughput/tail >=3x.
+  - [ ] Branch >=3x, cold workspace >=1.5x and warm converged served fraction >90%.
+  - [ ] Retain A/A controls, queue/transfer/setup/storage costs and zero-divergence evidence.
+- [ ] Perform the original frontier proceed/kill review (M16); defer only with evidence.
+- [ ] Finish with exact source/test denominators, retained failures, graph validation,
+  Beads sync, scoped commits and non-force synchronization of both required branches.
+
+The two native compiler fixes are committed at `3ddd07170c35df57c90e543dc549dc6448b4380e`.
+The first matching build request refused with queue timeout before compiling.
+The installed CLI forbids both clean-overlay/job and source-receipt/job
+combinations, so the existing native runner is now requested as a supported RCH
+job from a separate clean checkout at that exact source, with a private off-root
+mirror and result directory. It retains a longer bounded queue wait without
+changing daemon configuration or disturbing another invocation. At this update
+it is queued, not passed; transcript:
+`/Volumes/trj-data/rabs-execute-20261030-native-canonical-root-job.log`.
+
+### Capability assessment
+
 | # | Original testable goal | Current evidence and boundary | Status / owner |
 |---|---|---|---|
 | 1 | Conventional RCH offloads actual jobs and preserves ownership | Installed client and daemon are 2.1.34; the live Mac daemon reports 17 configured workers, 15 healthy, 43 effective slots and 35 available at observation. Three workers have critical disk pressure. A source-ownership refusal is an infrastructure refusal, not a RABS test result. | Operational, degraded fleet; existing conventional RCH issues remain |

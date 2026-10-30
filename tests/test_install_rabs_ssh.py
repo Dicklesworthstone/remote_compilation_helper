@@ -162,7 +162,7 @@ class SSHDeploymentTests(unittest.TestCase):
         result = self.deploy(["drop-ack"])
         self.assertEqual(result["workers"][0]["state"], "unconfirmed")
         self.assertTrue(result["workers"][0]["activation_may_have_occurred"])
-        self.assertTrue((self.root / "drop-ack" / ".local" / "bin" / "rabsd").exists())
+        self.assertTrue((self.root / "drop-ack" / ".local" / "bin" / "rabsd").exists(), result)
         self.assertEqual(len(self.calls()), 1)
 
     def test_stdout_banner_is_not_a_success_receipt(self):
