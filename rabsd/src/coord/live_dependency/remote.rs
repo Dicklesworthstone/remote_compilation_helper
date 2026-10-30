@@ -952,7 +952,10 @@ impl PendingRemote {
         // execution was accepted, on this bounded blocking lane. The observer
         // checks every byte digest and both inventory fences; the upload then
         // owns these bytes without reopening the caller's mutable target tree.
-        let dependency_artifacts = request.dependencies.retained_artifacts().map_err(settled)?;
+        let dependency_artifacts = request
+            .dependencies
+            .retained_artifacts(|| cancellation.is_cancelled())
+            .map_err(settled)?;
         let mut upload = SourceUpload::from_snapshot(
             Arc::clone(&request.package.snapshot),
             PACKAGE_ROOT,
@@ -989,7 +992,7 @@ impl PendingRemote {
                 .map_err(|error| settled(format!("prepare native inputs: {error}")))?;
         }
         let upload = upload
-            .with_dependency_artifacts(dependency_artifacts)
+            .with_retained_dependency_artifacts(dependency_artifacts)
             .map_err(|error| settled(error.to_string()))?;
         verify_request(&request).map_err(settled)?;
         // The worker persists a request-id high-water mark. The admission owner
