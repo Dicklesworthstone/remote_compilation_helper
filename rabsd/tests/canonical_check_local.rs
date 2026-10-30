@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{IsTerminal, Read, Write};
 use std::net::TcpListener;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -811,6 +811,28 @@ fn assert_shared_service_build(
     target
 }
 
+fn retained_service_toolchains(state: &Path) -> Vec<(PathBuf, u64, u64)> {
+    let mut images = fs::read_dir(state.join("canonical-compile-v1"))
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .as_encoded_bytes()
+                .starts_with(b"retained-toolchain-")
+        })
+        .map(|entry| {
+            assert!(entry.file_type().unwrap().is_dir());
+            let tree = entry.path().join("tree");
+            let compiler = fs::symlink_metadata(tree.join("bin/rustc")).unwrap();
+            assert!(compiler.is_file());
+            (tree, compiler.dev(), compiler.ino())
+        })
+        .collect::<Vec<_>>();
+    images.sort();
+    images
+}
+
 #[test]
 #[ignore = "requires full canonical bubblewrap namespaces, native toolchain and matching RABS_CANONICAL_TEST_WRAPPER; runs concurrent actual Cargo builds through one persistent service"]
 fn canonical_shared_service_overlaps_builds_scopes_cancellation_and_reuses_private_targets() {
@@ -883,7 +905,17 @@ fn canonical_shared_service_overlaps_builds_scopes_cancellation_and_reuses_priva
     let first_owner = operation_owner(&first_marker);
     let second_owner = operation_owner(&second_marker);
     assert_ne!(first_owner, second_owner);
+    let toolchains = retained_service_toolchains(&root.join("state"));
+    assert_eq!(
+        toolchains.len(),
+        1,
+        "concurrent builds must share one actual captured compiler"
+    );
     for (operation, label) in [(&first_owner, b"A"), (&second_owner, b"B")] {
+        assert!(
+            !operation.join("bundle/toolchain").exists(),
+            "a shared operation must not recopy the complete toolchain"
+        );
         assert_eq!(
             read_bounded(&operation.join("runtime-workspace/service-label.txt")),
             label,
@@ -947,6 +979,11 @@ fn canonical_shared_service_overlaps_builds_scopes_cancellation_and_reuses_priva
     assert!(!output.contains("SERVICE_DIAGNOSTIC_A_ONLY"), "{output}");
     let second_target =
         assert_shared_service_build(root, 5001, &events, &output, "B:244\n", "cold");
+    assert_eq!(
+        retained_service_toolchains(&root.join("state")),
+        toolchains,
+        "cancelling another client must preserve the selected compiler image"
+    );
     assert!(!service.diagnostics().contains("SERVICE_DIAGNOSTIC_B_ONLY"));
 
     // Use the same running service and exact source again. The private target
@@ -957,6 +994,11 @@ fn canonical_shared_service_overlaps_builds_scopes_cancellation_and_reuses_priva
     let warm_target =
         assert_shared_service_build(root, 5003, &events, &output, "B:244\n", "restored");
     assert_ne!(second_target, warm_target);
+    assert_eq!(
+        retained_service_toolchains(&root.join("state")),
+        toolchains,
+        "a subsequent build must reuse the same compiler inode and backing"
+    );
     let fresh_app = output
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -997,6 +1039,10 @@ fn canonical_shared_service_overlaps_builds_scopes_cancellation_and_reuses_priva
     );
     service.assert_running();
     service.finish(Duration::from_secs(15), true);
+    assert!(
+        retained_service_toolchains(&root.join("state")).is_empty(),
+        "service shutdown must join preparation and release its retained images"
+    );
 
     // An existing private cache must not turn a dead service into permission
     // to start a second standalone coordinator or silently compile locally.

@@ -8,7 +8,7 @@
 //! Cargo remains the resolver: the returned paths grant no execution, cache or
 //! publication authority, and metadata is still checked against the capture.
 
-use super::{MAX_PACKAGES, OUTPUT_LIMIT, contained_relative, invalid, require};
+use super::{MAX_PACKAGES, OUTPUT_LIMIT, PreparationControl, contained_relative, invalid, require};
 use super::{validate_manifest_paths_with_cache, vendor::VendoredSources};
 use rabs_sandbox::snapshot_capture::SealedSourceSnapshot;
 use std::collections::{BTreeMap, BTreeSet};
@@ -83,12 +83,30 @@ fn manifest_path(directory: &Path) -> io::Result<String> {
 }
 
 impl ControlInputs {
+    #[cfg(test)]
     pub(super) fn discover(
         image: &SealedSourceSnapshot,
         selected: &str,
         vendor: Option<&VendoredSources>,
         cached_registry: bool,
     ) -> io::Result<Self> {
+        Self::discover_controlled(
+            image,
+            selected,
+            vendor,
+            cached_registry,
+            &PreparationControl::uncontrolled(),
+        )
+    }
+
+    pub(super) fn discover_controlled(
+        image: &SealedSourceSnapshot,
+        selected: &str,
+        vendor: Option<&VendoredSources>,
+        cached_registry: bool,
+        control: &PreparationControl<'_>,
+    ) -> io::Result<Self> {
+        control.checkpoint()?;
         let captured = image
             .manifest("workspace")
             .ok_or_else(|| invalid("missing captured Cargo anchor"))?;
@@ -111,6 +129,7 @@ impl ControlInputs {
         let mut roles = BTreeMap::from([(selected.to_owned(), InputRole::Member)]);
         let mut selected_root = None;
         while let Some(path) = pending.pop_first() {
+            control.checkpoint()?;
             let role = roles.get(&path).copied().unwrap_or(InputRole::Control);
             // A foreign workspace may first be needed only for inheritance,
             // then later be named as an actual path dependency. Upgrade that
@@ -137,7 +156,7 @@ impl ControlInputs {
             if role == InputRole::Control {
                 continue;
             }
-            let root = workspace_root(image, &path, &value, &mut pending, &mut parsed)?;
+            let root = workspace_root(image, &path, &value, &mut pending, &mut parsed, control)?;
             if path == selected {
                 selected_root = Some(root.clone());
                 enqueue(&mut pending, &mut roles, root.clone(), InputRole::Member);
@@ -156,10 +175,18 @@ impl ControlInputs {
                     )?);
             let mut reached = BTreeSet::new();
             let mut inherited = BTreeSet::new();
-            dependency_manifests(base, &value, member, &mut reached, &mut inherited)?;
+            dependency_manifests(base, &value, member, &mut reached, &mut inherited, control)?;
             if let Some(targets) = value.get("target").and_then(toml::Value::as_table) {
                 for target in targets.values() {
-                    dependency_manifests(base, target, member, &mut reached, &mut inherited)?;
+                    control.checkpoint()?;
+                    dependency_manifests(
+                        base,
+                        target,
+                        member,
+                        &mut reached,
+                        &mut inherited,
+                        control,
+                    )?;
                 }
             }
             if !inherited.is_empty() {
@@ -171,6 +198,7 @@ impl ControlInputs {
                     .parent()
                     .ok_or_else(|| invalid("Cargo workspace manifest parent"))?;
                 for name in inherited {
+                    control.checkpoint()?;
                     let entry =
                         entries
                             .and_then(|entries| entries.get(&name))
@@ -181,6 +209,7 @@ impl ControlInputs {
                 }
             }
             for dependency in reached {
+                control.checkpoint()?;
                 enqueue(
                     &mut pending,
                     &mut roles,
@@ -201,7 +230,7 @@ impl ControlInputs {
                         let _ = workspace_patterns(base, workspace, "default-members")?;
                     }
                     let mut members = BTreeSet::new();
-                    workspace_members(base, workspace, &candidates, &mut members)?;
+                    workspace_members(base, workspace, &candidates, &mut members, control)?;
                     for member in members {
                         enqueue(&mut pending, &mut roles, member, InputRole::Member);
                     }
@@ -209,11 +238,11 @@ impl ControlInputs {
                 let mut overrides = BTreeSet::new();
                 if let Some(patches) = value.get("patch").and_then(toml::Value::as_table) {
                     for dependencies in patches.values() {
-                        dependency_paths(base, dependencies, &mut overrides)?;
+                        dependency_paths(base, dependencies, &mut overrides, control)?;
                     }
                 }
                 if let Some(replacements) = value.get("replace") {
-                    dependency_paths(base, replacements, &mut overrides)?;
+                    dependency_paths(base, replacements, &mut overrides, control)?;
                 }
                 for replacement in overrides {
                     enqueue(&mut pending, &mut roles, replacement, InputRole::Dependency);
@@ -267,6 +296,7 @@ fn workspace_root(
     value: &toml::Value,
     pending: &mut BTreeSet<String>,
     parsed: &mut BTreeMap<String, Arc<toml::Value>>,
+    control: &PreparationControl<'_>,
 ) -> io::Result<String> {
     if value.get("workspace").is_some() {
         return Ok(path.to_owned());
@@ -284,6 +314,7 @@ fn workspace_root(
         }
     }
     for ancestor in base.ancestors().skip(1) {
+        control.checkpoint()?;
         let candidate = manifest_path(ancestor)?;
         if image.file_bytes("workspace", &candidate).is_some() {
             let parent = manifest_value(image, &candidate, parsed)?;
@@ -318,6 +349,7 @@ fn dependency_manifests(
     member: bool,
     pending: &mut BTreeSet<String>,
     inherited: &mut BTreeSet<String>,
+    control: &PreparationControl<'_>,
 ) -> io::Result<()> {
     for field in [
         "dependencies",
@@ -330,9 +362,10 @@ fn dependency_manifests(
             continue;
         }
         if let Some(dependencies) = value.get(field) {
-            dependency_paths(base, dependencies, pending)?;
+            dependency_paths(base, dependencies, pending, control)?;
             if let Some(dependencies) = dependencies.as_table() {
                 for (name, dependency) in dependencies {
+                    control.checkpoint()?;
                     if dependency.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
                         inherited.insert(name.clone());
                     }
@@ -347,9 +380,11 @@ fn dependency_paths(
     base: &Path,
     dependencies: &toml::Value,
     pending: &mut BTreeSet<String>,
+    control: &PreparationControl<'_>,
 ) -> io::Result<()> {
     if let Some(dependencies) = dependencies.as_table() {
         for dependency in dependencies.values() {
+            control.checkpoint()?;
             dependency_path(base, dependency, pending)?;
         }
     }
@@ -372,12 +407,14 @@ fn workspace_members(
     workspace: &toml::Value,
     candidates: &[String],
     pending: &mut BTreeSet<String>,
+    control: &PreparationControl<'_>,
 ) -> io::Result<()> {
     // default-members only select from the already-resolved members; they do
     // not add manifests to the graph. Cargo also ignores default-members when
     // the invocation selected a member manifest rather than the workspace root.
     for pattern in workspace_patterns(base, workspace, "members")? {
         for manifest in candidates {
+            control.checkpoint()?;
             let directory = Path::new(manifest)
                 .parent()
                 .ok_or_else(|| invalid("Cargo member parent"))?;

@@ -42,6 +42,7 @@ use rabs_sandbox::dependency_context::{
 };
 use rabs_sandbox::loader_directories::{LoaderDirectoryWitness, observe_loader_directories};
 use rabs_sandbox::runtime_cohort::observe_runtime_cohort;
+use rabs_sandbox::toolchain_cache::RetainedToolchain as SharedToolchain;
 #[cfg(test)]
 use rabs_sandbox::toolchain_dataset::capture_toolchain;
 use rabs_sandbox::toolchain_dataset::{
@@ -273,8 +274,54 @@ pub struct RemoteDependencies {
 #[derive(Debug)]
 struct RetainedToolchain {
     guard: ToolchainGuard,
-    image: Arc<PreparedToolchain>,
-    _directory: tempfile::TempDir,
+    backing: RetainedToolchainBacking,
+}
+
+#[derive(Debug)]
+enum RetainedToolchainBacking {
+    Captured {
+        image: Arc<PreparedToolchain>,
+        _directory: tempfile::TempDir,
+    },
+    Shared(Arc<SharedToolchain>),
+}
+
+impl RetainedToolchain {
+    fn image(&self) -> &PreparedToolchain {
+        match &self.backing {
+            RetainedToolchainBacking::Captured { image, .. } => image,
+            RetainedToolchainBacking::Shared(owner) => owner.image(),
+        }
+    }
+
+    fn verify_source(&self, source: &Path) -> io::Result<()> {
+        match &self.backing {
+            RetainedToolchainBacking::Captured { image, .. } => {
+                image.verify_source_unchanged(source, || false)
+            }
+            RetainedToolchainBacking::Shared(owner) => {
+                if source != owner.root() {
+                    return Err(invalid(
+                        "remote compiler differs from its retained service image",
+                    ));
+                }
+                // This operation selected immutable captured bytes. A later
+                // edit to the mutable original cannot change their identity.
+                owner.image().verify_retained_generation(|| false)
+            }
+        }
+    }
+
+    fn attach(&self, upload: SourceUpload, request: &Value) -> io::Result<SourceUpload> {
+        match &self.backing {
+            RetainedToolchainBacking::Captured { image, .. } => {
+                upload.with_shared_toolchain(Arc::clone(image), request)
+            }
+            RetainedToolchainBacking::Shared(owner) => {
+                upload.with_retained_toolchain(Arc::clone(owner), request)
+            }
+        }
+    }
 }
 
 fn toolchain_staging_directory(state: &Path) -> io::Result<tempfile::TempDir> {
@@ -352,8 +399,7 @@ impl RemoteValidation {
         self.verify_read_closure(request)?;
         request.verify_toolchain()?;
         self.retained
-            .image
-            .verify_source_unchanged(request.toolchain.sysroot(), || false)
+            .verify_source(request.toolchain.sysroot())
             .map_err(|error| format!("complete original toolchain changed: {error}"))?;
         self.loader
             .verify_absence(|| false)
@@ -363,8 +409,7 @@ impl RemoteValidation {
             .verify_absence(|| false)
             .map_err(|error| format!("original loader directories changed: {error}"))?;
         self.retained
-            .image
-            .verify_source_unchanged(request.toolchain.sysroot(), || false)
+            .verify_source(request.toolchain.sysroot())
             .map_err(|error| format!("complete original toolchain changed: {error}"))?;
         request.verify_toolchain()?;
         // Both newly produced remote results and remote cache hits call this
@@ -542,7 +587,9 @@ impl RemoteDependencies {
         let physical_empty_loader = physical_paths(&empty_loader, canonical)?;
         let loader_witness = observe_loader_directories(&physical_empty_loader, || false)
             .map_err(|error| format!("original loader directories: {error}"))?;
-        let Some(retained) = self.retained_toolchain(guard, Path::new(&physical.compiler))? else {
+        let Some(retained) =
+            self.retained_toolchain(guard, Path::new(&physical.compiler), canonical)?
+        else {
             return Ok(None);
         };
         // Probe the compiler's complete original lookup order. The worker may
@@ -568,7 +615,7 @@ impl RemoteDependencies {
             inputs,
             build_script_output,
             &visible_root,
-            &retained.image.identity().sha256,
+            &retained.image().identity().sha256,
             &runtime,
         )
         .map_err(|error| error.to_string())?;
@@ -656,8 +703,7 @@ impl RemoteDependencies {
         })?;
         guard.verify_unchanged(Path::new(&physical.compiler))?;
         retained
-            .image
-            .verify_source_unchanged(root, || false)
+            .verify_source(root)
             .map_err(|error| format!("original toolchain changed during keying: {error}"))?;
         let validation = RemoteValidation {
             retained,
@@ -681,8 +727,21 @@ impl RemoteDependencies {
         &self,
         guard: &ToolchainGuard,
         compiler: &Path,
+        canonical: Option<&CanonicalPaths>,
     ) -> Result<Option<Arc<RetainedToolchain>>, String> {
         guard.verify_unchanged(compiler)?;
+        if let Some(owner) = canonical.and_then(CanonicalPaths::retained_toolchain) {
+            let retained = Arc::new(RetainedToolchain {
+                guard: guard.clone(),
+                backing: RetainedToolchainBacking::Shared(Arc::clone(owner)),
+            });
+            retained
+                .verify_source(guard.sysroot())
+                .map_err(|error| error.to_string())?;
+            // Do not pin these leases in the separate remote memo. Otherwise
+            // its idle entries could consume every service-pool slot forever.
+            return Ok(Some(retained));
+        }
         let key = (compiler.to_path_buf(), guard.sysroot().to_path_buf());
         let retained = {
             // A contended cache is preparation, never authority or an excuse
@@ -722,8 +781,10 @@ impl RemoteDependencies {
                         .map_err(|error| error.to_string())?;
                     Ok(RetainedToolchain {
                         guard: capture_guard,
-                        image: Arc::new(image),
-                        _directory: directory,
+                        backing: RetainedToolchainBacking::Captured {
+                            image: Arc::new(image),
+                            _directory: directory,
+                        },
                     })
                 })?
         };
@@ -735,10 +796,7 @@ impl RemoteDependencies {
         // upload use it. Validate outside the lock so other ready toolchains
         // make progress. Keep all original checks, not just a cached path hit.
         if retained.guard.verify_unchanged(compiler).is_err()
-            || retained
-                .image
-                .verify_source_unchanged(guard.sysroot(), || false)
-                .is_err()
+            || retained.verify_source(guard.sysroot()).is_err()
         {
             let mut memo = self
                 .toolchain
@@ -917,12 +975,12 @@ impl PendingRemote {
             &invocation.argv,
             &invocation.context,
             upload.wire_manifest(),
-            retained.image.identity(),
+            retained.image().identity(),
             request_id,
         )
         .map_err(settled)?;
-        let upload = upload
-            .with_shared_toolchain(Arc::clone(&retained.image), &wire)
+        let upload = retained
+            .attach(upload, &wire)
             .map_err(|error| settled(format!("prepare worker upload: {error}")))?;
         let owner: Arc<Mutex<Option<AdmittedRemote>>> = Arc::new(Mutex::new(None));
         let admitted_owner = Arc::clone(&owner);

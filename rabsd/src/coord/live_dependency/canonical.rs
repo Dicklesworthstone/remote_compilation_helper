@@ -10,6 +10,7 @@ use rabs_key::live_dependency::{
     LiveRustcRequest, PlannedExtern,
 };
 use rabs_sandbox::cargo_check::{CompilationSelection, CompilationUnit};
+use rabs_sandbox::toolchain_cache::RetainedToolchain;
 use std::collections::BTreeSet;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -41,6 +42,7 @@ struct Mount {
 #[derive(Debug)]
 pub struct CanonicalPaths {
     _owner: Arc<tempfile::TempDir>,
+    shared_toolchain: Option<Arc<RetainedToolchain>>,
     mounts: Vec<Mount>,
     closed_dependency_execution_required: bool,
     workspace_units: Vec<CompilationUnit>,
@@ -122,9 +124,20 @@ fn generated_layout(logical: &DependencyActionPlan) -> Result<Option<&Path>, Str
 }
 
 impl CanonicalPaths {
+    #[cfg(test)]
     pub(crate) fn new(
         owner: Arc<tempfile::TempDir>,
         mappings: Vec<(PathBuf, PathBuf)>,
+    ) -> Result<Arc<Self>, String> {
+        Self::new_with_retained_toolchain(owner, mappings, None)
+    }
+
+    /// Only the driver may retain a service-owned compiler image outside this
+    /// operation. All writable and source mounts keep their original owner.
+    pub(crate) fn new_with_retained_toolchain(
+        owner: Arc<tempfile::TempDir>,
+        mappings: Vec<(PathBuf, PathBuf)>,
+        shared_toolchain: Option<Arc<RetainedToolchain>>,
     ) -> Result<Arc<Self>, String> {
         let owned = owner.path();
         if !ordinary_absolute(owned) {
@@ -137,14 +150,40 @@ impl CanonicalPaths {
         {
             return Err("canonical operation root must be an owned private directory".into());
         }
+        if let Some(toolchain) = &shared_toolchain {
+            let parent = toolchain.owner_path();
+            let metadata = std::fs::symlink_metadata(parent).map_err(|error| error.to_string())?;
+            if !ordinary_absolute(parent)
+                || !metadata.is_dir()
+                || metadata.uid() != root.uid()
+                || metadata.mode() & 0o077 != 0
+            {
+                return Err("retained compiler owner must be an owned private directory".into());
+            }
+            toolchain
+                .image()
+                .verify_retained_generation(|| false)
+                .map_err(|error| error.to_string())?;
+        }
         let mut visible = BTreeSet::new();
         let mut mounts: Vec<Mount> = Vec::new();
         for (logical, backing) in mappings {
+            let mount_owner = match &shared_toolchain {
+                Some(toolchain) if logical == Path::new("/__rabs/toolchain") => {
+                    if backing != toolchain.root() {
+                        return Err(
+                            "canonical compiler mount differs from its retained lease".into()
+                        );
+                    }
+                    toolchain.owner_path()
+                }
+                _ => owned,
+            };
             if !ROOTS.iter().any(|root| logical == Path::new(root))
                 || !visible.insert(logical.clone())
                 || !ordinary_absolute(&backing)
-                || backing == owned
-                || !backing.starts_with(owned)
+                || backing == mount_owner
+                || !backing.starts_with(mount_owner)
                 || mounts.iter().any(|mount| {
                     backing.starts_with(&mount.backing) || mount.backing.starts_with(&backing)
                 })
@@ -153,7 +192,7 @@ impl CanonicalPaths {
             }
             for ancestor in backing
                 .ancestors()
-                .take_while(|path| path.starts_with(owned))
+                .take_while(|path| path.starts_with(mount_owner))
             {
                 let metadata =
                     std::fs::symlink_metadata(ancestor).map_err(|error| error.to_string())?;
@@ -180,6 +219,7 @@ impl CanonicalPaths {
         }
         Ok(Arc::new(Self {
             _owner: owner,
+            shared_toolchain,
             mounts,
             closed_dependency_execution_required: false,
             workspace_units: Vec::new(),
@@ -187,6 +227,10 @@ impl CanonicalPaths {
             workspace_benches_selected: false,
             workspace_bulk_harnesses_selected: false,
         }))
+    }
+
+    pub(crate) fn retained_toolchain(&self) -> Option<&Arc<RetainedToolchain>> {
+        self.shared_toolchain.as_ref()
     }
 
     /// Bind actual Cargo-selected path-package units before the endpoint
@@ -678,6 +722,228 @@ mod tests {
         ] {
             assert!(paths.physical(Path::new(path)).is_err(), "{path}");
         }
+    }
+
+    struct RetainedMountFixture {
+        pool: rabs_sandbox::toolchain_cache::ToolchainPool,
+        lease: Arc<RetainedToolchain>,
+        source: tempfile::TempDir,
+        _pool_parent: tempfile::TempDir,
+    }
+
+    fn retained_mount_fixture() -> RetainedMountFixture {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        // Actual captured trees for ownership and generation checks. These
+        // bytes are never executed and do not stand in for compiler evidence.
+        let source = crate::test_util::private_tempdir();
+        std::fs::create_dir(source.path().join("bin")).unwrap();
+        std::fs::create_dir(source.path().join("lib")).unwrap();
+        let compiler = source.path().join("bin/rustc");
+        std::fs::write(&compiler, b"selected compiler bytes").unwrap();
+        std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(source.path().join("lib/runtime"), b"selected runtime bytes").unwrap();
+        let parent = crate::test_util::private_tempdir();
+        let pool =
+            rabs_sandbox::toolchain_cache::ToolchainPool::new(parent.path(), 2, |_, _, _| false)
+                .unwrap();
+        let lease = pool
+            .acquire(source.path(), Duration::from_secs(5), || false)
+            .unwrap();
+        RetainedMountFixture {
+            source,
+            _pool_parent: parent,
+            pool,
+            lease,
+        }
+    }
+
+    fn retained_mount_mappings(owner: &Path, lease: &RetainedToolchain) -> Vec<(PathBuf, PathBuf)> {
+        ROOTS
+            .iter()
+            .enumerate()
+            .map(|(index, root)| {
+                let backing = if *root == "/__rabs/toolchain" {
+                    lease.root().to_path_buf()
+                } else {
+                    owner.join(index.to_string())
+                };
+                (PathBuf::from(root), backing)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn retained_compiler_mount_keeps_its_generation_after_pool_shutdown_and_drop() {
+        let retained = retained_mount_fixture();
+        let (owner, _) = fixture();
+        let generation = retained.lease.owner_path().to_path_buf();
+        let weak = Arc::downgrade(&retained.lease);
+        let paths = CanonicalPaths::new_with_retained_toolchain(
+            Arc::clone(&owner),
+            retained_mount_mappings(owner.path(), &retained.lease),
+            Some(Arc::clone(&retained.lease)),
+        )
+        .unwrap();
+        retained.pool.shutdown().unwrap();
+        drop(retained.pool);
+        drop(retained.lease);
+        drop(owner);
+
+        // The capability is now the sole strong lease. Pool shutdown and a
+        // later edit of the original cannot replace this operation's compiler.
+        std::fs::write(
+            retained.source.path().join("bin/rustc"),
+            b"later source generation",
+        )
+        .unwrap();
+        assert!(weak.upgrade().is_some());
+        let compiler = paths
+            .physical(Path::new("/__rabs/toolchain/bin/rustc"))
+            .unwrap();
+        assert_eq!(std::fs::read(compiler).unwrap(), b"selected compiler bytes");
+        paths
+            .retained_toolchain()
+            .unwrap()
+            .image()
+            .verify_retained_generation(|| false)
+            .unwrap();
+        assert!(
+            paths
+                .retained_toolchain()
+                .unwrap()
+                .verify(retained.source.path(), || false)
+                .is_err()
+        );
+
+        drop(paths);
+        assert!(weak.upgrade().is_none());
+        assert!(!generation.exists());
+    }
+
+    #[test]
+    fn retained_compiler_mount_requires_the_exact_leased_tree() {
+        let retained = retained_mount_fixture();
+        let (owner, _) = fixture();
+        // This sibling satisfies owner, ancestry, and permission checks. Only
+        // the exact tree/root binding distinguishes it from the leased image.
+        let sibling = retained.lease.owner_path().join("another-tree");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&sibling)
+            .unwrap();
+        let mut mappings = retained_mount_mappings(owner.path(), &retained.lease);
+        mappings
+            .iter_mut()
+            .find(|(logical, _)| logical == Path::new("/__rabs/toolchain"))
+            .unwrap()
+            .1 = sibling;
+        let error = CanonicalPaths::new_with_retained_toolchain(
+            owner,
+            mappings,
+            Some(Arc::clone(&retained.lease)),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "canonical compiler mount differs from its retained lease"
+        );
+    }
+
+    #[test]
+    fn retained_owner_cannot_back_workspace_or_writable_operation_mounts() {
+        let retained = retained_mount_fixture();
+        let (owner, _) = fixture();
+        for (index, logical) in [
+            "/__rabs/workspace",
+            "/__rabs/cargo-home",
+            "/__rabs/out/cargo",
+            "/__rabs/home",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let sibling = retained.lease.owner_path().join(format!("shared-{index}"));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&sibling)
+                .unwrap();
+            let mut mappings = retained_mount_mappings(owner.path(), &retained.lease);
+            mappings
+                .iter_mut()
+                .find(|(mount, _)| mount == Path::new(logical))
+                .unwrap()
+                .1 = sibling;
+            let error = CanonicalPaths::new_with_retained_toolchain(
+                Arc::clone(&owner),
+                mappings,
+                Some(Arc::clone(&retained.lease)),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error, "canonical mount mapping is outside or aliases its owned roots",
+                "{logical} escaped its operation owner"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_compiler_mount_refuses_changed_bytes_under_the_same_root_inode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let retained = retained_mount_fixture();
+        let (owner, _) = fixture();
+        let before = std::fs::symlink_metadata(retained.lease.root()).unwrap();
+        let compiler = retained.lease.root().join("bin/rustc");
+        std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(&compiler, b"modified compiler bytes").unwrap();
+        std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let after = std::fs::symlink_metadata(retained.lease.root()).unwrap();
+        assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+        assert!(
+            CanonicalPaths::new_with_retained_toolchain(
+                Arc::clone(&owner),
+                retained_mount_mappings(owner.path(), &retained.lease),
+                Some(Arc::clone(&retained.lease)),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read(retained.source.path().join("bin/rustc")).unwrap(),
+            b"selected compiler bytes"
+        );
+    }
+
+    #[test]
+    fn retained_compiler_mount_refuses_replaced_root_for_new_and_existing_capabilities() {
+        let retained = retained_mount_fixture();
+        let (owner, _) = fixture();
+        let paths = CanonicalPaths::new_with_retained_toolchain(
+            Arc::clone(&owner),
+            retained_mount_mappings(owner.path(), &retained.lease),
+            Some(Arc::clone(&retained.lease)),
+        )
+        .unwrap();
+        std::fs::rename(
+            retained.lease.root(),
+            retained.lease.owner_path().join("retired-tree"),
+        )
+        .unwrap();
+        std::fs::create_dir(retained.lease.root()).unwrap();
+        assert!(
+            paths
+                .physical(Path::new("/__rabs/toolchain/bin/rustc"))
+                .is_err()
+        );
+        assert!(
+            CanonicalPaths::new_with_retained_toolchain(
+                Arc::clone(&owner),
+                retained_mount_mappings(owner.path(), &retained.lease),
+                Some(Arc::clone(&retained.lease)),
+            )
+            .is_err()
+        );
     }
 
     fn workspace_graph(package_id: &str) -> rabs_sandbox::cargo_check::CompilationUnitGraph {

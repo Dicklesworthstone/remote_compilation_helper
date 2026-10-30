@@ -21,6 +21,7 @@ use super::live::{CoordLive, cluster_id};
 use super::live_dependency::LiveDependencyLane;
 use super::live_dependency::canonical::CanonicalPaths;
 use super::live_dependency::remote::RemoteDependencies;
+use super::source_delivery::control::{PreparationControl, PreparationRootGuard};
 use crate::edge::live_facts::{FileSig, read_stable};
 use crate::edge::server::{
     CanonicalActivity, EdgeServerConfig, canonical_edge_work, canonical_edge_work_shared,
@@ -45,6 +46,7 @@ use rabs_sandbox::cargo_check::{
 use rabs_sandbox::cargo_home::CargoHomeProjection;
 use rabs_sandbox::cargo_target::state::{PrivateTreeSnapshot, SourceTimestamps};
 use rabs_sandbox::source_transfer::{MAX_SOURCE_BYTES, SourceManifest};
+use rabs_sandbox::toolchain_cache::{CAPACITY as TOOLCHAIN_CAPACITY, ToolchainPool};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -177,6 +179,7 @@ fn overlap(first: &Path, second: &Path) -> bool {
 /// A canonical profile has its own authority/CAS namespace. The advisory file
 /// lock is held from admission through the last process/session join, so a
 /// second invocation cannot advance the first invocation's coordinator term.
+#[derive(Debug)]
 struct StateOwner {
     root: PathBuf,
     root_identity: (u64, u64),
@@ -241,7 +244,7 @@ impl StateOwner {
 /// Operation edges share this coordinator and worker pool, while their paths,
 /// cancellation, output files and completion barriers remain independent.
 pub(super) struct SharedRuntime {
-    state: StateOwner,
+    state: Arc<StateOwner>,
     parent: PathBuf,
     coord: Arc<CoordLive>,
     lane: LiveDependencyLane,
@@ -249,6 +252,7 @@ pub(super) struct SharedRuntime {
     roots: Arc<RootPermitBroker>,
     jobs_per_root: u32,
     target_cache_lock: Arc<Mutex<()>>,
+    toolchains: ToolchainPool,
     build_identity: String,
     release_mode: ReleaseAuthorizationMode,
     stopped: Arc<AtomicBool>,
@@ -286,7 +290,15 @@ impl SharedRuntime {
             "canonical service root and per-root job limits must be between 1 and 4096",
         )?;
         private_directory(state_root)?;
-        let state = StateOwner::acquire(state_root)?;
+        let state = Arc::new(StateOwner::acquire(state_root)?);
+        // The state owner stays locked through pool shutdown. Every returned
+        // lease separately owns its private captured tree through the last
+        // planning, execution or worker upload that uses it.
+        let toolchains = ToolchainPool::new(
+            &state.root,
+            TOOLCHAIN_CAPACITY,
+            rabs_cas::materialization::try_verified_reflink,
+        )?;
         let cas = Arc::new(
             crate::janitor::store::mount_and_reconcile(&state.root.join("cas"))
                 .map_err(io::Error::other)?,
@@ -347,6 +359,7 @@ impl SharedRuntime {
             roots: RootPermitBroker::new(max_roots),
             jobs_per_root,
             target_cache_lock: Arc::new(Mutex::new(())),
+            toolchains,
             build_identity,
             release_mode,
             stopped,
@@ -377,6 +390,7 @@ impl SharedRuntime {
             "canonical service still owns active Cargo roots",
         )?;
         self.stopped.store(true, Ordering::Release);
+        let toolchains = self.toolchains.shutdown();
         let server = self
             .server
             .lock()
@@ -388,6 +402,7 @@ impl SharedRuntime {
                 "canonical service coordinator did not drain cleanly",
             )?;
         }
+        toolchains?;
         Ok(())
     }
 
@@ -417,6 +432,7 @@ impl SharedRuntime {
                 let admitted = RootAdmission {
                     permit: Some(permit),
                     obligations,
+                    _state: Arc::clone(&self.state),
                 };
                 if stopped.load(Ordering::Acquire) || !self.healthy() {
                     return Err(io::Error::new(
@@ -433,6 +449,7 @@ impl SharedRuntime {
 impl Drop for SharedRuntime {
     fn drop(&mut self) {
         self.stopped.store(true, Ordering::Release);
+        let _ = self.toolchains.shutdown();
         // Explicit join precedes field destruction, particularly StateOwner's
         // process lock. The last Arc cannot disappear while an operation runs.
         let server = match self.server.get_mut() {
@@ -449,6 +466,9 @@ impl Drop for SharedRuntime {
 struct RootAdmission {
     permit: Option<RootPermit>,
     obligations: ObligationSet,
+    // Failed cleanup retains the charge and this lock together. A new service
+    // cannot acquire the same authority while an unresolved root still exists.
+    _state: Arc<StateOwner>,
 }
 
 impl Drop for RootAdmission {
@@ -797,6 +817,7 @@ impl Profile {
 /// Resolve only the graph query's run target. Every probe runs the captured
 /// Cargo inside the same immutable namespace before a wrapper endpoint exists.
 /// The actual run command and its program arguments remain unchanged.
+#[allow(clippy::too_many_arguments)]
 fn resolve_run_selection(
     profile: &Profile,
     spec: &CanonicalNamespaceSpec,
@@ -804,6 +825,8 @@ fn resolve_run_selection(
     owner: &Path,
     timeout: Duration,
     stopped: &AtomicBool,
+    shared: Option<&SharedRuntime>,
+    destination: &mut OperationOutput,
 ) -> io::Result<CompilationSelection> {
     let selection = profile.selection.clone().unwrap_or_default();
     if !selection.bin.is_empty() || !selection.example.is_empty() {
@@ -818,7 +841,7 @@ fn resolve_run_selection(
         "--manifest-path".into(),
         profile.manifest_path(),
     ];
-    let metadata = execute(
+    let metadata = execute_controlled(
         spec,
         support,
         CARGO,
@@ -829,9 +852,11 @@ fn resolve_run_selection(
         },
         timeout,
         stopped,
+        shared,
+        destination,
     )?;
     if !metadata.status.success() {
-        replay(&metadata)?;
+        destination.replay(&metadata)?;
         return Err(invalid(
             "captured Cargo metadata could not resolve the run target",
         ));
@@ -847,7 +872,7 @@ fn resolve_run_selection(
             "--package".into(),
             package.clone(),
         ];
-        let output = execute(
+        let output = execute_controlled(
             spec,
             support,
             CARGO,
@@ -858,9 +883,11 @@ fn resolve_run_selection(
             },
             timeout,
             stopped,
+            shared,
+            destination,
         )?;
         if !output.status.success() {
-            replay(&output)?;
+            destination.replay(&output)?;
             return Err(invalid(
                 "captured Cargo pkgid could not resolve the selected run package",
             ));
@@ -963,6 +990,20 @@ fn run_operation(
     stopped: Arc<AtomicBool>,
     mut output: OperationOutput,
 ) -> io::Result<i32> {
+    let timeout = Duration::from_secs(profile.timeout_seconds);
+    let cancelled = || {
+        stopped.load(Ordering::Acquire) || shared.as_ref().is_some_and(|runtime| !runtime.healthy())
+    };
+    let acquire_root = |budget| {
+        shared
+            .as_ref()
+            .expect("shared preparation admission is installed only for a service")
+            .acquire_root(&stopped, budget)
+            .map(PreparationRootGuard::new)
+    };
+    let preparation =
+        PreparationControl::new(&cancelled, shared.as_ref().map(|_| &acquire_root as &_));
+    preparation.checkpoint()?;
     let standalone_state = shared
         .is_none()
         .then(|| StateOwner::acquire(&profile.state_root))
@@ -975,12 +1016,7 @@ fn run_operation(
             .root
             .clone(),
     };
-    if stopped.load(Ordering::Acquire) {
-        return Err(io::Error::new(
-            io::ErrorKind::Interrupted,
-            "canonical operation cancelled before capture",
-        ));
-    }
+    preparation.checkpoint()?;
     let support = HostIsolationSupport::probe();
     require(
         support.missing_for_canonical().is_empty(),
@@ -989,6 +1025,17 @@ fn run_operation(
             support.missing_for_canonical()
         ),
     )?;
+    // A service owns this warmup independently of its waiting clients. The
+    // original source generation is checked at acquisition; this operation
+    // then executes the exact retained image even if that source later changes.
+    let retained_toolchain = shared
+        .as_ref()
+        .map(|runtime| {
+            runtime
+                .toolchains
+                .acquire(&profile.toolchain_root, timeout, cancelled)
+        })
+        .transpose()?;
     let owner = Arc::new(
         tempfile::Builder::new()
             .prefix("rabs-compile-")
@@ -996,10 +1043,12 @@ fn run_operation(
             .tempdir_in(&profile.operation_root)?,
     );
     let bundle = owner.path().join("bundle");
-    let (_report, source) = super::source_delivery::prepare_local_bundle(
+    let (_report, source) = super::source_delivery::prepare_local_bundle_controlled(
         &profile.source_root,
         &profile.source_specification()?,
         &bundle,
+        retained_toolchain.clone(),
+        &preparation,
     )?;
     let (_, request_bytes) = read_stable(
         &bundle.join("request.json"),
@@ -1023,7 +1072,7 @@ fn run_operation(
         .transpose()?;
     let cargo_home = cargo_projection
         .as_ref()
-        .map(|projection| projection.prepare(&source, &owner.path().join("inputs"), || false))
+        .map(|projection| projection.prepare(&source, &owner.path().join("inputs"), cancelled))
         .transpose()?;
     let captured_workspace = cargo_home
         .as_ref()
@@ -1042,11 +1091,11 @@ fn run_operation(
             let runtime = owner.path().join("runtime-workspace");
             create_private(&runtime)?;
             let snapshot =
-                PrivateTreeSnapshot::capture(&captured_workspace, MAX_SOURCE_BYTES, &|| false)?;
+                PrivateTreeSnapshot::capture(&captured_workspace, MAX_SOURCE_BYTES, &cancelled)?;
             snapshot.restore_into_with_cloner(
                 &captured_workspace,
                 &runtime,
-                &|| false,
+                &cancelled,
                 rabs_cas::materialization::try_verified_reflink,
             )?;
             Ok(runtime)
@@ -1054,9 +1103,10 @@ fn run_operation(
         match copy() {
             Ok(runtime) => runtime,
             Err(error) => {
+                preparation.checkpoint()?;
                 // A failed optional copy is never mounted. Verify the original
                 // exact inputs again, then execute cold without retiming them.
-                SourceTimestamps::capture(&captured_workspace, workspace_manifest, &|| false)?;
+                SourceTimestamps::capture(&captured_workspace, workspace_manifest, &cancelled)?;
                 output.warning("workspace-copy", &error)?;
                 target_reuse_enabled = false;
                 captured_workspace
@@ -1076,7 +1126,10 @@ fn run_operation(
         create_private(&path)?;
         path
     };
-    let toolchain = bundle.join("toolchain");
+    let toolchain = retained_toolchain.as_ref().map_or_else(
+        || bundle.join("toolchain"),
+        |retained| retained.root().to_path_buf(),
+    );
     let mut plan = CanonicalMountPlan::new(&toolchain, &workspace, &cargo_root, &home_root);
     plan.out_units.push(UnitMount {
         unit: "cargo".into(),
@@ -1100,7 +1153,7 @@ fn run_operation(
     // bind obscure its protection in the namespace builder's mount ordering.
     make_read_only(&mut spec, "/__rabs/workspace")?;
     make_read_only(&mut spec, "/__rabs/home")?;
-    let paths = CanonicalPaths::new(
+    let paths = CanonicalPaths::new_with_retained_toolchain(
         owner.clone(),
         vec![
             ("/__rabs/workspace".into(), workspace.clone()),
@@ -1109,6 +1162,7 @@ fn run_operation(
             (TARGET.into(), target_root.clone()),
             ("/__rabs/home".into(), home_root.clone()),
         ],
+        retained_toolchain.clone(),
     )
     .map_err(io::Error::other)?;
     if profile.command == CompilationCommand::Clippy {
@@ -1123,7 +1177,10 @@ fn run_operation(
             )?;
         }
     }
-    let timeout = Duration::from_secs(profile.timeout_seconds);
+    preparation.checkpoint()?;
+    if let Some(retained) = &retained_toolchain {
+        retained.image().verify_retained_generation(cancelled)?;
+    }
     let compilation_args = profile.compilation_args()?;
     // Ask the captured Cargo for the exact units this command would compile.
     // Metadata's package list includes inactive optional/dev targets and cannot
@@ -1138,6 +1195,8 @@ fn run_operation(
             owner.path(),
             timeout,
             &stopped,
+            shared.as_deref(),
+            &mut output,
         )?)
     } else {
         None
@@ -1270,7 +1329,7 @@ fn run_operation(
     }
     // A failed restore remains in unmounted private staging. The live endpoint
     // receives only the completely selected target's retained inode capability.
-    let paths = CanonicalPaths::new(
+    let paths = CanonicalPaths::new_with_retained_toolchain(
         owner.clone(),
         vec![
             ("/__rabs/workspace".into(), workspace),
@@ -1279,6 +1338,7 @@ fn run_operation(
             (TARGET.into(), target_root.clone()),
             ("/__rabs/home".into(), home_root.clone()),
         ],
+        retained_toolchain.clone(),
     )
     .map_err(io::Error::other)?;
     let paths = paths
@@ -1430,6 +1490,13 @@ fn run_operation(
         receipt.clean(),
         "canonical coordinator did not drain cleanly",
     )?;
+    // The operator-owned image is mounted read-only in the build, but a host
+    // mutation must still invalidate this operation before target publication
+    // or delivery. Do not substitute the now-current mutable toolchain source.
+    preparation.checkpoint()?;
+    if let Some(retained) = &retained_toolchain {
+        retained.image().verify_retained_generation(cancelled)?;
+    }
     output.replay(&compiled)?;
     output.line(&receipt.to_json_line())?;
     if (compiled.status.success()
@@ -1646,28 +1713,6 @@ enum CargoOutput {
     Inherit { inherit_stdin: bool },
 }
 
-fn execute(
-    spec: &CanonicalNamespaceSpec,
-    support: &HostIsolationSupport,
-    program: &str,
-    args: &[String],
-    output: CargoOutput,
-    timeout: Duration,
-    stopped: &AtomicBool,
-) -> io::Result<DrainedOutput> {
-    execute_controlled(
-        spec,
-        support,
-        program,
-        args,
-        output,
-        timeout,
-        stopped,
-        None,
-        &mut OperationOutput::Inherit,
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 fn execute_controlled(
     spec: &CanonicalNamespaceSpec,
@@ -1718,7 +1763,7 @@ fn execute_controlled(
     // Capture and transfer have finished before this scarce root permit is
     // acquired. Cargo creates its own valid jobserver from the admitted --jobs
     // value; this broker separately accounts for its implicit root token.
-    let _root = shared
+    let root = shared
         .map(|runtime| runtime.acquire_root(stopped, timeout))
         .transpose()?;
     if stopped.load(Ordering::Acquire) || shared.is_some_and(|runtime| !runtime.healthy()) {
@@ -1728,15 +1773,32 @@ fn execute_controlled(
         ));
     }
     let process = ManagedProcessGroup::spawn_command(command, Attribution::default())?;
+    let group = process.pgid();
     let start = Instant::now();
     let mut cancelled = false;
     let mut timed_out = false;
-    let output = process.wait_with_bounded_drain_budget(&limits, maximum, || {
+    let drained = process.wait_with_bounded_drain_budget(&limits, maximum, || {
         cancelled |=
             stopped.load(Ordering::Acquire) || shared.is_some_and(|runtime| !runtime.healthy());
         timed_out |= start.elapsed() >= timeout;
         cancelled || timed_out
-    })?;
+    });
+    let unresolved = match &drained {
+        Ok(output) => output.residual_group_members != 0,
+        Err(_) => !rabs_asupersync::process_groups::members_from_proc(group).is_empty(),
+    };
+    if unresolved {
+        if let Some(runtime) = shared {
+            runtime.stopped.store(true, Ordering::Release);
+        }
+        // Failed cleanup is neither a free root nor a clean cancellation. The
+        // admission also retains the state lock until the service process exits.
+        std::mem::forget(root);
+        return Err(io::Error::other(
+            "canonical Cargo process group did not drain",
+        ));
+    }
+    let output = drained?;
     cancelled |=
         stopped.load(Ordering::Acquire) || shared.is_some_and(|runtime| !runtime.healthy());
     timed_out |= start.elapsed() >= timeout;
@@ -1755,10 +1817,6 @@ fn execute_controlled(
             },
         ));
     }
-    require(
-        output.residual_group_members == 0,
-        "canonical Cargo process group did not drain",
-    )?;
     Ok(output)
 }
 

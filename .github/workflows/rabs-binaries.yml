@@ -112,6 +112,7 @@ jobs:
           cargo test -p rabs-sandbox --lib toolchain_cache --locked
           cargo test -p rabs-sandbox --lib toolchain_cache --locked -- --test-threads=1
           cargo test -p rabs-sandbox --lib snapshot_capture --locked
+          cargo test -p rabs-sandbox --lib source_transfer --locked
       - name: Check changed wrapper formatting
         run: rustfmt --edition 2024 --check rabs-wrap/src/main.rs rabs-wrap/tests/live_protocol.rs
       - name: Run wrapper unit and real socket delivery regressions
@@ -144,6 +145,7 @@ jobs:
       - name: Locked registry capture and isolated Cargo workspace
         run: |
           cargo test --release -p rabsd --lib coord::source_delivery::preparation::cargo --locked
+          cargo test --release -p rabsd --lib coord::source_delivery::toolchain --locked
           cargo test --release -p rabsd --test cargo_vendor_prepare --locked
           cargo test --release -p rabs-sandbox --lib cargo_home --locked
           cargo test --release -p rabs-wkr --lib cargo_home --locked

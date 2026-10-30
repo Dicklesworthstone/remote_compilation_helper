@@ -10,9 +10,10 @@
 
 mod cargo;
 
+use super::control::PreparationControl;
 use super::{MAX_SOURCE_ROOTS, SourceUpload, invalid, manifest_value, require, valid_closure_root};
 use rabs_sandbox::snapshot_capture::{
-    MemberDisposition, capture_sealed_source, member_disposition,
+    CaptureError, MemberDisposition, capture_sealed_source_cancellable, member_disposition,
 };
 use rabs_sandbox::source_transfer::{
     MAX_SOURCE_BYTES, MAX_SOURCE_FILES, SourceFile, SourceManifest,
@@ -222,26 +223,42 @@ impl SourcePreparation {
             .and_then(cargo::CargoSource::cargo_home_projection)
     }
 
-    pub(super) fn capture(&self, planning_toolchain: Option<&Path>) -> io::Result<SourceUpload> {
+    pub(super) fn capture_controlled(
+        &self,
+        planning_toolchain: Option<&Path>,
+        control: &PreparationControl<'_>,
+    ) -> io::Result<SourceUpload> {
+        control.checkpoint()?;
         // Never capture roots independently and merge them afterward. The scanner
         // compares a complete first closure pass with a complete second pass and
         // retries the ENTIRE closure on mutation. Its byte budget is global.
         let image = Arc::new(
-            capture_sealed_source(&self.roots, false, 2, MAX_SOURCE_BYTES)
-                .map_err(|error| invalid(&format!("source closure capture refused: {error:?}")))?,
+            capture_sealed_source_cancellable(&self.roots, false, 2, MAX_SOURCE_BYTES, || {
+                control.is_cancelled()
+            })
+            .map_err(|error| capture_error("source closure capture refused", error))?,
         );
+        control.checkpoint()?;
         if let Some(cargo) = &self.cargo {
-            let (image, files) = cargo.prepare(image, planning_toolchain)?;
-            SourceUpload::from_snapshot(image, "workspace", &files)
+            let (image, files) = cargo.prepare_controlled(image, planning_toolchain, control)?;
+            SourceUpload::from_snapshot_controlled(image, "workspace", &files, control)
         } else if self.closure {
-            SourceUpload::from_snapshot_closure(image, &self.selections)
+            SourceUpload::from_snapshot_closure_controlled(image, &self.selections, control)
         } else {
             let (root, files) = self
                 .selections
                 .first()
                 .ok_or_else(|| invalid("source preparation has no selection"))?;
-            SourceUpload::from_snapshot(image, root, files)
+            SourceUpload::from_snapshot_controlled(image, root, files, control)
         }
+    }
+}
+
+fn capture_error(context: &str, error: CaptureError) -> io::Error {
+    if matches!(error, CaptureError::Cancelled) {
+        PreparationControl::cancelled()
+    } else {
+        invalid(&format!("{context}: {error:?}"))
     }
 }
 
@@ -249,6 +266,7 @@ impl SourcePreparation {
 mod tests {
     use super::*;
     use crate::coord::source_delivery::{prepare_source_bundle, request_manifest};
+    use rabs_sandbox::snapshot_capture::capture_sealed_source;
     use serde_json::json;
     use std::fs;
 

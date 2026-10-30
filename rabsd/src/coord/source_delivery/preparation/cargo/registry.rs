@@ -6,7 +6,8 @@
 //! index entries are never opened. This supplies inputs, not cache authority.
 
 use super::{
-    MAX_PACKAGES, OUTPUT_LIMIT, git, invalid, require, validate_manifest_paths_with_cache, vendor,
+    MAX_PACKAGES, OUTPUT_LIMIT, PreparationControl, git, invalid, require,
+    validate_manifest_paths_with_cache, vendor,
 };
 use flate2::read::MultiGzDecoder;
 use rabs_sandbox::snapshot_capture::{MemberKind, SealedSourceSnapshot};
@@ -15,7 +16,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
 pub(super) const CACHE_PREFIX: &str = "rabs-cargo-home";
@@ -314,20 +315,32 @@ pub(super) fn open_selected(_root: &File, _path: &str, _directory: bool) -> io::
     ))
 }
 
+#[cfg(test)]
 fn read_selected(root: &File, path: &str, limit: u64) -> io::Result<Vec<u8>> {
-    read_selected_file(open_selected(root, path, false)?, limit)
+    read_selected_controlled(root, path, limit, &PreparationControl::uncontrolled())
 }
 
-fn read_selected_file(mut file: File, limit: u64) -> io::Result<Vec<u8>> {
+fn read_selected_controlled(
+    root: &File,
+    path: &str,
+    limit: u64,
+    control: &PreparationControl<'_>,
+) -> io::Result<Vec<u8>> {
+    control.checkpoint()?;
+    read_selected_file(open_selected(root, path, false)?, limit, control)
+}
+
+fn read_selected_file(
+    mut file: File,
+    limit: u64,
+    control: &PreparationControl<'_>,
+) -> io::Result<Vec<u8>> {
     let before = file.metadata()?;
     require(
         before.is_file() && before.len() <= limit,
         "selected Cargo cache file is not a bounded regular file",
     )?;
-    let mut bytes = Vec::new();
-    Read::by_ref(&mut file)
-        .take(before.len())
-        .read_to_end(&mut bytes)?;
+    let bytes = control.read_bounded(&mut file, before.len())?;
     let after = file.metadata()?;
     require(
         bytes.len() as u64 == before.len() && before.len() == after.len(),
@@ -375,6 +388,7 @@ fn archive_candidates<'a>(
     Ok(candidates)
 }
 
+#[cfg(test)]
 fn read_archive_candidate<'a>(
     root: &File,
     path: &str,
@@ -382,6 +396,25 @@ fn read_archive_candidate<'a>(
     candidate_remaining: &mut u64,
     retained_limit: u64,
 ) -> io::Result<Option<MatchedArchive<'a>>> {
+    read_archive_candidate_controlled(
+        root,
+        path,
+        identities,
+        candidate_remaining,
+        retained_limit,
+        &PreparationControl::uncontrolled(),
+    )
+}
+
+fn read_archive_candidate_controlled<'a>(
+    root: &File,
+    path: &str,
+    identities: &CandidateIdentities<'a>,
+    candidate_remaining: &mut u64,
+    retained_limit: u64,
+    control: &PreparationControl<'_>,
+) -> io::Result<Option<MatchedArchive<'a>>> {
+    control.checkpoint()?;
     let file = match open_selected(root, path, false) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -393,8 +426,8 @@ fn read_archive_candidate<'a>(
     })?;
     // Reserve before reading or comparing checksums. The same descriptor and
     // size limit prevent a replacement/growth from exceeding that reservation.
-    let bytes = read_selected_file(file, size.min(retained_limit))?;
-    let digest = <[u8; 32]>::from(Sha256::digest(&bytes));
+    let bytes = read_selected_file(file, size.min(retained_limit), control)?;
+    let digest = control.sha256(&bytes)?;
     let mut matches = Vec::new();
     for (identity @ (source, _, _), expected) in identities {
         if digest == **expected {
@@ -532,14 +565,20 @@ fn validate_index_config(bytes: &[u8], crates_io: bool) -> io::Result<()> {
     )
 }
 
-struct ArchiveBudget<R> {
+struct ArchiveBudget<'control, 'operation, R> {
     reader: R,
     consumed: u64,
     limit: u64,
+    control: &'control PreparationControl<'operation>,
 }
 
-impl<R: Read> Read for ArchiveBudget<R> {
+impl<R: Read> Read for ArchiveBudget<'_, '_, R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.control.is_cancelled() {
+            // tar/read_exact may retry Interrupted forever. Abort the decoder
+            // with a non-retryable error, then restore Interrupted at our API.
+            return Err(io::Error::other("registry archive capture cancelled"));
+        }
         if buffer.is_empty() {
             return Ok(0);
         }
@@ -552,7 +591,7 @@ impl<R: Read> Read for ArchiveBudget<R> {
             )?;
             return Ok(0);
         }
-        let available = buffer.len().min(remaining as usize);
+        let available = buffer.len().min(remaining as usize).min(64 * 1024);
         let count = self.reader.read(&mut buffer[..available])?;
         self.consumed += count as u64;
         Ok(count)
@@ -564,6 +603,7 @@ struct CapturedPackage {
     members: BTreeMap<String, (u64, [u8; 32])>,
 }
 
+#[cfg(test)]
 fn inspect_archive(
     bytes: &[u8],
     name: &str,
@@ -571,6 +611,38 @@ fn inspect_archive(
     remaining: &mut u64,
     member_count: &mut usize,
 ) -> io::Result<CapturedPackage> {
+    inspect_archive_controlled(
+        bytes,
+        name,
+        version,
+        remaining,
+        member_count,
+        &PreparationControl::uncontrolled(),
+    )
+}
+
+fn inspect_archive_controlled(
+    bytes: &[u8],
+    name: &str,
+    version: &str,
+    remaining: &mut u64,
+    member_count: &mut usize,
+    control: &PreparationControl<'_>,
+) -> io::Result<CapturedPackage> {
+    let result = inspect_archive_inner(bytes, name, version, remaining, member_count, control);
+    control.checkpoint()?;
+    result
+}
+
+fn inspect_archive_inner(
+    bytes: &[u8],
+    name: &str,
+    version: &str,
+    remaining: &mut u64,
+    member_count: &mut usize,
+    control: &PreparationControl<'_>,
+) -> io::Result<CapturedPackage> {
+    control.checkpoint()?;
     let top = format!("{name}-{version}");
     // Count *all* decompressed bytes, including GNU/PAX metadata consumed inside
     // the tar iterator and padding after its end marker, before trusting sizes.
@@ -578,6 +650,7 @@ fn inspect_archive(
         reader: MultiGzDecoder::new(bytes),
         consumed: 0,
         limit: *remaining,
+        control,
     };
     let mut archive = tar::Archive::new(reader);
     let mut paths = BTreeSet::new();
@@ -585,6 +658,7 @@ fn inspect_archive(
     let mut members = BTreeMap::new();
     let mut manifest = None;
     for entry in archive.entries()? {
+        control.checkpoint()?;
         let mut entry = entry?;
         *member_count = member_count
             .checked_add(1)
@@ -722,12 +796,14 @@ pub(super) struct RegistryCache {
 }
 
 impl RegistryCache {
-    pub(super) fn capture(
+    pub(super) fn capture_controlled(
         image: &SealedSourceSnapshot,
         lock: &Path,
         approved: &Path,
         cargo_home: &Path,
+        control: &PreparationControl<'_>,
     ) -> io::Result<Self> {
+        control.checkpoint()?;
         let lock_path = lock
             .to_str()
             .ok_or_else(|| invalid("non-UTF-8 Cargo lock path"))?;
@@ -752,6 +828,7 @@ impl RegistryCache {
         let mut remaining = MAX_SOURCE_BYTES;
         let mut file_count = 0_usize;
         for member in workspace.members.values() {
+            control.checkpoint()?;
             if let MemberKind::Regular { size, .. } = member {
                 remaining = remaining
                     .checked_sub(*size)
@@ -777,29 +854,32 @@ impl RegistryCache {
         let mut expanded_remaining = MAX_SOURCE_BYTES;
         let mut expanded_members = 0_usize;
         for namespace in namespaces {
+            control.checkpoint()?;
             let config_path = format!("registry/index/{namespace}/config.json");
             let mut namespace_sources = BTreeSet::new();
             // Group by the physical cache path before acquisition: many locked
             // source identities can share a host, package name and version.
             // Each candidate is read and hashed once, not once per identity.
             for (path, identities) in archive_candidates(&namespace, &locked)? {
-                let Some(candidate) = read_archive_candidate(
+                let Some(candidate) = read_archive_candidate_controlled(
                     &root,
                     &path,
                     &identities,
                     &mut candidate_remaining,
                     remaining,
+                    control,
                 )?
                 else {
                     continue;
                 };
                 let (_, name, version) = candidate.identities[0];
-                let package = inspect_archive(
+                let package = inspect_archive_controlled(
                     &candidate.bytes,
                     name,
                     version,
                     &mut expanded_remaining,
                     &mut expanded_members,
+                    control,
                 )?;
                 captured.insert(path, candidate.bytes, &mut remaining, &mut file_count)?;
                 captured
@@ -807,7 +887,12 @@ impl RegistryCache {
                     .insert((namespace.clone(), name.clone(), version.clone()), package);
                 let record = format!("registry/index/{namespace}/.cache/{}", index_record(name));
                 if !captured.files.contains_key(&record) {
-                    let bytes = read_selected(&root, &record, OUTPUT_LIMIT.min(remaining))?;
+                    let bytes = read_selected_controlled(
+                        &root,
+                        &record,
+                        OUTPUT_LIMIT.min(remaining),
+                        control,
+                    )?;
                     require(
                         !bytes.is_empty(),
                         "locked package sparse index record is empty",
@@ -826,7 +911,12 @@ impl RegistryCache {
                 }
             }
             if !namespace_sources.is_empty() {
-                let config = read_selected(&root, &config_path, OUTPUT_LIMIT.min(remaining))?;
+                let config = read_selected_controlled(
+                    &root,
+                    &config_path,
+                    OUTPUT_LIMIT.min(remaining),
+                    control,
+                )?;
                 validate_index_config(&config, namespace_sources.contains(CRATES_IO))?;
                 captured.insert(config_path, config, &mut remaining, &mut file_count)?;
             }
@@ -842,7 +932,7 @@ impl RegistryCache {
         // candidates were charged separately during the single acquisition pass.
         for (path, bytes) in &captured.files {
             require(
-                read_selected(&root, path, bytes.len() as u64)? == *bytes,
+                read_selected_controlled(&root, path, bytes.len() as u64, control)? == *bytes,
                 "selected Cargo cache changed between capture passes",
             )?;
         }
@@ -856,13 +946,15 @@ impl RegistryCache {
                 remaining,
                 &mut expanded_remaining,
                 &mut expanded_members,
+                control,
             )?;
             for (path, bytes) in files {
+                control.checkpoint()?;
                 captured.insert(path, bytes, &mut remaining, &mut file_count)?;
             }
             captured.git = Some(git);
         }
-        captured.materialize(cargo_home)?;
+        captured.materialize_controlled(cargo_home, control)?;
         Ok(captured)
     }
 
@@ -888,11 +980,16 @@ impl RegistryCache {
         )
     }
 
-    pub(super) fn materialize(&self, destination: &Path) -> io::Result<Vec<String>> {
+    pub(super) fn materialize_controlled(
+        &self,
+        destination: &Path,
+        control: &PreparationControl<'_>,
+    ) -> io::Result<Vec<String>> {
         // Both destinations are inside a private operation-owned directory.
         // create_new prevents overwriting any workspace or Cargo-created file.
         fs::create_dir_all(destination)?;
         for (path, bytes) in &self.files {
+            control.checkpoint()?;
             let output = destination.join(path);
             fs::create_dir_all(
                 output
@@ -903,7 +1000,7 @@ impl RegistryCache {
                 .write(true)
                 .create_new(true)
                 .open(output)?;
-            file.write_all(bytes)?;
+            control.write_all(&mut file, bytes)?;
         }
         Ok(self.files.keys().cloned().collect())
     }
@@ -915,7 +1012,13 @@ impl RegistryCache {
         )
     }
 
-    pub(super) fn check_package(&self, home: &Path, package: &Value) -> io::Result<()> {
+    pub(super) fn check_package(
+        &self,
+        home: &Path,
+        package: &Value,
+        control: &PreparationControl<'_>,
+    ) -> io::Result<()> {
+        control.checkpoint()?;
         if package.get("source").is_some_and(Value::is_null) {
             return Ok(());
         }
@@ -1008,18 +1111,23 @@ impl RegistryCache {
             let (size, expected) = captured.members.get(relative).ok_or_else(|| {
                 invalid("resolved registry target was not present in its captured archive")
             })?;
-            let bytes = read_selected(&directory, relative, *size)?;
+            let bytes = read_selected_controlled(&directory, relative, *size, control)?;
             require(
-                <[u8; 32]>::from(Sha256::digest(&bytes)) == *expected,
+                control.sha256(&bytes)? == *expected,
                 "unpacked registry manifest or target differs from its captured archive",
             )?;
         }
         Ok(())
     }
 
-    pub(super) fn verify_git_checkouts(&self, home: &Path, packages: &[Value]) -> io::Result<()> {
+    pub(super) fn verify_git_checkouts(
+        &self,
+        home: &Path,
+        packages: &[Value],
+        control: &PreparationControl<'_>,
+    ) -> io::Result<()> {
         if let Some(git) = &self.git {
-            git.verify_checkouts(home, packages)?;
+            git.verify_checkouts(home, packages, control)?;
         }
         Ok(())
     }
@@ -1031,6 +1139,7 @@ mod tests {
     use flate2::Compression;
     use flate2::write::GzEncoder;
     use serde_json::json;
+    use std::io::Write;
 
     const MANIFEST: &[u8] = b"[package]\nname='fixture'\nversion='1.0.0'\nedition='2021'\n";
 
@@ -1049,6 +1158,44 @@ mod tests {
     fn inspect(bytes: &[u8]) -> io::Result<CapturedPackage> {
         let mut remaining = MAX_SOURCE_BYTES;
         inspect_archive(bytes, "fixture", "1.0.0", &mut remaining, &mut 0)
+    }
+
+    #[test]
+    fn cancellation_interrupts_registry_archive_expansion_without_retrying_reads() {
+        use std::cell::Cell;
+
+        let payload = vec![b'x'; 1024 * 1024];
+        let bytes = archive(&[
+            ("fixture-1.0.0/Cargo.toml", MANIFEST),
+            ("fixture-1.0.0/large-input", &payload),
+        ]);
+        let polls = Cell::new(0_usize);
+        let stopped = || {
+            let next = polls.get() + 1;
+            polls.set(next);
+            next >= 12
+        };
+        let control = PreparationControl::new(&stopped, None);
+        let mut remaining = MAX_SOURCE_BYTES;
+        let mut members = 0;
+        let error = inspect_archive_controlled(
+            &bytes,
+            "fixture",
+            "1.0.0",
+            &mut remaining,
+            &mut members,
+            &control,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(
+            polls.get() < 20,
+            "tar must not retry a cancelled reader indefinitely"
+        );
+        assert!(
+            members > 0,
+            "cancellation must interrupt actual archive expansion"
+        );
     }
 
     #[test]
