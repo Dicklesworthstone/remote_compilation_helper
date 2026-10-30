@@ -2,7 +2,8 @@
 """Qualify source ownership over real, isolated loopback OpenSSH on Linux.
 
 This runs the exact production holder, release waiter, pair custody, registry
-transaction, activity check, retained-tree program and namespace controller.
+transaction, cancellation settlement coordinator, activity check, retained-tree
+program and namespace controller.
 It uses fixture-owned host/client keys, strict host
 verification and a server listening only on 127.0.0.1. Heartbeat fault tests
 select a two-second worker lease through the production session argument;
@@ -36,6 +37,7 @@ import unittest
 REPO = Path(__file__).resolve().parents[2]
 HOLDER = (REPO / "rch/src/hook/source_lock_holder.sh").read_text()
 CONTROL = (REPO / "rch/src/hook/source_namespace_control.sh").read_text()
+SETTLEMENT = (REPO / "rch/src/hook/source_cancel_settlement.py").read_text()
 SSH_SOURCE = (REPO / "rch/src/hook/ssh.rs").read_text()
 WAITER = SSH_SOURCE.split('const SOURCE_AUTHORITY_RELEASE_WAITER: &str = r#"', 1)[1].split('"#;', 1)[0]
 PAIR_CUSTODY = SSH_SOURCE.split('const SOURCE_PAIR_CUSTODY: &str = r#"', 1)[1].split('"#;', 1)[0]
@@ -246,10 +248,11 @@ class SourceOwnershipSshTests(unittest.TestCase):
             finally:
                 os.close(descriptor)
 
-    def invocation(self, operation, token=None):
-        return shlex.join([FLOCK, "-x", "--", str(self.registry / "metadata.lock"),
+    def invocation(self, operation, token=None, registry=None):
+        registry = self.registry if registry is None else registry
+        return shlex.join([FLOCK, "-x", "--", str(registry / "metadata.lock"),
                            "sh", "-c", TRANSACTION, "rch-source-registry",
-                           str(self.registry), token or self.token, self.digest, operation])
+                           str(registry), token or self.token, self.digest, operation])
 
     def transaction(self, operation, token=None):
         command = self.invocation(operation, token)
@@ -259,13 +262,93 @@ class SourceOwnershipSshTests(unittest.TestCase):
         return subprocess.run([*self.argv, command], input=self.roots.encode(),
                               capture_output=True, timeout=8)
 
-    def cancellation_state(self, token=None):
-        program = (self.invocation("cancellation-state", token) +
+    def cancellation_state(self, token=None, registry=None):
+        program = (self.invocation("cancellation-state", token, registry) +
                    " <<'RCH_SOURCE_CLAIM_ROOTS'\n" + self.roots +
                    "RCH_SOURCE_CLAIM_ROOTS\n")
         client = self.start(program, "set -- RCH_SOURCE_INTENT_CANCELLATION_STATE\n" + CONTROL)
         stdout, stderr = client.finish()
         return client.process.returncode, stdout, stderr
+
+    def make_legacy_registry(self):
+        self.legacy = self.root / "legacy"
+        self.legacy.mkdir(mode=0o700)
+        for name in ("cancelled", "released", "quarantine"):
+            (self.legacy / name).mkdir(mode=0o700)
+        (self.legacy / "metadata.lock").touch(mode=0o600)
+
+    def namespace_command(self, operation, namespace, token=None):
+        token = token or self.token
+        registry = self.registry if namespace == "current" else self.legacy
+        peer = self.legacy if namespace == "current" else self.registry
+        command = ["env", "RCH_LEGACY_SOURCE_CLAIM_REGISTRY=" + str(peer)]
+        if operation in ("cancel", "finish-cancel", "settle-cancel", "release"):
+            command.extend([FLOCK, "-x", "--", str(registry / (token + ".activity.lock"))])
+        # Preserve the production activity -> current metadata -> legacy
+        # metadata order, including when the identity is bound to legacy.
+        for directory in (self.registry, self.legacy):
+            command.extend([FLOCK, "-x", "--", str(directory / "metadata.lock")])
+        return shlex.join([*command, "sh", "-c", TRANSACTION, "rch-source-registry",
+                           str(registry), token, self.digest, operation])
+
+    def namespace_transaction(self, operation, namespace, token=None):
+        return subprocess.run([*self.argv, self.namespace_command(operation, namespace, token)],
+                              input=self.roots.encode(), capture_output=True, timeout=8)
+
+    def roots_program(self, command):
+        return (command + " <<'RCH_SOURCE_CLAIM_ROOTS'\n" + self.roots +
+                "RCH_SOURCE_CLAIM_ROOTS\n")
+
+    def settlement_program(self, operation, expected="", token=None):
+        return self.roots_program(shlex.join([
+            sys.executable, "-I", "-S", "-c", SETTLEMENT, str(self.registry),
+            str(self.root / "legacy"), token or self.token, self.digest,
+            TRANSACTION, operation, expected]))
+
+    def settlement(self, operation, expected="", token=None):
+        contract = {"locate": "RCH_SOURCE_AUTHORITY_NAMESPACE",
+                    "discover": "RCH_SOURCE_AUTHORITY_DISCOVERY"}.get(
+                        operation, "RCH_SOURCE_CANCELLATION_SETTLED")
+        client = self.start(self.settlement_program(operation, expected, token),
+                            "set -- " + contract + "\n" + CONTROL)
+        stdout, stderr = client.finish(seconds=20)
+        return subprocess.CompletedProcess([], client.process.returncode, stdout, stderr)
+
+    def lose_control_reply(self, program, contract, label):
+        committed = self.root / (label + ".committed")
+        # The real coordinator/registry writes its response into the real
+        # controller's capture pipe. Hold the uploaded program before exit so
+        # that no response has been delivered, then drop this exact SSH child.
+        client = self.start("set -eu\n" + program +
+                            "\nprintf committed > " + QUOTE(str(committed)) +
+                            "\nread -r lost_reply\n",
+                            "set -- " + contract + "\n" + CONTROL)
+        eventually(lambda: committed.exists(), "worker did not reach the lost-reply frontier")
+        self.assertIsNone(client.line(seconds=0.1), "controller delivered before program completion")
+        client.process.kill()
+        stdout, _ = client.finish()
+        self.assertEqual(stdout, b"", "dropped SSH reply must not be accepted as completion")
+
+    def fail_sync_after_pending_publication(self, pending):
+        tools = self.root / "pending-publication-tools"
+        tools.mkdir(mode=0o700)
+        adapter = tools / "python3"
+        # Real file writes and atomic publication run. Fail only the next
+        # production fsync adapter call after this exact pending file exists;
+        # the record's content has already been written and file-synced.
+        adapter.write_text(
+            '#!/bin/sh\ncase "${4-}" in *os.fsync*)\n'
+            "  if [ -e " + QUOTE(str(pending)) + " ]; then\n"
+            "    printf 'injected post-pending publication sync failure\\n' >&2\n"
+            "    exit 91\n  fi\nesac\nexec " + QUOTE(sys.executable) + ' "$@"\n')
+        adapter.chmod(0o700)
+        return "env PATH=" + QUOTE(str(tools)) + ':"$PATH" '
+
+    def authority_records(self):
+        return {str(path.relative_to(self.root)): (path.stat().st_ino, path.read_bytes())
+                for registry in (self.registry, self.root / "legacy") if registry.exists()
+                for path in registry.rglob("*")
+                if path.is_file() and not path.name.endswith(".lock")}
 
     def pair_program(self, operation, source, token=None):
         token = token or self.token
@@ -292,17 +375,18 @@ class SourceOwnershipSshTests(unittest.TestCase):
                               capture_output=True, timeout=8)
 
     def start(self, program, command="exec sh -s"):
+        command = "export TMPDIR=" + QUOTE(str(self.root)) + "\n" + command
         client = SshProcess(self.argv, command)
         self.clients.append(client)
         client.send("{\n" + program + "\n}\n")
         return client
 
-    def start_holder(self, idle=2, ready=True):
+    def start_holder(self, idle=2, ready=True, acquire_command=None):
         waiter = shlex.join([sys.executable, "-I", "-S", "-c", WAITER, "source",
                              str(self.registry), self.token, self.digest, self.release])
         retirement = shlex.join([FLOCK, "-x", "--", str(self.activity_lock)]) + " " + self.invocation("release")
         terminal = ("set -eu; ready=$1; roots=$(cat <&4); exec 4<&-; "
-                    "printf '%s\\n' \"$roots\" | " + self.invocation("acquire") + "; "
+                    "printf '%s\\n' \"$roots\" | " + (acquire_command or self.invocation("acquire")) + "; "
                     "printf '%s\\n' \"$ready\"; " + waiter + "; "
                     "printf '%s\\n' \"$roots\" | " + retirement + "; "
                     "printf '%s\\n' " + QUOTE(self.release))
@@ -353,15 +437,16 @@ class SourceOwnershipSshTests(unittest.TestCase):
         self.source.mkdir()
         (self.source / "sentinel").write_bytes(b"materialized source evidence\n")
 
-    def activity_prefix(self, mode="cleanup", token=None):
+    def activity_prefix(self, mode="cleanup", token=None, registry=None):
         token = token or self.token
+        registry = self.registry if registry is None else registry
         return shlex.join([
-            "nohup", FLOCK, "-x", "--", str(self.registry / (token + ".activity.lock")),
-            "sh", "-c", ACTIVITY_CHECK, "rch-source-activity", str(self.registry),
+            "nohup", FLOCK, "-x", "--", str(registry / (token + ".activity.lock")),
+            "sh", "-c", ACTIVITY_CHECK, "rch-source-activity", str(registry),
             token, mode])
 
-    def activity_command(self, program, mode="cleanup", token=None):
-        return self.activity_prefix(mode, token) + " " + shlex.join(["sh", "-c", program])
+    def activity_command(self, program, mode="cleanup", token=None, registry=None):
+        return self.activity_prefix(mode, token, registry) + " " + shlex.join(["sh", "-c", program])
 
     def retention_command(self, identity=None, root=None, retained=None):
         return shlex.join([
@@ -491,6 +576,213 @@ class SourceOwnershipSshTests(unittest.TestCase):
         activity.send("finish\n")
         stdout, stderr = activity.finish()
         self.assertEqual((activity.process.returncode, stdout, stderr), (0, b"", b""))
+
+    def assert_pending_publication_can_cancel_and_readmit(self, namespace):
+        self.make_legacy_registry()
+        self.source = self.root / "unmaterialized-source"
+        self.roots = str(self.source) + "\n"
+        self.digest = hashlib.sha256(self.roots.encode()).hexdigest()
+        self.active = self.registry / (self.token + "." + self.digest + ".claim")
+        registry = self.registry if namespace == "current" else self.legacy
+        pending = registry / (self.token + "." + self.digest + ".pending")
+        active = pending.with_suffix(".claim")
+        fence = pending.with_suffix(".cancelling")
+        receipt = registry / "cancelled" / active.name
+        command = (self.fail_sync_after_pending_publication(pending) +
+                   self.namespace_command("acquire", namespace))
+        holder = self.start_holder(idle=90, ready=False, acquire_command=command)
+        holder.process.wait(timeout=10)
+        stdout, stderr = holder.finish()
+        self.assertEqual((holder.process.returncode, stdout), (73, b""), stderr)
+        self.assertIn(b"RCH_SOURCE_REGISTRY_PUBLICATION_UNCONFIRMED", stderr)
+        self.assertEqual(pending.read_text(), self.roots)
+        pending_identity = pending.stat().st_ino, pending.read_bytes()
+        self.assertFalse(active.exists())
+        self.assertFalse(self.source.exists(), "unready holder must not materialize source")
+        self.assertTrue(available(self.kernel_lock))
+        before = self.authority_records()
+
+        blocked = self.namespace_transaction("try-acquire", "current", "bb-111")
+        self.assertEqual((blocked.returncode, blocked.stdout), (75, b""), blocked.stderr)
+        self.lose_control_reply(self.settlement_program("locate"),
+                                "RCH_SOURCE_AUTHORITY_NAMESPACE", "pending-location")
+        self.assertEqual(self.authority_records(), before)
+        for operation in ("locate", "discover", "locate", "discover"):
+            result = self.settlement(operation)
+            contract = "NAMESPACE" if operation == "locate" else "DISCOVERY"
+            self.assertEqual((result.returncode, result.stdout, result.stderr),
+                             (0, f"RCH_SOURCE_AUTHORITY_{contract} {namespace}\n".encode(), b""))
+            self.assertEqual(self.authority_records(), before)
+            self.assertFalse(active.exists(), "namespace observation promoted pending ownership")
+        # A located pending publication is not cancellation or retirement.
+        status, output, error = self.cancellation_state(registry=registry)
+        self.assertEqual((status, output), (73, b""), error)
+        refused = self.settlement("settle-cancel", namespace)
+        self.assertEqual((refused.returncode, refused.stdout), (73, b""), refused.stderr)
+        self.assertEqual(self.authority_records(), before)
+
+        self.lose_control_reply(self.roots_program(self.namespace_command("cancel", namespace)),
+                                "RCH_SOURCE_INTENT_CANCEL", "pending-cancel")
+        self.assertFalse(pending.exists())
+        self.assertEqual((active.stat().st_ino, active.read_bytes()), pending_identity)
+        self.assertEqual(fence.read_text(), self.roots)
+        cancelled_before = self.authority_records()
+        for _ in range(2):
+            cancelled = self.namespace_transaction("cancel", namespace)
+            self.assertEqual((cancelled.returncode, cancelled.stdout, cancelled.stderr),
+                             (0, b"owned", b""))
+            self.assertEqual(self.authority_records(), cancelled_before)
+            blocked = self.namespace_transaction("try-acquire", "current", "bb-111")
+            self.assertEqual((blocked.returncode, blocked.stdout), (75, b""), blocked.stderr)
+
+        # This actual holder failed before readiness; no source operation or
+        # materialization was ever started. Complete the checked cancellation
+        # protocol, preserving its original claim as the retirement receipt.
+        self.lose_control_reply(self.roots_program(self.namespace_command("finish-cancel", namespace)),
+                                "RCH_SOURCE_INTENT_FINISHED", "pending-finish")
+        self.assertFalse(active.exists())
+        self.assertEqual((receipt.stat().st_ino, receipt.read_bytes()), pending_identity)
+        finished = self.namespace_transaction("finish-cancel", namespace)
+        self.assertEqual((finished.returncode, finished.stdout, finished.stderr), (0, b"", b""))
+        admitted = self.namespace_transaction("try-acquire", "current", "bb-111")
+        self.assertEqual((admitted.returncode, admitted.stdout, admitted.stderr), (0, b"", b""))
+        successor = self.registry / ("bb-111." + self.digest + ".claim")
+        self.source.mkdir()
+        sentinel = self.source / "successor"
+        sentinel.write_bytes(b"new dispatcher source\n")
+        protected = (receipt, fence, successor, sentinel)
+        protected_before = [(path.stat().st_ino, path.read_bytes()) for path in protected]
+        for _ in range(2):
+            settled = self.settlement("settle-cancel", namespace)
+            self.assertEqual((settled.returncode, settled.stdout, settled.stderr),
+                             (0, b"RCH_SOURCE_CANCELLATION_SETTLED\n", b""))
+            delayed = self.namespace_transaction("recover", namespace)
+            self.assertEqual((delayed.returncode, delayed.stdout), (73, b""), delayed.stderr)
+            self.assertEqual([(path.stat().st_ino, path.read_bytes()) for path in protected],
+                             protected_before)
+
+    def test_interrupted_current_pending_publication_can_cancel_and_readmit_over_ssh(self):
+        self.assert_pending_publication_can_cancel_and_readmit("current")
+
+    def test_interrupted_legacy_pending_publication_can_cancel_and_readmit_over_ssh(self):
+        self.assert_pending_publication_can_cancel_and_readmit("legacy")
+
+    def test_optional_discovery_absence_preserves_another_dispatchers_live_claim(self):
+        acquired = self.transaction("acquire", "bb-111")
+        self.assertEqual((acquired.returncode, acquired.stdout, acquired.stderr), (0, b"", b""))
+        before = self.authority_records()
+        sentinel = self.source / "sentinel"
+        source_before = sentinel.stat().st_ino, sentinel.read_bytes()
+        for _ in range(2):
+            result = self.settlement("discover")
+            self.assertEqual((result.returncode, result.stdout, result.stderr),
+                             (0, b"RCH_SOURCE_AUTHORITY_DISCOVERY absent\n", b""))
+            strict = self.settlement("locate")
+            self.assertEqual((strict.returncode, strict.stdout), (73, b""), strict.stderr)
+            self.assertEqual(self.authority_records(), before)
+            self.assertFalse((self.root / "legacy").exists())
+            self.assertFalse(self.active.exists())
+            self.assertEqual((sentinel.stat().st_ino, sentinel.read_bytes()), source_before)
+        refused = self.transaction("recover")
+        self.assertEqual((refused.returncode, refused.stdout), (73, b""), refused.stderr)
+        self.assertEqual(self.authority_records(), before)
+
+    def test_legacy_terminal_cancellation_discovery_survives_a_lost_settlement_reply(self):
+        self.make_legacy_registry()
+        self.token = "a" * 32
+        self.source = self.root / "terminal-source"
+        self.retained = self.root / (self.source.name + ".retained-" + self.token)
+        self.roots = "".join(root + "\n" for root in sorted(map(str, (self.source, self.retained))))
+        self.digest = hashlib.sha256(self.roots.encode()).hexdigest()
+        active = self.legacy / (self.token + "." + self.digest + ".claim")
+        fence = active.with_suffix(".cancelling")
+        receipt = self.legacy / "cancelled" / active.name
+        acquired = self.namespace_transaction("acquire", "legacy")
+        self.assertEqual((acquired.returncode, acquired.stdout, acquired.stderr), (0, b"", b""))
+        active_before = active.stat().st_ino, active.read_bytes()
+        self.source.mkdir()
+        (self.source / "sentinel").write_bytes(b"retired original source\n")
+        cancelled = self.namespace_transaction("cancel", "legacy")
+        self.assertEqual((cancelled.returncode, cancelled.stdout, cancelled.stderr), (0, b"owned", b""))
+        # Execute actual activity admission and the Linux retained-tree
+        # program. This proves the worker's retirement frontier; the separate
+        # Rust recovery tests must still qualify durable journal ownership.
+        retained = subprocess.run(
+            [*self.argv, self.activity_command(self.retention_command(), registry=self.legacy)],
+            input=b"", capture_output=True, timeout=8)
+        self.assertEqual((retained.returncode, retained.stdout, retained.stderr),
+                         (0, b"RCH_SOURCE_RETAINED\n", b""))
+        self.assertFalse(self.source.exists())
+        before = self.authority_records()
+        for _ in range(2):
+            located = self.settlement("discover")
+            self.assertEqual((located.returncode, located.stdout, located.stderr),
+                             (0, b"RCH_SOURCE_AUTHORITY_DISCOVERY legacy\n", b""))
+            status, output, error = self.cancellation_state(registry=self.legacy)
+            self.assertEqual((status, output, error), (0, b"cancellation", b""))
+            self.assertEqual(self.authority_records(), before)
+        blocked = self.namespace_transaction("try-acquire", "current", "bb-111")
+        self.assertEqual((blocked.returncode, blocked.stdout), (75, b""), blocked.stderr)
+        wrong_binding = self.settlement("settle-cancel", "current")
+        self.assertEqual((wrong_binding.returncode, wrong_binding.stdout), (73, b""), wrong_binding.stderr)
+        self.assertIn(b"namespace changed from recorded binding", wrong_binding.stderr)
+        self.assertEqual(self.authority_records(), before)
+        self.lose_control_reply(self.settlement_program("settle-cancel", "legacy"),
+                                "RCH_SOURCE_CANCELLATION_SETTLED", "terminal-settlement")
+        self.assertFalse(active.exists())
+        self.assertEqual((receipt.stat().st_ino, receipt.read_bytes()), active_before)
+        self.assertEqual(fence.read_text(), self.roots)
+        admitted = self.namespace_transaction("try-acquire", "current", "bb-111")
+        self.assertEqual((admitted.returncode, admitted.stdout, admitted.stderr), (0, b"", b""))
+        self.source.mkdir()
+        successor_source = self.source / "successor"
+        successor_source.write_bytes(b"live successor source\n")
+        successor = self.registry / ("bb-111." + self.digest + ".claim")
+        protected = (receipt, fence, successor, successor_source, self.retained / "sentinel")
+        protected_before = [(path.stat().st_ino, path.read_bytes()) for path in protected]
+        for _ in range(2):
+            restarted = self.settlement("settle-cancel", "legacy")
+            self.assertEqual((restarted.returncode, restarted.stdout, restarted.stderr),
+                             (0, b"RCH_SOURCE_CANCELLATION_SETTLED\n", b""))
+            discovered = self.settlement("discover")
+            self.assertEqual((discovered.returncode, discovered.stdout, discovered.stderr),
+                             (0, b"RCH_SOURCE_AUTHORITY_DISCOVERY legacy\n", b""))
+            self.assertEqual([(path.stat().st_ino, path.read_bytes()) for path in protected],
+                             protected_before)
+        delayed = subprocess.run(
+            [*self.argv, self.activity_command(self.retention_command(), registry=self.legacy)],
+            input=b"", capture_output=True, timeout=8)
+        self.assertEqual(delayed.returncode, 73, delayed.stderr)
+        self.assertIn(b"source grant is not active", delayed.stderr)
+        self.assertEqual([(path.stat().st_ino, path.read_bytes()) for path in protected], protected_before)
+
+    def test_optional_discovery_refuses_malformed_or_conflicting_evidence_over_ssh(self):
+        self.make_legacy_registry()
+        acquired = self.namespace_transaction("acquire", "current", "bb-111")
+        self.assertEqual((acquired.returncode, acquired.stdout, acquired.stderr), (0, b"", b""))
+        cases = (("aa-121", "torn-pending"), ("aa-122", "wrong-fence"),
+                 ("aa-123", "unknown-record"), ("aa-124", "both-namespaces"))
+        for token, case in cases:
+            with self.subTest(case=case):
+                stem = token + "." + self.digest
+                if case == "torn-pending":
+                    (self.registry / (stem + ".pending")).write_bytes(b"interrupted")
+                elif case == "wrong-fence":
+                    (self.registry / (stem + ".cancelling")).write_text(str(self.root / "wrong") + "\n")
+                elif case == "unknown-record":
+                    (self.registry / (stem + ".unexpected")).write_text(self.roots)
+                else:
+                    for registry in (self.registry, self.legacy):
+                        (registry / (stem + ".cancelling")).write_text(self.roots)
+                before = self.authority_records()
+                for operation in ("discover", "locate", "settle-cancel"):
+                    expected = "current" if operation == "settle-cancel" else ""
+                    refused = self.settlement(operation, expected, token)
+                    self.assertEqual((refused.returncode, refused.stdout), (73, b""), refused.stderr)
+                    self.assertEqual(self.authority_records(), before)
+                self.assertFalse(any((self.registry / "quarantine").iterdir()),
+                                 "namespace observation moved malformed evidence")
+        self.assertEqual((self.source / "sentinel").read_text(), "source remains owned\n")
 
     def test_live_heartbeats_and_explicit_release_publish_exact_retirement(self):
         holder = self.start_holder()

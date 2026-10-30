@@ -420,6 +420,8 @@ class SourceNamespaceControlTests(unittest.TestCase):
             b"RCH_SOURCE_AUTHORITY_NAMESPACE legacy\n",
         )
         for reply in (*replies, b"RCH_SOURCE_AUTHORITY_NAMESPACE unknown\n",
+                      b"RCH_SOURCE_AUTHORITY_NAMESPACE absent\n",
+                      b"RCH_SOURCE_AUTHORITY_DISCOVERY absent\n",
                       replies[0][:-1], replies[1] + b"\n", replies[0] + replies[1],
                       b"RCH_TOPOLOGY_OK\n", b"RCH_SOURCE_AUTHORITY_NAMESPACE current\x00\n"):
             with self.subTest(reply=reply):
@@ -427,6 +429,25 @@ class SourceNamespaceControlTests(unittest.TestCase):
                     "import os; os.write(1, {!r})".format(reply))
                 result = subprocess.run(
                     [SHELL, "-c", "set -- RCH_SOURCE_AUTHORITY_NAMESPACE\n" + self.script],
+                    input=program.encode(), capture_output=True, env=self.env,
+                    timeout=5, check=False,
+                )
+                self.assertEqual(result.returncode == 0, reply in replies, result.stderr)
+                self.assertEqual(result.stdout, reply if reply in replies else b"")
+
+    def test_namespace_discovery_accepts_only_its_exact_non_authorizing_envelope(self):
+        replies = tuple(f"RCH_SOURCE_AUTHORITY_DISCOVERY {state}\n".encode()
+                        for state in ("current", "legacy", "absent"))
+        for reply in (*replies, b"", replies[2][:-1], replies[2] + b"\n",
+                      replies[0] + replies[2], b"RCH_SOURCE_AUTHORITY_DISCOVERY unknown\n",
+                      b"RCH_SOURCE_AUTHORITY_DISCOVERY absent\x00\n",
+                      b"RCH_SOURCE_AUTHORITY_NAMESPACE current\n",
+                      b"RCH_SOURCE_CANCELLATION_SETTLED\n"):
+            with self.subTest(reply=reply):
+                program = shlex.quote(sys.executable) + " -I -S -c " + shlex.quote(
+                    "import os; os.write(1, {!r})".format(reply))
+                result = subprocess.run(
+                    [SHELL, "-c", "set -- RCH_SOURCE_AUTHORITY_DISCOVERY\n" + self.script],
                     input=program.encode(), capture_output=True, env=self.env,
                     timeout=5, check=False,
                 )

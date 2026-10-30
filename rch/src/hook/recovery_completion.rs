@@ -186,7 +186,7 @@ pub(super) async fn finish(
     mut send: impl AsyncFnMut(&str) -> Result<String>,
 ) -> Result<()> {
     let lease = writer.snapshot();
-    let mut recipe = load_recipe(writer)?;
+    let recipe = load_recipe(writer)?;
     let exit = recipe
         .returned
         .context("recovery delivery is not settled")?;
@@ -255,8 +255,14 @@ pub(super) async fn finish(
             writer.snapshot() == lease,
             "recovery journal changed during daemon reconciliation; acknowledgement refused"
         );
-        recipe.daemon_record_absent = true;
-        writer.set_recovery(serde_json::to_value(recipe)?)?;
+        let mut recovery = lease
+            .recovery
+            .context("recovery recipe disappeared before daemon acknowledgement")?;
+        recovery
+            .as_object_mut()
+            .context("recovery recipe is not an object")?
+            .insert("daemon_record_absent".into(), Value::Bool(true));
+        writer.set_recovery(recovery)?;
         return writer.acknowledge_terminal();
     }
     let daemon_exit = completed(&reply, build_id, worker, wrapper)?;
@@ -280,8 +286,17 @@ pub(super) async fn finish(
     }
     // Persist the daemon fact first. A crash between this write and local ack
     // resumes via readback, without another artifact write or workload launch.
-    recipe.daemon_exit_code = Some(daemon_exit);
-    writer.set_recovery(serde_json::to_value(recipe)?)?;
+    // Retain the original recipe bytes' meaning, including unknown custody
+    // fields, omitted legacy defaults and historical root spellings. Loading
+    // a typed recipe for validation does not authorize rewriting that evidence.
+    let mut recovery = lease
+        .recovery
+        .context("recovery recipe disappeared before daemon acknowledgement")?;
+    recovery
+        .as_object_mut()
+        .context("recovery recipe is not an object")?
+        .insert("daemon_exit_code".into(), Value::from(daemon_exit));
+    writer.set_recovery(recovery)?;
     writer.acknowledge_terminal()
 }
 
@@ -366,6 +381,53 @@ mod tests {
             "local_wrapper_id":lease.identity.local_wrapper_id,
             "record":{"id":41,"worker_id":lease.worker_id,"exit_code":code}
         })
+    }
+
+    #[tokio::test]
+    async fn daemon_reconciliation_preserves_original_recovery_custody() {
+        for absent in [false, true] {
+            let (_directory, writer) = fixture(137);
+            let mut original = writer.snapshot().recovery.unwrap();
+            original["source_roots"] = serde_json::json!(["/owned/project/"]);
+            original["source_cancellation_settled"] = serde_json::json!(true);
+            original["future_custody"] = serde_json::json!({
+                "original_path": "/original//evidence/", "proof": ["keep", 9]
+            });
+            for field in ["pair_released", "tree_retired"] {
+                original.as_object_mut().unwrap().remove(field);
+            }
+            writer.set_recovery(original.clone()).unwrap();
+            if absent {
+                writer.lease.lock().unwrap().heartbeat_unix_ms = 1;
+                writer.persist().unwrap();
+            }
+            let reply = if absent {
+                response(serde_json::json!({"status": "not_found"}))
+            } else {
+                // Daemon cancellation and recovered delivery are distinct
+                // outcomes; adding one must not rewrite the other's custody.
+                response(terminal(&writer, 130))
+            };
+            finish(&writer, async |request: &str| {
+                assert!(request.starts_with("GET /builds/41?"));
+                Ok(reply.clone())
+            })
+            .await
+            .unwrap();
+            let mut expected = original;
+            if absent {
+                expected["daemon_record_absent"] = serde_json::json!(true);
+            } else {
+                expected["daemon_exit_code"] = serde_json::json!(130);
+            }
+            let after = writer.snapshot();
+            assert!(after.terminal_acknowledged);
+            assert_eq!(after.exit_code, Some(137));
+            assert_eq!(after.recovery, Some(expected));
+            let stored: DurableJobLease =
+                serde_json::from_slice(&std::fs::read(&writer.path).unwrap()).unwrap();
+            assert_eq!(stored, after);
+        }
     }
 
     fn output_phase(

@@ -361,6 +361,29 @@ outer upload can still leave an SSH process, but it owns no source activity
 lock. This is not an expiry policy for running compilers or streamed rsync/tar
 payloads: their independent activity must still drain before cancellation.
 
+Source rsync sessions now receive the configured
+`source_sync_silence_timeout_secs` as rsync's peer I/O timeout, including uploads,
+no-delta content barriers and clean-overlay archive upload. The default is 120
+seconds; an explicit zero keeps the existing source-sync opt-out. Estimates
+retain their own finite estimate budget, rounded upward to whole seconds, even
+when actual source sync opts out. Declared result-directory retrieval now uses
+the same 30-second I/O timeout as ordinary artifact retrieval. A real rsync
+client forwards this option to its remote sender or receiver, so a half-open
+channel no longer depends solely on the dispatcher's local progress timer to
+release transfer activity. Ongoing I/O renews the timeout; this is not a total
+transfer or compiler lifetime limit.
+Protocol keepalives can renew it without payload progress; it does not bound a
+peer that continues communicating at the application-protocol level.
+
+Source-sync rsync exit 30 is reported as a typed peer I/O stall when the source
+silence policy is enabled. It keeps the existing no-in-place-retry and worker
+failover classification, and explicitly reports that worker retirement remains
+unconfirmed. Artifact retrieval and an opted-out source policy retain their
+ordinary transfer-failure classification. Neither a process exit nor a local
+timeout releases a durable source claim or acknowledges cancellation; recovery
+still needs exact ownership and drained activity. Native rsync flavor and
+platform acceptance remain required for the deployed workers.
+
 Finite cancellation, cancellation-finish and release/receipt RPCs, including
 pair reconciliation, run inside the same bounded metadata controller as
 namespace initialization. Its worker-side execution budget is 15 seconds with
@@ -406,9 +429,60 @@ plumbing for this ordering does not create a claim or cancellation receipt.
 A legacy pair-only intent without a source-registry record remains refused:
 its namespace cannot be guessed from the present layout.
 
-Old executed-but-lost
-cancellations that recorded neither `preparation_cancelled` nor the new
-settlement field cannot safely be identified from their exit code alone.
+An isolated, complete `.pending` publication can now establish an older
+journal's namespace after its exact closure and file/directory durability
+barriers are confirmed. This closes the recovery dead end after atomic pending
+publication but before its acknowledgement: that record already excludes
+overlapping admission, yet the older journal needs a namespace before it can
+cancel. Location does not promote the claim, grant source access or perform
+cleanup. A torn record or any contradictory same-identity claim, cancellation,
+release or quarantine evidence remains refused. Normal cancellation or recovery
+must revalidate ownership and competing lexical/physical roots afterward.
+
+Detached recovery checks a retired failed legacy lease for an unrecorded
+cancellation obligation before daemon acknowledgement, and explicit recovery
+checks an already acknowledged terminal lease too. Historical cancellation
+could persist a failed return and resource retirement before its dispatcher
+died or daemon reconciliation failed. A retired shortcut must not acknowledge
+that lease and remove it from background recovery before checking the worker.
+Every detached recovery outcome now passes one completion boundary after
+resource retirement. Before contacting the worker it requires exclusive
+verified journal ownership, an unchanged retired recipe, a recorded matching
+failed delivery, a valid complete source intent and exact pair binding where
+present. An acknowledged lease additionally requires `state=finished` and an
+unchanged outer exit result. An unacknowledged lease can record its verified
+recovered delivery result, including successful recovery of an earlier transfer
+failure; the daemon's execution outcome remains a separate fact.
+
+Retirement proof applies to resources actually owned: nonempty source roots
+require source release, a present pair requires pair release, and a present
+retirement tree requires tree retirement. Missing legacy flags for an absent
+pair or tree do not invent an outstanding resource. Malformed flags or resource
+fields still refuse recovery. The hook and daemon use the same raw-recipe
+predicate, and daemon readback refuses a newly discovered pending cancellation
+even when the original candidate had no recorded obligation.
+
+The exit code alone proves no cancellation. If the namespace is unknown, a
+separate optional discovery operation reports exact `current`, `legacy` or
+`absent` evidence under the existing activity/metadata lock order. It preserves
+absent registries, pins existing registry parents and refuses malformed,
+ambiguous or changed evidence. An absent result grants no authority and leaves
+the cancellation recipe unchanged; ordinary daemon reconciliation can proceed
+from independently verified retirement. Mandatory ownership location and
+settlement still refuse missing evidence.
+
+Only a positive exact cancellation-intent observation checkpoints the namespace
+and `source_cancellation_settled=false`, preserving original JSON custody fields
+and path spellings. The existing activity-drained settlement then completes that
+obligation, including after a lost reply or dispatcher restart. A pending or
+unconfirmed observation keeps an unacknowledged lease eligible for recovery;
+daemon acknowledgement follows confirmed settlement. An already acknowledged
+terminal retry does not reconcile daemon accounting again. Both paths preserve
+retired source/pair trees, retain the old-token fence and require the same exact
+worker validation on every retry. This does not scan every historical failed
+job in the background. The final daemon checkpoint adds only its outcome or
+absence fact to the original JSON, retaining unknown custody fields, omitted
+legacy defaults and historical path spellings.
 
 The registry migration also changed hierarchy-lock paths. A read-only legacy
 scan does not prove safe admission across simultaneously active old and new
@@ -510,6 +584,67 @@ HUP until completion. The existing heartbeat, stale-lock, pair-publication and
 owner-conflict cases passed in the same run. Pinned workspace formatting and
 `git diff --check` also passed for this correction.
 
+The following interrupted-publication, terminal-discovery and rsync-idle
+correction passed 313 Linux regression checks with no skips: 106 comprehensive
+registry cases, 31 earlier registry cases, 25 namespace cases, 80 holder/pair
+cases, 32 controller cases, 11 native-timer cases, three delivery/backpressure
+cases and 25 real loopback OpenSSH cases. The four pending-publication positive
+cases fail against the unchanged `cd8fb446` registry under both `sh` and `bash`
+in both namespaces, establishing their sensitivity to the repair. The expanded
+registry tests cover lost durability acknowledgements, fresh-process retries,
+conflicting claims, incomplete evidence and replacement of an absent registry's
+parent while discovery waits for metadata.
+
+Five new SSH cases interrupt actual pending publication before readiness, drop
+replies after worker location/cancellation/finish/settlement, and resume from
+both namespaces. Terminal legacy settlement follows actual retained-tree
+retirement under the legacy activity guard; retries preserve a live successor's
+claim, the old fence and receipt, and retained-tree bytes. Optional absence
+creates no ownership, and malformed or ambiguous evidence remains untouched.
+These execute worker programs and the metadata controller, not a copied Rust
+lease state machine.
+
+The new holder checks use a real Linux rsync 3.2.7 client and its actual remote
+receiver/sender arguments. With a two-second I/O idle budget, abandoned input
+and blocked output independently exited 30 after approximately 3.1 and 2.1
+seconds, releasing activity without fixture EOF or signal termination. Upload
+and download with ongoing traffic both succeeded after about four seconds.
+The explicit opt-out remained live after four seconds and ended only when the
+fixture closed input. Every case retained the exact claim inode and bytes and
+source sentinel, without creating cancellation or release receipts.
+
+Workspace `cargo fmt --all -- --check`, shell/Python syntax checks and
+`git diff --check` passed for this correction. Five new
+`terminal_legacy_cancellation_discovery_` Rust tests and two `source_rsync_`
+policy/classification tests were added, and the existing generated-command
+controller regression now exercises optional discovery. These RCH tests remain
+**uncompiled and unexecuted** in this environment. Independent source review
+found no ownership or protocol blocker; it is not a compiler verdict. The
+backing filesystem remained full with limited tmpfs space under the same 8 GiB
+memory constraint, so the already-failing heavy dependency build was not
+repeated. Native rsync results do not qualify openrsync, Darwin or Windows.
+
+The subsequent pre-acknowledgement correction passed 29 job-identity and journal
+tests in the actual default-feature `rch-common` crate, including four new
+resource-applicability and malformed-evidence cases. Default-feature common
+library/test Clippy passed with `-D warnings`. All 25 real loopback OpenSSH
+cases passed again with no skips, qualifying the unchanged worker protocols;
+they do not execute the changed Rust completion boundary. Pinned workspace
+formatting and `git diff --check` passed.
+
+Ten new RCH/daemon tests cover the retired pre-acknowledgement route, a concurrent
+journal owner, lost settlement replies and disk restart, optional absent or
+unconfirmed observations, legitimate transfer-failure recovery, applicable
+resource absence, pending or malformed daemon readback, and raw custody
+preservation through the final daemon checkpoint. These tests use the actual
+journal and completion functions with injected worker/daemon replies. They
+remain **uncompiled and unexecuted** here; successful common-crate compilation
+does not qualify those callers. The backing filesystem was still full and
+insufficient temporary build capacity remained for the mandatory heavy
+dependency graph, so the previous `asupersync 0.5.0` failure was not repeated.
+The earlier 313-case Linux result remains scoped to its recorded correction;
+only the 25-case SSH suite was rerun for this follow-up.
+
 The journal-custody correction passed 25 job-identity and journal tests in the
 actual default-feature `rch-common` crate using the pinned nightly toolchain.
 Default-feature `rch-common` Clippy with `--lib --tests -- -D warnings` also
@@ -572,9 +707,21 @@ the worker acceptance cases below:
 ```bash
 cargo check --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked -p rch-common --lib job_identity:: -- --test-threads=1
+cargo test --locked -p rch --bin rch retired_failed_recovery_ -- --test-threads=1
+cargo test --locked -p rch --bin rch recovered_delivery_can_replace_ -- --test-threads=1
+cargo test --locked -p rch --bin rch source_cancellation_retirement_tests -- --test-threads=1
+cargo test --locked -p rch --bin rch daemon_reconciliation_preserves_ -- --test-threads=1
+cargo test --locked -p rchd --bin rchd terminal_cancellation_recovery_preserves_ -- --test-threads=1
+cargo test --locked -p rchd --bin rchd retired_delivery_refuses_ -- --test-threads=1
+cargo test --locked -p rchd --bin rchd handoff_completion_refuses_ -- --test-threads=1
 cargo test --locked -p rch --bin rch namespace_preflight_ -- --test-threads=1
 cargo test --locked -p rch --bin rch paired_cancellation_recovery_ -- --test-threads=1
 cargo test --locked -p rch --bin rch completed_source_cancellation_ -- --test-threads=1
+cargo test --locked -p rch --bin rch terminal_legacy_cancellation_discovery_ -- --test-threads=1
+cargo test --locked -p rch --bin rch terminal_cancellation_command_preserves_ -- --test-threads=1
+cargo test --locked -p rch --bin rch source_rsync_idle_timeout_ -- --test-threads=1
+cargo test --locked -p rch --bin rch source_rsync_peer_timeout_ -- --test-threads=1
 cargo test --locked -p rch --bin rch finite_source_activity_script_ -- --test-threads=1
 cargo test --locked -p rch --bin rch remote_manifest_finite_input_ -- --test-threads=1
 cargo test --locked -p rch --bin rch verifier_ -- --test-threads=1
@@ -602,6 +749,18 @@ worker fixtures:
    Include paired legacy journals before tree retirement and after the tree
    checkpoint but before pair release; exact completion must resume guarded
    cleanup, while an absent or conflicting owner must remain refused.
+   Include complete pending publication interrupted before its durability reply,
+   and terminal legacy journals with no recorded cancellation obligation.
+   Optional absent discovery must leave the terminal journal unchanged; exact
+   cancellation evidence must survive loss on either side of its checkpoint.
+   Include a retired failed legacy journal interrupted before daemon
+   acknowledgement: recovery must discover and settle its worker cancellation
+   before acknowledging it, including a lost settlement reply and disk restart.
+   Cover absent pair/tree fields with omitted retirement flags, and require
+   proof when either resource is present. Confirm that the final daemon fact
+   preserves original custody fields and path spellings, and that a recovered
+   delivery can replace an unacknowledged transfer-failure result without
+   changing the separate daemon execution outcome.
 3. Exercise concurrent dispatchers and a still-running activity. Recovery must
    refuse while that activity owns its lock; an unrelated project must continue
    making progress. Corrupt, changed, absent and conflicting evidence must
@@ -615,6 +774,11 @@ worker fixtures:
    may hold activity. Cancel that exact intent, then deliver the tail and verify
    that it refuses without touching source contents. Qualify complete large
    programs and actual build/transfer activity independently of that bootstrap.
+   Stall rsync protocol input and output while retaining the SSH channel: the
+   remote sender/receiver must relinquish activity after its configured I/O idle
+   deadline while leaving claim bytes and source ownership intact. Verify long
+   progressing transfers survive, and qualify the explicit source-timeout zero
+   opt-out, bounded estimate policy and declared-result retrieval independently.
 5. Qualify the deployed Linux toolchain, including GNU/uutils differences, and
    native Darwin process/locking behavior where used, using the `python3` found
    on the worker's noninteractive SSH `PATH`. Exercise an inherited ignored

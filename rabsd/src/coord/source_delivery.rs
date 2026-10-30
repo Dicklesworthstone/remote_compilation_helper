@@ -6,6 +6,7 @@
 //! transfer reply before the delivery engine reaches its execution frontier.
 //! Source availability is not action-key validity or cache-publication authority.
 
+pub(crate) mod control;
 mod preparation;
 mod toolchain;
 
@@ -22,6 +23,7 @@ use rabs_sandbox::snapshot_capture::{MemberKind, SealedSourceSnapshot};
 use rabs_sandbox::source_transfer::{
     MAX_SOURCE_CHUNK, MAX_SOURCE_FILES, SOURCE_TRANSFER, SourceFile, SourceManifest, SourceReceiver,
 };
+use rabs_sandbox::toolchain_cache::RetainedToolchain;
 use rabs_sandbox::toolchain_dataset::{
     PreparedToolchain, ToolchainLimits, capture_toolchain_with_cloner,
 };
@@ -33,6 +35,33 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+
+use control::PreparationControl;
+
+enum PreparationToolchain {
+    Captured(PreparedToolchain),
+    Retained(Arc<RetainedToolchain>),
+}
+
+impl PreparationToolchain {
+    fn image(&self) -> &PreparedToolchain {
+        match self {
+            Self::Captured(image) => image,
+            Self::Retained(owner) => owner.image(),
+        }
+    }
+
+    fn root(&self) -> &Path {
+        self.image().root()
+    }
+
+    fn attach(self, upload: SourceUpload, request: &Value) -> io::Result<SourceUpload> {
+        match self {
+            Self::Captured(image) => upload.with_toolchain(image, request),
+            Self::Retained(owner) => upload.with_retained_toolchain(owner, request),
+        }
+    }
+}
 
 /// Bound the number of independently captured repositories in one source tree.
 pub const MAX_SOURCE_ROOTS: usize = 64;
@@ -205,20 +234,38 @@ pub fn prepare_source_bundle(
     specification: &Value,
     destination: &Path,
 ) -> io::Result<Value> {
-    prepare_source_bundle_inner(source_root, specification, destination, false, false)
-        .map(|(report, _source)| report)
+    prepare_source_bundle_inner(
+        source_root,
+        specification,
+        destination,
+        false,
+        false,
+        None,
+        &PreparationControl::uncontrolled(),
+    )
+    .map(|(report, _source)| report)
 }
 
-/// The canonical local driver keeps the sealed receiver alive when deriving
-/// its private Cargo home. This is the same capture and verification as an
-/// ordinary prepared bundle, without reopening a path as source authority.
+/// Retain the selected service-owned compiler image while preparing independent
+/// source bytes. The lease is a driver capability, never a decoded host path.
+/// The canonical driver keeps the sealed receiver alive for Cargo projection.
 #[cfg(target_os = "linux")]
-pub(crate) fn prepare_local_bundle(
+pub(crate) fn prepare_local_bundle_controlled(
     source_root: &Path,
     specification: &Value,
     destination: &Path,
+    toolchain: Option<Arc<RetainedToolchain>>,
+    control: &PreparationControl<'_>,
 ) -> io::Result<(Value, SourceReceiver)> {
-    prepare_source_bundle_inner(source_root, specification, destination, false, true)
+    prepare_source_bundle_inner(
+        source_root,
+        specification,
+        destination,
+        false,
+        true,
+        toolchain,
+        control,
+    )
 }
 
 /// Capture immutable inputs for a daemon job whose worker request ID is not yet
@@ -243,8 +290,16 @@ pub fn prepare_source_template(
     // This zero exists only during the ordinary source/request validators. It
     // is never written to request.json, returned as an identity, or dispatched.
     probe["request_id"] = json!(0);
-    prepare_source_bundle_inner(source_root, &probe, destination, true, false)
-        .map(|(report, _source)| report)
+    prepare_source_bundle_inner(
+        source_root,
+        &probe,
+        destination,
+        true,
+        false,
+        None,
+        &PreparationControl::uncontrolled(),
+    )
+    .map(|(report, _source)| report)
 }
 
 fn prepare_source_bundle_inner(
@@ -253,7 +308,10 @@ fn prepare_source_bundle_inner(
     destination: &Path,
     allocation_intent: bool,
     selected_planning_toolchain: bool,
+    retained_toolchain: Option<Arc<RetainedToolchain>>,
+    control: &PreparationControl<'_>,
 ) -> io::Result<(Value, SourceReceiver)> {
+    control.checkpoint()?;
     let inputs = preparation::SourcePreparation::parse(source_root, specification)?;
     require(
         destination.is_absolute()
@@ -301,14 +359,16 @@ fn prepare_source_bundle_inner(
                 !destination.starts_with(&canonical),
                 "bundle destination must be outside the selected toolchain",
             )?;
-            if let Some(expected) = &expected_toolchain {
+            if let Some(expected) = &expected_toolchain
+                && retained_toolchain.is_none()
+            {
                 // Reject a caller's stale explicit pin before creating output.
                 // Capture still checks the pin again across its own mutation
                 // barrier; this preflight never authorizes later bytes.
                 let current = rabs_sandbox::toolchain_dataset::fingerprint_toolchain(
                     &path,
                     &ToolchainLimits::default(),
-                    || false,
+                    || control.is_cancelled(),
                 )?;
                 require(
                     &current == expected,
@@ -318,6 +378,23 @@ fn prepare_source_bundle_inner(
             Ok::<_, io::Error>(path)
         })
         .transpose()?;
+    if let Some(retained) = &retained_toolchain {
+        require(
+            selected_planning_toolchain,
+            "retained toolchains are only admitted by the canonical driver",
+        )?;
+        let source = toolchain_source
+            .as_ref()
+            .ok_or_else(|| invalid("retained toolchain requires an explicit source binding"))?;
+        retained.verify(source, || control.is_cancelled())?;
+        if let Some(expected) = &expected_toolchain {
+            require(
+                retained.image().identity() == expected,
+                "retained toolchain does not match the specified toolchain_identity",
+            )?;
+        }
+    }
+    control.checkpoint()?;
     // The local canonical bridge must not run an ambient RUSTC/CARGO during
     // source planning. Capture the selected dataset first and plan through its
     // retained executable paths. Existing operator preparation keeps its
@@ -333,20 +410,33 @@ fn prepare_source_bundle_inner(
             builder.mode(0o700);
         }
         builder.create(&destination)?;
-        let prepared = capture_toolchain_with_cloner(
-            source,
-            &destination.join("toolchain"),
-            expected_toolchain.as_ref(),
-            &ToolchainLimits::default(),
-            || false,
-            rabs_cas::materialization::try_verified_reflink,
-        )?;
-        prepared.sync(|| false)?;
-        Some(prepared)
+        if let Some(retained) = retained_toolchain {
+            Some(PreparationToolchain::Retained(retained))
+        } else {
+            let prepared = capture_toolchain_with_cloner(
+                source,
+                &destination.join("toolchain"),
+                expected_toolchain.as_ref(),
+                &ToolchainLimits::default(),
+                || control.is_cancelled(),
+                rabs_cas::materialization::try_verified_reflink,
+            )?;
+            prepared.sync(|| control.is_cancelled())?;
+            Some(PreparationToolchain::Captured(prepared))
+        }
     } else {
         None
     };
-    let mut upload = inputs.capture(planning_toolchain.as_ref().map(PreparedToolchain::root))?;
+    let mut upload = inputs.capture_controlled(
+        planning_toolchain.as_ref().map(PreparationToolchain::root),
+        control,
+    )?;
+    control.checkpoint()?;
+    if let Some(prepared) = &planning_toolchain {
+        prepared
+            .image()
+            .verify_retained_generation(|| control.is_cancelled())?;
+    }
     if let Some(context) = specification.get("dependency_context") {
         require(
             context["version"] == rabs_sandbox::dependency_context::DEPENDENCY_CONTEXT_VERSION,
@@ -387,11 +477,11 @@ fn prepare_source_bundle_inner(
                     &destination.join("toolchain"),
                     expected_toolchain.as_ref(),
                     &ToolchainLimits::default(),
-                    || false,
+                    || control.is_cancelled(),
                     rabs_cas::materialization::try_verified_reflink,
                 )?;
-                prepared.sync(|| false)?;
-                Ok::<_, io::Error>(prepared)
+                prepared.sync(|| control.is_cancelled())?;
+                Ok::<_, io::Error>(PreparationToolchain::Captured(prepared))
             })
             .transpose()?
     };
@@ -429,15 +519,16 @@ fn prepare_source_bundle_inner(
         );
         fields.insert(
             "toolchain_identity".to_owned(),
-            super::worker_delivery::toolchain_identity_value(prepared.identity()),
+            super::worker_delivery::toolchain_identity_value(prepared.image().identity()),
         );
     }
     fields.insert("source_manifest".to_owned(), upload.wire_manifest());
     // One validator for prepared and hand-authored execution requests. This
     // preserves argv, output declarations, timeouts, and unknown extensions.
     validate_request(&request)?;
+    let prepared_toolchain_root = toolchain.as_ref().map(|owner| owner.root().to_path_buf());
     if let Some(toolchain) = toolchain {
-        upload = upload.with_toolchain(toolchain, &request)?;
+        upload = toolchain.attach(upload, &request)?;
     }
     upload.validate_request(&request)?;
     if allocation_intent {
@@ -447,8 +538,10 @@ fn prepare_source_bundle_inner(
     let source = destination.join("source");
     let mut receiver = SourceReceiver::create(&source, upload.manifest.clone())?;
     for file in upload.manifest.files() {
+        control.checkpoint()?;
         let bytes = upload.file_bytes(&file.path)?;
         for (index, chunk) in bytes.chunks(MAX_SOURCE_CHUNK).enumerate() {
+            control.checkpoint()?;
             receiver.write_chunk(
                 &file.path,
                 index as u64 * MAX_SOURCE_CHUNK as u64,
@@ -457,22 +550,26 @@ fn prepare_source_bundle_inner(
             )?;
         }
     }
-    receiver.seal()?;
+    control.checkpoint()?;
+    receiver.seal_cancellable(|| control.is_cancelled())?;
     // Sync only the validated closure, children before parents. Reverse lexical
     // path order puts every directory after its descendants, including root.
     let mut directories = BTreeSet::from([PathBuf::new()]);
     for file in upload.manifest.files() {
+        control.checkpoint()?;
         File::open(source.join(&file.path))?.sync_all()?;
         for directory in Path::new(&file.path).ancestors().skip(1) {
             directories.insert(directory.to_path_buf());
         }
     }
     for directory in directories.iter().rev() {
+        control.checkpoint()?;
         File::open(source.join(directory))?.sync_all()?;
     }
     File::open(&destination)?.sync_all()?;
     // Full source durability precedes any parseable request. If this write or
     // sync fails, report failure and retain the new directory for inspection.
+    control.checkpoint()?;
     let request_path = destination.join("request.json");
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -493,7 +590,7 @@ fn prepare_source_bundle_inner(
         "manifest_sha256":hex(&upload.manifest.digest()), "source_roots":inputs.root_count(),
         "source_files":upload.manifest.files().len(), "source_bytes":upload.manifest.total_bytes(),
         "toolchain_identity":request.get("toolchain_identity"),
-        "toolchain_root":toolchain_source.as_ref().map(|_| destination.join("toolchain")),
+        "toolchain_root":prepared_toolchain_root,
         "toolchain_transfer":request.get("toolchain_transfer"),
         "executed":false, "publication_authorized":false}),
         receiver,
@@ -546,6 +643,16 @@ impl SourceUpload {
         root: &str,
         paths: &[String],
     ) -> io::Result<Self> {
+        Self::from_snapshot_controlled(image, root, paths, &PreparationControl::uncontrolled())
+    }
+
+    pub(crate) fn from_snapshot_controlled(
+        image: Arc<SealedSourceSnapshot>,
+        root: &str,
+        paths: &[String],
+        control: &PreparationControl<'_>,
+    ) -> io::Result<Self> {
+        control.checkpoint()?;
         require(
             !paths.is_empty() && paths.len() <= MAX_SOURCE_FILES,
             "source projection file count",
@@ -555,6 +662,7 @@ impl SourceUpload {
             .ok_or_else(|| invalid("unknown source snapshot root"))?;
         let mut files = Vec::with_capacity(paths.len());
         for path in paths {
+            control.checkpoint()?;
             let Some(MemberKind::Regular {
                 size,
                 content_sha256,
@@ -568,8 +676,7 @@ impl SourceUpload {
                 .file_bytes(root, path)
                 .ok_or_else(|| invalid("captured source bytes missing"))?;
             require(
-                bytes.len() as u64 == *size
-                    && <[u8; 32]>::from(Sha256::digest(bytes)) == *content_sha256,
+                bytes.len() as u64 == *size && control.sha256(bytes)? == *content_sha256,
                 "captured source disagrees with its manifest",
             )?;
             files.push(SourceFile {
@@ -600,7 +707,16 @@ impl SourceUpload {
         image: Arc<SealedSourceSnapshot>,
         roots: &[(String, Vec<String>)],
     ) -> io::Result<Self> {
+        Self::from_snapshot_closure_controlled(image, roots, &PreparationControl::uncontrolled())
+    }
+
+    pub(crate) fn from_snapshot_closure_controlled(
+        image: Arc<SealedSourceSnapshot>,
+        roots: &[(String, Vec<String>)],
+        control: &PreparationControl<'_>,
+    ) -> io::Result<Self> {
         use rabs_sandbox::snapshot_capture::{MemberDisposition, member_disposition};
+        control.checkpoint()?;
         require(
             !roots.is_empty() && roots.len() <= MAX_SOURCE_ROOTS,
             "source closure root count",
@@ -608,6 +724,7 @@ impl SourceUpload {
         let mut names = BTreeSet::new();
         let mut files = Vec::new();
         for (root, paths) in roots {
+            control.checkpoint()?;
             require(
                 valid_closure_root(root) && names.insert(root.to_ascii_lowercase()),
                 "unsafe, hidden, duplicate or case-colliding source closure root",
@@ -616,7 +733,8 @@ impl SourceUpload {
                 paths.len() <= MAX_SOURCE_FILES.saturating_sub(files.len()),
                 "source closure exceeds aggregate file count",
             )?;
-            let selected = Self::from_snapshot(Arc::clone(&image), root, paths)?;
+            let selected =
+                Self::from_snapshot_controlled(Arc::clone(&image), root, paths, control)?;
             for mut file in selected.manifest.files().iter().cloned() {
                 file.path = format!("{root}/{}", file.path);
                 // The saved bundle is recaptured as a single workspace before
@@ -968,6 +1086,25 @@ impl SourceUpload {
         )?;
         self.validate_source_request(request)?;
         self.toolchain = Some(toolchain::ToolchainUpload::from_shared(prepared, request)?);
+        self.validate_request(request)?;
+        Ok(self)
+    }
+
+    /// Keep the service's bounded generation lease through the entire upload.
+    /// The image cannot escape its counted owner or outlive its private backing.
+    pub(crate) fn with_retained_toolchain(
+        mut self,
+        retained: Arc<RetainedToolchain>,
+        request: &Value,
+    ) -> io::Result<Self> {
+        require(
+            self.toolchain.is_none(),
+            "toolchain upload already attached",
+        )?;
+        self.validate_source_request(request)?;
+        self.toolchain = Some(toolchain::ToolchainUpload::from_retained(
+            retained, request,
+        )?);
         self.validate_request(request)?;
         Ok(self)
     }

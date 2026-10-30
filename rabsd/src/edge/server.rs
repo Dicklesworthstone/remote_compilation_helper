@@ -321,18 +321,22 @@ pub(crate) fn canonical_edge_work_shared(
     paths: Arc<crate::coord::live_dependency::canonical::CanonicalPaths>,
     activity: Arc<CanonicalActivity>,
     remote: Option<Arc<crate::coord::live_dependency::remote::RemoteDependencies>>,
+    executions: Option<Arc<crate::coord::live_dependency::remote::SharedRemoteExecutions>>,
 ) -> SubsystemWork {
     let binding = CanonicalBinding {
         paths,
         activity,
-        remote: CanonicalRemote::Shared(remote),
+        remote: CanonicalRemote::Shared { remote, executions },
     };
     Box::new(move |cx, shutdown| Box::pin(serve(cx, shutdown, config, Some(binding))))
 }
 
 enum CanonicalRemote {
     FromEnvironment,
-    Shared(Option<Arc<crate::coord::live_dependency::remote::RemoteDependencies>>),
+    Shared {
+        remote: Option<Arc<crate::coord::live_dependency::remote::RemoteDependencies>>,
+        executions: Option<Arc<crate::coord::live_dependency::remote::SharedRemoteExecutions>>,
+    },
 }
 
 struct CanonicalBinding {
@@ -351,11 +355,14 @@ impl CanonicalBinding {
             CanonicalRemote::FromEnvironment => {
                 rustc_request::LiveEdge::canonical_configured(lane, Arc::clone(&self.paths), state)
             }
-            CanonicalRemote::Shared(remote) => Ok(rustc_request::LiveEdge::canonical_shared(
-                lane,
-                Arc::clone(&self.paths),
-                remote.clone(),
-            )),
+            CanonicalRemote::Shared { remote, executions } => {
+                Ok(rustc_request::LiveEdge::canonical_shared(
+                    lane,
+                    Arc::clone(&self.paths),
+                    remote.clone(),
+                    executions.clone(),
+                ))
+            }
         }
     }
 }
@@ -808,6 +815,23 @@ async fn handle_connection(
                             pending,
                             reply,
                             may_wait,
+                            &mut stream,
+                        )
+                        .await
+                        {
+                            Some(reply) => reply,
+                            None => break,
+                        }
+                    }
+                    Ok(rustc_request::Decided::SharedRemote { reply, pending }) => {
+                        let Some(live) = live.clone() else {
+                            break;
+                        };
+                        match remote_dependency::complete_shared_on_connection(
+                            &limits.materialization,
+                            live,
+                            pending,
+                            reply,
                             &mut stream,
                         )
                         .await

@@ -63,6 +63,7 @@ pub mod snapshot_capture;
 pub mod socket_endpoint;
 pub mod source_capture;
 pub mod source_transfer;
+pub mod toolchain_cache;
 pub mod toolchain_dataset;
 pub mod toolchain_transfer;
 pub mod unit_convergence;

@@ -1,6 +1,6 @@
 //! Filesystem/manifest regressions. These do not run Cargo or assert package
 //! authenticity: generated checksum metadata supplies consistency fixtures.
-use super::super::{CargoSource, validate_capture, validate_metadata};
+use super::super::{CargoSource, validate_capture, validate_metadata_controlled};
 use super::*;
 use rabs_sandbox::snapshot_capture::capture_sealed_source;
 use serde_json::json;
@@ -30,9 +30,16 @@ fn package(root: &Path, directory: &str, name: &str, version: &str) -> String {
     let mut hashes = serde_json::Map::new();
     for (path, text) in contents {
         write(root, &format!("{directory}/{path}"), text.as_bytes());
-        hashes.insert(path.to_owned(), json!(hash(text.as_bytes())));
+        hashes.insert(
+            path.to_owned(),
+            json!(hash(text.as_bytes(), &PreparationControl::uncontrolled()).unwrap()),
+        );
     }
-    let package_hash = hash(format!("fixture archive {name}@{version}").as_bytes());
+    let package_hash = hash(
+        format!("fixture archive {name}@{version}").as_bytes(),
+        &PreparationControl::uncontrolled(),
+    )
+    .unwrap();
     write(
         root,
         &format!("{directory}/{CHECKSUM_FILE}"),
@@ -75,7 +82,12 @@ fn image(root: &Path) -> SealedSourceSnapshot {
 }
 
 fn verify(root: &Path) -> io::Result<VendoredSources> {
-    VendoredSources::verify(&image(root), "app/Cargo.toml", "vendor")
+    VendoredSources::verify(
+        &image(root),
+        "app/Cargo.toml",
+        "vendor",
+        &PreparationControl::uncontrolled(),
+    )
 }
 
 fn metadata(root: &Path) -> Value {
@@ -123,7 +135,13 @@ fn alternate_registry_indexes_bind_names_lock_and_resolved_source_exactly() {
         let root = tempfile::tempdir().unwrap();
         alternate_registry_fixture(root.path(), index, source);
         let retained = image(root.path());
-        let vendor = VendoredSources::verify(&retained, "app/Cargo.toml", "vendor").unwrap();
+        let vendor = VendoredSources::verify(
+            &retained,
+            "app/Cargo.toml",
+            "vendor",
+            &PreparationControl::uncontrolled(),
+        )
+        .unwrap();
         validate_capture(&retained, "app/Cargo.toml", Some(&vendor), false).unwrap();
         let locked = vendor
             .bind_lock(&retained, Path::new("app/Cargo.lock"))
@@ -135,26 +153,28 @@ fn alternate_registry_indexes_bind_names_lock_and_resolved_source_exactly() {
         let planning = Path::new("/private/planning");
         let mut resolved = metadata(planning);
         resolved["packages"][1]["source"] = json!(source);
-        validate_metadata(
+        validate_metadata_controlled(
             &retained,
             planning,
             "app/Cargo.toml",
             &resolved,
             Some(&vendor),
             None,
+            &PreparationControl::uncontrolled(),
         )
         .unwrap();
         // A valid checksum/name/version under another registry is a different
         // package identity, even when the replacement contains identical bytes.
         resolved["packages"][1]["source"] = json!(CRATES_IO);
         assert!(
-            validate_metadata(
+            validate_metadata_controlled(
                 &retained,
                 planning,
                 "app/Cargo.toml",
                 &resolved,
                 Some(&vendor),
                 None,
+                &PreparationControl::uncontrolled(),
             )
             .is_err()
         );
@@ -302,7 +322,13 @@ fn coherent_vendor_tree_binds_lock_and_metadata_without_rereading_checkout() {
     let root = tempfile::tempdir().unwrap();
     fixture(root.path());
     let retained = image(root.path());
-    let vendor = VendoredSources::verify(&retained, "app/Cargo.toml", "vendor").unwrap();
+    let vendor = VendoredSources::verify(
+        &retained,
+        "app/Cargo.toml",
+        "vendor",
+        &PreparationControl::uncontrolled(),
+    )
+    .unwrap();
     let files = validate_capture(&retained, "app/Cargo.toml", Some(&vendor), false).unwrap();
     assert_eq!(files.len(), 8);
     assert!(files.contains(&format!("{DEP}/data.txt")));
@@ -323,13 +349,14 @@ fn coherent_vendor_tree_binds_lock_and_metadata_without_rereading_checkout() {
         "changed after capture",
     );
     let planning = Path::new("/private/planning");
-    validate_metadata(
+    validate_metadata_controlled(
         &retained,
         planning,
         "app/Cargo.toml",
         &metadata(planning),
         Some(&vendor),
         None,
+        &PreparationControl::uncontrolled(),
     )
     .unwrap();
     assert!(verify(root.path()).is_err());
@@ -481,7 +508,13 @@ fn checksum_consistency_is_bound_to_the_actual_workspace_lock_not_a_neighbor() {
         write(root.path(), "other/Cargo.lock", before);
         fs::write(&path, changed).unwrap();
         let retained = image(root.path());
-        let vendor = VendoredSources::verify(&retained, "app/Cargo.toml", "vendor").unwrap();
+        let vendor = VendoredSources::verify(
+            &retained,
+            "app/Cargo.toml",
+            "vendor",
+            &PreparationControl::uncontrolled(),
+        )
+        .unwrap();
         assert!(
             vendor
                 .bind_lock(&retained, Path::new("app/Cargo.lock"))
@@ -502,7 +535,13 @@ fn resolved_registry_packages_cannot_change_source_name_version_root_or_lock_mem
         "2.0.0",
     );
     let retained = image(root.path());
-    let vendor = VendoredSources::verify(&retained, "app/Cargo.toml", "vendor").unwrap();
+    let vendor = VendoredSources::verify(
+        &retained,
+        "app/Cargo.toml",
+        "vendor",
+        &PreparationControl::uncontrolled(),
+    )
+    .unwrap();
     let planning = Path::new("/private/planning");
     let good = metadata(planning);
     for case in 0..7 {
@@ -526,13 +565,14 @@ fn resolved_registry_packages_cannot_change_source_name_version_root_or_lock_mem
             }
         }
         assert!(
-            validate_metadata(
+            validate_metadata_controlled(
                 &retained,
                 planning,
                 "app/Cargo.toml",
                 &changed,
                 Some(&vendor),
                 None,
+                &PreparationControl::uncontrolled(),
             )
             .is_err(),
             "case {case}"
@@ -553,8 +593,13 @@ fn symlink_and_duplicate_package_identity_refuse_the_entire_vendor_source() {
     let root = tempfile::tempdir().unwrap();
     fixture(root.path());
     assert!(
-        VendoredSources::verify(&image(root.path()), &format!("{DEP}/Cargo.toml"), "vendor")
-            .is_err()
+        VendoredSources::verify(
+            &image(root.path()),
+            &format!("{DEP}/Cargo.toml"),
+            "vendor",
+            &PreparationControl::uncontrolled()
+        )
+        .is_err()
     );
 }
 
@@ -630,7 +675,13 @@ fn locked_git_sources_preserve_literal_selectors_and_coexist_with_registry_packa
         let root = tempfile::tempdir().unwrap();
         let source = git_fixture(root.path(), selector);
         let retained = image(root.path());
-        let vendor = VendoredSources::verify(&retained, "app/Cargo.toml", "vendor").unwrap();
+        let vendor = VendoredSources::verify(
+            &retained,
+            "app/Cargo.toml",
+            "vendor",
+            &PreparationControl::uncontrolled(),
+        )
+        .unwrap();
         let selected = validate_capture(&retained, "app/Cargo.toml", Some(&vendor), false).unwrap();
         assert!(selected.contains(&format!("{GIT_DEP}/{CHECKSUM_FILE}")));
         let locked = vendor
@@ -638,13 +689,14 @@ fn locked_git_sources_preserve_literal_selectors_and_coexist_with_registry_packa
             .unwrap();
         assert!(locked.contains(&("git_dep".to_owned(), "2.0.0".to_owned(), source.clone())));
         let planning = Path::new("/private/planning");
-        validate_metadata(
+        validate_metadata_controlled(
             &retained,
             planning,
             "app/Cargo.toml",
             &git_metadata(planning, &source),
             Some(&vendor),
             None,
+            &PreparationControl::uncontrolled(),
         )
         .unwrap();
     }
@@ -655,7 +707,13 @@ fn git_lock_and_metadata_bind_the_full_revision_not_only_name_version_or_referen
     let root = tempfile::tempdir().unwrap();
     let source = git_fixture(root.path(), Some(("branch", "stable")));
     let retained = image(root.path());
-    let vendor = VendoredSources::verify(&retained, "app/Cargo.toml", "vendor").unwrap();
+    let vendor = VendoredSources::verify(
+        &retained,
+        "app/Cargo.toml",
+        "vendor",
+        &PreparationControl::uncontrolled(),
+    )
+    .unwrap();
     let planning = Path::new("/private/planning");
     for wrong in [
         source.replace(GIT_REVISION, &"a".repeat(40)),
@@ -666,13 +724,14 @@ fn git_lock_and_metadata_bind_the_full_revision_not_only_name_version_or_referen
         CRATES_IO.to_owned(),
     ] {
         assert!(
-            validate_metadata(
+            validate_metadata_controlled(
                 &retained,
                 planning,
                 "app/Cargo.toml",
                 &git_metadata(planning, &wrong),
                 Some(&vendor),
                 None,
+                &PreparationControl::uncontrolled(),
             )
             .is_err(),
             "{wrong}"
@@ -681,13 +740,14 @@ fn git_lock_and_metadata_bind_the_full_revision_not_only_name_version_or_referen
     let mut value = git_metadata(planning, &source);
     value["packages"][2]["source"] = Value::Null;
     assert!(
-        validate_metadata(
+        validate_metadata_controlled(
             &retained,
             planning,
             "app/Cargo.toml",
             &value,
             Some(&vendor),
-            None
+            None,
+            &PreparationControl::uncontrolled(),
         )
         .is_err()
     );
@@ -751,8 +811,13 @@ fn git_and_registry_checksum_kinds_cannot_be_substituted_or_omit_evidence() {
             }
         }
         let retained = image(root.path());
-        let checked = VendoredSources::verify(&retained, "app/Cargo.toml", "vendor")
-            .and_then(|vendor| vendor.bind_lock(&retained, Path::new("app/Cargo.lock")));
+        let checked = VendoredSources::verify(
+            &retained,
+            "app/Cargo.toml",
+            "vendor",
+            &PreparationControl::uncontrolled(),
+        )
+        .and_then(|vendor| vendor.bind_lock(&retained, Path::new("app/Cargo.lock")));
         assert!(checked.is_err(), "case {case}");
     }
 }
@@ -790,11 +855,16 @@ fn undeclared_git_dependencies_and_ambiguous_replacements_are_refused_before_car
             }
         }
         let retained = image(root.path());
-        let checked =
-            VendoredSources::verify(&retained, "app/Cargo.toml", "vendor").and_then(|vendor| {
-                validate_capture(&retained, "app/Cargo.toml", Some(&vendor), false)?;
-                vendor.bind_lock(&retained, Path::new("app/Cargo.lock"))
-            });
+        let checked = VendoredSources::verify(
+            &retained,
+            "app/Cargo.toml",
+            "vendor",
+            &PreparationControl::uncontrolled(),
+        )
+        .and_then(|vendor| {
+            validate_capture(&retained, "app/Cargo.toml", Some(&vendor), false)?;
+            vendor.bind_lock(&retained, Path::new("app/Cargo.lock"))
+        });
         assert!(checked.is_err(), "case {case}");
     }
 }
@@ -804,7 +874,13 @@ fn git_directory_source_path_semantics_do_not_relax_targets_or_local_inputs() {
     let root = tempfile::tempdir().unwrap();
     git_fixture(root.path(), Some(("rev", GIT_REVISION)));
     let retained = image(root.path());
-    let vendor = VendoredSources::verify(&retained, "app/Cargo.toml", "vendor").unwrap();
+    let vendor = VendoredSources::verify(
+        &retained,
+        "app/Cargo.toml",
+        "vendor",
+        &PreparationControl::uncontrolled(),
+    )
+    .unwrap();
     for declaration in [
         "[dependencies]\nsibling={path='../sibling',version='1'}",
         "[target.'cfg(unix)'.build-dependencies]\nsibling={path='/original/git/checkout/sibling',version='1'}",

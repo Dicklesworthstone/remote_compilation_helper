@@ -1198,9 +1198,11 @@ fn check_archive_upload_result(
     })
 }
 
-/// Typed source-sync stall error (issue #59): the transfer produced NO output
-/// at all — no rsync progress refresh, stats, or itemized line — for the
-/// configured silence window. Deliberately distinct from the wall-clock
+/// Typed source-sync stall error (issue #59): either the transfer produced no
+/// output for the configured silence window, or rsync reported its peer I/O
+/// timeout. The detail distinguishes these observations; neither establishes
+/// that the worker activity or durable source grant has been retired.
+/// Deliberately distinct from the wall-clock
 /// attempt timeout: silence means a dead channel or wedged rsync, so the hook
 /// releases the worker's reservation and re-enters selection EXCLUDING this
 /// worker instead of waiting out a cap that scales to an hour.
@@ -1245,6 +1247,16 @@ pub(crate) struct SyncSilencePolicy {
     pub(crate) limit: std::time::Duration,
     pub(crate) worker_id: String,
     pub(crate) phase: &'static str,
+}
+
+/// rsync accepts whole seconds in a signed integer. Round a finite deadline
+/// upward, never to zero (which would disable its peer-side I/O timeout).
+fn rsync_io_timeout_arg(limit: std::time::Duration) -> String {
+    let seconds = limit
+        .as_secs()
+        .saturating_add(u64::from(limit.subsec_nanos() != 0))
+        .clamp(1, 2_147_483_647);
+    format!("--timeout={seconds}")
 }
 
 /// POSIX `sh` script that SIGKILLs the process group recorded in `pgid_file`
@@ -3970,6 +3982,20 @@ impl TransferPipeline {
         })
     }
 
+    /// A local progress timeout cannot close a half-open worker SSH channel.
+    /// rsync forwards this I/O-idle bound to its actual server, so the receiver
+    /// or sender can relinquish activity without a live dispatcher. Preserve
+    /// the established zero opt-out for source synchronization; timeout never
+    /// releases the durable source claim or acknowledges preparation cleanup.
+    fn append_source_rsync_io_timeout(&self, command: &mut Command) {
+        let seconds = self.transfer_config.source_sync_silence_timeout_secs;
+        if seconds != 0 {
+            command.arg(rsync_io_timeout_arg(std::time::Duration::from_secs(
+                seconds,
+            )));
+        }
+    }
+
     /// Override the remote project path used for sync and command execution.
     ///
     /// Intended for canonical multi-repo layouts where the remote path must
@@ -4637,6 +4663,7 @@ impl TransferPipeline {
         } else {
             self.source_rsync_path(format!("mkdir -p {} && rsync", escaped_remote_path))
         };
+        self.append_source_rsync_io_timeout(&mut cmd);
         cmd.arg("-azn")
             .arg("--checksum")
             .arg("--itemize-changes")
@@ -5541,6 +5568,9 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
     fn build_estimate_command(&self, worker: &WorkerConfig) -> Command {
         let effective_excludes = self.get_effective_excludes();
         let (mut cmd, _capabilities) = self.rsync_command();
+        // Estimates retain their own finite policy even when the operator
+        // disables silence detection for actual source uploads.
+        cmd.arg(rsync_io_timeout_arg(self.transfer_estimate_timeout()));
 
         let identity_file = shellexpand::tilde(&worker.identity_file);
         let ssh_command = format!(
@@ -5701,6 +5731,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         effective_excludes: &[String],
     ) -> Command {
         let (mut cmd, capabilities) = self.rsync_command();
+        self.append_source_rsync_io_timeout(&mut cmd);
 
         let identity_file = shellexpand::tilde(&worker.identity_file);
         let ssh_command = self.build_rsync_ssh_command(identity_file.as_ref());
@@ -5762,6 +5793,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         effective_excludes: &[String],
     ) -> Command {
         let (mut cmd, capabilities) = self.rsync_command();
+        self.append_source_rsync_io_timeout(&mut cmd);
 
         let identity_file = shellexpand::tilde(&worker.identity_file);
         let ssh_command = self.build_rsync_ssh_command(identity_file.as_ref());
@@ -5956,6 +5988,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                     async move {
                         let mut rsync = Command::new(&rsync_path); // ubs:ignore — same trusted rsync resolver as rsync_command; payload remains argv
                         rch_common::rsync_flavor::configure_rsync_remote_args(rsync.as_std_mut());
+                        self.append_source_rsync_io_timeout(&mut rsync);
                         rsync
                             .env("LC_ALL", "C")
                             .arg("-a")
@@ -7721,6 +7754,9 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             .arg(Self::artifact_integrity_arg(self.resolved_rsync().flavor));
         add_portable_rsync_archive_args(&mut cmd);
         cmd.arg("--stats")
+            // Match ordinary artifact retrieval: a dead receiver must not
+            // leave this remote sender holding source activity indefinitely.
+            .arg("--timeout=30")
             .arg("--safe-links")
             .arg("--exclude=.rch-clean-overlay-base.tar")
             .arg("-e")
@@ -9589,6 +9625,22 @@ where
         }
     };
     if !status.success() {
+        if status.code() == Some(30)
+            && let Some(policy) = effective_silence
+        {
+            // A peer timeout can win the race with the local progress timer.
+            // Keep the same no-in-place-retry / worker-failover classification,
+            // without treating a child exit as worker retirement evidence.
+            return Err(SourceSyncStalled {
+                worker_id: policy.worker_id.clone(),
+                phase: policy.phase,
+                silence: policy.limit,
+                detail: format!(
+                    "{operation_name}: rsync peer I/O timeout (exit 30; worker activity retirement remains unconfirmed)"
+                ),
+            }
+            .into());
+        }
         return Err(TransferError::SyncFailed {
             reason: "rsync failed".to_string(),
             exit_code: status.code(),
@@ -12980,6 +13032,82 @@ Number of files transferred: 42
             tags: vec![],
             tools: Vec::new(),
         }
+    }
+
+    #[test]
+    fn source_rsync_idle_timeout_respects_source_opt_out_and_estimate_budget() {
+        let _guard = test_guard!();
+        let worker = estimate_test_worker();
+        let timeout_args = |command: Command| {
+            command
+                .as_std()
+                .get_args()
+                .filter_map(|arg| arg.to_str())
+                .filter(|arg| arg.starts_with("--timeout="))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        for (seconds, explicit_ms, expected_estimate) in [
+            (120, None, "--timeout=120"),
+            (7, None, "--timeout=7"),
+            (0, None, "--timeout=120"),
+            (0, Some(1_500), "--timeout=2"),
+            (120, Some(1_001), "--timeout=2"),
+        ] {
+            let pipeline = TransferPipeline::new(
+                PathBuf::from("/home/user/project"),
+                "idle-policy".into(),
+                "abcdef".into(),
+                TransferConfig {
+                    source_sync_silence_timeout_secs: seconds,
+                    sync_timeout_ms: explicit_ms,
+                    ..TransferConfig::default()
+                },
+            )
+            .with_rsync(pinned_rsync(RsyncFlavor::Rsync {
+                major: 3,
+                minor: 2,
+                patch: 7,
+            }))
+            .with_ssh_options(SshOptions {
+                control_master: false,
+                ..SshOptions::default()
+            });
+            let expected_source: Vec<String> = (seconds != 0)
+                .then(|| format!("--timeout={seconds}"))
+                .into_iter()
+                .collect();
+            for command in [
+                pipeline.build_sync_command(&worker, "worker:/source", "/source", &[]),
+                pipeline.build_sync_streaming_command(&worker, "worker:/source", "/source", &[]),
+                pipeline.build_source_content_rsync_barrier_command(&worker, &[], None),
+                pipeline.build_source_content_rsync_barrier_command(&worker, &[], Some(true)),
+            ] {
+                assert_eq!(timeout_args(command), expected_source);
+            }
+            assert_eq!(
+                timeout_args(pipeline.build_estimate_command(&worker)),
+                [expected_estimate]
+            );
+            // Source silence opt-out must not remove artifact collection's
+            // existing peer-I/O deadline, including declared result dirs.
+            for command in [
+                pipeline.build_retrieve_command(&worker, "/source", &["target/**".into()]),
+                pipeline.build_retrieve_streaming_command(
+                    &worker,
+                    "/source",
+                    &["target/**".into()],
+                ),
+                pipeline.build_result_dir_retrieve_command(&worker, "/source", Path::new("out")),
+            ] {
+                assert_eq!(timeout_args(command), ["--timeout=30"]);
+            }
+        }
+        assert_eq!(
+            rsync_io_timeout_arg(Duration::from_millis(1)),
+            "--timeout=1"
+        );
+        assert_eq!(rsync_io_timeout_arg(Duration::MAX), "--timeout=2147483647");
     }
 
     #[test]
@@ -20316,6 +20444,71 @@ exec /usr/bin/rsync "$@" -e "sh -c 'if [ \"\$1\" = -l ]; then shift 2; fi; shift
             limit: std::time::Duration::from_millis(millis),
             worker_id: "stall-worker".to_string(),
             phase: "source_sync",
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn source_rsync_peer_timeout_keeps_stall_classification_without_in_place_retry() {
+        let _guard = test_guard!();
+        let policy = test_silence_policy(10_000);
+        let retry = RetryConfig {
+            max_attempts: 3,
+            base_delay_ms: 1,
+            max_delay_ms: 2,
+            jitter_factor: 0.0,
+            total_timeout_ms: 30_000,
+        };
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let build = || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut command = Command::new("sh");
+            command
+                .args([
+                    "-c",
+                    "printf 'recent progress\\r'; printf 'rsync error: timeout in data send/receive (code 30)\\n' >&2; exit 30",
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            command
+        };
+        let error = run_command_streaming_with_retry(
+            &retry,
+            "source_sync",
+            Some(Duration::from_secs(30)),
+            Some(&policy),
+            build,
+            |_, _| {},
+        )
+        .await
+        .unwrap_err();
+        let stall =
+            find_source_sync_stall(&error).expect("rsync I/O timeout remains a source stall");
+        assert_eq!(stall.worker_id, "stall-worker");
+        assert_eq!(stall.silence, policy.limit);
+        assert!(stall.detail.contains("peer I/O timeout"));
+        assert!(stall.detail.contains("retirement remains unconfirmed"));
+        assert!(!streaming_error_is_retryable(&error));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        for policy in [None, Some(test_silence_policy(0))] {
+            let error = run_command_streaming(
+                build(),
+                "artifact_collection",
+                Duration::from_secs(30),
+                policy.as_ref(),
+                |_, _| {},
+            )
+            .await
+            .unwrap_err();
+            assert!(find_source_sync_stall(&error).is_none());
+            assert!(matches!(
+                error.downcast_ref::<TransferError>(),
+                Some(TransferError::SyncFailed {
+                    exit_code: Some(30),
+                    ..
+                })
+            ));
         }
     }
 

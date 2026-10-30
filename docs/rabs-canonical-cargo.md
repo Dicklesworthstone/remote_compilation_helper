@@ -1466,6 +1466,46 @@ Each profile's `jobs` must be at most `jobs_per_root`, and a root retains its
 admission through process and stream drain. Independent roots can compile
 concurrently while sharing the same coordinator generation. Eligible identical
 dependency actions use the existing singleflight, sampling and replay gates.
+With isolated dependency workers configured, callers that overlap an active
+dependency compilation join one service-owned execution. Cancelling its first
+caller removes only that caller's interest; the worker continues while another
+subscriber remains. The final subscriber's departure requests cancellation,
+and the service keeps the transport owner until it returns verified completion
+or an explicitly uncertain outcome with retained recovery state. Service shutdown
+cancels and joins these owners before releasing coordinator authority.
+
+Each subscriber retains its own input observations and target mapping. Shared
+compilation never writes a target by itself: each caller must accept the exact
+completed manifest before its own bounded installer runs and revalidates its
+inputs. New callers cannot join a completed execution; they pass the ordinary
+cache and verification gates. Execution-only workspace units still require their
+own fresh worker execution. The service bounds active shared producers by the
+configured worker count and retains at most 256 subscriptions, including offers
+waiting for acknowledgment and completed results waiting for installation.
+
+Preparation's Cargo metadata, package selection, rustup and Git subprocesses use
+the same root broker, so preliminary work cannot exceed the configured process
+root limit. Source capture, cache expansion, hashing, materialization and final
+source sealing observe operation cancellation between bounded chunks.
+
+The service captures each selected toolchain once and retains that exact image
+across operations. Concurrent requests for the same original toolchain share one
+capture; subsequent requests check the original source and retained filesystem
+generations without recopying or rehashing the complete toolchain. A changed
+source selects a fresh image. Active operations keep their earlier immutable
+image until planning, execution and any worker upload have finished. Remote
+dependency execution uploads from this same retained owner, avoiding a second
+coordinator-side toolchain copy.
+
+Retention is bounded to four images, including preparation and old generations
+still held by active operations. An image with an outstanding lease cannot be
+evicted. Each image also obeys the existing toolchain entry/byte limits; this is
+not a filesystem free-space quota. One capture runs at a time, and a caller
+waiting for capacity observes its timeout and cancellation. Cancelling a client
+does not cancel another client's shared preparation. The service owns that
+preparation with an independent 120-second cooperative deadline and cancels and
+joins it during shutdown. Images are private to this service lifetime; restart
+captures them again.
 
 The service supports `check`, `build`, `clippy`, `test`, `test --no-run` and
 `bench --no-run`. It has closed stdin. `run` and executing `bench` commands retain
@@ -1480,7 +1520,8 @@ Cargo output is bounded at 64 MiB, with a separate 128 MiB protocol limit includ
 planning and driver diagnostics. Disconnecting the client or exceeding an output
 bound cancels and drains that operation; this interface does not create a detached
 recoverable background job. Service shutdown stops admission, cancels and joins
-its active operations, then releases coordinator authority.
+its active operations and shared remote executions, then releases coordinator
+authority.
 
 ### Persistent reuse and command results
 
@@ -1490,7 +1531,9 @@ invocations sharing an active state root return a busy error instead of
 superseding its coordinator term; use `service_socket` for concurrent commands.
 This separate namespace also keeps canonical compilation independent of a normal
 daemon's CAS. Retain the state parent across commands; each command gets fresh
-private target and source/toolchain capture under `operation_root`.
+private target and source capture under `operation_root`. Direct invocations
+also capture their toolchain there; the service instead holds its bounded shared
+toolchain images under the locked state root.
 
 To retain Cargo's own private target state between local canonical commands,
 add this optional object to the same profile:

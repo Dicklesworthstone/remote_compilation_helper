@@ -175,6 +175,27 @@ impl PreparedToolchain {
             Err(unsupported())
         }
     }
+
+    /// Revalidate the exact retained generation without rehashing its bytes.
+    ///
+    /// Initial capture/open already verified every retained byte against the
+    /// content identity. This checks the same anchored file, directory and
+    /// alias generations, including a final directory-membership barrier.
+    /// Replaced inodes, writes, mode changes, added members and retargeted
+    /// aliases invalidate this owner; this call never refreshes its witness.
+    /// The original mutable source is checked separately by
+    /// [`Self::verify_source_unchanged`].
+    pub fn verify_retained_generation(&self, stopped: impl Fn() -> bool) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            self.inventory.verify_source(&self.root, &stopped)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = stopped;
+            Err(unsupported())
+        }
+    }
 }
 
 fn invalid(message: &str) -> io::Error {

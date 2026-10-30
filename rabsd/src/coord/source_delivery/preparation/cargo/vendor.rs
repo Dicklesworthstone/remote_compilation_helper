@@ -6,13 +6,13 @@
 //! The source-replacement configuration is preserved, never generated or rewritten.
 
 use super::{
-    MAX_PACKAGES, OUTPUT_LIMIT, active_cargo_configs, contained_relative, invalid, require,
+    MAX_PACKAGES, OUTPUT_LIMIT, PreparationControl, active_cargo_configs, contained_relative,
+    invalid, require,
 };
 use rabs_sandbox::snapshot_capture::{MemberKind, SealedSourceSnapshot};
 use rabs_sandbox::source_transfer::MAX_SOURCE_FILES;
 use serde::Deserialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -101,11 +101,12 @@ fn validate_registry_source(source: &str) -> io::Result<()> {
     )
 }
 
-fn hash(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
+fn hash(bytes: &[u8], control: &PreparationControl<'_>) -> io::Result<String> {
+    Ok(control
+        .sha256(bytes)?
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect()
+        .collect())
 }
 
 fn toml_input(image: &SealedSourceSnapshot, path: &str) -> io::Result<toml::Value> {
@@ -421,7 +422,9 @@ impl VendoredSources {
         image: &SealedSourceSnapshot,
         manifest: &str,
         directory: &str,
+        control: &PreparationControl<'_>,
     ) -> io::Result<Self> {
+        control.checkpoint()?;
         validate_directory(directory)?;
         require(
             !Path::new(manifest).starts_with(directory),
@@ -435,6 +438,7 @@ impl VendoredSources {
         let mut members: BTreeMap<String, BTreeMap<String, &str>> = BTreeMap::new();
         let prefix = format!("{directory}/");
         for (path, kind) in &captured.members {
+            control.checkpoint()?;
             require(
                 !matches!(kind, MemberKind::Symlink { .. }),
                 "vendored source capture contains a symlink",
@@ -493,6 +497,7 @@ impl VendoredSources {
         let mut identities = BTreeSet::new();
         let mut count = 0_usize;
         for (root, files) in members {
+            control.checkpoint()?;
             count = count
                 .checked_add(files.len())
                 .filter(|count| *count <= MAX_SOURCE_FILES)
@@ -543,7 +548,7 @@ impl VendoredSources {
                     .file_bytes("workspace", captured_path)
                     .ok_or_else(|| invalid("checksummed vendor bytes unavailable"))?;
                 require(
-                    hash(bytes) == *expected,
+                    hash(bytes, control)? == *expected,
                     "vendored file checksum differs from captured bytes",
                 )?;
             }

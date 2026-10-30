@@ -42,6 +42,7 @@ use rabs_sandbox::dependency_context::{
 };
 use rabs_sandbox::loader_directories::{LoaderDirectoryWitness, observe_loader_directories};
 use rabs_sandbox::runtime_cohort::observe_runtime_cohort;
+use rabs_sandbox::toolchain_cache::RetainedToolchain as SharedToolchain;
 #[cfg(test)]
 use rabs_sandbox::toolchain_dataset::capture_toolchain;
 use rabs_sandbox::toolchain_dataset::{
@@ -57,7 +58,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 mod recovery;
+mod shared;
 mod toolchains;
+
+pub use shared::{PendingSharedRemote, SharedRemoteExecutions, SharedRemoteSubscription};
 
 const CONFIG_KEYS: [&str; 3] = [
     "RABS_DEPENDENCY_WORKER_LISTEN",
@@ -273,8 +277,54 @@ pub struct RemoteDependencies {
 #[derive(Debug)]
 struct RetainedToolchain {
     guard: ToolchainGuard,
-    image: Arc<PreparedToolchain>,
-    _directory: tempfile::TempDir,
+    backing: RetainedToolchainBacking,
+}
+
+#[derive(Debug)]
+enum RetainedToolchainBacking {
+    Captured {
+        image: Arc<PreparedToolchain>,
+        _directory: tempfile::TempDir,
+    },
+    Shared(Arc<SharedToolchain>),
+}
+
+impl RetainedToolchain {
+    fn image(&self) -> &PreparedToolchain {
+        match &self.backing {
+            RetainedToolchainBacking::Captured { image, .. } => image,
+            RetainedToolchainBacking::Shared(owner) => owner.image(),
+        }
+    }
+
+    fn verify_source(&self, source: &Path) -> io::Result<()> {
+        match &self.backing {
+            RetainedToolchainBacking::Captured { image, .. } => {
+                image.verify_source_unchanged(source, || false)
+            }
+            RetainedToolchainBacking::Shared(owner) => {
+                if source != owner.root() {
+                    return Err(invalid(
+                        "remote compiler differs from its retained service image",
+                    ));
+                }
+                // This operation selected immutable captured bytes. A later
+                // edit to the mutable original cannot change their identity.
+                owner.image().verify_retained_generation(|| false)
+            }
+        }
+    }
+
+    fn attach(&self, upload: SourceUpload, request: &Value) -> io::Result<SourceUpload> {
+        match &self.backing {
+            RetainedToolchainBacking::Captured { image, .. } => {
+                upload.with_shared_toolchain(Arc::clone(image), request)
+            }
+            RetainedToolchainBacking::Shared(owner) => {
+                upload.with_retained_toolchain(Arc::clone(owner), request)
+            }
+        }
+    }
 }
 
 fn toolchain_staging_directory(state: &Path) -> io::Result<tempfile::TempDir> {
@@ -352,8 +402,7 @@ impl RemoteValidation {
         self.verify_read_closure(request)?;
         request.verify_toolchain()?;
         self.retained
-            .image
-            .verify_source_unchanged(request.toolchain.sysroot(), || false)
+            .verify_source(request.toolchain.sysroot())
             .map_err(|error| format!("complete original toolchain changed: {error}"))?;
         self.loader
             .verify_absence(|| false)
@@ -363,8 +412,7 @@ impl RemoteValidation {
             .verify_absence(|| false)
             .map_err(|error| format!("original loader directories changed: {error}"))?;
         self.retained
-            .image
-            .verify_source_unchanged(request.toolchain.sysroot(), || false)
+            .verify_source(request.toolchain.sysroot())
             .map_err(|error| format!("complete original toolchain changed: {error}"))?;
         request.verify_toolchain()?;
         // Both newly produced remote results and remote cache hits call this
@@ -542,7 +590,9 @@ impl RemoteDependencies {
         let physical_empty_loader = physical_paths(&empty_loader, canonical)?;
         let loader_witness = observe_loader_directories(&physical_empty_loader, || false)
             .map_err(|error| format!("original loader directories: {error}"))?;
-        let Some(retained) = self.retained_toolchain(guard, Path::new(&physical.compiler))? else {
+        let Some(retained) =
+            self.retained_toolchain(guard, Path::new(&physical.compiler), canonical)?
+        else {
             return Ok(None);
         };
         // Probe the compiler's complete original lookup order. The worker may
@@ -568,7 +618,7 @@ impl RemoteDependencies {
             inputs,
             build_script_output,
             &visible_root,
-            &retained.image.identity().sha256,
+            &retained.image().identity().sha256,
             &runtime,
         )
         .map_err(|error| error.to_string())?;
@@ -656,8 +706,7 @@ impl RemoteDependencies {
         })?;
         guard.verify_unchanged(Path::new(&physical.compiler))?;
         retained
-            .image
-            .verify_source_unchanged(root, || false)
+            .verify_source(root)
             .map_err(|error| format!("original toolchain changed during keying: {error}"))?;
         let validation = RemoteValidation {
             retained,
@@ -681,8 +730,21 @@ impl RemoteDependencies {
         &self,
         guard: &ToolchainGuard,
         compiler: &Path,
+        canonical: Option<&CanonicalPaths>,
     ) -> Result<Option<Arc<RetainedToolchain>>, String> {
         guard.verify_unchanged(compiler)?;
+        if let Some(owner) = canonical.and_then(CanonicalPaths::retained_toolchain) {
+            let retained = Arc::new(RetainedToolchain {
+                guard: guard.clone(),
+                backing: RetainedToolchainBacking::Shared(Arc::clone(owner)),
+            });
+            retained
+                .verify_source(guard.sysroot())
+                .map_err(|error| error.to_string())?;
+            // Do not pin these leases in the separate remote memo. Otherwise
+            // its idle entries could consume every service-pool slot forever.
+            return Ok(Some(retained));
+        }
         let key = (compiler.to_path_buf(), guard.sysroot().to_path_buf());
         let retained = {
             // A contended cache is preparation, never authority or an excuse
@@ -722,8 +784,10 @@ impl RemoteDependencies {
                         .map_err(|error| error.to_string())?;
                     Ok(RetainedToolchain {
                         guard: capture_guard,
-                        image: Arc::new(image),
-                        _directory: directory,
+                        backing: RetainedToolchainBacking::Captured {
+                            image: Arc::new(image),
+                            _directory: directory,
+                        },
                     })
                 })?
         };
@@ -735,10 +799,7 @@ impl RemoteDependencies {
         // upload use it. Validate outside the lock so other ready toolchains
         // make progress. Keep all original checks, not just a cached path hit.
         if retained.guard.verify_unchanged(compiler).is_err()
-            || retained
-                .image
-                .verify_source_unchanged(guard.sysroot(), || false)
-                .is_err()
+            || retained.verify_source(guard.sysroot()).is_err()
         {
             let mut memo = self
                 .toolchain
@@ -763,6 +824,7 @@ impl LiveDependencyLane {
         request: LiveDependencyRequest,
         remote: Arc<RemoteDependencies>,
         invocation: RemoteInvocation,
+        shared: Option<Arc<SharedRemoteExecutions>>,
     ) -> LiveDecision {
         if let Err(reason) = invocation
             .validation
@@ -783,20 +845,42 @@ impl LiveDependencyLane {
                 Err(reason) => return LiveDecision::PassThrough(format!("serve-fault: {reason}")),
             }
         };
+        // Only an existing service-owned execution may share its current
+        // private result. Completed flights reject new joins, which keeps
+        // ordinary replay and verification sampling on the path above.
+        let shared = shared.filter(|_| !request.is_execution_only());
+        if let Some(executions) = &shared
+            && let Some(subscription) = executions.try_join(&request.key.action_key)
+        {
+            return LiveDecision::SharedRemote(PendingSharedRemote::joined(
+                Arc::clone(&self.coord),
+                request,
+                invocation.validation,
+                subscription,
+            ));
+        }
         match self.coord.submitted_actor(&request.key.action_key) {
             Ok(Some(_)) => return LiveDecision::InFlight,
             Ok(None) => {}
             Err(error) => return LiveDecision::PassThrough(format!("remote dispatch: {error:?}")),
         }
         match remote.workers.try_reserve(&request.key.action_key) {
-            Ok((reservation, action_claim)) => LiveDecision::Remote(PendingRemote {
-                lane: self.clone(),
-                request,
-                remote,
-                invocation,
-                reservation,
-                action_claim,
-            }),
+            Ok((reservation, action_claim)) => {
+                let pending = PendingRemote {
+                    lane: self.clone(),
+                    request,
+                    remote,
+                    invocation,
+                    reservation,
+                    action_claim,
+                };
+                match shared {
+                    Some(executions) => LiveDecision::SharedRemote(PendingSharedRemote::starter(
+                        executions, pending,
+                    )),
+                    None => LiveDecision::Remote(pending),
+                }
+            }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => LiveDecision::InFlight,
             Err(error) => LiveDecision::PassThrough(format!("remote worker: {error}")),
         }
@@ -820,8 +904,9 @@ impl PendingRemote {
         &self.request.key.action_key
     }
 
-    /// Run only on the edge's bounded dedicated execution lane. The transport
-    /// must already have the wrapper's private-execution acknowledgment.
+    /// Run only on an owned bounded execution thread. The transport must
+    /// already have a wrapper's private-execution acknowledgment. A shared
+    /// flight supplies its action token, never one subscriber's cancellation.
     pub fn execute(self, cancellation: OperationCancellation) -> RemoteResult {
         match self.execute_inner(cancellation) {
             Ok(pending) => RemoteResult::Ready(pending),
@@ -917,12 +1002,12 @@ impl PendingRemote {
             &invocation.argv,
             &invocation.context,
             upload.wire_manifest(),
-            retained.image.identity(),
+            retained.image().identity(),
             request_id,
         )
         .map_err(settled)?;
-        let upload = upload
-            .with_shared_toolchain(Arc::clone(&retained.image), &wire)
+        let upload = retained
+            .attach(upload, &wire)
             .map_err(|error| settled(format!("prepare worker upload: {error}")))?;
         let owner: Arc<Mutex<Option<AdmittedRemote>>> = Arc::new(Mutex::new(None));
         let admitted_owner = Arc::clone(&owner);
@@ -1039,7 +1124,9 @@ impl PendingRemote {
         // verified delivery for acknowledgment-only reconciliation when needed.
         directory.delivery_finished(delivery.acknowledgments_confirmed);
         if cancellation.is_cancelled() {
-            return Err(settled("caller left after private remote execution".into()));
+            return Err(settled(
+                "remote execution interest ended after private execution".into(),
+            ));
         }
         let attempt = owned
             .attempt
@@ -1110,20 +1197,23 @@ impl PendingRemote {
             ) {
                 return Err(settled(format!("remote publication: {outcome:?}")));
             }
-            attempt.settle();
+            // A shared result outlives its producer. Require durable attempt
+            // retirement before any subscriber can receive that custody.
+            attempt.settle_checked().map_err(settled)?;
             RemoteInstallAuthority::Published
         };
-        let attempt = owned
-            .attempt
-            .take()
-            .ok_or_else(|| ("completed attempt owner missing".to_owned(), false))?;
         // AdmittedRemote's session owner drops on return, after result custody and
-        // before waiting for permission to write any caller destination.
+        // before waiting for permission to write any caller destination. Retain
+        // only immutable result custody and this subscriber's input witnesses;
+        // the settled execution attempt is not an installation owner.
         Ok(PendingRemoteInstall {
-            attempt,
-            manifest,
-            manifest_key,
-            canonical_transcript,
+            coord: Arc::clone(&attempt.coord),
+            request: attempt.request.clone(),
+            output: Arc::new(RemoteOutput {
+                manifest,
+                manifest_key,
+                canonical_transcript,
+            }),
             validation: invocation.validation,
             result,
         })
@@ -1485,8 +1575,42 @@ enum RemoteInstallAuthority {
     RequestOwned(Box<RequestOwnedResult>),
 }
 
+impl RemoteInstallAuthority {
+    /// Sharing consumes only current published-result custody. An affine
+    /// workspace capture cannot acquire publication or replay authority here.
+    fn into_shared_output(self, output: Arc<RemoteOutput>) -> Result<Arc<RemoteOutput>, String> {
+        match self {
+            Self::Published => Ok(output),
+            Self::RequestOwned(_) => {
+                Err("fresh workspace execution cannot enter a shared result flight".into())
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod request_owned_tests;
+
+/// Captured bytes shared only by subscribers enrolled in the producing flight.
+/// The published CAS roots retain artifacts; this owner keeps their exact
+/// manifest and transcript without copying the transcript for every delivery.
+#[derive(Debug)]
+struct RemoteOutput {
+    manifest: CanonicalActionResultManifest,
+    manifest_key: String,
+    canonical_transcript: Vec<u8>,
+}
+
+impl RemoteOutput {
+    fn verify_binding(&self, request: &LiveDependencyRequest) -> Result<(), String> {
+        if self.manifest.action_key != request.key.action_key
+            || self.manifest.canonical_descriptor_digest != request.key.descriptor_digest
+        {
+            return Err("remote result differs from the subscriber's action descriptor".into());
+        }
+        Ok(())
+    }
+}
 
 /// A successful current producer, not an arbitrary cache-read capability.
 /// Dependency results have H011 publication; workspace results carry only
@@ -1494,10 +1618,9 @@ mod request_owned_tests;
 /// the same wrapper's manifest-specific acknowledgment before target writes.
 #[derive(Debug)]
 pub struct PendingRemoteInstall {
-    attempt: ExecutionAttempt,
-    manifest: CanonicalActionResultManifest,
-    manifest_key: String,
-    canonical_transcript: Vec<u8>,
+    coord: Arc<CoordLive>,
+    request: LiveDependencyRequest,
+    output: Arc<RemoteOutput>,
     validation: RemoteValidation,
     result: RemoteInstallAuthority,
 }
@@ -1505,12 +1628,12 @@ pub struct PendingRemoteInstall {
 impl PendingRemoteInstall {
     #[must_use]
     pub fn action_key(&self) -> &TypedDigest {
-        &self.attempt.key
+        &self.request.key.action_key
     }
 
     #[must_use]
     pub fn capture(&self) -> &str {
-        &self.manifest_key
+        &self.output.manifest_key
     }
 
     /// Called only after the wrapper acknowledges this exact captured result.
@@ -1518,8 +1641,12 @@ impl PendingRemoteInstall {
     /// result uses its consumed request owner and never enters cache serving.
     #[must_use]
     pub fn install(self) -> InstallResult {
-        let request = &self.attempt.request;
-        if let Err(reason) = verify_request(request).and_then(|()| self.validation.verify(request))
+        let request = &self.request;
+        if let Err(reason) = self
+            .output
+            .verify_binding(request)
+            .and_then(|()| verify_request(request))
+            .and_then(|()| self.validation.verify(request))
         {
             return InstallResult::Declined(reason);
         }
@@ -1533,18 +1660,18 @@ impl PendingRemoteInstall {
             Err(reason) => return InstallResult::Declined(reason),
         };
         let installed_result = match self.result {
-            RemoteInstallAuthority::Published => self.attempt.coord.serve_produced_result(
-                &self.attempt.key,
-                &self.manifest_key,
+            RemoteInstallAuthority::Published => self.coord.serve_produced_result(
+                &request.key.action_key,
+                &self.output.manifest_key,
                 Path::new(&physical.out_dir),
                 &expected,
                 now_micros(),
             ),
             RemoteInstallAuthority::RequestOwned(captured) => {
-                match self.attempt.coord.install_request_owned_result(
+                match self.coord.install_request_owned_result(
                     *captured,
-                    &self.attempt.key,
-                    &self.manifest_key,
+                    &request.key.action_key,
+                    &self.output.manifest_key,
                     Path::new(&physical.out_dir),
                     &expected,
                     || verify_request(request).and_then(|()| self.validation.verify(request)),
@@ -1561,7 +1688,7 @@ impl PendingRemoteInstall {
         };
         match installed_result {
             Ok(ServeOutcome::Served { files }) => {
-                if files.len() != self.manifest.logical_outputs.len() {
+                if files.len() != self.output.manifest.logical_outputs.len() {
                     return InstallResult::Fault(
                         "remote installed output set is incomplete".into(),
                     );
@@ -1572,7 +1699,7 @@ impl PendingRemoteInstall {
                         path.file_name()
                             .and_then(|name| name.to_str())
                             .and_then(|name| {
-                                self.manifest.logical_outputs.iter().find(|output| {
+                                self.output.manifest.logical_outputs.iter().find(|output| {
                                     output.virtual_path.as_bytes() == name.as_bytes()
                                 })
                             })
@@ -1595,7 +1722,7 @@ impl PendingRemoteInstall {
                     &request.dependencies,
                     &request.package,
                     &physical,
-                    render_compiler_transcript(&self.canonical_transcript, plan),
+                    render_compiler_transcript(&self.output.canonical_transcript, plan),
                     installed,
                 )
             }

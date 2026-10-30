@@ -170,6 +170,7 @@ fn sustained_real_mutation_refuses_with_a_typed_refusal() {
         CaptureError::Incoherent(refusal) => assert_eq!(refusal.attempts, 3),
         CaptureError::Io(io) => panic!("wrong class: {io}"),
         CaptureError::Rejected { .. } => panic!("unexpected policy refusal"),
+        CaptureError::Cancelled => panic!("non-cancellable capture was cancelled"),
     }
 }
 

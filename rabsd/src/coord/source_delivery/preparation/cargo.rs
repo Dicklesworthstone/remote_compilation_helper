@@ -11,15 +11,20 @@ mod graph;
 mod registry;
 mod vendor;
 
-use rabs_asupersync::process_groups::{GroupSignal, ManagedProcessGroup};
+use super::super::control::PreparationRootGuard;
+use super::{PreparationControl, capture_error};
+use rabs_asupersync::process_groups::ManagedProcessGroup;
 use rabs_asupersync::region_tree::Attribution;
-use rabs_sandbox::snapshot_capture::{MemberKind, SealedSourceSnapshot, capture_sealed_source};
+use rabs_asupersync::stream_drain::{DrainLimits, DrainedOutput};
+use rabs_sandbox::snapshot_capture::{
+    MemberKind, SealedSourceSnapshot, capture_sealed_source_cancellable,
+};
 use rabs_sandbox::source_transfer::{MAX_SOURCE_BYTES, MAX_SOURCE_FILES};
 use registry::RegistryCache;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -124,22 +129,39 @@ impl CargoSource {
 
     /// Return retained input bytes and their explicit selection. The coordinator
     /// constructs and validates the transport projection from this same image.
+    #[cfg(test)]
     pub(super) fn prepare(
         &self,
         image: Arc<SealedSourceSnapshot>,
         selected_toolchain: Option<&Path>,
     ) -> io::Result<(Arc<SealedSourceSnapshot>, Vec<String>)> {
+        self.prepare_controlled(
+            image,
+            selected_toolchain,
+            &PreparationControl::uncontrolled(),
+        )
+    }
+
+    pub(super) fn prepare_controlled(
+        &self,
+        image: Arc<SealedSourceSnapshot>,
+        selected_toolchain: Option<&Path>,
+        control: &PreparationControl<'_>,
+    ) -> io::Result<(Arc<SealedSourceSnapshot>, Vec<String>)> {
+        control.checkpoint()?;
         let vendor = self
             .vendor
             .as_deref()
-            .map(|directory| VendoredSources::verify(&image, &self.manifest, directory))
+            .map(|directory| VendoredSources::verify(&image, &self.manifest, directory, control))
             .transpose()?;
-        let files = validate_capture(
+        let files = validate_capture_controlled(
             &image,
             &self.manifest,
             vendor.as_ref(),
             self.cargo_home_source.is_some(),
+            control,
         )?;
+        control.checkpoint()?;
         // Planning starts only after a complete paired capture. Cargo never sees
         // a mutable original checkout or a mixture of pre/post-mutation files.
         let planning = tempfile::Builder::new()
@@ -148,8 +170,8 @@ impl CargoSource {
         let planning_root = fs::canonicalize(planning.path())?;
         reject_ancestor_configuration(&planning_root)?;
         image
-            .materialize_into(&planning_root.join("image"))
-            .map_err(|error| invalid(&format!("Cargo planning copy failed: {error:?}")))?;
+            .materialize_into_cancellable(&planning_root.join("image"), || control.is_cancelled())
+            .map_err(|error| capture_error("Cargo planning copy failed", error))?;
         let root = fs::canonicalize(planning_root.join("image/workspace"))?;
         let tools = planning_root.join("tools");
         fs::create_dir(&tools)?;
@@ -164,9 +186,9 @@ impl CargoSource {
             }
             (cargo, rustc)
         } else {
-            let cargo = local_tool("cargo", &tools)?;
+            let cargo = local_tool_controlled("cargo", &tools, control)?;
             let rustc = match std::env::var_os("RUSTC") {
-                Some(_) => local_tool("rustc", &tools)?,
+                Some(_) => local_tool_controlled("rustc", &tools, control)?,
                 None if cargo
                     .parent()
                     .is_some_and(|parent| parent.join("rustc").is_file()) =>
@@ -176,7 +198,7 @@ impl CargoSource {
                         .ok_or_else(|| invalid("Cargo executable parent"))?
                         .join("rustc")
                 }
-                None => local_tool("rustc", &tools)?,
+                None => local_tool_controlled("rustc", &tools, control)?,
             };
             (cargo, rustc)
         };
@@ -200,11 +222,12 @@ impl CargoSource {
                     .args(["locate-project", "--workspace", "--message-format=json"])
                     .arg("--manifest-path")
                     .arg(root.join(&self.manifest));
-                let located: Value = serde_json::from_slice(&bounded_command(
+                let located: Value = serde_json::from_slice(&bounded_command_controlled(
                     locate,
                     &planning_root,
                     METADATA_TIMEOUT,
                     OUTPUT_LIMIT,
+                    control,
                 )?)
                 .map_err(|_| invalid("invalid Cargo workspace location"))?;
                 let workspace_manifest = captured_metadata_path(&image, &root, &located["root"])?;
@@ -215,7 +238,7 @@ impl CargoSource {
                     .strip_prefix(&root)
                     .map_err(|_| invalid("Cargo workspace lock escapes captured source"))?
                     .to_path_buf();
-                RegistryCache::capture(&image, &lock, approved, &cargo_home)
+                RegistryCache::capture_controlled(&image, &lock, approved, &cargo_home, control)
             })
             .transpose()?;
         let mut command = planning_command(
@@ -236,10 +259,17 @@ impl CargoSource {
             ])
             .arg("--manifest-path")
             .arg(root.join(&self.manifest));
-        let output = bounded_command(command, &planning_root, METADATA_TIMEOUT, OUTPUT_LIMIT)?;
+        let output = bounded_command_controlled(
+            command,
+            &planning_root,
+            METADATA_TIMEOUT,
+            OUTPUT_LIMIT,
+            control,
+        )?;
+        control.checkpoint()?;
         let metadata: Value = serde_json::from_slice(&output)
             .map_err(|error| invalid(&format!("invalid Cargo metadata JSON: {error}")))?;
-        validate_metadata(
+        validate_metadata_controlled(
             &image,
             &root,
             &self.manifest,
@@ -248,13 +278,14 @@ impl CargoSource {
             registry
                 .as_ref()
                 .map(|registry| (registry, cargo_home.as_path())),
+            control,
         )?;
-        verify_planning_bytes(&image, &root, &files)?;
+        verify_planning_bytes_controlled(&image, &root, &files, control)?;
         if let Some(registry) = registry {
             let mut selected = files;
             selected.extend(
                 registry
-                    .materialize(&root.join(registry::CACHE_PREFIX))?
+                    .materialize_controlled(&root.join(registry::CACHE_PREFIX), control)?
                     .into_iter()
                     .map(|path| format!("{}/{path}", registry::CACHE_PREFIX)),
             );
@@ -265,15 +296,14 @@ impl CargoSource {
             drop(registry);
             drop(image);
             let derived = Arc::new(
-                capture_sealed_source(
+                capture_sealed_source_cancellable(
                     &[("workspace".to_owned(), root)],
                     false,
                     2,
                     MAX_SOURCE_BYTES,
+                    || control.is_cancelled(),
                 )
-                .map_err(|error| {
-                    invalid(&format!("retained Cargo cache capture refused: {error:?}"))
-                })?,
+                .map_err(|error| capture_error("retained Cargo cache capture refused", error))?,
             );
             // This new image is derived solely from the retained source and
             // checksum-bound cache bytes. It is input delivery, not a resealed
@@ -321,17 +351,35 @@ fn planning_command(
     Ok(command)
 }
 
+#[cfg(test)]
 fn validate_capture(
     image: &SealedSourceSnapshot,
     manifest: &str,
     vendor: Option<&VendoredSources>,
     cached_registry: bool,
 ) -> io::Result<Vec<String>> {
+    validate_capture_controlled(
+        image,
+        manifest,
+        vendor,
+        cached_registry,
+        &PreparationControl::uncontrolled(),
+    )
+}
+
+fn validate_capture_controlled(
+    image: &SealedSourceSnapshot,
+    manifest: &str,
+    vendor: Option<&VendoredSources>,
+    cached_registry: bool,
+    control: &PreparationControl<'_>,
+) -> io::Result<Vec<String>> {
     let captured = image
         .manifest("workspace")
         .ok_or_else(|| invalid("missing captured Cargo anchor"))?;
     let mut files = Vec::new();
     for (path, kind) in &captured.members {
+        control.checkpoint()?;
         require(
             !cached_registry
                 || (path != registry::CACHE_PREFIX
@@ -358,9 +406,16 @@ fn validate_capture(
     // that every fixture named Cargo.toml belongs to this command. Discover the
     // control-file closure before Cargo runs, retaining all other files as data.
     // Relevant path declarations are checked before metadata can follow them.
-    let controls = graph::ControlInputs::discover(image, manifest, vendor, cached_registry)?;
+    let controls = graph::ControlInputs::discover_controlled(
+        image,
+        manifest,
+        vendor,
+        cached_registry,
+        control,
+    )?;
     let configs = active_cargo_configs(image, manifest)?;
     for path in &files {
+        control.checkpoint()?;
         if configs.contains(path) {
             if let Some(vendor) = vendor {
                 // The vendor adapter validates its one source-replacement
@@ -1150,7 +1205,17 @@ fn reject_ancestor_configuration(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn local_tool(name: &str, scratch: &Path) -> io::Result<PathBuf> {
+    local_tool_controlled(name, scratch, &PreparationControl::uncontrolled())
+}
+
+fn local_tool_controlled(
+    name: &str,
+    scratch: &Path,
+    control: &PreparationControl<'_>,
+) -> io::Result<PathBuf> {
+    control.checkpoint()?;
     let selected = if let Some(explicit) = std::env::var_os(name.to_ascii_uppercase()) {
         let explicit = PathBuf::from(explicit);
         require(
@@ -1193,7 +1258,13 @@ fn local_tool(name: &str, scratch: &Path) -> io::Result<PathBuf> {
                 command.env(key, value);
             }
         }
-        let output = bounded_command(command, scratch, Duration::from_secs(5), 64 * 1024)?;
+        let output = bounded_command_controlled(
+            command,
+            scratch,
+            Duration::from_secs(5),
+            64 * 1024,
+            control,
+        )?;
         let path = std::str::from_utf8(&output)
             .map_err(|_| invalid("rustup which returned non-UTF-8"))?
             .trim();
@@ -1212,40 +1283,139 @@ fn local_tool(name: &str, scratch: &Path) -> io::Result<PathBuf> {
 }
 
 struct OwnedGroup {
-    process: ManagedProcessGroup,
-    reaped: bool,
+    process: Option<ManagedProcessGroup>,
+    // A root remains charged during cancellation and residual descendant drain.
+    root: Option<PreparationRootGuard>,
 }
 
-impl Drop for OwnedGroup {
-    fn drop(&mut self) {
-        if !self.reaped {
-            if self.process.signal_group(GroupSignal::Kill).is_err() {
-                // Minimal operator PATHs can still run absolute Cargo/rustc.
-                // Reach their whole group through the host signal utility before
-                // the direct-child fallback, including compiler grandchildren.
-                let _ = Command::new("/bin/kill")
-                    .args(["-KILL", "--", &format!("-{}", self.process.pgid())])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
+impl OwnedGroup {
+    fn stop(&mut self) {
+        if let Some(process) = &mut self.process {
+            #[cfg(target_os = "linux")]
+            if process.refresh_members().is_ok_and(|count| count == 0) {
+                return;
             }
-            // No PATH dependency: a missing kill(1) must not turn the deadline
-            // into an unbounded wait for the directly owned Cargo process.
-            let _ = self.process.kill_leader();
-            let _ = self.process.wait_leader();
-            let _ = self.process.reap_residuals();
+            #[cfg(unix)]
+            if let Some(group) = i32::try_from(process.pgid())
+                .ok()
+                .filter(|group| *group > 1)
+                .and_then(rustix::process::Pid::from_raw)
+            {
+                // This is a safe native signal: cancellation cannot depend on
+                // the supervisor PATH or wait for a signal-helper subprocess.
+                let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+            }
+            let _ = process.kill_leader();
+        }
+    }
+
+    fn retain_unresolved_root(&mut self) {
+        if let Some(root) = self.root.take() {
+            // An unresolved group still occupies execution capacity. Preserve
+            // the charge until service restart; never advertise it as drained.
+            std::mem::forget(root);
+        }
+    }
+
+    fn drain(&mut self) -> io::Result<DrainedOutput> {
+        // Keep the managed handle available for signaling throughout the
+        // bounded closure proof. Consuming it before this proof could lose a
+        // still-live group on a cleanup error or block on an unkillable leader.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        self.stop();
+        loop {
+            let closure = (|| -> io::Result<bool> {
+                let process = self
+                    .process
+                    .as_mut()
+                    .ok_or_else(|| invalid("Cargo planning process was already drained"))?;
+                Ok(process.leader_try_wait()?.is_some() && process.refresh_members()? == 0)
+            })();
+            match closure {
+                Ok(true) => break,
+                Err(error) => {
+                    self.retain_unresolved_root();
+                    return Err(io::Error::other(format!(
+                        "Cargo planning process-group cleanup could not verify closure: {error}"
+                    )));
+                }
+                Ok(false) if Instant::now() >= deadline => {
+                    self.retain_unresolved_root();
+                    return Err(io::Error::other(
+                        "Cargo planning process-group cleanup exceeded its bound with unresolved members",
+                    ));
+                }
+                Ok(false) => {}
+            }
+            self.stop();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let process = self
+            .process
+            .take()
+            .ok_or_else(|| invalid("Cargo planning process was already drained"))?;
+        let group = process.pgid();
+        let output = process.wait_with_bounded_drain_budget(
+            &DrainLimits {
+                resident_bound: 0,
+                spill_dir: PathBuf::new(),
+            },
+            0,
+            || true,
+        );
+        match output {
+            Ok(output) if output.residual_group_members == 0 => Ok(output),
+            Ok(_) => {
+                self.retain_unresolved_root();
+                Err(io::Error::other(
+                    "Cargo planning process-group cleanup left unresolved members",
+                ))
+            }
+            Err(error) => {
+                if !rabs_asupersync::process_groups::members_from_proc(group).is_empty() {
+                    self.retain_unresolved_root();
+                }
+                Err(error)
+            }
         }
     }
 }
 
+impl Drop for OwnedGroup {
+    fn drop(&mut self) {
+        if self.process.is_some() {
+            // Normal returns drain explicitly. This final bounded attempt keeps
+            // signaling ownership during unwinding or after failed cleanup;
+            // an unproven closure retains its service root admission.
+            let _ = self.drain();
+        }
+    }
+}
+
+#[cfg(test)]
 fn bounded_command(
     command: Command,
     scratch: &Path,
     timeout: Duration,
     limit: u64,
 ) -> io::Result<Vec<u8>> {
-    bounded_command_with_input(command, scratch, timeout, limit, None)
+    bounded_command_controlled(
+        command,
+        scratch,
+        timeout,
+        limit,
+        &PreparationControl::uncontrolled(),
+    )
+}
+
+fn bounded_command_controlled(
+    command: Command,
+    scratch: &Path,
+    timeout: Duration,
+    limit: u64,
+    control: &PreparationControl<'_>,
+) -> io::Result<Vec<u8>> {
+    bounded_command_with_input(command, scratch, timeout, limit, None, control)
 }
 
 fn bounded_command_with_input(
@@ -1254,7 +1424,9 @@ fn bounded_command_with_input(
     timeout: Duration,
     limit: u64,
     input: Option<&[u8]>,
+    control: &PreparationControl<'_>,
 ) -> io::Result<Vec<u8>> {
+    control.checkpoint()?;
     let logs = tempfile::Builder::new()
         .prefix("metadata-output-")
         .tempdir_in(scratch)?;
@@ -1262,7 +1434,7 @@ fn bounded_command_with_input(
     let stderr = logs.path().join("stderr");
     let stdin = if let Some(input) = input {
         let path = logs.path().join("stdin");
-        fs::write(&path, input)?;
+        control.write_all(File::create(&path)?, input)?;
         Stdio::from(File::open(path)?)
     } else {
         Stdio::null()
@@ -1271,39 +1443,48 @@ fn bounded_command_with_input(
         .stdin(stdin)
         .stdout(File::create(&stdout)?)
         .stderr(File::create(&stderr)?);
+    let admission = control.acquire_root(timeout)?;
     let mut owned = OwnedGroup {
-        process: ManagedProcessGroup::spawn_command(
+        process: Some(ManagedProcessGroup::spawn_command(
             command,
             Attribution {
                 build_operation: Some("local-cargo-source-preparation".to_owned()),
                 ..Attribution::default()
             },
-        )?,
-        reaped: false,
+        )?),
+        root: Some(admission),
     };
     let deadline = Instant::now() + timeout;
-    let status = loop {
-        require(
-            fs::metadata(&stdout)?.len() <= limit && fs::metadata(&stderr)?.len() <= limit,
-            "Cargo metadata exceeded its output bound",
-        )?;
-        if let Some(status) = owned.process.leader_try_wait()? {
-            break status;
+    let completion = (|| -> io::Result<std::process::ExitStatus> {
+        loop {
+            control.checkpoint()?;
+            require(
+                fs::metadata(&stdout)?.len() <= limit && fs::metadata(&stderr)?.len() <= limit,
+                "Cargo metadata exceeded its output bound",
+            )?;
+            if let Some(status) = owned
+                .process
+                .as_mut()
+                .ok_or_else(|| invalid("Cargo planning process missing"))?
+                .leader_try_wait()?
+            {
+                return Ok(status);
+            }
+            require(
+                Instant::now() < deadline,
+                "Cargo metadata exceeded its runtime bound",
+            )?;
+            std::thread::sleep(Duration::from_millis(5));
         }
-        require(
-            Instant::now() < deadline,
-            "Cargo metadata exceeded its runtime bound",
-        )?;
-        std::thread::sleep(Duration::from_millis(5));
-    };
-    require(
-        owned.process.reap_residuals() == 0,
-        "Cargo metadata left live process-group members",
-    )?;
-    owned.reaped = true;
+    })();
+    // Cleanup failure takes precedence over success, timeout, or cancellation.
+    // Drop remains the unwind guard, but cannot report a failed closure itself.
+    owned.drain()?;
+    let status = completion?;
+    control.checkpoint()?;
+    drop(owned);
     let read = |path: &Path| -> io::Result<Vec<u8>> {
-        let mut bytes = Vec::new();
-        File::open(path)?.take(limit + 1).read_to_end(&mut bytes)?;
+        let bytes = control.read_bounded(File::open(path)?, limit.saturating_add(1))?;
         require(
             bytes.len() as u64 <= limit,
             "Cargo metadata exceeded its output bound",
@@ -1350,14 +1531,16 @@ fn captured_metadata_path<'a>(
     Ok(path)
 }
 
-fn validate_metadata(
+fn validate_metadata_controlled(
     image: &SealedSourceSnapshot,
     root: &Path,
     manifest: &str,
     value: &Value,
     vendor: Option<&VendoredSources>,
     registry: Option<(&RegistryCache, &Path)>,
+    control: &PreparationControl<'_>,
 ) -> io::Result<()> {
+    control.checkpoint()?;
     require(value["version"] == 1, "unsupported Cargo metadata format")?;
     let workspace = Path::new(
         value["workspace_root"]
@@ -1392,10 +1575,11 @@ fn validate_metadata(
     let mut ids = BTreeSet::new();
     let mut selected = false;
     for package in packages {
+        control.checkpoint()?;
         if let (Some(vendor), Some(locked)) = (vendor, locked.as_ref()) {
             vendor.check_package(root, package, locked)?;
         } else if let Some((registry, home)) = registry {
-            registry.check_package(home, package)?;
+            registry.check_package(home, package, control)?;
         } else {
             require(
                 package.get("source").is_some_and(Value::is_null),
@@ -1424,7 +1608,7 @@ fn validate_metadata(
         }
     }
     if let Some((registry, home)) = registry {
-        registry.verify_git_checkouts(home, packages)?;
+        registry.verify_git_checkouts(home, packages, control)?;
     }
     // A virtual workspace manifest is not itself a package but is an exact
     // captured Cargo input and must be the metadata workspace's manifest.
@@ -1448,6 +1632,7 @@ fn validate_metadata(
         .ok_or_else(|| invalid("Cargo dependency resolution missing"))?;
     let mut resolved = BTreeSet::new();
     for node in nodes {
+        control.checkpoint()?;
         let id = node["id"]
             .as_str()
             .ok_or_else(|| invalid("Cargo resolve node missing identity"))?;
@@ -1468,12 +1653,23 @@ fn validate_metadata(
     require(resolved == ids, "Cargo package graph is incomplete")
 }
 
+#[cfg(test)]
 fn verify_planning_bytes(
     image: &SealedSourceSnapshot,
     root: &Path,
     files: &[String],
 ) -> io::Result<()> {
+    verify_planning_bytes_controlled(image, root, files, &PreparationControl::uncontrolled())
+}
+
+fn verify_planning_bytes_controlled(
+    image: &SealedSourceSnapshot,
+    root: &Path,
+    files: &[String],
+    control: &PreparationControl<'_>,
+) -> io::Result<()> {
     for path in files {
+        control.checkpoint()?;
         let original = image
             .file_bytes("workspace", path)
             .ok_or_else(|| invalid("missing retained source bytes"))?;
@@ -1483,10 +1679,7 @@ fn verify_planning_bytes(
             metadata.is_file() && metadata.len() == original.len() as u64,
             "Cargo planning changed a captured input",
         )?;
-        let mut bytes = Vec::new();
-        File::open(local)?
-            .take(original.len() as u64 + 1)
-            .read_to_end(&mut bytes)?;
+        let bytes = control.read_bounded(File::open(local)?, original.len() as u64 + 1)?;
         require(
             bytes == original,
             "Cargo planning changed captured source/manifest/lock bytes",
@@ -2062,6 +2255,134 @@ mod tests {
         assert_eq!(
             bounded_command(valid, scratch.path(), Duration::from_secs(5), 1024).unwrap(),
             b"bounded"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cancelled_planning_process_drains_descendants_before_releasing_root() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct Admission {
+            held: Rc<Cell<bool>>,
+            drained_at_release: Rc<Cell<bool>>,
+            group_path: PathBuf,
+        }
+        impl Drop for Admission {
+            fn drop(&mut self) {
+                let group = fs::read_to_string(&self.group_path)
+                    .ok()
+                    .and_then(|text| text.parse::<u32>().ok());
+                self.drained_at_release.set(group.is_some_and(|group| {
+                    rabs_asupersync::process_groups::members_from_proc(group).is_empty()
+                }));
+                self.held.set(false);
+            }
+        }
+
+        // Check both cancellation with a live leader and successful leader exit
+        // with a still-live descendant. Neither may return capacity early.
+        for cancel in [true, false] {
+            let scratch = tempfile::tempdir().unwrap();
+            let group_path = scratch.path().join("group");
+            let held = Rc::new(Cell::new(false));
+            let drained_at_release = Rc::new(Cell::new(false));
+            let acquisitions = Cell::new(0);
+            let stopped = || {
+                cancel
+                    && fs::read_to_string(&group_path)
+                        .ok()
+                        .is_some_and(|text| text.parse::<u32>().is_ok())
+            };
+            let acquire = |timeout| {
+                assert_eq!(timeout, Duration::from_secs(10));
+                assert!(!held.replace(true), "one planning root per process");
+                acquisitions.set(acquisitions.get() + 1);
+                Ok(PreparationRootGuard::new(Admission {
+                    held: Rc::clone(&held),
+                    drained_at_release: Rc::clone(&drained_at_release),
+                    group_path: group_path.clone(),
+                }))
+            };
+            let control = PreparationControl::new(&stopped, Some(&acquire));
+            let mut command = Command::new("/bin/sh");
+            command
+                .args([
+                    "-c",
+                    if cancel {
+                        "trap '' TERM; /bin/sleep 30 & printf '%s' \"$$\" > \"$1\"; wait"
+                    } else {
+                        "/bin/sleep 30 & printf '%s' \"$$\" > \"$1\"; printf complete"
+                    },
+                    "fixture",
+                ])
+                .arg(&group_path);
+            let started = Instant::now();
+            let result = bounded_command_controlled(
+                command,
+                scratch.path(),
+                Duration::from_secs(10),
+                1024,
+                &control,
+            );
+            if cancel {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+            } else {
+                assert_eq!(result.unwrap(), b"complete");
+            }
+            assert!(started.elapsed() < Duration::from_secs(5));
+            assert_eq!(acquisitions.get(), 1);
+            assert!(!held.get());
+            assert!(
+                drained_at_release.get(),
+                "root released with live descendants"
+            );
+        }
+    }
+
+    #[test]
+    fn cancellation_while_waiting_for_root_admission_never_spawns_planning_work() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct Admission(Rc<Cell<bool>>);
+        impl Drop for Admission {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+
+        let scratch = tempfile::tempdir().unwrap();
+        let marker = scratch.path().join("must-not-start");
+        let cancelled = Cell::new(false);
+        let released = Rc::new(Cell::new(false));
+        let stopped = || cancelled.get();
+        let acquire = |_| {
+            cancelled.set(true);
+            Ok(PreparationRootGuard::new(Admission(Rc::clone(&released))))
+        };
+        let control = PreparationControl::new(&stopped, Some(&acquire));
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "printf started > \"$1\"", "fixture"])
+            .arg(&marker);
+        let error = bounded_command_controlled(
+            command,
+            scratch.path(),
+            Duration::from_secs(5),
+            1024,
+            &control,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(
+            released.get(),
+            "cancelled admission must return its unused root"
+        );
+        assert!(
+            !marker.exists(),
+            "cancelled planning work must never be spawned"
         );
     }
 

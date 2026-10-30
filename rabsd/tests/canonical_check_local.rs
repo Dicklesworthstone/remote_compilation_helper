@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{IsTerminal, Read, Write};
 use std::net::TcpListener;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -811,6 +811,295 @@ fn assert_shared_service_build(
     target
 }
 
+fn retained_service_toolchains(state: &Path) -> Vec<(PathBuf, u64, u64)> {
+    let mut images = fs::read_dir(state.join("canonical-compile-v1"))
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .as_encoded_bytes()
+                .starts_with(b"retained-toolchain-")
+        })
+        .map(|entry| {
+            assert!(entry.file_type().unwrap().is_dir());
+            let tree = entry.path().join("tree");
+            let compiler = fs::symlink_metadata(tree.join("bin/rustc")).unwrap();
+            assert!(compiler.is_file());
+            (tree, compiler.dev(), compiler.ino())
+        })
+        .collect::<Vec<_>>();
+    images.sort();
+    images
+}
+
+/// Pause only the actual worker process, never substitute its executor or
+/// result. Resume before native fixture owners drain, including on assertion
+/// failure. The caller verifies this fresh worker has not reached execution.
+struct PausedNativeWorker(rustix::process::Pid);
+
+impl PausedNativeWorker {
+    fn pause(worker: &NativeWorker) -> Self {
+        let pid = worker.process.as_ref().unwrap().pgid();
+        let pid = rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap();
+        rustix::process::kill_process(pid, rustix::process::Signal::STOP).unwrap();
+        let paused = Self(pid);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let status = fs::read_to_string(format!("/proc/{}/status", pid.as_raw_pid())).unwrap();
+            if status.lines().any(|line| {
+                line.starts_with("State:") && line.split_whitespace().nth(1) == Some("T")
+            }) {
+                return paused;
+            }
+            assert!(Instant::now() < deadline, "native worker did not stop");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
+
+impl Drop for PausedNativeWorker {
+    fn drop(&mut self) {
+        if rustix::process::kill_process(self.0, rustix::process::Signal::CONT).is_err() {
+            // NativeWorker still owns reaping if resumption was refused.
+            let _ = rustix::process::kill_process(self.0, rustix::process::Signal::KILL);
+        }
+    }
+}
+
+fn shared_remote_operation(operations: &Path, label: &str) -> PathBuf {
+    let owners = fs::read_dir(operations)
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|entry| entry.file_type().unwrap().is_dir())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            fs::read(path.join("bundle/source/shared-flight-label.txt"))
+                .is_ok_and(|bytes| bytes == label.as_bytes())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(owners.len(), 1, "missing unique {label} source owner");
+    owners.into_iter().next().unwrap()
+}
+
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual concurrent canonical Cargo clients, shared TLS compiler execution and origin cancellation"]
+fn canonical_shared_remote_flight_survives_origin_cancellation() {
+    let (owner, mut first_profile) = native_fixture();
+    let root = owner.path();
+    for (source, label) in [("source-a", "origin"), ("source-b", "survivor")] {
+        write(&root.join(source), "shared-flight-label.txt", label);
+        write(
+            &root.join(source),
+            "src/main.rs",
+            "fn main() { println!(\"{}:{}\", include_str!(\"../shared-flight-label.txt\"), canonical_app::answer()); }\n",
+        );
+    }
+    let (mut worker, environment) = NativeWorker::start(root);
+    let socket = root.join("canonical-service.sock");
+    let service_profile = root.join("shared-remote-service.json");
+    fs::write(
+        &service_profile,
+        serde_json::to_vec(&json!({
+            "version":"canonical-compile-service-v1", "state_root":root.join("state"),
+            "socket":socket, "max_roots":2, "jobs_per_root":1,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    first_profile["command"] = json!("build");
+    first_profile["service_socket"] = json!(socket);
+    let mut second_profile = first_profile.clone();
+    second_profile["source_root"] = json!(root.join("source-b"));
+    let mut command = shared_service_command(root);
+    command
+        .envs(environment.iter().map(|(name, value)| (name, value)))
+        .arg("--canonical-compile-service")
+        .arg(service_profile);
+    let mut service = SharedServiceChild::spawn(root, "shared-remote-service", command);
+    let service_pid = service.process.as_ref().unwrap().pgid();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !socket.exists()
+        || !service
+            .events()
+            .iter()
+            .any(|event| event["kind"] == "canonical-service-listening")
+    {
+        service.assert_running();
+        assert!(Instant::now() < deadline, "{}", service.diagnostics());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let mut first = shared_service_client(root, 5100, &first_profile);
+    let deadline = Instant::now() + Duration::from_secs(240);
+    let key = loop {
+        let events = service.events();
+        let offered = decisions(&events, "shared-remote-offer");
+        if let Some(key) = offered.get("canonical_leaf")
+            && events.iter().any(|event| {
+                event["kind"] == "rabsd-remote-dependency-admitted" && event["key"] == *key
+            })
+        {
+            break key.clone();
+        }
+        service.assert_running();
+        first.assert_running();
+        assert!(Instant::now() < deadline, "{}", service.diagnostics());
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    let paused = PausedNativeWorker::pause(&worker);
+    // The worker durably records an execution before launching its lease or
+    // compiler. Read that real journal while the process is stopped: absence
+    // of a compiler-acquisition log alone cannot rule out an expiring lease.
+    let journal: Value =
+        serde_json::from_slice(&read_bounded(&worker.state.join("requests.json"))).unwrap();
+    assert!(
+        journal.get("last").is_some_and(Value::is_null),
+        "worker passed the required pre-execution pause boundary: {journal}"
+    );
+    // This fresh worker is still transferring inputs. Never waive the durable
+    // admission check or manufacture a completed result to arrange overlap.
+    assert!(
+        !worker
+            .events()
+            .iter()
+            .any(|event| event["kind"] == "worker-toolchain-acquired"),
+        "worker passed the required pre-execution pause boundary"
+    );
+    let origin = shared_remote_operation(&root.join("ops"), "origin");
+    let mut second = shared_service_client(root, 5101, &second_profile);
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let joined = service
+            .events()
+            .iter()
+            .filter(|event| {
+                event["kind"] == "rabsd-live-dependency"
+                    && event["decision"] == "shared-remote-offer"
+                    && event["crate"] == "canonical_leaf"
+                    && event["key"] == key
+            })
+            .count();
+        if joined == 2 {
+            break;
+        }
+        assert!(
+            joined < 2,
+            "one client offered the same active action twice"
+        );
+        service.assert_running();
+        first.assert_running();
+        second.assert_running();
+        assert!(Instant::now() < deadline, "{}", service.diagnostics());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let survivor = shared_remote_operation(&root.join("ops"), "survivor");
+    assert_ne!(origin, survivor);
+    let (code, events, output) = first.finish(Duration::from_secs(15), true);
+    assert_ne!(code, 0, "{output}");
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["kind"] == "canonical-build-completed")
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !service.events().iter().any(|event| {
+        event["kind"] == "canonical-service-session-error"
+            && event["reason"].as_str().is_some_and(|reason| {
+                reason.contains("canonical client disconnected; its operation was drained")
+            })
+    }) {
+        service.assert_running();
+        second.assert_running();
+        assert!(
+            Instant::now() < deadline,
+            "origin did not drain independently of shared execution: {}",
+            service.diagnostics()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // The initiating operation has returned, but its actual captured source
+    // must remain until the service-owned producer no longer reads it.
+    assert_eq!(
+        read_bounded(&origin.join("bundle/source/shared-flight-label.txt")),
+        b"origin"
+    );
+    assert_eq!(service.process.as_ref().unwrap().pgid(), service_pid);
+    second.assert_running();
+    drop(paused);
+
+    let (code, events, output) = second.finish(Duration::from_secs(240), false);
+    assert_eq!(code, 0, "{output}\n{}", service.diagnostics());
+    let target =
+        assert_shared_service_build(root, 5101, &events, &output, "survivor:42\n", "disabled");
+    assert_ne!(target, origin.join("target"));
+    let receipt = worker.completed_receipt();
+    let current = service.events();
+    for kind in [
+        "rabsd-remote-dependency-admitted",
+        "rabsd-remote-dependency-executed",
+    ] {
+        assert_eq!(
+            current
+                .iter()
+                .filter(|event| event["kind"] == kind && event["key"] == key)
+                .count(),
+            1,
+            "one real producer and only the surviving destination may complete: {current:?}"
+        );
+    }
+    assert!(
+        !current.iter().any(|event| {
+            event["key"] == key
+                && (matches!(
+                    event["kind"].as_str(),
+                    Some(
+                        "rabsd-remote-dependency-failed" | "rabsd-remote-dependency-install-failed"
+                    )
+                ) || (event["kind"] == "rabsd-live-dependency"
+                    && matches!(
+                        event["decision"].as_str(),
+                        Some("execute" | "hit" | "served")
+                    )))
+        }),
+        "fallback or replay must not satisfy the shared producer: {current:?}"
+    );
+    assert!(
+        !origin.exists(),
+        "finished producer retained its departed origin"
+    );
+    assert!(
+        !survivor.exists(),
+        "delivered target retained its operation owner"
+    );
+
+    // This was only the initial publication. A later cold target must acquire
+    // fresh verification through a new producer, even though the service lives.
+    let later = shared_service_client(root, 5102, &second_profile);
+    let (code, events, output) = later.finish(Duration::from_secs(240), false);
+    assert_eq!(code, 0, "{output}\n{}", service.diagnostics());
+    let later_target =
+        assert_shared_service_build(root, 5102, &events, &output, "survivor:42\n", "disabled");
+    assert_ne!(target, later_target);
+    assert_eq!(
+        service
+            .events()
+            .iter()
+            .filter(|event| {
+                event["kind"] == "rabsd-remote-dependency-admitted" && event["key"] == key
+            })
+            .count(),
+        2,
+        "a terminal cohort bypassed fresh verification or split its action key"
+    );
+    assert!(
+        worker.completed_receipt()["request_id"].as_u64().unwrap()
+            > receipt["request_id"].as_u64().unwrap()
+    );
+    service.finish(Duration::from_secs(15), true);
+    worker.finish();
+}
+
 #[test]
 #[ignore = "requires full canonical bubblewrap namespaces, native toolchain and matching RABS_CANONICAL_TEST_WRAPPER; runs concurrent actual Cargo builds through one persistent service"]
 fn canonical_shared_service_overlaps_builds_scopes_cancellation_and_reuses_private_targets() {
@@ -883,7 +1172,17 @@ fn canonical_shared_service_overlaps_builds_scopes_cancellation_and_reuses_priva
     let first_owner = operation_owner(&first_marker);
     let second_owner = operation_owner(&second_marker);
     assert_ne!(first_owner, second_owner);
+    let toolchains = retained_service_toolchains(&root.join("state"));
+    assert_eq!(
+        toolchains.len(),
+        1,
+        "concurrent builds must share one actual captured compiler"
+    );
     for (operation, label) in [(&first_owner, b"A"), (&second_owner, b"B")] {
+        assert!(
+            !operation.join("bundle/toolchain").exists(),
+            "a shared operation must not recopy the complete toolchain"
+        );
         assert_eq!(
             read_bounded(&operation.join("runtime-workspace/service-label.txt")),
             label,
@@ -947,6 +1246,11 @@ fn canonical_shared_service_overlaps_builds_scopes_cancellation_and_reuses_priva
     assert!(!output.contains("SERVICE_DIAGNOSTIC_A_ONLY"), "{output}");
     let second_target =
         assert_shared_service_build(root, 5001, &events, &output, "B:244\n", "cold");
+    assert_eq!(
+        retained_service_toolchains(&root.join("state")),
+        toolchains,
+        "cancelling another client must preserve the selected compiler image"
+    );
     assert!(!service.diagnostics().contains("SERVICE_DIAGNOSTIC_B_ONLY"));
 
     // Use the same running service and exact source again. The private target
@@ -957,6 +1261,11 @@ fn canonical_shared_service_overlaps_builds_scopes_cancellation_and_reuses_priva
     let warm_target =
         assert_shared_service_build(root, 5003, &events, &output, "B:244\n", "restored");
     assert_ne!(second_target, warm_target);
+    assert_eq!(
+        retained_service_toolchains(&root.join("state")),
+        toolchains,
+        "a subsequent build must reuse the same compiler inode and backing"
+    );
     let fresh_app = output
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -997,6 +1306,10 @@ fn canonical_shared_service_overlaps_builds_scopes_cancellation_and_reuses_priva
     );
     service.assert_running();
     service.finish(Duration::from_secs(15), true);
+    assert!(
+        retained_service_toolchains(&root.join("state")).is_empty(),
+        "service shutdown must join preparation and release its retained images"
+    );
 
     // An existing private cache must not turn a dead service into permission
     // to start a second standalone coordinator or silently compile locally.

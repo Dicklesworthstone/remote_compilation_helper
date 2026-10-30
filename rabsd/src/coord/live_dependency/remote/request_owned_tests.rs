@@ -15,7 +15,7 @@ use std::collections::BTreeSet;
 const ARTIFACT: &[u8] = b"fresh request-owned compiler output";
 const CLUSTER: &str = "request-owned-install-tests";
 
-struct Fixture {
+pub(super) struct Fixture {
     root: tempfile::TempDir,
     cas: Arc<LiveCas>,
     coord: Arc<CoordLive>,
@@ -25,7 +25,7 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let root = crate::test_util::private_tempdir();
         let cas = Arc::new(mount_and_reconcile(&root.path().join("cas")).unwrap());
         let coord = Arc::new(CoordLive::with_cas(Arc::clone(&cas)));
@@ -42,7 +42,7 @@ impl Fixture {
         }
     }
 
-    fn capture(&self) -> RequestOwnedResult {
+    pub(super) fn capture(&self) -> RequestOwnedResult {
         let authority = self.coord.authority().unwrap();
         let object = ObjectId(object_id(ARTIFACT).unwrap());
         let (mut offer, bytes) = offer_serving_object(&authority, &object);
@@ -304,5 +304,29 @@ fn abandoned_private_capture_releases_only_capture_pins_without_installation() {
     assert_eq!(fixture.active_capture_pins(), both / 2);
     drop(second);
     assert_eq!(fixture.active_capture_pins(), 0);
+    fixture.assert_unpublished();
+}
+
+#[test]
+fn shared_flight_conversion_refuses_affine_workspace_custody() {
+    let fixture = Fixture::new();
+    let captured = fixture.capture();
+    let output = Arc::new(RemoteOutput {
+        manifest: captured.manifest().clone(),
+        manifest_key: fixture.manifest.clone(),
+        canonical_transcript: b"private workspace transcript".to_vec(),
+    });
+    assert!(fixture.active_capture_pins() >= 3);
+    let refused = RemoteInstallAuthority::RequestOwned(Box::new(captured))
+        .into_shared_output(Arc::clone(&output));
+    assert!(
+        refused
+            .unwrap_err()
+            .contains("workspace execution cannot enter a shared result")
+    );
+    // Rejecting fan-out drops exactly this affine capture, releases its pins,
+    // and creates no publication, sample, transcript index or target writer.
+    assert_eq!(fixture.active_capture_pins(), 0);
+    assert_eq!(Arc::strong_count(&output), 1);
     fixture.assert_unpublished();
 }

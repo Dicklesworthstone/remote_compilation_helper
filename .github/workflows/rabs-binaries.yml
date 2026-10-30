@@ -109,15 +109,12 @@ jobs:
         run: rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
       - name: Native toolchain retention ownership without the daemon dependency graph
         run: |
-          # Compile the actual production module, not an extracted or rewritten model.
-          # This complements, and does not replace, the full daemon gates below.
-          printf '#![forbid(unsafe_code)]\n#[path = "%s/rabsd/src/coord/live_dependency/remote/toolchains.rs"]\nmod toolchains;\n' \
-            "$GITHUB_WORKSPACE" > "$RUNNER_TEMP/rabs_toolchain_retention.rs"
-          rustc --edition=2024 --test -D warnings \
-            "$RUNNER_TEMP/rabs_toolchain_retention.rs" \
-            -o "$RUNNER_TEMP/rabs_toolchain_retention_tests"
-          timeout 60 "$RUNNER_TEMP/rabs_toolchain_retention_tests"
-          timeout 60 "$RUNNER_TEMP/rabs_toolchain_retention_tests" --test-threads=1
+          # The production owner now includes filesystem capture and lives in
+          # the sandbox crate. Run all original ownership and new image tests.
+          cargo test -p rabs-sandbox --lib toolchain_cache --locked
+          cargo test -p rabs-sandbox --lib toolchain_cache --locked -- --test-threads=1
+          cargo test -p rabs-sandbox --lib snapshot_capture --locked
+          cargo test -p rabs-sandbox --lib source_transfer --locked
       - name: Check changed wrapper formatting
         run: rustfmt --edition 2024 --check rabs-wrap/src/main.rs rabs-wrap/tests/live_protocol.rs
       - name: Run wrapper unit and real socket delivery regressions
@@ -160,6 +157,7 @@ jobs:
       - name: Locked registry capture and isolated Cargo workspace
         run: |
           cargo test --release -p rabsd --lib coord::source_delivery::preparation::cargo --locked
+          cargo test --release -p rabsd --lib coord::source_delivery::toolchain --locked
           cargo test --release -p rabsd --test cargo_vendor_prepare --locked
           cargo test --release -p rabs-sandbox --lib cargo_home --locked
           cargo test --release -p rabs-wkr --lib cargo_home --locked
@@ -180,6 +178,7 @@ jobs:
           test "$size" -lt 2097152
       - name: Worker diagnostic custody through real pipes and retained readers
         run: |
+          cargo test --release -p rabs-asupersync --lib process_groups --locked
           cargo test --release -p rabs-asupersync --lib stream_drain --locked
           cargo test --release -p rabs-wkr --lib output::tests --locked
           cargo test --release -p rabs-wkr --lib session::tests --locked
@@ -207,9 +206,12 @@ jobs:
           cargo test --release -p rabsd --lib output_capture --locked
           cargo test --release -p rabsd --lib capture_pins --locked
           cargo test --release -p rabsd --lib coord::live_dependency::remote::recovery --locked
-          cargo test --release -p rabsd --lib coord::live_dependency::remote::toolchains --locked
+          cargo test --release -p rabs-sandbox --lib toolchain_cache --locked
           cargo test --release -p rabsd --lib coord::live_dependency::remote::worker_pool_tests --locked
           cargo test --release -p rabsd --lib coord::live_dependency::remote::execution_resource_tests --locked
+          cargo test --release -p rabsd --lib coord::live_dependency::shared_work --locked
+          cargo test --release -p rabsd --lib coord::live_dependency::remote::shared --locked
+          cargo test --release -p rabsd --lib coord::live_dependency::remote::request_owned_tests --locked
           cargo test --release -p rabsd --lib coord::remote_dependency_transport::tests --locked
           cargo test --release -p rabsd --lib edge::live_facts::package_capture --locked
       - name: Toolchain ownership and complete live input observations
@@ -243,9 +245,13 @@ jobs:
         timeout-minutes: 30
         env:
           RABS_CANONICAL_TEST_WRAPPER: ${{ github.workspace }}/target/release/rabs-wrap
+          RABS_TEST_WORKER_BIN: ${{ github.workspace }}/target/release/rabs-wkr
         run: |
           cargo test --release -p rabsd --test canonical_check_local --locked \
             canonical_shared_service_overlaps_builds_scopes_cancellation_and_reuses_private_targets \
+            -- --ignored --exact --nocapture
+          cargo test --release -p rabsd --test canonical_check_local --locked \
+            canonical_shared_remote_flight_survives_origin_cancellation \
             -- --ignored --exact --nocapture
       - name: Canonical Cargo delivers no-run tests and always executes current harnesses
         timeout-minutes: 30

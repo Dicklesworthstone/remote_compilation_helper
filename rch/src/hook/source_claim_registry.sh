@@ -571,7 +571,14 @@ for previous in "$registry/$token."*.claim "$registry/$token."*.pending \
     [ -e "$previous" ] || [ -L "$previous" ] || continue
     case "$previous" in *.pending)
         case "$operation" in
-            settle-cancel|locate|cancellation-state) refuse 'unfinished claim transition during namespace reconciliation' ;;
+            settle-cancel|cancellation-state) refuse 'unfinished claim transition during namespace reconciliation' ;;
+            locate)
+                # Discovery may bind a complete interrupted publication, but
+                # must not quarantine or repair an incomplete one as a side
+                # effect of locating an old dispatcher's namespace.
+                rch_claim_record_valid "$previous" \
+                    || refuse 'incomplete pending source namespace evidence'
+                ;;
         esac
         if ! rch_claim_record_valid "$previous"; then
             rch_claim_quarantine_pending "$registry" "$previous" || refuse 'cannot quarantine pending claim'
@@ -660,6 +667,22 @@ fi
 # requesting any worker mutation. A later authorizing transaction must still
 # revalidate ownership and competing lexical/physical roots under those locks.
 if [ "$operation" = locate ]; then
+    if [ -e "$pending" ] || [ -L "$pending" ]; then
+        # A complete pending claim already excludes overlapping admission but
+        # has never granted activity. Legacy recovery must locate this exact
+        # namespace before it can use the normal recover/cancel transitions.
+        # Confirm only an isolated publication; no promotion, source access or
+        # retirement is authorized by this namespace observation.
+        matches_request "$pending"
+        for conflict in "$active" "$released" "$cancelled" "$cancelling" \
+            "$registry/quarantine/$token.$digest.pending"; do
+            [ ! -e "$conflict" ] && [ ! -L "$conflict" ] \
+                || refuse 'pending source namespace has conflicting ownership'
+        done
+        confirm_durable_record "$pending"
+        printf located
+        exit 0
+    fi
     if [ -e "$registry/quarantine/$token.$digest.pending" ] \
         || [ -L "$registry/quarantine/$token.$digest.pending" ]; then
         [ -e "$cancelled" ] && rch_claim_quarantine_fence "$registry" "$cancelling" \
