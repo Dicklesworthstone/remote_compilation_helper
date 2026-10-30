@@ -315,6 +315,25 @@ class SourceNamespaceControlTests(unittest.TestCase):
             self.assertEqual(result.returncode == 0, success, result.stderr)
             self.assertEqual(result.stdout, b"RCH_SOURCE_CANCELLATION_SETTLED\n" if success else b"")
 
+    def test_namespace_lookup_contract_accepts_only_exact_current_or_legacy(self):
+        replies = (
+            b"RCH_SOURCE_AUTHORITY_NAMESPACE current\n",
+            b"RCH_SOURCE_AUTHORITY_NAMESPACE legacy\n",
+        )
+        for reply in (*replies, b"RCH_SOURCE_AUTHORITY_NAMESPACE unknown\n",
+                      replies[0][:-1], replies[1] + b"\n", replies[0] + replies[1],
+                      b"RCH_TOPOLOGY_OK\n", b"RCH_SOURCE_AUTHORITY_NAMESPACE current\x00\n"):
+            with self.subTest(reply=reply):
+                program = shlex.quote(sys.executable) + " -I -S -c " + shlex.quote(
+                    "import os; os.write(1, {!r})".format(reply))
+                result = subprocess.run(
+                    [SHELL, "-c", "set -- RCH_SOURCE_AUTHORITY_NAMESPACE\n" + self.script],
+                    input=program.encode(), capture_output=True, env=self.env,
+                    timeout=5, check=False,
+                )
+                self.assertEqual(result.returncode == 0, reply in replies, result.stderr)
+                self.assertEqual(result.stdout, reply if reply in replies else b"")
+
     def test_malformed_success_is_not_repaired_into_readiness(self):
         for text in (b"", b"RCH_TOPOLOGY_OK", b"RCH_TOPOLOGY_OK\n\n",
                      b"RCH_TOPOLOGY_OK\x00\n", b"noise\nRCH_TOPOLOGY_OK\n"):
@@ -416,6 +435,251 @@ class SourceNamespaceControlTests(unittest.TestCase):
             child.wait(timeout=5)
             child.stdout.close()
             child.stderr.close()
+
+
+@unittest.skipUnless(sys.platform == "linux" and hasattr(os, "pidfd_open"),
+                     "requires native Linux PID-pinned process cleanup")
+class SourceNamespaceTimerObserverTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="rch-namespace-observer-"))
+        self.script = CONTROL.read_text()
+        self.processes = []
+        self.pinned = []
+
+    def tearDown(self):
+        # Failure cleanup signals only pinned fixture identities, never a
+        # remembered group ID after its leader could have been reaped.
+        for descriptor in self.pinned:
+            try:
+                signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            os.close(descriptor)
+        for process in self.processes:
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=5)
+
+    def fixture(self, backend):
+        root = self.root / backend
+        root.mkdir()
+        tools = root / "tools"
+        tools.mkdir()
+        temporary = root / "tmp"
+        temporary.mkdir()
+        for name in ("mktemp", "ps", "head", "grep", "mkfifo", "wc", "cmp",
+                     "cat", "rm", "rmdir", "sleep"):
+            executable = shutil.which(name)
+            self.assertIsNotNone(executable, name)
+            (tools / name).symlink_to(executable)
+        # A regular wrapper permits a scheduling hook without writing through
+        # a symlink to the system shell.
+        (tools / "sh").write_text("#!/bin/sh\nexec " + shlex.quote(SHELL) + ' "$@"\n')
+        (tools / "sh").chmod(0o700)
+        (tools / "python3").symlink_to(sys.executable)
+        if backend == "gnu":
+            if not TIMEOUT or b"GNU coreutils" not in subprocess.run(
+                    [TIMEOUT, "--version"], capture_output=True, timeout=3).stdout:
+                self.skipTest("GNU timer unavailable")
+            (tools / "gnutimeout").symlink_to(TIMEOUT)
+        return root, tools, {"PATH": str(tools), "TMPDIR": str(temporary), "LC_ALL": "C"}
+
+    def start(self, env, program):
+        process = subprocess.Popen([SHELL, "-c", self.script], stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        self.processes.append(process)
+        process.stdin.write(program.encode())
+        process.stdin.close()
+        process.stdin = None
+        return process
+
+    def wait_file(self, path, process):
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                contents = path.read_text()
+                if contents:
+                    return contents
+            except FileNotFoundError:
+                pass
+            self.assertIsNone(process.poll(), "fixture exited before its scheduling boundary")
+            self.assertLess(time.monotonic(), deadline, str(path))
+            time.sleep(0.01)
+
+    def pin(self, pid):
+        descriptor = os.pidfd_open(pid)
+        self.pinned.append(descriptor)
+        return descriptor
+
+    def assert_exited(self, descriptor, timeout=1500):
+        exited = select.poll()
+        exited.register(descriptor, select.POLLIN)
+        self.assertTrue(exited.poll(timeout), "owned process survived timer teardown")
+
+    def sleeper(self, root):
+        code = (
+            "import fcntl,os,signal,time\n"
+            "for s in (signal.SIGHUP,signal.SIGINT,signal.SIGTERM): signal.signal(s,signal.SIG_IGN)\n"
+            "lock=open({!r},'a'); fcntl.flock(lock,fcntl.LOCK_EX)\n"
+            "open({!r},'w').write(str(os.getpid())+' '+str(os.getpgrp())+' '+str(os.getppid()))\n"
+            "os.close(1); os.close(2); time.sleep(60)\n"
+        ).format(str(root / "metadata.lock"), str(root / "held"))
+        return shlex.quote(sys.executable) + " -I -S -c " + shlex.quote(code)
+
+    def python_setup(self, tools, setup):
+        # Only alter the observation capability/scheduling boundary. Execute
+        # the exact production Python afterwards, with real fork/signal/wait.
+        (tools / "python3").rename(tools / "python3.original")
+        bootstrap = ("import os,signal,sys\n"
+                     "if (sys.argv[1:4] == ['-I','-S','-c'] and len(sys.argv)>5\n"
+                     "        and 'timer = os.fork()' in sys.argv[4]):\n"
+                     + "".join("    " + line + "\n" for line in setup.splitlines())
+                     + "    test_program=sys.argv[4]\n"
+                     "    sys.argv=['-c',*sys.argv[5:]]\n"
+                     "    exec(compile(test_program,'<production namespace observer>','exec'))\n"
+                     "else:\n"
+                     "    os.execv(sys.executable,[sys.executable,*sys.argv[1:]])\n")
+        (tools / "python3").write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) +
+                                        " -I -S -c " + shlex.quote(bootstrap) + ' "$@"\n')
+        (tools / "python3").chmod(0o700)
+
+    def exercise_timer_signal(self, signum):
+        for backend in ("gnu", "python"):
+            with self.subTest(backend=backend, signal=signum):
+                root, _, env = self.fixture(backend)
+                claim = root / "durable.claim"
+                claim.write_text("retained ownership\n")
+                with (root / "unrelated.lock").open("a") as unrelated:
+                    fcntl.flock(unrelated, fcntl.LOCK_EX)
+                    process = self.start(env, "exec " + self.sleeper(root))
+                    child, timer, monitor = map(int, self.wait_file(root / "held", process).split())
+                    child_fd, timer_fd, monitor_fd = map(self.pin, (child, timer, monitor))
+                    self.assertNotEqual(timer, os.getpgrp())
+                    signal.pidfd_send_signal(timer_fd, signum)
+                    stdout, stderr = process.communicate(timeout=5)
+                    self.assertEqual((process.returncode, stdout), (73, b""))
+                    self.assertIn(b"RCH_SOURCE_NAMESPACE_CONTROL_UNSETTLED", stderr)
+                    for descriptor in (child_fd, timer_fd, monitor_fd):
+                        self.assert_exited(descriptor)
+                    with (root / "metadata.lock").open("a") as lock:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    with (root / "unrelated.lock").open("a") as probe:
+                        with self.assertRaises(BlockingIOError):
+                            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.assertEqual(claim.read_text(), "retained ownership\n")
+
+    def test_killed_real_timer_cannot_leave_descendants_holding_metadata(self):
+        self.exercise_timer_signal(signal.SIGKILL)
+
+    def test_stopped_real_timer_cannot_leave_descendants_holding_metadata(self):
+        self.exercise_timer_signal(signal.SIGSTOP)
+
+    def test_timer_stopped_before_group_setup_cannot_run_the_program(self):
+        for backend in ("gnu", "python"):
+            with self.subTest(backend=backend):
+                root, tools, env = self.fixture(backend)
+                stopped = root / "stopped"
+                mutation = root / "must-not-run"
+                self.python_setup(tools,
+                    "if sys.argv[5] == 'teardown':\n"
+                    "    test_fork=os.fork\n"
+                    "    def test_stop_child():\n"
+                    "        child=test_fork()\n"
+                    "        if child==0:\n"
+                    "            open({!r},'w').write(str(os.getpid()))\n"
+                    "            os.kill(os.getpid(),signal.SIGSTOP)\n"
+                    "        return child\n"
+                    "    os.fork=test_stop_child".format(str(stopped)))
+                process = self.start(env, "printf unexpected > " + shlex.quote(str(mutation)))
+                stopped_pid = int(self.wait_file(stopped, process))
+                try:
+                    stopped_fd = self.pin(stopped_pid)
+                except ProcessLookupError:
+                    stopped_fd = None  # Already killed and reaped by the observer.
+                stdout, stderr = process.communicate(timeout=5)
+                self.assertTrue(stopped.exists(), "pre-group stop must actually occur")
+                self.assertEqual((process.returncode, stdout), (73, b""))
+                self.assertIn(b"RCH_SOURCE_NAMESPACE_CONTROL_UNSETTLED", stderr)
+                self.assertFalse(mutation.exists())
+                if stopped_fd is not None:
+                    self.assert_exited(stopped_fd)
+
+    def test_observer_does_not_require_waitid_or_inherit_auto_reaping(self):
+        for backend in ("gnu", "python"):
+            with self.subTest(backend=backend):
+                _, tools, env = self.fixture(backend)
+                self.python_setup(tools,
+                    "for feature in ('waitid','WNOWAIT'):\n"
+                    "    if hasattr(os,feature): delattr(os,feature)\n"
+                    "signal.signal(signal.SIGCHLD,signal.SIG_IGN)\n"
+                    "signal.pthread_sigmask(signal.SIG_BLOCK,{signal.SIGCHLD})")
+                process = self.start(env, "printf 'RCH_TOPOLOGY_OK\\n'")
+                stdout, stderr = process.communicate(timeout=5)
+                self.assertEqual((process.returncode, stdout, stderr),
+                                 (0, b"RCH_TOPOLOGY_OK\n", b""))
+
+    def test_ordinary_exit_137_is_not_a_group_teardown_acknowledgement(self):
+        for backend in ("gnu", "python"):
+            with self.subTest(backend=backend):
+                _, _, env = self.fixture(backend)
+                prefix = self.script.split("# GNU timeout kills", 1)[0]
+                timer = "gnutimeout" if backend == "gnu" else "rch_namespace_python_timer"
+                command = (prefix + "\nrch_namespace_timer=" + timer +
+                           "\n(rch_namespace_observed_timer teardown --kill-after=1 1 sh -c 'exit 137')")
+                result = subprocess.run([SHELL, "-c", command], capture_output=True,
+                                        env=env, timeout=5)
+                self.assertEqual((result.returncode, result.stdout, result.stderr), (73, b"", b""))
+
+    def test_observer_death_after_result_cannot_acknowledge_before_group_teardown(self):
+        for backend in ("gnu", "python"):
+            with self.subTest(backend=backend):
+                root, tools, env = self.fixture(backend)
+                stopped = root / "before-group-kill"
+                claim = root / "durable.claim"
+                claim.write_text("retained ownership\n")
+                # Stop the real inner monitor at the kernel-signaling boundary,
+                # after its valid result is written but before group teardown.
+                # Its independent real timer retains the shipped 15s deadline.
+                hook = ("kill() { if [ \"$1:$2\" = -KILL:0 ]; then printf '%s\\n' \"$$\" > " +
+                        shlex.quote(str(stopped)) +
+                        "; command kill -STOP \"$$\"; fi; command kill \"$@\"; };\n")
+                (tools / "sh").write_text(
+                    "#!/bin/sh\nif [ \"${1-}:${3-}\" = -c:rch-namespace-monitor ]; then\n"
+                    "  program=" + shlex.quote(hook) + '"$2"\n'
+                    '  shift 2\n  exec ' + shlex.quote(SHELL) + ' -c "$program" "$@"\nfi\n'
+                    "exec " + shlex.quote(SHELL) + ' "$@"\n')
+                (tools / "sh").chmod(0o700)
+                program = (self.sleeper(root) + " &\nwhile [ ! -s " +
+                           shlex.quote(str(root / "held")) +
+                           " ]; do sleep 0.01; done\nprintf 'RCH_TOPOLOGY_OK\\n'\n")
+                process = self.start(env, program)
+                child, timer, _ = map(int, self.wait_file(root / "held", process).split())
+                child_fd, timer_fd = map(self.pin, (child, timer))
+                monitor = int(self.wait_file(stopped, process))
+                monitor_fd = self.pin(monitor)
+                observer = next(int(line.split()[1]) for line in
+                                Path(f"/proc/{timer}/status").read_text().splitlines()
+                                if line.startswith("PPid:"))
+                self.assertNotEqual(observer, process.pid)
+                observer_fd = self.pin(observer)
+                results = list((root / "tmp").glob("rch-namespace-control.*/result"))
+                self.assertEqual(len(results), 1)
+                self.assertEqual(results[0].read_bytes(), b"0\n")
+                signal.pidfd_send_signal(observer_fd, signal.SIGKILL)
+                process.wait(timeout=5)
+                self.assertEqual(process.returncode, 73,
+                                 "observer death was mistaken for settled teardown")
+                # Keep streams open: closing them would hide orphan cleanup by
+                # delivering SIGPIPE. The independent timer must drain the group.
+                self.assert_exited(child_fd, timeout=20000)
+                for descriptor in (timer_fd, monitor_fd, observer_fd):
+                    self.assert_exited(descriptor)
+                stdout, stderr = process.communicate(timeout=5)
+                self.assertEqual(stdout, b"")
+                self.assertIn(b"RCH_SOURCE_NAMESPACE_CONTROL_UNSETTLED", stderr)
+                with (root / "metadata.lock").open("a") as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.assertEqual(claim.read_text(), "retained ownership\n")
 
 
 if __name__ == "__main__":
