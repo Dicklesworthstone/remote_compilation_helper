@@ -107,15 +107,11 @@ jobs:
         run: rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
       - name: Native toolchain retention ownership without the daemon dependency graph
         run: |
-          # Compile the actual production module, not an extracted or rewritten model.
-          # This complements, and does not replace, the full daemon gates below.
-          printf '#![forbid(unsafe_code)]\n#[path = "%s/rabsd/src/coord/live_dependency/remote/toolchains.rs"]\nmod toolchains;\n' \
-            "$GITHUB_WORKSPACE" > "$RUNNER_TEMP/rabs_toolchain_retention.rs"
-          rustc --edition=2024 --test -D warnings \
-            "$RUNNER_TEMP/rabs_toolchain_retention.rs" \
-            -o "$RUNNER_TEMP/rabs_toolchain_retention_tests"
-          timeout 60 "$RUNNER_TEMP/rabs_toolchain_retention_tests"
-          timeout 60 "$RUNNER_TEMP/rabs_toolchain_retention_tests" --test-threads=1
+          # The production owner now includes filesystem capture and lives in
+          # the sandbox crate. Run all original ownership and new image tests.
+          cargo test -p rabs-sandbox --lib toolchain_cache --locked
+          cargo test -p rabs-sandbox --lib toolchain_cache --locked -- --test-threads=1
+          cargo test -p rabs-sandbox --lib snapshot_capture --locked
       - name: Check changed wrapper formatting
         run: rustfmt --edition 2024 --check rabs-wrap/src/main.rs rabs-wrap/tests/live_protocol.rs
       - name: Run wrapper unit and real socket delivery regressions
@@ -195,7 +191,7 @@ jobs:
           cargo test --release -p rabsd --lib output_capture --locked
           cargo test --release -p rabsd --lib capture_pins --locked
           cargo test --release -p rabsd --lib coord::live_dependency::remote::recovery --locked
-          cargo test --release -p rabsd --lib coord::live_dependency::remote::toolchains --locked
+          cargo test --release -p rabs-sandbox --lib toolchain_cache --locked
           cargo test --release -p rabsd --lib coord::live_dependency::remote::worker_pool_tests --locked
           cargo test --release -p rabsd --lib coord::live_dependency::remote::execution_resource_tests --locked
           cargo test --release -p rabsd --lib coord::remote_dependency_transport::tests --locked
