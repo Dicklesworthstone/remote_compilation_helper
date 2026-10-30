@@ -294,15 +294,26 @@ The worker still drains activity, checks the exact source closure and preserves
 the old-token cancellation fence. Journal changes, missing pair proof and
 conflicting worker records remain failures with the evidence retained.
 
-For a non-paired legacy job with an exact execution-completion receipt, recovery
-also recognizes a cancellation marker left before `finish-cancel` or after
-receipt collection. It checkpoints the observed command exit and cancellation
-obligation before invoking the existing activity-drained cancellation cleanup.
-The observation does not itself mark sources released, return a result, retire
-the journal or acknowledge the daemon. A lost cleanup reply leaves a durable
-obligation for the next recovery owner. Missing or conflicting intent remains
-unconfirmed. A legacy paired job without its required retirement proof remains
-refused rather than borrowing another owner's source pair.
+For a legacy job with an exact execution-completion receipt, recovery also
+recognizes a cancellation marker left before `finish-cancel` or after receipt
+collection. This includes a source pair whose tree or pair retirement has not
+finished. Before adopting that cancellation or requesting cleanup, a paired recipe must
+validate its full source intent, bind the pair token to the same identity,
+include the canonical pair root in that closure, and name that exact root for
+retirement. Comparing canonical spellings does not rewrite the stored pair or
+retirement evidence. An unrelated or invalid pair remains refused before a
+cancellation cleanup grant or source mutation. Earlier namespace discovery or
+preparation-cancellation bookkeeping does not establish cleanup authority.
+
+Recovery checkpoints the observed command exit and cancellation obligation
+before invoking the existing activity-drained cleanup. The observation does
+not itself mark sources released, return a result, retire the journal or
+acknowledge the daemon. A lost cleanup reply leaves a durable obligation for
+the next recovery owner. Missing or conflicting intent remains unconfirmed.
+If the tree checkpoint exists but the pair-release receipt is absent, the early
+metadata-only reconciliation leaves the journal unchanged and defers to the
+later execution-complete or execution-lost path. It does not invent pair
+retirement from an absent receipt.
 
 When cancellation started before tree or pair retirement completed, an exact
 execution-completion or execution-lost proof resumes the existing cancellation
@@ -332,6 +343,23 @@ blocked; only the observer retains its blocked notification mask. Timer death
 is observed before reaping, so descendants cannot retain metadata locks after
 an acknowledged controller teardown. An exit code of 137 alone is not a
 teardown acknowledgement.
+
+Finite shell programs now arrive completely before acquiring the source
+activity lock. Previously, `flock ... sh -s` could acquire activity while SSH
+had delivered only an opening brace, before the build supervisor or execution
+identity existed. A half-open upload could then block cancellation indefinitely.
+The outer shell now parses a complete compound containing a quoted, collision-
+checked heredoc before executing the activity prefix. Interrupted input cannot
+execute the inner program; after a delayed upload completes, the existing
+post-lock ownership check still refuses a cancelled or released identity.
+
+The framing covers build and finite transfer scripts, topology/ownership and
+dependency probes, and the bounded source-manifest verification payload. A
+separate quoted heredoc preserves that verifier's exact TSV bytes and existing
+count/hash checks. Large programs remain on stdin rather than SSH argv. A stalled
+outer upload can still leave an SSH process, but it owns no source activity
+lock. This is not an expiry policy for running compilers or streamed rsync/tar
+payloads: their independent activity must still drain before cancellation.
 
 Finite cancellation, cancellation-finish and release/receipt RPCs, including
 pair reconciliation, run inside the same bounded metadata controller as
@@ -452,6 +480,36 @@ repeated old-token reconciliation remained safe. No skips occurred in these
 suites. The earlier holder/pair-custody results remain scoped to their prior
 revision; this correction did not change those programs.
 
+The next paired-cleanup qualification passed all 20 real loopback SSH cases,
+including eight new regressions. It executes the shipped activity check, pair
+custody/release waiter, lock-session supervisor and retained-tree program.
+Disconnect before retirement and transport loss after the retained-tree rename
+both preserve exact ownership for restart. A surviving cleanup activity must
+drain before retry; concurrent old recovery cannot bypass the real pair lock.
+Missing or changed pair owners, absent source grants and mismatched cancellation
+fences refuse without source mutation. Repeated old-token reconciliation leaves
+the admitted successor's claim, owner and source bytes unchanged. The suite also
+checks a partial finite-script upload followed by cancellation and a delayed
+upload tail. No tests were skipped. A fixture-only first-run failure caused by
+this container exposing `/dev/null` as a regular file was resolved by using a
+private empty SSH configuration; no system device or worker rule was changed.
+
+The finite-upload failure was reproduced against the unchanged `10407d7`
+launch shape: sending only an opening brace to `flock ... sh -s` held activity
+and blocked cancellation until stdin closed. The corrected shell frame instead
+leaves activity unacquired until its complete program arrives and refuses a
+late completion after cancellation. This removes that bootstrap lock orphan;
+it does not claim a universal lifetime bound for all SSH processes.
+The expanded Linux holder/pair suite passed all 76 tests without skips,
+including four new finite-input regressions. The native checks execute the
+production shell frames and post-lock ownership check, and the actual isolated
+Python manifest verifier. They cover incomplete EOF under `sh` and `bash`,
+half-open 256 KiB uploads, cancellation before a delayed tail, empty manifests,
+literal shell metacharacters and Unicode, and legitimate activity surviving
+HUP until completion. The existing heartbeat, stale-lock, pair-publication and
+owner-conflict cases passed in the same run. Pinned workspace formatting and
+`git diff --check` also passed for this correction.
+
 The journal-custody correction passed 25 job-identity and journal tests in the
 actual default-feature `rch-common` crate using the pinned nightly toolchain.
 Default-feature `rch-common` Clippy with `--lib --tests -- -D warnings` also
@@ -481,8 +539,14 @@ Two `completed_source_cancellation_` Rust tests were added for the later legacy
 intent correction, and the four paired tests were strengthened. They exercise
 actual journal ownership and disk reload with injected worker observations,
 including a crash before cleanup, conflicting command outcomes and changed
-custody. All six remain **uncompiled and unexecuted** here. Native worker tests
-validate the registry observations separately from this dispatcher integration.
+custody. The subsequent paired correction adds three further journal tests for
+exact cleanup binding, canonical comparison without rewriting evidence, and
+restart on both sides of tree retirement before pair release. Two new finite
+input tests cover delimiter collisions, large programs, exact manifest bytes
+and malformed input; the existing Python and portable verifier controls now
+exercise framed input too. These changed RCH tests remain **uncompiled and
+unexecuted** here. Native worker tests validate the embedded programs separately
+from the dispatcher builders and journal integration.
 
 The latest locked, default-feature `cargo check -p rch --all-targets` attempt
 again received SIGKILL while compiling the unchanged `asupersync 0.5.0`
@@ -497,6 +561,10 @@ Clippy and Linux process/SSH qualifications do not replace those gates or the
 original affected worker's acceptance. After the legacy-intent correction,
 both the backing filesystem and temporary filesystem had no free space; the
 heavy Rust gates were not repeated under the unchanged memory constraint.
+During the paired/bootstrap follow-up, the backing filesystem still had no
+free space, `/dev/shm` had about 185 MiB available, and cgroup usage was about
+7.9 GiB of the 8 GiB limit. No further heavy compiler retry was attempted under
+those conditions; earlier SIGKILL results are not a verdict on this revision.
 
 On a native host with sufficient build capacity, include these Rust gates with
 the worker acceptance cases below:
@@ -507,6 +575,9 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked -p rch --bin rch namespace_preflight_ -- --test-threads=1
 cargo test --locked -p rch --bin rch paired_cancellation_recovery_ -- --test-threads=1
 cargo test --locked -p rch --bin rch completed_source_cancellation_ -- --test-threads=1
+cargo test --locked -p rch --bin rch finite_source_activity_script_ -- --test-threads=1
+cargo test --locked -p rch --bin rch remote_manifest_finite_input_ -- --test-threads=1
+cargo test --locked -p rch --bin rch verifier_ -- --test-threads=1
 cargo test --locked -p rch --bin rch source_pair_ -- --test-threads=1
 cargo test --locked -p rch --bin rch retry_selection_ -- --test-threads=1
 cargo test --locked -p rch --bin rch retry_custody_ -- --test-threads=1
@@ -528,6 +599,9 @@ worker fixtures:
    remain terminal, with no replay and no invented conflicting local exit.
    Include legacy marker-only journals and lost release replies aged past
    retention, with all shared-registry dispatchers using the updated policy.
+   Include paired legacy journals before tree retirement and after the tree
+   checkpoint but before pair release; exact completion must resume guarded
+   cleanup, while an absent or conflicting owner must remain refused.
 3. Exercise concurrent dispatchers and a still-running activity. Recovery must
    refuse while that activity owns its lock; an unrelated project must continue
    making progress. Corrupt, changed, absent and conflicting evidence must
@@ -537,6 +611,10 @@ worker fixtures:
    scheduling assumptions, durable records remain, and separate build/transfer
    activity is not killed. Include observer and supervisor termination, a
    stopped supervisor and an explicit `SIGCHLD` sent to its observer.
+   Stall a finite script and manifest upload before the closing frame: neither
+   may hold activity. Cancel that exact intent, then deliver the tail and verify
+   that it refuses without touching source contents. Qualify complete large
+   programs and actual build/transfer activity independently of that bootstrap.
 5. Qualify the deployed Linux toolchain, including GNU/uutils differences, and
    native Darwin process/locking behavior where used, using the `python3` found
    on the worker's noninteractive SSH `PATH`. Exercise an inherited ignored

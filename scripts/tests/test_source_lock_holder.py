@@ -10,8 +10,10 @@ import contextlib
 import errno
 import fcntl
 import hashlib
+import json
 import os
 from pathlib import Path
+import re
 import resource
 import selectors
 import shlex
@@ -35,6 +37,20 @@ CLAIM_REGISTRY = (REPO / "rch/src/hook/source_claim_registry.sh").read_text()
 CLAIM_HELPER_SOURCE = (REPO / "rch-common/src/stale_target_reap.rs").read_text()
 CLAIM_HELPERS = CLAIM_HELPER_SOURCE.split(
     'pub const SOURCE_CLAIM_RECORD_HELPERS: &str = r#"', 1)[1].split('"#;', 1)[0]
+# Execute the unchanged production upload framing and post-lock ownership
+# check. The native suite does not reimplement either admission decision.
+ACTIVITY_SOURCE = SSH_SOURCE.split(
+    'fn source_authority_activity_prefix_for_mode(', 1)[1].split('\n}\n', 1)[0]
+ACTIVITY_LITERAL = re.search(r'let check = ("(?:[^"\\]|\\[\s\S])*");', ACTIVITY_SOURCE).group(1)
+ACTIVITY_CHECK = json.loads(re.sub(r'\\\n[ \t]*', '', ACTIVITY_LITERAL))
+TRANSFER_SOURCE = (REPO / "rch/src/transfer.rs").read_text()
+FINITE_ACTIVITY_TEMPLATE = TRANSFER_SOURCE.split(
+    'pub(crate) fn source_activity_finite_script(', 1)[1].split('r#"', 1)[1].split('"#', 1)[0]
+FIDELITY_SOURCE = (REPO / "rch/src/hook/source_fidelity.rs").read_text()
+MANIFEST_TEMPLATE = FIDELITY_SOURCE.split(
+    'fn remote_manifest_verifier_script(', 1)[1].split('r#"', 1)[1].split('"#', 1)[0]
+MANIFEST_VERIFIER = FIDELITY_SOURCE.split(
+    'const REMOTE_VERIFY_PYTHON: &str = r#"', 1)[1].split('"#;', 1)[0]
 FLOCK = shutil.which("flock")
 GNU_FLOCK = bool(FLOCK and b"--no-fork" in subprocess.run(
     [FLOCK, "--help"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -484,8 +500,21 @@ class SourceLockHolderTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="rch-source-holder-"))
         self.holders = []
+        self.activity_processes = []
 
     def tearDown(self):
+        for process in reversed(self.activity_processes):
+            # Each fixture created its own group. Signal it only while its
+            # unreaped leader remains this test's direct child.
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+            if process.stdin is not None:
+                try:
+                    process.stdin.close()
+                except BrokenPipeError:
+                    pass
+                process.stdin = None
+            process.communicate(timeout=5)
         for holder in reversed(self.holders):
             holder.close()
 
@@ -610,6 +639,199 @@ class SourceLockHolderTests(unittest.TestCase):
         return subprocess.run(command, input=content, stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, timeout=20, check=False,
                               env={**os.environ, "LC_ALL": "C"})
+
+    def finite_activity_script(self, registry, command, token="aa"):
+        prefix = shlex.join([
+            "nohup", FLOCK, "-x", "--", str(registry / f"{token}.activity.lock"),
+            "sh", "-c", ACTIVITY_CHECK, "rch-source-activity", str(registry), token, "active",
+        ])
+        delimiter = "RCH_TEST_FINITE_ACTIVITY"
+        self.assertNotIn(delimiter, command.splitlines())
+        return FINITE_ACTIVITY_TEMPLATE.format(
+            prefix=prefix, script=command, delimiter=delimiter), delimiter
+
+    def start_finite_activity(self, script):
+        process = subprocess.Popen(
+            ["/bin/sh", "-s"], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+            cwd=self.root,
+        )
+        self.activity_processes.append(process)
+        process.stdin.write(script.encode())
+        process.stdin.flush()
+        return process
+
+    def finish_finite_activity(self, process, remaining=""):
+        if remaining:
+            process.stdin.write(remaining.encode())
+            process.stdin.flush()
+        process.stdin.close()
+        process.stdin = None
+        return process.communicate(timeout=5)
+
+    @unittest.skipUnless(FLOCK, "flock required for real activity authority")
+    def test_finite_activity_incomplete_eof_never_executes_or_acquires_authority(self):
+        shells = ["/bin/sh", *([BASH] if BASH else [])]
+        for shell in shells:
+            for frontier in ("opening", "header", "body", "delimiter", "closing-brace"):
+                with self.subTest(shell=shell, frontier=frontier):
+                    registry = self.release_registry(f"{Path(shell).name}-{frontier}")
+                    claim, _, content = self.claim_record(registry, "aa", [self.root / "project"])
+                    inode = claim.stat().st_ino
+                    ran = registry / "workload-started"
+                    payload = "printf started > {}\n# {}\n".format(
+                        shlex.quote(str(ran)), "x" * (256 * 1024))
+                    script, delimiter = self.finite_activity_script(registry, payload)
+                    body = script.index(payload)
+                    end = script.index("\n" + delimiter + "\n", body)
+                    cut = {
+                        "opening": 2,
+                        "header": body,
+                        "body": body + len(payload) // 2,
+                        "delimiter": end + len(delimiter) // 2,
+                        "closing-brace": len(script) - 2,
+                    }[frontier]
+                    result = subprocess.run(
+                        [shell, "-s"], input=script[:cut].encode(),
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        timeout=5, check=False,
+                    )
+                    self.assertNotEqual(result.returncode, 0, (frontier, result.stderr))
+                    self.assertFalse(ran.exists(), "partial bootstrap executed a workload")
+                    self.assertFalse((registry / "aa.activity.lock").exists(),
+                                     "partial bootstrap entered the activity prefix")
+                    self.assertEqual((claim.stat().st_ino, claim.read_bytes()), (inode, content))
+
+    @unittest.skipUnless(FLOCK, "flock required for real activity cancellation")
+    def test_half_open_finite_upload_cannot_cross_cancel_or_terminal_fence(self):
+        for terminal in (False, True):
+            with self.subTest(terminal=terminal):
+                registry = self.release_registry("terminal" if terminal else "cancelling")
+                roots = [self.root / "unmaterialized-project"]
+                claim, digest, content = self.claim_record(registry, "aa", roots)
+                inode = claim.stat().st_ino
+                ran = registry / "workload-started"
+                payload = "printf forbidden > {}\n# {}\n".format(
+                    shlex.quote(str(ran)), "x" * (256 * 1024))
+                script, delimiter = self.finite_activity_script(registry, payload)
+                cut = script.index("\n" + delimiter + "\n", script.index(payload))
+                process = self.start_finite_activity(script[:cut])
+                # The upload exceeds pipe capacity, so its initial bytes have
+                # actually been consumed, but the channel stays open. There is
+                # no activity lock, workload or PGID for cancellation to drain.
+                self.assertIsNone(process.poll())
+                self.assertFalse((registry / "aa.activity.lock").exists())
+                self.assertFalse(ran.exists())
+                cancelled = self.registry_transaction(registry, "aa", roots, "cancel")
+                self.assertEqual((cancelled.returncode, cancelled.stdout),
+                                 (0, b"owned"), cancelled.stderr)
+                fence = registry / f"aa.{digest}.cancelling"
+                self.assertEqual((claim.stat().st_ino, claim.read_bytes()), (inode, content))
+                self.assertEqual(fence.read_bytes(), content)
+                if terminal:
+                    # No source tree was materialized. This exact transaction
+                    # settles only the fixture's owned cancellation.
+                    finished = self.registry_transaction(registry, "aa", roots, "finish-cancel")
+                    self.assertEqual((finished.returncode, finished.stdout),
+                                     (0, b""), finished.stderr)
+                stdout, stderr = self.finish_finite_activity(process, script[cut:])
+                self.assertEqual((process.returncode, stdout), (73, b""), stderr)
+                self.assertIn(b"source grant is not active" if terminal
+                              else b"source grant is cancelling", stderr)
+                self.assertFalse(ran.exists(), "late upload bypassed the cancellation fence")
+                self.assertTrue(available(registry / "aa.activity.lock"))
+                retained = registry / "cancelled" / f"aa.{digest}.claim" if terminal else claim
+                self.assertEqual(retained.read_bytes(), content)
+                self.assertEqual(fence.read_bytes(), content)
+
+    @unittest.skipUnless(FLOCK, "flock required for real activity authority")
+    def test_complete_finite_program_preserves_bytes_and_live_activity_after_hup(self):
+        registry = self.release_registry()
+        claim, _, content = self.claim_record(registry, "aa", [self.root / "project"])
+        started = registry / "workload-started"
+        finish = registry / "workload-may-finish"
+        literal = "$(printf expanded) `printf expanded` $HOME 'literal'"
+        payload = "# {}\nprintf started > {}; while [ ! -e {} ]; do sleep 0.02; done; printf '%s' {}; exit 17\n".format(
+            "x" * (256 * 1024), shlex.quote(str(started)),
+            shlex.quote(str(finish)), shlex.quote(literal))
+        script, _ = self.finite_activity_script(registry, payload)
+        process = self.start_finite_activity(script)
+        process.stdin.close()
+        process.stdin = None
+        eventually(started.exists, "complete bootstrap did not start its workload")
+        activity = registry / "aa.activity.lock"
+        self.assertFalse(available(activity), "running workload lost activity authority")
+        os.killpg(process.pid, signal.SIGHUP)
+        self.assertIsNone(process.poll())
+        self.assertFalse(available(activity), "HUP released a running workload's authority")
+        self.assertEqual(claim.read_bytes(), content)
+        finish.write_bytes(b"finish\n")
+        stdout, stderr = process.communicate(timeout=5)
+        self.assertEqual((process.returncode, stdout, stderr), (17, literal.encode(), b""))
+        self.assertTrue(available(activity))
+        self.assertEqual(claim.read_bytes(), content)
+
+    @unittest.skipUnless(FLOCK, "flock required for real manifest activity")
+    def test_finite_manifest_preserves_verifier_stdin_and_refuses_incomplete_uploads(self):
+        for frontier in ("empty", "complete", "incomplete-eof", "cancelled"):
+            with self.subTest(frontier=frontier):
+                registry = self.release_registry(frontier)
+                root = registry / "source root with ' quotes"
+                root.mkdir()
+                files = []
+                if frontier != "empty":
+                    for name, data, executable in (
+                        ("literal '$HOME `printf changed` $(printf changed) café.rs", b"source\n", False),
+                        ("executable.sh", b"#!/bin/sh\nexit 0\n", True),
+                    ):
+                        path = root / name
+                        path.write_bytes(data)
+                        path.chmod(0o755 if executable else 0o644)
+                        files.append((path, data, executable))
+                payload = "".join("{}\t{}\t{}\t{}\n".format(
+                    hashlib.sha256(data).hexdigest(), len(data), int(executable), path.name,
+                ) for path, data, executable in files)
+                total = sum(len(data) for _, data, _ in files)
+                # This is the exact production Python verifier, not a receipt
+                # stub. Its row count and byte denominator detect even one
+                # extra newline or shell expansion in the nested payload.
+                verifier = shlex.join([
+                    sys.executable, "-I", "-c", MANIFEST_VERIFIER,
+                    str(root), str(len(files)), str(total),
+                ])
+                program = MANIFEST_TEMPLATE.format(
+                    command=shlex.quote(verifier), payload=payload,
+                    delimiter="RCH_TEST_MANIFEST_INPUT",
+                )
+                script, _ = self.finite_activity_script(registry, program)
+                claim, _, content = self.claim_record(registry, "aa", [root])
+                if frontier in ("empty", "complete"):
+                    process = self.start_finite_activity(script)
+                    stdout, stderr = self.finish_finite_activity(process)
+                    self.assertEqual((process.returncode, stdout, stderr), (
+                        0, f"RCH_SOURCE_CONTENT_VERIFIED\t{len(files)}\t{total}\n".encode(), b"",
+                    ))
+                else:
+                    cut = script.index(payload) + len(payload) // 2
+                    process = self.start_finite_activity(script[:cut])
+                    self.assertIsNone(process.poll())
+                    self.assertFalse((registry / "aa.activity.lock").exists())
+                    if frontier == "cancelled":
+                        cancelled = self.registry_transaction(registry, "aa", [root], "cancel")
+                        self.assertEqual((cancelled.returncode, cancelled.stdout),
+                                         (0, b"owned"), cancelled.stderr)
+                        stdout, stderr = self.finish_finite_activity(process, script[cut:])
+                        self.assertEqual((process.returncode, stdout), (73, b""), stderr)
+                        self.assertIn(b"source grant is cancelling", stderr)
+                    else:
+                        stdout, stderr = self.finish_finite_activity(process)
+                        self.assertNotEqual(process.returncode, 0, stderr)
+                        self.assertEqual(stdout, b"")
+                        self.assertFalse((registry / "aa.activity.lock").exists())
+                self.assertEqual(claim.read_bytes(), content)
+                for path, data, executable in files:
+                    self.assertEqual(path.read_bytes(), data)
+                    self.assertEqual(bool(path.stat().st_mode & 0o111), executable)
 
     def start_release_waiter(self, registry, token, binding, mode="source", lock=None,
                              session_idle=None):

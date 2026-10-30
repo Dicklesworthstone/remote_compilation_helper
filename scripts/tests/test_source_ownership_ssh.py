@@ -2,7 +2,8 @@
 """Qualify source ownership over real, isolated loopback OpenSSH on Linux.
 
 This runs the exact production holder, release waiter, pair custody, registry
-transaction and namespace controller. It uses fixture-owned host/client keys, strict host
+transaction, activity check, retained-tree program and namespace controller.
+It uses fixture-owned host/client keys, strict host
 verification and a server listening only on 127.0.0.1. Heartbeat fault tests
 select a two-second worker lease through the production session argument;
 they do not alter the production protocol or kernel-lock implementation.
@@ -15,9 +16,11 @@ import contextlib
 import errno
 import fcntl
 import hashlib
+import json
 import os
 from pathlib import Path
 import pwd
+import re
 import select
 import shlex
 import shutil
@@ -36,6 +39,14 @@ CONTROL = (REPO / "rch/src/hook/source_namespace_control.sh").read_text()
 SSH_SOURCE = (REPO / "rch/src/hook/ssh.rs").read_text()
 WAITER = SSH_SOURCE.split('const SOURCE_AUTHORITY_RELEASE_WAITER: &str = r#"', 1)[1].split('"#;', 1)[0]
 PAIR_CUSTODY = SSH_SOURCE.split('const SOURCE_PAIR_CUSTODY: &str = r#"', 1)[1].split('"#;', 1)[0]
+# Decode Rust's existing literal, including escaped-newline continuation. The
+# shell check itself is not a fixture implementation of the ownership rules.
+ACTIVITY_SOURCE = SSH_SOURCE.split('fn source_authority_activity_prefix_for_mode(', 1)[1].split('\n}\n', 1)[0]
+ACTIVITY_LITERAL = re.search(r'let check = ("(?:[^"\\]|\\[\s\S])*");', ACTIVITY_SOURCE).group(1)
+ACTIVITY_CHECK = json.loads(re.sub(r'\\\n[ \t]*', '', ACTIVITY_LITERAL))
+TRANSFER_SOURCE = (REPO / "rch/src/transfer.rs").read_text()
+RETENTION = TRANSFER_SOURCE.split("fn remote_tree_retention_program() -> &'static str {", 1)[1].split('r#"', 1)[1].split('"#', 1)[0]
+FINITE_ACTIVITY = TRANSFER_SOURCE.split('pub(crate) fn source_activity_finite_script(', 1)[1].split('r#"', 1)[1].split('"#', 1)[0]
 HELPERS_SOURCE = (REPO / "rch-common/src/stale_target_reap.rs").read_text()
 HELPERS = HELPERS_SOURCE.split('pub const SOURCE_CLAIM_RECORD_HELPERS: &str = r#"', 1)[1].split('"#;', 1)[0]
 TRANSACTION = HELPERS + "\n" + (REPO / "rch/src/hook/source_claim_registry.sh").read_text()
@@ -148,6 +159,10 @@ class SourceOwnershipSshTests(unittest.TestCase):
         (cls.server_root / "known_hosts").write_text(
             "[127.0.0.1]:{} {}\n".format(
                 port, " ".join((cls.server_root / "host.pub").read_text().split()[:2])))
+        # Do not share the config path with worker stdout/stderr sinks. Some
+        # constrained qualification containers expose /dev/null as a file.
+        empty_config = cls.server_root / "empty_config"
+        empty_config.write_text("")
         config = cls.server_root / "sshd_config"
         config.write_text(
             "ListenAddress 127.0.0.1\nPort {}\nHostKey {}\nPidFile {}\n"
@@ -161,15 +176,17 @@ class SourceOwnershipSshTests(unittest.TestCase):
                 cls.server_root / "client.pub", cls.username))
         cls.server_log = (cls.server_root / "sshd.log").open("ab")
         cls.server = subprocess.Popen([SSHD, "-D", "-e", "-f", str(config)],
-                                      stdin=subprocess.DEVNULL, stdout=cls.server_log,
+                                      stdin=subprocess.PIPE, stdout=cls.server_log,
                                       stderr=cls.server_log)
+        cls.server.stdin.close()
+        cls.server.stdin = None
         cls.addClassCleanup(cls.stop_server)
-        cls.argv = [SSH, "-F", "/dev/null", "-T", "-p", str(port),
+        cls.argv = [SSH, "-F", str(empty_config), "-T", "-p", str(port),
                     "-i", str(cls.server_root / "client"),
                     "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none",
                     "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
                     "-o", "UserKnownHostsFile=" + str(cls.server_root / "known_hosts"),
-                    "-o", "GlobalKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR",
+                    "-o", "GlobalKnownHostsFile=" + str(empty_config), "-o", "LogLevel=ERROR",
                     "-o", "ControlMaster=no", "-o", "ControlPath=none",
                     "-o", "ConnectTimeout=5", "-o", "ServerAliveInterval=0",
                     cls.username + "@127.0.0.1"]
@@ -250,23 +267,25 @@ class SourceOwnershipSshTests(unittest.TestCase):
         stdout, stderr = client.finish()
         return client.process.returncode, stdout, stderr
 
-    def pair_command(self, operation, source, token=None, after=""):
+    def pair_program(self, operation, source, token=None):
         token = token or self.token
-        lock = self.root / "pair.lock"
         # The Rust caller supplies the exact per-token receipt name. This
         # fixture exercises that worker program and lock order over real SSH;
         # it does not substitute for compiling Rust's command construction.
         receipt = self.root / ("pair.lock.released-" + token)
+        return shlex.join([
+            sys.executable, "-I", "-S", "-c", PAIR_CUSTODY, operation,
+            str(self.root / "pair.lock.owner"), str(receipt), token, str(source)])
+
+    def pair_command(self, operation, source, token=None, after=""):
+        lock = self.root / "pair.lock"
         command = [FLOCK, "-x", "--", str(lock)]
         if operation == "claim":
             command.extend([FLOCK, "-x", "--", str(self.registry / "metadata.lock")])
-        program = [sys.executable, "-I", "-S", "-c", PAIR_CUSTODY, operation,
-                   str(self.root / "pair.lock.owner"), str(receipt), token, str(source)]
+        program = self.pair_program(operation, source, token)
         if after:
-            command.extend(["sh", "-c", "set -eu\n" + shlex.join(program) + after])
-        else:
-            command.extend(program)
-        return shlex.join(command)
+            return shlex.join([*command, "sh", "-c", "set -eu\n" + program + after])
+        return shlex.join(command) + " " + program
 
     def pair_transaction(self, operation, source, token=None):
         return subprocess.run([*self.argv, self.pair_command(operation, source, token)],
@@ -314,8 +333,125 @@ class SourceOwnershipSshTests(unittest.TestCase):
         self.assertFalse(available(self.activity_lock))
         return client
 
+    def prepare_materialized_pair(self, pair_token=None, claim_pair=True, grant_source=True):
+        # Keep the default fixture intact; every materialized or retained tree
+        # remains available for inspection after this test finishes.
+        self.token = "1234567890abcdef1234567890abcdef"
+        self.source = self.root / "owned-pair-source"
+        self.retained = self.root / (self.source.name + ".retained-" + self.token)
+        self.roots = "".join(root + "\n" for root in sorted(map(str, (self.source, self.retained))))
+        self.digest = hashlib.sha256(self.roots.encode()).hexdigest()
+        self.active = self.registry / (self.token + "." + self.digest + ".claim")
+        self.fence = self.registry / (self.token + "." + self.digest + ".cancelling")
+        self.activity_lock = self.registry / (self.token + ".activity.lock")
+        if claim_pair:
+            pair = self.pair_transaction("claim", self.source, pair_token)
+            self.assertEqual((pair.returncode, pair.stdout, pair.stderr), (0, b"", b""))
+        if grant_source:
+            granted = self.transaction("acquire")
+            self.assertEqual((granted.returncode, granted.stdout, granted.stderr), (0, b"", b""))
+        self.source.mkdir()
+        (self.source / "sentinel").write_bytes(b"materialized source evidence\n")
+
+    def activity_prefix(self, mode="cleanup", token=None):
+        token = token or self.token
+        return shlex.join([
+            "nohup", FLOCK, "-x", "--", str(self.registry / (token + ".activity.lock")),
+            "sh", "-c", ACTIVITY_CHECK, "rch-source-activity", str(self.registry),
+            token, mode])
+
+    def activity_command(self, program, mode="cleanup", token=None):
+        return self.activity_prefix(mode, token) + " " + shlex.join(["sh", "-c", program])
+
+    def retention_command(self, identity=None, root=None, retained=None):
+        return shlex.join([
+            sys.executable, "-I", "-c", RETENTION, "retain", str(root or self.source),
+            str(retained or self.retained), identity or self.token, "0"])
+
+    def retain_pair_tree(self, **arguments):
+        return subprocess.run([*self.argv, self.activity_command(self.retention_command(**arguments))],
+                              input=b"", capture_output=True, timeout=8)
+
+    def start_checked_activity(self, mode="active", before=""):
+        program = (before + "\n" if before else "") + (
+            "exec " + shlex.join([sys.executable, "-I", "-S", "-c",
+                                  "import sys\nprint('ACTIVITY_READY',flush=True)\n"
+                                  "sys.exit(0 if sys.stdin.readline()=='finish\\n' else 9)\n"]))
+        return self.start("exec " + self.activity_command(program, mode))
+
+    def start_cancel_waiter(self, label):
+        reached = self.root / (label + ".entered")
+        command = ("printf entered > " + QUOTE(str(reached)) + "\nexec " +
+                   shlex.join([FLOCK, "-x", "--", str(self.activity_lock)]) + " " +
+                   self.invocation("cancel") + " <<'RCH_SOURCE_CLAIM_ROOTS'\n" +
+                   self.roots + "RCH_SOURCE_CLAIM_ROOTS\n")
+        client = self.start(command, "set -- RCH_SOURCE_INTENT_CANCEL\n" + CONTROL)
+        eventually(lambda: reached.exists(), "cancellation did not reach the activity lock")
+        return client
+
+    def start_pair_holder(self, mode="cleanup-pair", idle=90, ready=True, label="cleanup", token=None):
+        token = token or self.token
+        release = "RCH_SOURCE_PAIR_RELEASE:" + token
+        ready_marker = "RCH_SOURCE_PAIR_READY:" + token
+        waiter = shlex.join([sys.executable, "-I", "-S", "-c", WAITER, mode,
+                             str(self.registry), token, str(self.source), release])
+        after = ("\nprintf '%s\\n' " + QUOTE(ready_marker) + "\n" + waiter + "\n" +
+                 self.pair_program("release", self.source, token) +
+                 "\nprintf '%s\\n' " + QUOTE(release) + "\n")
+        reached = self.root / (label + ".entered")
+        program = ("printf entered > " + QUOTE(str(reached)) + "\nexec " +
+                   self.pair_command("recover", self.source, token, after))
+        supervised = ("set -eu\nexec 3<<'RCH_SOURCE_LOCK_SESSION_PROGRAM'\n" + program +
+                      "\nRCH_SOURCE_LOCK_SESSION_PROGRAM\nexec sh -c " + QUOTE(HOLDER) +
+                      " " + QUOTE(HOLDER) + " --rch-session " + str(idle))
+        client = self.start(supervised)
+        client.pair_release = release
+        eventually(lambda: reached.exists(), "pair recovery did not reach its kernel lock")
+        if ready:
+            self.assertEqual(client.line(), ready_marker.encode())
+            if mode == "cleanup-pair":
+                self.assertFalse(available(self.root / "pair.lock"))
+        return client
+
+    def release_pair_holder(self, holder, queued=False):
+        holder.send(holder.pair_release + "\n")
+        stdout, stderr = holder.finish()
+        self.assertEqual((holder.process.returncode, stdout, stderr),
+                         (0, (holder.pair_release + "\n").encode(), b""))
+        if not queued:
+            self.assertTrue(available(self.root / "pair.lock"))
+
+    def finish_pair_cancellation(self):
+        finished = self.transaction("finish-cancel")
+        self.assertEqual((finished.returncode, finished.stdout, finished.stderr), (0, b"", b""))
+        self.assertFalse(self.active.exists())
+        self.assertEqual(self.fence.read_text(), self.roots)
+        self.assertEqual((self.registry / "cancelled" / self.active.name).read_text(), self.roots)
+        successor_token = "b" * 32
+        successor = self.pair_transaction("claim", self.source, successor_token)
+        self.assertEqual((successor.returncode, successor.stdout, successor.stderr), (0, b"", b""))
+        admitted = self.transaction("try-acquire", successor_token)
+        self.assertEqual((admitted.returncode, admitted.stdout, admitted.stderr), (0, b"", b""))
+        self.source.mkdir()
+        sentinel = self.source / "successor"
+        sentinel.write_bytes(b"live successor source\n")
+        owner = self.root / "pair.lock.owner"
+        claim = self.registry / (successor_token + "." + self.digest + ".claim")
+        before = [(path.stat().st_ino, path.read_bytes()) for path in (owner, claim, sentinel)]
+        for _ in range(2):
+            settled = self.transaction("settle-cancel")
+            self.assertEqual((settled.returncode, settled.stdout, settled.stderr), (0, b"settled", b""))
+            released = self.pair_transaction("released", self.source)
+            self.assertEqual((released.returncode, released.stdout, released.stderr), (0, b"released", b""))
+            self.assertEqual([(path.stat().st_ino, path.read_bytes()) for path in (owner, claim, sentinel)], before)
+        late = self.retain_pair_tree()
+        self.assertEqual(late.returncode, 73, late.stderr)
+        self.assertIn(b"source grant is not active", late.stderr)
+        self.assertEqual([(path.stat().st_ino, path.read_bytes()) for path in (owner, claim, sentinel)], before)
+        self.assertEqual((self.retained / "sentinel").read_bytes(), b"materialized source evidence\n")
+
     @contextlib.contextmanager
-    def heartbeat_during_setup(self, holder):
+    def heartbeat_during_setup(self, holder, lock=None):
         # Establishing the independent SSH session is not the transport fault.
         # Keep the short test lease alive during that real handshake, just as
         # the dispatcher does, then stop the sole producer before injecting it.
@@ -340,7 +476,7 @@ class SourceOwnershipSshTests(unittest.TestCase):
             self.assertFalse(sender.is_alive(), "fixture heartbeat producer did not stop")
             self.assertFalse(failures, "source holder died before transport fault injection")
         self.assertIsNone(holder.process.poll(), "source holder exited during fixture setup")
-        self.assertFalse(available(self.kernel_lock), "source lock was lost before the transport fault")
+        self.assertFalse(available(lock or self.kernel_lock), "source lock was lost before the transport fault")
 
     def assert_owner_retained(self):
         self.assertEqual(self.active.read_text(), self.roots)
@@ -504,6 +640,219 @@ class SourceOwnershipSshTests(unittest.TestCase):
                               for path in (owner, fresh, sentinel)], before)
         self.assertFalse(self.active.exists())
         self.assertEqual((self.registry / "cancelled" / self.active.name).read_text(), self.roots)
+
+    def test_materialized_pair_cancellation_drains_activity_and_excludes_late_recovery(self):
+        self.prepare_materialized_pair()
+        activity = self.start_checked_activity()
+        self.assertEqual(activity.line(), b"ACTIVITY_READY")
+        before = (self.active.stat().st_ino, self.active.read_bytes())
+        cancelling = self.start_cancel_waiter("initial-cancellation")
+        self.assertIsNone(cancelling.line(seconds=0.25), "cancel bypassed live activity")
+        self.assertFalse(self.fence.exists())
+        self.assertEqual((self.active.stat().st_ino, self.active.read_bytes()), before)
+        self.finish_activity(activity)
+        stdout, stderr = cancelling.finish()
+        self.assertEqual((cancelling.process.returncode, stdout, stderr), (0, b"owned", b""))
+
+        # The legacy normal guard yields to this fence. Recovery must acquire
+        # the cleanup-specific guard, not retry the same normal guard forever.
+        normal = self.start_pair_holder(mode="pair", label="normal")
+        normal.process.wait(timeout=5)
+        stdout, stderr = normal.finish()
+        self.assertEqual((normal.process.returncode, stdout), (75, b""), stderr)
+        self.assertIn(b"yielding kernel locks", stderr)
+        owned = self.pair_transaction("cancel-owned", self.source)
+        self.assertEqual((owned.returncode, owned.stdout, owned.stderr), (0, b"owned", b""))
+        holder = self.start_pair_holder()
+        late = self.start_pair_holder(ready=False, label="concurrent-recovery")
+        self.assertIsNone(late.line(seconds=0.25), "concurrent recovery bypassed the pair lock")
+        blocked = self.transaction("try-acquire", token="b" * 32)
+        self.assertEqual((blocked.returncode, blocked.stdout), (75, b""), blocked.stderr)
+
+        inode = self.source.stat().st_ino
+        retained = self.retain_pair_tree()
+        self.assertEqual((retained.returncode, retained.stdout, retained.stderr),
+                         (0, b"RCH_SOURCE_RETAINED\n", b""))
+        self.assertFalse(self.source.exists())
+        self.assertEqual(self.retained.stat().st_ino, inode)
+        self.assertEqual(self.active.read_text(), self.roots)
+        self.assertFalse((self.root / ("pair.lock.released-" + self.token)).exists())
+        self.release_pair_holder(holder, queued=True)
+        late.process.wait(timeout=5)
+        stdout, stderr = late.finish()
+        self.assertEqual((late.process.returncode, stdout), (73, b""), stderr)
+        self.assertIn(b"RCH_SOURCE_PAIR_OWNERSHIP_UNCONFIRMED", stderr)
+        self.assertTrue(available(self.root / "pair.lock"))
+        self.finish_pair_cancellation()
+
+    def test_cleanup_pair_ssh_disconnect_before_retirement_keeps_exact_ownership(self):
+        self.prepare_materialized_pair()
+        cancelled = self.transaction("cancel")
+        self.assertEqual((cancelled.returncode, cancelled.stdout, cancelled.stderr), (0, b"owned", b""))
+        evidence = (self.active, self.fence, self.root / "pair.lock.owner", self.source / "sentinel")
+        before = [(path.stat().st_ino, path.read_bytes()) for path in evidence]
+        holder = self.start_pair_holder(idle=2)
+        stdout, stderr = holder.finish()  # EOF without an explicit release frame.
+        self.assertEqual((holder.process.returncode, stdout), (73, b""), stderr)
+        self.assertIn(b"RCH_SOURCE_LOCK_DISCONNECTED", stderr)
+        self.assertTrue(available(self.root / "pair.lock"))
+        self.assertEqual([(path.stat().st_ino, path.read_bytes()) for path in evidence], before)
+        self.assertFalse(self.retained.exists())
+        released = self.pair_transaction("released", self.source)
+        self.assertEqual((released.returncode, released.stdout, released.stderr), (0, b"pending", b""))
+        blocked = self.transaction("try-acquire", token="b" * 32)
+        self.assertEqual((blocked.returncode, blocked.stdout), (75, b""), blocked.stderr)
+
+        restarted = self.start_pair_holder(label="restarted-cleanup")
+        retained = self.retain_pair_tree()
+        self.assertEqual((retained.returncode, retained.stdout, retained.stderr),
+                         (0, b"RCH_SOURCE_RETAINED\n", b""))
+        self.release_pair_holder(restarted)
+        self.finish_pair_cancellation()
+
+    def test_cleanup_pair_transport_loss_after_retention_drains_live_cleanup_before_retry(self):
+        self.prepare_materialized_pair()
+        cancelled = self.transaction("cancel")
+        self.assertEqual((cancelled.returncode, cancelled.stdout, cancelled.stderr), (0, b"owned", b""))
+        holder = self.start_pair_holder(idle=2)
+        with self.heartbeat_during_setup(holder, lock=self.root / "pair.lock"):
+            cleanup = self.start_checked_activity(mode="cleanup", before=self.retention_command())
+            self.assertEqual(cleanup.line(), b"RCH_SOURCE_RETAINED")
+            self.assertEqual(cleanup.line(), b"ACTIVITY_READY")
+        inode = self.retained.stat().st_ino
+        marker = os.readlink(self.retained / ".rch-retention-v1")
+        evidence = (self.active, self.fence, self.root / "pair.lock.owner", self.retained / "sentinel")
+        before = [(path.stat().st_ino, path.read_bytes()) for path in evidence]
+        holder.process.kill()
+        holder.finish()
+        eventually(lambda: available(self.root / "pair.lock"), "lost cleanup SSH retained the pair mutex")
+        self.assertFalse(self.source.exists())
+        self.assertIsNone(cleanup.process.poll(), "holder loss killed independent cleanup")
+        self.assertFalse(available(self.activity_lock))
+        retry = self.start_cancel_waiter("restarted-cancellation")
+        self.assertIsNone(retry.line(seconds=0.25), "retry cancellation bypassed live cleanup")
+        self.assertEqual([(path.stat().st_ino, path.read_bytes()) for path in evidence], before)
+        blocked = self.transaction("try-acquire", token="b" * 32)
+        self.assertEqual((blocked.returncode, blocked.stdout), (75, b""), blocked.stderr)
+        self.finish_activity(cleanup)
+        stdout, stderr = retry.finish()
+        self.assertEqual((retry.process.returncode, stdout, stderr), (0, b"owned", b""))
+        released = self.pair_transaction("released", self.source)
+        self.assertEqual((released.returncode, released.stdout, released.stderr), (0, b"pending", b""))
+
+        # This is the tree-retired/pair-not-yet-released restart frontier. Only
+        # an exact cleanup guard may reconcile it. The retained tree's marker
+        # independently binds the old identity and both paths.
+        restarted = self.start_pair_holder(label="retired-tree-cleanup")
+        wrong_identity = self.retain_pair_tree(identity="c" * 32)
+        self.assertEqual(wrong_identity.returncode, 74, wrong_identity.stderr)
+        self.assertIn(b"source retention marker does not bind", wrong_identity.stderr)
+        wrong_root = self.retain_pair_tree(root=self.root / "another-source")
+        self.assertEqual(wrong_root.returncode, 74, wrong_root.stderr)
+        self.assertIn(b"source retention marker does not bind", wrong_root.stderr)
+        retained = self.retain_pair_tree()
+        self.assertEqual((retained.returncode, retained.stdout, retained.stderr),
+                         (0, b"RCH_SOURCE_RETAINED\n", b""))
+        self.assertEqual(self.retained.stat().st_ino, inode)
+        self.assertEqual(os.readlink(self.retained / ".rch-retention-v1"), marker)
+        self.assertEqual([(path.stat().st_ino, path.read_bytes()) for path in evidence], before)
+        self.release_pair_holder(restarted)
+        self.finish_pair_cancellation()
+
+    def assert_unowned_pair_refuses_cleanup_guard(self, claim_pair):
+        self.prepare_materialized_pair(pair_token="b" * 32, claim_pair=claim_pair)
+        cancelled = self.transaction("cancel")
+        self.assertEqual((cancelled.returncode, cancelled.stdout, cancelled.stderr), (0, b"owned", b""))
+        paths = [self.active, self.fence, self.source / "sentinel"]
+        if claim_pair:
+            paths.append(self.root / "pair.lock.owner")
+        before = [(path.stat().st_ino, path.read_bytes()) for path in paths]
+        pair = self.pair_transaction("cancel-owned", self.source)
+        self.assertEqual((pair.returncode, pair.stdout, pair.stderr), (0, b"unowned", b""))
+        rejected = self.start_pair_holder(ready=False, label="unowned-cleanup")
+        rejected.process.wait(timeout=5)
+        stdout, stderr = rejected.finish()
+        self.assertEqual((rejected.process.returncode, stdout), (73, b""), stderr)
+        self.assertIn(b"RCH_SOURCE_PAIR_OWNERSHIP_UNCONFIRMED", stderr)
+        self.assertEqual([(path.stat().st_ino, path.read_bytes()) for path in paths], before)
+        self.assertFalse(self.retained.exists())
+        self.assertFalse((self.source / ".rch-retention-v1").is_symlink())
+        self.assertFalse((self.root / ("pair.lock.released-" + self.token)).exists())
+        blocked = self.transaction("try-acquire", token="c" * 32)
+        self.assertEqual((blocked.returncode, blocked.stdout), (75, b""), blocked.stderr)
+
+    def test_cancelled_source_with_other_pair_owner_cannot_recover_cleanup_guard(self):
+        self.assert_unowned_pair_refuses_cleanup_guard(claim_pair=True)
+
+    def test_cancelled_source_with_missing_pair_owner_cannot_recover_cleanup_guard(self):
+        self.assert_unowned_pair_refuses_cleanup_guard(claim_pair=False)
+
+    def test_unowned_cancellation_receipt_cannot_authorize_materialized_tree_retirement(self):
+        self.prepare_materialized_pair(grant_source=False)
+        sentinel = self.source / "sentinel"
+        original = (self.source.stat().st_ino, sentinel.stat().st_ino, sentinel.read_bytes())
+        cancelled = self.transaction("cancel")
+        self.assertEqual((cancelled.returncode, cancelled.stdout, cancelled.stderr), (0, b"unowned", b""))
+        pair = self.pair_transaction("cancel-unowned", self.source)
+        self.assertEqual((pair.returncode, pair.stdout, pair.stderr), (0, b"unowned", b""))
+        refused = self.retain_pair_tree()
+        self.assertEqual(refused.returncode, 73, refused.stderr)
+        self.assertIn(b"source grant is not active", refused.stderr)
+        self.assertFalse(self.retained.exists())
+        self.assertFalse((self.source / ".rch-retention-v1").is_symlink())
+        self.assertEqual((self.source.stat().st_ino, sentinel.stat().st_ino, sentinel.read_bytes()), original)
+        # Pair metadata retirement grants no permission to remove a preexisting
+        # tree whose source intent never acquired a grant.
+        successor = self.pair_transaction("claim", self.source, "b" * 32)
+        self.assertEqual(successor.returncode, 73, successor.stderr)
+        self.assertIn(b"source pair has unretired source", successor.stderr)
+        self.assertEqual((self.source.stat().st_ino, sentinel.stat().st_ino, sentinel.read_bytes()), original)
+
+    def test_cleanup_activity_refuses_mismatched_cancellation_evidence_without_mutation(self):
+        self.prepare_materialized_pair()
+        self.fence.write_text(str(self.root / "wrong-root") + "\n")
+        evidence = (self.active, self.fence, self.root / "pair.lock.owner", self.source / "sentinel")
+        before = [(path.stat().st_ino, path.read_bytes()) for path in evidence]
+        retained = self.retain_pair_tree()
+        self.assertEqual(retained.returncode, 73, retained.stderr)
+        self.assertIn(b"source cleanup authority is absent", retained.stderr)
+        cancelled = self.transaction("cancel")
+        self.assertEqual((cancelled.returncode, cancelled.stdout), (73, b""), cancelled.stderr)
+        self.assertEqual([(path.stat().st_ino, path.read_bytes()) for path in evidence], before)
+        self.assertFalse(self.retained.exists())
+        self.assertFalse((self.source / ".rch-retention-v1").is_symlink())
+        self.assertFalse((self.registry / "cancelled" / self.active.name).exists())
+
+    def test_incomplete_ssh_script_upload_does_not_hold_activity_and_late_completion_observes_cancel(self):
+        acquired = self.transaction("acquire")
+        self.assertEqual((acquired.returncode, acquired.stdout, acquired.stderr), (0, b"", b""))
+        ran = self.root / "late-payload-ran"
+        delimiter = "RCH_SOURCE_ACTIVITY_NATIVE_SSH_FIXTURE"
+        uploaded = FINITE_ACTIVITY.format(
+            prefix=self.activity_prefix(mode="active"),
+            script="printf ran > " + QUOTE(str(ran)), delimiter=delimiter)
+        # Send the entire payload except its closing heredoc and compound.
+        # The first line proves the remote shell reached this incomplete
+        # upload, rather than merely observing a slow SSH handshake.
+        frontier = uploaded.rindex("\n" + delimiter + "\n")
+        client = SshProcess(self.argv, "exec sh -s")
+        self.clients.append(client)
+        client.send("printf 'UPLOAD_READY\\n'\n" + uploaded[:frontier])
+        self.assertEqual(client.line(), b"UPLOAD_READY")
+        self.assertTrue(available(self.activity_lock), "partial upload acquired the activity mutex")
+        self.assertFalse(ran.exists())
+        cancelled = self.transaction("cancel")
+        self.assertEqual((cancelled.returncode, cancelled.stdout, cancelled.stderr), (0, b"owned", b""))
+        before = (self.active.stat().st_ino, self.active.read_bytes())
+        self.assertIsNone(client.process.poll(), "fault must retain the incomplete upload")
+        client.send(uploaded[frontier:])
+        stdout, stderr = client.finish()
+        self.assertEqual((client.process.returncode, stdout), (73, b""), stderr)
+        self.assertIn(b"source grant is cancelling", stderr)
+        self.assertFalse(ran.exists())
+        self.assertTrue(available(self.activity_lock))
+        self.assertEqual((self.active.stat().st_ino, self.active.read_bytes()), before)
+        self.assert_owner_retained()
 
     def test_cancellation_probe_does_not_release_a_live_activity_or_its_source_grant(self):
         acquired = self.transaction("acquire")

@@ -1216,6 +1216,36 @@ fn remote_manifest_payload(manifest: &SourceContentRootManifest) -> anyhow::Resu
     Ok(payload)
 }
 
+/// Keep the finite manifest as the verifier's exact stdin, inside a program
+/// whose complete upload precedes activity admission. A partially uploaded
+/// manifest must not leave a verifier holding source activity while waiting
+/// for the rest of its input. Framing is for this bounded UTF-8 TSV only.
+fn remote_manifest_verifier_script(command: &str, payload: &[u8]) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        payload.len() <= MAX_REMOTE_MANIFEST_BYTES,
+        "source-content remote manifest cap exceeded"
+    );
+    let payload = std::str::from_utf8(payload).context("source manifest is not UTF-8")?;
+    anyhow::ensure!(
+        !payload.contains('\0') && (payload.is_empty() || payload.ends_with('\n')),
+        "source manifest cannot preserve its exact bytes in finite input framing"
+    );
+    let delimiter = loop {
+        let candidate = format!("RCH_SOURCE_MANIFEST_{}", uuid::Uuid::new_v4().simple());
+        if !payload.lines().any(|line| line == candidate) {
+            break candidate;
+        }
+    };
+    let command = shell_escape::escape(command.into());
+    // The payload already ends with LF, or is empty. Adding another newline
+    // would invent a manifest row and change the verifier's denominator.
+    Ok(format!(
+        r#"exec sh -c {command} <<'{delimiter}'
+{payload}{delimiter}
+"#
+    ))
+}
+
 // The portable shell verifier forks several utilities for every file. Large
 // admitted source trees can exhaust the verification deadline before Cargo
 // starts. When available, an isolated Python process streams the same bytes
@@ -1393,9 +1423,16 @@ async fn verify_remote_root(
     }
     let payload = remote_manifest_payload(&root.manifest)?;
     let command = remote_verify_command(&root.manifest);
-    let command = match source_identity {
-        Some(identity) => super::ssh::wrap_remote_source_activity(&command, identity)?,
-        None => command,
+    let (command, payload) = match source_identity {
+        Some(identity) => {
+            let script = remote_manifest_verifier_script(&command, &payload)?;
+            let script = crate::transfer::source_activity_finite_script(
+                &super::ssh::source_authority_activity_prefix(identity)?,
+                &script,
+            );
+            ("sh -s".to_owned(), script.into_bytes())
+        }
+        None => (command, payload),
     };
     let output =
         run_offload_ssh_command_with_stdin(worker, &command, &payload, REMOTE_VERIFY_TIMEOUT)
@@ -2639,17 +2676,83 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn remote_manifest_finite_input_preserves_exact_bytes_and_rejects_unframeable_input() {
+        use std::io::Write as _;
+        use std::process::Stdio;
+
+        for payload in [
+            Vec::new(),
+            "hash\t3\t0\tliteral ' $(printf unexpected) `false` café.rs\n"
+                .as_bytes()
+                .to_vec(),
+            "hash\t3\t0\tlarge-manifest.rs\n"
+                .repeat(10_000)
+                .into_bytes(),
+        ] {
+            let verifier = remote_manifest_verifier_script("/bin/cat", &payload).unwrap();
+            // Actual registry/activity authority is qualified separately. This
+            // control executes both finite-input shell layers and checks the
+            // exact bytes delivered to the verifier, including empty input.
+            let script = crate::transfer::source_activity_finite_script("/usr/bin/env", &verifier);
+            let mut child = std::process::Command::new("/bin/sh")
+                .arg("-s")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(script.as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(output.stderr.is_empty(), "{output:?}");
+            assert_eq!(output.stdout, payload);
+        }
+        for payload in [
+            b"missing-final-newline".as_slice(),
+            b"nul\0byte\n",
+            b"\xff\n",
+        ] {
+            assert!(remote_manifest_verifier_script("/bin/cat", payload).is_err());
+        }
+        assert!(
+            remote_manifest_verifier_script(
+                "/bin/cat",
+                &vec![b'\n'; MAX_REMOTE_MANIFEST_BYTES + 1]
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
     fn run_source_verifier(
         manifest: &SourceContentRootManifest,
         payload: &[u8],
         path_override: Option<&Path>,
+        finite_input: bool,
     ) -> std::process::Output {
         use std::io::Write as _;
         use std::process::Stdio;
 
+        let verifier = remote_verify_command(manifest);
+        let script = finite_input.then(|| {
+            crate::transfer::source_activity_finite_script(
+                "/usr/bin/env",
+                &remote_manifest_verifier_script(&verifier, payload).unwrap(),
+            )
+        });
         let mut command = std::process::Command::new("/bin/sh");
+        if script.is_some() {
+            command.arg("-s");
+        } else {
+            command.args(["-c", &verifier]);
+        }
         command
-            .args(["-c", &remote_verify_command(manifest)])
             .current_dir(&manifest.remote_root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -2662,13 +2765,13 @@ mod tests {
             .stdin
             .take()
             .expect("source verifier has piped stdin")
-            .write_all(payload)
+            .write_all(script.as_ref().map_or(payload, |script| script.as_bytes()))
             .expect("source manifest reaches verifier");
         child.wait_with_output().expect("source verifier completes")
     }
 
     #[cfg(unix)]
-    fn check_source_verifier_controls(path_override: Option<&Path>) {
+    fn check_source_verifier_controls(path_override: Option<&Path>, finite_input: bool) {
         use std::os::unix::fs::PermissionsExt as _;
 
         let temp = tempfile::tempdir().expect("private verifier test directory");
@@ -2744,7 +2847,7 @@ mod tests {
             content_root: "b".repeat(64),
         };
         let payload = remote_manifest_payload(&manifest).unwrap();
-        let output = run_source_verifier(&manifest, &payload, path_override);
+        let output = run_source_verifier(&manifest, &payload, path_override, finite_input);
         assert!(output.status.success(), "{:?}", output);
         assert!(output.stderr.is_empty(), "{:?}", output);
         assert_eq!(
@@ -2803,6 +2906,7 @@ mod tests {
                 &mutated,
                 &remote_manifest_payload(&mutated).unwrap(),
                 path_override,
+                finite_input,
             );
             assert_eq!(output.status.code(), Some(code), "{:?}", output);
             assert!(output.stdout.is_empty(), "{:?}", output);
@@ -2824,7 +2928,12 @@ mod tests {
         let mut escaping_manifest = manifest.clone();
         escaping_manifest.file_count += 1;
         escaping_manifest.byte_count += escape_target.len() as u64;
-        let output = run_source_verifier(&escaping_manifest, &escaping_payload, path_override);
+        let output = run_source_verifier(
+            &escaping_manifest,
+            &escaping_payload,
+            path_override,
+            finite_input,
+        );
         assert_eq!(output.status.code(), Some(63), "{:?}", output);
         assert!(output.stdout.is_empty(), "{:?}", output);
         assert!(
@@ -2835,7 +2944,14 @@ mod tests {
             output
         );
         for truncated in [&payload[..payload.len() - 1], &payload[..0]] {
-            let output = run_source_verifier(&manifest, truncated, path_override);
+            if finite_input && !truncated.is_empty() && !truncated.ends_with(b"\n") {
+                assert!(
+                    remote_manifest_verifier_script(&remote_verify_command(&manifest), truncated)
+                        .is_err()
+                );
+                continue;
+            }
+            let output = run_source_verifier(&manifest, truncated, path_override, finite_input);
             assert_eq!(output.status.code(), Some(67), "{:?}", output);
             assert!(output.stdout.is_empty(), "{:?}", output);
         }
@@ -2852,7 +2968,8 @@ mod tests {
             )
             .unwrap();
             std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
-            let output = run_source_verifier(&manifest, &payload, Some(&bin));
+            std::os::unix::fs::symlink("/bin/sh", bin.join("sh")).unwrap();
+            let output = run_source_verifier(&manifest, &payload, Some(&bin), finite_input);
             assert_eq!(output.status.code(), Some(73), "{:?}", output);
             assert!(output.stdout.is_empty(), "{:?}", output);
         }
@@ -2866,7 +2983,9 @@ mod tests {
             .status()
             .expect("Python verification must execute, not skip its assertions");
         assert!(python.success());
-        check_source_verifier_controls(None);
+        for finite_input in [false, true] {
+            check_source_verifier_controls(None, finite_input);
+        }
     }
 
     #[cfg(unix)]
@@ -2885,19 +3004,23 @@ mod tests {
             };
             let bin = tempfile::tempdir().expect("private portable verifier PATH");
             for (name, path) in std::iter::once((hash_tool, hash_path)).chain(
-                ["awk", "wc", "tr", "readlink"].into_iter().map(|name| {
-                    (
-                        name,
-                        resolve(name).expect("portable verifier utility must be present"),
-                    )
-                }),
+                ["awk", "wc", "tr", "readlink", "sh"]
+                    .into_iter()
+                    .map(|name| {
+                        (
+                            name,
+                            resolve(name).expect("portable verifier utility must be present"),
+                        )
+                    }),
             ) {
                 let executable = path
                     .canonicalize()
                     .expect("portable verifier utility path resolves");
                 std::os::unix::fs::symlink(executable, bin.path().join(name)).unwrap();
             }
-            check_source_verifier_controls(Some(bin.path()));
+            for finite_input in [false, true] {
+                check_source_verifier_controls(Some(bin.path()), finite_input);
+            }
             verified_hash_tools += 1;
         }
         assert!(

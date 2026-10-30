@@ -11,6 +11,42 @@ mod retrieval_space;
 mod retrieval_space_tests;
 pub(crate) mod source_content_barrier;
 
+/// Upload a finite program before acquiring its source-activity lock. An SSH
+/// channel stalled halfway through `sh -s` must not hold that lock before any
+/// workload or recoverable process identity exists. The outer compound also
+/// refuses EOF before the whole heredoc and closing brace arrive: a bare
+/// unterminated heredoc can otherwise execute on some POSIX shells.
+///
+/// The existing prefix checks ownership after acquiring the lock, so a late
+/// completed upload still observes a cancellation or retirement. Keep the
+/// script on stdin, including large programs and workers using cmd.exe as the
+/// SSH login shell. This is not a framing protocol for streamed archive data.
+pub(crate) fn source_activity_finite_script(prefix: &str, script: &str) -> String {
+    source_activity_finite_script_with_delimiter(
+        prefix,
+        script,
+        format!("RCH_SOURCE_ACTIVITY_{}", uuid::Uuid::new_v4().simple()),
+    )
+}
+
+fn source_activity_finite_script_with_delimiter(
+    prefix: &str,
+    script: &str,
+    mut delimiter: String,
+) -> String {
+    while script.lines().any(|line| line == delimiter) {
+        delimiter.push('_');
+    }
+    format!(
+        r#"{{
+exec {prefix} sh -s <<'{delimiter}'
+{script}
+{delimiter}
+}}
+"#
+    )
+}
+
 fn artifact_header_probe_script(
     remote: &str,
     cargo_target_root: Option<&str>,
@@ -3063,6 +3099,13 @@ impl TransferPipeline {
         }
     }
 
+    fn source_activity_script<'a>(&self, script: &'a str) -> Cow<'a, str> {
+        match &self.source_authority_prefix {
+            Some(prefix) => Cow::Owned(source_activity_finite_script(prefix, script)),
+            None => Cow::Borrowed(script),
+        }
+    }
+
     /// A durable source grant is not permission for opportunistic cache
     /// reclamation. Keep the pool and cache sweeps out of its activity; only
     /// its TMPDIR scratch is swept, under the guards of
@@ -6023,7 +6066,8 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
     /// (`mkdir: missing operand`). Feeding the script on stdin to `sh -s` — Git's
     /// POSIX shell — sidesteps that entirely, exactly as the exec path does.
     async fn run_remote_sh(&self, worker: &WorkerConfig, script: &str) -> Result<()> {
-        let mut cmd = self.worker_ssh_command(worker, &["sh", "-s"]);
+        let script = self.source_activity_script(script);
+        let mut cmd = self.worker_ssh_command_with_activity(worker, &["sh", "-s"], false);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -6302,9 +6346,10 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         // required for execution. -P (the default) does not traverse symlinks.
         // A NUL-delimited inventory preserves spaces and shell metacharacters.
         let inventory_script = windows_artifact_inventory_script(remote_path);
+        let inventory_script = self.source_activity_script(&inventory_script);
         let mut inventory = Vec::new();
         run_windows_artifact_process(
-            self.worker_ssh_command(worker, &["sh", "-s"]),
+            self.worker_ssh_command_with_activity(worker, &["sh", "-s"], false),
             &inventory_script,
             &mut inventory,
             MAX_SOURCE_CONTENT_RSYNC_OUTPUT_BYTES as u64,
@@ -6324,9 +6369,11 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             let deadline = started + Duration::from_millis(retry.total_timeout_ms);
             let (archive, archive_bound) = self.windows_retrieval_archive(selected_size, count)?;
             let mut output = tokio::fs::File::from_std(archive.reopen()?);
+            let archive_script = windows_artifact_archive_script(remote_path, &selected);
+            let archive_script = self.source_activity_script(&archive_script);
             bytes = run_windows_artifact_process(
-                self.worker_ssh_command(worker, &["sh", "-s"]),
-                &windows_artifact_archive_script(remote_path, &selected),
+                self.worker_ssh_command_with_activity(worker, &["sh", "-s"], false),
+                &archive_script,
                 &mut output,
                 archive_bound,
                 deadline,
@@ -6865,13 +6912,13 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             }
         }
 
-        // IMPORTANT: pass the script via stdin (`sh -s`) to avoid quoting issues with
-        // newlines/comments in `remote_script`. This preserves the prior mux behavior
-        // where the script is an argv payload, not re-parsed by the user's login shell.
+        // Upload the complete finite program before taking activity authority.
+        // Its inner prefix still checks the grant after acquiring the mutex;
+        // an interrupted bootstrap never strands that mutex before the workload
+        // supervisor and process identity can exist. Stdin also avoids login-
+        // shell quoting and the per-argument size limit for large build scripts.
+        let remote_script = self.source_activity_script(remote_script);
         cmd.arg(&destination);
-        if let Some(prefix) = &self.source_authority_prefix {
-            cmd.arg(prefix);
-        }
         cmd.arg("sh").arg("-s");
 
         cmd.stdin(Stdio::piped())
@@ -7506,7 +7553,8 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         // root. A missing/unreadable candidate is not evidence of compatibility.
         let cargo_target_root = self.remote_cargo_target_dir();
         let script = artifact_header_probe_script(&remote, Some(&cargo_target_root), &paths)?;
-        let mut command = self.worker_ssh_command(worker, &["sh", "-s"]);
+        let script = self.source_activity_script(&script);
+        let mut command = self.worker_ssh_command_with_activity(worker, &["sh", "-s"], false);
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -13393,6 +13441,44 @@ Number of files transferred: 42
             .unwrap();
         assert_eq!(output.status.code(), Some(73), "{output:?}");
         assert!(output.stdout.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finite_source_activity_script_preserves_colliding_delimiters_and_literal_bytes() {
+        use std::io::Write as _;
+
+        let delimiter = "RCH_SOURCE_ACTIVITY_TEST";
+        let literal = format!(
+            "{delimiter}\n{delimiter}_\n$(printf expanded) `printf expanded` $HOME 'literal'\n"
+        );
+        let script = format!(
+            "# {}\ntest \"$RCH_ACTIVITY_TEST\" = owned || exit 99\ncat <<'EXPECTED_LITERAL'\n{literal}EXPECTED_LITERAL\n",
+            "x".repeat(256 * 1024),
+        );
+        let framed = source_activity_finite_script_with_delimiter(
+            "env RCH_ACTIVITY_TEST=owned",
+            &script,
+            delimiter.to_owned(),
+        );
+        let mut child = std::process::Command::new("sh")
+            .args(["-s"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // No program bytes travel through argv, even beyond MAX_ARG_STRLEN.
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(framed.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, literal.as_bytes());
+        assert!(output.stderr.is_empty(), "{output:?}");
     }
 
     #[cfg(unix)]

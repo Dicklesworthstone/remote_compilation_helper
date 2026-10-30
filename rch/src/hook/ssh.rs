@@ -2479,13 +2479,16 @@ pub(super) async fn ensure_worker_projects_topology(
     let canonical_display = topology_policy.canonical_root().display().to_string();
     let alias_display = topology_policy.alias_root().display().to_string();
     let topology_cmd = build_worker_projects_topology_cmd(topology_policy, allow_initialization);
-    let remote_reader = match source_identity {
-        Some(identity) => format!("{} sh -s", source_authority_activity_prefix(identity)?),
-        None => "sh -s".to_owned(),
+    let topology_cmd = match source_identity {
+        Some(identity) => crate::transfer::source_activity_finite_script(
+            &source_authority_activity_prefix(identity)?,
+            &topology_cmd,
+        ),
+        None => topology_cmd,
     };
     let output = run_offload_ssh_command_with_stdin(
         worker,
-        &remote_reader,
+        "sh -s",
         topology_cmd.as_bytes(),
         Duration::from_secs(20),
     )
@@ -2577,9 +2580,12 @@ async fn repair_worker_mirror_ownership(
         return Ok(0);
     }
     let cmd = build_worker_ownership_repair_cmd(roots, &worker.user);
-    let remote_reader = match source_identity {
-        Some(identity) => format!("{} sh -s", source_authority_activity_prefix(identity)?),
-        None => "sh -s".to_owned(),
+    let cmd = match source_identity {
+        Some(identity) => crate::transfer::source_activity_finite_script(
+            &source_authority_activity_prefix(identity)?,
+            &cmd,
+        ),
+        None => cmd,
     };
     // bd-gc0ze: closure-scoped sweeps normally finish in seconds; 600s bounds
     // pathological trees without failing every dispatch the way the old fixed
@@ -2588,7 +2594,7 @@ async fn repair_worker_mirror_ownership(
     // executor retains the timeout, concurrent output drains and kill-on-drop.
     let output = run_offload_ssh_command_with_stdin(
         worker,
-        &remote_reader,
+        "sh -s",
         cmd.as_bytes(),
         Duration::from_secs(600),
     )
