@@ -160,11 +160,14 @@ and no conflicting records for that token. Receipt-only, malformed, symlinked,
 quarantined or contradictory evidence is preserved. In particular, an incomplete
 hard-linked quarantine fence cannot replace the complete receipt needed for
 later recovery. Failed fence or registry durability barriers preserve both
-records. Each collection pass validates at most 16 eligible cancellation
-receipts; this bounds the added confirmations, not directory enumeration or
-filesystem latency. Unresolved early candidates can defer later collection.
-The existing released-receipt policy is unchanged, and activity lock files are
-not collected.
+records. Released receipts also remain whenever any other same-token evidence
+exists, apart from a regular nonsymlink activity-lock file. Otherwise an aged
+released receipt could be discarded first, hiding a contradiction from the
+cancellation check. Ordinary unambiguous released receipts still expire.
+Each collection pass validates at most 16 released and 16 cancelled candidates;
+this bounds the added checks, not directory enumeration or filesystem latency.
+Unresolved early candidates can defer later collection. Activity lock files are
+not collected, and this policy does not add permanent released-token fences.
 
 Preserve the original journal, cancellation records and lock files when
 diagnosing a refusal. Neither a terminal lease alone, an empty process listing,
@@ -191,6 +194,18 @@ or the word `Killed` alone:
 | `RCH_SOURCE_CANCELLATION_UNSETTLED` | Worker evidence or its lock namespace could not be verified. The accompanying reason identifies what must be resolved before retrying. |
 | `RCH_SOURCE_CLAIM_RETENTION_DEFERRED` | Receipt collection could not confirm the retained cancellation fence's durability. Both records remain; this does not grant cleanup authority. |
 | `RCH_GC_LEGACY_SOURCE_OWNERSHIP_UNKNOWN` | A legacy active claim is malformed or unsafe to read. GC cannot prove the candidate unowned and preserves both the record and source tree. |
+
+#### Journal custody during readmission
+
+Readmission that supersedes source recovery must preserve the preceding journal
+under its exclusive ownership gate. Current journals written with a normal
+umask, including modes `0640` and `0644`, can supply that evidence when they are
+regular files owned by the current user, have one link and are not writable by
+group or others. Retained snapshots and publication temporaries remain private
+(`0600`). Exact bytes and named inode are verified before and after publication;
+changed, symlinked, hard-linked or externally writable evidence is refused. The
+original journal is not chmodded or otherwise changed to satisfy snapshot
+validation.
 
 #### Bounded POSIX control-session liveness
 
@@ -289,18 +304,38 @@ publication after unlocking. Run it with
 `python3 scripts/tests/test_source_ownership_ssh.py` on an isolated Linux host
 where the test user may start `sshd`.
 
-The subsequent cancellation-retention repair was qualified on native Linux with
-84 comprehensive registry cases and 31 earlier registry cases, all passing.
-The eight new cases (four methods under both `sh` and `bash`) reproduce missing
+The subsequent cancellation-retention repairs were qualified on native Linux
+with 90 comprehensive registry cases and 31 earlier registry cases, all passing.
+The first eight new cases (four methods under both `sh` and `bash`) reproduce missing
 fences, discarded recovery evidence, missing durability acknowledgements and
 unrestricted receipt-confirmation work against the unchanged `f22678a` registry.
 They pass with the repair, including interrupted receipt publication, historical
 receipt-only replay, conflicting records, quarantine recovery and old-token
-refusal after receipt collection. Shell syntax, Python syntax and whitespace
-checks passed. These isolated tmpfs tests exercise real processes and locks with
-injected durability failures; they do not qualify physical power-loss recovery
-or an installed production worker. The earlier holder, controller and SSH
+refusal after receipt collection. Six further cases reproduce aged released
+evidence being discarded before cancellation conflict detection. After the full
+90-case run, those six were strengthened and rerun successfully to check exact
+bytes and inodes across three separate collection admissions and preservation
+of ordinary activity-lock files during bounded receipt expiry. Shell syntax,
+Python syntax and whitespace checks passed.
+
+The real loopback OpenSSH suite was rerun against the corrected registry: all
+eight cases passed, including stopped/killed clients, heartbeat expiry,
+cancellation queued behind live activity and timer death. These isolated Linux
+tests exercise actual processes, locks and transport with injected durability
+failures; tmpfs qualification does not establish physical power-loss recovery
+or installed-worker acceptance. The earlier standalone holder and controller
 results above describe their stated revision and were not rerun for this change.
+
+The journal-custody correction passed 25 job-identity and journal tests in the
+actual default-feature `rch-common` crate using the pinned nightly toolchain.
+Default-feature `rch-common` Clippy with `--lib --tests -- -D warnings` also
+passed.
+An isolated unchanged-code build ran the readable-original regression and
+reproduced the reported `retained journal file identity, permissions or exact
+bytes changed` error on an owned `0644` original. The correction accepts `0640`
+and `0644` originals while still refusing writable or hard-linked originals,
+changed evidence and nonprivate retained snapshots. This qualification does not
+substitute for compilation and execution of the full RCH retry integration.
 
 Pinned workspace `cargo fmt --check` passed. The full locked workspace check
 was terminated by SIGKILL while compiling the unchanged `asupersync 0.5.0`

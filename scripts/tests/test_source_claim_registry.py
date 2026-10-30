@@ -825,6 +825,89 @@ class SourceClaimRegistryTests(unittest.TestCase):
         self.assertEqual({path: (path.stat().st_ino, path.read_bytes()) for path in fences}, fences)
         self.assert_refused(self.transact("00", [self.root / "00"]))
 
+    def test_released_receipt_gc_preserves_aged_cancellation_contradiction(self):
+        token = "aa"
+        roots = [self.root / "project"]
+        name = token + "." + digest(roots) + ".claim"
+        released = self.registry / "released" / name
+        cancelled = self.registry / "cancelled" / name
+        fence = self.record(token, roots, "cancelling")
+        for receipt in (released, cancelled):
+            receipt.write_bytes(body(roots))
+            os.utime(receipt, (1_000_000, 1_000_000))
+        before = {path: (path.stat().st_ino, path.read_bytes())
+                  for path in (released, cancelled, fence)}
+
+        # Collection for another job must not erase the released contradiction
+        # before the cancellation collector validates this same identity.
+        for attempt in range(3):
+            self.assert_granted(self.transact("b" + format(attempt, "x"),
+                                             [self.root / ("other-project-" + str(attempt))]))
+            for path, evidence in before.items():
+                self.assertTrue(path.exists(), "contradictory terminal evidence must survive GC")
+                self.assertEqual((path.stat().st_ino, path.read_bytes()), evidence)
+        for operation in ("acquire", "recover", "cancel", "finish-cancel", "settle-cancel"):
+            self.assert_refused(self.transact(token, roots, operation))
+
+    def test_released_receipt_gc_preserves_active_and_unknown_same_identity_evidence(self):
+        for index, state in enumerate(("active", "pending", "cancelling", "cancelled",
+                                       "quarantine", "released", "unknown",
+                                       "unknown-released", "unknown-cancelled", "unknown-quarantine")):
+            with self.subTest(state=state):
+                token = "a" + format(index, "x")
+                roots = [self.root / token]
+                receipt = self.registry / "released" / (token + "." + digest(roots) + ".claim")
+                receipt.write_bytes(body(roots))
+                os.utime(receipt, (1_000_000, 1_000_000))
+                if state in ("active", "pending", "cancelling"):
+                    conflict = self.record(token, roots, "claim" if state == "active" else state)
+                elif state in ("cancelled", "quarantine"):
+                    extension = "pending" if state == "quarantine" else "claim"
+                    conflict = self.registry / state / (token + "." + digest(roots) + "." + extension)
+                    conflict.write_bytes(body(roots))
+                elif state == "released":
+                    other_roots = [self.root / (token + "-changed")]
+                    conflict = self.registry / "released" / (token + "." + digest(other_roots) + ".claim")
+                    conflict.write_bytes(body(other_roots))
+                else:
+                    directory = self.registry if state == "unknown" else self.registry / state[8:]
+                    conflict = directory / (token + ".unknown")
+                    conflict.write_bytes(b"unknown same-identity evidence")
+                before = {path: (path.stat().st_ino, path.read_bytes())
+                          for path in (receipt, conflict)}
+                for attempt in range(3):
+                    self.assert_granted(self.transact("f" + format(index, "x") + str(attempt),
+                                                     [self.root / ("gc-trigger-" + token + "-" + str(attempt))]))
+                    for path, evidence in before.items():
+                        self.assertTrue(path.exists(), "same-identity evidence must survive GC")
+                        self.assertEqual((path.stat().st_ino, path.read_bytes()), evidence)
+
+    def test_released_receipt_gc_bounds_confirmation_work_and_makes_progress(self):
+        receipts = []
+        activity_locks = {}
+        for index in range(40):
+            token = format(index, "02x")
+            roots = [self.root / token]
+            receipt = self.registry / "released" / (token + "." + digest(roots) + ".claim")
+            receipt.write_bytes(body(roots))
+            os.utime(receipt, (1_000_000, 1_000_000))
+            receipts.append(receipt)
+            activity = self.registry / (token + ".activity.lock")
+            activity.write_bytes(b"retained activity lock inode")
+            activity_locks[activity] = activity.stat().st_ino, activity.read_bytes()
+        self.assert_granted(self.transact("ff", [self.root / "gc-first"]))
+        removed = sum(not path.exists() for path in receipts)
+        self.assertGreater(removed, 0, "unambiguous old receipts should still expire")
+        self.assertLessEqual(removed, 16, "one admission must bound released candidate checks")
+        for index in range(len(receipts)):
+            if not any(path.exists() for path in receipts):
+                break
+            token = "fa" + format(index, "x")
+            self.assert_granted(self.transact(token, [self.root / ("gc-next-" + token)]))
+        self.assertFalse(any(path.exists() for path in receipts))
+        self.assertEqual({path: (path.stat().st_ino, path.read_bytes())
+                          for path in activity_locks}, activity_locks)
+
 
 @unittest.skipUnless(shutil.which("bash"), "bash is unavailable")
 class SourceClaimRegistryBashTests(SourceClaimRegistryTests):

@@ -444,9 +444,41 @@ prune_terminal_claims() {
         ''|*[!0-9]*) retention_minutes=1440 ;;
     esac
     terminal_dir="$registry/released"
-    if [ ! -L "$terminal_dir" ] && [ -d "$terminal_dir" ]; then
+    if [ ! -L "$terminal_dir" ] && [ -d "$terminal_dir" ] \
+        && [ ! -L "$registry/cancelled" ] && [ ! -L "$registry/quarantine" ]; then
+        # A released receipt may contradict another record for this identity.
+        # Preserve that evidence before cancellation GC inspects it: deleting
+        # the released half first could make ambiguous ownership look settled.
+        # Confirm at most 16 released candidates per transaction (in addition
+        # to at most 16 cancelled candidates below). This bounds validation
+        # work, not directory enumeration or individual filesystem latency.
         find "$terminal_dir" -maxdepth 1 -type f -name '*.claim' \
-            ! -name "$token.*" -mmin +"$retention_minutes" -delete 2>/dev/null || true
+            ! -name "$token.*" -mmin +"$retention_minutes" -print 2>/dev/null |
+        (
+            gc_checked=0
+            while IFS= read -r gc_receipt; do
+                [ "$gc_checked" -lt 16 ] || break
+                gc_checked=$((gc_checked + 1))
+                [ "${gc_receipt%/*}" = "$terminal_dir" ] || continue
+                rch_claim_record_valid "$gc_receipt" || continue
+                gc_token=$__rch_token
+                gc_conflict=0
+                for gc_other in "$registry/$gc_token."* "$registry/released/$gc_token."* \
+                    "$registry/cancelled/$gc_token."* "$registry/quarantine/$gc_token."*; do
+                    [ -e "$gc_other" ] || [ -L "$gc_other" ] || continue
+                    [ "$gc_other" = "$gc_receipt" ] && continue
+                    if [ "$gc_other" = "$registry/$gc_token.activity.lock" ] \
+                        && [ ! -L "$gc_other" ] && [ -f "$gc_other" ]; then
+                        continue
+                    fi
+                    gc_conflict=1
+                    break
+                done
+                [ "$gc_conflict" -eq 0 ] || continue
+                find "$gc_receipt" -maxdepth 0 -type f -mmin +"$retention_minutes" \
+                    -delete 2>/dev/null || true
+            done
+        ) || true
     fi
 
     terminal_dir="$registry/cancelled"

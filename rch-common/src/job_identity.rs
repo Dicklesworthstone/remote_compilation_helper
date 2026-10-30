@@ -182,11 +182,32 @@ pub mod journal {
             })
     }
 
-    fn private_regular(metadata: &Metadata) -> bool {
+    fn owned_regular(metadata: &Metadata) -> bool {
         metadata.is_file()
             && metadata.uid() == rustix::process::geteuid().as_raw()
             && metadata.nlink() == 1
-            && metadata.mode() & 0o077 == 0
+    }
+
+    fn private_regular(metadata: &Metadata) -> bool {
+        owned_regular(metadata) && metadata.mode() & 0o077 == 0
+    }
+
+    #[derive(Clone, Copy)]
+    enum JournalFileRole {
+        Current,
+        Retained,
+    }
+
+    impl JournalFileRole {
+        fn accepts(self, metadata: &Metadata) -> bool {
+            match self {
+                // Earlier and fallback journal writers use the process umask.
+                // Reading an owned journal does not permit another user to
+                // change its recovery evidence; foreign write access does.
+                Self::Current => owned_regular(metadata) && metadata.mode() & 0o022 == 0,
+                Self::Retained => private_regular(metadata),
+            }
+        }
     }
 
     fn require_named_bytes(
@@ -194,13 +215,14 @@ pub mod journal {
         name: &CStr,
         held: &File,
         expected: &[u8],
+        role: JournalFileRole,
     ) -> Result<()> {
         let (named, bytes) = read_regular_at(directory, name)?;
         let held = held.metadata()?;
         let named = named.metadata()?;
         ensure!(
-            private_regular(&held)
-                && private_regular(&named)
+            role.accepts(&held)
+                && role.accepts(&named)
                 && held.dev() == named.dev()
                 && held.ino() == named.ino()
                 && bytes == expected,
@@ -249,7 +271,7 @@ pub mod journal {
                 "retained journal filename does not bind its exact bytes and wrapper"
             );
         }
-        require_named_bytes(directory, name, &file, &bytes)?;
+        require_named_bytes(directory, name, &file, &bytes, JournalFileRole::Retained)?;
         Ok((
             file,
             bytes,
@@ -433,6 +455,7 @@ pub mod journal {
                 &self.journal_name,
                 &original,
                 &bytes,
+                JournalFileRole::Current,
             )?;
             let digest = blake3::hash(&bytes).to_hex().to_string();
             let name = CString::new(format!(
@@ -474,7 +497,13 @@ pub mod journal {
                     file.sync_all()?;
                     before_publication(&self.parent.join(temporary.to_str()?))?;
                     self.verify()?;
-                    require_named_bytes(self.directory.as_fd(), &temporary, &file, &bytes)?;
+                    require_named_bytes(
+                        self.directory.as_fd(),
+                        &temporary,
+                        &file,
+                        &bytes,
+                        JournalFileRole::Retained,
+                    )?;
                     match publish_snapshot_name(self.directory.as_fd(), &temporary, &name) {
                         Ok(()) => file,
                         Err(error)
@@ -503,12 +532,19 @@ pub mod journal {
             retained.sync_all()?;
             self.directory.sync_all()?;
             self.verify()?;
-            require_named_bytes(self.directory.as_fd(), &name, &retained, &bytes)?;
+            require_named_bytes(
+                self.directory.as_fd(),
+                &name,
+                &retained,
+                &bytes,
+                JournalFileRole::Retained,
+            )?;
             require_named_bytes(
                 self.directory.as_fd(),
                 &self.journal_name,
                 &original,
                 &bytes,
+                JournalFileRole::Current,
             )?;
             self.verify()?;
             Ok(self.parent.join(name.to_str()?))
@@ -725,6 +761,121 @@ pub mod journal {
         }
 
         #[test]
+        fn snapshot_preserves_readable_originals_as_private_idempotent_evidence() {
+            for mode in [0o640, 0o644] {
+                let fixture = Fixture::new();
+                std::fs::set_permissions(&fixture.path, std::fs::Permissions::from_mode(mode))
+                    .unwrap();
+                let original = std::fs::metadata(&fixture.path).unwrap();
+                let snapshot = fixture.gate.retain_snapshot(&fixture.lease).unwrap();
+                assert_eq!(snapshot, fixture.snapshot_path());
+                let retained = std::fs::metadata(&snapshot).unwrap();
+                assert!(private_regular(&retained));
+                assert_eq!(retained.mode() & 0o777, 0o600);
+                assert_eq!(std::fs::read(&snapshot).unwrap(), fixture.bytes);
+                let name = CString::new(snapshot.file_name().unwrap().as_bytes()).unwrap();
+                let observed =
+                    read_retained_snapshot_at(fixture.gate.directory().as_fd(), &name).unwrap();
+                assert_eq!(observed.lease, fixture.lease);
+                assert_eq!(
+                    fixture.gate.retain_snapshot(&fixture.lease).unwrap(),
+                    snapshot
+                );
+                assert_eq!(std::fs::metadata(&snapshot).unwrap().ino(), retained.ino());
+                let current = std::fs::metadata(&fixture.path).unwrap();
+                assert_eq!(current.dev(), original.dev());
+                assert_eq!(current.ino(), original.ino());
+                assert_eq!(current.uid(), original.uid());
+                assert_eq!(current.nlink(), original.nlink());
+                assert_eq!(current.mode(), original.mode());
+                assert_eq!(std::fs::read(&fixture.path).unwrap(), fixture.bytes);
+                assert!(fixture.temporary_paths().is_empty());
+            }
+        }
+
+        #[test]
+        fn snapshot_refuses_writable_or_hardlinked_originals_without_mutation() {
+            for change in ["group_writable", "other_writable", "hardlink"] {
+                let fixture = Fixture::new();
+                let alias = fixture.root.path().join("original-alias");
+                let mode = match change {
+                    "group_writable" => 0o664,
+                    "other_writable" => 0o606,
+                    "hardlink" => 0o644,
+                    _ => unreachable!(),
+                };
+                std::fs::set_permissions(&fixture.path, std::fs::Permissions::from_mode(mode))
+                    .unwrap();
+                if change == "hardlink" {
+                    std::fs::hard_link(&fixture.path, &alias).unwrap();
+                }
+                let original = std::fs::metadata(&fixture.path).unwrap();
+                assert!(
+                    fixture.gate.retain_snapshot(&fixture.lease).is_err(),
+                    "accepted {change}"
+                );
+                let current = std::fs::metadata(&fixture.path).unwrap();
+                assert_eq!(current.dev(), original.dev());
+                assert_eq!(current.ino(), original.ino());
+                assert_eq!(current.mode(), original.mode());
+                assert_eq!(current.nlink(), original.nlink());
+                assert_eq!(std::fs::read(&fixture.path).unwrap(), fixture.bytes);
+                assert!(!fixture.snapshot_path().exists());
+                assert!(fixture.temporary_paths().is_empty());
+                if change == "hardlink" {
+                    assert_eq!(std::fs::read(alias).unwrap(), fixture.bytes);
+                }
+            }
+        }
+
+        #[test]
+        fn readable_original_changes_refuse_success_and_preserve_both_records() {
+            for change in ["bytes", "inode", "permissions", "hardlink"] {
+                let fixture = Fixture::new();
+                std::fs::set_permissions(&fixture.path, std::fs::Permissions::from_mode(0o644))
+                    .unwrap();
+                let preserved = fixture.root.path().join("original-before-change");
+                let result = fixture.gate.retain_snapshot_with(&fixture.lease, |_| {
+                    match change {
+                        "bytes" => std::fs::write(&fixture.path, b"changed readable journal")?,
+                        "inode" => {
+                            std::fs::rename(&fixture.path, &preserved)?;
+                            write_private(&fixture.path, &fixture.bytes);
+                        }
+                        "permissions" => std::fs::set_permissions(
+                            &fixture.path,
+                            std::fs::Permissions::from_mode(0o664),
+                        )?,
+                        "hardlink" => std::fs::hard_link(&fixture.path, &preserved)?,
+                        _ => unreachable!(),
+                    }
+                    Ok(())
+                });
+                assert!(result.is_err(), "accepted changed original: {change}");
+                let snapshot = fixture.snapshot_path();
+                assert_eq!(std::fs::read(&snapshot).unwrap(), fixture.bytes);
+                assert!(private_regular(&std::fs::metadata(&snapshot).unwrap()));
+                if change == "bytes" {
+                    assert_eq!(
+                        std::fs::read(&fixture.path).unwrap(),
+                        b"changed readable journal"
+                    );
+                } else {
+                    assert_eq!(std::fs::read(&fixture.path).unwrap(), fixture.bytes);
+                }
+                if matches!(change, "inode" | "hardlink") {
+                    assert_eq!(std::fs::read(&preserved).unwrap(), fixture.bytes);
+                }
+                if change == "permissions" {
+                    assert_eq!(
+                        std::fs::metadata(&fixture.path).unwrap().mode() & 0o777,
+                        0o664
+                    );
+                }
+            }
+        }
+
+        #[test]
         fn snapshot_refuses_a_stale_expected_epoch_without_creating_evidence() {
             let fixture = Fixture::new();
             let mut stale = fixture.lease.clone();
@@ -762,6 +913,7 @@ pub mod journal {
                 "corrupt",
                 "hardlink",
                 "writable",
+                "readable",
                 "symlink",
                 "fifo",
                 "directory",
@@ -776,9 +928,10 @@ pub mod journal {
                         write_private(&snapshot, &fixture.bytes);
                         std::fs::hard_link(&snapshot, fixture.root.path().join("alias")).unwrap();
                     }
-                    "writable" => {
+                    "writable" | "readable" => {
                         write_private(&snapshot, &fixture.bytes);
-                        std::fs::set_permissions(&snapshot, std::fs::Permissions::from_mode(0o666))
+                        let mode = if change == "readable" { 0o644 } else { 0o666 };
+                        std::fs::set_permissions(&snapshot, std::fs::Permissions::from_mode(mode))
                             .unwrap();
                     }
                     "symlink" => std::os::unix::fs::symlink(&unrelated, &snapshot).unwrap(),
