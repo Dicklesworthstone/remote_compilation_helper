@@ -86,6 +86,167 @@ pause: it suppresses auto-rejoin until you explicitly `rch workers enable`, so a
 worker disabled for a momentary blip stays out of the pool. Prefer observing the
 self-healing breaker (open → half-open → closed) over any manual intervention.
 
+### Source namespace and terminal cancellation recovery (#111)
+
+**Symptoms:** source namespace initialization refuses with status 73, an
+overlapping source owner remains unavailable, or an SSH control session retains
+source locks after its dispatcher has disappeared. A lease can already report
+`state=finished` and `terminal_acknowledged=true` while an older cancellation
+still needs worker metadata reconciliation.
+
+Start with the original wrapper on the dispatcher that retains its journal:
+
+```bash
+rch jobs
+rch jobs recover <wrapper-id> --timeout-secs 300
+rch jobs attach <wrapper-id> --timeout-secs 300
+```
+
+Recovery keeps the recorded worker, build, token and source closure. For an
+already acknowledged cancellation, it acquires exclusive journal ownership and
+validates the failed delivery result and complete source, tree and pair
+retirement. It then reconciles worker metadata, without reopening source paths,
+replaying compilation or repeating completed daemon accounting. Ordinary
+acknowledged deliveries do not require this cancellation operation.
+
+New cancellations persist `source_cancellation_settled=false` before contacting
+the worker. Only an exact worker settlement reply allows the journal to record
+`true`; a failed journal publication remains retryable. A new terminal
+acknowledgement or readmission cannot discard an unresolved cancellation.
+Older preparation cancellations without this field also enter reconciliation.
+The daemon's existing recovery service considers eligible acknowledged
+cancellations normally after a 15-minute scheduling grace, retaining its
+per-worker concurrency limits and failure backoff. It excludes live or unverified owners.
+Elapsed time selects a recovery attempt; it never proves source ownership has
+ended.
+
+#### Evidence required on the worker
+
+The worker acquires the token's activity locks before registry metadata locks.
+This drains previously admitted transfers, execution and cleanup. Future normal
+activity must reject the cancellation fence; cleanup must still possess an
+active claim. Locks are checked against their current inodes, and records must
+match the exact requested token and source-closure digest. The transaction
+confirms file and containing-directory durability before acknowledging a change.
+
+The following outcomes additionally require the complete, owned local recovery
+evidence described above:
+
+| Worker evidence | Settlement result |
+|---|---|
+| Exact active claim plus cancellation marker | Move the existing claim into `cancelled/` and retain the marker. |
+| Exact cancellation marker with no remaining grant | Publish a cancellation receipt and retain the marker; no source tree is inspected or changed. |
+| Exact completed cancellation receipt | Reconfirm durability and retain or create the matching marker. Repeated recovery is idempotent. |
+| Active claim without a cancellation fence, incomplete pending state, quarantine without a completed cancellation receipt, missing evidence, mismatched roots, contradictory terminal state, or ambiguous registry histories | Refuse settlement and retain the evidence. |
+
+**A remaining `.cancelling` file is not a failed cleanup verdict.** It protects
+against delayed acquire/recover requests for that identity even after retention
+GC removes an old cancellation receipt. New identities are excluded by active
+or complete pending claims, not by an unrelated terminal marker. A successfully
+settled old token must remain refused while a new token can acquire the released
+closure.
+
+Preserve the original journal, cancellation records and lock files when
+diagnosing a refusal. Neither a terminal lease alone, an empty process listing,
+a free metadata lock, nor record age authorizes deleting them. Unlinking an
+apparently stale `*.activity.lock` can leave an existing holder on the old inode
+while a new caller locks a different inode. The settlement operation does not
+reap activity lock files or infer cleanup authority from current source bytes.
+
+#### Distinguishing refusals
+
+Use the diagnostic token and its operation/stage fields, rather than status 73
+or the word `Killed` alone:
+
+| Diagnostic | Meaning and next observation |
+|---|---|
+| `RCH_SOURCE_NAMESPACE_METADATA_LOCK_BUSY` | The initializer exhausted its five-second metadata-lock wait; `elapsed_ms` and `lock` identify that wait. This uses status 76 and admits no source grant. |
+| `RCH_SOURCE_SETTLEMENT_LOCK_BUSY` | Recovery could not drain the named activity or metadata lock within its bounded wait. Retain the journal and retry after the owning activity resolves. |
+| `RCH_SOURCE_CANCELLATION_FENCE` | An explicit same-token fence or an overlapping active cancelling owner caused refusal. Use the reported identity/record to find its owning journal. |
+| `RCH_SOURCE_REGISTRY_PUBLICATION_UNCONFIRMED` | A record transition or durability confirmation did not complete. A visible rename is insufficient acknowledgement; retry the same identity. |
+| `RCH_SOURCE_REGISTRY_INTERRUPTED` | A registry step exited unexpectedly; retain its `operation`, `stage`, `status` and identity. |
+| `RCH_SOURCE_NAMESPACE_PROCESS_TERMINATED`, `RCH_SOURCE_NAMESPACE_CONTROL_UNSETTLED`, or `RCH_SOURCE_NAMESPACE_INTERRUPTED` | The program terminated, teardown was not confirmed, or the worker supplied no diagnostic. These do not establish whether the cause was an external signal, a deadline, OOM, or another infrastructure fault. |
+| `RCH_SOURCE_LOCK_HEARTBEAT_EXPIRED`, `RCH_SOURCE_LOCK_DISCONNECTED`, or `RCH_SOURCE_LOCK_RELEASE_TIMEOUT` | The control session expired or lost its release protocol. Durable ownership remains for recovery. |
+| `RCH_SOURCE_LOCK_PROCESS_TERMINATED` or `RCH_SOURCE_LOCK_SUPERVISOR_TERMINATED` | The holder or its supervisor terminated. A process exit alone does not authorize retiring the durable claim. |
+| `RCH_SOURCE_CANCELLATION_UNSETTLED` | Worker evidence or its lock namespace could not be verified. The accompanying reason identifies what must be resolved before retrying. |
+
+#### Bounded POSIX control-session liveness
+
+New POSIX source and source-pair lock sessions carry complete heartbeats every
+10 seconds. A worker supervisor uses a monotonic 90-second idle deadline during
+bootstrap, acquisition and holding. Partial or invalid frames do not renew it.
+An explicit release has a separate 15-second completion budget. The supervisor
+owns a private process group and tears down its holders and inheriting helpers;
+the observer verifies teardown before accepting completion. Missing required
+Python process/locking capabilities fail before a source grant is acquired.
+
+Expiry releases control-session descriptors while retaining active claims,
+cancellation fences, pair ownership and receipts. Separately launched compiler
+or rsync sessions are not part of this group. Their activity locks and durable
+claims remain the evidence recovery must drain and validate. The bound assumes
+the worker supervisor can run and its processes can be terminated; a stopped
+supervisor or uninterruptible kernel I/O cannot be promised a hard 90-second
+lock-release time. Native Windows retains its existing transport and has no
+equivalent qualified heartbeat supervisor in this change.
+
+This policy applies to newly launched sessions. It does not change `sshd`
+configuration or retrofit watchdogs into old sessions. Dispatcher binaries
+generate the SSH programs, so updating only a worker binary does not replace
+an older dispatcher's control-session behavior.
+
+#### Legacy registries and remaining acceptance
+
+Terminal recovery inspects existing current
+`/var/tmp/rch-source-authority-locks/claims-v1` and legacy
+`/tmp/rch-source-authority-locks/claims-v1` registries. It does not initialize an
+absent registry to manufacture evidence. A matching identity in both registries
+is ambiguous and is retained for investigation. Old executed-but-lost
+cancellations that recorded neither `preparation_cancelled` nor the new
+settlement field cannot safely be identified from their exit code alone.
+
+The registry migration also changed hierarchy-lock paths. A read-only legacy
+scan does not prove safe admission across simultaneously active old and new
+dispatchers. Quiesce pre-migration dispatchers and account for their outstanding
+sessions and leases during rollout; do not treat this terminal-recovery change
+as qualification of mixed-version admission.
+
+**Native-worker acceptance remains required.** The
+[October 29 report](https://github.com/Dicklesworthstone/remote_compilation_helper/issues/111#issuecomment-6484520860)
+correlates a persistent project-specific namespace failure with terminal
+cancellation records. Both current source and the reported `ff152a046086`
+implementation exclude other identities through `.claim`/`.pending` records;
+the two reported terminal records alone do not explain a fresh identity's
+namespace refusal. Preserve that distinction when evaluating the repair.
+The separate retrieval-staging work tracked by `bd-ra5aw` does not resolve this
+incident by itself.
+
+Before calling the incident resolved on the fleet, record the exact dispatcher
+and worker revisions and complete these acceptance cases on isolated native
+worker fixtures:
+
+1. Run the required Rust workspace checks and the recovery/lease/SSH regression
+   targets, plus the Linux registry, holder and namespace-controller suites.
+   Record any blocked gate explicitly; source review is not compilation.
+2. Reproduce interrupted initialization and cancellation over real SSH,
+   including a lost settlement reply and restart between worker publication and
+   local journal acknowledgement. Retrying the original wrapper must settle
+   once, preserve the old-token fence and admit a new overlapping job safely.
+3. Exercise concurrent dispatchers and a still-running activity. Recovery must
+   refuse while that activity owns its lock; an unrelated project must continue
+   making progress. Corrupt, changed, absent and conflicting evidence must
+   remain refused without source-tree mutation.
+4. Exercise a half-open/multiplexed SSH session and a stopped or dead client.
+   Verify control locks are released after heartbeat loss under the stated
+   scheduling assumptions, durable records remain, and separate build/transfer
+   activity is not killed. Include observer and supervisor termination.
+5. Qualify the deployed Linux toolchain, including GNU/uutils differences, and
+   native Darwin process/locking behavior where used. Linux subprocess tests
+   alone do not qualify Darwin or Windows.
+6. Revisit the affected project and worker with the new diagnostics and original
+   lease evidence. Establish the cause of the historical namespace refusal and
+   verify repeated admissions after recovery. A passing isolated reproduction
+   does not establish that the production failure has been eliminated.
+
 ### Disk Pressure Critical
 
 **Symptoms:** Worker pressure state "critical", builds deferred

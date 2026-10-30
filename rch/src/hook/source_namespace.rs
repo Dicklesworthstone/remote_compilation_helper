@@ -21,6 +21,43 @@ const ADMISSION: &str = include_str!("source_claim_admission.sh");
 const CLAIMS: &str = include_str!("source_claim_registry.sh");
 const CONTROL: &str = include_str!("source_namespace_control.sh");
 const SOURCE_ADMISSION_WAIT: Duration = Duration::from_secs(60);
+// A bounded, monotonic wait reports metadata contention independently of the
+// enclosing control group's 15-second execution deadline. Python is already
+// required for the registry's record/directory fsync. The descriptor survives
+// exec and CONTROL kills every inheriting descendant before acknowledgement.
+const REGISTRY_LOCK: &str = r#"
+import errno, fcntl, os, stat, sys, time
+started = time.monotonic()
+try:
+    lock = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    info = os.fstat(lock)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise OSError('invalid metadata lock inode')
+    while True:
+        named = os.stat(sys.argv[1], follow_symlinks=False)
+        if (named.st_dev, named.st_ino) != (info.st_dev, info.st_ino):
+            raise OSError('metadata lock changed while waiting')
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError as error:
+            if error.errno not in (errno.EAGAIN, errno.EACCES):
+                raise
+        elapsed = time.monotonic() - started
+        if elapsed >= 5:
+            print('RCH_SOURCE_NAMESPACE_METADATA_LOCK_BUSY elapsed_ms={} lock={}'.format(
+                int(elapsed * 1000), sys.argv[1]), file=sys.stderr)
+            sys.exit(76)
+        time.sleep(0.02)
+    named = os.stat(sys.argv[1], follow_symlinks=False)
+    if (named.st_dev, named.st_ino) != (info.st_dev, info.st_ino):
+        raise OSError('metadata lock changed after acquisition')
+    os.set_inheritable(lock, True)
+    os.execvp(sys.argv[2], sys.argv[2:])
+except OSError as error:
+    print('RCH_SOURCE_NAMESPACE_METADATA_LOCK_INVALID {}'.format(error), file=sys.stderr)
+    sys.exit(73)
+"#;
 
 fn retryable_source_admission_error(error: &anyhow::Error) -> bool {
     let detail = format!("{error:#}");
@@ -155,11 +192,12 @@ fn namespace_command(
     // bounded wait, allowing exact-owner recovery to release the old claim.
     Ok(format!(
         "{setup}rch_source_attempt() {{ (\nset -eu\n\
-         exec flock -x -- \"$registry/metadata.lock\" sh -c {script} \
+         exec python3 -I -S -c {lock_program} \"$registry/metadata.lock\" sh -c {script} \
          rch-source-namespace \"$registry\" {identity} {digest} topology {check} {create} \
          <<'RCH_NAMESPACE_SCOPE'\n{body}RCH_NAMESPACE_SCOPE\n\
          ); }}\nrch_admission_attempts=6\n{ADMISSION}",
         setup = super::ssh::source_registry_setup(registry),
+        lock_program = quote(REGISTRY_LOCK),
         script = quote(&registry_script),
         identity = quote(identity),
         check = quote(&paths("check")),
@@ -201,13 +239,25 @@ pub(super) async fn initialize_worker_namespace(
 /// kept placing the project on the same worker: vmi1153651 refused it four
 /// times in 30 minutes on 2026-10-23 while one long build held the source.
 fn namespace_refusal(worker: &WorkerConfig, status: Option<i32>, stderr: &[u8]) -> anyhow::Error {
+    let detail = String::from_utf8_lossy(stderr);
+    let detail = detail.trim();
+    let detail = if detail.is_empty() {
+        "RCH_SOURCE_NAMESPACE_INTERRUPTED: worker returned no diagnostic; publication and teardown are unconfirmed"
+    } else {
+        detail
+    };
     let error = anyhow::anyhow!(
         "worker source namespace initialization refused on {} (status {:?}): {}",
         worker.id,
         status,
-        String::from_utf8_lossy(stderr).trim(),
+        detail,
     );
-    if retryable_source_admission_error(&error) {
+    if status == Some(76) && detail.contains("RCH_SOURCE_NAMESPACE_METADATA_LOCK_BUSY") {
+        error.context(crate::transfer::SourceAuthorityBusy(format!(
+            "worker registry metadata lock on {} remained busy; no source grant was admitted",
+            worker.id
+        )))
+    } else if retryable_source_admission_error(&error) {
         overlapping_owner_outlived_wait(error, worker)
     } else {
         error
@@ -391,5 +441,93 @@ mod tests {
             let error = namespace_refusal(&worker, Some(73), terminal.as_bytes());
             assert!(!crate::transfer::source_authority_busy(&error), "{error:#}");
         }
+    }
+
+    #[test]
+    fn source_namespace_metadata_busy_requires_status_and_explicit_lock_verdict() {
+        let worker = WorkerConfig {
+            id: rch_common::WorkerId::new("metadata-worker"),
+            host: "localhost".to_owned(),
+            user: "test".to_owned(),
+            identity_file: "/tmp/test_key".to_owned(),
+            total_slots: 4,
+            priority: 1,
+            tags: vec![],
+            tools: vec![],
+        };
+        let busy = b"RCH_SOURCE_NAMESPACE_METADATA_LOCK_BUSY elapsed_ms=5003 lock=/registry/metadata.lock\n";
+        let error = namespace_refusal(&worker, Some(76), busy);
+        assert!(crate::transfer::source_authority_busy(&error), "{error:#}");
+        let detail = format!("{error:#}");
+        assert!(detail.contains("metadata-worker"));
+        assert!(detail.contains("elapsed_ms=5003"));
+        assert!(detail.contains("no source grant was admitted"));
+
+        // A killed/interrupted controller might have captured a busy line
+        // before failing elsewhere. That is not a completed busy verdict.
+        for status in [None, Some(73), Some(137)] {
+            let error = namespace_refusal(&worker, status, busy);
+            assert!(!crate::transfer::source_authority_busy(&error), "{error:#}");
+            assert!(format!("{error:#}").contains("elapsed_ms=5003"));
+        }
+        for refusal in [
+            "RCH_SOURCE_NAMESPACE_METADATA_LOCK_INVALID metadata lock changed while waiting",
+            "RCH_SOURCE_CANCELLATION_FENCE identity=abc record=/registry/abc.cancelling",
+            "RCH_SOURCE_REGISTRY_PUBLICATION_UNCONFIRMED identity=abc operation=topology stage=publish",
+            "RCH_SOURCE_NAMESPACE_PROCESS_TERMINATED status=137 signal=9 signal_origin=unknown",
+            "Killed",
+        ] {
+            for status in [Some(73), Some(76)] {
+                let error = namespace_refusal(&worker, status, refusal.as_bytes());
+                assert!(!crate::transfer::source_authority_busy(&error), "{error:#}");
+                assert!(format!("{error:#}").contains(refusal));
+            }
+        }
+    }
+
+    #[test]
+    fn source_namespace_empty_diagnostic_reports_uncertain_publication_and_teardown() {
+        let worker = WorkerConfig {
+            id: rch_common::WorkerId::new("silent-worker"),
+            host: "localhost".to_owned(),
+            user: "test".to_owned(),
+            identity_file: "/tmp/test_key".to_owned(),
+            total_slots: 4,
+            priority: 1,
+            tags: vec![],
+            tools: vec![],
+        };
+        for status in [None, Some(73), Some(76), Some(137)] {
+            for stderr in [b"".as_slice(), b" \n\t".as_slice()] {
+                let error = namespace_refusal(&worker, status, stderr);
+                assert!(!crate::transfer::source_authority_busy(&error), "{error:#}");
+                let detail = format!("{error:#}");
+                assert!(detail.contains("silent-worker"));
+                assert!(detail.contains("RCH_SOURCE_NAMESPACE_INTERRUPTED"));
+                assert!(detail.contains("publication and teardown are unconfirmed"));
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_namespace_registry_lock_process_protocol() {
+        let fixture = tempfile::tempdir().unwrap().keep();
+        let compiled = fixture.join("registry-lock.py");
+        std::fs::write(&compiled, REGISTRY_LOCK).unwrap();
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../scripts/tests/test_source_namespace_control.py");
+        let output = std::process::Command::new("python3")
+            .arg(script)
+            .arg("SourceNamespaceRegistryLockTests")
+            .env("RCH_TEST_SOURCE_NAMESPACE_REGISTRY_LOCK", &compiled)
+            .output()
+            .expect("Python 3 is required for native registry-lock qualification");
+        assert!(
+            output.status.success(),
+            "metadata-lock qualification failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 }
