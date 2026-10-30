@@ -96,14 +96,9 @@ pub fn workspace_source_path(plan: &DependencyActionPlan) -> Result<String, Live
 }
 
 pub(super) fn workspace_layout(plan: &DependencyActionPlan) -> Result<(), LiveRefusal> {
-    // Native inputs use only this request's complete own OUT_DIR in the closed
-    // worker view. Propagated foreign roots need separate ownership and transport
-    // evidence and cannot borrow the single retained generated tree.
-    remote::validate_generated_native_inputs(
-        &plan.invocation,
-        plan.generated_root.as_deref(),
-        plan.canonical_cargo,
-    )?;
+    // Foreign roots require their separately captured Cargo records and complete
+    // trees. They never borrow this package's current generated-tree witness.
+    remote::validate_plan_native_roots(plan)?;
     if plan
         .invocation
         .codegen
@@ -240,14 +235,12 @@ pub fn remote_workspace_execution_isolation_policy(
     // This extension grants only fresh metadata execution from the same complete
     // generated tree; it never permits workspace cache publication or replay.
     if output_class == RemoteDependencyOutputClass::Metadata
-        && !remote::validate_generated_native_inputs(
-            &plan.invocation,
-            plan.generated_root.as_deref(),
-            true,
-        )?
-        .is_empty()
+        && !remote::validate_plan_native_roots(plan)?.is_empty()
     {
         policy.str(remote::CANONICAL_GENERATED_NATIVE_METADATA_ISOLATION_EXTENSION);
+    }
+    if !plan.native_roots.is_empty() {
+        policy.str(remote::CANONICAL_FOREIGN_NATIVE_ISOLATION_EXTENSION);
     }
     Ok(compute(POLICY_DOMAIN, &policy.finish()))
 }
@@ -1207,7 +1200,7 @@ mod tests {
     }
 
     #[test]
-    fn native_workspace_scope_refuses_foreign_searches_modifiers_and_mutated_plans() {
+    fn native_workspace_scope_refuses_unbound_searches_modifiers_and_mutated_plans() {
         for emit in ["dep-info,metadata,link", "dep-info,metadata"] {
             let (argv, env) = native_request(emit);
             let plan = from_request(&argv, &env, WORKSPACE);
@@ -1221,7 +1214,6 @@ mod tests {
                 assert!(key(changed, &manifest).is_err());
             };
             for extra in [
-                "-Lnative=/__rabs/out/cargo/debug/build/other/out",
                 "-Lnative=/__rabs/workspace/native",
                 "-Lnative=/__rabs/toolchain/lib",
                 "-Lnative=/usr/lib",
@@ -1255,6 +1247,12 @@ mod tests {
                 forged.invocation = crate::invocation::parse(&changed, None).unwrap();
                 refuse(&forged);
             }
+            let mut undeclared = plan.clone();
+            undeclared
+                .invocation
+                .lib_search
+                .push("native=/__rabs/out/cargo/debug/build/other/out".into());
+            refuse(&undeclared);
             let mut no_search = plan.clone();
             no_search
                 .invocation
@@ -1275,6 +1273,135 @@ mod tests {
             refuse(&metadata);
             metadata.invocation.native_libs.clear();
             refuse(&metadata);
+        }
+    }
+
+    #[test]
+    fn workspace_native_consumers_retain_foreign_trees_without_gaining_cache_authority() {
+        const FOREIGN: &str = "/__rabs/out/cargo/debug/build/provider-123/out";
+        for emit in ["dep-info,metadata", "dep-info,metadata,link"] {
+            let (mut argv, env) = request();
+            argv[8] = format!("--emit={emit}");
+            argv.push(format!("-Lnative={FOREIGN}/native"));
+            // Cargo propagates the provider's search path through pure Rust
+            // consumers which have neither OUT_DIR nor their own run record.
+            let plan = from_request(&argv, &env, WORKSPACE);
+            assert!(plan.generated_root.is_none());
+            assert_eq!(plan.native_roots, [FOREIGN]);
+            let mut retained = inputs(&plan);
+            retained.directory_enumerations.extend([
+                listing(plan.native_input_virtual_root(0), &["empty", "native"]),
+                listing(plan.native_input_virtual_path(0, "empty"), &[]),
+                listing(
+                    plan.native_input_virtual_path(0, "native"),
+                    &["libanswer.a"],
+                ),
+            ]);
+            for (path, contents) in [
+                (
+                    plan.native_input_virtual_path(0, "native/libanswer.a"),
+                    b"archive".as_slice(),
+                ),
+                (
+                    plan.native_record_virtual_path(0),
+                    b"cargo:rustc-link-search=native=retained\n".as_slice(),
+                ),
+            ] {
+                retained.inputs.push(PositiveInput {
+                    virtual_path: RawBytes::new(path.into_bytes()),
+                    object: ObjectId(compute("rabs.test.workspace-input.v1", contents)),
+                    file_type: InputFileType::Regular,
+                    executable: false,
+                    symlink_resolution: Vec::new(),
+                });
+            }
+            let original = key(&plan, &retained).unwrap();
+            assert_eq!(
+                original.descriptor.action_class,
+                ActionClass::RustcWorkspaceCompile
+            );
+            assert_eq!(
+                workspace_input_directories(&plan, &retained).unwrap(),
+                ["empty", "member", "member/src"]
+            );
+            assert!(
+                generated_input_directories(&plan, &retained)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                super::super::native_input_directories(&plan, &retained, 0).unwrap(),
+                ["empty", "native"]
+            );
+            for position in retained.inputs.len() - 2..retained.inputs.len() {
+                let mut changed = retained.clone();
+                changed.inputs[position].object =
+                    ObjectId(compute("rabs.test.workspace-input.v1", b"mutated"));
+                assert_ne!(
+                    original.action_key,
+                    key(&plan, &changed).unwrap().action_key
+                );
+                let mut absent = retained.clone();
+                absent.inputs.remove(position);
+                assert!(key(&plan, &absent).is_err());
+            }
+            assert!(
+                live_dependency_key(
+                    &plan,
+                    &toolchain(),
+                    &[],
+                    &directories(&plan),
+                    None,
+                    &retained
+                )
+                .is_err()
+            );
+            assert!(
+                canonical_cargo_dependency_key(
+                    &plan,
+                    &toolchain(),
+                    &[],
+                    &directories(&plan),
+                    None,
+                    &retained
+                )
+                .is_err()
+            );
+            assert!(
+                remote::remote_dependency_key(
+                    &plan,
+                    &toolchain(),
+                    &directories(&plan),
+                    &retained,
+                    None,
+                    TOOLCHAIN,
+                    &[39; 32],
+                    &compute(remote::RUNTIME_COHORT_DOMAIN, b"runtime"),
+                )
+                .is_err()
+            );
+
+            // Named static inputs must exist in an actual searched directory,
+            // even when the broader foreign tree is completely retained.
+            let mut named = plan.clone();
+            named.invocation.native_libs.push("static=answer".into());
+            assert!(key(&named, &retained).is_ok());
+            named.invocation.native_libs = vec!["static=missing".into()];
+            assert!(key(&named, &retained).is_err());
+            let mut unsearched = plan.clone();
+            unsearched
+                .invocation
+                .lib_search
+                .retain(|search| !search.starts_with("native="));
+            unsearched
+                .invocation
+                .lib_search
+                .push(format!("native={FOREIGN}/empty"));
+            unsearched
+                .invocation
+                .native_libs
+                .push("static=answer".into());
+            assert!(key(&unsearched, &retained).is_err());
         }
     }
 

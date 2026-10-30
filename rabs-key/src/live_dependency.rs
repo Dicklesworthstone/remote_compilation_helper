@@ -448,6 +448,11 @@ pub struct DependencyActionPlan {
     /// Cargo's build-script output tree consumed by this compile, if present.
     /// Its exact spelling is keyed; it is not a placement mapping.
     pub generated_root: Option<String>,
+    /// Complete foreign build-script OUT_DIR trees reached through Cargo's
+    /// propagated native searches, sorted by exact canonical visible path.
+    /// These require independently retained Cargo run records and closed
+    /// worker execution; ordinary/local dependency capture cannot use them.
+    pub native_roots: Vec<String>,
     /// Target triple the outputs are for.
     pub target_triple: String,
     /// Host triple from the toolchain probe.
@@ -523,6 +528,29 @@ impl DependencyActionPlan {
     #[must_use]
     pub fn generated_input_virtual_path(&self, relative: &str) -> String {
         format!("{}/{relative}", self.generated_virtual_root())
+    }
+
+    /// Distinct input-manifest root of one foreign native input tree. The
+    /// index is the position in the sorted `native_roots` contract, never the
+    /// order of native searches, which remains exact in the invocation.
+    #[must_use]
+    pub fn native_input_virtual_root(&self, index: usize) -> String {
+        format!("{}-native-{index:04}", self.source_virtual_root())
+    }
+
+    /// Virtual input path of a member of one complete foreign native tree.
+    #[must_use]
+    pub fn native_input_virtual_path(&self, index: usize, relative: &str) -> String {
+        format!("{}/{relative}", self.native_input_virtual_root(index))
+    }
+
+    /// Synthetic evidence path for the exact completed Cargo stdout record of
+    /// a foreign native producer. This object is keyed but never mounted into
+    /// the compiler's tree. Its `root-output` spelling is checked separately by
+    /// the coordinator against the retained logical/physical root mapping.
+    #[must_use]
+    pub fn native_record_virtual_path(&self, index: usize) -> String {
+        format!("{}-native-records/{index:04}", self.source_virtual_root())
     }
 
     /// Output file names relative to the out-dir, sorted.
@@ -945,9 +973,15 @@ fn plan_in_profile(
     {
         return Err(LiveRefusal::UnrepresentablePath(root.clone()));
     }
-    remote::validate_generated_native_inputs(
+    let native_roots = if canonical_archive_execution {
+        remote::canonical_generated_native_roots(&invocation, generated_root.as_deref())?
+    } else {
+        Vec::new()
+    };
+    remote::validate_generated_native_inputs_with_roots(
         &invocation,
         generated_root.as_deref(),
+        &native_roots,
         canonical_archive_execution,
     )?;
     let mut dependency_dirs = Vec::new();
@@ -960,6 +994,9 @@ fn plan_in_profile(
             || generated_root
                 .as_ref()
                 .is_some_and(|root| path == root || within(path, root) || within(root, path))
+            || native_roots
+                .iter()
+                .any(|root| path == root || within(path, root) || within(root, path))
             || dependency_dirs
                 .iter()
                 .any(|other: &String| other != path && (within(path, other) || within(other, path)))
@@ -979,7 +1016,8 @@ fn plan_in_profile(
     for entry in &invocation.lib_search {
         // These inputs belong to the complete generated tree, not to Rust's
         // crate-candidate inventory. The bounded remote validator above has
-        // already proved every native directory is within the exact OUT_DIR.
+        // already proved every native directory is within an exact retained
+        // OUT_DIR. Foreign producers have independent run-record evidence.
         if canonical_archive_execution && entry.starts_with("native=") {
             continue;
         }
@@ -1049,6 +1087,7 @@ fn plan_in_profile(
         source_root,
         source_dir_name,
         generated_root,
+        native_roots,
         target_triple,
         host_triple: host_triple.to_owned(),
         externs,
@@ -1291,7 +1330,7 @@ pub fn live_dependency_key(
     build_script_output: Option<&[u8]>,
     inputs: &ActionInputManifest,
 ) -> Result<LiveDependencyKey, LiveRefusal> {
-    if plan.canonical_cargo {
+    if plan.canonical_cargo || !plan.native_roots.is_empty() {
         return Err(LiveRefusal::Facts(
             "canonical Cargo plans require their distinct dependency-key policy".into(),
         ));
@@ -1356,8 +1395,41 @@ fn captured_action_key(
         workspace_input_directories(plan, inputs)?;
     }
     generated_input_directories(plan, inputs)?;
+    if !plan.native_roots.is_empty() {
+        remote::validate_plan_native_roots(plan)?;
+        for index in 0..plan.native_roots.len() {
+            native_input_directories(plan, inputs, index)?;
+            let record = plan.native_record_virtual_path(index);
+            let mut records = inputs
+                .inputs
+                .iter()
+                .filter(|input| input.virtual_path.as_bytes() == record.as_bytes());
+            let Some(input) = records.next() else {
+                return Err(LiveRefusal::Facts(
+                    "foreign native input tree lacks its completed Cargo output record".into(),
+                ));
+            };
+            if records.next().is_some()
+                || input.file_type != InputFileType::Regular
+                || input.executable
+                || !input.symlink_resolution.is_empty()
+            {
+                return Err(LiveRefusal::Facts(
+                    "foreign native Cargo output record must be one exact regular input".into(),
+                ));
+            }
+        }
+    }
     let root = format!("{}/", plan.source_virtual_root());
     let generated = format!("{}/", plan.generated_virtual_root());
+    let native = (0..plan.native_roots.len())
+        .map(|index| {
+            (
+                format!("{}/", plan.native_input_virtual_root(index)),
+                plan.native_record_virtual_path(index),
+            )
+        })
+        .collect::<Vec<_>>();
     if inputs.inputs.is_empty()
         || !inputs.approved_generated_objects.is_empty()
         || inputs.inputs.iter().any(|input| {
@@ -1368,7 +1440,11 @@ fn captured_action_key(
                         && input
                             .virtual_path
                             .as_bytes()
-                            .starts_with(generated.as_bytes())))
+                            .starts_with(generated.as_bytes()))
+                    || native.iter().any(|(tree, record)| {
+                        input.virtual_path.as_bytes().starts_with(tree.as_bytes())
+                            || input.virtual_path.as_bytes() == record.as_bytes()
+                    }))
                 || (input.virtual_path.as_bytes().starts_with(root.as_bytes())
                     && matches!(
                         plan.source_kind,
@@ -1446,6 +1522,14 @@ fn captured_action_key(
             enc.str("complete-generated-input-tree-enumeration-v2")
                 .str(generated_root)
                 .str(&plan.generated_virtual_root());
+        }
+        if !plan.native_roots.is_empty() {
+            enc.str("complete-foreign-native-input-trees-v1");
+            for (index, root) in plan.native_roots.iter().enumerate() {
+                enc.str(root)
+                    .str(&plan.native_input_virtual_root(index))
+                    .str(&plan.native_record_virtual_path(index));
+            }
         }
         compute(DOMAIN_LIVE_NEGATIVE, &enc.finish())
     };
@@ -1552,11 +1636,15 @@ pub fn generated_input_directories(
                 .into(),
         )
     };
-    let workspace_root = (plan.source_kind == DependencySourceKind::WorkspaceExecutionOnly)
-        .then(|| plan.source_virtual_root());
+    let mut other_roots = (0..plan.native_roots.len())
+        .map(|index| plan.native_input_virtual_root(index))
+        .collect::<Vec<_>>();
+    if plan.source_kind == DependencySourceKind::WorkspaceExecutionOnly {
+        other_roots.push(plan.source_virtual_root());
+    }
     if plan.generated_root.is_none() {
         return if inputs.directory_enumerations.iter().all(|enumeration| {
-            workspace_root.as_ref().is_some_and(|root| {
+            other_roots.iter().any(|root| {
                 enumeration.virtual_path.as_bytes() == root.as_bytes()
                     || enumeration
                         .virtual_path
@@ -1569,11 +1657,7 @@ pub fn generated_input_directories(
             Err(refuse())
         };
     }
-    complete_input_directories(
-        inputs,
-        &plan.generated_virtual_root(),
-        workspace_root.as_deref(),
-    )
+    complete_input_directories(inputs, &plan.generated_virtual_root(), &other_roots)
 }
 
 /// Validate the complete retained workspace directory closure for an
@@ -1596,17 +1680,55 @@ pub fn workspace_input_directories(
             "workspace directory evidence requires a canonical execution-only plan".into(),
         ));
     }
-    let generated = plan
+    let mut other_roots = plan
         .generated_root
         .as_ref()
-        .map(|_| plan.generated_virtual_root());
-    complete_input_directories(inputs, &plan.source_virtual_root(), generated.as_deref())
+        .map(|_| plan.generated_virtual_root())
+        .into_iter()
+        .collect::<Vec<_>>();
+    other_roots
+        .extend((0..plan.native_roots.len()).map(|index| plan.native_input_virtual_root(index)));
+    complete_input_directories(inputs, &plan.source_virtual_root(), &other_roots)
+}
+
+/// Validate one complete foreign native OUT_DIR's file and directory closure.
+/// Each root must retain every immediate listing, including empty directories;
+/// the synthetic Cargo stdout record is separate evidence, never tree content.
+///
+/// # Errors
+/// Noncanonical plans, missing/out-of-range roots, undeclared listings, duplicate
+/// paths, symlinks, absent parents or inconsistent file/directory membership.
+pub fn native_input_directories(
+    plan: &DependencyActionPlan,
+    inputs: &ActionInputManifest,
+    index: usize,
+) -> Result<Vec<String>, LiveRefusal> {
+    if !plan.canonical_cargo
+        || index >= plan.native_roots.len()
+        || plan.native_roots.len() > remote::MAX_CANONICAL_NATIVE_ROOTS
+    {
+        return Err(LiveRefusal::Facts(
+            "foreign native directory evidence requires an exact canonical root".into(),
+        ));
+    }
+    remote::validate_plan_native_roots(plan)?;
+    let mut other_roots = (0..plan.native_roots.len())
+        .filter(|other| *other != index)
+        .map(|other| plan.native_input_virtual_root(other))
+        .collect::<Vec<_>>();
+    if plan.source_kind == DependencySourceKind::WorkspaceExecutionOnly {
+        other_roots.push(plan.source_virtual_root());
+    }
+    if plan.generated_root.is_some() {
+        other_roots.push(plan.generated_virtual_root());
+    }
+    complete_input_directories(inputs, &plan.native_input_virtual_root(index), &other_roots)
 }
 
 fn complete_input_directories(
     inputs: &ActionInputManifest,
     root: &str,
-    other_root: Option<&str>,
+    other_roots: &[String],
 ) -> Result<Vec<String>, LiveRefusal> {
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -1620,7 +1742,8 @@ fn complete_input_directories(
     // The generated root occupies one additional enumeration but no relative
     // directory name in the worker context.
     if inputs.directory_enumerations.is_empty()
-        || inputs.directory_enumerations.len() > if other_root.is_some() { 8194 } else { 4097 }
+        || other_roots.len() > remote::MAX_CANONICAL_NATIVE_ROOTS + 1
+        || inputs.directory_enumerations.len() > 4097 * (other_roots.len() + 1)
     {
         return Err(refuse());
     }
@@ -1629,7 +1752,10 @@ fn complete_input_directories(
     for enumeration in &inputs.directory_enumerations {
         let path =
             std::str::from_utf8(enumeration.virtual_path.as_bytes()).map_err(|_| refuse())?;
-        if other_root.is_some_and(|other| path == other || within(path, other)) {
+        if other_roots
+            .iter()
+            .any(|other| path == other || within(path, other))
+        {
             continue;
         }
         let relative = if path == root {
@@ -2359,9 +2485,18 @@ fn observed_input_virtual_path(plan: &DependencyActionPlan, absolute: &str) -> O
         }
         return Some(plan.input_virtual_path(relative));
     }
-    let root = plan.generated_root.as_ref()?;
-    let normalized = normalized_within(absolute, root)?;
-    Some(plan.generated_input_virtual_path(&normalized[root.len() + 1..]))
+    if let Some(root) = &plan.generated_root
+        && let Some(normalized) = normalized_within(absolute, root)
+    {
+        return Some(plan.generated_input_virtual_path(&normalized[root.len() + 1..]));
+    }
+    plan.native_roots
+        .iter()
+        .enumerate()
+        .find_map(|(index, root)| {
+            let normalized = normalized_within(absolute, root)?;
+            Some(plan.native_input_virtual_path(index, &normalized[root.len() + 1..]))
+        })
 }
 
 #[cfg(test)]

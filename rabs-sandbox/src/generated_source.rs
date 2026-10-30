@@ -65,6 +65,7 @@ pub fn validate_generated_directories(directories: &[String]) -> io::Result<()> 
 pub struct GeneratedSource {
     image: Arc<SealedSourceSnapshot>,
     root: String,
+    prefix: String,
     files: Vec<SourceFile>,
     directories: Vec<String>,
 }
@@ -79,6 +80,30 @@ impl GeneratedSource {
         root: &str,
         paths: &[String],
     ) -> io::Result<Self> {
+        Self::from_snapshot_with_prefix(image, root, paths, "generated")
+    }
+
+    /// Select another complete generated tree from the same retained capture.
+    /// Native trees have a separately declared `native/NNNN` transport prefix;
+    /// it is not a filesystem path or authority to read an uncaptured root.
+    pub fn from_snapshot_with_prefix(
+        image: Arc<SealedSourceSnapshot>,
+        root: &str,
+        paths: &[String],
+        prefix: &str,
+    ) -> io::Result<Self> {
+        let native = prefix.strip_prefix("native/").is_some_and(|index| {
+            index.len() == 4
+                && index.bytes().all(|byte| byte.is_ascii_digit())
+                && index
+                    .parse::<usize>()
+                    .is_ok_and(|index| index < crate::dependency_context::MAX_NATIVE_ROOTS)
+        });
+        if prefix != "generated" && !native {
+            return Err(invalid(
+                "generated source has an undeclared transport prefix",
+            ));
+        }
         if paths.len() > MAX_SOURCE_FILES {
             return Err(invalid("generated source exceeds the file count bound"));
         }
@@ -140,7 +165,7 @@ impl GeneratedSource {
                 ));
             }
             files.push(SourceFile {
-                path: format!("generated/{path}"),
+                path: format!("{prefix}/{path}"),
                 len: *size,
                 sha256: *content_sha256,
                 executable: mode & 0o111 != 0,
@@ -155,6 +180,7 @@ impl GeneratedSource {
         Ok(Self {
             image,
             root: root.to_owned(),
+            prefix: prefix.to_owned(),
             files,
             directories,
         })
@@ -170,6 +196,12 @@ impl GeneratedSource {
         &self.files
     }
 
+    /// Exact validated namespace of this tree in the sealed source bundle.
+    #[must_use]
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
     /// Complete sorted generated subdirectory inventory, including empty
     /// directories. The captured root itself is represented by the context.
     #[must_use]
@@ -183,8 +215,10 @@ impl GeneratedSource {
         self.files
             .binary_search_by(|file| file.path.as_str().cmp(path))
             .ok()?;
-        self.image
-            .file_bytes(&self.root, path.strip_prefix("generated/")?)
+        self.image.file_bytes(
+            &self.root,
+            path.strip_prefix(&self.prefix)?.strip_prefix('/')?,
+        )
     }
 }
 
@@ -279,6 +313,58 @@ mod tests {
         assert!(source.shares_snapshot(&image));
         assert!(source.file_bytes("generated/anything").is_none());
         assert!(GeneratedSource::from_snapshot(image, "missing", &[]).is_err());
+    }
+
+    #[test]
+    fn native_projection_preserves_the_same_capture_without_cross_root_byte_access() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("empty")).unwrap();
+        fs::write(root.path().join("libanswer.a"), b"retained native archive").unwrap();
+        let image = capture(root.path());
+        let source = GeneratedSource::from_snapshot_with_prefix(
+            Arc::clone(&image),
+            "generated",
+            &["libanswer.a".into()],
+            "native/0007",
+        )
+        .unwrap();
+        assert!(source.shares_snapshot(&image));
+        assert_eq!(source.prefix(), "native/0007");
+        assert_eq!(source.directories(), ["empty"]);
+        assert_eq!(
+            source.file_bytes("native/0007/libanswer.a"),
+            Some(b"retained native archive".as_slice())
+        );
+        for path in [
+            "generated/libanswer.a",
+            "native/0006/libanswer.a",
+            "native/0007/../libanswer.a",
+        ] {
+            assert!(source.file_bytes(path).is_none());
+        }
+        for prefix in [
+            "native/7",
+            "native/0007/",
+            "native/0032",
+            "native/../0007",
+            "package",
+            "generated/other",
+        ] {
+            assert!(
+                GeneratedSource::from_snapshot_with_prefix(
+                    Arc::clone(&image),
+                    "generated",
+                    &["libanswer.a".into()],
+                    prefix,
+                )
+                .is_err(),
+                "{prefix}"
+            );
+        }
+        assert!(
+            GeneratedSource::from_snapshot_with_prefix(image, "generated", &[], "native/0000")
+                .is_err()
+        );
     }
 
     #[test]

@@ -46,11 +46,7 @@ pub(super) fn canonical_layout(plan: &DependencyActionPlan) -> Result<(), LiveRe
             "workspace execution-only plans cannot use canonical dependency authority".into(),
         ));
     }
-    super::remote::validate_generated_native_inputs(
-        &plan.invocation,
-        plan.generated_root.as_deref(),
-        plan.canonical_cargo,
-    )?;
+    super::remote::validate_plan_native_roots(plan)?;
     let mut presented = plan
         .execution_env
         .iter()
@@ -132,7 +128,7 @@ pub(super) fn canonical_layout(plan: &DependencyActionPlan) -> Result<(), LiveRe
 /// execution. Canonical path spelling alone cannot authorize local capture.
 fn local_metadata_layout(plan: &DependencyActionPlan) -> Result<(), LiveRefusal> {
     canonical_layout(plan)?;
-    if plan.generated_root.is_some() {
+    if plan.generated_root.is_some() || !plan.native_roots.is_empty() {
         return Err(LiveRefusal::Facts(
             "canonical Cargo generated inputs require isolated worker execution".into(),
         ));

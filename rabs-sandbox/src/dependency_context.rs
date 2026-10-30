@@ -42,10 +42,16 @@ pub const CANONICAL_WORKSPACE_CONTEXT_VERSION: &str = "canonical-workspace-exec-
 /// capability before dispatching native metadata to an older worker. Archive
 /// execution does not require it and keeps its existing policy identity.
 pub const CANONICAL_NATIVE_METADATA_CAPABILITY: &str = "canonical-generated-static-metadata-v1";
+/// Additional complete Cargo build-output trees consumed through propagated
+/// native search paths. Peers must negotiate this before transferring inputs;
+/// it does not widen ordinary dependency execution or cache authority.
+pub const CANONICAL_NATIVE_ROOTS_CAPABILITY: &str = "canonical-generated-native-roots-v1";
 /// Full environments remain bounded by the existing command transport allowance.
 pub const MAX_DEPENDENCY_ENV_ENTRIES: usize = 1024;
 /// Maximum dependency search roots accepted in this bounded execution mode.
 pub const MAX_DEPENDENCY_DIRS: usize = 64;
+/// Maximum independently retained native build-output roots per compilation.
+pub const MAX_NATIVE_ROOTS: usize = 32;
 
 /// The output class selects the filesystem contract independently of argv.
 /// The worker must also check that the actual invocation belongs to this class.
@@ -261,6 +267,15 @@ pub struct DependencyArtifactRoot {
     pub prefix: String,
 }
 
+/// A complete foreign Cargo build-script output tree. The prefix selects only
+/// its sealed bundle bytes; visible paths never authorize host filesystem reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencyNativeRoot {
+    pub path: String,
+    pub prefix: String,
+    pub directories: Vec<String>,
+}
+
 /// Validated original paths and complete environment for one rustc action.
 /// Physical source, toolchain, output and jobserver backings never appear here.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -272,6 +287,7 @@ pub struct DependencyExecContext {
     source_directories: Vec<String>,
     generated_root: Option<String>,
     generated_directories: Vec<String>,
+    native_roots: Vec<DependencyNativeRoot>,
     cwd: String,
     toolchain_root: String,
     compiler: String,
@@ -801,6 +817,7 @@ impl DependencyExecContext {
             source_directories: Vec::new(),
             generated_root,
             generated_directories: Vec::new(),
+            native_roots: Vec::new(),
             cwd,
             toolchain_root,
             compiler,
@@ -892,6 +909,59 @@ impl DependencyExecContext {
             .map_err(|_| invalid("dependency generated directory inventory is invalid"))?;
         self.generated_directories = directories;
         Ok(self)
+    }
+
+    /// Retain additional complete native search trees from canonical Cargo's
+    /// completed dependency build scripts. Their files and run records are
+    /// acquired by the coordinator; this validates only the mount contract.
+    /// Sorted paths define stable bundle prefixes without host path aliases.
+    pub fn with_native_roots(
+        mut self,
+        roots: Vec<DependencyNativeRoot>,
+    ) -> Result<Self, DependencyContextError> {
+        if roots.len() > MAX_NATIVE_ROOTS
+            || (!roots.is_empty() && !self.canonical_cargo)
+            || roots.windows(2).any(|pair| pair[0].path >= pair[1].path)
+        {
+            return Err(invalid(
+                "native input roots require a bounded canonical sorted set",
+            ));
+        }
+        for (index, root) in roots.iter().enumerate() {
+            if !canonical_descendant(&root.path, "/__rabs/out/cargo")
+                || !root.path.ends_with("/out")
+                || root.prefix != format!("native/{index:04}")
+            {
+                return Err(invalid(
+                    "native input root has an invalid canonical path or prefix",
+                ));
+            }
+            validate_generated_directories(&root.directories)
+                .map_err(|_| invalid("native input directory inventory is invalid"))?;
+            let visible = Path::new(&root.path);
+            if [&self.source_root, &self.toolchain_root, &self.out_dir]
+                .into_iter()
+                .chain(self.generated_root.iter())
+                .chain(self.dependency_dirs.iter())
+                .any(|other| overlaps(visible, Path::new(other)))
+                || roots[index + 1..]
+                    .iter()
+                    .any(|other| overlaps(visible, Path::new(&other.path)))
+                || self
+                    .loader_dirs
+                    .iter()
+                    .any(|directory| Path::new(directory).starts_with(visible))
+            {
+                return Err(invalid("native input root shadows another mount"));
+            }
+        }
+        self.native_roots = roots;
+        Ok(self)
+    }
+
+    /// Ordered additional retained build-output trees, each with exact topology.
+    pub fn native_roots(&self) -> &[DependencyNativeRoot] {
+        &self.native_roots
     }
     /// Original compiler working directory.
     pub fn cwd(&self) -> &str {
@@ -1014,6 +1084,7 @@ impl DependencyExecContext {
                 .chain(std::iter::once(self.out_dir.as_str()))
                 .chain(self.artifact_roots.iter().map(|root| root.path.as_str()))
                 .chain(self.generated_root())
+                .chain(self.native_roots.iter().map(|root| root.path.as_str()))
             {
                 if let Ok(relative) = Path::new(child).strip_prefix(*alias)
                     && !relative.as_os_str().is_empty()
@@ -1059,7 +1130,10 @@ impl DependencyExecContext {
             Bind::new(source_backing, &self.source_root),
             Bind::new(toolchain_backing, &self.toolchain_root),
         ];
-        if !self.artifact_roots.is_empty() || self.generated_root.is_some() {
+        if !self.artifact_roots.is_empty()
+            || self.generated_root.is_some()
+            || !self.native_roots.is_empty()
+        {
             if source_backing.file_name() != Some(std::ffi::OsStr::new("package")) {
                 return Err(invalid("dependency source is not a sealed package bundle"));
             }
@@ -1076,6 +1150,11 @@ impl DependencyExecContext {
                 self.artifact_roots
                     .iter()
                     .filter(|root| root.path != self.out_dir)
+                    .map(|root| Bind::new(bundle.join(&root.prefix), &root.path)),
+            );
+            spec.ro_binds.extend(
+                self.native_roots
+                    .iter()
                     .map(|root| Bind::new(bundle.join(&root.prefix), &root.path)),
             );
         }
@@ -1176,6 +1255,7 @@ fn build_dependency_argv_with_package_anchor(
     ]
     .into_iter()
     .chain(context.generated_root())
+    .chain(context.native_roots.iter().map(|root| root.path.as_str()))
     .chain(context.empty_aliases())
     .chain(
         context
@@ -1371,6 +1451,84 @@ mod tests {
 
     fn workspace_directories() -> Vec<String> {
         vec!["empty".into(), "member".into(), "member/src".into()]
+    }
+
+    fn native_root(path: &str, index: usize) -> DependencyNativeRoot {
+        DependencyNativeRoot {
+            path: path.into(),
+            prefix: format!("native/{index:04}"),
+            directories: vec!["empty".into(), "nested".into()],
+        }
+    }
+
+    #[test]
+    fn canonical_native_roots_keep_disjoint_complete_mounts_without_out_dir() {
+        let roots = vec![
+            native_root("/__rabs/out/cargo/debug/build/a-hash/out", 0),
+            native_root("/__rabs/out/cargo/debug/build/b-hash/out", 1),
+        ];
+        let context = canonical_context()
+            .with_native_roots(roots.clone())
+            .unwrap();
+        assert_eq!(context.native_roots(), roots);
+        assert!(context.generated_root().is_none());
+        let spec = context
+            .namespace(
+                Path::new("/private/bundle/package"),
+                Path::new("/private/toolchain"),
+                Path::new("/private/output"),
+                Path::new("/private/empty"),
+                Path::new("/private/home"),
+            )
+            .unwrap();
+        for root in &roots {
+            assert!(spec.ro_binds.contains(&Bind::new(
+                Path::new("/private/bundle").join(&root.prefix),
+                &root.path
+            )));
+            assert!(
+                !spec
+                    .rw_binds
+                    .iter()
+                    .any(|bind| bind.visible == Path::new(&root.path))
+            );
+        }
+        for path in [
+            "/host/native/out",
+            "/__rabs/out/cargo/debug/build/a/../out",
+            "/__rabs/out/cargo/debug/build/a",
+            CANONICAL_OUTPUT,
+        ] {
+            assert!(
+                canonical_context()
+                    .with_native_roots(vec![native_root(path, 0)])
+                    .is_err(),
+                "{path}"
+            );
+        }
+        let mut reversed = roots.clone();
+        reversed.reverse();
+        assert!(canonical_context().with_native_roots(reversed).is_err());
+        let mut bad_prefix = roots.clone();
+        bad_prefix[1].prefix = "native/0000".into();
+        assert!(canonical_context().with_native_roots(bad_prefix).is_err());
+        let mut parentless = roots.clone();
+        parentless[0].directories = vec!["missing/parent".into()];
+        assert!(canonical_context().with_native_roots(parentless).is_err());
+        let overlap = vec![
+            roots[0].clone(),
+            native_root(&format!("{}/nested/out", roots[0].path), 1),
+        ];
+        assert!(canonical_context().with_native_roots(overlap).is_err());
+        let own = workspace_context(
+            DependencyExecutionMode::Rlib,
+            workspace_directories(),
+            Some(&roots[0].path),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(own.with_native_roots(roots).is_err());
     }
 
     #[test]
@@ -3430,6 +3588,20 @@ mod tests {
     #[test]
     #[ignore = "requires bubblewrap, cc, GNU ar, and RABS_TEST_TOOLCHAIN_ROOT naming an installed rustc toolchain"]
     fn real_canonical_archive_bundles_retained_native_inputs_and_denies_thin_escape() {
+        assert_real_native_archive_view(false);
+    }
+
+    /// Exercise a downstream package with no OUT_DIR, whose native search paths
+    /// name two separately retained dependency build-script trees.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires bubblewrap, cc, GNU ar, and RABS_TEST_TOOLCHAIN_ROOT naming an installed rustc toolchain"]
+    fn real_canonical_archive_bundles_propagated_native_roots_and_denies_thin_escape() {
+        assert_real_native_archive_view(true);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_real_native_archive_view(foreign: bool) {
         use std::process::Command;
 
         let toolchain = PathBuf::from(
@@ -3442,7 +3614,16 @@ mod tests {
         for workspace in [false, true] {
             let owner = tempfile::tempdir().unwrap();
             let source = owner.path().join("bundle/package");
-            let generated = owner.path().join("bundle/generated/native");
+            let generated = owner.path().join(if foreign {
+                "bundle/native/0000/native"
+            } else {
+                "bundle/generated/native"
+            });
+            let thin_generated = if foreign {
+                owner.path().join("bundle/native/0001/native")
+            } else {
+                generated.clone()
+            };
             let original = owner.path().join("original");
             let output = owner.path().join("output");
             let home = owner.path().join("home");
@@ -3450,6 +3631,7 @@ mod tests {
             for directory in [&source, &generated, &original, &output, &home, &empty] {
                 std::fs::create_dir_all(directory).unwrap();
             }
+            std::fs::create_dir_all(&thin_generated).unwrap();
             let checked = |command: &mut Command| {
                 let result = command.output().unwrap();
                 assert!(
@@ -3488,8 +3670,11 @@ mod tests {
                     .starts_with(b"!<thin>\n"),
                 "the escape case must be an actual thin archive"
             );
-            for name in ["libretained.a", "libthin.a"] {
-                std::fs::copy(original.join(name), generated.join(name)).unwrap();
+            for (name, destination) in [
+                ("libretained.a", &generated),
+                ("libthin.a", &thin_generated),
+            ] {
+                std::fs::copy(original.join(name), destination.join(name)).unwrap();
             }
             // Corrupt only the original archive after the private snapshot exists.
             // The original object deliberately remains readable on the host for
@@ -3530,6 +3715,13 @@ mod tests {
             )
             .unwrap();
             let generated_root = "/__rabs/out/cargo/debug/build/native-hash/out";
+            let foreign_second_root = "/__rabs/out/cargo/debug/build/native-z-hash/out";
+            let own_root = (!foreign).then(|| generated_root.to_owned());
+            let own_directories = if foreign {
+                Vec::new()
+            } else {
+                vec!["native".into()]
+            };
             let package_root = if workspace {
                 layout::WORKSPACE
             } else {
@@ -3541,8 +3733,10 @@ mod tests {
                 ("CARGO_MANIFEST_DIR".into(), package_root.into()),
                 ("CARGO_PKG_NAME".into(), "native_fixture".into()),
                 ("LD_LIBRARY_PATH".into(), "/__rabs/toolchain/lib".into()),
-                ("OUT_DIR".into(), generated_root.into()),
             ];
+            if let Some(root) = &own_root {
+                env.push(("OUT_DIR".into(), root.clone()));
+            }
             let context = if workspace {
                 env.push(("CARGO_PRIMARY_PACKAGE".into(), "1".into()));
                 DependencyExecContext::new_canonical_workspace_execution(
@@ -3552,9 +3746,9 @@ mod tests {
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
-                    Some(generated_root.into()),
+                    own_root,
                     Vec::new(),
-                    vec!["native".into()],
+                    own_directories,
                     env,
                     runtime.cohort().bytes,
                 )
@@ -3568,13 +3762,32 @@ mod tests {
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
-                    Some(generated_root.into()),
+                    own_root,
                     env,
                     runtime.cohort().bytes,
                 )
                 .unwrap()
-                .with_generated_directories(vec!["native".into()])
+                .with_generated_directories(own_directories)
                 .unwrap()
+            };
+            let context = if foreign {
+                assert!(context.generated_root().is_none());
+                context
+                    .with_native_roots(vec![
+                        DependencyNativeRoot {
+                            path: generated_root.into(),
+                            prefix: "native/0000".into(),
+                            directories: vec!["native".into()],
+                        },
+                        DependencyNativeRoot {
+                            path: foreign_second_root.into(),
+                            prefix: "native/0001".into(),
+                            directories: vec!["native".into()],
+                        },
+                    ])
+                    .unwrap()
+            } else {
+                context
             };
             assert_eq!(context.workspace_execution_only(), workspace);
             context.prepare_empty_backings(&empty).unwrap();
@@ -3582,7 +3795,7 @@ mod tests {
                 .namespace(&source, &toolchain, &output, &empty, &home)
                 .unwrap();
             let compile = |library: &str, name: &str| {
-                let args = vec![
+                let mut args = vec![
                     "lib.rs".into(),
                     format!("--crate-name={name}"),
                     "--edition=2024".into(),
@@ -3592,6 +3805,9 @@ mod tests {
                     format!("-Lnative={generated_root}/native"),
                     format!("-lstatic={library}"),
                 ];
+                if foreign {
+                    args.push(format!("-Lnative={foreign_second_root}/native"));
+                }
                 let launch = if workspace {
                     build_workspace_dependency_argv(
                         &context,
