@@ -2,7 +2,11 @@
 
 ## Reality check and execution order — October 30, 2026
 
-**Source assessed:** `7ae3f5fe0cf4a4ca533c235e9e1d89dbfd413ff3`.
+**Initial source assessed:** `7ae3f5fe0cf4a4ca533c235e9e1d89dbfd413ff3`.
+**Current native qualification source:** `a11a6788179e4d5732880400f07d6a52053c6abe`.
+The newer source includes the two daemon compiler repairs, source-bound release
+identity, retained toolchain images, a persistent canonical service and shared
+remote dependency flights. Their presence is distinct from passing acceptance.
 This section supersedes the older assessments below. Its consumers are the
 operator deciding whether to enable RABS and agents implementing the original
 milestones. It addresses the observed mismatch between closed milestones and
@@ -39,8 +43,9 @@ only the stated step, never closure of the surrounding milestone.
   formatted dependency-negotiation error passed to `invalid(&str)`.
 - [ ] Compile a mutually matching current wrapper, coordinator and worker on Linux.
   - [ ] Bind the exact source/overlay, toolchain, profile, Cargo artifacts and binary hashes.
-  - [ ] Include validated `RCH_BUILD_SOURCE` in the default release/service identity;
-    test that a verdict for one overlay cannot authorize another.
+  - [x] Include validated `RCH_BUILD_SOURCE` in the default release/service identity
+    and add the cross-overlay verdict rejection regression (`1a5487bc`).
+  - [ ] Execute that Rust regression with an explicit compiled source stamp.
   - [ ] Keep strict remote execution, disk preflight and existing ownership intact.
   - [ ] Resolve every compiler error; rerun workspace/all-target check and strict Clippy.
 - [ ] Run real Cargo cross-worktree dependency acceptance to a terminal result (M4).
@@ -49,7 +54,17 @@ only the stated step, never closure of the surrounding milestone.
   - [ ] Cargo Fresh rebuild and workspace-only edit; restricted build-script cases.
   - [ ] Retain complete failures/refusals and distinguish support tests from Cargo tests.
 - [ ] Run canonical namespace and authenticated worker acceptance unchanged (M4/M9).
-  - [ ] Full production namespace probe, retained toolchain/runtime and private target roots.
+  - [x] Extend the existing native runner with `--suite canonical`: build wrapper,
+    daemon, worker and Cargo supervisor together from source-checked Cargo JSON
+    artifacts; include all original ignored tests and bound default test concurrency.
+    The runner contract selection passed 25/25, exit 0, 23.715s on trj after
+    lint cleanup, with explicit Cargo doubles; transcript
+    `rabs-execute-20261030-runner-canonical-contract-final.log`.
+    The first new contract run failed five subcases because artifact hashing
+    still selected the original pair; corrected the selector and reran all 25.
+  - [x] Run the production base namespace argv with `/usr/bin/true`: exit 0 on
+    trj and ts1. This proves namespace creation only, not a Cargo build.
+  - [ ] Exercise retained toolchain/runtime and private target roots with actual Cargo.
   - [ ] Local canonical dependency reuse and source invalidation across worktrees.
   - [ ] Real mutual TLS worker metadata execution, earned replay and no dispatch on hits.
   - [ ] Real archive execution, final delivered executable and observed program output.
@@ -76,7 +91,12 @@ only the stated step, never closure of the surrounding milestone.
   - [ ] Clean private install/upgrade on capable Linux hosts; version/hash/doctor checks.
   - [ ] Real-repository Cargo canary compared with stock/current RCH in the same invocation.
   - [ ] Source/env/toolchain/dependency/negative-input invalidation and output/diagnostic parity.
-  - [ ] Deliberately qualify/re-enable CI under resource policy; do not equate YAML with a run.
+  - [x] Bound CI Cargo concurrency, add workspace/check/strict-Clippy prerequisites,
+    retain manually requested source runs across main updates, validate with actionlint,
+    re-enable the workflow and dispatch source `a11a6788`.
+  - [ ] Obtain terminal CI results; repository-level Actions is disabled, so an
+    enabled workflow and dispatch currently start no jobs. Preserve that broader
+    repository setting and execute native qualification directly on the fleet.
   - [ ] Publish tested matching tools; verify downloaded archive and fresh installed execution.
   - [ ] Sustained shadow/soak, incident-free cleanup and explicit rollback per original gates.
 - [ ] Deliver native/header/final-link serving (M5), not just retained archive execution.
@@ -120,12 +140,42 @@ only the stated step, never closure of the surrounding milestone.
 The two native compiler fixes are committed at `3ddd07170c35df57c90e543dc549dc6448b4380e`.
 The first matching build request refused with queue timeout before compiling.
 The installed CLI forbids both clean-overlay/job and source-receipt/job
-combinations, so the existing native runner is now requested as a supported RCH
-job from a separate clean checkout at that exact source, with a private off-root
-mirror and result directory. It retains a longer bounded queue wait without
-changing daemon configuration or disturbing another invocation. At this update
-it is queued, not passed; transcript:
+combinations. The separate frozen checkout's off-root attempt ultimately refused
+namespace initialization before compilation; its transcript is
 `/Volumes/trj-data/rabs-execute-20261030-native-canonical-root-job.log`.
+A later source-bound standard checkout on ts1 reached compilation but its outer
+`CARGO_TARGET_DIR` was rewritten onto the pressured root volume. Only that owned
+invocation (`rchw-311d56b6-e1ab-4e08-8775-d19b33c034a5`, build
+`30087403704156396`) was cooperatively cancelled with `rch jobs cancel`; it
+terminated 143 and its result receipt was retrieved. No other build was stopped.
+The next trj attempt refused on unfinished overlapping source ownership, before
+compilation; its existing claims were left intact. At 22:56 UTC, source
+`a11a6788` began the native runner on ts1 with its explicit `--target-dir`
+`/mnt/je_nas/rch-rabs-execution-20261030/native-a11a6788-target`, two Cargo jobs,
+dev profile, debug information/incremental disabled, and a new result directory.
+Worker process argv confirms real Cargo/rustc use that healthy volume. The
+transcript is `/Volumes/trj-data/rabs-execute-20261030-native-nas-explicit-target.log`.
+This running build is not yet an executed or passed Cargo suite. Its RCH job
+does not inject a compile-time source stamp; qualify source identity separately
+with explicit `RCH_BUILD_SOURCE`, keeping these initial dev results distinct.
+
+The existing native-runner contract suite independently passed **21/21, exit 0,
+21.563s** on trj; transcript
+`/Volumes/trj-data/rabs-execute-20261030-runner-contract.log`. Its Cargo executable
+is an explicit double; it proves artifact/process/jobserver orchestration, not
+compiled RABS behavior. The production base bubblewrap argv ended 0 on both
+trj and ts1, using `/usr/bin/true`; full Cargo isolation remains a separate test.
+
+The new canonical runner contract subsequently passed **25/25** as described in
+the checklist. Scoped UBS remains exit 1 with seven reviewed critical flags:
+four identify the intended operator-selected Cargo/argv subprocess boundaries
+(no shell evaluation), and three mistake public filesystem stat tuples named
+`signature` for authentication secrets. File descriptors close in `finally` or
+file contexts; test JSON parsing intentionally propagates malformed receipts.
+No suppression or scanner change was applied. Ruff findings were corrected
+manually, including executable modes, import spacing and explicit test
+`check=False`; actionlint and `git diff --check` pass. Retained scan:
+`/Volumes/trj-data/rabs-execute-20261030-runner-ubs-reviewed.log`.
 
 ### Capability assessment
 
@@ -143,19 +193,28 @@ it is queued, not passed; transcript:
 | 10 | Restore nearest compatible incremental ancestry with positive ROI | Private target seed capture/restoration is real. `edge/snapshot_lineage.rs` models requested/resolved source lineage; that is not the full portable incremental snapshot/ancestry program or its 3x branch gate. | Partial / M13 |
 | 11 | Watch edits/git events, prewarm and promote real actions | `CoordLive` exposes speculation/prewarm methods, but the searched call sites for `handle_git_prewarm_event`, `submit_default_on_speculation` and `publish_ci_canonical_prewarm` are definitions and tests. No production event source was found in the audited executable paths. | Library capabilities; wiring/ROI gap / M14 |
 | 12 | Explain live decisions and deliver `rch advise` | `rch why` accepts explicit prior/current JSON or a refusal code. `rch advise --help` is an unknown subcommand, and the source CLI has no Advise variant. Key-analysis libraries are not a delivered advice command. | Partial / M15 |
-| 13 | Fleet authority, cross-edge singleflight and root permits | Local coordinator actors, admission and pool ownership exist. Canonical-local operations construct their own coordinator. Two workers are not two edge hosts sharing one authoritative action lineage. | Cross-edge integration/proof gap / M6 |
+| 13 | Fleet authority, cross-edge singleflight and root permits | Current source adds a persistent canonical service owning one coordinator, independent Cargo clients and shared remote dependency flights with per-subscriber cancellation. Real concurrent Cargo/TLS fixtures exist, including origin cancellation. They are not yet qualified here, and do not establish two distinct edge hosts sharing authoritative lineage. | New implementation awaiting native acceptance; cross-host proof gap / M6 |
 | 14 | Native transport cutover with control isolation and data advantage | `worker_transport.rs` uses real ATP frames over native Asupersync mutual TLS. QUIC reactor/batcher types cited by the M7-M9 closure occur in `rabs-protocol/object_transfer.rs` definitions/tests, not the audited worker transport. Full control-under-bulk, WAN recovery and rsync comparison acceptance remain necessary. | Partial / M7, M8 |
 | 15 | Meet the original quantitative performance gates | `benchmarks/GATE_LEDGER.md` still marks eight of eleven rows PENDING, including hit latency, miss overhead, agent loops, storm, branch ping-pong, cold workspace and served fraction. Layer-0/sccache numbers are baselines, not RABS wins. Its in-process metadata claim is not a substitute for a timed production lookup measurement. | Unproven / `bd-yb4ib`, `bd-hjhe3`, `bd-3wscg` |
 | 16 | Ship the tested RABS tools together | Main's release workflow and `install.sh --with-rabs` contain packaging support. The actual latest published v2.1.34 x86_64 GNU tarball lists only `rch`, `rchd`, `rch-wkr`. Its revision is `ff152a046086f26845cbd4e9b0541a7b782fc64f`, 415 commits behind the assessed source. Source packaging is not shipped packaging. | Release gap / S7 (`bd-n8qt3`) |
 | 17 | Qualify safety and rollout with production soak | S8's close reason cites seven chaos tests and component/Cargo suites, not its 24-hour shadow soak or the bridge's continuous shadow-week acceptance. No such new soak was performed by this audit. | Proof gap / S8 (`bd-rb754`) |
 | 18 | Pursue frontier features only after positive evidence | M16's closure cites an optional C/C++ compile plane, rather than its hypothesis/benchmark/proceed/kill review. Frontier candidates remain optional and must not block or replace core delivery. | Decision/evidence gap / M16 |
 
-The live GitHub API also reports the **RABS Binaries workflow is
+At intake the live GitHub API reported the **RABS Binaries workflow was
 `disabled_manually`**, last changed August 20. Its most recent listed successful
 run is August 12 at `42b50f317010c1715c0425cb5cadc06c5a2e73c0`
 ([run 31627022560](https://github.com/Dicklesworthstone/remote_compilation_helper/actions/runs/31627022560)).
-Adding current native tests to the workflow does not mean they have run in CI.
-This audit did not change the workflow's enablement or the rollout policy.
+The workflow has now been re-enabled and explicitly dispatched for `a11a6788`:
+[run 41140223977](https://github.com/Dicklesworthstone/remote_compilation_helper/actions/runs/41140223977).
+At 22:57 UTC it remained queued with zero jobs started. All original acceptance
+tests and thresholds remain; Cargo concurrency is bounded at two, formatting,
+workspace checks and strict Clippy precede the release build, and manual source
+qualifications survive unrelated main pushes. Actionlint passes. A workflow
+dispatch is not a CI pass, a published release or rollout authorization. A
+subsequent `GET /repos/Dicklesworthstone/remote_compilation_helper/actions/permissions`
+returned `enabled:false`: repository-level Actions remains disabled. The
+workflow enable alone therefore supplies no execution route. The broader
+repository setting has been preserved; direct native fleet execution continues.
 
 The executable paths inspected are substantial implementations, not a collection
 of `todo!()` bodies. The central failure mode is **proof-class inflation**:

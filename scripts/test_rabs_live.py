@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
-"""Build one matching binary pair, then run the real Cargo RABS acceptance suite.
+"""Build matching binaries, then run a real Cargo RABS acceptance suite.
 
 The default daemon-release profile exercises the shipping throughput profile,
 not an inner unoptimized daemon. --profile dev selects the debug path explicitly.
 Cargo's own JSON artifact records select executables; no sibling/PATH guess,
-preseeded cache, warmup build, retry, or altered serving budget is used. The Rust
-test helper verifies both binary hashes before starting the daemon. Compiler
+preseeded cache, warmup build, retry, or altered serving budget is used. The
+worktrees Rust helper verifies both binary hashes before starting the daemon. Compiler
 diagnostics and test output retain their original streams.
 
-Usage: python3 scripts/test_rabs_live.py [--profile PROFILE] [--target-dir DIR]
+Usage: python3 scripts/test_rabs_live.py [--suite worktrees|canonical]
+       [--profile PROFILE] [--target-dir DIR]
        [--output-dir NEW_DIR] [--cargo CARGO] [-- LIBTEST_ARGS...]
+
+The default worktrees suite verifies live dependency serving. The canonical
+suite builds the worker and Cargo supervisor too, and explicitly includes the
+ignored production namespace/Cargo/TLS tests, serially unless a thread count
+is supplied. Host support and every original acceptance assertion remain
+mandatory. Neither suite is a performance qualification.
 
 Requires Linux, Python 3.9+, and the repository's Rust toolchain. Build and test
 failures propagate. Preparation records remain in the output directory; this
@@ -21,20 +28,22 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
 import shutil
 import signal
 import stat
 import subprocess
 import sys
 import time
-
+from pathlib import Path
 
 SCHEMA = "rabs.test-binaries"
 MANIFEST_ENV = "RABS_TEST_BINARIES"
 MAX_FRAME = 4 * 1024 * 1024
 MAX_LOG = 64 * 1024 * 1024
 NAMES = ("rabs-wrap", "rabsd")
+CANONICAL_NAMES = NAMES + ("rabs-wkr", "rabs-cargo-root")
+BINARY_SOURCES = {name: Path(name) / "src/main.rs" for name in NAMES + ("rabs-wkr",)}
+BINARY_SOURCES["rabs-cargo-root"] = Path("rabs-wkr/src/bin/rabs-cargo-root.rs")
 
 
 class PreparationError(Exception):
@@ -96,8 +105,9 @@ def fingerprint(path):
 
 class CargoArtifacts:
     """Accept only the requested workspace binaries and one successful finish."""
-    def __init__(self, workspace):
+    def __init__(self, workspace, names=NAMES):
         self.workspace = workspace
+        self.names = names
         self.executables = {}
         self.finished = None
 
@@ -111,7 +121,7 @@ class CargoArtifacts:
         if reason != "compiler-artifact":
             return
         target = value.get("target")
-        if not isinstance(target, dict) or target.get("name") not in NAMES:
+        if not isinstance(target, dict) or target.get("name") not in self.names:
             return
         profile = value.get("profile")
         if (target.get("kind") != ["bin"] or not isinstance(profile, dict)
@@ -119,23 +129,24 @@ class CargoArtifacts:
             return
         name = target["name"]
         source = target.get("src_path")
-        expected = self.workspace / name / "src/main.rs"
+        expected = self.workspace / BINARY_SOURCES[name]
         if not isinstance(source, str) or Path(source) != expected:
-            raise PreparationError("Cargo reported {} from another source tree".format(name))
+            raise PreparationError(f"Cargo reported {name} from another source tree")
         executable = value.get("executable")
         if not isinstance(executable, str) or not os.path.isabs(executable):
-            raise PreparationError("Cargo did not name an absolute {} executable".format(name))
+            raise PreparationError(f"Cargo did not name an absolute {name} executable")
         old = self.executables.get(name)
         if old is not None and old != executable:
-            raise PreparationError("Cargo reported multiple {} executables".format(name))
+            raise PreparationError(f"Cargo reported multiple {name} executables")
         self.executables[name] = executable
 
     def finish(self):
         if self.finished is not True:
             raise PreparationError("Cargo did not confirm a successful build")
-        if set(self.executables) != set(NAMES):
-            raise PreparationError("Cargo did not report both required binary artifacts")
-        return {name: fingerprint(self.executables[name]) for name in NAMES}
+        if set(self.executables) != set(self.names):
+            missing = sorted(set(self.names) - set(self.executables))
+            raise PreparationError("Cargo did not report required binary artifacts: " + ", ".join(missing))
+        return {name: fingerprint(self.executables[name]) for name in self.names}
 
 
 def write_new_json(path, value):
@@ -145,9 +156,9 @@ def write_new_json(path, value):
         output.write("\n")
 
 
-def collect_build(command, workspace, env, log):
+def collect_build(command, workspace, env, log, names=NAMES):
     """Bound each JSON allocation; drain rejected output before reaping Cargo."""
-    collector = CargoArtifacts(workspace)
+    collector = CargoArtifacts(workspace, names)
     # Preserve the caller's explicitly inheritable descriptors, as Cargo's
     # normal exec path does. Keeping CARGO_MAKEFLAGS while closing its pipe
     # descriptors breaks the jobserver; guessing/recreating tokens would invent
@@ -198,6 +209,7 @@ def collect_build(command, workspace, env, log):
 def arguments(argv):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--profile", default="daemon-release")
+    parser.add_argument("--suite", choices=("worktrees", "canonical"), default="worktrees")
     parser.add_argument("--target-dir")
     parser.add_argument("--output-dir", help="new directory for artifact records and Cargo build log")
     parser.add_argument("--cargo", default=os.environ.get("CARGO", "cargo"))
@@ -226,33 +238,55 @@ def run(args, workspace):
     output.mkdir(mode=0o700, parents=True, exist_ok=False)
     common = ["--locked", "--manifest-path", str(workspace / "Cargo.toml"),
               "--target-dir", str(target), "--profile", args.profile]
-    build = [cargo, "build"] + common + ["-p", "rabs-wrap", "-p", "rabsd", "--bins",
-                                              "--message-format=json-render-diagnostics"]
-    test = [cargo, "test"] + common + ["-p", "rabs-wrap", "--test", "live_cargo_worktrees",
-                                            "--", "--nocapture"] + args.test_args
+    canonical = args.suite == "canonical"
+    names = CANONICAL_NAMES if canonical else NAMES
+    packages = ["-p", "rabs-wrap", "-p", "rabsd"]
+    if canonical:
+        packages += ["-p", "rabs-wkr"]
+    build = [cargo, "build"] + common + packages + ["--bins", "--message-format=json-render-diagnostics"]
+    test_target = (["-p", "rabsd", "--test", "canonical_check_local"] if canonical else
+                   ["-p", "rabs-wrap", "--test", "live_cargo_worktrees"])
+    test_options = ["--nocapture"]
+    if canonical:
+        test_options += ["--include-ignored"]
+        if not any(value == "--test-threads" or value.startswith("--test-threads=")
+                   for value in args.test_args):
+            test_options += ["--test-threads=1"]
+    test = [cargo, "test"] + common + test_target + ["--"] + test_options + args.test_args
     env = dict(os.environ)
     # An old manifest from a calling test session is not this build's output.
-    env.pop(MANIFEST_ENV, None)
+    for key in (MANIFEST_ENV, "RABS_CANONICAL_TEST_WRAPPER", "RABS_TEST_WORKER_BIN"):
+        env.pop(key, None)
     report = {"schema": "rabs.live-test-run", "version": 1,
-              "workspace_root": str(workspace), "profile": args.profile,
+              "workspace_root": str(workspace), "profile": args.profile, "suite": args.suite,
+              "build_source": env.get("RCH_BUILD_SOURCE"),
               "build_command": build, "test_command": test,
               "build_exit": None, "test_exit": None}
     start = time.monotonic()
     try:
-        print("RABS binary preparation ({}) -> {}".format(args.profile, output), file=sys.stderr, flush=True)
+        print(f"RABS binary preparation ({args.profile}) -> {output}", file=sys.stderr, flush=True)
         descriptor = os.open(output / "cargo-build.jsonl", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(descriptor, "wb") as log:
-            status, pair = collect_build(build, workspace, env, log)
+            status, binaries = collect_build(build, workspace, env, log, names)
         report["build_exit"] = status
         report["preparation_seconds"] = time.monotonic() - start
         if status != 0:
             return status
+        if canonical and (Path(binaries["rabs-wkr"]["path"]).parent !=
+                          Path(binaries["rabs-cargo-root"]["path"]).parent):
+            raise PreparationError("worker and Cargo supervisor artifacts are not siblings")
         manifest = output / "binaries.json"
-        record = {"schema": SCHEMA, "version": 1, "workspace_root": str(workspace),
-                  "profile": args.profile, **pair}
+        record = {"schema": "rabs.canonical-test-binaries" if canonical else SCHEMA,
+                  "version": 1, "workspace_root": str(workspace),
+                  "profile": args.profile, **binaries}
         write_new_json(manifest, record)
-        env[MANIFEST_ENV] = str(manifest)
-        print("RABS live Cargo tests -> prepared binary pair", file=sys.stderr, flush=True)
+        if canonical:
+            env["RABS_CANONICAL_TEST_WRAPPER"] = binaries["rabs-wrap"]["path"]
+            env["RABS_TEST_WORKER_BIN"] = binaries["rabs-wkr"]["path"]
+        else:
+            env[MANIFEST_ENV] = str(manifest)
+        print(f"RABS live Cargo tests ({args.suite}) -> prepared binaries",
+              file=sys.stderr, flush=True)
         started_test = time.monotonic()
         # The test Cargo needs the SAME inherited jobserver, not just its env.
         status = subprocess.call(test, cwd=workspace, env=env, close_fds=False)

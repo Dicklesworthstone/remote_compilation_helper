@@ -6,15 +6,14 @@ import hashlib
 import importlib.util
 import json
 import os
-from pathlib import Path
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
-
 
 RUNNER = Path(__file__).resolve().parents[1] / "test_rabs_live.py"
 spec = importlib.util.spec_from_file_location("rabs_live_runner", RUNNER)
@@ -44,6 +43,8 @@ for entry in pathlib.Path("/proc/self/fd").iterdir():
 with (root / "calls.jsonl").open("a") as log:
     log.write(json.dumps({"argv": args, "cwd": os.getcwd(),
         "manifest": os.environ.get("RABS_TEST_BINARIES"),
+        "wrapper": os.environ.get("RABS_CANONICAL_TEST_WRAPPER"),
+        "worker": os.environ.get("RABS_TEST_WORKER_BIN"),
         "toolchain": os.environ.get("RUSTUP_TOOLCHAIN"),
         "rustflags": os.environ.get("RUSTFLAGS"),
         "makeflags": os.environ.get("CARGO_MAKEFLAGS"),
@@ -63,12 +64,19 @@ if args[0] == "build":
     if mode == "duplicate-json":
         print('{"reason":"build-finished","success":true,"success":true}')
         sys.exit(0)
-    for name in ["rabsd", "rabs-wrap"]:
+    names = ["rabsd", "rabs-wrap"]
+    if "rabs-wkr" in args:
+        names += ["rabs-wkr", "rabs-cargo-root"]
+    for name in names:
         binary = directory / name
         binary.write_bytes(b"#!/bin/sh\nprintf fixture\\n\n" + name.encode())
         binary.chmod(0o700)
         if mode == "missing" and name == "rabsd":
             continue  # A sibling exists, but Cargo never identified it.
+        if mode == "missing-worker" and name == "rabs-wkr":
+            continue
+        if mode == "missing-supervisor" and name == "rabs-cargo-root":
+            continue
         if mode == "nonexec" and name == "rabsd":
             binary.chmod(0o600)
         if mode == "symlink" and name == "rabsd":
@@ -76,8 +84,20 @@ if args[0] == "build":
             binary.rename(real)
             binary.symlink_to(real)
         source = str(root / name / "src/main.rs")
+        if name == "rabs-cargo-root":
+            source = str(root / "rabs-wkr/src/bin/rabs-cargo-root.rs")
         if mode == "wrong-tree" and name == "rabsd":
             source = "/another-checkout/rabsd/src/main.rs"
+        if mode == "wrong-worker-tree" and name == "rabs-wkr":
+            source = "/another-checkout/rabs-wkr/src/main.rs"
+        if mode == "wrong-supervisor-tree" and name == "rabs-cargo-root":
+            source = str(root / "rabs-cargo-root/src/main.rs")
+        if mode == "separate-supervisor" and name == "rabs-cargo-root":
+            other = directory / "another-profile"
+            other.mkdir()
+            moved = other / name
+            binary.rename(moved)
+            binary = moved
         kind = ["lib"] if mode == "library-only" and name == "rabsd" else ["bin"]
         record = {"reason": "compiler-artifact", "target": {
             "name": name, "kind": kind, "src_path": source},
@@ -89,11 +109,21 @@ if args[0] == "build":
     print(json.dumps({"reason": "build-finished", "success": mode not in ["nonzero", "failed-finish"]}))
     sys.exit(31 if mode == "nonzero" else 0)
 if args[0] == "test":
-    record = json.loads(pathlib.Path(os.environ["RABS_TEST_BINARIES"]).read_text())
-    assert record["schema"] == "rabs.test-binaries" and record["version"] == 1
+    canonical = "canonical_check_local" in args
+    manifest = (pathlib.Path(os.environ["TEST_OUTPUT"]) / "binaries.json" if canonical else
+                pathlib.Path(os.environ["RABS_TEST_BINARIES"]))
+    record = json.loads(manifest.read_text())
+    assert record["schema"] == ("rabs.canonical-test-binaries" if canonical else "rabs.test-binaries")
+    assert record["version"] == 1
     assert record["profile"] == args[args.index("--profile") + 1]
     assert record["workspace_root"] == str(root)
-    for name in ["rabs-wrap", "rabsd"]:
+    names = ["rabs-wrap", "rabsd"]
+    if canonical:
+        names += ["rabs-wkr", "rabs-cargo-root"]
+        assert "RABS_TEST_BINARIES" not in os.environ
+        assert os.environ["RABS_CANONICAL_TEST_WRAPPER"] == record["rabs-wrap"]["path"]
+        assert os.environ["RABS_TEST_WORKER_BIN"] == record["rabs-wkr"]["path"]
+    for name in names:
         item = record[name]
         data = pathlib.Path(item["path"]).read_bytes()
         assert item["sha256"] == hashlib.sha256(data).hexdigest()
@@ -119,12 +149,12 @@ class RunnerTests(unittest.TestCase):
         self.program = self.root / "scripts/test_rabs_live.py"
         shutil.copyfile(RUNNER, self.program)
         (self.root / "Cargo.toml").write_text("[workspace]\n")
-        for name in runner.NAMES:
-            source = self.root / name / "src/main.rs"
-            source.parent.mkdir(parents=True)
+        for source_path in runner.BINARY_SOURCES.values():
+            source = self.root / source_path
+            source.parent.mkdir(parents=True, exist_ok=True)
             source.write_text("fn main() {}\n")
         self.cargo = self.root / "cargo with spaces"
-        self.cargo.write_text("#!{} -S\n{}".format(sys.executable, FAKE_CARGO))
+        self.cargo.write_text(f"#!{sys.executable} -S\n{FAKE_CARGO}")
         self.cargo.chmod(0o700)
         self.count = 0
 
@@ -134,11 +164,12 @@ class RunnerTests(unittest.TestCase):
         env = {key: value for key, value in os.environ.items()
                if not key.startswith(("CARGO", "RUST", "RABS", "TEST_"))}
         env["TEST_ROOT"] = str(self.root)
+        env["TEST_OUTPUT"] = str(self.output)
         env.update(changes or {})
         result = subprocess.run([sys.executable, "-S", str(self.program), "--cargo", str(self.cargo),
                                  "--output-dir", str(self.output)] + list(args),
                                 env=env, cwd=self.root, capture_output=True, timeout=15,
-                                pass_fds=pass_fds)
+                                pass_fds=pass_fds, check=False)
         return result
 
     def calls(self):
@@ -183,6 +214,54 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(test["argv"][test["argv"].index("--") + 1:],
                          ["--nocapture", "build_script_reuse", "--test-threads=1", "--exact"])
 
+    def test_canonical_suite_prepares_all_binaries_and_runs_original_ignored_tests(self):
+        result = self.launch(["--suite", "canonical", "--profile", "dev"], {
+            "RABS_TEST_BINARIES": "/stale/manifest",
+            "RABS_CANONICAL_TEST_WRAPPER": "/stale/wrapper",
+            "RABS_TEST_WORKER_BIN": "/stale/worker",
+            "RCH_BUILD_SOURCE": "a11a6788179e4d5732880400f07d6a52053c6abe",
+        })
+        self.assertEqual(result.returncode, 0, result.stderr)
+        build, test = self.calls()
+        self.assertIn("rabs-wkr", build["argv"])
+        self.assertIn("--bins", build["argv"])
+        self.assertIn("canonical_check_local", test["argv"])
+        self.assertNotIn("live_cargo_worktrees", test["argv"])
+        self.assertEqual(test["argv"][test["argv"].index("-p") + 1], "rabsd")
+        self.assertEqual(test["argv"][test["argv"].index("--") + 1:],
+                         ["--nocapture", "--include-ignored", "--test-threads=1"])
+        self.assertIsNone(build["wrapper"])
+        self.assertIsNone(build["worker"])
+        self.assertEqual(self.report()["suite"], "canonical")
+        self.assertEqual(self.report()["build_source"],
+                         "a11a6788179e4d5732880400f07d6a52053c6abe")
+
+    def test_canonical_selection_and_explicit_parallelism_are_preserved(self):
+        for threads in (["--test-threads=2"], ["--test-threads", "2"]):
+            with self.subTest(threads=threads):
+                result = self.launch(["--suite", "canonical", "--", "selected_native_test",
+                                      "--exact"] + threads)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                argv = self.calls()[-1]["argv"]
+                self.assertEqual(argv[argv.index("--") + 1:],
+                                 ["--nocapture", "--include-ignored", "selected_native_test", "--exact"] + threads)
+
+    def test_canonical_missing_foreign_and_misplaced_worker_artifacts_refuse_before_tests(self):
+        for mode in ["missing-worker", "missing-supervisor", "wrong-worker-tree",
+                     "wrong-supervisor-tree", "separate-supervisor"]:
+            with self.subTest(mode=mode):
+                mark = len(self.calls())
+                result = self.launch(["--suite", "canonical"], {"TEST_MODE": mode})
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(len(self.calls()), mark + 1)
+                self.assertIsNone(self.report()["test_exit"])
+                self.assertFalse((self.output / "binaries.json").exists())
+
+    def test_canonical_test_failure_propagates(self):
+        result = self.launch(["--suite", "canonical"], {"TEST_EXIT": "37"})
+        self.assertEqual(result.returncode, 37, result.stderr)
+        self.assertEqual(self.report()["test_exit"], 37)
+
     def test_toolchain_rustflags_and_jobserver_environment_are_not_rewritten(self):
         changes = {"RUSTUP_TOOLCHAIN": "nightly-fixture", "RUSTFLAGS": "-C debuginfo=1",
                    "CARGO_MAKEFLAGS": "-j --jobserver-auth=3,4", "RABS_TEST_BINARIES": "/stale/manifest"}
@@ -201,7 +280,7 @@ class RunnerTests(unittest.TestCase):
                 try:
                     os.write(write_fd, b"+")
                     os.set_blocking(read_fd, False)
-                    flags = "-j {}={},{}".format(spelling, read_fd, write_fd)
+                    flags = f"-j {spelling}={read_fd},{write_fd}"
                     mark = len(self.calls())
                     result = self.launch(changes={
                         "CARGO_MAKEFLAGS": flags,
@@ -230,7 +309,7 @@ class RunnerTests(unittest.TestCase):
                     os.write(write_fd, b"+")
                     os.set_blocking(read_fd, False)
                     result = self.launch(changes={
-                        **changes, "CARGO_MAKEFLAGS": "-j --jobserver-auth={},{}".format(read_fd, write_fd),
+                        **changes, "CARGO_MAKEFLAGS": f"-j --jobserver-auth={read_fd},{write_fd}",
                         "TEST_JOBSERVER_READ": str(read_fd),
                         "TEST_JOBSERVER_WRITE": str(write_fd),
                     }, pass_fds=(read_fd, write_fd))
@@ -259,7 +338,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertTrue((self.root / "target/daemon-release/rabsd").exists())
         self.assertEqual(len(self.calls()), 1)
-        self.assertIn("both required", self.report()["preparation_error"])
+        self.assertIn("required binary artifacts: rabsd", self.report()["preparation_error"])
 
     def test_bad_json_wrong_sources_and_ambiguous_builds_refuse(self):
         for mode in ["malformed", "oversize", "duplicate-json", "wrong-tree",
@@ -347,9 +426,8 @@ class ArtifactTests(unittest.TestCase):
                     changed = True
                     path.write_bytes(b"y" * 100000)
                 return data
-            with mock.patch.object(runner.os, "read", side_effect=reading):
-                with self.assertRaises(runner.PreparationError):
-                    runner.fingerprint(path)
+            with mock.patch.object(runner.os, "read", side_effect=reading), self.assertRaises(runner.PreparationError):
+                runner.fingerprint(path)
 
     def test_binary_hashing_does_not_open_a_fifo_or_follow_a_symlink(self):
         with tempfile.TemporaryDirectory() as directory:

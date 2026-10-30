@@ -20,6 +20,8 @@ on:
       - 'rch-common/src/toolchain.rs'
       - 'rch-common/src/toolchain/**'
       - 'scripts/cargo-rabs'
+      - 'scripts/test_rabs_live.py'
+      - 'scripts/tests/test_rabs_live_runner.py'
       - 'scripts/tests/test_cargo_rabs.py'
       - 'scripts/tests/test_cargo_rabs_canonical.py'
       - 'scripts/tests/test_cargo_rabs_local.py'
@@ -66,6 +68,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+      - name: Native acceptance runner orchestration (explicit Cargo fixtures)
+        run: python3 -I -S scripts/tests/test_rabs_live_runner.py -v
       - name: Native filesystem, process, archive and upgrade regressions
         run: python3 -m unittest discover -s tests -p 'test_install_rabs*.py' -v
       - name: SPRT native SQL and boundary model (not a Rust execution proof)
