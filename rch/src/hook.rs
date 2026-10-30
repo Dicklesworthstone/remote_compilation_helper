@@ -276,9 +276,75 @@ enum RemotePipelineFailurePolicy {
     FailClosedNoLocalFallback,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceNamespacePreflightStage {
+    TopologyProbe,
+    NamespaceInitialization,
+}
+
+/// Issued only after the exact admitted journal durably records a failed
+/// namespace preflight phase with no source intent or observed outcome. The
+/// original transport error stays in the chain; it must not be confused with
+/// a timeout after admission. A daemon terminal receipt determines the outcome.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error(
+    "RCH_SOURCE_NAMESPACE_PRE_ADMISSION_FAILED worker={worker_id} build={build_id} stage={stage:?}: no source or execution grant was issued"
+)]
+struct SourceNamespacePreflightFailure {
+    local_wrapper_id: String,
+    worker_id: WorkerId,
+    build_id: u64,
+    stage: SourceNamespacePreflightStage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceNamespacePreflightCompletion {
+    Failed,
+    Cancelled,
+}
+
+impl SourceNamespacePreflightCompletion {
+    fn exit_code(self) -> i32 {
+        match self {
+            Self::Failed => EXIT_BUILD_ERROR,
+            Self::Cancelled => 130,
+        }
+    }
+}
+
+/// A release ACK proves that the reservation is retired, but a cancellation
+/// may already have supplied its terminal result. Read the exact receipt
+/// before recording an outcome or retrying. A missing reply leaves exit=None
+/// so owner-verified restart recovery can reconcile that same daemon receipt.
+async fn confirm_source_namespace_preflight_release(
+    writer: &DurableLeaseWriter,
+    failure: &SourceNamespacePreflightFailure,
+    release_acknowledged: bool,
+    socket_path: &str,
+) -> anyhow::Result<SourceNamespacePreflightCompletion> {
+    let result = async {
+        anyhow::ensure!(
+            release_acknowledged,
+            "namespace preflight reservation release is unconfirmed"
+        );
+        let observed = writer.snapshot();
+        writer.validate_source_namespace_preflight_identity(&observed, failure)?;
+        let completion =
+            daemon_ipc::query_source_namespace_preflight_completion(socket_path, &observed).await?;
+        writer.record_source_namespace_preflight_completion(failure, completion)?;
+        Ok(completion)
+    }
+    .await;
+    result.map_err(|error: anyhow::Error| {
+        error
+            .context("namespace preflight terminal receipt could not be reconciled")
+            .context(crate::transfer::RemoteExecutionUnconfirmed)
+    })
+}
+
 fn classify_remote_pipeline_failure(error: &anyhow::Error) -> RemotePipelineFailurePolicy {
     if is_remote_execution_unconfirmed(error)
-        || is_ssh_command_timeout_error(error)
+        || (is_ssh_command_timeout_error(error) && !error.is::<SourceNamespacePreflightFailure>())
         || error
             .downcast_ref::<crate::transfer::RemoteBuildDiskBudgetExceeded>()
             .is_some_and(|failure| failure.started)
@@ -2136,6 +2202,105 @@ impl DurableLeaseWriter {
         next.exit_code = Some(exit_code);
         self.publish_transition(&mut lease, next)
     }
+
+    /// The two namespace preflight RPCs run before RecoverySession::begin,
+    /// source/pair acquisition, transfer or execution. Record their failed
+    /// phase before daemon release, without inventing source cleanup or a
+    /// terminal result that could conflict with a concurrent daemon cancellation.
+    /// Only this durable, identity-checked transition permits the typed retry
+    /// classification; uncertain journal publication retains ownership instead.
+    fn source_namespace_preflight_failed(
+        &self,
+        worker_id: &WorkerId,
+        build_id: Option<u64>,
+        local_wrapper_id: Option<&str>,
+        stage: SourceNamespacePreflightStage,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        if is_remote_execution_unconfirmed(&error) {
+            return error;
+        }
+        let checkpoint = (|| -> anyhow::Result<(u64, String)> {
+            let mut lease = self.lease.lock().unwrap_or_else(|p| p.into_inner());
+            let build_id =
+                build_id.context("namespace preflight failure has no admitted build identity")?;
+            let wrapper_id =
+                local_wrapper_id.context("namespace preflight failure has no wrapper identity")?;
+            self.admission_reference_from_lease(&lease, wrapper_id, build_id, worker_id)?;
+            anyhow::ensure!(
+                !lease.terminal_acknowledged
+                    && lease.exit_code.is_none()
+                    && lease.recovery.is_none(),
+                "namespace preflight failure cannot replace source ownership or an observed outcome"
+            );
+            let mut next = lease.clone();
+            next.heartbeat("source_namespace_preflight_failed", now_unix_ms());
+            self.publish_transition(&mut lease, next)?;
+            Ok((build_id, wrapper_id.to_owned()))
+        })();
+        match checkpoint {
+            Ok((build_id, local_wrapper_id)) => error.context(SourceNamespacePreflightFailure {
+                local_wrapper_id,
+                worker_id: worker_id.clone(),
+                build_id,
+                stage,
+            }),
+            Err(checkpoint) => error
+                .context(format!(
+                    "namespace preflight failure could not be durably recorded: {checkpoint:#}"
+                ))
+                .context(crate::transfer::RemoteExecutionUnconfirmed),
+        }
+    }
+
+    fn validate_source_namespace_preflight_identity(
+        &self,
+        lease: &DurableJobLease,
+        failure: &SourceNamespacePreflightFailure,
+    ) -> anyhow::Result<()> {
+        self.admission_reference_from_lease(
+            lease,
+            &failure.local_wrapper_id,
+            failure.build_id,
+            &failure.worker_id,
+        )?;
+        anyhow::ensure!(
+            lease.recovery.is_none(),
+            "namespace preflight completion cannot replace source ownership"
+        );
+        Ok(())
+    }
+
+    /// Publish only the exact admitted attempt's validated daemon outcome.
+    /// Heartbeats may change phase during the query; admission, source evidence
+    /// and observed outcomes must still agree under this same journal mutex.
+    fn record_source_namespace_preflight_completion(
+        &self,
+        failure: &SourceNamespacePreflightFailure,
+        completion: SourceNamespacePreflightCompletion,
+    ) -> anyhow::Result<()> {
+        let mut lease = self.lease.lock().unwrap_or_else(|p| p.into_inner());
+        self.validate_source_namespace_preflight_identity(&lease, failure)?;
+        let exit_code = completion.exit_code();
+        anyhow::ensure!(
+            lease.exit_code.is_none_or(|observed| observed == exit_code),
+            "namespace preflight daemon completion contradicts the observed outcome"
+        );
+        if lease.terminal_acknowledged {
+            anyhow::ensure!(
+                lease.exit_code == Some(exit_code),
+                "namespace preflight terminal journal has no matching outcome"
+            );
+            return Ok(());
+        }
+        let mut next = lease.clone();
+        next.exit_code = Some(exit_code);
+        if completion == SourceNamespacePreflightCompletion::Cancelled {
+            next.acknowledge_terminal(now_unix_ms());
+        }
+        self.publish_transition(&mut lease, next)
+    }
+
     fn create(
         command: &str,
         strict_remote: bool,
@@ -4699,6 +4864,41 @@ pub async fn run_exec(
                 ));
             }
             return Err(release_unconfirmed_error(&worker.id, remote_build_id));
+        }
+
+        if !retain_unconfirmed_ownership
+            && let Err(error) = result.as_ref()
+            && let Some(failure) = error.downcast_ref::<SourceNamespacePreflightFailure>()
+        {
+            let completion = confirm_source_namespace_preflight_release(
+                &durable_lease,
+                failure,
+                release_acknowledged,
+                &config.general.socket_path,
+            )
+            .await?;
+            if completion == SourceNamespacePreflightCompletion::Cancelled {
+                reporter.summary("[RCH] cancelled during source namespace initialization");
+                emit_exec_envelope(&ExecResultEnvelope {
+                    api_version: "1.0",
+                    command: &remote_command,
+                    outcome: "completed",
+                    location: "remote",
+                    fallback_reason: None,
+                    worker_id: Some(worker.id.as_str()),
+                    remote_exit_code: Some(130),
+                    duration_ms: Some(exec_start.elapsed().as_millis() as u64),
+                    timing: exec_timing.as_ref(),
+                    result_dirs: exec_dir_stats.as_deref(),
+                    error_code: None,
+                    admission: durable_lease.machine_admission_reference(
+                        &wrapper_id,
+                        remote_build_id,
+                        &worker.id,
+                    )?,
+                });
+                std::process::exit(130);
+            }
         }
 
         // Classify the outcome. Terminal cases (success, real build/test failure,

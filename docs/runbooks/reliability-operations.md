@@ -184,6 +184,7 @@ or the word `Killed` alone:
 | Diagnostic | Meaning and next observation |
 |---|---|
 | `RCH_SOURCE_NAMESPACE_METADATA_LOCK_BUSY` | The initializer exhausted its five-second metadata-lock wait; `elapsed_ms` and `lock` identify that wait. This uses status 76 and admits no source grant. |
+| `RCH_SOURCE_NAMESPACE_PRE_ADMISSION_FAILED` | The named topology or initialization stage failed before source or execution intent. The exact admitted journal recorded the phase; retry still requires acknowledged daemon release and its exact terminal receipt. |
 | `RCH_SOURCE_SETTLEMENT_LOCK_BUSY` | Recovery could not drain the named activity or metadata lock within its bounded wait. Retain the journal and retry after the owning activity resolves. |
 | `RCH_SOURCE_CANCELLATION_FENCE` | An explicit same-token fence or an overlapping active cancelling owner caused refusal. Use the reported identity/record to find its owning journal. |
 | `RCH_SOURCE_REGISTRY_PUBLICATION_UNCONFIRMED` | A record transition or durability confirmation did not complete. A visible rename is insufficient acknowledgement; retry the same identity. |
@@ -194,6 +195,40 @@ or the word `Killed` alone:
 | `RCH_SOURCE_CANCELLATION_UNSETTLED` | Worker evidence or its lock namespace could not be verified. The accompanying reason identifies what must be resolved before retrying. |
 | `RCH_SOURCE_CLAIM_RETENTION_DEFERRED` | Receipt collection could not confirm the retained cancellation fence's durability. Both records remain; this does not grant cleanup authority. |
 | `RCH_GC_LEGACY_SOURCE_OWNERSHIP_UNKNOWN` | A legacy active claim is malformed or unsafe to read. GC cannot prove the candidate unowned and preserves both the record and source tree. |
+
+#### Namespace failure, daemon completion and readmission
+
+The topology probe and namespace initialization run before the recovery intent,
+source or pair acquisition, transfer and execution. A failure at either boundary
+can receive the typed preflight diagnostic only after the exact admitted journal
+durably records its failed phase. Its schema, wrapper, worker, build and
+nonpending selection must match, with no source recovery, observed outcome or
+terminal acknowledgement. The phase is diagnostic, never recovery authority;
+later finalize or release-uncertain heartbeats may replace it. The outcome stays
+unset until daemon completion is verified.
+
+For this path, an acknowledged release is followed by a bounded read-only
+completion query on the same configured daemon socket. The wrapper, worker and
+build must match the exact terminal record. An ordinary failed result permits
+the existing retry policy. A completed cancellation with exit `130`, the exact
+cancellation operation ID and successful cleanup/history evidence instead
+publishes terminal acknowledgement and exits without selecting another worker.
+A release ACK alone cannot choose between those results: an idempotent release
+may acknowledge cancellation that already won the race.
+
+The journal rechecks admission identity, absent source recovery and outcome
+agreement under its mutex after the query. A failed or oversized reply,
+contradictory receipt, changed admission or failed journal publication remains
+unconfirmed; it cannot authorize another selection. Any
+`RemoteExecutionUnconfirmed` in the original error chain still takes precedence.
+Generic later SSH timeouts remain fail closed, while original source-contention
+evidence remains available to the worker-selection policy.
+
+If the dispatcher stops before release or before receiving that terminal
+receipt, the journal has no invented exit code to conflict with a later daemon
+cancellation. Existing owner-verified restart recovery can adopt the exact
+daemon completion after the wrapper is absent. This neither fabricates daemon
+completion from a phase nor relaxes conflicting outcomes in older journals.
 
 #### Journal custody during readmission
 
@@ -337,13 +372,35 @@ and `0644` originals while still refusing writable or hard-linked originals,
 changed evidence and nonprivate retained snapshots. This qualification does not
 substitute for compilation and execution of the full RCH retry integration.
 
-Pinned workspace `cargo fmt --check` passed. The full locked workspace check
-was terminated by SIGKILL while compiling the unchanged `asupersync 0.5.0`
-dependency in an environment limited to 8 GiB; it did not establish a compiler
-verdict for the changed Rust integration. Rust checks, Clippy and execution of
-the recovery/lease regressions remain required before release acceptance.
-The Linux process and SSH results do not stand in for those Rust gates or for
-the original affected worker's acceptance.
+Pinned workspace `cargo fmt --all -- --check` passed on current main with the
+admission correction. Eight focused `namespace_preflight_` tests were added for
+phase publication, exact terminal receipts over real Unix sockets, cancellation
+winning a release race, invalid/oversized replies, source-busy propagation,
+journal reload and concurrent completion. These new RCH tests were **not
+executed** in this environment.
+
+The latest locked, default-feature `cargo check -p rch --all-targets` attempt
+again received SIGKILL while compiling the unchanged `asupersync 0.5.0`
+dependency, before reaching RCH. It used one Cargo job, one rustc thread, no
+debug info and no incremental compilation under the 8 GiB memory limit; the
+cgroup OOM-kill counter increased during that failure. The earlier full locked
+workspace check at `5b1eee2` encountered the same dependency failure. These
+attempts establish no compiler verdict for the changed RCH integration. Full
+workspace check/Clippy and execution of the RCH recovery, lease and retry
+regressions remain required before release acceptance. Successful common-crate
+Clippy and Linux process/SSH qualifications do not replace those gates or the
+original affected worker's acceptance.
+
+On a native host with sufficient build capacity, include these Rust gates with
+the worker acceptance cases below:
+
+```bash
+cargo check --locked --workspace --all-targets
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked -p rch --bin rch namespace_preflight_ -- --test-threads=1
+cargo test --locked -p rch --bin rch retry_selection_ -- --test-threads=1
+cargo test --locked -p rch --bin rch retry_custody_ -- --test-threads=1
+```
 
 Before calling the incident resolved on the fleet, record the exact dispatcher
 and worker revisions and complete these acceptance cases on isolated native
@@ -356,6 +413,9 @@ worker fixtures:
    including a lost settlement reply and restart between worker publication and
    local journal acknowledgement. Retrying the original wrapper must settle
    once, preserve the old-token fence and admit a new overlapping job safely.
+   Interrupt preflight before daemon release and race release against daemon
+   cancellation. Exact failure receipts may retry; completed cancellation must
+   remain terminal, with no replay and no invented conflicting local exit.
 3. Exercise concurrent dispatchers and a still-running activity. Recovery must
    refuse while that activity owns its lock; an unrelated project must continue
    making progress. Corrupt, changed, absent and conflicting evidence must

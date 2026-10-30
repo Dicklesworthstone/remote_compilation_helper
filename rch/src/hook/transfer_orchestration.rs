@@ -1440,11 +1440,20 @@ async fn execute_remote_compilation_inner(
     // Initialize under the registry mutex before any job intent or pair/source
     // lock exists. Its bounded wait must not block exact-owner recovery.
     if durable_sources {
-        durable_lease.context(
+        let writer = durable_lease.context(
             "remote source ownership requires an admitted durable job lease; use rch exec",
         )?;
         if worker_projects_topology_requires_initialization(&worker_config, &remote_topology_policy)
-            .await?
+            .await
+            .map_err(|error| {
+                writer.source_namespace_preflight_failed(
+                    &worker_config.id,
+                    build_id,
+                    local_wrapper_id,
+                    SourceNamespacePreflightStage::TopologyProbe,
+                    error,
+                )
+            })?
         {
             reporter
                 .verbose("[RCH] initializing shared path translation without claiming its bases");
@@ -1456,7 +1465,16 @@ async fn execute_remote_compilation_inner(
             &remote_topology_policy,
             &recovery_identity,
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            writer.source_namespace_preflight_failed(
+                &worker_config.id,
+                build_id,
+                local_wrapper_id,
+                SourceNamespacePreflightStage::NamespaceInitialization,
+                error,
+            )
+        })?;
     }
     let source_target_root = sync_plan
         .iter()

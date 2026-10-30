@@ -901,6 +901,58 @@ pub(crate) async fn release_worker_with_fault(
         .context("release was not acknowledged")
 }
 
+/// A pre-intent namespace failure has no command result of its own. Release
+/// can acknowledge a prior cancellation, so read this exact build's terminal
+/// receipt using the same configured socket before publishing its outcome.
+pub(super) async fn query_source_namespace_preflight_completion(
+    socket_path: &str,
+    observed: &DurableJobLease,
+) -> anyhow::Result<SourceNamespacePreflightCompletion> {
+    let build_id = observed
+        .identity
+        .remote_build_id
+        .filter(|id| *id > 0)
+        .context("namespace completion requires an admitted build")?;
+    let stream = timeout(Duration::from_secs(2), UnixStream::connect(socket_path))
+        .await
+        .context("namespace completion daemon connection timed out")??;
+    let (reader, mut writer) = stream.into_split();
+    let request = format!(
+        "GET /builds/{build_id}?local_wrapper_id={}\n",
+        urlencoding_encode(&observed.identity.local_wrapper_id)
+    );
+    let budget = daemon_io_timeout();
+    write_daemon_request(&mut writer, request.as_bytes(), budget).await?;
+    let body = read_daemon_body(reader, budget, false).await?;
+    let reply: serde_json::Value =
+        serde_json::from_str(&body).context("malformed namespace completion receipt")?;
+    let exit = crate::commands::jobs::validate_completion(observed, &reply)?;
+    match exit {
+        EXIT_BUILD_ERROR => {
+            anyhow::ensure!(
+                reply["record"]["cancellation"].is_null(),
+                "namespace failure receipt contains conflicting cancellation evidence"
+            );
+            Ok(SourceNamespacePreflightCompletion::Failed)
+        }
+        130 => {
+            let cancellation: rch_common::BuildCancellationMetadata = serde_json::from_value(
+                reply["record"]["cancellation"].clone(),
+            )
+            .context("namespace cancellation receipt has no complete cancellation evidence")?;
+            anyhow::ensure!(
+                cancellation.operation_id == format!("cancel-{build_id}")
+                    && cancellation.final_state == "completed"
+                    && cancellation.cleanup_ok
+                    && cancellation.history_cancelled,
+                "namespace cancellation receipt does not prove completed cancellation"
+            );
+            Ok(SourceNamespacePreflightCompletion::Cancelled)
+        }
+        _ => anyhow::bail!("namespace preflight received an unexpected daemon exit {exit}"),
+    }
+}
+
 /// Record a successful build on a worker (for cache affinity).
 pub(crate) async fn record_build(
     socket_path: &str,
