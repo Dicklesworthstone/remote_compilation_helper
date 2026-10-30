@@ -1,4 +1,203 @@
 set -eu
+# A source holder is a control session, never the compiler or rsync session.
+# Keep its liveness independent of sshd/kernel TCP keepalive. The supervisor
+# owns a private group from before lock acquisition through final teardown;
+# expiry cannot touch a separately launched source activity and never edits a
+# claim, cancellation marker, pair owner or receipt. Those durable records,
+# plus the activity mutex, remain the authority for recovery after expiry.
+if [ "${1-}" = --rch-session ]; then
+    command -v python3 >/dev/null 2>&1 || {
+        printf '%s\n' 'RCH_SOURCE_LOCK_LIVENESS_UNAVAILABLE: Python 3 is required; no source locks acquired' >&2
+        exit 73
+    }
+    exec python3 -I -S -c '
+import os
+import select
+import signal
+import sys
+import time
+
+HEARTBEAT = b"RCH_SOURCE_LOCK_HEARTBEAT\n"
+MAX_FRAME = 4096
+MAX_PROGRAM = 32 * 1024 * 1024
+
+def diagnostic(message):
+    # Diagnostics must not prevent teardown when the SSH reader is gone or
+    # its pipe is full. Called only on fatal paths, immediately before exit.
+    try:
+        os.set_blocking(2, False)
+        os.write(2, (message + "\n").encode())
+    except OSError:
+        pass
+
+try:
+    idle = int(sys.argv[1])
+    if len(sys.argv) != 2 or not 1 <= idle <= 3600:
+        raise ValueError("invalid heartbeat deadline")
+    if not hasattr(os, "waitid") or not hasattr(os, "WNOWAIT"):
+        raise ValueError("non-reaping child observation is unavailable")
+    with os.fdopen(3, "rb", closefd=True) as source:
+        program = source.read(MAX_PROGRAM + 1)
+    if not program or len(program) > MAX_PROGRAM or b"\x00" in program:
+        raise ValueError("invalid bounded holder program")
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+    receipt_read, receipt_write = os.pipe()
+    monitor = os.fork()
+except (OSError, ValueError, IndexError) as error:
+    diagnostic("RCH_SOURCE_LOCK_LIVENESS_UNAVAILABLE: " + str(error))
+    sys.exit(73)
+
+if monitor:
+    # Fork before setsid: an ssh login shell can itself be a session leader.
+    # This observer owns no source descriptors. Keep its direct child unreaped
+    # while tearing down the group, including when the monitor itself is killed
+    # externally. A zombie child pins its PID; no saved/reused PID is authority.
+    os.close(receipt_write)
+    os.close(0)
+    os.waitid(os.P_PID, monitor, os.WEXITED | os.WNOWAIT)
+    if os.getpgid(monitor) == monitor:
+        try:
+            os.killpg(monitor, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    _, status = os.waitpid(monitor, 0)
+    receipt = os.read(receipt_read, 32)
+    os.close(receipt_read)
+    if (os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL
+            and receipt.endswith(b"\n") and receipt[:-1].isdigit()
+            and 0 <= int(receipt) <= 255):
+        sys.exit(int(receipt))
+    diagnostic("RCH_SOURCE_LOCK_SUPERVISOR_TERMINATED: no holder completion receipt; "
+               + "durable ownership retained; status=" + str(status))
+    sys.exit(73)
+
+os.close(receipt_read)
+group = None
+interrupted = 0
+
+def interrupt(signum, _frame):
+    global interrupted
+    if not interrupted:
+        interrupted = signum
+
+def finish(status, message=None):
+    if message:
+        diagnostic(message)
+    # Our own live membership pins this group identity until SIGKILL. Never
+    # reap a group leader and subsequently signal its possibly reused PID.
+    if group != os.getpid() or os.getpgrp() != group:
+        os._exit(73)
+    try:
+        os.write(receipt_write, (str(status) + "\n").encode())
+        os.close(receipt_write)
+    finally:
+        # The observer may already have died with its SSH session. A broken
+        # receipt pipe must never bypass teardown or strand inherited locks.
+        os.killpg(group, signal.SIGKILL)
+        os._exit(73)
+
+try:
+    os.setsid()
+    group = os.getpid()
+    if os.getpgrp() != group:
+        raise ValueError("holder monitor has no private process group")
+    for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+        signal.signal(signum, interrupt)
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+    signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+    child_read, child_write = os.pipe()
+    child = os.fork()
+    if child == 0:
+        os.close(receipt_write)
+        os.close(child_write)
+        os.dup2(child_read, 0)
+        os.close(child_read)
+        for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM, signal.SIGPIPE):
+            signal.signal(signum, signal.SIG_DFL)
+        try:
+            os.execvp("sh", ["sh", "-s"])
+        except OSError:
+            os._exit(127)
+    os.close(child_read)
+    os.set_blocking(child_write, False)
+    os.set_blocking(0, False)
+    # The full compound program is parsed before any release-stream reader.
+    # The closure remains stdin data; it is never moved into a size-limited
+    # exec argument. At most this bounded bootstrap and one frame are queued.
+    pending = b"{\n" + program + b"\n}\n"
+    buffered = b""
+    released = False
+    input_open = True
+    deadline = time.monotonic() + idle
+    while True:
+        now = time.monotonic()
+        if interrupted:
+            finish(73, "RCH_SOURCE_LOCK_INTERRUPTED: signal=" + str(interrupted)
+                   + "; durable ownership retained")
+        if now >= deadline:
+            reason = "RELEASE_TIMEOUT" if released else "HEARTBEAT_EXPIRED"
+            finish(73, "RCH_SOURCE_LOCK_" + reason
+                   + ": durable ownership retained; idle_seconds=" + str(idle))
+        waited, status = os.waitpid(child, os.WNOHANG)
+        if waited:
+            if os.WIFEXITED(status):
+                finish(os.WEXITSTATUS(status))
+            if os.WIFSIGNALED(status):
+                signum = os.WTERMSIG(status)
+                finish(128 + signum, "RCH_SOURCE_LOCK_PROCESS_TERMINATED: signal="
+                       + str(signum) + "; durable ownership retained")
+            finish(73, "RCH_SOURCE_LOCK_PROCESS_TERMINATED: unknown child status")
+        readable, writable, _ = select.select(
+            [0] if input_open else [],
+            [child_write] if child_write is not None and pending else [],
+            [], min(0.05, max(0, deadline - now)))
+        if readable:
+            data = os.read(0, MAX_FRAME + 1 - len(buffered))
+            if not data:
+                if not released or buffered:
+                    finish(73, "RCH_SOURCE_LOCK_DISCONNECTED: no complete release; durable ownership retained")
+                input_open = False
+            else:
+                buffered += data
+                while b"\n" in buffered:
+                    frame, buffered = buffered.split(b"\n", 1)
+                    frame += b"\n"
+                    if released:
+                        finish(73, "RCH_SOURCE_LOCK_PROTOCOL_ERROR: input after release")
+                    if frame == HEARTBEAT:
+                        # Partial or unknown input never refreshes liveness.
+                        deadline = time.monotonic() + idle
+                        continue
+                    prefix, separator, token = frame[:-1].partition(b":")
+                    if (separator != b":" or prefix not in
+                            (b"RCH_SOURCE_AUTHORITY_RELEASE", b"RCH_SOURCE_PAIR_RELEASE")
+                            or not 1 <= len(token) <= 128
+                            or any(c not in b"0123456789abcdef-" for c in token)):
+                        finish(73, "RCH_SOURCE_LOCK_PROTOCOL_ERROR: invalid release frame")
+                    pending += frame
+                    released = True
+                    deadline = time.monotonic() + 15
+                if len(buffered) >= MAX_FRAME:
+                    finish(73, "RCH_SOURCE_LOCK_PROTOCOL_ERROR: frame exceeded byte bound")
+        if writable:
+            try:
+                written = os.write(child_write, pending[:65536])
+                pending = pending[written:]
+            except BlockingIOError:
+                pass
+            except BrokenPipeError:
+                os.close(child_write)
+                child_write = None
+        if released and not pending and child_write is not None:
+            os.close(child_write)
+            child_write = None
+except BaseException as error:
+    if group is not None:
+        finish(73, "RCH_SOURCE_LOCK_LIVENESS_FAILED: " + str(error)
+               + "; durable ownership retained")
+    os._exit(73)
+' "${2-}"
+fi
 # Probe the platform once. The internal marker pins the minimal GNU fallback
 # rather than recursively selecting a backend; it grants no lock rights.
 portable=no

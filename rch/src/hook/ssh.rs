@@ -38,6 +38,9 @@ use crate::transfer::WorkerPlatform;
 const MAX_OFFLOAD_SSH_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SOURCE_LOCK_READY_BYTES: usize = 4096;
 const MAX_SOURCE_LOCK_OUTPUT_BYTES: usize = 64 * 1024;
+const SOURCE_LOCK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const SOURCE_LOCK_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
+const SOURCE_LOCK_HEARTBEAT_FRAME: &[u8] = b"RCH_SOURCE_LOCK_HEARTBEAT\n";
 const REMOTE_SOURCE_AUTHORITY_LOCK_DIR: &str = "/var/tmp/rch-source-authority-locks";
 const SOURCE_AUTHORITY_LOCK_HOLDER: &str = include_str!("source_lock_holder.sh");
 const SOURCE_CLAIM_REGISTRY: &str = include_str!("source_claim_registry.sh");
@@ -48,14 +51,77 @@ const REMOTE_SOURCE_CLAIM_REGISTRY: &str = "/var/tmp/rch-source-authority-locks/
 /// The remote holder blocks on this SSH session's stdin after acquiring every
 /// lock. EOF/HUP releases kernel locks but retains a durable ownership claim.
 /// Only explicit, acknowledged release permits an overlapping future writer.
+/// POSIX sessions also expire without client heartbeats; expiry retains every
+/// durable claim and never terminates a separate compiler/rsync activity.
 pub(super) struct RemoteSourceAuthorityLock {
     worker_id: WorkerId,
     child: Option<tokio::process::Child>,
     stdin: Option<tokio::process::ChildStdin>,
     stdout_drain: Option<tokio::task::JoinHandle<std::io::Result<Vec<u8>>>>,
     stderr_drain: Option<tokio::task::JoinHandle<std::io::Result<Vec<u8>>>>,
+    heartbeat: Option<SourceLockHeartbeat>,
     release_request: Option<String>,
     pair_root: Option<String>,
+}
+
+/// The single stdin writer serializes complete heartbeat/release frames. In
+/// particular release must not abort a half-written heartbeat and concatenate
+/// its suffix with a valid ownership-release request.
+struct SourceLockHeartbeat {
+    release: Option<tokio::sync::oneshot::Sender<Option<String>>>,
+    task: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+impl SourceLockHeartbeat {
+    fn start(mut stdin: tokio::process::ChildStdin, period: Duration) -> Self {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (release, mut requested) = tokio::sync::oneshot::channel::<Option<String>>();
+        let task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(period);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    request = &mut requested => {
+                        let request = request.map_err(|_| std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "source-lock heartbeat owner was dropped",
+                        ))?;
+                        if let Some(request) = request {
+                            stdin.write_all(format!("{request}\n").as_bytes()).await?;
+                        }
+                        return stdin.shutdown().await;
+                    }
+                    _ = interval.tick() => {
+                        stdin.write_all(SOURCE_LOCK_HEARTBEAT_FRAME).await?;
+                        stdin.flush().await?;
+                    }
+                }
+            }
+        });
+        Self {
+            release: Some(release),
+            task,
+        }
+    }
+
+    async fn release(&mut self, request: Option<String>) -> anyhow::Result<()> {
+        let sender = self
+            .release
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("source-lock release was already requested"))?;
+        // If the receiver already failed, awaiting its task below preserves
+        // the actual write error rather than substituting a channel error.
+        let _ = sender.send(request);
+        (&mut self.task).await??;
+        Ok(())
+    }
+}
+
+impl Drop for SourceLockHeartbeat {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 impl RemoteSourceAuthorityLock {
@@ -79,6 +145,16 @@ impl RemoteSourceAuthorityLock {
 
     /// Fail closed if the lock-holder SSH process disappeared before Cargo starts.
     pub(super) fn ensure_held(&mut self) -> anyhow::Result<()> {
+        if self
+            .heartbeat
+            .as_ref()
+            .is_some_and(|heartbeat| heartbeat.task.is_finished())
+        {
+            anyhow::bail!(
+                "source-authority heartbeat on {} ended; durable ownership remains fenced",
+                self.worker_id,
+            );
+        }
         let child = self
             .child
             .as_mut()
@@ -103,7 +179,9 @@ impl RemoteSourceAuthorityLock {
 
         let deadline = tokio::time::Instant::now() + budget;
         let collect = async {
-            if let Some(request) = self.release_request.as_ref() {
+            if let Some(heartbeat) = self.heartbeat.as_mut() {
+                heartbeat.release(self.release_request.clone()).await?;
+            } else if let Some(request) = self.release_request.as_ref() {
                 let stdin = self
                     .stdin
                     .as_mut()
@@ -157,6 +235,9 @@ impl RemoteSourceAuthorityLock {
 
 impl Drop for RemoteSourceAuthorityLock {
     fn drop(&mut self) {
+        // Abort the writer before killing the transport. A cancelled caller
+        // must not detach a task that keeps renewing remote source locks.
+        drop(self.heartbeat.take());
         if let Some(child) = self.child.as_mut() {
             let _ = child.start_kill();
         }
@@ -704,6 +785,70 @@ pub(super) async fn finish_cancel_remote_source_authority_intent(
     Ok(())
 }
 
+fn source_cancellation_settlement_command(
+    registry: &str,
+    legacy_registry: &str,
+    roots: &[String],
+    identity: &str,
+) -> anyhow::Result<String> {
+    validate_source_identity(identity)?;
+    let (roots, digest) = source_claim_roots(roots)?;
+    let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
+    let transaction = format!(
+        "{}\n{}",
+        rch_common::stale_target_reap::SOURCE_CLAIM_RECORD_HELPERS,
+        SOURCE_CLAIM_REGISTRY,
+    );
+    Ok(format!(
+        "exec python3 -I -S -c {coordinator} {registry} {legacy} {identity} {digest} {transaction} \
+         <<'RCH_SOURCE_CLAIM_ROOTS'\n{roots}RCH_SOURCE_CLAIM_ROOTS\n",
+        coordinator = quote(include_str!("source_cancel_settlement.py")),
+        registry = quote(registry),
+        legacy = quote(legacy_registry),
+        identity = quote(identity),
+        digest = quote(&digest),
+        transaction = quote(&transaction),
+    ))
+}
+
+/// Settle cancellation metadata only after the caller has validated its exact
+/// durable failed-result and source/tree/pair retirement evidence. Detached
+/// recovery must retain its journal ownership across this call. Independent
+/// worker activity/metadata locks and matching records are also required;
+/// neither a terminal daemon lease nor a missing worker record grants authority.
+/// The legacy registry participates because pre-migration recipes did not store
+/// their registry location. Ambiguous cross-registry identity fails closed.
+pub(super) async fn settle_remote_source_cancellation(
+    worker: &WorkerConfig,
+    roots: &[String],
+    identity: &str,
+) -> anyhow::Result<()> {
+    let command = source_cancellation_settlement_command(
+        REMOTE_SOURCE_CLAIM_REGISTRY,
+        "/tmp/rch-source-authority-locks/claims-v1",
+        roots,
+        identity,
+    )?;
+    let output = run_offload_ssh_command_with_stdin(
+        worker,
+        &format!(
+            "set -- RCH_SOURCE_CANCELLATION_SETTLED\n{}",
+            include_str!("source_namespace_control.sh")
+        ),
+        command.as_bytes(),
+        Duration::from_secs(30),
+    )
+    .await?;
+    anyhow::ensure!(
+        output.status.success() && output.stdout.as_slice() == b"RCH_SOURCE_CANCELLATION_SETTLED\n",
+        "cannot settle terminal source cancellation on {} (status {:?}): {}",
+        worker.id,
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr).trim(),
+    );
+    Ok(())
+}
+
 fn source_authority_lock_transport(
     platform: WorkerPlatform,
     remote_cmd: &str,
@@ -720,6 +865,18 @@ fn source_authority_lock_transport(
     // pairs read their explicit release request from the same pipe.
     // An exec sh -c '<large script>' bootstrap would merely move E2BIG remotely.
     (reader, Some(format!("{{\n{remote_cmd}\n}}\n")))
+}
+
+/// Supervise only this session, including waits for hierarchy and metadata
+/// locks. An expired session retains durable ownership; it cannot authorize
+/// source cleanup or terminate an independently launched activity.
+fn source_authority_live_session_command(remote_cmd: &str, idle: Duration) -> String {
+    let holder = shell_escape::escape(SOURCE_AUTHORITY_LOCK_HOLDER.into());
+    format!(
+        "set -eu\nexec 3<<'RCH_SOURCE_LOCK_SESSION_PROGRAM'\n{remote_cmd}\nRCH_SOURCE_LOCK_SESSION_PROGRAM\n\
+         exec sh -c {holder} {holder} --rch-session {seconds}",
+        seconds = idle.as_secs(),
+    )
 }
 
 /// Acquire sorted, worker-side locks for every mutable canonical source root.
@@ -1069,13 +1226,22 @@ async fn spawn_source_authority_lock(
     cmd.arg("-o").arg("BatchMode=yes");
     cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
     cmd.arg("-o").arg("ConnectTimeout=10");
+    cmd.arg("-o").arg("ServerAliveInterval=10");
+    cmd.arg("-o").arg("ServerAliveCountMax=3");
     cmd.arg("-i").arg(identity_file.as_ref());
     if let Some(opts) = rch_common::ssh_utils::identities_only_args(identity_file.as_ref()) {
         cmd.args(opts);
     }
     cmd.arg(&destination);
+    let platform = WorkerPlatform::from_worker(worker);
+    // Python process groups are available on Linux/Darwin, not native Windows.
+    // Windows retains its existing transport until a native liveness backend
+    // has been qualified; never silently claim that TCP keepalive is the same.
+    let heartbeat = !platform.is_windows();
+    let supervised = heartbeat
+        .then(|| source_authority_live_session_command(remote_cmd, SOURCE_LOCK_HEARTBEAT_TIMEOUT));
     let (remote_arg, stdin_bootstrap) =
-        source_authority_lock_transport(WorkerPlatform::from_worker(worker), remote_cmd);
+        source_authority_lock_transport(platform, supervised.as_deref().unwrap_or(remote_cmd));
     cmd.arg(remote_arg);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1091,6 +1257,7 @@ async fn spawn_source_authority_lock(
         ready_marker,
         stdin_bootstrap.as_deref(),
         wait_timeout,
+        heartbeat,
     )
     .await
 }
@@ -1101,13 +1268,15 @@ async fn finish_source_authority_lock_acquisition(
     ready_marker: &str,
     stdin_bootstrap: Option<&str>,
     wait_timeout: Duration,
+    heartbeat: bool,
 ) -> anyhow::Result<RemoteSourceAuthorityLock> {
     use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
 
-    let mut stdin = child
+    let stdin = child
         .stdin
         .take()
         .ok_or_else(|| anyhow::anyhow!("source-authority lock stdin was not piped"))?;
+    let mut stdin = Some(stdin);
     let stdout = child
         .stdout
         .take()
@@ -1129,6 +1298,7 @@ async fn finish_source_authority_lock_acquisition(
         stdin: None,
         stdout_drain: None,
         stderr_drain: Some(stderr_drain),
+        heartbeat: None,
         release_request: None,
         pair_root: None,
     };
@@ -1137,8 +1307,17 @@ async fn finish_source_authority_lock_acquisition(
     let acquisition = async {
         let write_bootstrap = async {
             if let Some(bootstrap) = stdin_bootstrap {
-                stdin.write_all(bootstrap.as_bytes()).await?;
-                stdin.flush().await?;
+                let pipe = stdin
+                    .as_mut()
+                    .expect("stdin owned until bootstrap completes");
+                pipe.write_all(bootstrap.as_bytes()).await?;
+                pipe.flush().await?;
+            }
+            if heartbeat {
+                guard.heartbeat = Some(SourceLockHeartbeat::start(
+                    stdin.take().expect("bootstrap retains stdin"),
+                    SOURCE_LOCK_HEARTBEAT_INTERVAL,
+                ));
             }
             Ok::<(), std::io::Error>(())
         };
@@ -1191,6 +1370,7 @@ async fn finish_source_authority_lock_acquisition(
         }
     };
     if let Some(failure) = failure {
+        drop(guard.heartbeat.take());
         drop(stdin);
         if let Some(child) = guard.child.as_mut() {
             let _ = child.start_kill();
@@ -1219,7 +1399,7 @@ async fn finish_source_authority_lock_acquisition(
         });
     }
 
-    guard.stdin = Some(stdin);
+    guard.stdin = stdin;
     guard.stdout_drain = Some(tokio::spawn(crate::transfer::read_bounded_output_stream(
         stdout,
         MAX_SOURCE_LOCK_OUTPUT_BYTES,
@@ -2265,6 +2445,7 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
             "CLOSURE_READY",
             bootstrap.as_deref(),
             Duration::from_secs(10),
+            false,
         )
         .await
         .unwrap()
@@ -2294,6 +2475,7 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
             "DURABLE_READY",
             bootstrap.as_deref(),
             Duration::from_secs(10),
+            false,
         )
         .await?;
         guard.release_request = Some(format!("RCH_SOURCE_AUTHORITY_RELEASE:{identity}"));
@@ -2317,6 +2499,96 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
             .output()
             .await
             .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn terminal_cancellation_command_preserves_quoted_evidence_and_exact_control_result() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let registry = directory.path().join("registry ' ; $literal `literal`");
+        let legacy = directory.path().join("absent legacy ' registry");
+        let control = directory.path().join("control receipts");
+        std::fs::create_dir(&registry).unwrap();
+        std::fs::create_dir(&control).unwrap();
+        for name in ["released", "cancelled", "quarantine"] {
+            std::fs::create_dir(registry.join(name)).unwrap();
+        }
+        let source = directory
+            .path()
+            .join("source ' ; $(touch expanded-dollar) `touch expanded-backtick`");
+        let roots = vec![source.display().to_string()];
+        let identity = "ac03";
+        let (body, digest) = source_claim_roots(&roots).unwrap();
+        let fence = registry.join(format!("{identity}.{digest}.cancelling"));
+        let receipt = registry
+            .join("cancelled")
+            .join(format!("{identity}.{digest}.claim"));
+        std::fs::write(&fence, &body).unwrap();
+        let command = source_cancellation_settlement_command(
+            registry.to_str().unwrap(),
+            legacy.to_str().unwrap(),
+            &roots,
+            identity,
+        )
+        .unwrap();
+        let remote = build_remote_shell_command(
+            WorkerPlatform::Posix,
+            &format!(
+                "set -- RCH_SOURCE_CANCELLATION_SETTLED\n{}",
+                include_str!("source_namespace_control.sh")
+            ),
+        );
+        for attempt in 0..3 {
+            if attempt == 2 {
+                std::fs::write(&fence, b"/incomplete\n").unwrap();
+            }
+            // Use the real generated upload, login-shell quoting and bounded
+            // controller. The standalone Python qualification uses shlex and
+            // cannot detect a regression in these Rust command boundaries.
+            let mut child = Command::new("sh")
+                .args(["-c", &remote])
+                .current_dir(directory.path())
+                .env("TMPDIR", &control)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut input = child.stdin.take().unwrap();
+            input.write_all(command.as_bytes()).await.unwrap();
+            drop(input);
+            let output = timeout(Duration::from_secs(30), child.wait_with_output())
+                .await
+                .expect("metadata controller did not terminate")
+                .unwrap();
+            if attempt < 2 {
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(output.stdout, b"RCH_SOURCE_CANCELLATION_SETTLED\n");
+                assert_eq!(std::fs::read(&fence).unwrap(), body.as_bytes());
+            } else {
+                assert_eq!(output.status.code(), Some(73));
+                assert!(output.stdout.is_empty());
+                assert!(
+                    String::from_utf8_lossy(&output.stderr)
+                        .contains("RCH_SOURCE_CANCELLATION_UNSETTLED")
+                );
+                assert_eq!(std::fs::read(&fence).unwrap(), b"/incomplete\n");
+            }
+            assert_eq!(std::fs::read(&receipt).unwrap(), body.as_bytes());
+            assert!(!source.exists(), "metadata recovery created a source root");
+            assert!(!directory.path().join("expanded-dollar").exists());
+            assert!(!directory.path().join("expanded-backtick").exists());
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -3597,6 +3869,7 @@ os.execv({python:?}, [{python:?}] + args)
             &ready,
             bootstrap.as_deref(),
             TEST_LOCK_ACQUIRE_BUDGET,
+            false,
         )
         .await?;
         guard.release_request = Some(release);
@@ -3629,6 +3902,7 @@ os.execv({python:?}, [{python:?}] + args)
             &ready,
             bootstrap.as_deref(),
             TEST_LOCK_ACQUIRE_BUDGET,
+            false,
         )
         .await
         .unwrap();
@@ -3989,6 +4263,7 @@ os.execv({python:?}, [{python:?}] + args)
             marker,
             bootstrap.as_deref(),
             TEST_LOCK_ACQUIRE_BUDGET,
+            false,
         )
         .await
         .unwrap();
@@ -4001,6 +4276,7 @@ os.execv({python:?}, [{python:?}] + args)
             marker,
             bootstrap.as_deref(),
             TEST_LOCK_ACQUIRE_BUDGET,
+            false,
         ));
         assert!(
             timeout(Duration::from_millis(100), &mut competing)
@@ -4022,6 +4298,7 @@ os.execv({python:?}, [{python:?}] + args)
             marker,
             bootstrap.as_deref(),
             TEST_LOCK_ACQUIRE_BUDGET,
+            false,
         )
         .await
         .unwrap();
@@ -4051,6 +4328,7 @@ os.execv({python:?}, [{python:?}] + args)
                 "READY",
                 bootstrap.as_deref(),
                 Duration::from_secs(3),
+                false,
             )
             .await;
             let error = match result {
@@ -4097,6 +4375,7 @@ os.execv({python:?}, [{python:?}] + args)
             "READY",
             bootstrap.as_deref(),
             Duration::from_millis(250),
+            false,
         )
         .await;
         let error = match result {
@@ -4131,6 +4410,7 @@ os.execv({python:?}, [{python:?}] + args)
             "READY",
             Some(&bootstrap),
             Duration::from_millis(100),
+            false,
         )
         .await;
         let error = match result {
@@ -4155,6 +4435,7 @@ os.execv({python:?}, [{python:?}] + args)
             "READY",
             Some(&bootstrap),
             Duration::from_secs(60),
+            false,
         ));
         // Poll the real acquisition while its large write and readiness are
         // pending. Cancelling an unpolled future would miss the drain/guard
@@ -5091,6 +5372,7 @@ exec /bin/ln \"$@\"\n",
                 stdin: None,
                 stdout_drain,
                 stderr_drain,
+                heartbeat: None,
                 release_request: None,
                 pair_root: None,
             },
@@ -5185,6 +5467,7 @@ exec /bin/ln \"$@\"\n",
                 "READY",
                 None,
                 Duration::from_secs(2),
+                false,
             )
             .await
             .unwrap();
@@ -5221,6 +5504,7 @@ exec /bin/ln \"$@\"\n",
                     "READY",
                     None,
                     Duration::from_secs(60),
+                    false,
                 ),
             )
             .await
@@ -5253,6 +5537,7 @@ exec /bin/ln \"$@\"\n",
             "READY",
             None,
             Duration::from_secs(2),
+            false,
         )
         .await
         .unwrap();
@@ -5262,6 +5547,159 @@ exec /bin/ln \"$@\"\n",
             .await
             .unwrap_err();
         assert!(error.to_string().contains("exceeded"), "{error:#}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn source_lock_lifecycle_heartbeat_writer_serializes_release_and_eof() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
+
+        let mut child = Command::new("sh")
+            .args([
+                "-c",
+                "while IFS= read -r frame; do printf '%s\\n' \"$frame\"; done",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut writer =
+            SourceLockHeartbeat::start(child.stdin.take().unwrap(), Duration::from_millis(10));
+        let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap());
+        for _ in 0..3 {
+            let mut frame = String::new();
+            timeout(Duration::from_secs(2), output.read_line(&mut frame))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(frame.as_bytes(), SOURCE_LOCK_HEARTBEAT_FRAME);
+        }
+        writer
+            .release(Some("RCH_SOURCE_AUTHORITY_RELEASE:abc".to_owned()))
+            .await
+            .unwrap();
+        let mut remaining = String::new();
+        timeout(
+            Duration::from_secs(2),
+            output.read_to_string(&mut remaining),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(child.wait().await.unwrap().success());
+        let mut frames: Vec<_> = remaining.lines().collect();
+        assert_eq!(frames.pop(), Some("RCH_SOURCE_AUTHORITY_RELEASE:abc"));
+        assert!(
+            frames
+                .iter()
+                .all(|frame| *frame == "RCH_SOURCE_LOCK_HEARTBEAT")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn source_lock_lifecycle_supervised_claim_release_and_caller_loss() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+        for release in [true, false] {
+            let directory = tempfile::tempdir().unwrap().keep();
+            let registry = directory.join("registry");
+            let root = directory.join("source");
+            std::fs::create_dir(&root).unwrap();
+            let roots = vec![root.to_string_lossy().into_owned()];
+            let identity = uuid::Uuid::new_v4().simple().to_string();
+            let lock = directory.join("root.lock").to_string_lossy().into_owned();
+            let script = build_durable_source_authority_lock_cmd(
+                directory.to_str().unwrap(),
+                registry.to_str().unwrap(),
+                &exclusive_source_locks(std::slice::from_ref(&lock)),
+                &roots,
+                &identity,
+                "acquire",
+                "SUPERVISED_READY",
+            )
+            .unwrap();
+            let script = source_authority_live_session_command(&script, Duration::from_secs(90));
+            let (child, bootstrap) = local_source_lock_transport(WorkerPlatform::Posix, &script);
+            let mut guard = finish_source_authority_lock_acquisition(
+                child,
+                WorkerId::new("supervised-source-session"),
+                "SUPERVISED_READY",
+                bootstrap.as_deref(),
+                Duration::from_secs(10),
+                true,
+            )
+            .await
+            .unwrap();
+            guard.release_request = Some(format!("RCH_SOURCE_AUTHORITY_RELEASE:{identity}"));
+            guard.ensure_held().unwrap();
+            let sender = guard.heartbeat.as_ref().unwrap().task.abort_handle();
+            let (body, digest) = source_claim_roots(&roots).unwrap();
+            let active = registry.join(format!("{identity}.{digest}.claim"));
+            assert_eq!(std::fs::read(&active).unwrap(), body.as_bytes());
+            assert!(source_lock_scaling_is_held(&lock).await);
+            if release {
+                guard.release().await.unwrap();
+                assert!(!active.exists());
+                assert_eq!(
+                    std::fs::read(registry.join(format!("released/{identity}.{digest}.claim")))
+                        .unwrap(),
+                    body.as_bytes(),
+                );
+            } else {
+                // A build/rsync runs in a separate session and owns the
+                // activity mutex. Expiring its control holder may release
+                // hierarchy descriptors, but must neither kill this live
+                // activity nor admit another token to the same source.
+                let prefix =
+                    source_authority_activity_prefix_at(registry.to_str().unwrap(), &identity)
+                        .unwrap();
+                let command = format!(
+                    "exec {prefix} sh -c {}",
+                    shell_escape::escape(
+                        "printf 'ACTIVITY_READY\\n'; IFS= read -r done; [ \"$done\" = done ]"
+                            .into(),
+                    ),
+                );
+                let mut activity = Command::new("sh")
+                    .args(["-c", &command])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .unwrap();
+                let mut output = tokio::io::BufReader::new(activity.stdout.take().unwrap());
+                let mut ready = String::new();
+                timeout(Duration::from_secs(5), output.read_line(&mut ready))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(ready, "ACTIVITY_READY\n");
+                drop(guard);
+                assert_eq!(std::fs::read(&active).unwrap(), body.as_bytes());
+                let fresh = uuid::Uuid::new_v4().simple().to_string();
+                let refused = test_source_intent(&registry, &roots, &fresh, "acquire").await;
+                assert_eq!(refused.status.code(), Some(73));
+                assert!(activity.try_wait().unwrap().is_none());
+                activity
+                    .stdin
+                    .as_mut()
+                    .unwrap()
+                    .write_all(b"done\n")
+                    .await
+                    .unwrap();
+                assert!(activity.wait().await.unwrap().success());
+            }
+            timeout(Duration::from_secs(5), async {
+                while !sender.is_finished() || source_lock_scaling_is_held(&lock).await {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("caller loss detached a heartbeat sender or retained its kernel lock");
+        }
     }
 
     #[test]
@@ -5351,6 +5789,7 @@ exec /bin/ln \"$@\"\n",
                 marker,
                 bootstrap.as_deref(),
                 Duration::from_secs(20),
+                false,
             )
             .await
             .unwrap();
@@ -5390,6 +5829,7 @@ exec /bin/ln \"$@\"\n",
                 "SECOND",
                 bootstrap.as_deref(),
                 Duration::from_secs(20),
+                false,
             ));
             assert!(
                 timeout(Duration::from_millis(100), &mut second)
@@ -5428,6 +5868,7 @@ exec /bin/ln \"$@\"\n",
             "READY",
             bootstrap.as_deref(),
             Duration::from_secs(5),
+            false,
         )
         .await;
         assert!(
@@ -5458,6 +5899,7 @@ exec /bin/ln \"$@\"\n",
             "FIRST",
             bootstrap.as_deref(),
             Duration::from_secs(5),
+            false,
         )
         .await
         .unwrap();
@@ -5474,6 +5916,7 @@ exec /bin/ln \"$@\"\n",
             "SECOND",
             bootstrap.as_deref(),
             Duration::from_secs(20),
+            false,
         ));
         timeout(Duration::from_secs(5), async {
             loop {

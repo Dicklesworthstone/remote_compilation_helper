@@ -93,6 +93,12 @@ pub(crate) struct RecoveryRecipe {
     execution_started: bool,
     #[serde(default)]
     preparation_cancelled: bool,
+    /// Cancellation is not settled by a local terminal acknowledgement. False
+    /// is persisted before worker cancellation; true follows an exact worker
+    /// receipt under its activity and metadata locks. None also covers legacy
+    /// preparation cancellations, which still need that reconciliation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_cancellation_settled: Option<bool>,
     #[serde(default)]
     sources_released: bool,
     #[serde(default)]
@@ -976,6 +982,7 @@ impl RecoverySession {
             prepared: false,
             execution_started: false,
             preparation_cancelled: false,
+            source_cancellation_settled: None,
             sources_released: false,
             tree_retired: false,
             pair_released: false,
@@ -1155,6 +1162,7 @@ impl RecoverySession {
             prepared: true,
             execution_started: false,
             preparation_cancelled: false,
+            source_cancellation_settled: None,
             sources_released: false,
             tree_retired: false,
             pair_released: false,
@@ -2267,6 +2275,77 @@ impl RecoverySession {
         next_recipe.sources_released = true;
         self.persist_next_recipe(next_recipe)
     }
+    async fn reconcile_source_cancellation(&mut self) -> anyhow::Result<()> {
+        self.reconcile_source_cancellation_with(async |worker, roots, identity| {
+            super::super::ssh::settle_remote_source_cancellation(worker, roots, identity).await
+        })
+        .await
+    }
+
+    async fn reconcile_source_cancellation_with(
+        &mut self,
+        mut settle: impl AsyncFnMut(&WorkerConfig, &[String], &str) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        if self.recipe.source_cancellation_settled == Some(true)
+            || (!self.recipe.preparation_cancelled
+                && self.recipe.source_cancellation_settled.is_none())
+        {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            self.recipe.returned.is_some_and(|exit| exit != 0)
+                && self.recipe.sources_released
+                && self.recipe.tree_retired
+                && self.recipe.pair_released,
+            "source cancellation settlement requires durable failed delivery and complete resource retirement"
+        );
+        let before = self.writer.snapshot();
+        anyhow::ensure!(
+            serde_json::to_value(load_recipe(&self.writer)?)?
+                == serde_json::to_value(&self.recipe)?,
+            "source cancellation recipe changed before worker reconciliation"
+        );
+        if let Some(owner) = &self.writer.recovery_ownership {
+            owner.verify()?;
+        }
+        if !self.recipe.source_roots.is_empty() {
+            // This is metadata reconciliation only. The worker independently
+            // drains activity, verifies the exact identity/closure and keeps
+            // the anti-replay fence. No output or source path is reopened.
+            settle(
+                &self.recipe.worker,
+                &self.recipe.source_roots,
+                &self.recipe.identity,
+            )
+            .await?;
+        }
+        let mut latest = self.writer.snapshot();
+        // The live heartbeat loop can have one spawn_blocking publication in
+        // flight when cancellation begins. Its final phase/time observation
+        // cannot change admission, result or recovery authority. Preserve it
+        // when checkpointing instead of mistaking progress for a new owner.
+        latest.heartbeat_unix_ms = before.heartbeat_unix_ms;
+        latest.phase.clone_from(&before.phase);
+        anyhow::ensure!(
+            latest == before,
+            "job journal changed during source cancellation settlement; acknowledgement refused"
+        );
+        // A terminal reconciliation adds one fact. Preserve the rest of the
+        // original JSON, including legacy root spellings and unknown custody
+        // fields; parsing defaults must not rewrite historical evidence.
+        let mut recovery = before.recovery.context("cancellation recipe disappeared")?;
+        recovery
+            .as_object_mut()
+            .context("cancellation recipe is not an object")?
+            .insert(
+                "source_cancellation_settled".into(),
+                serde_json::json!(true),
+            );
+        self.writer.set_recovery(recovery)?;
+        self.recipe.source_cancellation_settled = Some(true);
+        Ok(())
+    }
+
     pub(crate) fn retired(&mut self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.recipe.returned.is_some(),
@@ -2284,6 +2363,13 @@ impl RecoverySession {
             self.recipe.source_roots.is_empty() || self.recipe.sources_released,
             "remote source release is outstanding"
         );
+        anyhow::ensure!(
+            self.recipe.source_cancellation_settled != Some(false)
+                && (!self.recipe.preparation_cancelled
+                    || self.recipe.source_roots.is_empty()
+                    || self.recipe.source_cancellation_settled == Some(true)),
+            "worker source cancellation settlement is outstanding"
+        );
         let mut next_recipe = self.recipe.clone();
         next_recipe.retired = true;
         self.persist_next_recipe(next_recipe)?;
@@ -2299,6 +2385,7 @@ impl RecoverySession {
     }
     pub(crate) async fn retire_returned(&mut self) -> anyhow::Result<()> {
         if self.recipe.retired {
+            self.reconcile_source_cancellation().await?;
             return Ok(());
         }
         anyhow::ensure!(
@@ -2402,6 +2489,7 @@ impl RecoverySession {
             pair.release().await?;
         }
         self.pair_released()?;
+        self.reconcile_source_cancellation().await?;
         self.retired()?;
         self.discard_completion_receipts().await;
         Ok(())
@@ -2472,6 +2560,14 @@ fn load_recipe(writer: &DurableLeaseWriter) -> anyhow::Result<RecoveryRecipe> {
             && Some(recipe.build_id) == lease.identity.remote_build_id
             && lease.worker_id.as_deref() == Some(recipe.worker.id.as_str()),
         "recovery recipe identity mismatch or unsupported source ownership version"
+    );
+    anyhow::ensure!(
+        recipe.source_cancellation_settled != Some(true)
+            || (recipe.returned.is_some_and(|exit| exit != 0)
+                && recipe.sources_released
+                && recipe.tree_retired
+                && recipe.pair_released),
+        "source cancellation settlement contradicts failed delivery or resource retirement evidence"
     );
     validate_retained_source_intent(
         &recipe.source_roots,
@@ -2595,6 +2691,12 @@ fn load_recipe(writer: &DurableLeaseWriter) -> anyhow::Result<RecoveryRecipe> {
 pub(crate) async fn cancel_preparation(writer: &DurableLeaseWriter) -> anyhow::Result<bool> {
     let recipe = load_recipe(writer)?;
     if recipe.retired {
+        RecoverySession {
+            recipe,
+            writer: writer.clone(),
+        }
+        .reconcile_source_cancellation()
+        .await?;
         return Ok(true);
     }
     if recipe.execution_started {
@@ -2615,6 +2717,12 @@ pub(crate) async fn cancel_preparation(writer: &DurableLeaseWriter) -> anyhow::R
 /// of the job can still run remotely: execution never started, or the probe in
 /// `remote_execution_lost` found it gone.
 async fn cancel_source_grant(mut session: RecoverySession) -> anyhow::Result<bool> {
+    // Preserve the obligation even when SSH loses the cancellation reply or
+    // the wrapper dies after worker retirement. Executed-but-lost attempts use
+    // this path too, so preparation_cancelled alone cannot identify it.
+    let mut next_recipe = session.recipe.clone();
+    next_recipe.source_cancellation_settled = Some(false);
+    session.persist_next_recipe(next_recipe)?;
     let worker = session.recipe.worker.clone();
     let owned = super::super::ssh::cancel_remote_source_authority_intent(
         &worker,
@@ -2678,6 +2786,7 @@ async fn cancel_source_grant(mut session: RecoverySession) -> anyhow::Result<boo
     session.pair_released()?;
     session.sources_released()?;
     session.returned(EXIT_BUILD_ERROR)?;
+    session.reconcile_source_cancellation().await?;
     session.retired()?;
     Ok(true)
 }
@@ -2709,8 +2818,9 @@ async fn recover_owned_job(writer: &DurableLeaseWriter) -> anyhow::Result<i32> {
             session.apply_retrieval_config(&config.transfer)?;
         }
     }
-    // Resolve lazily so an already acknowledged journal stays a read-only
-    // operation, but pin the chosen endpoint across the entire handoff.
+    // Resolve lazily: an acknowledged cancellation reconciles worker metadata,
+    // but does not need to reopen completed daemon accounting. Ordinary
+    // acknowledged delivery remains a local operation.
     let mut socket = None;
     Box::pin(recover_owned_job_with_daemon(
         writer,
@@ -2989,9 +3099,15 @@ async fn recover_owned_job_with_daemon(
             .returned
             .context("terminal recovery lacks a delivery result")?;
         anyhow::ensure!(
-            session.recipe.retired && lease.exit_code == Some(exit),
+            session.recipe.retired
+                && lease.state == rch_common::job_identity::JobLifecycleState::Finished
+                && lease.exit_code == Some(exit)
+                && (session.recipe.source_roots.is_empty() || session.recipe.sources_released)
+                && (session.recipe.pair.is_none() || session.recipe.pair_released)
+                && (session.recipe.retire_root.is_none() || session.recipe.tree_retired),
             "terminal recovery contradicts its retained delivery/retirement evidence"
         );
+        session.reconcile_source_cancellation().await?;
         return Ok(exit);
     }
     if !session.recipe.execution_started {
@@ -3432,6 +3548,398 @@ mod tests {
         )
         .unwrap();
         (directory, writer, worker)
+    }
+
+    fn terminal_cancellation_fixture() -> (tempfile::TempDir, DurableLeaseWriter) {
+        let (directory, writer, _) =
+            preparation_fixture_with_identity("0123456789abcdef0123456789abcdef");
+        let mut recipe = load_recipe(&writer).unwrap();
+        // Deliberately model an older acknowledged cancellation. These are
+        // local lifecycle facts, not a substitute worker quiescence proof.
+        recipe.preparation_cancelled = true;
+        recipe.sources_released = true;
+        recipe.tree_retired = true;
+        recipe.pair_released = true;
+        recipe.returned = Some(EXIT_BUILD_ERROR);
+        recipe.retired = true;
+        writer
+            .set_recovery(serde_json::to_value(recipe).unwrap())
+            .unwrap();
+        writer.record_exit(EXIT_BUILD_ERROR).unwrap();
+        // Old binaries acknowledged without the worker settlement field.
+        // Today's acknowledgement gate must refuse creating that state.
+        writer.lease.lock().unwrap().acknowledge_terminal(1);
+        writer.persist().unwrap();
+        (directory, writer)
+    }
+
+    #[test]
+    fn terminal_acknowledgement_refuses_unsettled_source_cancellation() {
+        for settled in [None, Some(false), Some(true)] {
+            let (_directory, writer, worker) = preparation_fixture();
+            let mut recipe = load_recipe(&writer).unwrap();
+            recipe.preparation_cancelled = true;
+            recipe.source_cancellation_settled = settled;
+            recipe.sources_released = true;
+            recipe.tree_retired = true;
+            recipe.pair_released = true;
+            recipe.returned = Some(EXIT_BUILD_ERROR);
+            recipe.retired = true;
+            writer
+                .set_recovery(serde_json::to_value(recipe).unwrap())
+                .unwrap();
+            writer.record_exit(EXIT_BUILD_ERROR).unwrap();
+            let before = std::fs::read(&writer.path).unwrap();
+            if settled != Some(true) {
+                assert!(writer.ensure_released_for_retry().is_err());
+                assert!(writer.begin_retry_selection(true).is_err());
+                assert!(writer.admit(42, &worker.id).is_err());
+                assert_eq!(std::fs::read(&writer.path).unwrap(), before);
+            }
+            let result = writer.acknowledge_terminal();
+            if settled != Some(true) {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("cancellation settlement")
+                );
+                assert!(!writer.snapshot().terminal_acknowledged);
+                assert_eq!(std::fs::read(&writer.path).unwrap(), before);
+            } else {
+                result.unwrap();
+                assert!(writer.snapshot().terminal_acknowledged);
+            }
+        }
+        for malformed in [serde_json::json!("true"), serde_json::json!(1)] {
+            let (_directory, writer) = terminal_cancellation_fixture();
+            let mut recipe = writer.snapshot().recovery.unwrap();
+            recipe["source_cancellation_settled"] = malformed;
+            writer.set_recovery(recipe).unwrap();
+            let before = std::fs::read(&writer.path).unwrap();
+            assert!(writer.acknowledge_terminal().is_err());
+            assert!(writer.ensure_released_for_retry().is_err());
+            assert!(load_recipe(&writer).is_err());
+            assert_eq!(std::fs::read(&writer.path).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn settled_cancellation_refuses_contradictory_terminal_evidence() {
+        for (key, value) in [
+            ("returned", serde_json::json!(0)),
+            ("returned", serde_json::Value::Null),
+            ("returned", serde_json::json!(i64::from(i32::MAX) + 1)),
+            ("sources_released", serde_json::json!(false)),
+            ("tree_retired", serde_json::json!(false)),
+            ("pair_released", serde_json::json!(false)),
+            ("tree_retired", serde_json::Value::Null),
+            ("pair_released", serde_json::json!("true")),
+        ] {
+            let (_directory, writer, worker) = preparation_fixture();
+            let mut recipe = load_recipe(&writer).unwrap();
+            recipe.preparation_cancelled = true;
+            recipe.source_cancellation_settled = Some(true);
+            recipe.sources_released = true;
+            recipe.tree_retired = true;
+            recipe.pair_released = true;
+            recipe.returned = Some(EXIT_BUILD_ERROR);
+            recipe.retired = true;
+            let mut contradictory = serde_json::to_value(recipe).unwrap();
+            contradictory[key] = value;
+            assert!(
+                !DurableLeaseWriter::cancellation_allows_retirement(&contradictory),
+                "{key}"
+            );
+            writer.set_recovery(contradictory).unwrap();
+            writer.record_exit(EXIT_BUILD_ERROR).unwrap();
+            let before = std::fs::read(&writer.path).unwrap();
+            assert!(load_recipe(&writer).is_err(), "{key}");
+            assert!(writer.acknowledge_terminal().is_err(), "{key}");
+            assert!(writer.ensure_released_for_retry().is_err(), "{key}");
+            assert!(writer.begin_retry_selection(true).is_err(), "{key}");
+            assert!(writer.admit(42, &worker.id).is_err(), "{key}");
+            assert_eq!(std::fs::read(&writer.path).unwrap(), before, "{key}");
+        }
+
+        let (_directory, writer, _) = preparation_fixture();
+        let mut recipe = load_recipe(&writer).unwrap();
+        recipe.preparation_cancelled = true;
+        recipe.source_cancellation_settled = Some(true);
+        recipe.sources_released = true;
+        recipe.tree_retired = true;
+        recipe.pair_released = true;
+        recipe.returned = Some(EXIT_BUILD_ERROR);
+        // Settlement is published immediately before retired, so that exact
+        // interrupted checkpoint must remain readable after a restart.
+        assert!(!recipe.retired);
+        writer
+            .set_recovery(serde_json::to_value(&recipe).unwrap())
+            .unwrap();
+        assert!(load_recipe(&writer).is_ok());
+        assert!(DurableLeaseWriter::cancellation_allows_retirement(
+            &writer.snapshot().recovery.unwrap()
+        ));
+
+        // Ordinary legacy delivery has no cancellation-settlement obligation.
+        recipe.source_cancellation_settled = None;
+        recipe.preparation_cancelled = false;
+        recipe.returned = Some(0);
+        recipe.sources_released = false;
+        recipe.tree_retired = false;
+        recipe.pair_released = false;
+        writer
+            .set_recovery(serde_json::to_value(recipe).unwrap())
+            .unwrap();
+        assert!(load_recipe(&writer).is_ok());
+        assert!(DurableLeaseWriter::cancellation_allows_retirement(
+            &writer.snapshot().recovery.unwrap()
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_cancellation_retries_worker_settlement_after_restart_without_replaying() {
+        let (_directory, writer) = terminal_cancellation_fixture();
+        let owned = recovery_owner::claim(&writer).await.unwrap();
+        let mut session = RecoverySession {
+            recipe: load_recipe(&owned).unwrap(),
+            writer: owned.clone(),
+        };
+        let before = std::fs::read(&writer.path).unwrap();
+        let error = session
+            .reconcile_source_cancellation_with(async |worker, roots, identity| {
+                assert_eq!(worker.id.as_str(), "source-recovery");
+                assert_eq!(roots, &["/data/projects/source-recovery"]);
+                assert_eq!(identity, "0123456789abcdef0123456789abcdef");
+                anyhow::bail!("worker activity is still held")
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("worker activity is still held"));
+        assert_eq!(std::fs::read(&writer.path).unwrap(), before);
+        assert_eq!(session.recipe.source_cancellation_settled, None);
+        drop(session);
+        drop(owned);
+
+        // A new writer reloads the retained journal. The remote verdict here
+        // is a supplied unit input; shell tests separately exercise its locks.
+        let reloaded = DurableLeaseWriter {
+            path: writer.path.clone(),
+            recovery_ownership: None,
+            lease: Arc::new(Mutex::new(
+                DurableLeaseWriter::read_journal(&writer.path, &writer.wrapper_id()).unwrap(),
+            )),
+        };
+        let owned = recovery_owner::claim(&reloaded).await.unwrap();
+        let mut session = RecoverySession {
+            recipe: load_recipe(&owned).unwrap(),
+            writer: owned.clone(),
+        };
+        let calls = std::cell::Cell::new(0);
+        session
+            .reconcile_source_cancellation_with(async |_, _, _| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            load_recipe(&owned).unwrap().source_cancellation_settled,
+            Some(true)
+        );
+        let after = std::fs::read(&writer.path).unwrap();
+        session
+            .reconcile_source_cancellation_with(async |_, _, _| {
+                panic!("already settled cancellation must not contact the worker")
+            })
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&writer.path).unwrap(), after);
+        assert_eq!(owned.snapshot().identity, writer.snapshot().identity);
+        assert_eq!(owned.snapshot().exit_code, Some(EXIT_BUILD_ERROR));
+        assert!(owned.snapshot().terminal_acknowledged);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_cancellation_requires_complete_retirement_before_worker_contact() {
+        for missing in ["sources", "tree", "pair", "returned"] {
+            let (_directory, writer) = terminal_cancellation_fixture();
+            let mut recipe = load_recipe(&writer).unwrap();
+            match missing {
+                "sources" => recipe.sources_released = false,
+                "tree" => recipe.tree_retired = false,
+                "pair" => recipe.pair_released = false,
+                "returned" => recipe.returned = None,
+                _ => unreachable!(),
+            }
+            writer
+                .set_recovery(serde_json::to_value(recipe).unwrap())
+                .unwrap();
+            let owned = recovery_owner::claim(&writer).await.unwrap();
+            let before = std::fs::read(&writer.path).unwrap();
+            let mut session = RecoverySession {
+                recipe: load_recipe(&owned).unwrap(),
+                writer: owned,
+            };
+            let error = session
+                .reconcile_source_cancellation_with(async |_, _, _| {
+                    panic!("incomplete retirement must not contact the worker")
+                })
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("complete resource retirement"),
+                "{error}"
+            );
+            assert_eq!(std::fs::read(&writer.path).unwrap(), before, "{missing}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_cancellation_checkpoint_preserves_original_recipe_evidence() {
+        let (_directory, writer) = terminal_cancellation_fixture();
+        let mut original = writer.snapshot().recovery.unwrap();
+        original["source_roots"] = serde_json::json!(["/data//projects/source-recovery/"]);
+        original["future_custody"] = serde_json::json!({"original": true});
+        writer.set_recovery(original.clone()).unwrap();
+        let owned = recovery_owner::claim(&writer).await.unwrap();
+        let mut session = RecoverySession {
+            recipe: load_recipe(&owned).unwrap(),
+            writer: owned.clone(),
+        };
+        session
+            .reconcile_source_cancellation_with(async |_, roots, _| {
+                assert_eq!(roots, &["/data/projects/source-recovery"]);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        original["source_cancellation_settled"] = serde_json::json!(true);
+        assert_eq!(owned.snapshot().recovery.unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_settlement_preserves_late_heartbeat_but_refuses_changed_recipe() {
+        for change_recipe in [false, true] {
+            let (_directory, writer) = terminal_cancellation_fixture();
+            {
+                let mut lease = writer.lease.lock().unwrap();
+                lease.terminal_acknowledged = false;
+                lease.state = rch_common::job_identity::JobLifecycleState::Running;
+            }
+            writer.persist().unwrap();
+            let mut session = RecoverySession {
+                recipe: load_recipe(&writer).unwrap(),
+                writer: writer.clone(),
+            };
+            let result = session
+                .reconcile_source_cancellation_with(async |_, _, _| {
+                    writer.heartbeat("release_unconfirmed")?;
+                    if change_recipe {
+                        let mut changed = writer.snapshot().recovery.unwrap();
+                        changed["identity"] = serde_json::json!("1123456789abcdef0123456789abcdef");
+                        writer.set_recovery(changed)?;
+                    }
+                    Ok(())
+                })
+                .await;
+            let current = writer.snapshot();
+            assert_eq!(current.phase, "release_unconfirmed");
+            assert!(current.heartbeat_unix_ms > 1);
+            assert!(!current.terminal_acknowledged);
+            if change_recipe {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("job journal changed")
+                );
+                assert_eq!(session.recipe.source_cancellation_settled, None);
+                assert_eq!(
+                    current.recovery.unwrap()["identity"],
+                    "1123456789abcdef0123456789abcdef"
+                );
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    load_recipe(&writer).unwrap().source_cancellation_settled,
+                    Some(true)
+                );
+                writer.acknowledge_terminal().unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_terminal_cancellation_recovery_keeps_one_journal_owner() {
+        let (_directory, writer) = terminal_cancellation_fixture();
+        let stale = DurableLeaseWriter {
+            path: writer.path.clone(),
+            recovery_ownership: None,
+            lease: Arc::new(Mutex::new(writer.snapshot())),
+        };
+        let owned = recovery_owner::claim(&writer).await.unwrap();
+        let mut session = RecoverySession {
+            recipe: load_recipe(&owned).unwrap(),
+            writer: owned.clone(),
+        };
+        session
+            .reconcile_source_cancellation_with(async |_, _, _| {
+                assert!(recovery_owner::claim(&stale).await.is_err());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        drop(session);
+        drop(owned);
+        let next = recovery_owner::claim(&stale).await.unwrap();
+        assert_eq!(
+            load_recipe(&next).unwrap().source_cancellation_settled,
+            Some(true)
+        );
+        let mut session = RecoverySession {
+            recipe: load_recipe(&next).unwrap(),
+            writer: next,
+        };
+        session
+            .reconcile_source_cancellation_with(async |_, _, _| {
+                panic!("the second dispatcher must observe the settled journal")
+            })
+            .await
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_cancellation_receipt_does_not_advance_a_failed_journal_publication() {
+        let (directory, writer) = terminal_cancellation_fixture();
+        let owned = recovery_owner::claim(&writer).await.unwrap();
+        let mut session = RecoverySession {
+            recipe: load_recipe(&owned).unwrap(),
+            writer: owned.clone(),
+        };
+        let before = std::fs::read(&writer.path).unwrap();
+        let gate = writer.path.with_extension("recovery.lock");
+        let alias = directory.path().join("changed-gate.lock");
+        let error = session
+            .reconcile_source_cancellation_with(async |_, _, _| {
+                std::fs::hard_link(&gate, &alias)?;
+                Ok(())
+            })
+            .await;
+        assert!(error.is_err());
+        assert_eq!(session.recipe.source_cancellation_settled, None);
+        assert_eq!(std::fs::read(&writer.path).unwrap(), before);
+        assert_eq!(
+            load_recipe(&owned).unwrap().source_cancellation_settled,
+            None
+        );
     }
 
     fn retained_preparation_fixture() -> (PathBuf, DurableLeaseWriter, WorkerConfig) {

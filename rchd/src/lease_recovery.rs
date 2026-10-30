@@ -10,6 +10,8 @@
 //! gone, a few per cycle, backing off per lease after a failure.
 //! Source retirement can precede the daemon handoff: those unacknowledged
 //! journals still need recovery, even though no worker filesystem work remains.
+//! Older acknowledged cancellations also remain candidates until their exact
+//! worker-side cancellation state has been reconciled (#111).
 
 #[cfg(test)]
 use crate::api::is_process_alive;
@@ -29,6 +31,9 @@ use tracing::{info, warn};
 
 /// How often the lease directory is checked for recoverable leases.
 const RECOVERY_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// Do not contend with a just-finished wrapper's journal. This is a scheduling
+/// grace only; activity-lock and durable worker receipts authorize settlement.
+const TERMINAL_CANCELLATION_GRACE_MS: u64 = 15 * 60 * 1000;
 /// Bound both starts per scan interval and total in-flight recovery clients.
 /// A worker gets at most one client, so a stalled worker cannot consume every
 /// lane or serialize independent workers behind its timeout.
@@ -68,6 +73,24 @@ fn retired_delivery(lease: &DurableJobLease) -> Option<i32> {
         .and_then(|code| i32::try_from(code).ok())
 }
 
+fn terminal_cancellation_unsettled(lease: &DurableJobLease) -> bool {
+    let Some(recipe) = lease.recovery.as_ref() else {
+        return false;
+    };
+    let pending = match &recipe["source_cancellation_settled"] {
+        serde_json::Value::Null => recipe["preparation_cancelled"].as_bool() == Some(true),
+        serde_json::Value::Bool(false) => true,
+        _ => false,
+    };
+    pending
+        && lease.terminal_acknowledged
+        && lease.state == rch_common::job_identity::JobLifecycleState::Finished
+        && retired_delivery(lease).is_some_and(|exit| exit != 0 && lease.exit_code == Some(exit))
+        && recipe["sources_released"].as_bool() == Some(true)
+        && recipe["tree_retired"].as_bool() == Some(true)
+        && recipe["pair_released"].as_bool() == Some(true)
+}
+
 /// Matches rchd's stuck-build hard cap (`should_remediate`) and the client's
 /// `DAEMON_ABSENCE_MIN_AGE_MS` threshold (bd-ey7fr).
 const DAEMON_ABSENCE_MIN_AGE_MS: u64 = 24 * 60 * 60 * 1000;
@@ -95,6 +118,43 @@ fn verify_recovery_completion(
         || before.command_fingerprint != after.command_fingerprint
     {
         return Err("recovery journal identity changed; completion not confirmed".into());
+    }
+    if terminal_cancellation_unsettled(before) {
+        // This lease already completed daemon accounting. The only remaining
+        // obligation is worker cancellation; a zero CLI exit with the old
+        // terminal flags is exactly the false success reported in #111.
+        let before_recipe = before.recovery.as_ref().expect("validated cancellation");
+        let Some(after_recipe) = after.recovery.as_ref() else {
+            return Err("terminal cancellation lost its recovery recipe".into());
+        };
+        if after_recipe["source_cancellation_settled"].as_bool() != Some(true)
+            || !after.terminal_acknowledged
+            || after.state != before.state
+            || after.exit_code != before.exit_code
+            || retired_delivery(after) != before.exit_code
+            || [
+                "identity",
+                "worker",
+                "source_roots",
+                "completion",
+                "pair",
+                "retire_root",
+                "retained_root",
+                "retained_materialized",
+                "sources_released",
+                "tree_retired",
+                "pair_released",
+                "execution_started",
+                "preparation_cancelled",
+            ]
+            .iter()
+            .any(|key| before_recipe[*key] != after_recipe[*key])
+        {
+            return Err(
+                "terminal cancellation exited without exact worker settlement evidence".into(),
+            );
+        }
+        return Ok(());
     }
     if before.recovery.is_none() && after.recovery.is_none() {
         if before.heartbeat_unix_ms == 0
@@ -168,9 +228,10 @@ struct RecoveryCandidate {
     heartbeat_unix_ms: u64,
 }
 
-/// Only dead, stale, unacknowledged source owners or pending daemon handoffs
-/// enter the queue. Unreadable/noncanonical journals are not execution authority;
-/// the separate restart scan retains its fail-closed treatment of bad evidence.
+/// Only dead, stale source owners, pending daemon handoffs, or acknowledged
+/// cancellations lacking worker settlement enter the queue. Unreadable or
+/// noncanonical journals are not execution authority; the separate restart
+/// scan retains its fail-closed treatment of bad evidence.
 fn recoverable_candidates(
     lease_dir: &Path,
     now_unix_ms: u64,
@@ -191,6 +252,15 @@ fn recoverable_candidates(
         })
         .filter_map(|path| read_lease(lease_dir, path.file_stem()?.to_str()?).ok())
         .filter(|lease| {
+            if terminal_cancellation_unsettled(lease) {
+                // lease_blocks_restart deliberately ignores terminal leases.
+                // Recovery must still exclude live or unverified wrappers.
+                return presence(lease) == OwnerPresence::Absent
+                    && lease.heartbeat_unix_ms > 0
+                    && (lease.heartbeat_unix_ms > now_unix_ms
+                        || now_unix_ms.saturating_sub(lease.heartbeat_unix_ms)
+                            >= TERMINAL_CANCELLATION_GRACE_MS);
+            }
             !lease.terminal_acknowledged
                 && (lease_owns_unretired_source(lease)
                     || retired_delivery(lease).is_some()
@@ -895,6 +965,111 @@ mod tests {
         after.exit_code = Some(exit);
         after.acknowledge_terminal(before.heartbeat_unix_ms + 1);
         after
+    }
+
+    fn terminal_cancellation_lease(stale: u64, pid: u32) -> DurableJobLease {
+        let mut before = handoff_lease(stale, pid, 1);
+        let recipe = before.recovery.as_mut().unwrap();
+        recipe["identity"] = serde_json::json!("0123456789abcdef0123456789abcdef");
+        recipe["preparation_cancelled"] = serde_json::json!(true);
+        recipe["tree_retired"] = serde_json::json!(true);
+        recipe["pair_released"] = serde_json::json!(true);
+        // Live wrappers historically acknowledged without a detached daemon
+        // receipt in the recipe. Their worker settlement is independent.
+        before.exit_code = Some(1);
+        before.acknowledge_terminal(stale);
+        before
+    }
+
+    #[test]
+    fn acknowledged_cancellations_are_recovered_after_restart_until_worker_settlement() {
+        let dir = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let now = 100 * 60 * 60 * 1000;
+        let stale = now - 60 * 60 * 1000;
+        let legacy = terminal_cancellation_lease(stale, 11);
+        let mut interrupted = terminal_cancellation_lease(stale, 12);
+        interrupted.recovery.as_mut().unwrap()["preparation_cancelled"] = serde_json::json!(false);
+        interrupted.recovery.as_mut().unwrap()["source_cancellation_settled"] =
+            serde_json::json!(false);
+        let live = terminal_cancellation_lease(stale, 22);
+        let unknown = terminal_cancellation_lease(stale, 33);
+        let fresh = terminal_cancellation_lease(now, 11);
+        let mut settled = terminal_cancellation_lease(stale, 11);
+        settled.recovery.as_mut().unwrap()["source_cancellation_settled"] = serde_json::json!(true);
+        let ordinary = completed_lease(&handoff_lease(stale, 11, 102), 102, 102);
+        let mut incomplete = terminal_cancellation_lease(stale, 11);
+        incomplete.recovery.as_mut().unwrap()["tree_retired"] = serde_json::json!(false);
+        for candidate in [
+            &legacy,
+            &interrupted,
+            &live,
+            &unknown,
+            &fresh,
+            &settled,
+            &ordinary,
+            &incomplete,
+        ] {
+            std::fs::write(
+                dir.path()
+                    .join(format!("{}.json", candidate.identity.local_wrapper_id)),
+                serde_json::to_vec(candidate).unwrap(),
+            )
+            .unwrap();
+        }
+        let presence = |lease: &DurableJobLease| match lease.wrapper_pid {
+            22 => OwnerPresence::Live,
+            33 => OwnerPresence::Unknown,
+            _ => OwnerPresence::Absent,
+        };
+        let mut expected = vec![
+            legacy.identity.local_wrapper_id.clone(),
+            interrupted.identity.local_wrapper_id.clone(),
+        ];
+        expected.sort();
+        for _restart in 0..2 {
+            let candidates = recoverable_candidates(dir.path(), now, presence);
+            assert_eq!(
+                candidates
+                    .iter()
+                    .map(|candidate| candidate.wrapper_id.clone())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_cancellation_recovery_requires_new_exact_worker_evidence() {
+        let before = terminal_cancellation_lease(1, 11);
+        assert!(verify_recovery_completion(&before, &before).is_err());
+        let mut after = before.clone();
+        after.recovery.as_mut().unwrap()["source_cancellation_settled"] = serde_json::json!(true);
+        verify_recovery_completion(&before, &after).unwrap();
+        for (key, value) in [
+            ("source_cancellation_settled", serde_json::json!("true")),
+            ("source_cancellation_settled", serde_json::json!(false)),
+            ("identity", serde_json::json!("another-attempt")),
+            ("source_roots", serde_json::json!(["/another-project"])),
+            (
+                "worker",
+                serde_json::json!({"id":"worker1", "host":"other"}),
+            ),
+            ("tree_retired", serde_json::json!(false)),
+            ("returned", serde_json::json!(0)),
+        ] {
+            let mut changed = after.clone();
+            changed.recovery.as_mut().unwrap()[key] = value;
+            assert!(
+                verify_recovery_completion(&before, &changed).is_err(),
+                "{key}"
+            );
+        }
+        let mut changed = after;
+        changed.exit_code = Some(0);
+        assert!(verify_recovery_completion(&before, &changed).is_err());
     }
 
     #[test]

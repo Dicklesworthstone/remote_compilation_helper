@@ -7,6 +7,7 @@ fixtures are retained; neither a passing test nor this suite claims fleet or
 native-Darwin qualification. Run directly or through the Rust integration test.
 """
 import hashlib
+import fcntl
 import os
 from pathlib import Path
 import random
@@ -15,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 REPO = Path(__file__).resolve().parents[2]
@@ -218,7 +220,9 @@ class SourceClaimRegistryTests(unittest.TestCase):
         self.assert_granted(cancel)
         self.assertEqual(cancel.stdout, b"owned")
         self.assert_refused(self.transact("aa", roots, "recover"))
-        self.assert_refused(self.transact("bb", roots))
+        conflict = self.transact("bb", roots)
+        self.assert_refused(conflict)
+        self.assertIn(b"RCH_SOURCE_CANCELLATION_FENCE identity=aa", conflict.stderr)
         self.assert_granted(self.transact("aa", roots, "finish-cancel"))
         self.assert_granted(self.transact("bb", roots))
         self.assert_refused(self.transact("aa", roots))
@@ -677,6 +681,224 @@ class SourceClaimRegistryTests(unittest.TestCase):
 @unittest.skipUnless(shutil.which("bash"), "bash is unavailable")
 class SourceClaimRegistryBashTests(SourceClaimRegistryTests):
     shell = shutil.which("bash")
+
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "requires native Linux worker processes")
+class TerminalCancellationSettlementTests(unittest.TestCase):
+    shell = "/bin/sh"
+    record = SourceClaimRegistryTests.record
+    transact = SourceClaimRegistryTests.transact
+    command = SourceClaimRegistryTests.command
+    assert_granted = SourceClaimRegistryTests.assert_granted
+    assert_refused = SourceClaimRegistryTests.assert_refused
+    tools_env = SourceClaimRegistryTests.tools_env
+    barrier_env = SourceClaimRegistryTests.barrier_env
+    fail_sync_after_move = SourceClaimRegistryTests.fail_sync_after_move
+
+    def setUp(self):
+        SourceClaimRegistryTests.setUp(self)
+        self.legacy = self.root / "legacy"
+        self.roots = [self.root / "project", self.root / "project/.rch-target"]
+        self.coordinator = (REPO / "rch/src/hook/source_cancel_settlement.py").read_text()
+        self.control = (REPO / "rch/src/hook/source_namespace_control.sh").read_text()
+        self.tmp = self.root / "control"
+        self.tmp.mkdir()
+        self.env["TMPDIR"] = str(self.tmp)
+
+    def start_settlement(self, token="aa", roots=None, env=None, transaction=None):
+        roots = self.roots if roots is None else roots
+        invocation = [sys.executable, "-I", "-S", "-c", self.coordinator,
+                      str(self.registry), str(self.legacy), token, digest(roots),
+                      transaction or self.script.read_text()]
+        program = ("exec " + shlex.join(invocation) + " <<'RCH_SOURCE_CLAIM_ROOTS'\n"
+                   + body(roots).decode() + "RCH_SOURCE_CLAIM_ROOTS\n")
+        process = subprocess.Popen([self.shell, "-c",
+                                    "set -- RCH_SOURCE_CANCELLATION_SETTLED\n" + self.control],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, env=env or self.env)
+        process.stdin.write(program.encode())
+        process.stdin.close()
+        process.stdin = None
+        return process
+
+    def settle(self, **arguments):
+        process = self.start_settlement(**arguments)
+        stdout, stderr = process.communicate(timeout=25)
+        return subprocess.CompletedProcess([], process.returncode, stdout, stderr)
+
+    def assert_settled(self, result):
+        self.assert_granted(result)
+        self.assertEqual(result.stdout, b"RCH_SOURCE_CANCELLATION_SETTLED\n")
+
+    def records(self):
+        return {str(path.relative_to(self.root)): (path.stat().st_ino, path.read_bytes())
+                for directory in (self.registry, self.legacy) if directory.exists()
+                for path in directory.rglob("*")
+                if path.is_file() and not path.name.endswith(".lock")}
+
+    def test_active_fenced_claim_settles_and_new_owner_can_enter(self):
+        self.assert_granted(self.transact("aa", self.roots))
+        self.assertEqual(self.transact("aa", self.roots, "cancel").stdout, b"owned")
+        active = self.registry / ("aa." + digest(self.roots) + ".claim")
+        before = active.stat().st_ino, active.read_bytes()
+        fence = active.with_suffix(".cancelling")
+        self.assert_settled(self.settle())
+        receipt = self.registry / "cancelled" / active.name
+        self.assertEqual((receipt.stat().st_ino, receipt.read_bytes()), before)
+        self.assertFalse(active.exists())
+        self.assertEqual(fence.read_bytes(), body(self.roots))
+        self.assert_granted(self.transact("bb", self.roots))
+        next_owner = self.registry / ("bb." + digest(self.roots) + ".claim")
+        new_bytes = next_owner.read_bytes()
+        self.assert_settled(self.settle())
+        self.assertEqual(next_owner.read_bytes(), new_bytes)
+        self.assert_refused(self.transact("aa", self.roots, "recover"))
+        self.assert_refused(self.transact("aa", self.roots, "acquire"))
+
+    def test_marker_only_recovery_never_touches_source_and_keeps_delayed_request_fence(self):
+        self.roots[0].mkdir()
+        source = self.roots[0] / "keep-source"
+        source.write_bytes(b"another owner's source")
+        fence = self.record("aa", self.roots, "cancelling")
+        before = fence.stat().st_ino, fence.read_bytes()
+        self.assert_settled(self.settle())
+        self.assertEqual((fence.stat().st_ino, fence.read_bytes()), before)
+        self.assertEqual(source.read_bytes(), b"another owner's source")
+        self.assert_granted(self.transact("bb", self.roots))
+        self.assert_refused(self.transact("aa", self.roots))
+
+    def test_receipt_only_creates_permanent_fence_before_acknowledgement(self):
+        self.assertEqual(self.transact("aa", self.roots, "cancel").stdout, b"unowned")
+        receipt = self.registry / "cancelled" / ("aa." + digest(self.roots) + ".claim")
+        before = receipt.stat().st_ino, receipt.read_bytes()
+        self.assert_settled(self.settle())
+        self.assertEqual((receipt.stat().st_ino, receipt.read_bytes()), before)
+        fence = self.registry / receipt.with_suffix(".cancelling").name
+        self.assertEqual(fence.read_bytes(), body(self.roots))
+        os.utime(receipt, (1_000_000, 1_000_000))
+        self.assert_granted(self.transact("bb", [self.root / "different"]))
+        self.assertFalse(receipt.exists(), "exercise real existing receipt retention GC")
+        self.assert_refused(self.transact("aa", self.roots))
+        self.assert_settled(self.settle())
+
+    def test_missing_or_conflicting_evidence_is_preserved(self):
+        for state in ("absent", "active", "pending", "torn-pending", "released",
+                      "active-and-cancelled", "quarantine", "wrong-roots", "bad-marker"):
+            with self.subTest(state=state):
+                self.setUp()
+                if state in ("active", "active-and-cancelled"):
+                    self.record("aa", self.roots)
+                if state in ("pending", "torn-pending"):
+                    path = self.record("aa", self.roots, "pending")
+                    if state == "torn-pending":
+                        path.write_bytes(b"interrupted")
+                if state not in ("absent", "active"):
+                    marker = self.record("aa", self.roots, "cancelling")
+                    if state == "bad-marker":
+                        marker.write_bytes(b"incomplete")
+                if state in ("released", "active-and-cancelled", "quarantine"):
+                    folder = "cancelled" if state == "active-and-cancelled" else state
+                    suffix = "pending" if state == "quarantine" else "claim"
+                    (self.registry / folder / ("aa." + digest(self.roots) + "." + suffix)).write_bytes(body(self.roots))
+                before = self.records()
+                result = self.settle(roots=[self.root / "other"] if state == "wrong-roots" else None)
+                self.assert_refused(result)
+                self.assertEqual(result.stdout, b"")
+                self.assertEqual(self.records(), before)
+
+    def test_legacy_registry_settles_exact_owner_but_duplicate_namespaces_refuse(self):
+        self.legacy.mkdir()
+        for name in ("released", "cancelled", "quarantine"):
+            (self.legacy / name).mkdir()
+        marker = self.legacy / ("aa." + digest(self.roots) + ".cancelling")
+        marker.write_bytes(body(self.roots))
+        self.assert_settled(self.settle())
+        self.assertTrue((self.legacy / "cancelled" / marker.with_suffix(".claim").name).exists())
+        self.assertFalse(list(self.registry.glob("*.claim")))
+        self.record("aa", self.roots, "cancelling")
+        before = self.records()
+        result = self.settle()
+        self.assert_refused(result)
+        self.assertIn(b"2 registries contain identity", result.stderr)
+        self.assertEqual(self.records(), before)
+
+    def test_misplaced_same_identity_record_is_not_ignored(self):
+        for folder, suffix in (("cancelled", "pending"), ("released", "cancelling"),
+                               ("quarantine", "claim")):
+            with self.subTest(folder=folder):
+                self.setUp()
+                self.record("aa", self.roots, "cancelling")
+                (self.registry / folder / ("aa." + digest(self.roots) + "." + suffix)).write_bytes(body(self.roots))
+                before = self.records()
+                result = self.settle()
+                self.assert_refused(result)
+                self.assertIn(b"unrecognized same-identity", result.stderr)
+                self.assertEqual(self.records(), before)
+
+    def test_publication_interruption_is_not_acknowledged_and_restart_rechecks_durability(self):
+        self.assert_granted(self.transact("aa", self.roots))
+        self.assert_granted(self.transact("aa", self.roots, "cancel"))
+        receipt = self.registry / "cancelled" / ("aa." + digest(self.roots) + ".claim")
+        env = self.fail_sync_after_move(receipt)
+        result = self.settle(env=env)
+        self.assert_refused(result)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(b"RCH_SOURCE_REGISTRY_PUBLICATION_UNCONFIRMED", result.stderr)
+        before = self.records()
+        self.assert_refused(self.settle(env=env))
+        self.assertEqual(self.records(), before)
+        self.assert_settled(self.settle())
+        self.assertEqual(self.records(), before)
+
+    def test_live_activity_refuses_with_bounded_distinct_lock_diagnostic(self):
+        self.record("aa", self.roots, "cancelling")
+        before = self.records()
+        with (self.registry / "aa.activity.lock").open("a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            started = time.monotonic()
+            result = self.settle()
+            self.assert_refused(result)
+            self.assertIn(b"RCH_SOURCE_SETTLEMENT_LOCK_BUSY", result.stderr)
+            self.assertIn(b"elapsed_ms=", result.stderr)
+            self.assertLess(time.monotonic() - started, 12)
+            self.assertEqual(self.records(), before)
+        self.assert_settled(self.settle())
+
+    def test_concurrent_dispatchers_converge_to_one_receipt(self):
+        self.record("aa", self.roots, "cancelling")
+        processes = [self.start_settlement() for _ in range(3)]
+        for process in processes:
+            stdout, stderr = process.communicate(timeout=25)
+            self.assertEqual(process.returncode, 0, stderr)
+            self.assertEqual(stdout, b"RCH_SOURCE_CANCELLATION_SETTLED\n")
+        self.assertEqual(len(list((self.registry / "cancelled").glob("*.claim"))), 1)
+        self.assert_refused(self.transact("aa", self.roots))
+        self.assert_granted(self.transact("bb", self.roots))
+
+    def test_replaced_or_symlinked_lock_never_creates_split_ownership(self):
+        self.record("aa", self.roots, "cancelling")
+        lock = self.registry / "metadata.lock"
+        with lock.open("a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            process = self.start_settlement()
+            deadline = time.monotonic() + 3
+            while not (self.registry / "aa.activity.lock").exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            # The old inode remains held; no numeric PID or pathname deletion
+            # is used to reclaim it. Replacement must cause refusal, not reuse.
+            time.sleep(0.1)
+            lock.rename(self.registry / "saved-metadata.lock")
+            lock.write_bytes(b"")
+            stdout, stderr = process.communicate(timeout=10)
+            self.assertEqual(process.returncode, 73, stderr)
+            self.assertEqual(stdout, b"")
+            self.assertIn(b"lock changed", stderr)
+        lock.rename(self.registry / "replacement-metadata.lock")
+        lock.symlink_to(self.root / "unrelated")
+        result = self.settle()
+        self.assert_refused(result)
+        self.assertFalse((self.root / "unrelated").exists())
+        self.assertFalse(list((self.registry / "cancelled").glob("*.claim")))
 
 
 if __name__ == "__main__":

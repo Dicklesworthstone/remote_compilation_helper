@@ -474,15 +474,21 @@ class SourceAdmission105Tests(unittest.TestCase):
         self.assertEqual(self.fixture.run("aa", self.roots, "cancel").returncode, 73)
 
     def test_pending_sync_error_cannot_be_mistaken_for_retryable_contention(self):
-        sync = shutil.which("sync")
-        self.assertIsNotNone(sync)
-        shim = self.root / "tools/sync"
+        # Production fsyncs each descriptor through Python; intercepting the
+        # old sync utility no longer injects a failure. Keep the same pending
+        # frontier and error75, so it cannot be confused with overlap retry.
+        injected = self.root / "injected-pending-sync"
+        shim = self.root / "tools/python3"
         shim.write_text(
-            '#!/bin/sh\ncase "${2-}" in *.pending) exit 75;; esac\n'
-            f'exec {shlex.quote(sync)} "$@"\n', encoding="utf-8",
+            '#!/bin/sh\ncase "${4-}" in *os.fsync*)\n'
+            'case "${5-}" in *.pending)\n'
+            f'  printf injected > {shlex.quote(str(injected))}\n'
+            '  exit 75;; esac;; esac\n'
+            f'exec {shlex.quote(sys.executable)} "$@"\n', encoding="utf-8",
         )
         shim.chmod(0o700)
         result = self.fixture.run("bb", self.roots, "try-acquire")
+        self.assertEqual(injected.read_bytes(), b"injected", "the fault must actually fire")
         self.assertEqual(result.returncode, 73, result.stderr)
         self.assertFalse(self.fixture.path("bb", self.roots).exists())
         self.assertEqual(self.fixture.path("bb", self.roots, "pending").read_bytes(),

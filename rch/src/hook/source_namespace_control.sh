@@ -1,6 +1,12 @@
 # Fixed command argument; the namespace program stays on stdin. This is only
-# pre-intent namespace setup, never a source grant, pair lock or build workload.
+# pre-intent namespace setup or terminal cancellation metadata, never source
+# tree access or a build workload. Both require settled descendant teardown.
 set -eu
+rch_control_ready=${1:-RCH_TOPOLOGY_OK}
+case "$rch_control_ready" in
+    RCH_TOPOLOGY_OK|RCH_SOURCE_CANCELLATION_SETTLED) ;;
+    *) printf '%s\n' 'RCH: invalid metadata control result marker' >&2; exit 73 ;;
+esac
 # Native fallback for workers without GNU coreutils (including stock macOS).
 # This implements only the fixed timer ABI below, not arbitrary timeout flags.
 # The timer itself leads a new session/group and stays alive through escalation:
@@ -132,6 +138,7 @@ exec 3<&0
 set -eu
 control=$1
 observer=$2
+ready=$3
 # Prove that the direct parent leads a private process group BEFORE
 # installing a group-wide kill trap or reading any namespace program. A timer
 # wrapper using --foreground must not turn "kill 0" into a kill of the observer,
@@ -172,6 +179,10 @@ program=$!
 exec 3<&-
 wait "$program"
 status=$?
+if [ "$status" -ge 128 ]; then
+    printf "RCH_SOURCE_NAMESPACE_PROCESS_TERMINATED status=%s signal=%s signal_origin=unknown\n" \
+        "$status" "$((status - 128))" >&2
+fi
 wait "$stdout_reader"
 stdout_status=$?
 wait "$stderr_reader"
@@ -187,12 +198,12 @@ fi
 # An ordinary refusal may have printed readiness before failing. Preserve its
 # exit but never publish that marker. Successful evidence must match bytewise.
 [ "$status" -eq 0 ] || finish "$status"
-printf "RCH_TOPOLOGY_OK\n" | cmp -s - "$control/stdout" || {
+printf "%s\n" "$ready" | cmp -s - "$control/stdout" || {
     printf "%s\n" "RCH: namespace control returned invalid readiness" >&2
     exit 73
 }
 finish 0
-' rch-namespace-monitor "$control" "$$" <&3 3<&- &
+' rch-namespace-monitor "$control" "$$" "$rch_control_ready" <&3 3<&- &
 monitor=$!
 exec 3<&-
 set +e
@@ -205,6 +216,8 @@ set -e
 # not a teardown receipt. The monitor writes only a fully settled result, then
 # kills its group; timeout escalation can finish that same teardown if needed.
 [ "$monitor_status" -eq 137 ] && [ -f "$control/result" ] || {
+    printf 'RCH_SOURCE_NAMESPACE_CONTROL_UNSETTLED status=%s cause=deadline-or-external-interruption\n' \
+        "$monitor_status" >&2
     printf '%s\n' 'RCH: namespace control ended without settled group teardown' >&2
     exit 73
 }
@@ -216,6 +229,7 @@ set -eu
 # Otherwise GNU timeout can reap this shell while that descendant is blocked.
 trap "while :; do sleep 1; done" HUP INT TERM PIPE
 control=$1
+ready=$2
 IFS= read -r status < "$control/result" || exit 73
 case "$status" in ""|*[!0-9]*) exit 73 ;; esac
 [ "${#status}" -le 3 ] && [ "$status" -le 255 ] || exit 73
@@ -225,9 +239,9 @@ printf "%s\n" "$status" | cmp -s - "$control/result" || exit 73
 [ "$(wc -c < "$control/stderr")" -le 65536 ] || exit 73
 cat -- "$control/stderr" >&2 || exit 73
 [ "$status" -eq 0 ] || exit "$status"
-printf "RCH_TOPOLOGY_OK\n" | cmp -s - "$control/stdout" || exit 73
+printf "%s\n" "$ready" | cmp -s - "$control/stdout" || exit 73
 cat -- "$control/stdout"
-' rch-namespace-delivery "$control" </dev/null &
+' rch-namespace-delivery "$control" "$rch_control_ready" </dev/null &
 delivery=$!
 set +e
 # A foreground timer killed during delivery makes the observer shell print

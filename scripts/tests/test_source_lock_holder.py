@@ -71,7 +71,7 @@ def _ignored_sighup():
 
 class Holder:
     def __init__(self, script, args, env, plan, claim="claim input", fd_limit=None,
-                 closed_stdin=False, ignore_hup=False):
+                 closed_stdin=False, ignore_hup=False, session_idle=None):
         command = "set -eu\n"
         if fd_limit:
             command += "ulimit -n {}\n".format(fd_limit)
@@ -86,6 +86,12 @@ class Holder:
         command += "exec 4<<'RCH_TEST_CLAIM'\n{}\nRCH_TEST_CLAIM\n".format(claim)
         command += "exec sh -c {} {} {}".format(
             shlex.quote(script), shlex.quote(script), shlex.join(args))
+        if session_idle is not None:
+            # Match source_authority_live_session_command: the supervisor
+            # receives the whole holder script on fd 3, never through argv.
+            command = ("set -eu\nexec 3<<'RCH_SOURCE_LOCK_SESSION_PROGRAM'\n{}\n"
+                       "RCH_SOURCE_LOCK_SESSION_PROGRAM\nexec sh -c {} {} --rch-session {}"
+                       ).format(command, shlex.quote(script), shlex.quote(script), session_idle)
         self.process = subprocess.Popen(
             ["/bin/sh", "-c", command], env=env,
             stdin=subprocess.DEVNULL if closed_stdin else subprocess.PIPE,
@@ -147,9 +153,12 @@ class SourceLockHolderTests(unittest.TestCase):
         directory = self.root / (name if bash else name + "-legacy")
         directory.mkdir(exist_ok=True)
         uname = directory / "uname"
-        uname.write_text("#!/bin/sh\nprintf 'called\\n' >> {}\nprintf '%s\\n' {}\n".format(
-            shlex.quote(str(directory / "uname.calls")), "Darwin" if portable else "Linux"))
-        uname.chmod(0o700)
+        # Sibling holders may still be executing this same fixture. Its
+        # contents are immutable; replacing it races exec with ETXTBSY.
+        if not uname.exists():
+            uname.write_text("#!/bin/sh\nprintf 'called\\n' >> {}\nprintf '%s\\n' {}\n".format(
+                shlex.quote(str(directory / "uname.calls")), "Darwin" if portable else "Linux"))
+            uname.chmod(0o700)
         for name, target in [("sh", "/bin/sh"), ("cat", shutil.which("cat"))]:
             path = directory / name
             if not path.exists():
@@ -166,8 +175,9 @@ class SourceLockHolderTests(unittest.TestCase):
             # A successful test must never invoke GNU flock on this path.
             flock = directory / "flock"
             self.assertFalse(flock.is_symlink(), "must not overwrite a real tool through a symlink")
-            flock.write_text("#!/bin/sh\nprintf 'unexpected flock invocation\\n' >&2\nexit 97\n")
-            flock.chmod(0o700)
+            if not flock.exists():
+                flock.write_text("#!/bin/sh\nprintf 'unexpected flock invocation\\n' >&2\nexit 97\n")
+                flock.chmod(0o700)
         elif FLOCK:
             path = directory / "flock"
             if not path.exists():
@@ -221,6 +231,185 @@ class SourceLockHolderTests(unittest.TestCase):
         stdout, stderr = holder.finish()
         self.assertEqual((holder.process.returncode, stdout, stderr), (0, b"", b""))
         self.assertTrue(all(available(path) for path in paths))
+
+    def session_fixture(self, name="session", idle=1):
+        lock = self.root / (name + ".lock")
+        claim = self.root / (name + ".claim")
+        receipt = self.root / (name + ".released")
+        release = "RCH_SOURCE_AUTHORITY_RELEASE:abc-123"
+        terminal = ("set -eu; printf 'durable owner\\n' > {}; printf '%s\\n' \"$1\"; "
+                    "IFS= read -r request; [ \"$request\" = {} ]; "
+                    "printf '%s\\n' \"$request\" > {}; printf '%s\\n' \"$request\"").format(
+                        shlex.quote(str(claim)), shlex.quote(release), shlex.quote(str(receipt)))
+        holder = self.start([("x", lock)], terminal=terminal, session_idle=idle)
+        self.assertEqual(holder.line(), b"READY")
+        self.assertFalse(available(lock))
+        return holder, lock, claim, receipt, release
+
+    def test_session_half_open_requester_expires_without_erasing_durable_owner(self):
+        holder, lock, claim, receipt, _ = self.session_fixture()
+        # Keep stdin open: this is a half-open/stopped client, not an EOF test.
+        holder.process.wait(timeout=4)
+        stdout, stderr = holder.finish()
+        self.assertEqual((holder.process.returncode, stdout), (73, b""))
+        self.assertIn(b"RCH_SOURCE_LOCK_HEARTBEAT_EXPIRED", stderr)
+        self.assertEqual(claim.read_text(), "durable owner\n")
+        self.assertFalse(receipt.exists())
+        self.assertTrue(available(lock))
+
+    def test_session_heartbeats_renew_only_liveness_and_release_remains_exact(self):
+        holder, lock, claim, receipt, release = self.session_fixture()
+        for _ in range(14):
+            holder.send("RCH_SOURCE_LOCK_HEARTBEAT\n")
+            time.sleep(0.1)
+            self.assertIsNone(holder.process.poll())
+            self.assertFalse(available(lock))
+            self.assertFalse(receipt.exists())
+        holder.send(release + "\n")
+        # EOF immediately following a complete release must not turn a valid
+        # retirement into an unacknowledged cancellation.
+        stdout, stderr = holder.finish()
+        self.assertEqual((holder.process.returncode, stdout, stderr),
+                         (0, (release + "\n").encode(), b""))
+        self.assertEqual(receipt.read_text(), release + "\n")
+        self.assertEqual(claim.read_text(), "durable owner\n")
+        self.assertTrue(available(lock))
+
+    def test_session_partial_heartbeat_never_renews_deadline(self):
+        holder, lock, claim, receipt, _ = self.session_fixture()
+        started = time.monotonic()
+        for fragment in ("RCH_", "SOURCE_", "LOCK_", "HEARTBEAT"):
+            holder.send(fragment)
+            time.sleep(0.2)
+        holder.process.wait(timeout=2)
+        _, stderr = holder.finish()
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual(holder.process.returncode, 73)
+        self.assertIn(b"RCH_SOURCE_LOCK_HEARTBEAT_EXPIRED", stderr)
+        self.assertTrue(claim.exists() and available(lock))
+        self.assertFalse(receipt.exists())
+
+    def test_session_invalid_and_oversized_frames_never_release_authority(self):
+        for index, frame in enumerate(("RCH_SOURCE_LOCK_HEARTBEAT:release\n", "x" * 4096,
+                                       "RCH_SOURCE_AUTHORITY_RELEASE:../wrong\n")):
+            holder, lock, claim, receipt, _ = self.session_fixture(str(index))
+            holder.send(frame)
+            holder.process.wait(timeout=3)
+            _, stderr = holder.finish()
+            self.assertEqual(holder.process.returncode, 73)
+            self.assertIn(b"RCH_SOURCE_LOCK_PROTOCOL_ERROR", stderr)
+            self.assertTrue(claim.exists() and available(lock))
+            self.assertFalse(receipt.exists())
+
+    def test_session_eof_without_release_retains_owner_and_reaps_locks(self):
+        holder, lock, claim, receipt, _ = self.session_fixture(idle=90)
+        _, stderr = holder.finish()
+        self.assertEqual(holder.process.returncode, 73)
+        self.assertIn(b"RCH_SOURCE_LOCK_DISCONNECTED", stderr)
+        self.assertTrue(claim.exists() and available(lock))
+        self.assertFalse(receipt.exists())
+
+    @unittest.skipUnless(GNU_CANCELLABLE, "GNU flock and Bash 4.1 required")
+    def test_session_expires_queued_metadata_publisher_without_late_work(self):
+        root, metadata = self.root / "root.lock", self.root / "metadata.lock"
+        published = self.root / "unexpected-publication"
+        fd = os.open(metadata, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            terminal = ("printf 'WAITING\\n'; exec flock -x -- {} sh -c {}"
+                        ).format(shlex.quote(str(metadata)), shlex.quote(
+                            "printf 'late publication\\n' > " + shlex.quote(str(published))))
+            holder = self.start([("x", root)], terminal=terminal, session_idle=1,
+                                env=self.environment(portable=False))
+            self.assertEqual(holder.line(), b"WAITING")
+            self.assertFalse(available(root))
+            holder.process.wait(timeout=4)
+            _, stderr = holder.finish()
+            self.assertEqual(holder.process.returncode, 73)
+            self.assertIn(b"RCH_SOURCE_LOCK_HEARTBEAT_EXPIRED", stderr)
+            self.assertTrue(available(root))
+            self.assertFalse(published.exists())
+            self.assertFalse(available(metadata), "session killed an unrelated lock holder")
+        finally:
+            os.close(fd)
+        time.sleep(0.1)
+        self.assertFalse(published.exists(), "expired queued publisher ran after contention cleared")
+
+    def test_session_reports_external_holder_signal_without_release(self):
+        lock = self.root / "killed.lock"
+        terminal = 'printf "%s\\n" "$1" "$$"; exec cat >/dev/null'
+        holder = self.start([("x", lock)], terminal=terminal, session_idle=90)
+        self.assertEqual(holder.line(), b"READY")
+        pid = int(holder.line())
+        os.kill(pid, signal.SIGKILL)  # Exact child published by this fixture.
+        holder.process.wait(timeout=3)
+        _, stderr = holder.finish()
+        self.assertEqual(holder.process.returncode, 137)
+        self.assertIn(b"RCH_SOURCE_LOCK_PROCESS_TERMINATED: signal=9", stderr)
+        self.assertTrue(available(lock))
+
+    def test_session_teardown_reaps_descendant_lock_holders_on_normal_exit(self):
+        lock = self.root / "descendant.lock"
+        terminal = ("python3 -I -S -c {} & printf '%s\\n' \"$1\"; "
+                    "IFS= read -r request; exit 0").format(shlex.quote(
+                        "import time; time.sleep(120)"))
+        holder = self.start([("x", lock)], terminal=terminal, session_idle=90)
+        self.assertEqual(holder.line(), b"READY")
+        holder.send("RCH_SOURCE_AUTHORITY_RELEASE:abc\n")
+        stdout, stderr = holder.finish()
+        self.assertEqual((holder.process.returncode, stdout, stderr), (0, b"", b""))
+        self.assertTrue(available(lock), "descendant retained source lock after settled exit")
+
+    def test_session_heartbeat_expiry_survives_blocked_stdout(self):
+        lock = self.root / "blocked-output.lock"
+        terminal = ("printf '%s\\n' \"$1\"; exec python3 -I -S -c {}"
+                    ).format(shlex.quote("import os; os.write(1, b\"x\" * (1024 * 1024))"))
+        holder = self.start([("x", lock)], terminal=terminal, session_idle=1)
+        self.assertEqual(holder.line(), b"READY")
+        # Do not drain stdout until the monitor has terminated; this used to
+        # leave pipe writers inheriting source-lock descriptors indefinitely.
+        holder.process.wait(timeout=4)
+        _, stderr = holder.finish()
+        self.assertEqual(holder.process.returncode, 73)
+        self.assertIn(b"RCH_SOURCE_LOCK_HEARTBEAT_EXPIRED", stderr)
+        self.assertTrue(available(lock))
+
+    def test_session_observer_death_cannot_bypass_expiry_group_teardown(self):
+        lock = self.root / "orphaned-observer.lock"
+        terminal = ("printf '%s\\n' \"$1\"; exec python3 -I -S -c {}"
+                    ).format(shlex.quote(
+                        "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                        "time.sleep(120)"))
+        holder = self.start([("x", lock)], terminal=terminal, session_idle=1)
+        self.assertEqual(holder.line(), b"READY")
+        self.assertFalse(available(lock))
+        # Kill only our observer, leaving stdin open and its private holder
+        # group alive. The monitor must still kill that group even though its
+        # teardown-receipt write now fails with EPIPE.
+        holder.process.kill()
+        holder.process.wait(timeout=2)
+        eventually(lambda: available(lock), "dead observer stranded the holder group")
+        _, stderr = holder.finish()
+        self.assertEqual(holder.process.returncode, -signal.SIGKILL)
+        self.assertIn(b"RCH_SOURCE_LOCK_HEARTBEAT_EXPIRED", stderr)
+
+    def test_session_monitor_death_is_reaped_only_after_its_group_is_killed(self):
+        lock = self.root / "killed-monitor.lock"
+        terminal = ("printf '%s\\n' \"$1\"; exec python3 -I -S -c {}"
+                    ).format(shlex.quote(
+                        "import os,signal,time; print(os.getppid(), flush=True); "
+                        "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(120)"))
+        holder = self.start([("x", lock)], terminal=terminal, session_idle=90)
+        self.assertEqual(holder.line(), b"READY")
+        monitor = int(holder.line())
+        self.assertNotEqual(monitor, holder.process.pid)
+        self.assertFalse(available(lock))
+        os.kill(monitor, signal.SIGKILL)  # Exact parent reported by our fixture child.
+        holder.process.wait(timeout=3)
+        _, stderr = holder.finish()
+        self.assertEqual(holder.process.returncode, 73)
+        self.assertIn(b"RCH_SOURCE_LOCK_SUPERVISOR_TERMINATED", stderr)
+        self.assertTrue(available(lock), "externally killed monitor left its child holding locks")
 
     def test_readiness_waits_for_the_complete_ordered_plan(self):
         first, last = self.root / "first", self.root / "last"

@@ -29,6 +29,153 @@ TIMEOUT = shutil.which("gnutimeout") or shutil.which("gtimeout") or shutil.which
 FLOCK = shutil.which("flock")
 
 
+def registry_lock_program():
+    compiled = os.environ.get("RCH_TEST_SOURCE_NAMESPACE_REGISTRY_LOCK")
+    if compiled:
+        return Path(compiled).read_text()
+    # The raw Rust string is the production program, not a test copy. The
+    # module's Rust test supplies its compiled bytes through the override.
+    source = (REPO / "rch/src/hook/source_namespace.rs").read_text()
+    marker = 'const REGISTRY_LOCK: &str = r#"'
+    if source.count(marker) != 1:
+        raise AssertionError("cannot locate exact production metadata-lock program")
+    _, _, after = source.partition(marker)
+    program, end, _ = after.partition('"#;')
+    if not end:
+        raise AssertionError("unterminated production metadata-lock program")
+    return program
+
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "requires Linux native flock/procfs")
+class SourceNamespaceRegistryLockTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="rch-namespace-metadata-test-"))
+        self.lock = self.root / "metadata.lock"
+        self.mutation = self.root / "admitted"
+        self.program = registry_lock_program()
+        self.children = []
+
+    def tearDown(self):
+        for child in reversed(self.children):
+            if child.poll() is None:
+                child.kill()  # Only this fixture's exact unreaped child.
+            child.communicate(timeout=5)
+
+    def start(self, command=None):
+        if command is None:
+            command = [sys.executable, "-I", "-S", "-c",
+                       "from pathlib import Path; Path({!r}).write_text('admitted'); "
+                       "print('ADMITTED', flush=True)".format(str(self.mutation))]
+        child = subprocess.Popen(
+            [sys.executable, "-I", "-S", "-c", self.program, str(self.lock), *command],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.children.append(child)
+        return child
+
+    def wait_until_old_inode_is_open(self, child, held):
+        expected = os.fstat(held.fileno())
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            self.assertIsNone(child.poll(), "metadata waiter exited before observing contention")
+            for descriptor in Path("/proc/{}/fd".format(child.pid)).iterdir():
+                try:
+                    current = descriptor.stat()
+                except FileNotFoundError:
+                    continue
+                if (current.st_dev, current.st_ino) == (expected.st_dev, expected.st_ino):
+                    return
+            time.sleep(0.01)
+        self.fail("metadata waiter never opened the held inode")
+
+    def test_busy_timeout_names_lock_and_elapsed_wait_without_admission(self):
+        self.lock.write_text("original metadata lock\n")
+        started = time.monotonic()
+        with self.lock.open("r+") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            child = self.start()
+            stdout, stderr = child.communicate(timeout=8)
+            self.assertEqual(child.returncode, 76, stderr)
+            self.assertEqual(stdout, b"")
+            self.assertIn(b"RCH_SOURCE_NAMESPACE_METADATA_LOCK_BUSY", stderr)
+            self.assertIn(("lock=" + str(self.lock)).encode(), stderr)
+            elapsed = int(stderr.split(b"elapsed_ms=", 1)[1].split()[0])
+            self.assertGreaterEqual(elapsed, 5000)
+            self.assertLess(time.monotonic() - started, 8)
+            self.assertFalse(self.mutation.exists())
+            self.assertEqual(self.lock.read_text(), "original metadata lock\n")
+        # No queued initializer may wake and mutate after the busy verdict.
+        self.assertFalse(self.mutation.exists())
+
+    def test_released_contention_admits_and_exec_keeps_the_metadata_lock(self):
+        self.lock.write_text("metadata\n")
+        workload = ("from pathlib import Path; import sys; "
+                    "Path({!r}).write_text('admitted'); print('ADMITTED', flush=True); "
+                    "sys.exit(0 if sys.stdin.readline() == 'done\\n' else 9)"
+                    ).format(str(self.mutation))
+        with self.lock.open("r+") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            child = self.start([sys.executable, "-I", "-S", "-c", workload])
+            self.wait_until_old_inode_is_open(child, held)
+            self.assertFalse(self.mutation.exists())
+            fcntl.flock(held, fcntl.LOCK_UN)
+            self.assertTrue(select.select([child.stdout], [], [], 3)[0], "no admission after unlock")
+            self.assertEqual(child.stdout.readline(), b"ADMITTED\n")
+            self.assertEqual(self.mutation.read_text(), "admitted")
+            # The descriptor must survive exec of the actual initializer.
+            with self.assertRaises(BlockingIOError):
+                fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            stdout, stderr = child.communicate(input=b"done\n", timeout=3)
+            self.assertEqual((child.returncode, stdout, stderr), (0, b"", b""))
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_replaced_waiter_inode_refuses_without_locking_or_mutating_new_name(self):
+        self.lock.write_text("old inode\n")
+        old = self.root / "old-metadata.lock"
+        with self.lock.open("r+") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            child = self.start()
+            self.wait_until_old_inode_is_open(child, held)
+            self.lock.rename(old)
+            self.lock.write_text("replacement inode\n")
+            stdout, stderr = child.communicate(timeout=3)
+            self.assertEqual((child.returncode, stdout), (73, b""))
+            self.assertIn(b"RCH_SOURCE_NAMESPACE_METADATA_LOCK_INVALID", stderr)
+            self.assertIn(b"changed", stderr)
+            self.assertFalse(self.mutation.exists())
+            self.assertEqual(old.read_text(), "old inode\n")
+            self.assertEqual(self.lock.read_text(), "replacement inode\n")
+            with self.lock.open("r+") as replacement:
+                fcntl.flock(replacement, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_symlink_fifo_directory_and_hardlinked_locks_fail_without_mutation(self):
+        for kind in ("symlink", "fifo", "directory", "hardlink"):
+            with self.subTest(kind=kind):
+                self.lock = self.root / (kind + ".lock")
+                backing = self.root / (kind + ".backing")
+                if kind in ("symlink", "hardlink"):
+                    backing.write_text("untouched backing\n")
+                    if kind == "symlink":
+                        self.lock.symlink_to(backing)
+                    else:
+                        os.link(backing, self.lock)
+                elif kind == "fifo":
+                    os.mkfifo(self.lock, 0o600)
+                else:
+                    self.lock.mkdir()
+                before = self.lock.lstat()
+                child = self.start()
+                stdout, stderr = child.communicate(timeout=3)
+                self.assertEqual((child.returncode, stdout), (73, b""))
+                self.assertIn(b"RCH_SOURCE_NAMESPACE_METADATA_LOCK_INVALID", stderr)
+                self.assertFalse(self.mutation.exists())
+                after = self.lock.lstat()
+                self.assertEqual((before.st_dev, before.st_ino, before.st_mode),
+                                 (after.st_dev, after.st_ino, after.st_mode))
+                if backing.exists():
+                    self.assertEqual(backing.read_text(), "untouched backing\n")
+
+
 @unittest.skipUnless(sys.platform.startswith("linux") and TIMEOUT and FLOCK,
                      "requires Linux, GNU timeout, and flock")
 class SourceNamespaceControlTests(unittest.TestCase):
@@ -151,6 +298,22 @@ class SourceNamespaceControlTests(unittest.TestCase):
         self.assertEqual(result.returncode, 75, result.stderr)
         self.assertEqual(result.stdout, b"")
         self.assertEqual(result.stderr, b"refusal")
+
+    def test_externally_killed_program_reports_signal_without_guessing_its_origin(self):
+        result = self.run_control("kill -KILL $$\n")
+        self.assertEqual(result.returncode, 137, result.stderr)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(b"RCH_SOURCE_NAMESPACE_PROCESS_TERMINATED status=137 signal=9 signal_origin=unknown", result.stderr)
+
+    def test_settlement_contract_requires_its_own_exact_marker(self):
+        for marker, success in (("RCH_SOURCE_CANCELLATION_SETTLED", True),
+                                ("RCH_TOPOLOGY_OK", False)):
+            result = subprocess.run([SHELL, "-c",
+                                     "set -- RCH_SOURCE_CANCELLATION_SETTLED\n" + self.script],
+                                    input=("printf '" + marker + "\\n'\n").encode(),
+                                    capture_output=True, env=self.env, timeout=5, check=False)
+            self.assertEqual(result.returncode == 0, success, result.stderr)
+            self.assertEqual(result.stdout, b"RCH_SOURCE_CANCELLATION_SETTLED\n" if success else b"")
 
     def test_malformed_success_is_not_repaired_into_readiness(self):
         for text in (b"", b"RCH_TOPOLOGY_OK", b"RCH_TOPOLOGY_OK\n\n",
