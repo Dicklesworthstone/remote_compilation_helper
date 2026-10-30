@@ -72,6 +72,8 @@ It runs the captured nightly Cargo and rustc through rabsd's operation-owned
 canonical compilation driver. The profile version is canonical-compile-local-v1; see
 docs/rabs-canonical-cargo.md for its explicit source, toolchain, state, operation
 and wrapper paths. With no Cargo arguments this mode selects ordinary `check`.
+An optional service_socket selects an already-running persistent canonical
+compilation service for concurrent commands sharing the same state root.
 Package, workspace, feature, target-kind/named-target, built-in compilation target
 and compilation profile selection are accepted with `check`, `build`, `clippy`, `test` or `bench`. These
 command arguments replace the profile's command and selection, including an
@@ -1833,7 +1835,7 @@ def canonical_local_profile(path):
     """Validate retained intent before writing; the native driver checks it again."""
     profile = canonical_profile_object(path)
     required = {"version", "source_root", "toolchain_root", "state_root", "operation_root", "wrapper"}
-    optional = {"manifest", "vendor", "cargo_home_source", "jobs", "timeout_seconds", "command", "selection", "target_cache"}
+    optional = {"manifest", "vendor", "cargo_home_source", "jobs", "timeout_seconds", "command", "selection", "target_cache", "service_socket"}
     if (not required <= profile.keys() or profile.keys() - required - optional
             or profile["version"] != "canonical-compile-local-v1"):
         raise SetupError("invalid canonical-compile-local-v1 profile fields")
@@ -1883,6 +1885,13 @@ def canonical_local_profile(path):
             metadata = root.lstat()
             if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
                 raise SetupError("local canonical state and operation roots must be private to this user")
+    if "service_socket" in profile:
+        endpoint = canonical_daemon_endpoint(profile["service_socket"])
+        for field in ("source_root", "toolchain_root", "operation_root", "cargo_home_source"):
+            if profile.get(field) is not None:
+                root = Path(profile[field])
+                if endpoint == root or root in endpoint.parents:
+                    raise SetupError("canonical compilation service socket must be outside captured inputs and operation roots")
     wrapper = Path(canonical_path(profile["wrapper"], absolute=True))
     for parent in reversed(tuple(wrapper.parents)):
         if not stat.S_ISDIR(parent.lstat().st_mode):
@@ -1928,7 +1937,17 @@ def canonical_local_profile(path):
                         raise SetupError("local canonical " + field + " requires command " + " or ".join(commands))
                     original_args.extend(["--"] + selection[field])
         canonical_local_selection(original_args)
+    canonical_local_service_command(profile)
     return profile
+
+
+def canonical_local_service_command(profile):
+    """The shared service has closed stdin; no client descriptor is forwarded."""
+    command = profile.get("command", "check")
+    selection = profile.get("selection") or {}
+    if "service_socket" in profile and (command == "run" or (
+            command == "bench" and not selection.get("no_run", False))):
+        raise SetupError("canonical compilation service requires closed stdin; run and executing bench commands use a direct profile")
 
 
 def canonical_local_invocation(profile_path, args, env):
@@ -1948,6 +1967,7 @@ def canonical_local_invocation(profile_path, args, env):
     # empty selection is written, preserving Cargo's ordinary default targets.
     profile["command"] = args[0] if args else "check"
     profile["selection"] = selection
+    canonical_local_service_command(profile)
     if profile["command"] == "clippy":
         binaries = Path(profile["toolchain_root"]) / "bin"
         if not stat.S_ISDIR(binaries.lstat().st_mode):

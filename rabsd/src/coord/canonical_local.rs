@@ -14,19 +14,25 @@
 //! unsupported rustc invocations compile normally in the namespace. Workspace
 //! results never gain action-cache publication or replay authority.
 
+pub mod service;
 mod target_state;
 
 use super::live::{CoordLive, cluster_id};
 use super::live_dependency::LiveDependencyLane;
 use super::live_dependency::canonical::CanonicalPaths;
+use super::live_dependency::remote::RemoteDependencies;
 use crate::edge::live_facts::{FileSig, read_stable};
-use crate::edge::server::{CanonicalActivity, EdgeServerConfig, canonical_edge_work};
+use crate::edge::server::{
+    CanonicalActivity, EdgeServerConfig, canonical_edge_work, canonical_edge_work_shared,
+};
 use asupersync::signal::ShutdownController;
 use rabs_asupersync::daemon_runtime::{
     DaemonError, DaemonRunOptions, ShutdownReceipt, SubsystemWork, run_daemon_controlled,
 };
+use rabs_asupersync::obligations::ObligationSet;
 use rabs_asupersync::process_groups::ManagedProcessGroup;
 use rabs_asupersync::region_tree::Attribution;
+use rabs_asupersync::root_permits::{RootPermit, RootPermitBroker};
 use rabs_asupersync::stream_drain::{DrainLimits, DrainedOutput};
 use rabs_protocol::release_authorization::ReleaseAuthorizationMode;
 use rabs_sandbox::canonical_mounts::{CanonicalMountPlan, UnitMount};
@@ -47,8 +53,8 @@ use std::io::{self, IsTerminal, Write};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use target_state::{TargetCacheConfig, TargetState};
@@ -76,6 +82,9 @@ struct Profile {
     state_root: PathBuf,
     operation_root: PathBuf,
     wrapper: PathBuf,
+    /// A persistent coordinator can own several independent canonical builds.
+    /// This socket stays outside the compiler namespace.
+    service_socket: Option<PathBuf>,
     #[serde(default)]
     command: CompilationCommand,
     #[serde(default = "default_manifest")]
@@ -170,7 +179,8 @@ fn overlap(first: &Path, second: &Path) -> bool {
 /// second invocation cannot advance the first invocation's coordinator term.
 struct StateOwner {
     root: PathBuf,
-    _lock: File,
+    root_identity: (u64, u64),
+    lock: File,
 }
 impl StateOwner {
     fn acquire(parent: &Path) -> io::Result<Self> {
@@ -204,7 +214,353 @@ impl StateOwner {
                 format!("canonical state is busy or cannot be locked: {error}"),
             )
         })?;
-        Ok(Self { root, _lock: file })
+        let root_metadata = fs::symlink_metadata(&root)?;
+        Ok(Self {
+            root,
+            root_identity: (root_metadata.dev(), root_metadata.ino()),
+            lock: file,
+        })
+    }
+
+    fn verify(&self) -> io::Result<()> {
+        private_directory(&self.root)?;
+        let root = fs::symlink_metadata(&self.root)?;
+        let named_lock = fs::symlink_metadata(self.root.join("owner.lock"))?;
+        require(
+            (root.dev(), root.ino()) == self.root_identity
+                && named_lock.is_file()
+                && named_lock.uid() == rustix::process::geteuid().as_raw()
+                && named_lock.mode() & 0o077 == 0
+                && FileSig::of(&named_lock) == FileSig::of(&self.lock.metadata()?),
+            "canonical state owner generation changed",
+        )
+    }
+}
+
+/// One persistent authority for all builds admitted by a canonical service.
+/// Operation edges share this coordinator and worker pool, while their paths,
+/// cancellation, output files and completion barriers remain independent.
+pub(super) struct SharedRuntime {
+    state: StateOwner,
+    parent: PathBuf,
+    coord: Arc<CoordLive>,
+    lane: LiveDependencyLane,
+    remote: Option<Arc<RemoteDependencies>>,
+    roots: Arc<RootPermitBroker>,
+    jobs_per_root: u32,
+    target_cache_lock: Arc<Mutex<()>>,
+    build_identity: String,
+    release_mode: ReleaseAuthorizationMode,
+    stopped: Arc<AtomicBool>,
+    server: Mutex<Option<ServerOwner>>,
+}
+
+impl SharedRuntime {
+    pub(super) fn start(
+        state_root: &Path,
+        release_mode: ReleaseAuthorizationMode,
+        build_identity: String,
+        max_roots: usize,
+        jobs_per_root: u32,
+    ) -> io::Result<Arc<Self>> {
+        Self::start_with_remote(
+            state_root,
+            release_mode,
+            build_identity,
+            max_roots,
+            jobs_per_root,
+            RemoteDependencies::from_canonical_environment,
+        )
+    }
+
+    fn start_with_remote(
+        state_root: &Path,
+        release_mode: ReleaseAuthorizationMode,
+        build_identity: String,
+        max_roots: usize,
+        jobs_per_root: u32,
+        remote: impl FnOnce(&Path) -> io::Result<Option<Arc<RemoteDependencies>>>,
+    ) -> io::Result<Arc<Self>> {
+        require(
+            (1..=4096).contains(&max_roots) && (1..=4096).contains(&jobs_per_root),
+            "canonical service root and per-root job limits must be between 1 and 4096",
+        )?;
+        private_directory(state_root)?;
+        let state = StateOwner::acquire(state_root)?;
+        let cas = Arc::new(
+            crate::janitor::store::mount_and_reconcile(&state.root.join("cas"))
+                .map_err(io::Error::other)?,
+        );
+        let coord = Arc::new(
+            CoordLive::with_cas(cas)
+                .with_release_authorization(build_identity.clone(), release_mode),
+        );
+        let remote = remote(&state.root.join("shadow"))?;
+        let stopped = Arc::new(AtomicBool::new(false));
+        let controller = Arc::new(ShutdownController::new());
+        let options = DaemonRunOptions {
+            coord_work: Some(stop_on_exit(
+                coordinator_work(Arc::clone(&coord)),
+                Arc::clone(&stopped),
+                Arc::clone(&controller),
+            )),
+            ..DaemonRunOptions::default()
+        };
+        let worker_controller = Arc::clone(&controller);
+        let worker = std::thread::Builder::new()
+            .name("rabs-canonical-service-coord".into())
+            .spawn(move || run_daemon_controlled(options, worker_controller))?;
+        let server = ServerOwner {
+            controller,
+            worker: Some(worker),
+            normal_shutdown: None,
+        };
+        let started = Instant::now();
+        loop {
+            if stopped.load(Ordering::Acquire)
+                || server
+                    .worker
+                    .as_ref()
+                    .is_none_or(|worker| worker.is_finished())
+            {
+                return Err(io::Error::other(
+                    "canonical service coordinator stopped during startup",
+                ));
+            }
+            if coord.available() && coord.authority().is_some() {
+                break;
+            }
+            if started.elapsed() >= Duration::from_secs(30) {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "canonical service coordinator startup timed out",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Ok(Arc::new(Self {
+            state,
+            parent: state_root.to_path_buf(),
+            lane: LiveDependencyLane::new(Arc::clone(&coord)),
+            coord,
+            remote,
+            roots: RootPermitBroker::new(max_roots),
+            jobs_per_root,
+            target_cache_lock: Arc::new(Mutex::new(())),
+            build_identity,
+            release_mode,
+            stopped,
+            server: Mutex::new(Some(server)),
+        }))
+    }
+
+    pub(super) fn healthy(&self) -> bool {
+        !self.stopped.load(Ordering::Acquire)
+            && self.state.verify().is_ok()
+            && self.coord.available()
+            && self.coord.authority().is_some()
+            && self.server.lock().is_ok_and(|server| {
+                server.as_ref().is_some_and(|owner| {
+                    owner
+                        .worker
+                        .as_ref()
+                        .is_some_and(|worker| !worker.is_finished())
+                })
+            })
+    }
+
+    /// The service first seals admission, cancels/joins operations and only
+    /// then releases this authority. Dropping the last Arc is the RAII backstop.
+    pub(super) fn shutdown(&self) -> io::Result<()> {
+        require(
+            self.roots.active() == 0,
+            "canonical service still owns active Cargo roots",
+        )?;
+        self.stopped.store(true, Ordering::Release);
+        let server = self
+            .server
+            .lock()
+            .map_err(|_| io::Error::other("canonical service owner lock poisoned"))?
+            .take();
+        if let Some(server) = server {
+            require(
+                server.finish()?.clean(),
+                "canonical service coordinator did not drain cleanly",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn acquire_root(&self, stopped: &AtomicBool, budget: Duration) -> io::Result<RootAdmission> {
+        let deadline = Instant::now()
+            .checked_add(budget)
+            .ok_or_else(|| invalid("canonical root admission deadline overflow"))?;
+        let mut obligations = ObligationSet::default();
+        loop {
+            if stopped.load(Ordering::Acquire) || !self.healthy() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "canonical Cargo root admission cancelled",
+                ));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "canonical Cargo root admission timed out",
+                ));
+            }
+            if let Ok(permit) = self
+                .roots
+                .acquire_timeout(&mut obligations, remaining.min(Duration::from_millis(50)))
+            {
+                let admitted = RootAdmission {
+                    permit: Some(permit),
+                    obligations,
+                };
+                if stopped.load(Ordering::Acquire) || !self.healthy() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "canonical Cargo root admission cancelled",
+                    ));
+                }
+                return Ok(admitted);
+            }
+        }
+    }
+}
+
+impl Drop for SharedRuntime {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Release);
+        // Explicit join precedes field destruction, particularly StateOwner's
+        // process lock. The last Arc cannot disappear while an operation runs.
+        let server = match self.server.get_mut() {
+            Ok(server) => server.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if let Some(server) = server {
+            let _ = server.finish();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RootAdmission {
+    permit: Option<RootPermit>,
+    obligations: ObligationSet,
+}
+
+impl Drop for RootAdmission {
+    fn drop(&mut self) {
+        if let Some(permit) = self.permit.take() {
+            let result = permit.release_into(&mut self.obligations);
+            debug_assert!(
+                result.is_ok(),
+                "owned Cargo root obligation must resolve once"
+            );
+        }
+    }
+}
+
+/// Compiler output and driver events belong to one caller. The service path
+/// never inherits the daemon's stdio, and its files have one aggregate bound.
+enum OperationOutput {
+    Inherit,
+    Captured {
+        stdout: File,
+        stderr: File,
+        maximum: u64,
+        used: u64,
+        cargo_maximum: u64,
+    },
+}
+
+impl OperationOutput {
+    fn captured(stdout: File, stderr: File, maximum: u64) -> io::Result<Self> {
+        let first = stdout.metadata()?;
+        let second = stderr.metadata()?;
+        require(
+            maximum > 0
+                && [&first, &second].iter().all(|metadata| {
+                    metadata.is_file()
+                        && metadata.uid() == rustix::process::geteuid().as_raw()
+                        && metadata.mode() & 0o077 == 0
+                        && metadata.nlink() == 1
+                        && metadata.len() == 0
+                })
+                && (first.dev(), first.ino()) != (second.dev(), second.ino()),
+            "canonical operation output needs separate empty private ordinary files and a byte bound",
+        )?;
+        let total = maximum
+            .checked_add(MAX_GRAPH_BYTES)
+            .and_then(|value| value.checked_add(64 * 1024))
+            .ok_or_else(|| invalid("canonical output budget overflow"))?;
+        Ok(Self::Captured {
+            stdout,
+            stderr,
+            maximum: total,
+            used: 0,
+            cargo_maximum: maximum,
+        })
+    }
+
+    fn reserve(&mut self, bytes: u64) -> io::Result<()> {
+        if let Self::Captured { maximum, used, .. } = self {
+            let next = used
+                .checked_add(bytes)
+                .filter(|next| *next <= *maximum)
+                .ok_or_else(|| {
+                    io::Error::other("canonical operation output exceeded its byte bound")
+                })?;
+            *used = next;
+        }
+        Ok(())
+    }
+
+    fn line(&mut self, line: &str) -> io::Result<()> {
+        self.reserve((line.len() as u64).saturating_add(1))?;
+        match self {
+            Self::Inherit => writeln!(io::stderr().lock(), "{line}"),
+            Self::Captured { stderr, .. } => writeln!(stderr, "{line}"),
+        }
+    }
+
+    fn event(&mut self, value: Value) -> io::Result<()> {
+        self.line(&value.to_string())
+    }
+
+    fn warning(&mut self, stage: &str, error: &io::Error) -> io::Result<()> {
+        self.event(json!({"kind":"canonical-target-state-unavailable",
+            "stage":stage, "reason":error.to_string(), "action_cache_authority":false}))
+    }
+
+    fn replay(&mut self, output: &DrainedOutput) -> io::Result<()> {
+        let bytes = output
+            .stdout
+            .total_bytes()
+            .checked_add(output.stderr.total_bytes())
+            .ok_or_else(|| invalid("canonical diagnostic length overflow"))?;
+        self.reserve(bytes)?;
+        match self {
+            Self::Inherit => replay(output),
+            Self::Captured { stdout, stderr, .. } => {
+                io::copy(&mut output.stdout.reader()?, stdout)?;
+                io::copy(&mut output.stderr.reader()?, stderr)?;
+                stdout.flush()?;
+                stderr.flush()
+            }
+        }
+    }
+
+    fn cargo_output(&self, directory: PathBuf, inherit_stdin: bool) -> CargoOutput {
+        match self {
+            Self::Inherit => CargoOutput::Inherit { inherit_stdin },
+            Self::Captured { cargo_maximum, .. } => CargoOutput::Capture {
+                directory,
+                maximum: *cargo_maximum,
+            },
+        }
     }
 }
 
@@ -267,6 +623,19 @@ impl Profile {
                     "profile input and state roots must not overlap",
                 )?;
             }
+        }
+        if let Some(socket) = &self.service_socket {
+            require(
+                plain_absolute(socket)
+                    && !socket.starts_with(&self.source_root)
+                    && !socket.starts_with(&self.toolchain_root)
+                    && !socket.starts_with(&self.operation_root)
+                    && self
+                        .cargo_home_source
+                        .as_ref()
+                        .is_none_or(|root| !socket.starts_with(root)),
+                "service_socket must be an ordinary absolute path outside captured inputs and operation roots",
+            )?;
         }
         require(
             plain_absolute(&self.wrapper),
@@ -527,8 +896,91 @@ pub fn run_profile_with_release(
     // Refuse unsupported terminal input before validating source roots,
     // acquiring state, probing namespaces, or capturing any source bytes.
     profile.validate_stdin(std::io::stdin().is_terminal())?;
+    if profile.service_socket.is_some() && profile.inherits_stdin() {
+        return Err(invalid(
+            "canonical service does not accept commands with inherited stdin",
+        ));
+    }
     profile.validate()?;
-    let state = StateOwner::acquire(&profile.state_root)?;
+    if profile.service_socket.is_some() {
+        return service::run_client_profile(path, release_mode, build_identity);
+    }
+    run_operation(
+        profile,
+        release_mode,
+        build_identity,
+        None,
+        Arc::new(AtomicBool::new(false)),
+        OperationOutput::Inherit,
+    )
+}
+
+pub(super) fn run_shared_profile(
+    bytes: &[u8],
+    runtime: Arc<SharedRuntime>,
+    stopped: Arc<AtomicBool>,
+    stdout: File,
+    stderr: File,
+    maximum: u64,
+) -> io::Result<i32> {
+    require(
+        bytes.len() <= 64 * 1024,
+        "canonical profile exceeds its byte bound",
+    )?;
+    let profile: Profile =
+        serde_json::from_slice(bytes).map_err(|error| invalid(error.to_string()))?;
+    require(
+        !profile.inherits_stdin(),
+        "canonical service does not accept commands with inherited stdin",
+    )?;
+    require(
+        profile.service_socket.is_some()
+            && profile.state_root == runtime.parent
+            && profile.jobs <= runtime.jobs_per_root,
+        "canonical profile must name this service state and stay within its per-root job grant",
+    )?;
+    profile.validate()?;
+    require(
+        runtime.healthy(),
+        "canonical service coordinator is unavailable",
+    )?;
+    let output = OperationOutput::captured(stdout, stderr, maximum)?;
+    run_operation(
+        profile,
+        runtime.release_mode,
+        runtime.build_identity.clone(),
+        Some(runtime),
+        stopped,
+        output,
+    )
+}
+
+fn run_operation(
+    profile: Profile,
+    release_mode: ReleaseAuthorizationMode,
+    build_identity: String,
+    shared: Option<Arc<SharedRuntime>>,
+    stopped: Arc<AtomicBool>,
+    mut output: OperationOutput,
+) -> io::Result<i32> {
+    let standalone_state = shared
+        .is_none()
+        .then(|| StateOwner::acquire(&profile.state_root))
+        .transpose()?;
+    let state_root = match &shared {
+        Some(runtime) => runtime.state.root.clone(),
+        None => standalone_state
+            .as_ref()
+            .expect("standalone state owner")
+            .root
+            .clone(),
+    };
+    if stopped.load(Ordering::Acquire) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "canonical operation cancelled before capture",
+        ));
+    }
     let support = HostIsolationSupport::probe();
     require(
         support.missing_for_canonical().is_empty(),
@@ -605,7 +1057,7 @@ pub fn run_profile_with_release(
                 // A failed optional copy is never mounted. Verify the original
                 // exact inputs again, then execute cold without retiming them.
                 SourceTimestamps::capture(&captured_workspace, workspace_manifest, &|| false)?;
-                target_state_warning("workspace-copy", &error);
+                output.warning("workspace-copy", &error)?;
                 target_reuse_enabled = false;
                 captured_workspace
             }
@@ -671,7 +1123,6 @@ pub fn run_profile_with_release(
             )?;
         }
     }
-    let stopped = Arc::new(AtomicBool::new(false));
     let timeout = Duration::from_secs(profile.timeout_seconds);
     let compilation_args = profile.compilation_args()?;
     // Ask the captured Cargo for the exact units this command would compile.
@@ -692,7 +1143,7 @@ pub fn run_profile_with_release(
         None
     };
     let graph_args = profile.graph_args(run_selection.as_ref())?;
-    let planned = execute(
+    let planned = execute_controlled(
         &spec,
         &support,
         profile.program(),
@@ -703,9 +1154,11 @@ pub fn run_profile_with_release(
         },
         timeout,
         &stopped,
+        shared.as_deref(),
+        &mut output,
     )?;
     if !planned.status.success() {
-        replay(&planned)?;
+        output.replay(&planned)?;
         return Err(invalid(
             "captured Cargo unit planning failed (nightly Cargo with --unit-graph is required); no rustc cache endpoint was started",
         ));
@@ -757,7 +1210,16 @@ pub fn run_profile_with_release(
     };
     let mut target_state = None;
     if target_reuse_enabled && let Some(config) = &profile.target_cache {
-        let prepare = || -> io::Result<(TargetState, Option<PathBuf>)> {
+        let mut prepare = || -> io::Result<(TargetState, Option<PathBuf>)> {
+            let _cache_guard = shared
+                .as_ref()
+                .map(|runtime| {
+                    runtime
+                        .target_cache_lock
+                        .lock()
+                        .map_err(|_| io::Error::other("canonical target cache lock poisoned"))
+                })
+                .transpose()?;
             let (_, wrapper) = read_stable(&control.join("rabs-wrap"), 128 * 1024 * 1024)?;
             let key = TargetReuseContext {
                 request: &request,
@@ -774,7 +1236,7 @@ pub fn run_profile_with_release(
             }
             .key(config)?;
             let mut cache =
-                TargetState::open(&state.root, config, key, &workspace, workspace_manifest)?;
+                TargetState::open(&state_root, config, key, &workspace, workspace_manifest)?;
             let candidate = owner.path().join("restored-target");
             let restored = match create_private(&candidate).and_then(|()| cache.restore(&candidate))
             {
@@ -783,7 +1245,7 @@ pub fn run_profile_with_release(
                     // A failed optional restore still permits a successful
                     // cold Cargo execution to replace the seed in this run.
                     // The failed candidate never enters the namespace.
-                    target_state_warning("restore", &error);
+                    output.warning("restore", &error)?;
                     None
                 }
             };
@@ -803,7 +1265,7 @@ pub fn run_profile_with_release(
                     private_target_state = "restored";
                 }
             }
-            Err(error) => target_state_warning("restore", &error),
+            Err(error) => output.warning("restore", &error)?,
         }
     }
     // A failed restore remains in unmounted private staging. The live endpoint
@@ -836,34 +1298,75 @@ pub fn run_profile_with_release(
         socket.as_os_str().as_encoded_bytes().len() < 108,
         "operation_root is too long for the owned Unix socket (choose a shorter path)",
     )?;
-    let mounted = Arc::new(
-        crate::janitor::store::mount_and_reconcile(&state.root.join("cas"))
-            .map_err(io::Error::other)?,
-    );
-    let coord = Arc::new(
-        CoordLive::with_cas(mounted).with_release_authorization(build_identity, release_mode),
-    );
+    let coord = match &shared {
+        Some(runtime) => {
+            require(
+                runtime.healthy(),
+                "canonical service coordinator stopped during preparation",
+            )?;
+            Arc::clone(&runtime.coord)
+        }
+        None => {
+            let mounted = Arc::new(
+                crate::janitor::store::mount_and_reconcile(&state_root.join("cas"))
+                    .map_err(io::Error::other)?,
+            );
+            Arc::new(
+                CoordLive::with_cas(mounted)
+                    .with_release_authorization(build_identity, release_mode),
+            )
+        }
+    };
     let controller = Arc::new(ShutdownController::new());
-    controller.listen_for_signals();
+    if shared.is_none() {
+        controller.listen_for_signals();
+    }
     let activity = CanonicalActivity::new();
-    let edge = canonical_edge_work(
-        EdgeServerConfig {
-            socket_path: socket.clone(),
-            state_dir: state.root.join("shadow"),
-            coord: coord.edge_subscriber(),
-            prepared_operations: None,
-            live_dependency: Some(LiveDependencyLane::new(coord.clone())),
+    let config = EdgeServerConfig {
+        socket_path: socket.clone(),
+        state_dir: if shared.is_some() {
+            owner.path().join("shadow")
+        } else {
+            state_root.join("shadow")
         },
-        Arc::clone(&paths),
-        Arc::clone(&activity),
-    );
-    let options = DaemonRunOptions {
-        edge_work: Some(stop_on_exit(edge, stopped.clone(), controller.clone())),
-        coord_work: Some(stop_on_exit(
-            coordinator_work(coord.clone()),
-            stopped.clone(),
-            controller.clone(),
+        coord: coord.edge_subscriber(),
+        prepared_operations: None,
+        live_dependency: Some(shared.as_ref().map_or_else(
+            || LiveDependencyLane::new(Arc::clone(&coord)),
+            |runtime| runtime.lane.clone(),
         )),
+    };
+    let edge = match &shared {
+        Some(runtime) => canonical_edge_work_shared(
+            config,
+            Arc::clone(&paths),
+            Arc::clone(&activity),
+            runtime.remote.clone(),
+        ),
+        None => canonical_edge_work(config, Arc::clone(&paths), Arc::clone(&activity)),
+    };
+    // The service's cancel flag also governs response delivery. Finishing a
+    // successfully drained scoped edge must not cancel that caller, while an
+    // edge that exits before the owner requests shutdown must stop its Cargo.
+    let normal_shutdown = shared.as_ref().map(|_| Arc::new(AtomicBool::new(false)));
+    let edge = match &normal_shutdown {
+        Some(expected) => stop_on_unexpected_exit(
+            edge,
+            Arc::clone(&stopped),
+            Arc::clone(&controller),
+            Arc::clone(expected),
+        ),
+        None => stop_on_exit(edge, Arc::clone(&stopped), Arc::clone(&controller)),
+    };
+    let options = DaemonRunOptions {
+        edge_work: Some(edge),
+        coord_work: shared.is_none().then(|| {
+            stop_on_exit(
+                coordinator_work(coord.clone()),
+                stopped.clone(),
+                controller.clone(),
+            )
+        }),
         ..DaemonRunOptions::default()
     };
     let worker_controller = controller.clone();
@@ -873,10 +1376,10 @@ pub fn run_profile_with_release(
     let server = ServerOwner {
         controller,
         worker: Some(worker),
+        normal_shutdown,
     };
     wait_ready(&server, &socket, &coord, &stopped)?;
-    eprintln!(
-        "{}",
+    output.event(
         json!({"kind":"canonical-compilation-started", "version":PROFILE_VERSION,
         "command":profile.command.as_str(), "namespace":"canonical",
         "cache_scope":"external-dependency-metadata-and-worker-rlib",
@@ -890,53 +1393,85 @@ pub fn run_profile_with_release(
         "lint_result_cache":false,
         "workspace_cache":false, "source_sha256":request["source_manifest"]["manifest_sha256"],
         "selected_units":graph.units, "selected_packages":graph.packages,
-        "selected_roots":graph.roots})
+        "selected_roots":graph.roots, "shared_coordinator":shared.is_some()}),
+    )?;
+    let cargo_output = output.cargo_output(
+        owner.path().join("compilation-drain"),
+        profile.inherits_stdin(),
     );
-    let result = execute(
+    let result = execute_controlled(
         &spec,
         &support,
         profile.program(),
         &compilation_args,
-        CargoOutput::Inherit {
-            inherit_stdin: profile.inherits_stdin(),
-        },
+        cargo_output,
         timeout,
         &stopped,
+        shared.as_deref(),
+        &mut output,
     );
     // A successful wrapper exits after capture ACK; publication can still be
     // queued on that same session. Seal admission only after Cargo's process
     // group is gone, then keep coordinator authority alive through the last
     // session/publication before requesting subsystem shutdown.
     let publication_drain = if result.is_ok() {
-        activity.seal_and_wait(Duration::from_secs(60), || stopped.load(Ordering::Acquire))
+        activity.seal_and_wait(Duration::from_secs(60), || {
+            stopped.load(Ordering::Acquire)
+                || shared.as_ref().is_some_and(|runtime| !runtime.healthy())
+        })
     } else {
         Ok(())
     };
     let shutdown = server.finish();
-    let output = result?;
+    let compiled = result?;
     publication_drain.map_err(io::Error::other)?;
     let receipt = shutdown?;
     require(
         receipt.clean(),
         "canonical coordinator did not drain cleanly",
     )?;
-    eprintln!("{}", receipt.to_json_line());
-    if (output.status.success()
+    output.replay(&compiled)?;
+    output.line(&receipt.to_json_line())?;
+    if (compiled.status.success()
         || (matches!(
             profile.command,
             CompilationCommand::Test | CompilationCommand::Run | CompilationCommand::Bench
-        ) && output.status.code().is_some()))
+        ) && compiled.status.code().is_some()))
         && let Some(cache) = &target_state
     {
         // Retain state only after compiler, session, publication and coordinator
         // drain. Delivered files remain independent of this saved generation.
         // A normal program/harness failure can retain compiled artifacts too.
         // Cargo and the requested bodies execute again; no outcome is saved.
-        if let Err(error) = cache.capture(&target_root) {
-            target_state_warning("capture", &error);
+        let capture = || -> io::Result<()> {
+            let _cache_guard = shared
+                .as_ref()
+                .map(|runtime| {
+                    runtime
+                        .target_cache_lock
+                        .lock()
+                        .map_err(|_| io::Error::other("canonical target cache lock poisoned"))
+                })
+                .transpose()?;
+            cache.capture(&target_root)
+        };
+        if let Err(error) = capture() {
+            output.warning("capture", &error)?;
         }
     }
-    if output.status.success() && (profile.command == CompilationCommand::Build || profile.no_run())
+    // Optional target capture can outlive the client connection. Preserve its
+    // valid cache generation, but do not retain a deliverable whose owner is
+    // already known to have cancelled or lost coordinator authority.
+    if let Some(runtime) = &shared
+        && (stopped.load(Ordering::Acquire) || !runtime.healthy())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "canonical operation cancelled before output delivery",
+        ));
+    }
+    if compiled.status.success()
+        && (profile.command == CompilationCommand::Build || profile.no_run())
     {
         // No Cargo process, wrapper session or materializer remains. Verify
         // the retained target mapping once more before moving its completed
@@ -950,18 +1485,17 @@ pub fn run_profile_with_release(
             "completed target differs from its retained canonical mount",
         )?;
         let delivered = retain_build_target(&profile.operation_root, &target_root)?;
-        eprintln!(
-            "{}",
+        output.event(
             json!({"kind":"canonical-build-completed", "version":PROFILE_VERSION,
                 "command":profile.command.as_str(), "tests_executed":false,
-                "canonical_target":TARGET, "target_directory":delivered})
-        );
+                "canonical_target":TARGET, "target_directory":delivered}),
+        )?;
     }
     use std::os::unix::process::ExitStatusExt;
-    Ok(output
+    Ok(compiled
         .status
         .code()
-        .unwrap_or_else(|| 128 + output.status.signal().unwrap_or(1)))
+        .unwrap_or_else(|| 128 + compiled.status.signal().unwrap_or(1)))
 }
 
 /// Only private Cargo freshness uses this compatibility family. Every command
@@ -1055,14 +1589,6 @@ impl TargetReuseContext<'_> {
     }
 }
 
-fn target_state_warning(stage: &str, error: &io::Error) {
-    eprintln!(
-        "{}",
-        json!({"kind":"canonical-target-state-unavailable",
-        "stage":stage, "reason":error.to_string(), "action_cache_authority":false})
-    );
-}
-
 /// Move, rather than recopy, a fully drained target to a newly allocated private
 /// owner on the same filesystem. There is no caller-selected overwrite target
 /// and no retained copy of source or toolchain inputs. Successful builds and
@@ -1129,6 +1655,31 @@ fn execute(
     timeout: Duration,
     stopped: &AtomicBool,
 ) -> io::Result<DrainedOutput> {
+    execute_controlled(
+        spec,
+        support,
+        program,
+        args,
+        output,
+        timeout,
+        stopped,
+        None,
+        &mut OperationOutput::Inherit,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_controlled(
+    spec: &CanonicalNamespaceSpec,
+    support: &HostIsolationSupport,
+    program: &str,
+    args: &[String],
+    output: CargoOutput,
+    timeout: Duration,
+    stopped: &AtomicBool,
+    shared: Option<&SharedRuntime>,
+    destination: &mut OperationOutput,
+) -> io::Result<DrainedOutput> {
     let launch = build_canonical_argv(spec, support, program, args)
         .map_err(|error| invalid(error.to_string()))?;
     let mut command = command_for(&launch);
@@ -1164,19 +1715,33 @@ fn execute(
             )
         }
     };
+    // Capture and transfer have finished before this scarce root permit is
+    // acquired. Cargo creates its own valid jobserver from the admitted --jobs
+    // value; this broker separately accounts for its implicit root token.
+    let _root = shared
+        .map(|runtime| runtime.acquire_root(stopped, timeout))
+        .transpose()?;
+    if stopped.load(Ordering::Acquire) || shared.is_some_and(|runtime| !runtime.healthy()) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "canonical Cargo cancelled before spawn",
+        ));
+    }
     let process = ManagedProcessGroup::spawn_command(command, Attribution::default())?;
     let start = Instant::now();
     let mut cancelled = false;
     let mut timed_out = false;
     let output = process.wait_with_bounded_drain_budget(&limits, maximum, || {
-        cancelled |= stopped.load(Ordering::Acquire);
+        cancelled |=
+            stopped.load(Ordering::Acquire) || shared.is_some_and(|runtime| !runtime.healthy());
         timed_out |= start.elapsed() >= timeout;
         cancelled || timed_out
     })?;
-    cancelled |= stopped.load(Ordering::Acquire);
+    cancelled |=
+        stopped.load(Ordering::Acquire) || shared.is_some_and(|runtime| !runtime.healthy());
     timed_out |= start.elapsed() >= timeout;
     if cancelled || timed_out {
-        replay(&output)?;
+        destination.replay(&output)?;
         return Err(io::Error::new(
             if timed_out {
                 io::ErrorKind::TimedOut
@@ -1234,13 +1799,56 @@ fn stop_on_exit(
     })
 }
 
+fn stop_on_unexpected_exit(
+    work: SubsystemWork,
+    stopped: Arc<AtomicBool>,
+    controller: Arc<ShutdownController>,
+    normal_shutdown: Arc<AtomicBool>,
+) -> SubsystemWork {
+    Box::new(move |cx, shutdown| {
+        Box::pin(async move {
+            // Dropping or unwinding the work future must stop its caller too;
+            // otherwise a failed edge could leave Cargo waiting for its socket.
+            let _exit = ScopedExit {
+                stopped,
+                controller,
+                normal_shutdown,
+            };
+            work(cx, shutdown).await
+        })
+    })
+}
+
+struct ScopedExit {
+    stopped: Arc<AtomicBool>,
+    controller: Arc<ShutdownController>,
+    normal_shutdown: Arc<AtomicBool>,
+}
+
+impl Drop for ScopedExit {
+    fn drop(&mut self) {
+        if !self.normal_shutdown.load(Ordering::Acquire) {
+            self.stopped.store(true, Ordering::Release);
+        }
+        self.controller.shutdown();
+    }
+}
+
 struct ServerOwner {
     controller: Arc<ShutdownController>,
     worker: Option<JoinHandle<Result<ShutdownReceipt, DaemonError>>>,
+    normal_shutdown: Option<Arc<AtomicBool>>,
 }
 impl ServerOwner {
-    fn finish(mut self) -> io::Result<ShutdownReceipt> {
+    fn request_shutdown(&self) {
+        if let Some(expected) = &self.normal_shutdown {
+            expected.store(true, Ordering::Release);
+        }
         self.controller.shutdown();
+    }
+
+    fn finish(mut self) -> io::Result<ShutdownReceipt> {
+        self.request_shutdown();
         self.worker
             .take()
             .ok_or_else(|| io::Error::other("canonical coordinator already joined"))?
@@ -1251,7 +1859,7 @@ impl ServerOwner {
 }
 impl Drop for ServerOwner {
     fn drop(&mut self) {
-        self.controller.shutdown();
+        self.request_shutdown();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -1809,6 +2417,335 @@ mod tests {
     }
 
     #[test]
+    fn persistent_state_refuses_replaced_lock_and_root_generations() {
+        let parent = crate::test_util::private_tempdir();
+        let state = StateOwner::acquire(parent.path()).unwrap();
+        state.verify().unwrap();
+        fs::rename(
+            state.root.join("owner.lock"),
+            state.root.join("retained-owner.lock"),
+        )
+        .unwrap();
+        let replacement = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(state.root.join("owner.lock"))
+            .unwrap();
+        assert!(state.verify().is_err());
+        drop(replacement);
+        fs::rename(&state.root, parent.path().join("retained-state")).unwrap();
+        create_private(&state.root).unwrap();
+        let _replacement = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(state.root.join("owner.lock"))
+            .unwrap();
+        assert!(state.verify().is_err());
+    }
+
+    fn shared_runtime(state: &Path, roots: usize) -> Arc<SharedRuntime> {
+        // Actual coordinator, CAS, authority and scheduler; no external worker
+        // is configured by this filesystem/runtime test.
+        SharedRuntime::start_with_remote(
+            state,
+            ReleaseAuthorizationMode::Advisory,
+            "canonical-shared-tests".into(),
+            roots,
+            4,
+            |_| Ok(None),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn shared_root_admission_is_bounded_cancellable_and_preserves_authority() {
+        let owner = crate::test_util::private_tempdir();
+        let runtime = shared_runtime(owner.path(), 2);
+        let authority = runtime.coord.authority().unwrap();
+        let running = AtomicBool::new(false);
+        let first = runtime
+            .acquire_root(&running, Duration::from_secs(1))
+            .unwrap();
+        let second = runtime
+            .acquire_root(&running, Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(runtime.roots.active(), 2);
+        assert_eq!(
+            runtime
+                .acquire_root(&running, Duration::from_millis(10))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(runtime.shutdown().is_err());
+        assert!(runtime.healthy());
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let waiter = {
+            let runtime = Arc::clone(&runtime);
+            let cancelled = Arc::clone(&cancelled);
+            std::thread::spawn(move || runtime.acquire_root(&cancelled, Duration::from_secs(5)))
+        };
+        cancelled.store(true, Ordering::Release);
+        assert_eq!(
+            waiter.join().unwrap().unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(runtime.roots.active(), 2);
+        assert_eq!(runtime.coord.authority().unwrap(), authority);
+        assert!(runtime.healthy());
+        drop(first);
+        let next = runtime
+            .acquire_root(&running, Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(runtime.roots.active(), 2);
+        drop(second);
+        drop(next);
+        assert_eq!(runtime.roots.active(), 0);
+        runtime.shutdown().unwrap();
+        assert!(!runtime.healthy());
+        drop(runtime);
+
+        let restarted = shared_runtime(owner.path(), 1);
+        assert!(restarted.coord.authority().unwrap().term > authority.term);
+        assert_ne!(
+            restarted.coord.authority().unwrap().incarnation_id,
+            authority.incarnation_id
+        );
+        restarted.shutdown().unwrap();
+    }
+
+    #[test]
+    fn shared_profile_refuses_foreign_state_extra_jobs_and_inherited_stdin_before_capture() {
+        let owner = crate::test_util::private_tempdir();
+        let runtime = shared_runtime(owner.path(), 1);
+        let authority = runtime.coord.authority().unwrap();
+        let operations = owner.path().join("must-not-be-created");
+        let base = json!({"version":PROFILE_VERSION,
+            "source_root":"/missing-source", "toolchain_root":"/missing-toolchain",
+            "state_root":owner.path(), "operation_root":operations,
+            "wrapper":"/missing-wrapper", "service_socket":"/service.sock", "jobs":4});
+        for (index, (field, value, reason)) in [
+            (
+                "state_root",
+                json!("/different-service-state"),
+                "this service state",
+            ),
+            ("jobs", json!(5), "per-root job grant"),
+            ("service_socket", Value::Null, "this service state"),
+            ("command", json!("run"), "inherited stdin"),
+            ("command", json!("bench"), "inherited stdin"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut profile = base.clone();
+            profile[field] = value;
+            let file = |stream: &str| {
+                OpenOptions::new()
+                    .write(true)
+                    .read(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(owner.path().join(format!("{index}-{stream}")))
+                    .unwrap()
+            };
+            let error = run_shared_profile(
+                &serde_json::to_vec(&profile).unwrap(),
+                Arc::clone(&runtime),
+                Arc::new(AtomicBool::new(false)),
+                file("stdout"),
+                file("stderr"),
+                1024,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(reason), "{error}");
+            assert!(!operations.exists());
+            assert_eq!(runtime.roots.active(), 0);
+            assert_eq!(runtime.coord.authority().unwrap(), authority);
+            assert!(runtime.healthy());
+        }
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn shared_edges_keep_one_term_and_one_cancellation_does_not_stop_the_other() {
+        use std::io::{BufRead, BufReader};
+        let state = crate::test_util::private_tempdir();
+        let runtime = shared_runtime(state.path(), 2);
+        let authority = runtime.coord.authority().unwrap();
+        let attach = || {
+            let owner = Arc::new(crate::test_util::private_tempdir());
+            let mut mappings = Vec::new();
+            for (visible, name) in [
+                ("/__rabs/workspace", "source"),
+                ("/__rabs/toolchain", "toolchain"),
+                ("/__rabs/cargo-home", "cargo"),
+                (TARGET, "target"),
+                ("/__rabs/home", "home"),
+            ] {
+                let physical = owner.path().join(name);
+                create_private(&physical).unwrap();
+                mappings.push((PathBuf::from(visible), physical));
+            }
+            let paths = CanonicalPaths::new(Arc::clone(&owner), mappings).unwrap();
+            let socket = owner.path().join("rustc.sock");
+            let stopped = Arc::new(AtomicBool::new(false));
+            let activity = CanonicalActivity::new();
+            let controller = Arc::new(ShutdownController::new());
+            let normal_shutdown = Arc::new(AtomicBool::new(false));
+            let edge = canonical_edge_work_shared(
+                EdgeServerConfig {
+                    socket_path: socket.clone(),
+                    state_dir: owner.path().join("shadow"),
+                    coord: runtime.coord.edge_subscriber(),
+                    prepared_operations: None,
+                    live_dependency: Some(runtime.lane.clone()),
+                },
+                paths,
+                Arc::clone(&activity),
+                None,
+            );
+            let options = DaemonRunOptions {
+                edge_work: Some(stop_on_unexpected_exit(
+                    edge,
+                    Arc::clone(&stopped),
+                    Arc::clone(&controller),
+                    Arc::clone(&normal_shutdown),
+                )),
+                ..DaemonRunOptions::default()
+            };
+            let worker_controller = Arc::clone(&controller);
+            let worker =
+                std::thread::spawn(move || run_daemon_controlled(options, worker_controller));
+            let server = ServerOwner {
+                controller,
+                worker: Some(worker),
+                normal_shutdown: Some(normal_shutdown),
+            };
+            wait_ready(&server, &socket, &runtime.coord, &stopped).unwrap();
+            let stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            (owner, server, stopped, activity, BufReader::new(stream))
+        };
+        let exchange = |stream: &mut BufReader<std::os::unix::net::UnixStream>, request: Value| {
+            writeln!(stream.get_mut(), "{request}").unwrap();
+            let mut line = String::new();
+            stream.read_line(&mut line).unwrap();
+            serde_json::from_str::<Value>(&line).unwrap()
+        };
+        let hello = json!({"kind":"hello",
+            "transport":{"minimum_compatible":1,"current":1},
+            "application":{"minimum_compatible":1,"current":1}});
+        let (_first_owner, first, first_stopped, first_activity, mut first_peer) = attach();
+        let (_second_owner, second, second_stopped, second_activity, mut second_peer) = attach();
+        assert_eq!(exchange(&mut first_peer, hello.clone())["kind"], "hello-ok");
+        assert_eq!(exchange(&mut second_peer, hello)["kind"], "hello-ok");
+        assert_eq!(first_activity.active_sessions(), 1);
+        assert_eq!(second_activity.active_sessions(), 1);
+        assert_eq!(runtime.coord.authority().unwrap(), authority);
+
+        first_stopped.store(true, Ordering::Release);
+        assert!(first.finish().unwrap().clean());
+        assert!(first_stopped.load(Ordering::Acquire));
+        assert!(!second_stopped.load(Ordering::Acquire));
+        assert_eq!(first_activity.active_sessions(), 0);
+        assert_eq!(second_activity.active_sessions(), 1);
+        assert_eq!(
+            exchange(&mut second_peer, json!({"kind":"status"}))["reason"],
+            "canonical-build-socket"
+        );
+        assert!(runtime.healthy());
+        assert_eq!(runtime.coord.authority().unwrap(), authority);
+        assert!(second.finish().unwrap().clean());
+        assert!(!second_stopped.load(Ordering::Acquire));
+        assert_eq!(second_activity.active_sessions(), 0);
+        assert!(runtime.healthy());
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn unexpected_scoped_edge_completion_cancels_its_caller() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let controller = Arc::new(ShutdownController::new());
+        let normal_shutdown = Arc::new(AtomicBool::new(false));
+        let edge: SubsystemWork = Box::new(|_, _| Box::pin(async { Ok(()) }));
+        let options = DaemonRunOptions {
+            edge_work: Some(stop_on_unexpected_exit(
+                edge,
+                Arc::clone(&stopped),
+                Arc::clone(&controller),
+                Arc::clone(&normal_shutdown),
+            )),
+            ..DaemonRunOptions::default()
+        };
+        let worker_controller = Arc::clone(&controller);
+        let worker = std::thread::spawn(move || run_daemon_controlled(options, worker_controller));
+        let server = ServerOwner {
+            controller,
+            worker: Some(worker),
+            normal_shutdown: Some(normal_shutdown),
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !stopped.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(stopped.load(Ordering::Acquire));
+        assert!(server.finish().unwrap().clean());
+    }
+
+    #[test]
+    fn shared_output_files_are_private_distinct_and_have_an_aggregate_bound() {
+        let owner = crate::test_util::private_tempdir();
+        let make = |name: &str| {
+            OpenOptions::new()
+                .write(true)
+                .read(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(owner.path().join(name))
+                .unwrap()
+        };
+        let stdout = make("stdout");
+        assert!(
+            OperationOutput::captured(stdout.try_clone().unwrap(), stdout.try_clone().unwrap(), 1)
+                .is_err()
+        );
+        let stderr = make("stderr");
+        let mut first = OperationOutput::captured(stdout, stderr, 1).unwrap();
+        first.event(json!({"operation":"first"})).unwrap();
+        let mut second =
+            OperationOutput::captured(make("stdout-second"), make("stderr-second"), 1).unwrap();
+        second.event(json!({"operation":"second"})).unwrap();
+        assert_eq!(
+            fs::read_to_string(owner.path().join("stderr")).unwrap(),
+            "{\"operation\":\"first\"}\n"
+        );
+        assert_eq!(
+            fs::read_to_string(owner.path().join("stderr-second")).unwrap(),
+            "{\"operation\":\"second\"}\n"
+        );
+        let before = fs::metadata(owner.path().join("stderr")).unwrap().len();
+        assert!(
+            first
+                .line(&"x".repeat(MAX_GRAPH_BYTES as usize + 64 * 1024 + 1))
+                .is_err()
+        );
+        assert_eq!(
+            fs::metadata(owner.path().join("stderr")).unwrap().len(),
+            before
+        );
+        assert_eq!(fs::metadata(owner.path().join("stdout")).unwrap().len(), 0);
+    }
+
+    #[test]
     fn scoped_socket_refuses_generic_daemon_authority_and_drains_its_open_session() {
         use std::io::{BufRead, BufReader};
         let owner = Arc::new(crate::test_util::private_tempdir());
@@ -1858,6 +2795,7 @@ mod tests {
         let server = ServerOwner {
             controller,
             worker: Some(worker),
+            normal_shutdown: None,
         };
         wait_ready(&server, &socket, &coord, &stopped).unwrap();
         let stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();

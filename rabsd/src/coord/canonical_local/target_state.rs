@@ -1,7 +1,9 @@
 //! Restart-safe private Cargo target state for the local canonical driver.
 //!
-//! The caller holds StateOwner through every operation and exposes only fresh
-//! workspace/target copies to Cargo. This cache never skips Cargo or authorizes
+//! The caller holds StateOwner through every operation and serializes cache I/O
+//! across its active roots, exposing only fresh workspace/target copies to Cargo.
+//! Open/restore share one critical section; capture acquires a later one after
+//! Cargo drains. This cache never skips Cargo or authorizes
 //! action-result publication. Compatibility families retain independent seeds
 //! under an aggregate snapshot-byte and count budget. One pending replacement may
 //! coexist: the temporary disk bound is twice max_bytes, plus bounded metadata.
@@ -467,7 +469,7 @@ struct RetainedFamily {
     used: SystemTime,
 }
 
-/// No global mutable index is needed: the exclusive StateOwner serializes
+/// No global mutable index is needed: the StateOwner's cache-I/O lock serializes
 /// writers, and each bounded directory is its own recoverable transaction.
 struct TargetFamilies {
     root: TargetFamily,
@@ -631,7 +633,9 @@ impl TargetFamilies {
     }
 }
 
-/// One selected family under the caller's exclusive canonical StateOwner lock.
+/// One private operation's source observations. The selected family is retained
+/// only for its initial restore; concurrent roots may replace or evict that
+/// family while this operation compiles in its independent target directory.
 pub(super) struct TargetState {
     families: TargetFamilies,
     family: TargetFamily,
@@ -699,7 +703,12 @@ impl TargetState {
     }
 
     fn restore_inner(&mut self, fresh_empty_target: &Path) -> io::Result<bool> {
-        self.verify_owner()?;
+        self.families.root.verify_owner()?;
+        // Normally open and restore are one caller-owned critical section.
+        // Rebind here as well so a later restore never treats an evicted
+        // directory descriptor as authority over a new generation of its key.
+        self.family = self.families.family(&self.key)?;
+        self.family.recover()?;
         let seed = match self.family.load_seed().and_then(|seed| {
             if let Some(seed) = &seed {
                 require(
@@ -754,19 +763,41 @@ impl TargetState {
     /// all processes/sessions. Normally failed tests may retain compilation
     /// state; their outcome is never a cached test result.
     /// Snapshotting and cloning finish before the old seed is moved aside.
+    /// The caller holds the same cache-I/O lock used for open plus restore.
     pub fn capture(&self, target: &Path) -> io::Result<()> {
-        self.verify_owner()?;
+        self.families.root.verify_owner()?;
         require(
             SourceTimestamps::capture(&self.workspace, &self.manifest, &|| false)?
                 == self.source_times,
             "runtime workspace changed during Cargo execution",
         )?;
         let snapshot = PrivateTreeSnapshot::capture(target, self.max_bytes, &|| false)?;
-        let pending = self.family.root.join("pending");
-        let previous = self.family.root.join("previous");
+        // Another root may have replaced this seed, evicted its whole family,
+        // or removed our initially empty slot while Cargo ran. Never use the
+        // old family descriptor or a remembered aggregate inventory to publish.
+        // Recover current abandoned transactions before allocating the one
+        // permitted extra slot, without evicting any healthy committed seed.
+        let retained = self.families.retained()?;
+        let retained_bytes = retained.iter().try_fold(0u64, |total, entry| {
+            total
+                .checked_add(entry.bytes)
+                .ok_or_else(|| invalid("private target retained bytes overflow"))
+        })?;
+        // A concurrently completed profile may have selected a larger budget.
+        // A stale smaller-budget operation must not evict its healthy seeds or
+        // exceed its own temporary disk bound merely to attempt an optional save.
         require(
-            !present_directory(&pending, &self.family.owner)?
-                && !present_directory(&previous, &self.family.owner)?,
+            retained.len() <= self.families.max_families && retained_bytes <= self.max_bytes,
+            "private target retention budget changed while this operation ran",
+        )?;
+        drop(retained);
+        let family = self.families.family(&self.key)?;
+        family.recover()?;
+        let pending = family.root.join("pending");
+        let previous = family.root.join("previous");
+        require(
+            !present_directory(&pending, &family.owner)?
+                && !present_directory(&previous, &family.owner)?,
             "unfinished private target publication requires recovery",
         )?;
         create_private(&pending)?;
@@ -805,19 +836,21 @@ impl TargetState {
         metadata.write_all(&bytes)?;
         metadata.sync_all()?;
         File::open(&pending)?.sync_all()?;
-        self.verify_owner()?;
-        let _pending = generation_members(&pending, &self.family.owner, true)?;
-        let seed = self.family.root.join("seed");
-        if present_directory(&seed, &self.family.owner)? {
+        self.families.root.verify_owner()?;
+        family.verify_owner()?;
+        let _pending = generation_members(&pending, &family.owner, true)?;
+        let seed = family.root.join("seed");
+        if present_directory(&seed, &family.owner)? {
             publish_new_directory(&seed, &previous)?;
         }
         publish_new_directory(&pending, &seed)?;
-        self.family.remove_generation("previous")?;
-        self.family.promote()?;
+        family.remove_generation("previous")?;
+        family.promote()?;
         // Only a complete, durable candidate can displace another family.
         // Startup repeats this bounded pruning after a crash at this frontier.
         self.families.prune(Some(self.key))?;
-        self.verify_owner()
+        self.families.root.verify_owner()?;
+        family.verify_owner()
     }
 }
 
@@ -1030,6 +1063,211 @@ mod tests {
             .retained()
             .unwrap();
         assert_eq!(families.iter().map(|entry| entry.bytes).sum::<u64>(), 10);
+    }
+
+    #[test]
+    fn overlapping_cold_roots_rebind_retired_empty_slots_when_each_capture_finishes() {
+        let state = private();
+        let settings = TargetCacheConfig {
+            max_families: 2,
+            ..config()
+        };
+        let first_workspace = private();
+        let first_manifest = source(first_workspace.path(), b"source");
+        let first_target = private();
+        let mut first = TargetState::open(
+            state.path(),
+            &settings,
+            [40; 32],
+            first_workspace.path(),
+            &first_manifest,
+        )
+        .unwrap();
+        assert!(!first.restore(first_target.path()).unwrap());
+
+        // Each open/restore and each completed capture below represents one
+        // cache-I/O critical section. Cargo owns independent roots between them.
+        let second_workspace = private();
+        let second_manifest = source(second_workspace.path(), b"source");
+        let second_target = private();
+        let mut second = TargetState::open(
+            state.path(),
+            &settings,
+            [41; 32],
+            second_workspace.path(),
+            &second_manifest,
+        )
+        .unwrap();
+        assert!(!second.restore(second_target.path()).unwrap());
+        assert!(!family_path(state.path(), [40; 32]).exists());
+
+        completed_target(first_target.path(), b"first completed");
+        first.capture(first_target.path()).unwrap();
+        assert!(!family_path(state.path(), [41; 32]).exists());
+        completed_target(second_target.path(), b"second completed");
+        second.capture(second_target.path()).unwrap();
+        assert_eq!(
+            restore_family(state.path(), &settings, [40; 32]).as_deref(),
+            Some(b"first completed".as_slice())
+        );
+        assert_eq!(
+            restore_family(state.path(), &settings, [41; 32]).as_deref(),
+            Some(b"second completed".as_slice())
+        );
+    }
+
+    #[test]
+    fn evicted_inflight_family_publishes_its_private_result_under_current_aggregate_budget() {
+        let state = private();
+        let settings = TargetCacheConfig {
+            max_bytes: 6,
+            max_families: 1,
+            ..config()
+        };
+        capture_family(state.path(), &settings, [42; 32], b"aaaa");
+        let workspace = private();
+        let manifest = source(workspace.path(), b"source");
+        let target = private();
+        let mut inflight = TargetState::open(
+            state.path(),
+            &settings,
+            [42; 32],
+            workspace.path(),
+            &manifest,
+        )
+        .unwrap();
+        assert!(inflight.restore(target.path()).unwrap());
+
+        capture_family(state.path(), &settings, [43; 32], b"bbbbbb");
+        assert!(!family_path(state.path(), [42; 32]).exists());
+        assert_eq!(fs::read(target.path().join("artifact")).unwrap(), b"aaaa");
+        completed_target(target.path(), b"ccc");
+        inflight.capture(target.path()).unwrap();
+        assert!(!family_path(state.path(), [43; 32]).exists());
+        assert_eq!(
+            restore_family(state.path(), &settings, [42; 32]).as_deref(),
+            Some(b"ccc".as_slice())
+        );
+        let retained = TargetFamilies::open(state.path(), &settings)
+            .unwrap()
+            .retained()
+            .unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained.iter().map(|entry| entry.bytes).sum::<u64>(), 3);
+    }
+
+    #[test]
+    fn same_family_overlaps_keep_private_inodes_and_only_completed_last_writer_replaces_seed() {
+        let state = private();
+        let settings = TargetCacheConfig {
+            max_bytes: 12,
+            ..config()
+        };
+        let key = [44; 32];
+        capture_family(state.path(), &settings, key, b"old");
+        let first_workspace = private();
+        let first_manifest = source(first_workspace.path(), b"source");
+        let first_target = private();
+        let mut first = TargetState::open(
+            state.path(),
+            &settings,
+            key,
+            first_workspace.path(),
+            &first_manifest,
+        )
+        .unwrap();
+        assert!(first.restore(first_target.path()).unwrap());
+        let second_workspace = private();
+        let second_manifest = source(second_workspace.path(), b"source");
+        let second_target = private();
+        let mut second = TargetState::open(
+            state.path(),
+            &settings,
+            key,
+            second_workspace.path(),
+            &second_manifest,
+        )
+        .unwrap();
+        assert!(second.restore(second_target.path()).unwrap());
+        let seed = family_path(state.path(), key).join("seed/target/artifact");
+        let first_inode = fs::metadata(first_target.path().join("artifact"))
+            .unwrap()
+            .ino();
+        let second_inode = fs::metadata(second_target.path().join("artifact"))
+            .unwrap()
+            .ino();
+        assert_ne!(first_inode, second_inode);
+        assert_ne!(first_inode, fs::metadata(&seed).unwrap().ino());
+        assert_ne!(second_inode, fs::metadata(&seed).unwrap().ino());
+
+        completed_target(first_target.path(), b"first");
+        first.capture(first_target.path()).unwrap();
+        assert_eq!(
+            fs::read(second_target.path().join("artifact")).unwrap(),
+            b"old"
+        );
+        completed_target(second_target.path(), b"oversized incomplete candidate");
+        assert!(second.capture(second_target.path()).is_err());
+        assert_eq!(fs::read(&seed).unwrap(), b"first");
+
+        completed_target(second_target.path(), b"second");
+        second.capture(second_target.path()).unwrap();
+        completed_target(first_target.path(), b"not captured");
+        assert_eq!(fs::read(&seed).unwrap(), b"second");
+        assert_eq!(
+            restore_family(state.path(), &settings, key).as_deref(),
+            Some(b"second".as_slice())
+        );
+    }
+
+    #[test]
+    fn stale_smaller_budget_cannot_discard_newer_families_to_save_its_result() {
+        for count_limit in [false, true] {
+            let state = private();
+            let small = TargetCacheConfig {
+                max_bytes: 4,
+                max_families: 1,
+                ..config()
+            };
+            let workspace = private();
+            let manifest = source(workspace.path(), b"source");
+            let target = private();
+            let mut inflight =
+                TargetState::open(state.path(), &small, [45; 32], workspace.path(), &manifest)
+                    .unwrap();
+            assert!(!inflight.restore(target.path()).unwrap());
+            let roomy = TargetCacheConfig {
+                max_bytes: 8,
+                max_families: 2,
+                ..config()
+            };
+            capture_family(
+                state.path(),
+                &roomy,
+                [46; 32],
+                if count_limit { b"a" } else { b"aaaaaa" },
+            );
+            if count_limit {
+                capture_family(state.path(), &roomy, [47; 32], b"b");
+            }
+            completed_target(target.path(), b"new");
+            let refused = inflight.capture(target.path()).unwrap_err();
+            assert!(refused.to_string().contains("retention budget changed"));
+            let retained = TargetFamilies::open(state.path(), &roomy)
+                .unwrap()
+                .retained()
+                .unwrap();
+            assert_eq!(retained.len(), if count_limit { 2 } else { 1 });
+            assert!(!family_path(state.path(), [45; 32]).exists());
+            assert_eq!(
+                restore_family(state.path(), &roomy, [46; 32]).as_deref(),
+                Some(if count_limit {
+                    b"a".as_slice()
+                } else {
+                    b"aaaaaa".as_slice()
+                })
+            );
+        }
     }
 
     #[test]

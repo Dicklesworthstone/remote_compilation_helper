@@ -11,6 +11,7 @@
 //! - `--run-for-ms N` — auto-shutdown after N ms (acceptance harness)
 //! - `--worker-prepare` — capture an explicit source projection into a saved bundle
 //! - `--canonical-compile-local` — canonical local Cargo commands with dependency caching
+//! - `--canonical-compile-service` — one persistent coordinator for concurrent canonical builds
 //! - `--worker-exec-loopback` — receive one explicit worker execution and its files
 //! - `--worker-exec-tls` — receive one pinned worker execution over mutual TLS/ATP
 //! - `--worker-build-tls` — execute a prepared bundle and install verified outputs
@@ -457,6 +458,11 @@ fn main() {
                  Without a worker those units compile normally; source/HOME are read-only and networking is isolated.\n\
                  External metadata and isolated worker archives use the evidence-gated cache; workspace crates compile normally.\n\
                  This mode honors the configured build identity and release authorization policy.\n\
+                 CANONICAL SERVICE: rabsd --canonical-compile-service <service.json>\n\
+                 service version canonical-compile-service-v1 requires state_root, socket, max_roots and jobs_per_root.\n\
+                 Set service_socket in a canonical local profile to attach to that running service.\n\
+                 Independent builds share one coordinator and worker pool, with private targets and scoped cancellation.\n\
+                 Busy or unavailable services fail without local fallback. Run and executing Bench require standalone profiles.\n\
                  PREPARE: rabsd --worker-prepare <absolute-source-root> <spec.json> <new-absolute-bundle-directory>\n\
                  spec.json uses canonical-exec fields plus source_files, source_roots or cargo_source,\n\
                  instead of source_manifest or workspace_backing. Preparation does not build.\n\
@@ -501,6 +507,44 @@ fn main() {
                  env: RABS_SOCKET_PATH, RABS_LOG_LEVEL, RABS_PREPARED_CONCURRENCY."
             );
             return;
+        }
+        Some("--canonical-compile-service") => {
+            if args.len() != 2 {
+                eprintln!("usage: rabsd --canonical-compile-service <service.json>");
+                std::process::exit(2);
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let config = match load_config() {
+                    Ok(config) => config,
+                    Err(error) => {
+                        eprintln!("rabsd: {error}");
+                        std::process::exit(2);
+                    }
+                };
+                let result = rabsd::coord::canonical_local::service::run_service_profile(
+                    std::path::Path::new(&args[1]),
+                    config.release_authorization,
+                    config.build_identity,
+                );
+                let code = match result {
+                    Ok(()) => 0,
+                    Err(error) => {
+                        eprintln!("rabsd canonical service: {error}");
+                        if error.kind() == std::io::ErrorKind::InvalidInput {
+                            2
+                        } else {
+                            1
+                        }
+                    }
+                };
+                std::process::exit(code);
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                eprintln!("rabsd canonical service requires Linux namespace support");
+                std::process::exit(2);
+            }
         }
         Some("--canonical-compile-local") => {
             if args.len() != 2 {

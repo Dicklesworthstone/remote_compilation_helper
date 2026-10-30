@@ -1411,13 +1411,85 @@ program/benchmark result caching disabled. `bench --no-run` delivers the complet
 compiled target tree through the same retained-artifact contract as Build and
 `test --no-run`.
 
+### Share a canonical coordinator across concurrent commands
+
+An optional persistent service keeps one coordinator authority, CAS and dependency
+worker pool alive across local canonical commands. Each admitted command still
+captures its own inputs, runs its own Cargo process and uses private workspace,
+target, temporary and wrapper-endpoint directories. The service shares immutable
+results and the existing action ownership machinery; it does not share a writable
+Cargo target or make fresh-only workspace actions cacheable.
+
+Create the same private state directory used by the command profiles, then save
+this service configuration with your actual paths:
+
+```json
+{
+  "version": "canonical-compile-service-v1",
+  "state_root": "/home/builder/rabs-compile-state",
+  "socket": "/home/builder/rabs-compile-state/compile.sock",
+  "max_roots": 4,
+  "jobs_per_root": 2
+}
+```
+
+Start the installed native service:
+
+```sh
+rabsd --canonical-compile-service ./canonical-service.json
+```
+
+Configure the service process's dependency-worker pool and mutual-TLS environment
+before startup, using the worker settings above. The service reads that operator
+configuration once. A submitting client's worker environment cannot replace the
+service's pool or credentials.
+
+Add the existing socket to each local canonical profile, keeping its `state_root`
+equal to the service's state root:
+
+```json
+"service_socket": "/home/builder/rabs-compile-state/compile.sock"
+```
+
+Both `cargo rabs --rabs-canonical-local PROFILE.json -- ...` and the native
+`rabsd --canonical-compile-local PROFILE.json` entry point then submit to that
+service. Neither starts another coordinator nor silently falls back to direct
+execution when the service is unavailable. The socket must already exist, be
+owned by the current user and private, and have ordinary directory ancestors.
+It must be outside captured source, toolchain, optional Cargo-cache and operation
+roots. A socket inside the private state root is supported and never enters a
+build namespace.
+
+`max_roots` bounds simultaneous admitted operations. An additional client receives
+a busy refusal before capture; the service does not accumulate an unbounded queue.
+Each profile's `jobs` must be at most `jobs_per_root`, and a root retains its
+admission through process and stream drain. Independent roots can compile
+concurrently while sharing the same coordinator generation. Eligible identical
+dependency actions use the existing singleflight, sampling and replay gates.
+
+The service supports `check`, `build`, `clippy`, `test`, `test --no-run` and
+`bench --no-run`. It has closed stdin. `run` and executing `bench` commands retain
+the direct profile path because their inherited input is not forwarded through
+this protocol. The restriction is checked again after command-line selection
+replaces a saved profile's command and options. Test bodies still run on each
+invocation and retain their actual failure status.
+
+Compiler stdout and stderr are retained and replayed after completion, preserving
+each stream's exact bytes without inventing their original interleaving. Combined
+Cargo output is bounded at 64 MiB, with a separate 128 MiB protocol limit including
+planning and driver diagnostics. Disconnecting the client or exceeding an output
+bound cancels and drains that operation; this interface does not create a detached
+recoverable background job. Service shutdown stops admission, cancels and joins
+its active operations, then releases coordinator authority.
+
 ### Persistent reuse and command results
 
-The driver owns `state_root/canonical-compile-v1`, including its CAS and exclusive
-state lock. Concurrent invocations using the same state root return a busy error
-instead of superseding an active coordinator term. This separate namespace also
-keeps the local profile's lifecycle independent of a normal daemon's CAS. Use a
-dedicated state parent and retain it across commands; each command gets a fresh
+The direct driver or persistent service exclusively owns
+`state_root/canonical-compile-v1`, including its CAS and state lock. Direct
+invocations sharing an active state root return a busy error instead of
+superseding its coordinator term; use `service_socket` for concurrent commands.
+This separate namespace also keeps canonical compilation independent of a normal
+daemon's CAS. Retain the state parent across commands; each command gets fresh
 private target and source/toolchain capture under `operation_root`.
 
 To retain Cargo's own private target state between local canonical commands,
@@ -1474,6 +1546,17 @@ runtime epoch, lockfile, manifest, configuration and captured dependency changes
 separate the seed family. Immutable registry/Git/vendor inputs remain exact.
 This allows workspace crates to stay fresh without granting them action-cache
 publication or skipping Cargo's current command.
+
+The persistent service serializes target-cache I/O around open/restore and around
+completed capture, releasing that lock while Cargo runs. A command may continue
+from its independent target even if another command replaces or evicts the seed
+it restored. Each successful save reopens its current compatibility family and
+recalculates aggregate retention before publication; the last successful completed
+save supplies that family's next seed. A failed candidate capture does not displace
+a newer healthy generation. If another profile expanded retained state beyond an
+older command's smaller cache limits, that older command skips its optional save
+rather than discarding the newer families or exceeding its temporary byte bound.
+Cargo's completed result remains unchanged.
 
 Code-generating builds, all Test, Clippy, Run and Bench commands, and selected graphs with build scripts
 or procedural macros use the **complete captured source identity** for private target reuse. An unchanged capture can

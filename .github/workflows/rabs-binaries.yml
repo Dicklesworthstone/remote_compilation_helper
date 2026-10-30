@@ -207,6 +207,7 @@ jobs:
           cargo test --release -p rabsd --test live_dependency_inventory --locked
       - name: Canonical local Cargo ownership and path projection
         run: |
+          cargo test --release -p rabs-protocol --lib canonical_service --locked
           cargo test --release -p rabsd --lib coord::canonical_local --locked
           cargo test --release -p rabsd --lib coord::live_dependency::canonical --locked
           cargo test --release -p rabsd --test canonical_check_local --locked
@@ -225,6 +226,14 @@ jobs:
         run: |
           cargo test --release -p rabsd --test canonical_check_local --locked \
             canonical_private_targets_reuse_relocated_builds_and_preserve_current_outputs \
+            -- --ignored --exact --nocapture
+      - name: Canonical shared service overlaps Cargo roots and isolates cancellation
+        timeout-minutes: 30
+        env:
+          RABS_CANONICAL_TEST_WRAPPER: ${{ github.workspace }}/target/release/rabs-wrap
+        run: |
+          cargo test --release -p rabsd --test canonical_check_local --locked \
+            canonical_shared_service_overlaps_builds_scopes_cancellation_and_reuses_private_targets \
             -- --ignored --exact --nocapture
       - name: Canonical Cargo delivers no-run tests and always executes current harnesses
         timeout-minutes: 30

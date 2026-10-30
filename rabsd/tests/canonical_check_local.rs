@@ -527,6 +527,542 @@ fn native_fixture() -> (tempfile::TempDir, Value) {
     (owner, profile)
 }
 
+/// Native service/client processes keep diagnostics in ordinary files so two
+/// simultaneous Cargo roots cannot block on an undrained test-harness pipe.
+struct SharedServiceChild {
+    process: Option<ManagedProcessGroup>,
+    stdout: PathBuf,
+    stderr: PathBuf,
+    drain: PathBuf,
+}
+
+impl SharedServiceChild {
+    fn spawn(root: &Path, name: &str, mut command: Command) -> Self {
+        let stdout = root.join(format!("{name}.stdout"));
+        let stderr = root.join(format!("{name}.stderr"));
+        command
+            .stdin(Stdio::null())
+            .stdout(fs::File::create(&stdout).unwrap())
+            .stderr(fs::File::create(&stderr).unwrap());
+        Self {
+            process: Some(
+                ManagedProcessGroup::spawn_command(command, Attribution::default()).unwrap(),
+            ),
+            stdout,
+            stderr,
+            drain: root.join(format!("{name}-drain")),
+        }
+    }
+
+    fn diagnostics(&self) -> String {
+        format!(
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&read_bounded(&self.stdout)),
+            String::from_utf8_lossy(&read_bounded(&self.stderr))
+        )
+    }
+
+    fn events(&self) -> Vec<Value> {
+        String::from_utf8(read_bounded(&self.stderr))
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+
+    fn assert_running(&mut self) {
+        assert!(
+            self.process
+                .as_mut()
+                .unwrap()
+                .leader_try_wait()
+                .unwrap()
+                .is_none(),
+            "native service/client exited before its owned operation completed: {}",
+            self.diagnostics()
+        );
+    }
+
+    fn finish(mut self, budget: Duration, cancel: bool) -> (i32, Vec<Value>, String) {
+        let started = Instant::now();
+        let output = self
+            .process
+            .take()
+            .unwrap()
+            .wait_with_bounded_drain_budget(&DrainLimits::new(&self.drain), 0, || {
+                cancel || started.elapsed() >= budget
+            })
+            .unwrap();
+        assert_eq!(output.residual_group_members, 0);
+        assert!(
+            cancel || started.elapsed() < budget,
+            "native service/client exceeded its budget: {}",
+            self.diagnostics()
+        );
+        (
+            output.status.code().unwrap_or(-1),
+            self.events(),
+            self.diagnostics(),
+        )
+    }
+}
+
+impl Drop for SharedServiceChild {
+    fn drop(&mut self) {
+        if let Some(process) = self.process.take() {
+            let _ =
+                process.wait_with_bounded_drain_budget(&DrainLimits::new(&self.drain), 0, || true);
+        }
+    }
+}
+
+fn shared_service_command(root: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rabsd"));
+    command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("RABS_CONFIG", root.join("config.toml"))
+        .env("RABS_SPRT_SAMPLING", "0");
+    command
+}
+
+fn shared_service_client(root: &Path, number: u32, profile: &Value) -> SharedServiceChild {
+    let path = root.join(format!("shared-profile-{number}.json"));
+    fs::write(&path, serde_json::to_vec(profile).unwrap()).unwrap();
+    let mut command = shared_service_command(root);
+    command.arg("--canonical-compile-local").arg(path);
+    SharedServiceChild::spawn(root, &format!("shared-client-{number}"), command)
+}
+
+fn shared_service_source(root: &Path, label: &str, value: u32) {
+    write(root, "service-label.txt", label);
+    write(root, "service-value.txt", value.to_string());
+    write(
+        root,
+        "build.rs",
+        r#"fn main() {
+    let label = std::fs::read_to_string("service-label.txt").unwrap();
+    let value: u32 = std::fs::read_to_string("service-value.txt").unwrap().trim().parse().unwrap();
+    let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    std::fs::write(out.join("shared-service-ready"), label.trim()).unwrap();
+    println!("cargo::warning=SERVICE_DIAGNOSTIC_{}_ONLY", label.trim());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
+    while !out.join("shared-service-release").is_file() {
+        assert!(std::time::Instant::now() < deadline, "shared service fixture was never released");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    std::fs::write(out.join("service-value.rs"), format!("const SERVICE_VALUE: u32 = {value};\n")).unwrap();
+    println!("cargo::rustc-env=SERVICE_LABEL={}", label.trim());
+    println!("cargo::rerun-if-changed=service-label.txt");
+    println!("cargo::rerun-if-changed=service-value.txt");
+}
+"#,
+    );
+    write(
+        root,
+        "src/lib.rs",
+        "include!(concat!(env!(\"OUT_DIR\"), \"/service-value.rs\"));\npub fn answer()->u32 { canonical_dep::answer()+SERVICE_VALUE }\n",
+    );
+    write(
+        root,
+        "src/main.rs",
+        "fn main() { println!(\"{}:{}\", env!(\"SERVICE_LABEL\"), canonical_app::answer()); }\n",
+    );
+}
+
+/// Inspect only active private Cargo targets. Delivered targets and captured
+/// toolchains are excluded; Cargo's per-unit directory layout is not guessed.
+fn shared_service_markers(operations: &Path, label: &str) -> Vec<PathBuf> {
+    let mut pending = Vec::new();
+    for entry in fs::read_dir(operations).unwrap() {
+        let entry = entry.unwrap();
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with("rabs-compile-"))
+        {
+            for target in ["target", "restored-target"] {
+                let path = entry.path().join(target);
+                if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
+                    pending.push(path);
+                }
+            }
+        }
+    }
+    let mut markers = Vec::new();
+    let mut visited = 0;
+    while let Some(directory) = pending.pop() {
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => panic!("reading {}: {error}", directory.display()),
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => panic!("reading {}: {error}", directory.display()),
+            };
+            visited += 1;
+            assert!(visited <= 20_000, "unexpectedly large Cargo fixture target");
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => panic!("reading {}: {error}", entry.path().display()),
+            };
+            if file_type.is_dir() {
+                pending.push(entry.path());
+            } else if file_type.is_file()
+                && entry.file_name() == "shared-service-ready"
+                && fs::read(entry.path()).is_ok_and(|bytes| bytes == label.as_bytes())
+            {
+                markers.push(entry.path());
+            }
+        }
+    }
+    markers
+}
+
+fn wait_for_shared_service_marker(
+    operations: &Path,
+    label: &str,
+    service: &mut SharedServiceChild,
+    client: &mut SharedServiceChild,
+) -> PathBuf {
+    let deadline = Instant::now() + Duration::from_secs(150);
+    loop {
+        service.assert_running();
+        client.assert_running();
+        let markers = shared_service_markers(operations, label);
+        assert!(
+            markers.len() <= 1,
+            "ambiguous active {label} build: {markers:?}"
+        );
+        if let Some(marker) = markers.into_iter().next() {
+            return marker;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "actual Cargo build script never reached its synchronization point: {}\n{}",
+            client.diagnostics(),
+            service.diagnostics()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn assert_shared_service_build(
+    root: &Path,
+    number: u32,
+    events: &[Value],
+    output: &str,
+    expected: &str,
+    target_state: &str,
+) -> PathBuf {
+    let started = events
+        .iter()
+        .filter(|event| event["kind"] == "canonical-compilation-started")
+        .collect::<Vec<_>>();
+    assert_eq!(started.len(), 1, "{output}");
+    assert_eq!(started[0]["private_target_state"], target_state, "{output}");
+    let completed = events
+        .iter()
+        .filter(|event| event["kind"] == "canonical-build-completed")
+        .collect::<Vec<_>>();
+    assert_eq!(completed.len(), 1, "{output}");
+    let target = PathBuf::from(completed[0]["target_directory"].as_str().unwrap());
+    assert_eq!(target.file_name().unwrap(), "target");
+    assert_eq!(target.parent().unwrap().parent().unwrap(), root.join("ops"));
+    let executables = output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| event["reason"] == "compiler-artifact")
+        .filter_map(|event| event["executable"].as_str().map(PathBuf::from))
+        .collect::<BTreeSet<_>>();
+    let binary = executables
+        .into_iter()
+        .filter(|path| path.file_name().is_some_and(|name| name == "canonical_app"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        binary.len(),
+        1,
+        "Cargo must name one actual linked application: {output}"
+    );
+    let relative = binary[0].strip_prefix("/__rabs/out/cargo").unwrap();
+    assert!(
+        relative
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+    );
+    let binary = target.join(relative);
+    assert_eq!(fs::canonicalize(&binary).unwrap(), binary);
+    let mut command = Command::new(&binary);
+    command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .current_dir(root);
+    let process = SharedServiceChild::spawn(root, &format!("shared-binary-{number}"), command);
+    let stdout = process.stdout.clone();
+    let stderr = process.stderr.clone();
+    let (code, _, diagnostics) = process.finish(Duration::from_secs(10), false);
+    assert_eq!(code, 0, "{diagnostics}");
+    assert_eq!(read_bounded(&stdout), expected.as_bytes(), "{diagnostics}");
+    assert!(read_bounded(&stderr).is_empty(), "{diagnostics}");
+    target
+}
+
+#[test]
+#[ignore = "requires full canonical bubblewrap namespaces, native toolchain and matching RABS_CANONICAL_TEST_WRAPPER; runs concurrent actual Cargo builds through one persistent service"]
+fn canonical_shared_service_overlaps_builds_scopes_cancellation_and_reuses_private_targets() {
+    let (owner, mut first_profile) = native_fixture();
+    let root = owner.path();
+    let socket = root.join("canonical-service.sock");
+    let service_profile = root.join("canonical-service.json");
+    fs::write(
+        &service_profile,
+        serde_json::to_vec(&json!({
+            "version":"canonical-compile-service-v1", "state_root":root.join("state"),
+            "socket":socket, "max_roots":2, "jobs_per_root":1,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    shared_service_source(&root.join("source-a"), "A", 101);
+    shared_service_source(&root.join("source-b"), "B", 202);
+    first_profile["command"] = json!("build");
+    first_profile["service_socket"] = json!(socket);
+    first_profile["target_cache"] =
+        json!({"runtime_epoch":"shared-service-native-v1", "max_bytes":268435456});
+    let mut second_profile = first_profile.clone();
+    second_profile["source_root"] = json!(root.join("source-b"));
+    let mut command = shared_service_command(root);
+    command
+        .arg("--canonical-compile-service")
+        .arg(&service_profile);
+    let mut service = SharedServiceChild::spawn(root, "shared-service", command);
+    let service_pid = service.process.as_ref().unwrap().pgid();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        service.assert_running();
+        if socket.exists()
+            && service
+                .events()
+                .iter()
+                .any(|event| event["kind"] == "canonical-service-listening")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "service did not start: {}",
+            service.diagnostics()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let mut first = shared_service_client(root, 5000, &first_profile);
+    let first_marker =
+        wait_for_shared_service_marker(&root.join("ops"), "A", &mut service, &mut first);
+    let mut second = shared_service_client(root, 5001, &second_profile);
+    let second_marker =
+        wait_for_shared_service_marker(&root.join("ops"), "B", &mut service, &mut second);
+    // Both native build scripts are simultaneously paused inside independent
+    // Cargo roots. This is overlap evidence, not an elapsed-time speedup claim.
+    first.assert_running();
+    second.assert_running();
+    assert_eq!(read_bounded(&first_marker), b"A");
+    assert_eq!(read_bounded(&second_marker), b"B");
+    let operations = root.join("ops");
+    let operation_owner = |marker: &Path| {
+        marker
+            .ancestors()
+            .find(|path| path.parent() == Some(operations.as_path()))
+            .unwrap()
+            .to_path_buf()
+    };
+    let first_owner = operation_owner(&first_marker);
+    let second_owner = operation_owner(&second_marker);
+    assert_ne!(first_owner, second_owner);
+    for (operation, label) in [(&first_owner, b"A"), (&second_owner, b"B")] {
+        assert_eq!(
+            read_bounded(&operation.join("runtime-workspace/service-label.txt")),
+            label,
+            "each active Cargo root must use its own captured workspace"
+        );
+    }
+    let occupied_targets = fs::read_dir(root.join("ops")).unwrap().count();
+    let busy = shared_service_client(root, 5002, &second_profile);
+    let (code, events, output) = busy.finish(Duration::from_secs(15), false);
+    assert_ne!(
+        code, 0,
+        "a third root must not bypass service capacity: {output}"
+    );
+    assert!(
+        output.contains("busy") || output.contains("capacity"),
+        "{output}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["kind"] == "canonical-compilation-started"),
+        "{output}"
+    );
+    assert_eq!(
+        fs::read_dir(root.join("ops")).unwrap().count(),
+        occupied_targets
+    );
+
+    let (code, events, output) = first.finish(Duration::from_secs(15), true);
+    assert_ne!(code, 0, "cancelled client completed successfully: {output}");
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["kind"] == "canonical-build-completed")
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while first_owner.exists() {
+        service.assert_running();
+        second.assert_running();
+        assert!(
+            Instant::now() < deadline,
+            "disconnecting A did not drain its actual Cargo root: {}",
+            service.diagnostics()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    service.assert_running();
+    second.assert_running();
+    assert_eq!(service.process.as_ref().unwrap().pgid(), service_pid);
+    fs::write(
+        second_marker
+            .parent()
+            .unwrap()
+            .join("shared-service-release"),
+        b"released",
+    )
+    .unwrap();
+    let (code, events, output) = second.finish(Duration::from_secs(180), false);
+    assert_eq!(code, 0, "{output}\n{}", service.diagnostics());
+    assert!(output.contains("SERVICE_DIAGNOSTIC_B_ONLY"), "{output}");
+    assert!(!output.contains("SERVICE_DIAGNOSTIC_A_ONLY"), "{output}");
+    let second_target =
+        assert_shared_service_build(root, 5001, &events, &output, "B:244\n", "cold");
+    assert!(!service.diagnostics().contains("SERVICE_DIAGNOSTIC_B_ONLY"));
+
+    // Use the same running service and exact source again. The private target
+    // must restore actual Cargo fingerprints, not a fabricated success reply.
+    let warm = shared_service_client(root, 5003, &second_profile);
+    let (code, events, output) = warm.finish(Duration::from_secs(180), false);
+    assert_eq!(code, 0, "{output}");
+    let warm_target =
+        assert_shared_service_build(root, 5003, &events, &output, "B:244\n", "restored");
+    assert_ne!(second_target, warm_target);
+    let fresh_app = output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| {
+            event["reason"] == "compiler-artifact" && event["target"]["name"] == "canonical_app"
+        })
+        .collect::<Vec<_>>();
+    assert!(!fresh_app.is_empty(), "{output}");
+    assert!(
+        fresh_app.iter().all(|event| event["fresh"] == true),
+        "{output}"
+    );
+    service.assert_running();
+    assert_eq!(service.process.as_ref().unwrap().pgid(), service_pid);
+
+    // A source mutation must produce a new actual compiler result through the
+    // same authority. The build-script marker proves fresh execution occurred.
+    write(&root.join("source-b"), "service-value.txt", "203");
+    let mut changed = shared_service_client(root, 5004, &second_profile);
+    let changed_marker =
+        wait_for_shared_service_marker(&root.join("ops"), "B", &mut service, &mut changed);
+    fs::write(
+        changed_marker
+            .parent()
+            .unwrap()
+            .join("shared-service-release"),
+        b"released",
+    )
+    .unwrap();
+    let (code, events, output) = changed.finish(Duration::from_secs(180), false);
+    assert_eq!(code, 0, "{output}");
+    let changed_target =
+        assert_shared_service_build(root, 5004, &events, &output, "B:245\n", "cold");
+    assert_ne!(changed_target, warm_target);
+    assert!(
+        shared_service_markers(&root.join("ops"), "A").is_empty(),
+        "cancelled Cargo root did not drain"
+    );
+    service.assert_running();
+    service.finish(Duration::from_secs(15), true);
+
+    // An existing private cache must not turn a dead service into permission
+    // to start a second standalone coordinator or silently compile locally.
+    let retained = fs::read_dir(root.join("ops")).unwrap().count();
+    let absent = shared_service_client(root, 5005, &second_profile);
+    let (code, events, output) = absent.finish(Duration::from_secs(15), false);
+    assert_ne!(code, 0, "{output}");
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["kind"] == "canonical-compilation-started"
+                || event["kind"] == "canonical-build-completed"),
+        "{output}"
+    );
+    assert_eq!(fs::read_dir(root.join("ops")).unwrap().count(), retained);
+}
+
+#[test]
+fn canonical_shared_client_refuses_missing_service_before_namespace_or_state_acquisition() {
+    let root = tempfile::Builder::new()
+        .prefix("rabs-service-missing-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    for name in ["source", "toolchain", "state", "ops", "tools"] {
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(root.path().join(name))
+            .unwrap();
+    }
+    write(
+        root.path(),
+        "config.toml",
+        "[rabs]\nrelease_authorization='advisory'\n",
+    );
+    write(root.path(), "tools/rabs-wrap", "#!/bin/sh\nexit 99\n");
+    fs::set_permissions(
+        root.path().join("tools/rabs-wrap"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let profile = json!({
+        "version":"canonical-compile-local-v1", "command":"build",
+        "source_root":root.path().join("source"), "toolchain_root":root.path().join("toolchain"),
+        "state_root":root.path().join("state"), "operation_root":root.path().join("ops"),
+        "wrapper":root.path().join("tools/rabs-wrap"), "service_socket":root.path().join("missing.sock"),
+    });
+    let (code, events, output) = run(root.path(), 5100, &profile);
+    assert_ne!(code, 0, "{output}");
+    assert!(output.contains("No such file or directory"), "{output}");
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["kind"] == "canonical-compilation-started"
+                || event["kind"] == "canonical-build-completed"),
+        "{output}"
+    );
+    for name in ["state", "ops", "source", "toolchain"] {
+        assert_eq!(
+            fs::read_dir(root.path().join(name)).unwrap().count(),
+            0,
+            "missing service must not trigger local fallback: {output}"
+        );
+    }
+}
+
 #[test]
 #[ignore = "requires real bubblewrap namespaces, native toolchain and RABS_CANONICAL_TEST_WRAPPER"]
 fn canonical_cargo_earns_cross_worktree_dependency_hits_and_invalidates_changed_source() {

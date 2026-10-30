@@ -303,17 +303,68 @@ pub(crate) fn canonical_edge_work(
     paths: std::sync::Arc<crate::coord::live_dependency::canonical::CanonicalPaths>,
     activity: Arc<CanonicalActivity>,
 ) -> SubsystemWork {
-    Box::new(move |cx, shutdown| Box::pin(serve(cx, shutdown, config, Some((paths, activity)))))
+    let binding = CanonicalBinding {
+        paths,
+        activity,
+        remote: CanonicalRemote::FromEnvironment,
+    };
+    Box::new(move |cx, shutdown| Box::pin(serve(cx, shutdown, config, Some(binding))))
+}
+
+/// Bind one canonical operation to the persistent service's immutable worker
+/// pool. `None` is an explicit local-only choice made by that service, never a
+/// request to read process environment again when this endpoint starts.
+/// Sharing the exact pool preserves pending-action claims, worker occupancy,
+/// cooldown and durable admission ownership across simultaneous operations.
+pub(crate) fn canonical_edge_work_shared(
+    config: EdgeServerConfig,
+    paths: Arc<crate::coord::live_dependency::canonical::CanonicalPaths>,
+    activity: Arc<CanonicalActivity>,
+    remote: Option<Arc<crate::coord::live_dependency::remote::RemoteDependencies>>,
+) -> SubsystemWork {
+    let binding = CanonicalBinding {
+        paths,
+        activity,
+        remote: CanonicalRemote::Shared(remote),
+    };
+    Box::new(move |cx, shutdown| Box::pin(serve(cx, shutdown, config, Some(binding))))
+}
+
+enum CanonicalRemote {
+    FromEnvironment,
+    Shared(Option<Arc<crate::coord::live_dependency::remote::RemoteDependencies>>),
+}
+
+struct CanonicalBinding {
+    paths: Arc<crate::coord::live_dependency::canonical::CanonicalPaths>,
+    activity: Arc<CanonicalActivity>,
+    remote: CanonicalRemote,
+}
+
+impl CanonicalBinding {
+    fn live_edge(
+        &self,
+        lane: crate::coord::live_dependency::LiveDependencyLane,
+        state: &std::path::Path,
+    ) -> Result<rustc_request::LiveEdge, String> {
+        match &self.remote {
+            CanonicalRemote::FromEnvironment => {
+                rustc_request::LiveEdge::canonical_configured(lane, Arc::clone(&self.paths), state)
+            }
+            CanonicalRemote::Shared(remote) => Ok(rustc_request::LiveEdge::canonical_shared(
+                lane,
+                Arc::clone(&self.paths),
+                remote.clone(),
+            )),
+        }
+    }
 }
 
 async fn serve(
     cx: Cx,
     mut shutdown: ShutdownReceiver,
     config: EdgeServerConfig,
-    canonical: Option<(
-        std::sync::Arc<crate::coord::live_dependency::canonical::CanonicalPaths>,
-        Arc<CanonicalActivity>,
-    )>,
+    canonical: Option<CanonicalBinding>,
 ) -> Result<(), String> {
     let listener = endpoint::bind(&config.socket_path, FRAME_IO_BUDGET).await?;
     // The endpoint owner just checked the exact bound inode, kernel UID and
@@ -352,18 +403,16 @@ async fn serve(
             .clone()
             .map(|lane| {
                 match &canonical {
-                    Some((paths, _)) => rustc_request::LiveEdge::canonical_configured(
-                        lane,
-                        paths.clone(),
-                        &config.state_dir,
-                    ),
+                    Some(binding) => binding.live_edge(lane, &config.state_dir),
                     None => rustc_request::LiveEdge::configured(lane, &config.state_dir),
                 }
                 .map(std::sync::Arc::new)
             })
             .transpose()?,
         canonical_only,
-        canonical_activity: canonical.as_ref().map(|(_, activity)| Arc::clone(activity)),
+        canonical_activity: canonical
+            .as_ref()
+            .map(|binding| Arc::clone(&binding.activity)),
     };
     let limits = EdgeLimits::new(
         services

@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -93,6 +94,17 @@ class CanonicalLocalCargo(unittest.TestCase):
 
     def save(self):
         self.profile_path.write_text(json.dumps(self.profile))
+
+    def select_service(self, directory=None):
+        endpoint = (self.state if directory is None else directory) / "compile.sock"
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(listener.close)
+        listener.bind(str(endpoint))
+        endpoint.chmod(0o600)
+        listener.listen(1)
+        self.profile["service_socket"] = str(endpoint)
+        self.save()
+        return endpoint
 
     def invoke(self, args=None, env=None, prefix=None, input=b"", pass_fds=()):
         if prefix is None:
@@ -177,6 +189,69 @@ class CanonicalLocalCargo(unittest.TestCase):
                 retained = self.records()[-1]["profile"]
                 self.assertEqual(retained["target_cache"], cache)
                 self.assertEqual(retained["selection"], {"features": ["fast"]})
+
+    def test_service_profile_preserves_endpoint_and_selected_closed_stdin_command(self):
+        endpoint = self.select_service()
+        original = self.profile_path.read_bytes()
+        for args in (["check", "--workspace"], ["build", "--lib"],
+                     ["clippy", "--no-deps", "--", "-D", "warnings"],
+                     ["test"], ["test", "--no-run"], ["bench", "--no-run"]):
+            with self.subTest(args=args):
+                status, _, stderr, _ = self.invoke(args)
+                self.assertEqual(status, 0, stderr.decode(errors="replace"))
+                record = self.records()[-1]
+                self.assertEqual(record["profile"]["service_socket"], str(endpoint))
+                self.assertEqual(record["profile"]["state_root"], str(self.state))
+                self.assertEqual(record["profile"]["command"], args[0])
+                self.assertEqual(record["argv"], [str(self.driver), "--canonical-compile-local", record["retained"]])
+                self.assertEqual(record["profile"]["selection"], launcher.canonical_local_selection(args))
+                self.assertEqual(self.profile_path.read_bytes(), original)
+
+    def test_service_socket_requires_private_existing_endpoint_and_ordinary_ancestors(self):
+        endpoint = self.select_service()
+        alias = self.root / "service-alias.sock"
+        alias.symlink_to(endpoint)
+        regular = self.root / "not-a-service.sock"
+        regular.write_text("not a socket")
+        ancestor = self.root / "state-alias"
+        ancestor.symlink_to(self.state, target_is_directory=True)
+        for value in (None, True, 1, [], {}, "relative.sock", str(self.root / "missing.sock"),
+                      str(regular), str(alias), str(ancestor / endpoint.name), "/" + "s" * 108):
+            with self.subTest(value=value):
+                self.profile_path.write_text(json.dumps(dict(self.profile, service_socket=value)))
+                self.assert_refused(["check"])
+        self.save()
+        endpoint.chmod(0o660)
+        self.assert_refused(["check"])
+        endpoint.chmod(0o600)
+        self.state.chmod(0o770)
+        self.assert_refused(["check"])
+
+    def test_service_socket_cannot_enter_source_toolchain_operation_or_cargo_inputs(self):
+        cache = self.root / "cargo-cache"
+        cache.mkdir(mode=0o700)
+        for directory in (self.source, self.tools, self.operations, cache):
+            with self.subTest(directory=directory):
+                self.profile.pop("cargo_home_source", None)
+                if directory == cache:
+                    self.profile["cargo_home_source"] = str(cache)
+                self.select_service(directory)
+                self.assert_refused(["check"])
+
+    def test_service_refuses_inherited_stdin_commands_in_saved_and_overridden_intent(self):
+        self.select_service()
+        for args in (["run"], ["run", "--", "literal"], ["bench"],
+                     ["bench", "filter", "--", "--nocapture"]):
+            with self.subTest(args=args):
+                self.assert_refused(args)
+        original = dict(self.profile)
+        self.profile = dict(original, command="bench", selection={"no_run": True})
+        self.save()
+        self.assert_refused(["bench"])
+        for command in ("run", "bench"):
+            self.profile = dict(original, command=command)
+            self.save()
+            self.assert_refused(["check"])
 
     def test_private_target_configuration_is_bounded_before_native_handoff(self):
         for cache in (True, "enabled", {}, {"runtime_epoch": ""},
@@ -814,6 +889,7 @@ class CanonicalLocalCargo(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertIn(b"--rabs-canonical-local", stdout)
         self.assertIn(b"canonical-compile-local-v1", stdout)
+        self.assertIn(b"service_socket", stdout)
         self.assertIn(b"build --tests", stdout)
         self.assertIn(b"test --no-run", stdout)
         self.assertIn(b"Test results are never cached", stdout)

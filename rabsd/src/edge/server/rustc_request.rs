@@ -135,6 +135,19 @@ impl LiveEdge {
         }
     }
 
+    /// Observation and path capabilities stay operation-private while the
+    /// service's exact remote pool owns placement and admission across edges.
+    /// An explicit `None` never consults environment or wrapper configuration.
+    pub(crate) fn canonical_shared(
+        lane: LiveDependencyLane,
+        paths: Arc<CanonicalPaths>,
+        remote: Option<Arc<RemoteDependencies>>,
+    ) -> Self {
+        let mut live = Self::canonical(lane, paths);
+        live.remote = remote;
+        live
+    }
+
     fn physical_path(&self, path: &str) -> Result<PathBuf, String> {
         match &self.canonical {
             Some(paths) => paths.physical(Path::new(path)),
@@ -151,10 +164,9 @@ impl LiveEdge {
         paths: Arc<CanonicalPaths>,
         state: &Path,
     ) -> Result<Self, String> {
-        let mut live = Self::canonical(lane, paths);
-        live.remote = RemoteDependencies::from_canonical_environment(state)
+        let remote = RemoteDependencies::from_canonical_environment(state)
             .map_err(|error| error.to_string())?;
-        Ok(live)
+        Ok(Self::canonical_shared(lane, paths, remote))
     }
 }
 
@@ -1158,6 +1170,166 @@ mod completion_capture_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shared_edge_paths() -> Arc<CanonicalPaths> {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let owner = Arc::new(crate::test_util::private_tempdir());
+        let mappings = [
+            "/__rabs/workspace",
+            "/__rabs/cargo-home",
+            "/__rabs/toolchain",
+            "/__rabs/out/cargo",
+            "/__rabs/home",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, visible)| {
+            let backing = owner.path().join(index.to_string());
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&backing)
+                .unwrap();
+            (PathBuf::from(visible), backing)
+        })
+        .collect();
+        CanonicalPaths::new(owner, mappings)
+            .unwrap()
+            .require_closed_dependency_execution()
+            .unwrap()
+    }
+
+    #[test]
+    fn canonical_edges_share_service_pool_without_environment_or_request_override() {
+        use super::super::{CanonicalActivity, CanonicalBinding, CanonicalRemote};
+        use crate::coord::live::CoordLive;
+
+        const CHILD: &str = "RABS_TEST_SHARED_CANONICAL_EDGE";
+        const TEST: &str = "edge::server::rustc_request::tests::canonical_edges_share_service_pool_without_environment_or_request_override";
+        const COMPLETE: &str = "shared-canonical-edge-ownership-verified";
+        if std::env::var_os(CHILD).is_none() {
+            // Configure the actual environment reader in a private subprocess;
+            // never mutate this parallel test harness's process environment.
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env_clear()
+                .env(CHILD, "1")
+                .env(
+                    "RABS_DEPENDENCY_WORKERS_JSON",
+                    json!([{
+                        "listen":"127.0.0.1:19081",
+                        "worker_id":"service-worker",
+                        "worker_spki_sha256":"17".repeat(32),
+                    }])
+                    .to_string(),
+                )
+                .env("RABS_COORD_TLS_CA", "/private/ca.pem")
+                .env("RABS_COORD_TLS_CERT", "/private/coord.pem")
+                .env("RABS_COORD_TLS_KEY", "/private/coord.key")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&result.stdout).contains(COMPLETE),
+                "the child must run and complete this test, not an empty filter"
+            );
+            return;
+        }
+
+        let state = crate::test_util::private_tempdir();
+        let pool = RemoteDependencies::from_canonical_environment(state.path())
+            .unwrap()
+            .unwrap();
+        let coord = Arc::new(CoordLive::new());
+        let binding = |remote| CanonicalBinding {
+            paths: shared_edge_paths(),
+            activity: CanonicalActivity::new(),
+            remote,
+        };
+        let first_binding = binding(CanonicalRemote::Shared(Some(Arc::clone(&pool))));
+        let second_binding = binding(CanonicalRemote::Shared(Some(Arc::clone(&pool))));
+        let first_state = state.path().join("first-operation-shadow");
+        let second_state = state.path().join("second-operation-shadow");
+        let first = first_binding
+            .live_edge(LiveDependencyLane::new(Arc::clone(&coord)), &first_state)
+            .unwrap();
+        let second = second_binding
+            .live_edge(LiveDependencyLane::new(Arc::clone(&coord)), &second_state)
+            .unwrap();
+        // Sharing the exact owner also shares its pending-action map, worker
+        // occupancy/cooldown and durable-admission transports. A separately
+        // parsed equivalent JSON configuration would have different ownership.
+        assert!(Arc::ptr_eq(first.remote.as_ref().unwrap(), &pool));
+        assert!(Arc::ptr_eq(second.remote.as_ref().unwrap(), &pool));
+        assert_eq!(first.remote_worker_count(), 1);
+        assert_eq!(second.remote_configuration(), first.remote_configuration());
+        assert!(!Arc::ptr_eq(&first.facts, &second.facts));
+        assert!(!Arc::ptr_eq(
+            first.canonical.as_ref().unwrap(),
+            second.canonical.as_ref().unwrap()
+        ));
+        assert!(!first_state.exists());
+        assert!(!second_state.exists());
+        first_binding
+            .activity
+            .seal_and_wait(std::time::Duration::ZERO, || false)
+            .unwrap();
+        assert!(first_binding.activity.admit().is_none());
+        let other_session = second_binding.activity.admit().unwrap();
+        assert_eq!(second_binding.activity.active_sessions(), 1);
+        drop(other_session);
+
+        // A service that selected local-only remains local-only even though
+        // valid operator worker variables are present in this process.
+        let local_state = state.path().join("local-operation-shadow");
+        let local = binding(CanonicalRemote::Shared(None))
+            .live_edge(LiveDependencyLane::new(Arc::clone(&coord)), &local_state)
+            .unwrap();
+        assert_eq!(local.remote_worker_count(), 0);
+        assert!(local.remote_configuration().is_none());
+        for remote_protocol in [Value::Null, json!(1)] {
+            let request = json!({
+                "kind":"rustc-request", "remote_protocol":remote_protocol,
+                "argv":["/__rabs/toolchain/bin/rustc", "--crate-name=leaf"],
+                "cwd":"/__rabs/cargo-home/registry/src/index/leaf-1.0.0",
+                "env":[["RABS_DEPENDENCY_WORKERS_JSON", "[{\"worker_id\":\"project-worker\"}]"]],
+                "workers":[{"worker_id":"project-worker", "listen":"127.0.0.1:19082"}],
+                "dependency_worker":{"worker_id":"project-worker"},
+                "local_capture_allowed":true,
+            });
+            let Decided::Reply(reply) = decide(&local, &request) else {
+                panic!("project frame cannot obtain an executor or start input preparation");
+            };
+            let reply: Value = serde_json::from_str(&reply).unwrap();
+            assert_eq!(reply["decision"], "pass-through");
+            assert_eq!(
+                reply["reason"],
+                "canonical-project-executors-require-isolated-dependency-execution"
+            );
+            assert_eq!(reply["compiler_skip_authorized"], false);
+            assert!(local.remote_configuration().is_none());
+        }
+        assert!(!local_state.exists());
+
+        // Standalone canonical operation behavior remains explicit: its own
+        // binding reads operator configuration once and owns a separate pool.
+        let standalone_state = state.path().join("standalone-shadow");
+        let standalone = binding(CanonicalRemote::FromEnvironment)
+            .live_edge(LiveDependencyLane::new(coord), &standalone_state)
+            .unwrap();
+        assert_eq!(
+            standalone.remote_configuration(),
+            first.remote_configuration()
+        );
+        assert!(!Arc::ptr_eq(standalone.remote.as_ref().unwrap(), &pool));
+        assert!(standalone_state.join("dependency-workers").is_dir());
+        println!("{COMPLETE}");
+    }
 
     #[test]
     fn project_code_cannot_enable_local_capture_by_claiming_a_remote_protocol() {
