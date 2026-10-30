@@ -47,6 +47,7 @@
 pub mod authority;
 pub mod authority_matrix;
 pub mod build_script_policy;
+pub mod canonical_service;
 pub mod capability_tokens;
 pub mod class_policy;
 pub mod compat_doctor;

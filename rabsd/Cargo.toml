@@ -41,7 +41,7 @@ asupersync = { version = "=0.5.0", git = "https://github.com/Dicklesworthstone/a
 [target.'cfg(unix)'.dependencies]
 # Selected registry cache files are opened relative to retained directory
 # descriptors; neither symlinked ancestors nor a substituted FIFO are inputs.
-rustix = { version = "1.1.4", features = ["fs", "process"] }
+rustix = { version = "1.1.4", features = ["fs", "process", "net", "event"] }
 
 [dev-dependencies]
 tempfile = "3.25.0"
