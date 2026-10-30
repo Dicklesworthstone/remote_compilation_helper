@@ -45,14 +45,19 @@ only the stated step, never closure of the surrounding milestone.
   - [ ] Bind the exact source/overlay, toolchain, profile, Cargo artifacts and binary hashes.
   - [x] Include validated `RCH_BUILD_SOURCE` in the default release/service identity
     and add the cross-overlay verdict rejection regression (`1a5487bc`).
-  - [ ] Execute that Rust regression with an explicit compiled source stamp.
+  - [x] Execute the source-stamped Rust release/identity selection: 12/12 passed,
+    exit 0, wrapper-release profile at `78abd733` on trj (build `30087403704156409`).
+    This tests authorization/identity logic, not the daemon or cache serving.
   - [ ] Keep strict remote execution, disk preflight and existing ownership intact.
   - [ ] Resolve every compiler error; rerun workspace/all-target check and strict Clippy.
-- [ ] Run real Cargo cross-worktree dependency acceptance to a terminal result (M4).
-  - [ ] Cold compiler execution, two comparisons, later compiler skip and stock byte parity.
-  - [ ] Registry and vendored inputs, source mutation/unlisted files, large packages/artifacts.
-  - [ ] Cargo Fresh rebuild and workspace-only edit; restricted build-script cases.
-  - [ ] Retain complete failures/refusals and distinguish support tests from Cargo tests.
+- [x] Run real Cargo cross-worktree dependency acceptance to a terminal result (M4).
+  - [x] Cold compiler execution, two comparisons, later compiler skip and stock byte parity.
+  - [x] Registry and vendored inputs, source mutation/unlisted files, large packages/artifacts.
+  - [x] Cargo Fresh rebuild and workspace-only edit; restricted build-script cases.
+  - [x] Retain complete failures/refusals and distinguish support tests from Cargo tests.
+  Native result: 10/10, exit 0, 212.75s of test execution at `a11a6788` on ts1;
+  six real Cargo consumer cases plus four artifact-resolver/helper cases. This
+  qualifies the narrow fixture behavior, not M4's still-open field/performance gates.
 - [ ] Run canonical namespace and authenticated worker acceptance unchanged (M4/M9).
   - [x] Extend the existing native runner with `--suite canonical`: build wrapper,
     daemon, worker and Cargo supervisor together from source-checked Cargo JSON
@@ -62,6 +67,11 @@ only the stated step, never closure of the surrounding milestone.
     `rabs-execute-20261030-runner-canonical-contract-final.log`.
     The first new contract run failed five subcases because artifact hashing
     still selected the original pair; corrected the selector and reran all 25.
+  - [x] Prepare canonical Cargo's actual test graph before binding its daemon
+    and harness: `cargo test --no-run`, source-checked JSON artifacts and unchanged
+    binary checks before/after test execution. Its dev dependencies enable
+    additional runtime/CAS features, so a normal-build daemon hash is insufficient.
+    Expanded runner contract: 28/28, exit 0, 42.341s on trj; explicit Cargo doubles.
   - [x] Run the production base namespace argv with `/usr/bin/true`: exit 0 on
     trj and ts1. This proves namespace creation only, not a Cargo build.
   - [ ] Exercise retained toolchain/runtime and private target roots with actual Cargo.
@@ -176,6 +186,63 @@ No suppression or scanner change was applied. Ruff findings were corrected
 manually, including executable modes, import spacing and explicit test
 `check=False`; actionlint and `git diff --check` pass. Retained scan:
 `/Volumes/trj-data/rabs-execute-20261030-runner-ubs-reviewed.log`.
+
+The native `rabs-protocol` release-authorization selection then compiled and ran
+**12/12, exit 0**, with 486 other tests filtered out. RCH explicitly injected
+`RCH_BUILD_SOURCE=78abd733d6ebc58be078521a615e15d5af2fe3d5`; the derived-identity
+test therefore exercised the validated compiled-stamp branch, and the different
+overlay verdict was rejected. The source-content receipt covers 1,652 files,
+46,322,110 bytes; receipt root
+`ee90272387519345e7311f696ae54a105ffca9e7f228b45be38c548ba0fae9f3`.
+Transcript `/Volumes/trj-data/rabs-execute-20261030-stamped-release-identity-owned.log`.
+An earlier isolated off-root attempt ended with unconfirmed SSH completion;
+supported `rch jobs recover` subsequently acknowledged 255. It supplies no
+Rust test verdict. The a11a6788 workspace check remains a separate ongoing
+qualification.
+
+**Real Cargo serving result (23:31 UTC):** the ts1 wrapper/daemon dev build
+finished 0 after 1,843.070s, and the unchanged `live_cargo_worktrees` suite
+finished **10/10, exit 0**, 212.75s in libtest (252.802s including its harness
+build). Six cases invoke real Cargo/rustc and a real daemon/CAS; four are
+artifact-resolver/helper checks. The registry-layout and vendor fixtures earn
+their results through cold execution and two comparisons, then serve without
+admitting dependency compiler work. Stock bytes, Cargo Fresh behavior,
+workspace-only edits, changed and unlisted vendor inputs, large source/output
+preparation, restricted build-script reuse and tracked `OUT_DIR` refusal pass.
+This is narrow fixture correctness, not a production-repository canary,
+authenticated worker proof, release-profile qualification or M4 closure.
+
+The build source is `a11a6788179e4d5732880400f07d6a52053c6abe`, toolchain
+nightly-2026-08-31 (`rustc 90850177249efe0321573c569aec5d12b257f8d6`), dev
+profile, two Cargo jobs with dev/test debug information and incremental disabled.
+Prepared and consumer-verified binaries:
+`rabs-wrap` 1,463,840 bytes, SHA-256
+`48f7b2ee3c1037c1ab2726d54df8d4062d6c1b1d3e3314fbd49e68a32768caac`;
+`rabsd` 58,597,352 bytes, SHA-256
+`9b55f29cc1c31c09097b37c6a2fa5baaa4f40ee1ad79e6d3cc20cb339eb7729e`.
+The RCH job lacks the explicit compile-time source stamp as disclosed above;
+this does not authorize a release. Build `30087403704156398` acknowledged 0 and
+retrieved all three result files: `binaries.json`, `run.json`, `cargo-build.jsonl`
+under `/Users/jemanuel/projects/rabs_native_execution_20261030/.rch-tmp/rabs-native-nas-live/`.
+The complete transcript is
+`/Volumes/trj-data/rabs-execute-20261030-native-nas-explicit-target.log`, SHA-256
+`bb7ce2b4445b5e94571310ecdcac2adbce53a74f8e9ac81d4be8299e1e3af11d`.
+Both non-gating tiny-fixture timing observations remain visible: stock/served
+1.305108005s/579.522201ms and 524.727451ms/547.2483ms. The latter served run was
+slower; neither pair qualifies the original performance targets.
+
+The canonical runner subsequently gained a test-graph preparation phase because
+`rabsd`'s dev dependencies enable `asupersync/test-internals`, CAS test support
+and additional rustix features. Build wrapper/worker/supervisor normally, prepare
+the exact canonical integration target with `cargo test --no-run`, then bind the
+actual daemon and test executable from Cargo JSON before the unchanged test
+invocation. Check retained binaries again after preparation and execution.
+The expanded contract selection passed **28/28, exit 0, 42.341s**; it uses Cargo
+doubles and is not native acceptance. An earlier 27-case attempt had one
+ordering failure in the nonsibling-supervisor case; moving that refusal before
+test preparation preserved its fail-before-any-extra-work contract, and all
+28 were rerun. Transcript:
+`/Volumes/trj-data/rabs-execute-20261030-runner-test-graph-contract-fixed.log`.
 
 ### Capability assessment
 

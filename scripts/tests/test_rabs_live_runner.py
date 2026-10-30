@@ -108,6 +108,28 @@ if args[0] == "build":
             print(json.dumps(record))
     print(json.dumps({"reason": "build-finished", "success": mode not in ["nonzero", "failed-finish"]}))
     sys.exit(31 if mode == "nonzero" else 0)
+if args[0] == "test" and "--no-run" in args:
+    target = pathlib.Path(args[args.index("--target-dir") + 1])
+    profile = args[args.index("--profile") + 1]
+    directory = target / ("debug" if profile == "dev" else profile)
+    for name, source, kind in [
+        ("rabsd", root / "rabsd/src/main.rs", "bin"),
+        ("canonical_check_local", root / "rabsd/tests/canonical_check_local.rs", "test"),
+    ]:
+        binary = directory / name
+        binary.write_bytes(b"test graph artifact: " + name.encode())
+        binary.chmod(0o700)
+        if mode == "missing-prepared-daemon" and name == "rabsd":
+            continue
+        if mode == "foreign-harness" and kind == "test":
+            source = pathlib.Path("/another-checkout/rabsd/tests/canonical_check_local.rs")
+        if mode == "nonexec-harness" and kind == "test":
+            binary.chmod(0o600)
+        print(json.dumps({"reason": "compiler-artifact", "target": {
+            "name": name, "kind": [kind], "src_path": str(source)},
+            "profile": {"test": kind == "test"}, "executable": str(binary)}))
+    print(json.dumps({"reason": "build-finished", "success": mode != "prepare-failed"}))
+    sys.exit(43 if mode == "prepare-failed" else 0)
 if args[0] == "test":
     canonical = "canonical_check_local" in args
     manifest = (pathlib.Path(os.environ["TEST_OUTPUT"]) / "binaries.json" if canonical else
@@ -119,15 +141,18 @@ if args[0] == "test":
     assert record["workspace_root"] == str(root)
     names = ["rabs-wrap", "rabsd"]
     if canonical:
-        names += ["rabs-wkr", "rabs-cargo-root"]
+        names += ["rabs-wkr", "rabs-cargo-root", "canonical_check_local"]
         assert "RABS_TEST_BINARIES" not in os.environ
         assert os.environ["RABS_CANONICAL_TEST_WRAPPER"] == record["rabs-wrap"]["path"]
         assert os.environ["RABS_TEST_WORKER_BIN"] == record["rabs-wkr"]["path"]
+        assert pathlib.Path(record["rabsd"]["path"]).read_bytes() == b"test graph artifact: rabsd"
     for name in names:
         item = record[name]
         data = pathlib.Path(item["path"]).read_bytes()
         assert item["sha256"] == hashlib.sha256(data).hexdigest()
         assert item["size"] == len(data)
+    if mode == "mutate-during-test" and canonical:
+        pathlib.Path(record["rabsd"]["path"]).write_bytes(b"changed daemon")
     sys.stdout.buffer.write(b"fixture test stdout\x00\xff\n")
     sys.stdout.flush()
     sys.stderr.buffer.write(b"fixture test stderr\n")
@@ -222,9 +247,12 @@ class RunnerTests(unittest.TestCase):
             "RCH_BUILD_SOURCE": "a11a6788179e4d5732880400f07d6a52053c6abe",
         })
         self.assertEqual(result.returncode, 0, result.stderr)
-        build, test = self.calls()
+        build, preparation, test = self.calls()
         self.assertIn("rabs-wkr", build["argv"])
+        self.assertNotIn("rabsd", build["argv"])
         self.assertIn("--bins", build["argv"])
+        self.assertIn("--no-run", preparation["argv"])
+        self.assertIn("--message-format=json-render-diagnostics", preparation["argv"])
         self.assertIn("canonical_check_local", test["argv"])
         self.assertNotIn("live_cargo_worktrees", test["argv"])
         self.assertEqual(test["argv"][test["argv"].index("-p") + 1], "rabsd")
@@ -233,6 +261,7 @@ class RunnerTests(unittest.TestCase):
         self.assertIsNone(build["wrapper"])
         self.assertIsNone(build["worker"])
         self.assertEqual(self.report()["suite"], "canonical")
+        self.assertEqual(self.report()["test_preparation_exit"], 0)
         self.assertEqual(self.report()["build_source"],
                          "a11a6788179e4d5732880400f07d6a52053c6abe")
 
@@ -261,6 +290,48 @@ class RunnerTests(unittest.TestCase):
         result = self.launch(["--suite", "canonical"], {"TEST_EXIT": "37"})
         self.assertEqual(result.returncode, 37, result.stderr)
         self.assertEqual(self.report()["test_exit"], 37)
+
+    def test_canonical_test_graph_failure_or_bad_artifacts_never_runs_tests(self):
+        for mode, expected in [("prepare-failed", 43), ("missing-prepared-daemon", 2),
+                               ("foreign-harness", 2), ("nonexec-harness", 2)]:
+            with self.subTest(mode=mode):
+                mark = len(self.calls())
+                result = self.launch(["--suite", "canonical"], {"TEST_MODE": mode})
+                self.assertEqual(result.returncode, expected, result.stderr)
+                self.assertEqual(len(self.calls()), mark + 2)
+                self.assertIsNone(self.report()["test_exit"])
+                self.assertFalse((self.output / "binaries.json").exists())
+
+    def test_canonical_changed_test_graph_binary_cannot_claim_success(self):
+        result = self.launch(["--suite", "canonical"], {"TEST_MODE": "mutate-during-test"})
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(self.report()["test_exit"], 0)
+        self.assertIn("changed the prepared rabsd", self.report()["preparation_error"])
+
+    def test_canonical_jobserver_survives_build_test_preparation_and_execution(self):
+        read_fd, write_fd = os.pipe()
+        try:
+            os.write(write_fd, b"+")
+            os.set_blocking(read_fd, False)
+            flags = f"-j --jobserver-auth={read_fd},{write_fd}"
+            result = self.launch(["--suite", "canonical"], changes={
+                "CARGO_MAKEFLAGS": flags,
+                "TEST_JOBSERVER_READ": str(read_fd), "TEST_JOBSERVER_WRITE": str(write_fd),
+            }, pass_fds=(read_fd, write_fd))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            calls = self.calls()
+            self.assertEqual([call["argv"][0] for call in calls], ["build", "test", "test"])
+            for call in calls:
+                self.assertEqual(call["makeflags"], flags)
+                self.assertEqual(call["jobserver_token"], "2b")
+                for name in ["cargo-build.jsonl", "cargo-test-build.jsonl"]:
+                    self.assertNotIn(str(self.output / name), call["inherited"])
+            self.assertEqual(os.read(read_fd, 1), b"+")
+            with self.assertRaises(BlockingIOError):
+                os.read(read_fd, 1)
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
 
     def test_toolchain_rustflags_and_jobserver_environment_are_not_rewritten(self):
         changes = {"RUSTUP_TOOLCHAIN": "nightly-fixture", "RUSTFLAGS": "-C debuginfo=1",

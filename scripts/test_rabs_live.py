@@ -44,6 +44,7 @@ NAMES = ("rabs-wrap", "rabsd")
 CANONICAL_NAMES = NAMES + ("rabs-wkr", "rabs-cargo-root")
 BINARY_SOURCES = {name: Path(name) / "src/main.rs" for name in NAMES + ("rabs-wkr",)}
 BINARY_SOURCES["rabs-cargo-root"] = Path("rabs-wkr/src/bin/rabs-cargo-root.rs")
+BINARY_SOURCES["canonical_check_local"] = Path("rabsd/tests/canonical_check_local.rs")
 
 
 class PreparationError(Exception):
@@ -124,8 +125,9 @@ class CargoArtifacts:
         if not isinstance(target, dict) or target.get("name") not in self.names:
             return
         profile = value.get("profile")
-        if (target.get("kind") != ["bin"] or not isinstance(profile, dict)
-                or profile.get("test") is not False):
+        harness = target["name"] == "canonical_check_local"
+        if (target.get("kind") != (["test"] if harness else ["bin"])
+                or not isinstance(profile, dict) or profile.get("test") is not harness):
             return
         name = target["name"]
         source = target.get("src_path")
@@ -240,9 +242,7 @@ def run(args, workspace):
               "--target-dir", str(target), "--profile", args.profile]
     canonical = args.suite == "canonical"
     names = CANONICAL_NAMES if canonical else NAMES
-    packages = ["-p", "rabs-wrap", "-p", "rabsd"]
-    if canonical:
-        packages += ["-p", "rabs-wkr"]
+    packages = ["-p", "rabs-wrap", "-p", "rabs-wkr" if canonical else "rabsd"]
     build = [cargo, "build"] + common + packages + ["--bins", "--message-format=json-render-diagnostics"]
     test_target = (["-p", "rabsd", "--test", "canonical_check_local"] if canonical else
                    ["-p", "rabs-wrap", "--test", "live_cargo_worktrees"])
@@ -253,6 +253,8 @@ def run(args, workspace):
                    for value in args.test_args):
             test_options += ["--test-threads=1"]
     test = [cargo, "test"] + common + test_target + ["--"] + test_options + args.test_args
+    test_preparation = ([cargo, "test"] + common + test_target +
+                        ["--no-run", "--message-format=json-render-diagnostics"] if canonical else None)
     env = dict(os.environ)
     # An old manifest from a calling test session is not this build's output.
     for key in (MANIFEST_ENV, "RABS_CANONICAL_TEST_WRAPPER", "RABS_TEST_WORKER_BIN"):
@@ -261,13 +263,15 @@ def run(args, workspace):
               "workspace_root": str(workspace), "profile": args.profile, "suite": args.suite,
               "build_source": env.get("RCH_BUILD_SOURCE"),
               "build_command": build, "test_command": test,
+              "test_preparation_command": test_preparation, "test_preparation_exit": None,
               "build_exit": None, "test_exit": None}
     start = time.monotonic()
     try:
         print(f"RABS binary preparation ({args.profile}) -> {output}", file=sys.stderr, flush=True)
         descriptor = os.open(output / "cargo-build.jsonl", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(descriptor, "wb") as log:
-            status, binaries = collect_build(build, workspace, env, log, names)
+            build_names = tuple(name for name in names if not canonical or name != "rabsd")
+            status, binaries = collect_build(build, workspace, env, log, build_names)
         report["build_exit"] = status
         report["preparation_seconds"] = time.monotonic() - start
         if status != 0:
@@ -275,6 +279,22 @@ def run(args, workspace):
         if canonical and (Path(binaries["rabs-wkr"]["path"]).parent !=
                           Path(binaries["rabs-cargo-root"]["path"]).parent):
             raise PreparationError("worker and Cargo supervisor artifacts are not siblings")
+        if canonical:
+            # Cargo's dev dependencies can rebuild the daemon with a different
+            # feature graph. Prepare the SAME integration target before binding
+            # its executable, rather than guessing that the normal build is it.
+            descriptor = os.open(output / "cargo-test-build.jsonl", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "wb") as log:
+                status, test_binaries = collect_build(test_preparation, workspace, env, log,
+                                                     ("rabsd", "canonical_check_local"))
+            report["test_preparation_exit"] = status
+            if status != 0:
+                return status
+            for name, artifact in binaries.items():
+                if fingerprint(artifact["path"]) != artifact:
+                    raise PreparationError("test preparation changed the prepared " + name)
+            binaries.update(test_binaries)
+        report["preparation_seconds"] = time.monotonic() - start
         manifest = output / "binaries.json"
         record = {"schema": "rabs.canonical-test-binaries" if canonical else SCHEMA,
                   "version": 1, "workspace_root": str(workspace),
@@ -292,6 +312,10 @@ def run(args, workspace):
         status = subprocess.call(test, cwd=workspace, env=env, close_fds=False)
         report["test_seconds"] = time.monotonic() - started_test
         report["test_exit"] = status
+        if canonical:
+            for name, artifact in binaries.items():
+                if fingerprint(artifact["path"]) != artifact:
+                    raise PreparationError("test execution changed the prepared " + name)
         return status
     except (OSError, PreparationError) as error:
         report["preparation_error"] = str(error)
