@@ -361,6 +361,43 @@ outer upload can still leave an SSH process, but it owns no source activity
 lock. This is not an expiry policy for running compilers or streamed rsync/tar
 payloads: their independent activity must still drain before cancellation.
 
+Finite source RPCs also have a worker-side absolute deadline. Complete input
+alone does not prevent an orphan: an artifact-header reply blocked by a stopped
+SSH reader previously retained activity beyond the dispatcher's 30-second
+timeout. Each finite RPC now runs inside the private supervised group before
+waiting for activity. Its deadline covers inner-program parsing, lock
+acquisition, execution and reply writes, using the operation's existing budget:
+
+| Finite source operation | Worker execution budget |
+| --- | --- |
+| Project topology | 20 seconds |
+| Mirror ownership repair | 600 seconds |
+| Dependency preflight | 20 seconds per 128-path batch, summed across the closure |
+| Source-manifest verification | 180 seconds |
+| Artifact headers and Cargo evidence | 30 seconds |
+| Freshness refresh/qualification and retained-tree retirement | 120 seconds |
+| Clean-overlay archive extraction | Existing payload-size-derived attempt budget |
+
+This is an absolute request deadline, without heartbeat renewal. Expiry tears
+down that request's still-owned process group, including a queued activity
+waiter, and reports status 124 with `RCH_SOURCE_ACTIVITY_TIMEOUT` when the reply
+channel permits delivery. External termination and unavailable supervision use
+distinct `RCH_SOURCE_ACTIVITY_*` diagnostics. The observer accepts success or a
+nonzero command result only after group teardown and an exact completion
+receipt. A timeout does not release a durable claim or prove cancellation;
+lost mutation replies still require the existing ownership-verified recovery.
+
+Both shell frames remain on stdin. The finite supervisor forwards its complete
+program descriptor without imposing the heartbeat bootstrap's 32 MiB limit;
+valid large manifests and artifact path sets retain their existing limits.
+The upload shell stays alive to own any here-document writer; its ordinary exit
+must not masquerade as a supervisor child notification. Explicit status
+propagation preserves the worker result without that inherited-child race.
+Uploads and both output streams are polled concurrently by the bounded capture
+helpers. Compilers, streamed rsync and native Windows archive operations retain
+their separate lifetime policies. These deadlines share the supervisor's
+scheduling and interruptible-I/O assumptions below.
+
 Source rsync sessions now receive the configured
 `source_sync_silence_timeout_secs` as rsync's peer I/O timeout, including uploads,
 no-delta content barriers and clean-overlay archive upload. The default is 120
@@ -645,6 +682,49 @@ dependency graph, so the previous `asupersync 0.5.0` failure was not repeated.
 The earlier 313-case Linux result remains scoped to its recorded correction;
 only the 25-case SSH suite was rerun for this follow-up.
 
+The finite-RPC correction reproduced the blocked-reply defect against the
+unchanged artifact-header program: activity remained held after 32 seconds with
+complete input already delivered, beyond its declared 30-second client budget.
+Both a native unread pipe and real loopback SSH with a stopped local client
+reproduced it. Resuming the readers completed the exact 512- and 8,192-header
+replies respectively and only then freed activity; claims and source bytes
+remained unchanged.
+
+Qualification also caught and corrected a large-upload launcher interaction:
+an `exec` could transfer a shell's here-document writer into the observer, whose
+normal child notification then revoked the RPC. Keeping the upload shell alive
+with explicit result propagation passed the same 256 KiB program that had
+returned status 73. The production-frame tests also stream a 33 MiB program,
+proving that finite requests do not inherit the heartbeat bootstrap byte cap.
+
+The final native holder/pair suite passed all 89 cases without skips, including
+nine new finite-RPC regressions. They cover blocked artifact replies, queued
+requests that must never run after expiry, interrupted uploads, exact large
+output/nonzero results, subsecond and long budgets, observer/monitor/workload
+termination, and descendant drainage before successful acknowledgement. Exact
+claim bytes/inodes, source sentinels and receipt directories remain intact.
+The full real loopback OpenSSH suite passed all 29 cases without skips,
+including four new cases: a stopped reader during the actual 8,192-header reply,
+a disconnected queued request, a complete 512-header positive reply and exact
+nonzero status/output propagation. Existing cancellation, lost-reply, restart,
+successor-preservation and conflicting-evidence cases passed in that same run.
+
+Early qualification attempts encountered this container's regular-file
+`/dev/null` on a full filesystem and a full `/tmp`; one existing Bash bad-plan
+case could not create its input before reaching the expected refusal. The final
+runs used private mount/user namespaces with a genuine null character device
+and retained writable temporary storage. OpenSSH retained strict host checking,
+fresh fixture keys and privilege separation. No product prerequisite, assertion
+or timeout was weakened, and failed-attempt logs were retained.
+
+Pinned workspace formatting, shell/Python syntax and `git diff --check` passed.
+The new Rust concurrent-upload/output regression and expanded finite-frame,
+manifest-byte and Cargo-evidence tests remain **uncompiled and unexecuted**.
+The finite worker tests execute extracted production programs, not compiled
+Rust command builders. The same build-capacity constraint prevented another
+heavy dependency attempt; full workspace check/Clippy and RCH runtime tests
+remain required. The `ubs` scanner was unavailable in this environment.
+
 The journal-custody correction passed 25 job-identity and journal tests in the
 actual default-feature `rch-common` crate using the pinned nightly toolchain.
 Default-feature `rch-common` Clippy with `--lib --tests -- -D warnings` also
@@ -723,6 +803,8 @@ cargo test --locked -p rch --bin rch terminal_cancellation_command_preserves_ --
 cargo test --locked -p rch --bin rch source_rsync_idle_timeout_ -- --test-threads=1
 cargo test --locked -p rch --bin rch source_rsync_peer_timeout_ -- --test-threads=1
 cargo test --locked -p rch --bin rch finite_source_activity_script_ -- --test-threads=1
+cargo test --locked -p rch --bin rch source_rpc_upload_ -- --test-threads=1
+cargo test --locked -p rch --bin rch cargo_artifact_evidence_ -- --test-threads=1
 cargo test --locked -p rch --bin rch remote_manifest_finite_input_ -- --test-threads=1
 cargo test --locked -p rch --bin rch verifier_ -- --test-threads=1
 cargo test --locked -p rch --bin rch source_pair_ -- --test-threads=1
@@ -774,6 +856,15 @@ worker fixtures:
    may hold activity. Cancel that exact intent, then deliver the tail and verify
    that it refuses without touching source contents. Qualify complete large
    programs and actual build/transfer activity independently of that bootstrap.
+   After a complete finite RPC upload, stop its SSH reader while the artifact
+   reply is blocked and verify activity expires within the worker budget.
+   Abandon a queued RPC, let its deadline expire, then unlock: it must never
+   execute late. Preserve the claim, cancellation fence, pair owner and receipts
+   throughout. Interrupt freshness/retirement before its durable reply and
+   recover using the same exact identity. Qualify valid programs larger than
+   32 MiB, closure-derived budgets over one hour, progressing large replies and
+   exact nonzero exit results; the heartbeat bootstrap cap must not truncate
+   these finite requests.
    Stall rsync protocol input and output while retaining the SSH channel: the
    remote sender/receiver must relinquish activity after its configured I/O idle
    deadline while leaving claim bytes and source ownership intact. Verify long

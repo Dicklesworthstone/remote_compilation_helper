@@ -5,11 +5,24 @@ set -eu
 # expiry cannot touch a separately launched source activity and never edits a
 # claim, cancellation marker, pair owner or receipt. Those durable records,
 # plus the activity mutex, remain the authority for recovery after expiry.
-if [ "${1-}" = --rch-session ]; then
+# A finite RPC uses the same owned-group teardown with its caller's existing
+# absolute budget. It supervises only that RPC, including an activity-lock
+# wait and blocked reply; it never inherits a compiler or rsync session's life.
+if [ "${1-}" = --rch-session ] || [ "${1-}" = --rch-finite-rpc ]; then
+    rch_session_mode=$1
     command -v python3 >/dev/null 2>&1 || {
-        printf '%s\n' 'RCH_SOURCE_LOCK_LIVENESS_UNAVAILABLE: Python 3 is required; no source locks acquired' >&2
+        if [ "$rch_session_mode" = --rch-finite-rpc ]; then
+            printf '%s\n' 'RCH_SOURCE_ACTIVITY_LIVENESS_UNAVAILABLE: Python 3 is required; no source activity acquired' >&2
+        else
+            printf '%s\n' 'RCH_SOURCE_LOCK_LIVENESS_UNAVAILABLE: Python 3 is required; no source locks acquired' >&2
+        fi
         exit 73
     }
+    if [ "$rch_session_mode" = --rch-finite-rpc ]; then
+        set -- "${2-}" --rch-finite-rpc
+    else
+        set -- "${2-}"
+    fi
     exec python3 -I -S -c '
 import os
 import select
@@ -20,6 +33,8 @@ import time
 HEARTBEAT = b"RCH_SOURCE_LOCK_HEARTBEAT\n"
 MAX_FRAME = 4096
 MAX_PROGRAM = 32 * 1024 * 1024
+finite_rpc = len(sys.argv) == 3 and sys.argv[2] == "--rch-finite-rpc"
+family = "RCH_SOURCE_ACTIVITY" if finite_rpc else "RCH_SOURCE_LOCK"
 
 def diagnostic(message):
     # Diagnostics must not prevent teardown when the SSH reader is gone or
@@ -31,15 +46,31 @@ def diagnostic(message):
         pass
 
 try:
-    idle = int(sys.argv[1])
-    if len(sys.argv) != 2 or not 1 <= idle <= 3600:
-        raise ValueError("invalid heartbeat deadline")
+    budget = int(sys.argv[1])
+    if finite_rpc:
+        # Duration::MAX.as_millis(): preserve closure/size-derived budgets
+        # above an hour and subsecond RPCs; the heartbeat policy is unrelated.
+        if not 1 <= budget <= 18446744073709551615999:
+            raise ValueError("invalid finite RPC deadline in milliseconds")
+        idle = budget / 1000
+    else:
+        if len(sys.argv) != 2 or not 1 <= budget <= 3600:
+            raise ValueError("invalid heartbeat deadline")
+        idle = budget
     if not hasattr(signal, "pthread_sigmask") or not hasattr(signal, "sigwait"):
         raise ValueError("non-reaping child notification is unavailable")
-    with os.fdopen(3, "rb", closefd=True) as source:
-        program = source.read(MAX_PROGRAM + 1)
-    if not program or len(program) > MAX_PROGRAM or b"\x00" in program:
-        raise ValueError("invalid bounded holder program")
+    if finite_rpc:
+        # Rust has framed the complete program on fd 3 before invoking us.
+        # Forward the descriptor rather than copying it: a manifest/header
+        # request can legitimately exceed the holder bootstrap byte limit.
+        # Its shell still parses the inner complete frame before admission.
+        os.fstat(3)
+        deadline = time.monotonic() + idle
+    else:
+        with os.fdopen(3, "rb", closefd=True) as source:
+            program = source.read(MAX_PROGRAM + 1)
+        if not program or len(program) > MAX_PROGRAM or b"\x00" in program:
+            raise ValueError("invalid bounded holder program")
     # Block before fork, and catch rather than ignore SIGCHLD: Darwin can
     # discard default-ignored signals instead of making them pending for
     # sigwait. This also clears inherited explicit ignore/auto-reap behavior.
@@ -48,7 +79,7 @@ try:
     receipt_read, receipt_write = os.pipe()
     monitor = os.fork()
 except (OSError, ValueError, IndexError) as error:
-    diagnostic("RCH_SOURCE_LOCK_LIVENESS_UNAVAILABLE: " + str(error))
+    diagnostic(family + "_LIVENESS_UNAVAILABLE: " + str(error))
     sys.exit(73)
 
 if monitor:
@@ -61,6 +92,8 @@ if monitor:
     # an existing process group. No saved/reused PID is authority.
     os.close(receipt_write)
     os.close(0)
+    if finite_rpc:
+        os.close(3)
     signal.sigwait({signal.SIGCHLD})
     # Revoke the exact child first, including one stopped before setsid.
     # Then signal its still-pinned group unconditionally: inspecting getpgid
@@ -85,7 +118,7 @@ if monitor:
             and receipt.endswith(b"\n") and receipt[:-1].isdigit()
             and 0 <= int(receipt) <= 255):
         sys.exit(int(receipt))
-    diagnostic("RCH_SOURCE_LOCK_SUPERVISOR_TERMINATED: no holder completion receipt; "
+    diagnostic(family + "_SUPERVISOR_TERMINATED: no holder completion receipt; "
                + "durable ownership retained; status=" + str(status))
     sys.exit(73)
 
@@ -128,11 +161,15 @@ try:
         signal.signal(signum, interrupt)
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
     signal.signal(signal.SIGPIPE, signal.SIG_IGN)
-    child_read, child_write = os.pipe()
+    if finite_rpc:
+        child_read, child_write = 3, None
+    else:
+        child_read, child_write = os.pipe()
     child = os.fork()
     if child == 0:
         os.close(receipt_write)
-        os.close(child_write)
+        if child_write is not None:
+            os.close(child_write)
         os.dup2(child_read, 0)
         os.close(child_read)
         for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM, signal.SIGPIPE):
@@ -142,22 +179,33 @@ try:
         except OSError:
             os._exit(127)
     os.close(child_read)
-    os.set_blocking(child_write, False)
-    os.set_blocking(0, False)
-    # The full compound program is parsed before any release-stream reader.
-    # The closure remains stdin data; it is never moved into a size-limited
-    # exec argument. At most this bounded bootstrap and one frame are queued.
-    pending = b"{\n" + program + b"\n}\n"
+    if child_write is not None:
+        os.set_blocking(child_write, False)
+    if finite_rpc:
+        # The complete program came from fd 3. This mode has no renewal or
+        # release protocol and must not retain the abandoned SSH input pipe.
+        os.close(0)
+    else:
+        os.set_blocking(0, False)
+    # The finite RPC consumes only its complete fd-3 program, reaching EOF
+    # without ever retaining the abandoned SSH input pipe. The heartbeat
+    # holder instead queues its bounded bootstrap and release protocol.
+    pending = b"" if finite_rpc else b"{\n" + program + b"\n}\n"
     buffered = b""
     released = False
-    input_open = True
-    deadline = time.monotonic() + idle
+    input_open = not finite_rpc
+    if not finite_rpc:
+        deadline = time.monotonic() + idle
     while True:
         now = time.monotonic()
         if interrupted:
-            finish(73, "RCH_SOURCE_LOCK_INTERRUPTED: signal=" + str(interrupted)
+            finish(128 + interrupted if finite_rpc else 73,
+                   family + "_INTERRUPTED: signal=" + str(interrupted)
                    + "; durable ownership retained")
         if now >= deadline:
+            if finite_rpc:
+                finish(124, "RCH_SOURCE_ACTIVITY_TIMEOUT: budget_ms=" + str(budget)
+                       + "; durable ownership retained")
             reason = "RELEASE_TIMEOUT" if released else "HEARTBEAT_EXPIRED"
             finish(73, "RCH_SOURCE_LOCK_" + reason
                    + ": durable ownership retained; idle_seconds=" + str(idle))
@@ -167,9 +215,9 @@ try:
                 finish(os.WEXITSTATUS(status))
             if os.WIFSIGNALED(status):
                 signum = os.WTERMSIG(status)
-                finish(128 + signum, "RCH_SOURCE_LOCK_PROCESS_TERMINATED: signal="
+                finish(128 + signum, family + "_PROCESS_TERMINATED: signal="
                        + str(signum) + "; durable ownership retained")
-            finish(73, "RCH_SOURCE_LOCK_PROCESS_TERMINATED: unknown child status")
+            finish(73, family + "_PROCESS_TERMINATED: unknown child status")
         readable, writable, _ = select.select(
             [0] if input_open else [],
             [child_write] if child_write is not None and pending else [],
@@ -211,15 +259,15 @@ try:
             except BrokenPipeError:
                 os.close(child_write)
                 child_write = None
-        if released and not pending and child_write is not None:
+        if (released or finite_rpc) and not pending and child_write is not None:
             os.close(child_write)
             child_write = None
 except BaseException as error:
     if group is not None:
-        finish(73, "RCH_SOURCE_LOCK_LIVENESS_FAILED: " + str(error)
+        finish(73, family + "_LIVENESS_FAILED: " + str(error)
                + "; durable ownership retained")
     os._exit(73)
-' "${2-}"
+' "$@"
 fi
 # Probe the platform once. The internal marker pins the minimal GNU fallback
 # rather than recursively selecting a backend; it grants no lock rights.

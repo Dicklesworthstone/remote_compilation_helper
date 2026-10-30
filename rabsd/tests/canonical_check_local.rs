@@ -882,18 +882,23 @@ fn shared_remote_operation(operations: &Path, label: &str) -> PathBuf {
     owners.into_iter().next().unwrap()
 }
 
+fn shared_remote_source(root: &Path, label: &str, value: u32) {
+    source(root, value);
+    write(root, "shared-flight-label.txt", label);
+    write(
+        root,
+        "src/main.rs",
+        "fn main() { println!(\"{}:{}\", include_str!(\"../shared-flight-label.txt\"), canonical_app::answer()); }\n",
+    );
+}
+
 #[test]
 #[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual concurrent canonical Cargo clients, shared TLS compiler execution and origin cancellation"]
 fn canonical_shared_remote_flight_survives_origin_cancellation() {
     let (owner, mut first_profile) = native_fixture();
     let root = owner.path();
     for (source, label) in [("source-a", "origin"), ("source-b", "survivor")] {
-        write(&root.join(source), "shared-flight-label.txt", label);
-        write(
-            &root.join(source),
-            "src/main.rs",
-            "fn main() { println!(\"{}:{}\", include_str!(\"../shared-flight-label.txt\"), canonical_app::answer()); }\n",
-        );
+        shared_remote_source(&root.join(source), label, 40);
     }
     let (mut worker, environment) = NativeWorker::start(root);
     let socket = root.join("canonical-service.sock");
@@ -974,10 +979,7 @@ fn canonical_shared_remote_flight_survives_origin_cancellation() {
             .events()
             .iter()
             .filter(|event| {
-                event["kind"] == "rabsd-live-dependency"
-                    && event["decision"] == "shared-remote-offer"
-                    && event["crate"] == "canonical_leaf"
-                    && event["key"] == key
+                event["kind"] == "rabsd-shared-remote-subscribed" && event["key"] == key
             })
             .count();
         if joined == 2 {
@@ -985,7 +987,7 @@ fn canonical_shared_remote_flight_survives_origin_cancellation() {
         }
         assert!(
             joined < 2,
-            "one client offered the same active action twice"
+            "one client subscribed to the same active action twice"
         );
         service.assert_running();
         first.assert_running();
@@ -1095,6 +1097,233 @@ fn canonical_shared_remote_flight_survives_origin_cancellation() {
     assert!(
         worker.completed_receipt()["request_id"].as_u64().unwrap()
             > receipt["request_id"].as_u64().unwrap()
+    );
+    service.finish(Duration::from_secs(15), true);
+    worker.finish();
+}
+
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; queues distinct actual Cargo actions behind a busy authenticated worker"]
+fn canonical_shared_remote_queue_coalesces_and_survives_origin_cancellation() {
+    let (owner, mut first_profile) = native_fixture();
+    let root = owner.path();
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(root.join("source-c"))
+        .unwrap();
+    for (directory, label, value) in [
+        ("source-a", "running", 40),
+        ("source-b", "queued-origin", 80),
+        ("source-c", "queued-survivor", 80),
+    ] {
+        shared_remote_source(&root.join(directory), label, value);
+    }
+    let (mut worker, environment) = NativeWorker::start(root);
+    let socket = root.join("canonical-service.sock");
+    let service_profile = root.join("shared-queue-service.json");
+    fs::write(
+        &service_profile,
+        serde_json::to_vec(&json!({
+            "version":"canonical-compile-service-v1", "state_root":root.join("state"),
+            "socket":socket, "max_roots":3, "jobs_per_root":1,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    first_profile["command"] = json!("build");
+    first_profile["service_socket"] = json!(socket);
+    first_profile["timeout_seconds"] = json!(600);
+    let mut queued_profile = first_profile.clone();
+    queued_profile["source_root"] = json!(root.join("source-b"));
+    let mut survivor_profile = first_profile.clone();
+    survivor_profile["source_root"] = json!(root.join("source-c"));
+    let mut command = shared_service_command(root);
+    command
+        .envs(environment.iter().map(|(name, value)| (name, value)))
+        .arg("--canonical-compile-service")
+        .arg(service_profile);
+    let mut service = SharedServiceChild::spawn(root, "shared-queue-service", command);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !socket.exists()
+        || !service
+            .events()
+            .iter()
+            .any(|event| event["kind"] == "canonical-service-listening")
+    {
+        service.assert_running();
+        assert!(Instant::now() < deadline, "{}", service.diagnostics());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let mut first = shared_service_client(root, 5200, &first_profile);
+    let deadline = Instant::now() + Duration::from_secs(240);
+    let running_key = loop {
+        let events = service.events();
+        let offered = decisions(&events, "shared-remote-offer");
+        if let Some(key) = offered.get("canonical_leaf")
+            && events.iter().any(|event| {
+                event["kind"] == "rabsd-remote-dependency-admitted" && event["key"] == *key
+            })
+        {
+            break key.clone();
+        }
+        service.assert_running();
+        first.assert_running();
+        assert!(Instant::now() < deadline, "{}", service.diagnostics());
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    let paused = PausedNativeWorker::pause(&worker);
+    let journal = read_bounded(&worker.state.join("requests.json"));
+    let state: Value = serde_json::from_slice(&journal).unwrap();
+    assert!(
+        state.get("last").is_some_and(Value::is_null),
+        "the native worker must be paused before a compiler lease begins: {state}"
+    );
+
+    let mut queued = shared_service_client(root, 5201, &queued_profile);
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let queued_key = loop {
+        let events = service.events();
+        let offered = decisions(&events, "shared-remote-offer");
+        if let Some(key) = offered.get("canonical_leaf")
+            && key != &running_key
+            && events.iter().any(|event| {
+                event["kind"] == "rabsd-shared-remote-subscribed"
+                    && event["key"] == *key
+                    && event["disposition"] == "queued"
+            })
+        {
+            break key.clone();
+        }
+        service.assert_running();
+        first.assert_running();
+        queued.assert_running();
+        assert!(
+            Instant::now() < deadline,
+            "busy pool did not retain an acknowledged distinct action: {}",
+            service.diagnostics()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let origin = shared_remote_operation(&root.join("ops"), "queued-origin");
+    let mut survivor = shared_service_client(root, 5202, &survivor_profile);
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let joined = service.events().iter().any(|event| {
+            event["kind"] == "rabsd-shared-remote-subscribed"
+                && event["key"] == queued_key
+                && event["disposition"] == "joined"
+        });
+        if joined {
+            break;
+        }
+        service.assert_running();
+        first.assert_running();
+        queued.assert_running();
+        survivor.assert_running();
+        assert!(
+            Instant::now() < deadline,
+            "identical queued demand did not coalesce: {}",
+            service.diagnostics()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let surviving_operation = shared_remote_operation(&root.join("ops"), "queued-survivor");
+    assert_ne!(origin, surviving_operation);
+    assert_eq!(read_bounded(&worker.state.join("requests.json")), journal);
+    assert!(
+        !service.events().iter().any(|event| {
+            event["kind"] == "rabsd-remote-dependency-admitted" && event["key"] == queued_key
+        }),
+        "queued demand consumed a busy worker or minted execution authority"
+    );
+
+    let (code, events, output) = queued.finish(Duration::from_secs(15), true);
+    assert_ne!(code, 0, "{output}");
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["kind"] == "canonical-build-completed")
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !service.events().iter().any(|event| {
+        event["kind"] == "canonical-service-session-error"
+            && event["reason"].as_str().is_some_and(|reason| {
+                reason.contains("canonical client disconnected; its operation was drained")
+            })
+    }) {
+        service.assert_running();
+        first.assert_running();
+        survivor.assert_running();
+        assert!(
+            Instant::now() < deadline,
+            "queued origin did not drain independently: {}",
+            service.diagnostics()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        read_bounded(&origin.join("bundle/source/shared-flight-label.txt")),
+        b"queued-origin"
+    );
+    // The departed origin's captured inputs remain owned by the queue, while
+    // the surviving subscriber retains its own destination and validation.
+    drop(paused);
+    let (code, events, output) = first.finish(Duration::from_secs(240), false);
+    assert_eq!(code, 0, "{output}\n{}", service.diagnostics());
+    assert_shared_service_build(root, 5200, &events, &output, "running:42\n", "disabled");
+    let (code, events, output) = survivor.finish(Duration::from_secs(240), false);
+    assert_eq!(code, 0, "{output}\n{}", service.diagnostics());
+    let target = assert_shared_service_build(
+        root,
+        5202,
+        &events,
+        &output,
+        "queued-survivor:82\n",
+        "disabled",
+    );
+    assert_ne!(target, origin.join("target"));
+    worker.completed_receipt();
+    let events = service.events();
+    for key in [&running_key, &queued_key] {
+        for kind in [
+            "rabsd-remote-dependency-admitted",
+            "rabsd-remote-dependency-executed",
+        ] {
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["kind"] == kind && event["key"] == *key)
+                    .count(),
+                1,
+                "each key needs exactly one actual producer and surviving installation: {events:?}"
+            );
+        }
+        assert!(
+            !events.iter().any(|event| {
+                event["key"] == *key
+                    && (matches!(
+                        event["kind"].as_str(),
+                        Some(
+                            "rabsd-remote-dependency-failed"
+                                | "rabsd-remote-dependency-install-failed"
+                        )
+                    ) || (event["kind"] == "rabsd-live-dependency"
+                        && matches!(
+                            event["decision"].as_str(),
+                            Some("execute" | "hit" | "served")
+                        )))
+            }),
+            "local fallback or replay cannot satisfy queued native execution: {events:?}"
+        );
+    }
+    assert!(
+        !origin.exists(),
+        "completed queue retained its departed origin"
+    );
+    assert!(
+        !surviving_operation.exists(),
+        "completed delivery retained its subscriber operation"
     );
     service.finish(Duration::from_secs(15), true);
     worker.finish();

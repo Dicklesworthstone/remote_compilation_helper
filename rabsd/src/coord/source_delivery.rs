@@ -11,6 +11,7 @@ mod preparation;
 mod toolchain;
 
 use super::worker_delivery::{MAX_FRAME_BYTES, WorkerAuthentication, WorkerPeer, validate_request};
+use crate::edge::live_facts::RetainedDependencyArtifact;
 use rabs_asupersync::worker_transport::MAX_JSON_RECORD;
 use rabs_sandbox::cargo_home::{
     CARGO_HOME_SOURCE_VERSION, CargoHomeProjection, ISOLATED_CARGO_HOME_SOURCE_VERSION,
@@ -609,7 +610,7 @@ enum SourceLayout {
         root: String,
         generated: Option<GeneratedSource>,
         native: Vec<GeneratedSource>,
-        artifacts: Arc<std::collections::BTreeMap<String, Vec<u8>>>,
+        artifacts: Arc<std::collections::BTreeMap<String, Arc<RetainedDependencyArtifact>>>,
         artifacts_selected: bool,
     },
 }
@@ -763,9 +764,27 @@ impl SourceUpload {
     /// dependencies/NNNN/basename. Both share the existing bounded, authenticated
     /// source-files transfer, including its per-file reuse and seal verification.
     /// This constructor never opens a mutable dependency path on the caller.
-    pub fn with_dependency_artifacts(
+    pub fn with_dependency_artifacts(self, artifacts: Vec<(String, Vec<u8>)>) -> io::Result<Self> {
+        self.with_retained_dependency_artifacts(
+            artifacts
+                .into_iter()
+                .map(|(path, bytes)| {
+                    (
+                        path,
+                        Arc::new(RetainedDependencyArtifact::from_bytes(bytes)),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// Attach immutable artifact owners selected by the live input observer.
+    /// Their exact bytes and transport digests were sealed together; cloning
+    /// this upload neither copies nor rehashes them. The receiving worker still
+    /// verifies every actual byte against this manifest before execution.
+    pub(crate) fn with_retained_dependency_artifacts(
         mut self,
-        artifacts: Vec<(String, Vec<u8>)>,
+        artifacts: Vec<(String, Arc<RetainedDependencyArtifact>)>,
     ) -> io::Result<Self> {
         require(
             self.toolchain.is_none(),
@@ -809,7 +828,7 @@ impl SourceUpload {
             "dependency bundle exceeds aggregate file count",
         )?;
         let mut retained = std::collections::BTreeMap::new();
-        for (path, bytes) in artifacts {
+        for (path, artifact) in artifacts {
             let components: Vec<_> = path.split('/').collect();
             require(
                 components.len() == 3
@@ -825,12 +844,12 @@ impl SourceUpload {
             )?;
             let file = SourceFile {
                 path: path.clone(),
-                len: bytes.len() as u64,
-                sha256: Sha256::digest(&bytes).into(),
+                len: artifact.bytes().len() as u64,
+                sha256: artifact.sha256(),
                 executable: false,
             };
             require(
-                retained.insert(path, bytes).is_none(),
+                retained.insert(path, artifact).is_none(),
                 "dependency bundle repeats an artifact path",
             )?;
             files.push(file);
@@ -1025,7 +1044,7 @@ impl SourceUpload {
                 } else {
                     return artifacts
                         .get(path)
-                        .map(Vec::as_slice)
+                        .map(|artifact| artifact.bytes())
                         .ok_or_else(|| invalid("retained dependency artifact missing"));
                 }
             }
@@ -1631,6 +1650,65 @@ mod tests {
             .unwrap();
         assert_ne!(upload.manifest.digest(), changed.manifest.digest());
         assert!(changed.validate_request(&request).is_err());
+    }
+
+    #[test]
+    fn shared_dependency_byte_owners_transfer_into_independent_real_receivers() {
+        let root = tempfile::tempdir().unwrap();
+        let (package, mut request, source_bytes) = fixture(root.path());
+        let original = root.path().join("liboriginal.rmeta");
+        let bytes: Vec<_> = (0..MAX_SOURCE_CHUNK * 2 + 29)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        fs::write(&original, &bytes).unwrap();
+        let artifact = Arc::new(RetainedDependencyArtifact::from_bytes(
+            fs::read(&original).unwrap(),
+        ));
+        let path = "dependencies/0000/liboriginal.rmeta";
+        let raw = package
+            .clone()
+            .with_dependency_artifacts(vec![(path.into(), bytes.clone())])
+            .unwrap();
+        let upload = package
+            .with_retained_dependency_artifacts(vec![(path.into(), Arc::clone(&artifact))])
+            .unwrap();
+        assert_eq!(upload.wire_manifest(), raw.wire_manifest());
+        let SourceLayout::Dependency { artifacts, .. } = &upload.layout else {
+            panic!("typed artifacts lost their dependency layout");
+        };
+        assert!(Arc::ptr_eq(artifacts.get(path).unwrap(), &artifact));
+        request["source_manifest"] = upload.wire_manifest();
+        fs::write(&original, b"caller changed after byte retention").unwrap();
+        fs::write(root.path().join("src/lib.rs"), b"caller changed package").unwrap();
+        drop(artifact);
+
+        let cloned = upload.clone();
+        let mut first = ReceiverPeer::new();
+        let mut second = ReceiverPeer::new();
+        upload.transmit(&mut first, &request, false).unwrap();
+        cloned.transmit(&mut second, &request, false).unwrap();
+        let first_root = first.receiver.as_ref().unwrap().sealed_root().unwrap();
+        let second_root = second.receiver.as_ref().unwrap().sealed_root().unwrap();
+        for received in [first_root, second_root] {
+            assert_eq!(fs::read(received.join(path)).unwrap(), bytes);
+            assert_eq!(
+                fs::read(received.join("package/src/lib.rs")).unwrap(),
+                source_bytes
+            );
+        }
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        assert_ne!(
+            fs::metadata(first_root.join(path)).unwrap().ino(),
+            fs::metadata(second_root.join(path)).unwrap().ino(),
+        );
+        fs::set_permissions(first_root.join(path), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(
+            first_root.join(path),
+            b"one subscriber changed its private copy",
+        )
+        .unwrap();
+        assert_eq!(fs::read(second_root.join(path)).unwrap(), bytes);
+        assert_eq!(cloned.file_bytes(path).unwrap(), bytes);
     }
 
     #[test]

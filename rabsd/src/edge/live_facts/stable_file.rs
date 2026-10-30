@@ -10,10 +10,97 @@
 //! seal. O_NONBLOCK does not bound regular-file filesystem latency, and
 //! parent-component policy remains the responsibility of source admission.
 
-use super::{FileSig, lstat_regular};
+use rabs_cas::digest_set::{DigestRequest, StreamingObjectWriter};
+use rabs_protocol::result_identity::TypedDigest;
 use std::fs::File;
 use std::io::{self, Read};
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+
+/// Identity of one filesystem object at one moment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FileSig {
+    pub(super) dev: u64,
+    pub(super) ino: u64,
+    pub(super) size: u64,
+    pub(super) mtime_ns: i128,
+    pub(super) ctime_ns: i128,
+}
+
+impl FileSig {
+    /// The identity recorded in `meta`.
+    #[must_use]
+    pub fn of(meta: &std::fs::Metadata) -> Self {
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            size: meta.size(),
+            mtime_ns: i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
+            ctime_ns: i128::from(meta.ctime()) * 1_000_000_000 + i128::from(meta.ctime_nsec()),
+        }
+    }
+
+    /// Logical byte length.
+    #[must_use]
+    pub const fn size(&self) -> u64 {
+        self.size
+    }
+}
+
+pub(super) fn lstat_regular(path: &Path) -> io::Result<FileSig> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.file_type().is_file() {
+        return Err(io::Error::other("not a regular file"));
+    }
+    Ok(FileSig::of(&meta))
+}
+
+/// Read a whole regular file through one descriptor whose identity must
+/// not move during the read. `max_bytes` bounds the allocation.
+///
+/// # Errors
+/// I/O failures, non-regular files, oversized files, or identity movement.
+pub fn read_stable(path: &Path, max_bytes: u64) -> io::Result<(FileSig, Vec<u8>)> {
+    read_at(path, lstat_regular(path)?, max_bytes)
+}
+
+/// Stream-hash a regular file into its CAS object identity, with the same
+/// identity discipline as [`read_stable`].
+///
+/// # Errors
+/// As [`read_stable`].
+pub fn digest_stable(path: &Path) -> io::Result<(FileSig, TypedDigest)> {
+    digest_stable_at(path, lstat_regular(path)?)
+}
+
+pub(super) fn digest_stable_at(path: &Path, before: FileSig) -> io::Result<(FileSig, TypedDigest)> {
+    let mut file = open(path, before)?;
+    let mut writer = StreamingObjectWriter::new(DigestRequest::default(), Some(before.size));
+    let mut buffer = vec![0_u8; 256 * 1024];
+    let mut remaining = before.size;
+    while remaining > 0 {
+        let limit =
+            usize::try_from(remaining.min(buffer.len() as u64)).map_err(io::Error::other)?;
+        let read = file.read(&mut buffer[..limit])?;
+        if read == 0 {
+            return Err(io::Error::other("file shrank while it was hashed"));
+        }
+        writer
+            .write(&buffer[..read])
+            .map_err(|error| io::Error::other(format!("{error:?}")))?;
+        remaining -= read as u64;
+    }
+    let mut extra = [0_u8; 1];
+    if file.read(&mut extra)? != 0 {
+        return Err(io::Error::other("file grew while it was hashed"));
+    }
+    verify(&file, path, before)?;
+    let digest = writer
+        .finish()
+        .map_err(|error| io::Error::other(format!("{error:?}")))?
+        .atp_content_id;
+    Ok((before, digest))
+}
 
 pub(super) fn open(path: &Path, before: FileSig) -> io::Result<File> {
     let file = rabs_sandbox::regular_input::open(path)?;

@@ -201,6 +201,27 @@ impl RemoteDependencyTransport {
         self.try_reserve_at(Instant::now())
     }
 
+    /// Connectivity expiry as observed BEFORE a worker reservation probe. The
+    /// pool retains this absolute wake even if it passes before a later wait.
+    /// Occupancy release is signalled separately; this grants no slot, resets
+    /// no cooldown history and cannot reconcile an uncertain execution.
+    pub(crate) fn cooldown_deadline_at(&self, observed: Instant) -> io::Result<Option<Instant>> {
+        // This mutex protects only a small local hint, never I/O or native
+        // execution. Waiting for its current writer avoids losing an expiry
+        // when the queue is about to sleep without any further release event.
+        let cooldown = self
+            .cooldown
+            .lock()
+            .map_err(|_| io::Error::other("remote connectivity state poisoned"))?;
+        let Some(failed_at) = cooldown.failed_at else {
+            return Ok(None);
+        };
+        let deadline = failed_at
+            .checked_add(cooldown.delay)
+            .ok_or_else(|| io::Error::other("remote cooldown deadline overflow"))?;
+        Ok((observed < deadline).then_some(deadline))
+    }
+
     fn try_reserve_at(self: &Arc<Self>, now: Instant) -> io::Result<RemoteDependencyReservation> {
         self.occupied
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -861,6 +882,102 @@ mod tests {
         state.completed();
         state.interrupted(now);
         assert_eq!(state.remaining(now), Some(FIRST_CONNECTION_COOLDOWN));
+    }
+
+    #[test]
+    fn queue_cooldown_deadline_is_absolute_and_grants_no_reservation() {
+        let transport = transport();
+        let now = Instant::now();
+        assert_eq!(transport.cooldown_deadline_at(now).unwrap(), None);
+        transport.observe_delivery(&disconnected(false), false, now);
+        let deadline = now + FIRST_CONNECTION_COOLDOWN;
+        for elapsed in [
+            Duration::ZERO,
+            Duration::from_secs(1),
+            Duration::from_secs(4),
+        ] {
+            assert_eq!(
+                transport.cooldown_deadline_at(now + elapsed).unwrap(),
+                Some(deadline)
+            );
+            assert!(!transport.occupied.load(Ordering::Acquire));
+        }
+        assert_eq!(transport.cooldown_deadline_at(deadline).unwrap(), None);
+        let owner = transport.try_reserve_at(deadline).unwrap();
+        assert!(owner.request_id.is_none());
+        assert!(owner.admission.is_none());
+        assert!(!owner.dispatch_attempted);
+        assert_eq!(
+            transport.cooldown.lock().unwrap().delay,
+            FIRST_CONNECTION_COOLDOWN
+        );
+    }
+
+    #[test]
+    fn queue_cooldown_snapshot_waits_for_current_writer_and_reports_poison() {
+        let transport = transport();
+        let now = Instant::now();
+        let mut state = transport.cooldown.lock().unwrap();
+        let reader = Arc::clone(&transport);
+        let (started, start) = std::sync::mpsc::sync_channel(1);
+        let observer = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            reader.cooldown_deadline_at(now)
+        });
+        start.recv_timeout(Duration::from_secs(5)).unwrap();
+        state.interrupted(now);
+        drop(state);
+        assert_eq!(
+            observer.join().unwrap().unwrap(),
+            Some(now + FIRST_CONNECTION_COOLDOWN),
+        );
+        assert!(!transport.occupied.load(Ordering::Acquire));
+
+        let writer = Arc::clone(&transport);
+        assert!(
+            std::thread::spawn(move || {
+                let _state = writer.cooldown.lock().unwrap();
+                panic!("poison only the local connectivity hint");
+            })
+            .join()
+            .is_err()
+        );
+        assert_eq!(
+            transport.cooldown_deadline_at(now).unwrap_err().kind(),
+            io::ErrorKind::Other,
+        );
+        assert!(!transport.occupied.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn cooldown_expiring_after_refused_probe_keeps_its_immediate_queue_wake() {
+        let transport = transport();
+        let failed_at = Instant::now();
+        transport.observe_delivery(&disconnected(false), false, failed_at);
+        let expires = failed_at + FIRST_CONNECTION_COOLDOWN;
+        let observed = expires - Duration::from_nanos(1);
+        assert_eq!(
+            transport.try_reserve_at(observed).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+        );
+        // Advance the injected observation past expiry before calculating the
+        // queue wait. A fresh snapshot has no future deadline; retaining the
+        // failed probe's observation preserves the already-due immediate wake.
+        assert_eq!(transport.cooldown_deadline_at(expires).unwrap(), None);
+        assert_eq!(
+            transport.cooldown_deadline_at(observed).unwrap(),
+            Some(expires),
+        );
+        let owner = transport.try_reserve_at(expires).unwrap();
+        // Once a real owner has occupied the worker, the next probe waits for
+        // its notifying release rather than spinning on an old expiry.
+        assert_eq!(transport.cooldown_deadline_at(expires).unwrap(), None);
+        assert_eq!(
+            transport.try_reserve_at(expires).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+        );
+        drop(owner);
+        assert!(transport.try_reserve_at(expires).is_ok());
     }
 
     #[test]

@@ -259,6 +259,9 @@ jobs:
           cargo test --release -p rabsd --test canonical_check_local --locked \
             canonical_shared_remote_flight_survives_origin_cancellation \
             -- --ignored --exact --nocapture
+          cargo test --release -p rabsd --test canonical_check_local --locked \
+            canonical_shared_remote_queue_coalesces_and_survives_origin_cancellation \
+            -- --ignored --exact --nocapture
       - name: Canonical Cargo delivers no-run tests and always executes current harnesses
         timeout-minutes: 30
         env:

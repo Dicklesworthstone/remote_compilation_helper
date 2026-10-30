@@ -1,25 +1,114 @@
 //! Service-owned remote execution and independent subscriber delivery.
 //!
-//! A reserved offer does not launch work. Its exact wrapper acknowledgment
-//! starts one supervised producer; subsequent offers can retain membership in
-//! that open flight. Losing a subscriber releases only that interest. The
-//! service owns and joins the transport even after the originating edge exits.
+//! An offer claims no physical worker. Its exact wrapper acknowledgment admits
+//! bounded FIFO demand; one dispatcher starts a supervised producer when actual
+//! capacity becomes available. Other offers may join that open queued or active
+//! flight. Losing a subscriber releases only its interest. The service owns and
+//! joins the dispatcher and transports after the originating edge exits.
 
-use super::super::shared_work::{SharedWork, Subscription};
-use super::{
-    CoordLive, LiveDependencyRequest, OperationCancellation, PendingRemote, PendingRemoteInstall,
-    RemoteInstallAuthority, RemoteOutput, RemoteResult, RemoteValidation, TypedDigest,
+use super::super::shared_work::{
+    DeferredLaunch, LaunchStatus, SharedWork, Subscription, WorkError,
 };
+use super::{
+    CoordLive, LiveDependencyRequest, MAX_PENDING_ACTIONS, OperationCancellation, PendingRemote,
+    PendingRemoteInstall, RemoteInstallAuthority, RemoteOutput, RemoteResult, RemoteValidation,
+    TypedDigest, WorkerProbe,
+};
+use std::collections::VecDeque;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
-const MAX_SHARED_SUBSCRIBERS: usize = 256;
+const MAX_SHARED_SUBSCRIBERS: usize = MAX_PENDING_ACTIONS;
+const QUEUE_WAIT: Duration = Duration::from_secs(5 * 60);
+
+/// Wakeups carry no queue, supervisor or native thread ownership. A version
+/// recorded before probing capacity prevents release/cancel/complete events
+/// from being lost between a failed probe and the dispatcher's bounded wait.
+#[derive(Debug, Default)]
+pub(super) struct QueueSignal {
+    version: Mutex<u64>,
+    changed: Condvar,
+}
+
+impl QueueSignal {
+    pub(super) fn notify(&self) {
+        let mut version = self
+            .version
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *version = version.wrapping_add(1);
+        self.changed.notify_all();
+    }
+
+    pub(super) fn version(&self) -> u64 {
+        *self
+            .version
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    pub(super) fn wait(&self, observed: u64, deadline: Option<Instant>) {
+        let mut version = self
+            .version
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        while *version == observed {
+            version = if let Some(deadline) = deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return;
+                }
+                let (next, timeout) = self
+                    .changed
+                    .wait_timeout(version, remaining)
+                    .unwrap_or_else(|error| error.into_inner());
+                if timeout.timed_out() {
+                    return;
+                }
+                next
+            } else {
+                self.changed
+                    .wait(version)
+                    .unwrap_or_else(|error| error.into_inner())
+            };
+        }
+    }
+}
+
+struct QueuedRemote {
+    pending: Option<PendingRemote>,
+    launch: DeferredLaunch<TypedDigest, SharedRemoteResult>,
+    cancellation: OperationCancellation,
+    deadline: Instant,
+}
+
+#[derive(Default)]
+struct QueueState {
+    closed: bool,
+    pending: VecDeque<QueuedRemote>,
+}
+
+#[derive(Default)]
+struct QueueCore {
+    state: Mutex<QueueState>,
+    signal: Arc<QueueSignal>,
+}
+
+#[derive(Default)]
+struct Dispatcher {
+    worker: Option<JoinHandle<()>>,
+    failure: Option<String>,
+}
 
 /// The canonical service's bounded owner of all shared remote producer threads.
 /// Keep this separate from `RemoteDependencies`: producers retain the worker
 /// pool, and must never retain their own thread registry through that pool.
 pub struct SharedRemoteExecutions {
-    work: SharedWork<TypedDigest, SharedRemoteResult>,
+    work: Arc<SharedWork<TypedDigest, SharedRemoteResult>>,
+    queue: Arc<QueueCore>,
+    dispatcher: Mutex<Dispatcher>,
 }
 
 impl fmt::Debug for SharedRemoteExecutions {
@@ -35,21 +124,297 @@ impl SharedRemoteExecutions {
     /// retained subscribers, including offers awaiting their acknowledgment.
     #[must_use]
     pub fn new(worker_count: usize) -> Arc<Self> {
+        let queue = Arc::new(QueueCore::default());
+        let signal = Arc::downgrade(&queue.signal);
         Arc::new(Self {
-            work: SharedWork::new(worker_count, MAX_SHARED_SUBSCRIBERS),
+            work: Arc::new(
+                SharedWork::new(worker_count, MAX_SHARED_SUBSCRIBERS).with_notify(move || {
+                    if let Some(signal) = signal.upgrade() {
+                        signal.notify();
+                    }
+                }),
+            ),
+            queue,
+            dispatcher: Mutex::new(Dispatcher::default()),
         })
     }
 
     /// Seal new work and membership, cancel active actions, then join every
     /// producer before the service releases coordinator or filesystem custody.
     pub fn shutdown(&self) -> Result<(), String> {
-        self.work
+        // This lock serializes admission with close and concurrent shutdowns.
+        // The dispatcher never acquires it, so joining cannot deadlock it.
+        let mut dispatcher = self
+            .dispatcher
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.queue
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .closed = true;
+        self.queue.signal.notify();
+        if let Some(worker) = dispatcher.worker.take()
+            && worker.join().is_err()
+        {
+            dispatcher.failure = Some("shared remote queue dispatcher panicked".into());
+        }
+        let workers = self
+            .work
             .shutdown()
-            .map_err(|error| format!("shared remote execution shutdown: {error}"))
+            .map_err(|error| format!("shared remote execution shutdown: {error}"));
+        if let Some(failure) = &dispatcher.failure {
+            return Err(failure.clone());
+        }
+        workers
     }
 
     pub(super) fn try_join(&self, key: &TypedDigest) -> Option<Subscription<SharedRemoteResult>> {
+        // Serialize membership with queue closure. This short supervisor call
+        // only enrolls interest; it never reaps, prepares, spawns or calls user
+        // code while the queue lock is held.
+        let queue = self
+            .queue
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if queue.closed {
+            return None;
+        }
         self.work.try_join(key)
+    }
+
+    fn enqueue(&self, pending: PendingRemote) -> Result<Subscription<SharedRemoteResult>, String> {
+        if pending.reservation.is_some() {
+            return Err("queued remote action already owns a worker".into());
+        }
+        let mut dispatcher = self
+            .dispatcher
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self
+            .queue
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .closed
+        {
+            return Err("shared remote execution queue is closed".into());
+        }
+        if dispatcher
+            .worker
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+        {
+            return Err("shared remote queue dispatcher stopped".into());
+        }
+        if dispatcher.worker.is_none() {
+            let work = Arc::clone(&self.work);
+            let queue = Arc::clone(&self.queue);
+            dispatcher.worker = Some(
+                std::thread::Builder::new()
+                    .name("rabs-remote-dispatch".into())
+                    .spawn(move || dispatch(work, queue))
+                    .map_err(|error| format!("start shared remote queue: {error}"))?,
+            );
+        }
+        let deadline = Instant::now()
+            .checked_add(QUEUE_WAIT)
+            .ok_or("shared remote queue deadline overflow")?;
+        pending
+            .remote
+            .workers
+            .availability
+            .watch(&self.queue.signal);
+        let cancellation = OperationCancellation::new();
+        let cancel = cancellation.clone();
+        let signal = Arc::downgrade(&self.queue.signal);
+        let (subscription, launch) = self
+            .work
+            .defer(pending.action_key().clone(), move || {
+                cancel.cancel();
+                if let Some(signal) = signal.upgrade() {
+                    signal.notify();
+                }
+            })
+            .map_err(|error| format!("shared remote queue admission: {error}"))?;
+        let mut queue = self
+            .queue
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if queue.closed {
+            return Err("shared remote execution queue closed during admission".into());
+        }
+        queue.pending.push_back(QueuedRemote {
+            pending: Some(pending),
+            launch,
+            cancellation,
+            deadline,
+        });
+        drop(queue);
+        self.queue.signal.notify();
+        Ok(subscription)
+    }
+}
+
+impl Drop for SharedRemoteExecutions {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
+}
+
+fn failed_before_start(reason: impl Into<String>) -> SharedRemoteResult {
+    SharedRemoteResult::Failed {
+        reason: reason.into(),
+        execution_finished: true,
+    }
+}
+
+/// Even an unexpected dispatcher unwind resolves every dormant flight. Active
+/// producers remain owned by SharedWork and are joined by service shutdown.
+struct QueueOwner {
+    queue: Arc<QueueCore>,
+    work: Arc<SharedWork<TypedDigest, SharedRemoteResult>>,
+}
+
+impl Drop for QueueOwner {
+    fn drop(&mut self) {
+        let pending = {
+            let mut queue = self
+                .queue
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            queue.closed = true;
+            std::mem::take(&mut queue.pending)
+        };
+        for mut queued in pending {
+            queued.cancellation.cancel();
+            let _ = self.work.finish_deferred(
+                &mut queued.launch,
+                failed_before_start("shared remote service stopped before worker admission"),
+            );
+        }
+        self.queue.signal.notify();
+    }
+}
+
+fn dispatch(work: Arc<SharedWork<TypedDigest, SharedRemoteResult>>, queue: Arc<QueueCore>) {
+    let owner = QueueOwner { queue, work };
+    loop {
+        let observed = owner.queue.signal.version();
+        let pending = {
+            let mut state = owner
+                .queue
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if state.closed {
+                return;
+            }
+            std::mem::take(&mut state.pending)
+        };
+        let mut retained = VecDeque::new();
+        let mut blocked = false;
+        let mut deadline: Option<Instant> = None;
+        for mut queued in pending {
+            if owner
+                .queue
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .closed
+            {
+                retained.push_back(queued);
+                continue;
+            }
+            if queued.cancellation.is_cancelled() || !queued.launch.is_pending() {
+                continue;
+            }
+            if Instant::now() >= queued.deadline {
+                let _ = owner.work.finish_deferred(
+                    &mut queued.launch,
+                    failed_before_start(
+                        "shared remote worker queue exceeded its five-minute budget",
+                    ),
+                );
+                continue;
+            }
+            deadline = Some(deadline.map_or(queued.deadline, |at| at.min(queued.deadline)));
+            if blocked {
+                retained.push_back(queued);
+                continue;
+            }
+            let remote = Arc::clone(&queued.pending.as_ref().expect("queued input owner").remote);
+            let mut pool_error = None;
+            let mut worker_deadline = None;
+            let result = owner.work.try_launch(&mut queued.launch, || {
+                if owner
+                    .queue
+                    .state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .closed
+                {
+                    return None;
+                }
+                match remote.workers.probe_worker() {
+                    Ok(WorkerProbe::Reserved(reservation)) => {
+                        let mut pending = queued.pending.take().expect("queued input owner");
+                        pending.reservation = Some(reservation);
+                        let cancellation = queued.cancellation.clone();
+                        Some(move || SharedRemoteResult::from_remote(pending.execute(cancellation)))
+                    }
+                    Ok(WorkerProbe::Waiting(deadline)) => {
+                        worker_deadline = deadline;
+                        None
+                    }
+                    Err(error) => {
+                        pool_error = Some(error);
+                        None
+                    }
+                }
+            });
+            match result {
+                Ok(LaunchStatus::Started | LaunchStatus::CancelledBeforeStart) => {}
+                Ok(LaunchStatus::Blocked) => {
+                    if let Some(error) = pool_error {
+                        let _ = owner.work.finish_deferred(
+                            &mut queued.launch,
+                            failed_before_start(format!("shared remote worker admission: {error}")),
+                        );
+                    } else {
+                        if let Some(ready) = worker_deadline {
+                            deadline = Some(deadline.map_or(ready, |at| at.min(ready)));
+                        }
+                        blocked = true;
+                        retained.push_back(queued);
+                    }
+                }
+                Err(error) => {
+                    let _ = owner.work.finish_deferred(
+                        &mut queued.launch,
+                        failed_before_start(format!("shared remote dispatch: {error}")),
+                    );
+                }
+            }
+        }
+        {
+            let mut state = owner
+                .queue
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            // New arrivals stay behind the retained FIFO cohort. No queue lock
+            // is held during preparation, native spawn, reaping or callbacks.
+            retained.append(&mut state.pending);
+            state.pending = retained;
+            if state.closed {
+                return;
+            }
+        }
+        owner.queue.signal.wait(observed, deadline);
     }
 }
 
@@ -143,9 +508,9 @@ enum Offer {
     Joined(Subscription<SharedRemoteResult>),
 }
 
-/// An unaccepted private-execution offer. Dropping a starter releases its
-/// reserved worker without starting a flight; dropping a follower removes only
-/// its enrolled interest. Neither offer grants permission to write outputs.
+/// An unaccepted private-execution offer. Dropping a starter releases its key
+/// claim without reserving a worker or starting a flight; dropping a follower
+/// removes only its enrolled interest. Neither authorizes output writes.
 pub struct PendingSharedRemote {
     subscriber: SubscriberRequest,
     offer: Offer,
@@ -206,24 +571,18 @@ impl PendingSharedRemote {
         if subscriber.request.is_execution_only() {
             return Err("workspace execution cannot accept a shared remote offer".into());
         }
-        let work = match offer {
-            Offer::Joined(subscription) => subscription,
+        let (work, disposition) = match offer {
+            Offer::Joined(subscription) => (subscription, "joined"),
             Offer::Start {
                 executions,
                 pending,
-            } => {
-                let cancellation = OperationCancellation::new();
-                let cancel = cancellation.clone();
-                executions
-                    .work
-                    .start(
-                        subscriber.request.key.action_key.clone(),
-                        move || cancel.cancel(),
-                        move || SharedRemoteResult::from_remote((*pending).execute(cancellation)),
-                    )
-                    .map_err(|error| format!("shared remote execution admission: {error}"))?
-            }
+            } => (executions.enqueue(*pending)?, "queued"),
         };
+        let key = rabs_cas::metadata_store::digest_key(&subscriber.request.key.action_key);
+        crate::edge::server::log_line(
+            "rabsd-shared-remote-subscribed",
+            &[("key", &key), ("disposition", disposition)],
+        );
         Ok(SharedRemoteSubscription {
             subscriber: Some(subscriber),
             work,
@@ -281,7 +640,7 @@ impl SharedRemoteSubscription {
             },
             Err(error) => RemoteResult::Failed {
                 reason: format!("shared remote execution owner failed: {error}"),
-                execution_finished: false,
+                execution_finished: error == WorkError::CancelledBeforeStart,
             },
         }
     }
@@ -324,6 +683,101 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn release_between_capacity_probe_and_wait_is_not_lost() {
+        let signal = QueueSignal::default();
+        let before_probe = signal.version();
+        signal.notify();
+        // The production wait may have no upcoming cooldown. A versioned wait
+        // must observe this already-issued wake instead of sleeping until its
+        // fallback deadline without another capacity change.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        signal.wait(before_probe, Some(deadline));
+        assert!(Instant::now() < deadline, "the earlier release was lost");
+        assert_ne!(signal.version(), before_probe);
+    }
+
+    #[test]
+    fn queued_deadline_settles_surviving_members_without_starting_a_producer() {
+        let executions = SharedRemoteExecutions::new(1);
+        let key = rabs_key::typed_digest::compute("rabs.test.queued-deadline.v1", b"action");
+        let cancellation = OperationCancellation::new();
+        let cancel = cancellation.clone();
+        let (origin, launch) = executions
+            .work
+            .defer(key.clone(), move || cancel.cancel())
+            .unwrap();
+        let mut follower = executions.try_join(&key).unwrap();
+        drop(origin);
+        assert!(!cancellation.is_cancelled());
+        executions
+            .queue
+            .state
+            .lock()
+            .unwrap()
+            .pending
+            .push_back(QueuedRemote {
+                // This is deliberately a before-start refusal fixture: an expired
+                // dormant flight never dereferences or executes a PendingRemote.
+                // No compiler, transport, capture or publication is simulated.
+                pending: None,
+                launch,
+                cancellation,
+                deadline: Instant::now(),
+            });
+        let work = Arc::clone(&executions.work);
+        let queue = Arc::clone(&executions.queue);
+        executions.dispatcher.lock().unwrap().worker =
+            Some(std::thread::spawn(move || dispatch(work, queue)));
+        let result = wait(follower.wait()).unwrap();
+        assert!(matches!(result.as_ref(), SharedRemoteResult::Failed {
+            reason,
+            execution_finished: true,
+        } if reason.contains("five-minute budget")));
+        assert!(executions.try_join(&key).is_none());
+        executions.shutdown().unwrap();
+        assert!(executions.queue.state.lock().unwrap().pending.is_empty());
+        assert!(executions.dispatcher.lock().unwrap().worker.is_none());
+    }
+
+    #[test]
+    fn dispatcher_owner_settles_dormant_flights_before_releasing_queue_custody() {
+        let executions = SharedRemoteExecutions::new(1);
+        let key = rabs_key::typed_digest::compute("rabs.test.queued-shutdown.v1", b"action");
+        let cancellation = OperationCancellation::new();
+        let (mut member, launch) = executions.work.defer(key.clone(), || {}).unwrap();
+        executions
+            .queue
+            .state
+            .lock()
+            .unwrap()
+            .pending
+            .push_back(QueuedRemote {
+                // Exercise only the real queue owner's dormant cleanup path. An
+                // absent execution request makes any accidental dispatch fail.
+                pending: None,
+                launch,
+                cancellation: cancellation.clone(),
+                deadline: Instant::now() + QUEUE_WAIT,
+            });
+        drop(QueueOwner {
+            queue: Arc::clone(&executions.queue),
+            work: Arc::clone(&executions.work),
+        });
+        let result = wait(member.wait()).unwrap();
+        assert!(matches!(result.as_ref(), SharedRemoteResult::Failed {
+            reason,
+            execution_finished: true,
+        } if reason.contains("stopped before worker admission")));
+        assert!(cancellation.is_cancelled());
+        let queue = executions.queue.state.lock().unwrap();
+        assert!(queue.closed);
+        assert!(queue.pending.is_empty());
+        drop(queue);
+        assert!(executions.try_join(&key).is_none());
+        executions.shutdown().unwrap();
     }
 
     #[test]

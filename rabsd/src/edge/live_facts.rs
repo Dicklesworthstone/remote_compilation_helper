@@ -20,7 +20,9 @@
 //!    it would without RABS.
 
 use crate::coord::live_dependency::canonical::CanonicalGeneratedRoot;
-use rabs_cas::digest_set::{DigestRequest, StreamingObjectWriter};
+use rabs_cas::digest_set::DigestRequest;
+#[cfg(test)]
+use rabs_cas::digest_set::StreamingObjectWriter;
 use rabs_key::canonical::CanonicalEncoder;
 use rabs_key::live_dependency::{
     DependencyActionPlan, DependencyDirectoryFact, DependencySourceKind, ExternFact, ToolchainFacts,
@@ -35,18 +37,23 @@ use rabs_sandbox::snapshot_capture::{
     MemberDisposition, MemberKind, SealedSourceSnapshot, capture_sealed_source, member_disposition,
 };
 use std::collections::{BTreeMap, HashMap};
-use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod dependency_artifacts;
 mod package_capture;
 mod stable_file;
 mod toolchain_hashing;
 mod toolchain_observation;
 mod toolchain_probe;
 mod toolchain_runtime;
+
+pub(crate) use dependency_artifacts::RetainedDependencyArtifact;
+use dependency_artifacts::{MAX_DEPENDENCY_BYTES, MAX_DEPENDENCY_FILES};
+pub use stable_file::{FileSig, digest_stable, read_stable};
+use stable_file::{digest_stable_at, lstat_regular};
 
 /// Domain of the sysroot tree digest.
 pub const DOMAIN_SYSROOT_TREE: &str = "rabs.live-dependency.sysroot-tree.v1";
@@ -74,39 +81,7 @@ const MAX_RETAINED_PACKAGE_BYTES: u64 = 512 * 1024 * 1024;
 const PROBE_RETRY: Duration = Duration::from_secs(30);
 /// Concurrent background warms (each hashes a lot of bytes).
 const MAX_WARMING: usize = 2;
-const MAX_DEPENDENCY_BYTES: u64 = 512 * 1024 * 1024;
-const MAX_DEPENDENCY_FILES: usize = 4096;
 const MAX_DEPENDENCY_MEMOS: usize = 128;
-
-/// Identity of one filesystem object at one moment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct FileSig {
-    dev: u64,
-    ino: u64,
-    size: u64,
-    mtime_ns: i128,
-    ctime_ns: i128,
-}
-
-impl FileSig {
-    /// The identity recorded in `meta`.
-    #[must_use]
-    pub fn of(meta: &std::fs::Metadata) -> Self {
-        Self {
-            dev: meta.dev(),
-            ino: meta.ino(),
-            size: meta.size(),
-            mtime_ns: i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
-            ctime_ns: i128::from(meta.ctime()) * 1_000_000_000 + i128::from(meta.ctime_nsec()),
-        }
-    }
-
-    /// Logical byte length.
-    #[must_use]
-    pub const fn size(&self) -> u64 {
-        self.size
-    }
-}
 
 /// Why a fact is not available for this request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,64 +99,6 @@ impl std::fmt::Display for FactsMiss {
             Self::Refused(detail) => write!(f, "facts-refused: {detail}"),
         }
     }
-}
-
-fn lstat_regular(path: &Path) -> std::io::Result<FileSig> {
-    let meta = std::fs::symlink_metadata(path)?;
-    if !meta.file_type().is_file() {
-        return Err(std::io::Error::other("not a regular file"));
-    }
-    Ok(FileSig::of(&meta))
-}
-
-/// Read a whole regular file through one descriptor whose identity must
-/// not move during the read. `max_bytes` bounds the allocation.
-///
-/// # Errors
-/// I/O failures, non-regular files, oversized files, or identity movement.
-pub fn read_stable(path: &Path, max_bytes: u64) -> std::io::Result<(FileSig, Vec<u8>)> {
-    stable_file::read_at(path, lstat_regular(path)?, max_bytes)
-}
-
-/// Stream-hash a regular file into its CAS object identity, with the same
-/// identity discipline as [`read_stable`].
-///
-/// # Errors
-/// As [`read_stable`].
-pub fn digest_stable(path: &Path) -> std::io::Result<(FileSig, TypedDigest)> {
-    digest_stable_at(path, lstat_regular(path)?)
-}
-
-fn digest_stable_at(
-    path: &Path,
-    before: FileSig,
-) -> Result<(FileSig, TypedDigest), std::io::Error> {
-    let mut file = stable_file::open(path, before)?;
-    let mut writer = StreamingObjectWriter::new(DigestRequest::default(), Some(before.size));
-    let mut buffer = vec![0_u8; 256 * 1024];
-    let mut remaining = before.size;
-    while remaining > 0 {
-        let limit =
-            usize::try_from(remaining.min(buffer.len() as u64)).map_err(std::io::Error::other)?;
-        let read = file.read(&mut buffer[..limit])?;
-        if read == 0 {
-            return Err(std::io::Error::other("file shrank while it was hashed"));
-        }
-        writer
-            .write(&buffer[..read])
-            .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
-        remaining -= read as u64;
-    }
-    let mut extra = [0_u8; 1];
-    if file.read(&mut extra)? != 0 {
-        return Err(std::io::Error::other("file grew while it was hashed"));
-    }
-    stable_file::verify(&file, path, before)?;
-    let digest = writer
-        .finish()
-        .map_err(|error| std::io::Error::other(format!("{error:?}")))?
-        .atp_content_id;
-    Ok((before, digest))
 }
 
 /// Files and directory generations observed BEFORE running either probe.
@@ -666,6 +583,7 @@ pub struct DependencyFacts {
     // remove them during a build; another local writer could, as it could
     // equally rewrite package sources the instant after a check.
     root_identities: Vec<(u64, u64)>,
+    artifact_bytes: dependency_artifacts::ArtifactCache,
 }
 
 impl DependencyFacts {
@@ -680,7 +598,13 @@ impl DependencyFacts {
     /// lane. It does not borrow cached digests as permission to upload newer
     /// bytes: each descriptor, path, content digest and complete inventory is
     /// checked against the observation used to compute this action's key.
-    pub fn retained_artifacts(&self) -> Result<Vec<(String, Vec<u8>)>, String> {
+    pub(crate) fn retained_artifacts(
+        &self,
+        stopped: impl Fn() -> bool,
+    ) -> Result<Vec<(String, Arc<RetainedDependencyArtifact>)>, String> {
+        if stopped() {
+            return Err("dependency artifact retention cancelled".into());
+        }
         self.verify_unchanged()?;
         if self.roots.len() != self.members.len() || self.roots.len() != self.directories.len() {
             return Err("retained dependency inventory is incomplete".into());
@@ -709,22 +633,17 @@ impl DependencyFacts {
                 remaining = remaining
                     .checked_sub(signature.size)
                     .ok_or("retained dependency bytes exceed their bound")?;
-                let (_, bytes) = stable_file::read_at(&path, *signature, signature.size)
-                    .map_err(|error| format!("retaining dependency candidate: {error}"))?;
-                let mut writer =
-                    StreamingObjectWriter::new(DigestRequest::default(), Some(signature.size));
-                writer
-                    .write(&bytes)
-                    .map_err(|error| format!("hashing retained dependency: {error:?}"))?;
-                let digest = writer
-                    .finish()
-                    .map_err(|error| format!("sealing retained dependency: {error:?}"))?
-                    .atp_content_id;
-                if digest != fact.content_digest {
-                    return Err("retained dependency bytes differ from the keyed content".into());
-                }
-                retained.push((format!("dependencies/{index:04}/{name}"), bytes));
+                let artifact = self.artifact_bytes.acquire(
+                    &path,
+                    *signature,
+                    &fact.content_digest,
+                    &stopped,
+                )?;
+                retained.push((format!("dependencies/{index:04}/{name}"), artifact));
             }
+        }
+        if stopped() {
+            return Err("dependency artifact retention cancelled".into());
         }
         self.verify_unchanged()?;
         Ok(retained)
@@ -995,6 +914,7 @@ fn capture_dependencies(
         members,
         output,
         root_identities,
+        artifact_bytes: facts.artifact_bytes.clone(),
     };
     captured.verify_unchanged().map_err(FactsMiss::Refused)?;
     Ok(captured)
@@ -1379,6 +1299,7 @@ pub struct LiveFacts {
     toolchains: Mutex<HashMap<PathBuf, Slot<ProbedToolchain>>>,
     packages: Mutex<package_capture::PackageMemos>,
     dependencies: Mutex<DependencyMemos>,
+    artifact_bytes: dependency_artifacts::ArtifactCache,
     warming: Mutex<usize>,
 }
 
@@ -2669,9 +2590,12 @@ mod tests {
     #[test]
     fn retained_dependencies_preserve_first_use_roots_and_exact_complete_artifacts() {
         let (_directory, captured) = retained_dependency_fixture();
-        let retained = captured.retained_artifacts().unwrap();
+        let retained = captured.retained_artifacts(|| false).unwrap();
         assert_eq!(
-            retained,
+            retained
+                .iter()
+                .map(|(path, artifact)| (path.clone(), artifact.bytes().to_vec()))
+                .collect::<Vec<_>>(),
             [
                 (
                     "dependencies/0001/libmiddle.rmeta".into(),
@@ -2698,14 +2622,76 @@ mod tests {
             b"changed archive object bytes",
         )
         .unwrap();
-        assert_eq!(retained[2].1, b"complete archive object bytes");
-        assert!(captured.retained_artifacts().is_err());
+        assert_eq!(retained[2].1.bytes(), b"complete archive object bytes");
+        assert!(captured.retained_artifacts(|| false).is_err());
+    }
+
+    #[test]
+    fn overlapping_dependency_actions_reuse_bytes_while_each_inventory_stays_exact() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("deps");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("libfirst.rmeta"), b"first real dependency bytes").unwrap();
+        let facts = LiveFacts::new();
+        let roots = vec![(root.clone(), Vec::new(), Vec::new())];
+        let capture = |output: &str| {
+            let (members, _) = walk_dependencies(&roots).unwrap();
+            capture_dependencies(
+                &facts,
+                roots.clone(),
+                members,
+                (directory.path().join(output), Vec::new()),
+                None,
+            )
+            .unwrap()
+        };
+        let first = capture("first-output");
+        let retained = first.retained_artifacts(|| false).unwrap();
+        let different_output = capture("second-output");
+        let reused = different_output.retained_artifacts(|| false).unwrap();
+        assert!(Arc::ptr_eq(&retained[0].1, &reused[0].1));
+
+        // Cargo can finish another crate before the next action observes its
+        // search directory. Only that fresh inventory may include the new file.
+        std::fs::write(root.join("libsecond.rmeta"), b"new real dependency bytes").unwrap();
+        assert!(first.retained_artifacts(|| false).is_err());
+        let later = capture("third-output");
+        let extended = later.retained_artifacts(|| false).unwrap();
+        assert_eq!(extended.len(), 2);
+        assert!(Arc::ptr_eq(&retained[0].1, &extended[0].1));
+        assert_eq!(extended[1].1.bytes(), b"new real dependency bytes");
+    }
+
+    #[test]
+    fn warm_artifact_reuse_keeps_the_final_complete_inventory_fence() {
+        let (directory, captured) = retained_dependency_fixture();
+        let warm = captured.retained_artifacts(|| false).unwrap();
+        let first = Arc::clone(&warm[0].1);
+        let owners = Arc::strong_count(&first);
+        let changed = std::cell::Cell::new(false);
+        let result = captured.retained_artifacts(|| {
+            // A temporary cache-hit lease proves acquisition has crossed its
+            // first inventory fence. The original artifact itself stays intact.
+            if Arc::strong_count(&first) > owners && !changed.replace(true) {
+                std::fs::write(
+                    directory.path().join("z-first/libnew.rmeta"),
+                    b"new candidate during a warm acquisition",
+                )
+                .unwrap();
+            }
+            false
+        });
+        assert!(changed.get());
+        assert!(result.unwrap_err().contains("candidates changed"));
+        assert_eq!(first.bytes(), [0, 255, 10, 128]);
     }
 
     #[test]
     fn retained_dependencies_require_key_facts_to_match_the_observed_inventory() {
         for corruption in 0..3 {
             let (_directory, mut captured) = retained_dependency_fixture();
+            // A warm object must not hide corruption of the action's facts.
+            let _warm = captured.retained_artifacts(|| false).unwrap();
             match corruption {
                 0 => {
                     captured.directories[1].artifacts[0].content_digest =
@@ -2720,7 +2706,7 @@ mod tests {
                 _ => unreachable!(),
             }
             assert!(
-                captured.retained_artifacts().is_err(),
+                captured.retained_artifacts(|| false).is_err(),
                 "altered key facts must not authorize an upload: {corruption}"
             );
         }
@@ -2730,6 +2716,7 @@ mod tests {
     fn retained_dependencies_refuse_new_candidates_or_replaced_roots() {
         for replace_root in [false, true] {
             let (directory, captured) = retained_dependency_fixture();
+            let _warm = captured.retained_artifacts(|| false).unwrap();
             let root = directory.path().join("z-first");
             if replace_root {
                 let moved = directory.path().join("retained-original");
@@ -2738,7 +2725,7 @@ mod tests {
             } else {
                 std::fs::write(root.join("libnew.rmeta"), b"new transitive candidate").unwrap();
             }
-            assert!(captured.retained_artifacts().is_err());
+            assert!(captured.retained_artifacts(|| false).is_err());
         }
     }
 
@@ -2817,7 +2804,7 @@ mod tests {
                 "{name}"
             );
             assert!(captured.verify_unchanged().is_err(), "{name}");
-            assert!(captured.retained_artifacts().is_err(), "{name}");
+            assert!(captured.retained_artifacts(|| false).is_err(), "{name}");
         }
     }
 
