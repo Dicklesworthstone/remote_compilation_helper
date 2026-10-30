@@ -511,6 +511,7 @@ enum SourceLayout {
     Dependency {
         root: String,
         generated: Option<GeneratedSource>,
+        native: Vec<GeneratedSource>,
         artifacts: Arc<std::collections::BTreeMap<String, Vec<u8>>>,
         artifacts_selected: bool,
     },
@@ -652,10 +653,11 @@ impl SourceUpload {
             self.toolchain.is_none(),
             "dependency bundle must be selected before toolchain attachment",
         )?;
-        let (root, generated, mut files) = match &self.layout {
+        let (root, generated, native, mut files) = match &self.layout {
             SourceLayout::Root(root) => (
                 root.clone(),
                 None,
+                Vec::new(),
                 self.manifest
                     .files()
                     .iter()
@@ -669,11 +671,13 @@ impl SourceUpload {
             SourceLayout::Dependency {
                 root,
                 generated,
+                native,
                 artifacts_selected: false,
                 ..
             } => (
                 root.clone(),
                 generated.clone(),
+                native.clone(),
                 self.manifest.files().to_vec(),
             ),
             _ => {
@@ -717,6 +721,7 @@ impl SourceUpload {
         self.layout = SourceLayout::Dependency {
             root,
             generated,
+            native,
             artifacts: Arc::new(retained),
             artifacts_selected: true,
         };
@@ -743,9 +748,10 @@ impl SourceUpload {
             generated.shares_snapshot(&self.image),
             "package and generated source must share one coherent snapshot",
         )?;
-        let (package, artifacts, artifacts_selected, mut files) = match &self.layout {
+        let (package, native, artifacts, artifacts_selected, mut files) = match &self.layout {
             SourceLayout::Root(package) => (
                 package.clone(),
+                Vec::new(),
                 Arc::new(std::collections::BTreeMap::new()),
                 false,
                 self.manifest
@@ -761,10 +767,12 @@ impl SourceUpload {
             SourceLayout::Dependency {
                 root: package,
                 generated: None,
+                native,
                 artifacts,
                 artifacts_selected,
             } => (
                 package.clone(),
+                native.clone(),
                 Arc::clone(artifacts),
                 *artifacts_selected,
                 self.manifest.files().to_vec(),
@@ -784,6 +792,87 @@ impl SourceUpload {
         self.layout = SourceLayout::Dependency {
             root: package,
             generated: Some(generated),
+            native,
+            artifacts,
+            artifacts_selected,
+        };
+        Ok(self)
+    }
+
+    /// Retain a propagated native tree from the SAME coherent source capture.
+    /// The index is allocated here, rather than accepted from a caller. Empty
+    /// trees retain directory/mount intent without invented source files.
+    pub fn with_native_snapshot(
+        mut self,
+        image: Arc<SealedSourceSnapshot>,
+        root: &str,
+        paths: &[String],
+    ) -> io::Result<Self> {
+        require(
+            self.toolchain.is_none(),
+            "native inputs must precede toolchain attachment",
+        )?;
+        let (package, generated, mut native, artifacts, artifacts_selected, mut files) =
+            match &self.layout {
+                SourceLayout::Root(package) => (
+                    package.clone(),
+                    None,
+                    Vec::new(),
+                    Arc::new(BTreeMap::new()),
+                    false,
+                    self.manifest
+                        .files()
+                        .iter()
+                        .cloned()
+                        .map(|mut file| {
+                            file.path = format!("package/{}", file.path);
+                            file
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                SourceLayout::Dependency {
+                    root: package,
+                    generated,
+                    native,
+                    artifacts,
+                    artifacts_selected,
+                } => (
+                    package.clone(),
+                    generated.clone(),
+                    native.clone(),
+                    Arc::clone(artifacts),
+                    *artifacts_selected,
+                    self.manifest.files().to_vec(),
+                ),
+                SourceLayout::Closure => {
+                    return Err(invalid("native inputs require a dependency source bundle"));
+                }
+            };
+        require(
+            native.len() < rabs_sandbox::dependency_context::MAX_NATIVE_ROOTS,
+            "too many propagated native source trees",
+        )?;
+        let source = GeneratedSource::from_snapshot_with_prefix(
+            image,
+            root,
+            paths,
+            &format!("native/{:04}", native.len()),
+        )?;
+        require(
+            source.shares_snapshot(&self.image),
+            "native inputs and package must share one coherent snapshot",
+        )?;
+        require(
+            source.files().len() <= MAX_SOURCE_FILES.saturating_sub(files.len()),
+            "native source exceeds aggregate file count",
+        )?;
+        files.extend_from_slice(source.files());
+        native.push(source);
+        self.manifest = SourceManifest::new(files)?;
+        self.layout = SourceLayout::Dependency {
+            root: package,
+            generated,
+            native,
             artifacts,
             artifacts_selected,
         };
@@ -799,6 +888,7 @@ impl SourceUpload {
             SourceLayout::Dependency {
                 root,
                 generated,
+                native,
                 artifacts,
                 ..
             } => {
@@ -809,6 +899,11 @@ impl SourceUpload {
                         .as_ref()
                         .and_then(|source| source.file_bytes(path))
                         .ok_or_else(|| invalid("retained generated source missing"));
+                } else if path.starts_with("native/") {
+                    return native
+                        .iter()
+                        .find_map(|source| source.file_bytes(path))
+                        .ok_or_else(|| invalid("retained native source missing"));
                 } else {
                     return artifacts
                         .get(path)
@@ -947,7 +1042,10 @@ impl SourceUpload {
             "captured source differs from the saved execution manifest",
         )?;
         if let SourceLayout::Dependency {
-            root, generated, ..
+            root,
+            generated,
+            native,
+            ..
         } = &self.layout
         {
             if request["dependency_context"]["version"]
@@ -1003,6 +1101,26 @@ impl SourceUpload {
                         .is_none_or(|value| value.as_array().is_some_and(Vec::is_empty)),
                     "generated directories require a captured generated root",
                 )?;
+            }
+            match request["dependency_context"].get("native_roots") {
+                None if native.is_empty() => {}
+                Some(value) => {
+                    let roots = value
+                        .as_array()
+                        .ok_or_else(|| invalid("native roots must be an array"))?;
+                    require(
+                        roots.len() == native.len(),
+                        "native source selection differs from execution context",
+                    )?;
+                    for (root, source) in roots.iter().zip(native) {
+                        require(
+                            root["prefix"] == source.prefix()
+                                && root["directories"] == json!(source.directories()),
+                            "native directory topology or prefix differs from captured inputs",
+                        )?;
+                    }
+                }
+                _ => return Err(invalid("native source context is missing")),
             }
         }
         let begin = self.begin_frame(request);
@@ -1512,6 +1630,68 @@ mod tests {
         // original changes after selection; execution rechecks its owner too.
         fs::write(root.path().join("README"), b"changed after capture\n").unwrap();
         upload.validate_request(&request).unwrap();
+    }
+
+    #[test]
+    fn propagated_native_bundle_retains_exact_bytes_and_empty_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let image = generated_fixture(root.path(), true);
+        let paths = ["nested/generated.rs".into(), "data.bin".into()];
+        let package =
+            SourceUpload::from_snapshot(Arc::clone(&image), "package", &["src/lib.rs".into()])
+                .unwrap();
+        let upload = package
+            .clone()
+            .with_native_snapshot(Arc::clone(&image), "generated", &paths)
+            .unwrap()
+            .with_dependency_artifacts(Vec::new())
+            .unwrap();
+        let request = json!({"kind":"canonical-exec", "request_id":19,
+            "program":"fixture", "toolchain_backing":"/tc",
+            "dependency_context":{"generated_root":null,"generated_directories":[],
+                "native_roots":[{"path":"/__rabs/out/cargo/debug/build/provider/out", "prefix":"native/0000", "directories":["empty","empty/inner","nested"]}]},
+            "source_manifest":upload.wire_manifest()});
+        upload.validate_request(&request).unwrap();
+        assert_eq!(
+            upload.file_bytes("native/0000/data.bin").unwrap(),
+            image.file_bytes("generated", "data.bin").unwrap()
+        );
+        assert!(upload.file_bytes("native/0001/data.bin").is_err());
+        assert!(
+            package
+                .clone()
+                .with_native_snapshot(Arc::clone(&image), "generated", &paths[..1])
+                .is_err()
+        );
+        let other = tempfile::tempdir().unwrap();
+        let other_image = generated_fixture(other.path(), true);
+        assert!(
+            package
+                .with_native_snapshot(other_image, "generated", &paths)
+                .is_err()
+        );
+        for native in [
+            Value::Null,
+            json!([]),
+            json!([{"prefix":"native/0001", "directories":["empty","empty/inner","nested"]}]),
+            json!([{"prefix":"native/0000", "directories":["nested"]}]),
+        ] {
+            let mut changed = request.clone();
+            changed["dependency_context"]["native_roots"] = native;
+            assert!(upload.validate_request(&changed).is_err());
+        }
+        let mut peer = ReceiverPeer::new();
+        upload.transmit(&mut peer, &request, false).unwrap();
+        let received = peer.receiver.as_ref().unwrap().sealed_root().unwrap();
+        assert_eq!(
+            fs::read(received.join("native/0000/data.bin")).unwrap(),
+            image.file_bytes("generated", "data.bin").unwrap()
+        );
+        assert!(!received.join("generated").exists());
+        assert!(
+            !received.join("native/0000/empty").exists(),
+            "worker reconstructs directory intent separately from authenticated file bytes"
+        );
     }
 
     #[test]

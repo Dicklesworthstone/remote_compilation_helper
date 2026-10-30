@@ -37,7 +37,7 @@ use crate::coord::live::{
 };
 use crate::edge::live_facts::{
     DependencyFacts, FileSig, GENERATED_ROOT, PACKAGE_ROOT, PackageFacts, ToolchainGuard,
-    digest_stable, read_stable,
+    digest_stable, native_snapshot_root, read_stable,
 };
 use rabs_action::state_machines::AttemptState;
 use rabs_cas::blob_store::{DurabilityPolicy, PutLimits, put_if_absent};
@@ -131,6 +131,7 @@ impl LiveDependencyRequest {
         if let Some(paths) = &self.canonical_paths {
             paths.require_local_capture()?;
             if self.plan.generated_root.is_some()
+                || !self.plan.native_roots.is_empty()
                 || self
                     .plan
                     .execution_env
@@ -465,6 +466,12 @@ fn mappings_for_plan(plan: &DependencyActionPlan) -> Vec<(String, String)> {
     let mut mappings = vec![(PACKAGE_ROOT.to_owned(), plan.source_virtual_root())];
     if plan.generated_root.is_some() {
         mappings.push((GENERATED_ROOT.to_owned(), plan.generated_virtual_root()));
+    }
+    for index in 0..plan.native_roots.len() {
+        mappings.push((
+            native_snapshot_root(index),
+            plan.native_input_virtual_root(index),
+        ));
     }
     mappings
 }
@@ -932,11 +939,24 @@ impl LiveDependencyLane {
                 .map_err(|error| format!("action entry: {error:?}"))?;
         }
         let mappings = mappings_for_plan(&request.plan);
-        let submission = ActionSubmission::from_snapshot(
+        let evidence = request
+            .package
+            .native
+            .iter()
+            .enumerate()
+            .map(|(index, native)| {
+                (
+                    request.plan.native_record_virtual_path(index),
+                    native.build_script_output.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let submission = ActionSubmission::from_snapshot_with_evidence(
             request.key.descriptor.clone(),
             &request.inputs,
             Arc::clone(&request.package.snapshot),
             &mappings,
+            &evidence,
         )
         .map_err(refusal)?;
         if submission.key() != key {

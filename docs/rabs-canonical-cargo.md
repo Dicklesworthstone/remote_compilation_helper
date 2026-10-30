@@ -1143,7 +1143,7 @@ the selected `metadata` or `rlib` execution mode. Both peers retain that exact v
 authenticated admission. An older worker cannot silently reinterpret the request
 as ordinary-path dependency execution, and metadata support does not authorize an
 archive action. The worker receives only the retained
-package, any complete generated input tree, exact dependency candidates and
+package, complete generated input trees, exact dependency candidates and
 captured toolchain. It retains its own
 runtime and verifies it against the keyed runtime cohort, then creates private
 output and HOME trees. The outer Cargo workspace, Cargo home,
@@ -1165,7 +1165,7 @@ execution; they do not authorize local result capture or cache the script's
 execution, filesystem observations or side effects.
 
 Canonical metadata checks can also consume static native libraries generated in
-that exact `OUT_DIR`. Each `-L native=...` search directory must belong to the
+captured Cargo `OUT_DIR` trees. Each `-L native=...` search directory must belong to a
 captured tree, and every unmodified `-l static=NAME` must resolve to a retained
 `libNAME.a`. The coordinator binds archive bytes, search ordering, directory
 listings and Cargo directives into the key. The worker independently verifies
@@ -1179,10 +1179,30 @@ This extension requires the worker's explicit
 `canonical-generated-static-metadata-v1` capability in `dependency_native_inputs`.
 An older worker refuses before source upload or compiler dispatch. Native
 metadata has a distinct isolation-policy identity; existing pure-Rust metadata
-and archive identities are unchanged. Dynamic/system libraries, native library
-modifiers and another package's generated directory retain their existing
-refusals. Without the isolated worker path, these checks run under Cargo without
-local dependency-cache authority.
+and archive identities are unchanged. Dynamic/system libraries and native library
+modifiers retain their existing refusals. Without the isolated worker path, these
+checks run under Cargo without local dependency-cache authority.
+
+Cargo propagates a dependency build script's native search paths to downstream
+libraries and workspace targets. Those consumers can now execute through the
+same isolated worker path even when they have no build script, `OUT_DIR` or
+direct `-l` option of their own. For each foreign `-L native=...` root, the
+coordinator captures the producer's complete generated tree, persisted build-script
+stdout and `root-output` record through the canonical driver's retained target
+mount. The worker restores each tree read-only at its original logical path.
+Native search order, every retained file, empty directory and producer record
+participate in the consumer's identity; an unchanged Rust package or `.rmeta`
+cannot hide changed propagated native inputs. The worker never receives the
+whole mutable Cargo target directory.
+
+Requests carrying these additional generated roots require the explicit
+`canonical-generated-native-roots-v1` entry in `dependency_native_inputs`,
+alongside the existing output-mode and native-metadata capability checks.
+Update coordinator and worker together; an older worker refuses before input
+upload or execution. This does not admit arbitrary host search paths: each
+additional root must be a retained canonical Cargo generated tree with matching
+completed producer records. A missing record, unsupported native option or
+changed retained input prevents that invocation from acquiring cache authority.
 
 The capture binding comes from the driver's retained mount capability, not from
 a canonical-path flag in a compiler plan. It binds both the physical tree and
@@ -1271,9 +1291,13 @@ and dep-info; they do not link a library, executable or test harness. Archive
 bytes participate in the fresh execution identity even though rustc's dep-info
 does not list them and a metadata check may not read them.
 
-This scope excludes dynamic/system libraries, native
-library modifiers, and paths propagated from another package's generated tree.
-Those inputs cannot be acquired by spelling an unretained path in rustc argv.
+Workspace units can also receive native search paths propagated through dependency
+libraries. They use the same completed-record capture and
+`canonical-generated-native-roots-v1` capability described above, including
+consumers with no own `OUT_DIR`. The root's full retained files and directory
+listings remain part of each fresh workspace execution identity. This scope
+still excludes dynamic/system libraries and native library modifiers.
+Inputs cannot be acquired by spelling an unretained host path in rustc argv.
 Workspace native results remain request-owned and are never published or
 replayed through the dependency action cache.
 
@@ -1680,6 +1704,10 @@ RABS_TEST_TOOLCHAIN_ROOT="$(rustc --print sysroot)" \
   cargo test -p rabs-sandbox --lib \
     dependency_context::tests::real_canonical_rustc_archive_view_closes_assembler_inputs_missing_from_dep_info \
     --locked -- --ignored --exact --nocapture
+
+RABS_TEST_TOOLCHAIN_ROOT="$(rustc --print sysroot)" \
+  cargo test -p rabs-sandbox --lib real_canonical_archive_bundles_ \
+    --locked -- --ignored --nocapture
 ```
 
 The build fixture requires three real remote archive executions for each of two
@@ -1689,7 +1717,10 @@ binary, edits a dependency and requires new keys and changed outputs, and checks
 that the failing build script cannot create a completed build delivery. The
 sandbox fixture separately compiles an actual `.incbin` payload whose bytes appear
 in the archive but not rustc's dep-info, then verifies that unkeyed host/process/
-entropy inputs are inaccessible. These are runnable acceptance tests, not a
+entropy inputs are inaccessible. The native-archive fixtures compile and link real
+C objects through both an own generated tree and two propagated native trees,
+including a downstream unit with no `OUT_DIR`. They verify that a thin archive
+cannot read an original object outside the retained trees. These are runnable acceptance tests, not a
 claim that an incapable host has passed them. Full native execution, build
 qualification and performance evidence must be established on a capable host.
 
@@ -1744,6 +1775,37 @@ Only the script's workspace input changes; package source, exact stdout and
 new keys and execute remotely. This checks propagation through the dependency
 graph alongside the unchanged-leaf replay case above. The build case requires
 the delivered executable to use the new generated value.
+
+The propagated-native-root cases place a static native archive in a leaf
+dependency's `OUT_DIR`. Cargo carries its `-L native=...` path through a pure
+Rust middle dependency into workspace library and binary checks. Neither
+downstream package has its own build script or generated directory:
+
+```sh
+RABS_CANONICAL_TEST_WRAPPER="$PWD/target/debug/rabs-wrap" \
+RABS_TEST_WORKER_BIN="$PWD/target/debug/rabs-wkr" \
+  cargo test -p rabsd --test canonical_check_local --locked \
+    canonical_cargo_build_offloads_propagated_native_archives_and_invalidates_transitive_consumers \
+    -- --ignored --exact --nocapture
+
+RABS_CANONICAL_TEST_WRAPPER="$PWD/target/debug/rabs-wrap" \
+RABS_TEST_WORKER_BIN="$PWD/target/debug/rabs-wkr" \
+  cargo test -p rabsd --test canonical_check_local --locked \
+    canonical_cargo_check_offloads_propagated_native_roots_and_invalidates_transitive_consumers \
+    -- --ignored --exact --nocapture
+```
+
+Both cases require full Linux namespaces, OpenSSL, `cc`, `ar` and matching native
+binaries. They require actual remote offers and completions for the leaf,
+middle and eligible workspace units, earn dependency hits through three real
+samples, and replay those dependencies after relocating the checkout while
+workspace requests execute afresh. Changing only the generated archive must
+invalidate the leaf and middle keys even for metadata checks. A separate empty
+directory mutation must also invalidate both consumers while preserving
+the build case's archive bytes and executable result. The existing own-native
+dependency fixtures now likewise require their downstream workspace units to
+execute remotely. These are native acceptance tests to run on a capable host;
+their presence does not establish a completed native qualification or speedup.
 
 ### Select local Cargo units from the Cargo command line
 

@@ -226,7 +226,7 @@ fn generated_static_archives_reach_only_retained_canonical_remote_planning() {
 
     for extra in [
         "-Lnative=/usr/lib",
-        "-Lnative=/__rabs/out/cargo/debug/build/other/out",
+        "-Lnative=/__rabs/out/cargo/debug/build/other/unbound",
         "-Lnative=/__rabs/out/cargo/debug/build/native-hash/outside",
         "-lanswer",
         "-ldylib=answer",
@@ -256,6 +256,62 @@ fn generated_static_archives_reach_only_retained_canonical_remote_planning() {
         }),
         Some(LiveRefusal::RefusedEnv(_))
     ));
+}
+
+#[test]
+fn propagated_native_searches_reach_canonical_planning_without_own_out_dir() {
+    use super::{canonical_remote_rejection, remote_rejection, workspace_rejection};
+    use rabs_key::live_dependency::{
+        plan_canonical_remote_dependency_action, plan_canonical_workspace_execution,
+    };
+    let root = "/__rabs/out/cargo/debug/build/provider/out";
+    for workspace in [false, true] {
+        for emit in ["dep-info,metadata", "dep-info,metadata,link"] {
+            let package = if workspace {
+                "/__rabs/workspace/member"
+            } else {
+                "/__rabs/cargo-home/registry/src/pinned/consumer-1.0.0"
+            };
+            let mut argv = vec![
+                "/__rabs/toolchain/bin/rustc".into(),
+                "--crate-name=consumer".into(),
+                "--crate-type=lib".into(),
+                format!("--emit={emit}"),
+                "--error-format=json".into(),
+                "--out-dir=/__rabs/out/cargo/debug/deps".into(),
+                "-Ldependency=/__rabs/out/cargo/debug/deps".into(),
+                format!("-Lnative={root}/native"),
+                format!("{package}/lib.rs"),
+            ];
+            let mut env = vec![
+                ("CARGO_HOME".into(), "/__rabs/cargo-home".into()),
+                ("HOME".into(), "/__rabs/home".into()),
+                ("CARGO_MANIFEST_DIR".into(), package.into()),
+                ("CARGO_PKG_NAME".into(), "consumer".into()),
+            ];
+            if workspace {
+                env.push(("CARGO_PRIMARY_PACKAGE".into(), "1".into()));
+            } else {
+                argv.push("--cap-lints=allow".into());
+            }
+            let request = LiveRustcRequest {
+                argv: &argv,
+                cwd: package,
+                env: &env,
+            };
+            let plan = if workspace {
+                assert_eq!(workspace_rejection(request), None);
+                plan_canonical_workspace_execution(request, HOSTS[0]).unwrap()
+            } else {
+                assert_eq!(canonical_remote_rejection(request), None);
+                plan_canonical_remote_dependency_action(request, HOSTS[0], None).unwrap()
+            };
+            assert_eq!(plan.generated_root, None);
+            assert_eq!(plan.native_roots, vec![root]);
+            assert!(remote_rejection(request).is_some());
+            assert!(rejection(request).is_some());
+        }
+    }
 }
 
 #[test]
@@ -306,7 +362,7 @@ fn workspace_native_archives_reach_only_fresh_planning_with_the_exact_out_dir() 
     }
     for extra in [
         "-Lnative=/usr/lib",
-        "-Lnative=/__rabs/out/cargo/debug/build/other/out/native",
+        "-Lnative=/__rabs/out/cargo/debug/build/other/unbound/native",
         "-Lnative=/__rabs/out/cargo/debug/build/member-hash/outside",
         "-ldylib=answer",
         "-lstatic:-bundle=answer",

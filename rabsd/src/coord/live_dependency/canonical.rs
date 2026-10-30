@@ -443,6 +443,11 @@ impl CanonicalPaths {
             .as_deref()
             .map(translate)
             .transpose()?;
+        physical.native_roots = logical
+            .native_roots
+            .iter()
+            .map(|path| translate(path))
+            .collect::<Result<_, _>>()?;
         physical.dependency_dirs = logical
             .dependency_dirs
             .iter()
@@ -488,6 +493,57 @@ impl CanonicalPaths {
             physical: backing,
             logical: logical_root.to_path_buf(),
         }))
+    }
+
+    /// Bind propagated native search inputs to this driver's private target.
+    /// The planner selects only complete Cargo OUT_DIR roots. Their completed
+    /// root-output/stdout records are checked by the same observer used for
+    /// the current package's generated inputs, never trusted from the wrapper.
+    pub(crate) fn native_roots(
+        &self,
+        logical: &DependencyActionPlan,
+        physical: &DependencyActionPlan,
+    ) -> Result<Vec<CanonicalGeneratedRoot>, String> {
+        if !logical.canonical_cargo
+            || !physical.canonical_cargo
+            || logical.source_kind != physical.source_kind
+            || logical.execution_env != physical.execution_env
+            || self.physical(Path::new(&logical.source_root))? != Path::new(&physical.source_root)
+            || logical.native_roots.len() != physical.native_roots.len()
+            || logical.native_roots.len()
+                > rabs_key::live_dependency::remote::MAX_CANONICAL_NATIVE_ROOTS
+            || logical
+                .native_roots
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+        {
+            return Err("native input observation differs from its canonical mapping".into());
+        }
+        let mut bindings = Vec::with_capacity(logical.native_roots.len());
+        for (root, backing) in logical.native_roots.iter().zip(&physical.native_roots) {
+            let path = Path::new(root);
+            if !ordinary_absolute(path)
+                || !path.starts_with("/__rabs/out/cargo")
+                || path.file_name().and_then(|name| name.to_str()) != Some("out")
+                || [&logical.source_root, &logical.out_dir]
+                    .into_iter()
+                    .chain(&logical.dependency_dirs)
+                    .chain(logical.generated_root.iter())
+                    .chain(logical.native_roots.iter().filter(|other| *other != root))
+                    .any(|other| path.starts_with(other) || Path::new(other).starts_with(path))
+            {
+                return Err("native inputs must bind distinct Cargo OUT_DIR trees".into());
+            }
+            let expected = self.physical(path)?;
+            if expected != Path::new(backing) {
+                return Err("native input root differs from its retained backing".into());
+            }
+            bindings.push(CanonicalGeneratedRoot {
+                physical: expected,
+                logical: path.to_path_buf(),
+            });
+        }
+        Ok(bindings)
     }
 
     pub(crate) fn dependency_facts(
@@ -1403,8 +1459,189 @@ mod tests {
             facts: &Arc<crate::edge::live_facts::LiveFacts>,
         ) -> Result<Arc<crate::edge::live_facts::PackageFacts>, crate::edge::live_facts::FactsMiss>
         {
-            facts.package_canonical(&self.physical, Some(&self.binding))
+            facts.package_canonical(&self.physical, Some(&self.binding), &[])
         }
+    }
+
+    #[test]
+    fn propagated_native_capture_binds_complete_trees_records_and_memo_generations() {
+        use crate::edge::live_facts::{LiveFacts, native_snapshot_root};
+        use rabs_protocol::input_evidence::ActionInputManifest;
+        let mut fixture = GeneratedFixture::new(false, false);
+        let logical = "/__rabs/out/cargo/debug/build/provider/out";
+        let backing = fixture.paths.physical(Path::new(logical)).unwrap();
+        std::fs::create_dir_all(backing.join("native")).unwrap();
+        std::fs::create_dir_all(backing.join("empty/inner")).unwrap();
+        std::fs::write(
+            backing.join("native/libprovider.a"),
+            b"retained native archive",
+        )
+        .unwrap();
+        let unit = backing.parent().unwrap();
+        std::fs::write(unit.join("root-output"), logical).unwrap();
+        std::fs::write(
+            unit.join("output"),
+            format!("cargo::rustc-link-search=native={logical}/native\n"),
+        )
+        .unwrap();
+        // Downstream Cargo units inherit this search even without their own
+        // build script, OUT_DIR or rustc-link-lib argument.
+        fixture.plan.generated_root = None;
+        fixture
+            .plan
+            .execution_env
+            .retain(|(name, _)| name != "OUT_DIR");
+        fixture.plan.keyed_env = fixture.plan.execution_env.clone();
+        fixture.plan.native_roots = vec![logical.into()];
+        fixture
+            .plan
+            .invocation
+            .lib_search
+            .push(format!("native={logical}/native"));
+        fixture.physical = fixture.paths.project_plan(&fixture.plan).unwrap();
+        let native = fixture
+            .paths
+            .native_roots(&fixture.plan, &fixture.physical)
+            .unwrap();
+        let facts = LiveFacts::new();
+        let capture = || {
+            facts
+                .package_canonical(&fixture.physical, None, &native)
+                .unwrap()
+        };
+        let first = capture();
+        assert!(
+            Arc::ptr_eq(&first, &capture()),
+            "unchanged complete observation reuses one sealed image"
+        );
+        assert_eq!(first.native.len(), 1);
+        assert_eq!(
+            first
+                .snapshot
+                .file_bytes(&native_snapshot_root(0), "native/libprovider.a"),
+            Some(b"retained native archive".as_slice())
+        );
+        first.verify_generated_disjoint(&fixture.physical).unwrap();
+        let mut inputs = ActionInputManifest::default();
+        first
+            .append_native_inputs(&fixture.plan, &mut inputs)
+            .unwrap();
+        assert_eq!(
+            rabs_key::live_dependency::native_input_directories(&fixture.plan, &inputs, 0).unwrap(),
+            vec!["empty", "empty/inner", "native"]
+        );
+        let record_path = fixture.plan.native_record_virtual_path(0).into_bytes();
+        let record = inputs
+            .inputs
+            .iter()
+            .find(|input| input.virtual_path.as_bytes() == record_path)
+            .unwrap()
+            .object
+            .clone();
+        std::fs::write(
+            unit.join("output"),
+            format!("cargo::rustc-link-search=native={logical}/native\ncargo::metadata=changed\n"),
+        )
+        .unwrap();
+        assert!(
+            first
+                .verify_unchanged(Path::new(&fixture.physical.source_root))
+                .is_err()
+        );
+        let changed_record = capture();
+        assert!(!Arc::ptr_eq(&first, &changed_record));
+        let mut changed_inputs = ActionInputManifest::default();
+        changed_record
+            .append_native_inputs(&fixture.plan, &mut changed_inputs)
+            .unwrap();
+        assert_ne!(
+            record,
+            changed_inputs
+                .inputs
+                .iter()
+                .find(|input| input.virtual_path.as_bytes() == record_path)
+                .unwrap()
+                .object
+        );
+        std::fs::create_dir(backing.join("another-empty")).unwrap();
+        assert!(
+            changed_record
+                .verify_unchanged(Path::new(&fixture.physical.source_root))
+                .is_err()
+        );
+        let changed_tree = capture();
+        assert!(!Arc::ptr_eq(&changed_record, &changed_tree));
+        std::fs::write(
+            backing.join("native/libprovider.a"),
+            b"changed archive bytes",
+        )
+        .unwrap();
+        assert!(
+            changed_tree
+                .verify_unchanged(Path::new(&fixture.physical.source_root))
+                .is_err()
+        );
+        assert_ne!(changed_tree.native[0].files, capture().native[0].files);
+        std::fs::write(unit.join("root-output"), "/another/producers/out").unwrap();
+        assert!(
+            facts
+                .package_canonical(&fixture.physical, None, &native)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn native_mapping_and_capture_refuse_unbound_or_output_aliasing_roots() {
+        use crate::edge::live_facts::LiveFacts;
+        let mut fixture = GeneratedFixture::new(false, false);
+        let logical = "/__rabs/out/cargo/debug/build/provider/out";
+        let backing = fixture.paths.physical(Path::new(logical)).unwrap();
+        std::fs::create_dir_all(&backing).unwrap();
+        std::fs::write(backing.join("libprovider.a"), b"native bytes").unwrap();
+        std::fs::write(backing.parent().unwrap().join("root-output"), logical).unwrap();
+        std::fs::write(
+            backing.parent().unwrap().join("output"),
+            b"cargo::rustc-link-lib=static=provider\n",
+        )
+        .unwrap();
+        fixture.plan.native_roots = vec![logical.into()];
+        fixture
+            .plan
+            .invocation
+            .lib_search
+            .push(format!("native={logical}"));
+        fixture.physical = fixture.paths.project_plan(&fixture.plan).unwrap();
+        let native = fixture
+            .paths
+            .native_roots(&fixture.plan, &fixture.physical)
+            .unwrap();
+        let facts = LiveFacts::new();
+        assert!(
+            facts
+                .package_canonical(&fixture.physical, Some(&fixture.binding), &[])
+                .is_err()
+        );
+        let captured = facts
+            .package_canonical(&fixture.physical, Some(&fixture.binding), &native)
+            .unwrap();
+        captured
+            .verify_generated_disjoint(&fixture.physical)
+            .unwrap();
+        let output =
+            Path::new(&fixture.physical.out_dir).join(fixture.plan.output_names().first().unwrap());
+        std::fs::hard_link(backing.join("libprovider.a"), output).unwrap();
+        assert!(
+            captured
+                .verify_generated_disjoint(&fixture.physical)
+                .is_err()
+        );
+        let mut forged = fixture.physical.clone();
+        forged.native_roots[0] = fixture.physical.source_root.clone();
+        assert!(fixture.paths.native_roots(&fixture.plan, &forged).is_err());
+        let mut overlapping = fixture.plan.clone();
+        overlapping.native_roots[0] = fixture.plan.generated_root.clone().unwrap();
+        let physical = fixture.paths.project_plan(&overlapping).unwrap();
+        assert!(fixture.paths.native_roots(&overlapping, &physical).is_err());
     }
 
     #[test]
@@ -1653,7 +1890,7 @@ mod tests {
         );
         assert!(
             crate::edge::live_facts::LiveFacts::new()
-                .package_canonical(&wrong_backing, Some(&fixture.binding))
+                .package_canonical(&wrong_backing, Some(&fixture.binding), &[])
                 .is_err()
         );
     }

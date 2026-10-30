@@ -296,6 +296,24 @@ jobs:
           cargo test --release -p rabsd --test canonical_check_local --locked \
             canonical_cargo_build_offloads_generated_archives_and_delivers_current_generated_code \
             -- --ignored --exact --nocapture
+      - name: Canonical Cargo offloads propagated native roots and invalidates transitive consumers
+        timeout-minutes: 45
+        env:
+          RABS_CANONICAL_TEST_WRAPPER: ${{ github.workspace }}/target/release/rabs-wrap
+          RABS_TEST_WORKER_BIN: ${{ github.workspace }}/target/release/rabs-wkr
+        run: |
+          cargo test --release -p rabsd --test canonical_check_local --locked \
+            canonical_cargo_build_offloads_propagated_native_archives_and_invalidates_transitive_consumers \
+            -- --ignored --exact --nocapture
+          cargo test --release -p rabsd --test canonical_check_local --locked \
+            canonical_cargo_check_offloads_propagated_native_roots_and_invalidates_transitive_consumers \
+            -- --ignored --exact --nocapture
+          cargo test --release -p rabsd --test canonical_check_local --locked \
+            canonical_cargo_build_bundles_generated_native_archives_replays_and_invalidates_them \
+            -- --ignored --exact --nocapture
+          cargo test --release -p rabsd --test canonical_check_local --locked \
+            canonical_cargo_check_offloads_native_dependency_metadata_replays_and_invalidates_archives \
+            -- --ignored --exact --nocapture
       - name: Closed archive isolation and authenticated mode selection
         run: |
           cargo test --release -p rabs-sandbox --lib dependency_context --locked
@@ -307,6 +325,10 @@ jobs:
             cargo test --release -p rabs-sandbox --lib \
               dependency_context::tests::real_canonical_rustc_archive_view_closes_assembler_inputs_missing_from_dep_info \
               --locked -- --ignored --exact --nocapture
+          RABS_TEST_TOOLCHAIN_ROOT="$(rustc --print sysroot)" \
+            cargo test --release -p rabs-sandbox --lib \
+              real_canonical_archive_bundles_ \
+              --locked -- --ignored --nocapture
           cargo test --release -p rabs-wkr --bin rabs-wkr dependency --locked
           cargo test --release -p rabs-wkr --bin rabs-wkr archive --locked
           cargo test --release -p rabs-wkr --lib canonical_generated_inputs --locked

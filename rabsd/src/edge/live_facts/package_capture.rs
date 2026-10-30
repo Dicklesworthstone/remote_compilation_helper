@@ -29,6 +29,7 @@ pub(super) struct Observation {
     root_identity: (u64, u64),
     members: Vec<(String, MemberSig)>,
     generated: Option<GeneratedObservation>,
+    native: Vec<GeneratedObservation>,
     bytes: u64,
 }
 
@@ -47,7 +48,7 @@ impl Observation {
         source_kind: DependencySourceKind,
         generated_root: Option<&Path>,
     ) -> Result<Self, String> {
-        Self::read_with_record_root(root, source_kind, generated_root, generated_root)
+        Self::read_with_record_root(root, source_kind, generated_root, generated_root, &[])
     }
 
     fn read_with_record_root(
@@ -55,7 +56,11 @@ impl Observation {
         source_kind: DependencySourceKind,
         generated_root: Option<&Path>,
         generated_record_root: Option<&Path>,
+        native_roots: &[(std::path::PathBuf, std::path::PathBuf)],
     ) -> Result<Self, String> {
+        if native_roots.len() > rabs_key::live_dependency::remote::MAX_CANONICAL_NATIVE_ROOTS {
+            return Err("too many propagated native input trees".into());
+        }
         let identity = root_identity(root)?;
         let (members, source_bytes) = walk_package(root, source_kind)?;
         let (generated, generated_bytes) = match (generated_root, generated_record_root) {
@@ -66,11 +71,21 @@ impl Observation {
             (None, None) => (None, 0),
             _ => return Err("generated observation lacks its Cargo record binding".into()),
         };
-        let bytes = source_bytes
+        let mut bytes = source_bytes
             .checked_add(generated_bytes)
             .ok_or("package observation byte count overflow")?;
+        let mut native = Vec::with_capacity(native_roots.len());
+        for (root, record_root) in native_roots {
+            let (observed, size) = observe_generated(root, record_root)?;
+            bytes = bytes
+                .checked_add(size)
+                .ok_or("native observation byte count overflow")?;
+            native.push(observed);
+        }
         if bytes > MAX_PACKAGE_BYTES
-            || members.len() + generated.as_ref().map_or(0, |tree| tree.members.len())
+            || members.len()
+                + generated.as_ref().map_or(0, |tree| tree.members.len())
+                + native.iter().map(|tree| tree.members.len()).sum::<usize>()
                 > MAX_PACKAGE_FILES
         {
             return Err("combined source and generated inputs exceed capture bounds".into());
@@ -88,6 +103,7 @@ impl Observation {
             root_identity: identity,
             members,
             generated,
+            native,
             bytes,
         })
     }
@@ -98,6 +114,11 @@ impl Observation {
             self.key.1,
             self.key.2.as_deref(),
             self.key.3.as_deref(),
+            &self
+                .native
+                .iter()
+                .map(|tree| (tree.root.clone(), tree.record_root.clone()))
+                .collect::<Vec<_>>(),
         )
     }
 
@@ -105,6 +126,7 @@ impl Observation {
         if captured.source_kind != self.key.1
             || captured.members != self.members
             || captured.generated != self.generated
+            || captured.native_observations != self.native
             || captured.bytes != self.bytes
             || root_identity(&self.key.0)? != self.root_identity
         {
@@ -354,6 +376,7 @@ pub(super) fn observe_canonical(
     root: &Path,
     source_kind: DependencySourceKind,
     generated: Option<&CanonicalGeneratedRoot>,
+    native: &[CanonicalGeneratedRoot],
 ) -> Result<Arc<PackageFacts>, FactsMiss> {
     let observation = Arc::new(
         Observation::read_with_record_root(
@@ -361,6 +384,15 @@ pub(super) fn observe_canonical(
             source_kind,
             generated.map(CanonicalGeneratedRoot::physical),
             generated.map(CanonicalGeneratedRoot::logical),
+            &native
+                .iter()
+                .map(|binding| {
+                    (
+                        binding.physical().to_path_buf(),
+                        binding.logical().to_path_buf(),
+                    )
+                })
+                .collect::<Vec<_>>(),
         )
         .map_err(FactsMiss::Refused)?,
     );

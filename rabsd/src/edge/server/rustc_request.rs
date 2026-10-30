@@ -593,6 +593,9 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
             Err(reason) => return refuse(&reason),
         }
     }
+    if let Err(reason) = package.append_native_inputs(&plan, &mut inputs) {
+        return refuse(&reason);
+    }
     let mut externs = Vec::new();
     for planned in &plan.externs {
         if let PlannedExtern::File { path, .. } = planned {

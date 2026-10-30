@@ -9,7 +9,8 @@
 
 use rabs_key::invocation::{NormalizedRustcInvocation, SourceInput, parse};
 use rabs_key::live_dependency::remote::{
-    remote_dependency_output_class, validate_generated_native_inputs,
+    canonical_generated_native_roots, remote_dependency_output_class,
+    validate_generated_native_inputs_with_roots,
 };
 use rabs_key::live_dependency::{
     LiveRefusal, LiveRustcRequest, check_dependency_cache_read_closure,
@@ -202,16 +203,28 @@ fn dependency_inputs_rejection(
     generated_root: Option<&str>,
     canonical_archive_execution: bool,
 ) -> Option<LiveRefusal> {
-    if let Err(refusal) =
-        validate_generated_native_inputs(invocation, generated_root, canonical_archive_execution)
-    {
+    let native_roots = if canonical_archive_execution {
+        match canonical_generated_native_roots(invocation, generated_root) {
+            Ok(roots) => roots,
+            Err(refusal) => return Some(refusal),
+        }
+    } else {
+        Vec::new()
+    };
+    if let Err(refusal) = validate_generated_native_inputs_with_roots(
+        invocation,
+        generated_root,
+        &native_roots,
+        canonical_archive_execution,
+    ) {
         return Some(refusal);
     }
     // A proc-macro PRODUCER is rejected above, but the ordinary lib/rlib
     // that CONSUMES it cannot enter this class either.
     // Unbound native search paths also refuse above, including those without
     // -l. Only canonical worker executions may continue with native searches
-    // wholly inside their retained generated tree. These checks need neither
+    // inside complete generated trees whose completed Cargo records and bytes
+    // must still be captured by the coordinator. These checks need neither
     // a host probe, source capture, nor dependency enumeration
     // to establish this refusal. Let Cargo make progress immediately rather
     // than spend the wrapper's cold-readiness budget on an impossible hit.

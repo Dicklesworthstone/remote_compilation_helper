@@ -14,8 +14,8 @@ use rabs_protocol::capability_tokens::CapabilityToken;
 use rabs_sandbox::dependency_context::{
     CANONICAL_DEPENDENCY_CONTEXT_VERSION, CANONICAL_WORKSPACE_CONTEXT_VERSION,
     DEPENDENCY_CONTEXT_VERSION, DependencyArtifactRoot, DependencyExecContext,
-    DependencyExecutionMode, DependencyIsolationSupport, MAX_DEPENDENCY_DIRS,
-    MAX_DEPENDENCY_ENV_ENTRIES,
+    DependencyExecutionMode, DependencyIsolationSupport, DependencyNativeRoot, MAX_DEPENDENCY_DIRS,
+    MAX_DEPENDENCY_ENV_ENTRIES, MAX_NATIVE_ROOTS,
 };
 use rabs_sandbox::generated_source::MAX_GENERATED_DIRECTORIES;
 use rabs_sandbox::process_context::{
@@ -194,6 +194,9 @@ pub fn parse_dependency_context(
         .ok_or("dependency_context must be an object")?;
     let workspace = object.get("version").and_then(serde_json::Value::as_str)
         == Some(CANONICAL_WORKSPACE_CONTEXT_VERSION);
+    let canonical = workspace
+        || object.get("version").and_then(serde_json::Value::as_str)
+            == Some(CANONICAL_DEPENDENCY_CONTEXT_VERSION);
     const REQUIRED: &[&str] = &[
         "version",
         "execution_mode",
@@ -214,6 +217,7 @@ pub fn parse_dependency_context(
                 && field != "dependency_dirs"
                 && field != "loader_dirs"
                 && field != "generated_root"
+                && !(canonical && field == "native_roots")
                 && !(workspace && field == "source_directories")
         })
         || !matches!(
@@ -301,6 +305,49 @@ pub fn parse_dependency_context(
                 .to_owned(),
         ),
     };
+    let native_roots = match object.get("native_roots") {
+        None => Vec::new(),
+        Some(value) => value
+            .as_array()
+            .filter(|roots| roots.len() <= MAX_NATIVE_ROOTS)
+            .ok_or("native_roots must be a bounded array")?
+            .iter()
+            .map(|root| {
+                let root = root
+                    .as_object()
+                    .filter(|fields| {
+                        fields.len() == 3
+                            && ["path", "prefix", "directories"]
+                                .iter()
+                                .all(|name| fields.contains_key(*name))
+                    })
+                    .ok_or("native roots require exactly path, prefix and directories")?;
+                let directories = root["directories"]
+                    .as_array()
+                    .filter(|directories| directories.len() <= MAX_GENERATED_DIRECTORIES)
+                    .ok_or("native root directories must be a bounded array")?
+                    .iter()
+                    .map(|directory| {
+                        directory
+                            .as_str()
+                            .map(str::to_owned)
+                            .ok_or("native root directories require strings")
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(DependencyNativeRoot {
+                    path: root["path"]
+                        .as_str()
+                        .ok_or("native root path must be a string")?
+                        .to_owned(),
+                    prefix: root["prefix"]
+                        .as_str()
+                        .ok_or("native root prefix must be a string")?
+                        .to_owned(),
+                    directories,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+    };
     let artifact_roots = object
         .get("artifact_roots")
         .and_then(serde_json::Value::as_array)
@@ -381,6 +428,7 @@ pub fn parse_dependency_context(
                 env,
                 runtime_cohort,
             )
+            .and_then(|context| context.with_native_roots(native_roots))
             .map(Some)
             .map_err(|error| error.to_string());
         }
@@ -397,6 +445,7 @@ pub fn parse_dependency_context(
             runtime_cohort,
         )
         .and_then(|context| context.with_generated_directories(generated_directories))
+        .and_then(|context| context.with_native_roots(native_roots))
         .map(Some)
         .map_err(|error| error.to_string());
     }
@@ -432,7 +481,7 @@ pub fn validate_dependency_execution(
     use rabs_key::invocation::SourceInput;
     use rabs_key::live_dependency::remote::{
         RemoteDependencyOutputClass, remote_dependency_output_class,
-        validate_generated_native_inputs,
+        validate_generated_native_inputs_with_roots,
     };
     use std::collections::BTreeSet;
     use std::path::{Component, Path};
@@ -446,27 +495,44 @@ pub fn validate_dependency_execution(
         .map_err(|error| format!("dependency invocation: {error:?}"))?;
     let class = remote_dependency_output_class(&invocation).map_err(|error| error.to_string())?;
     // Canonical metadata checks and closed rlib execution can consume static
-    // native inputs from their exact retained OUT_DIR. This grants neither
+    // native inputs from complete retained Cargo build-output trees. This grants neither
     // host-native lookup nor local compiler-result authority.
     // The source transfer retains the complete generated tree; the compiler
     // can resolve only these declared directories and its other sealed inputs.
-    let native_directories = validate_generated_native_inputs(
+    let native_roots = context
+        .native_roots()
+        .iter()
+        .map(|root| root.path.clone())
+        .collect::<Vec<_>>();
+    let native_directories = validate_generated_native_inputs_with_roots(
         &invocation,
         context.generated_root(),
+        &native_roots,
         context.canonical_cargo(),
     )
     .map_err(|error| format!("dependency generated native inputs: {error}"))?;
+    let native_tree = |directory: &str| {
+        context
+            .generated_root()
+            .map(|root| (root, context.generated_directories(), "generated"))
+            .into_iter()
+            .chain(context.native_roots().iter().map(|root| {
+                (
+                    root.path.as_str(),
+                    root.directories.as_slice(),
+                    root.prefix.as_str(),
+                )
+            }))
+            .find(|(root, _, _)| Path::new(directory).starts_with(root))
+    };
     for directory in &native_directories {
+        let (root, directories, _) =
+            native_tree(directory).ok_or("native search has no retained input root")?;
         let relative = Path::new(directory)
-            .strip_prefix(
-                context
-                    .generated_root()
-                    .ok_or("native input lacks OUT_DIR")?,
-            )
+            .strip_prefix(root)
             .map_err(|_| "native input is outside the retained generated tree")?;
         if !relative.as_os_str().is_empty()
-            && !context
-                .generated_directories()
+            && !directories
                 .iter()
                 .any(|declared| Path::new(declared) == relative)
         {
@@ -482,20 +548,18 @@ pub fn validate_dependency_execution(
             .iter()
             .map(|file| file.path.as_str())
             .collect::<BTreeSet<_>>();
-        let generated = Path::new(
-            context
-                .generated_root()
-                .ok_or("native input lacks OUT_DIR")?,
-        );
         for library in &invocation.native_libs {
             let name = library
                 .strip_prefix("static=")
                 .ok_or("native inputs require default-bundle static archives")?;
             let present = native_directories.iter().any(|directory| {
-                let Ok(relative) = Path::new(directory).strip_prefix(generated) else {
+                let Some((root, _, prefix)) = native_tree(directory) else {
                     return false;
                 };
-                let path = Path::new("generated")
+                let Ok(relative) = Path::new(directory).strip_prefix(root) else {
+                    return false;
+                };
+                let path = Path::new(prefix)
                     .join(relative)
                     .join(format!("lib{name}.a"));
                 path.to_str().is_some_and(|path| files.contains(path))
@@ -1140,6 +1204,7 @@ fn execute_canonical_inner(
     // excluding a file from a shared Cargo input/output directory.
     let mut dependency_inputs = None;
     let mut generated_inputs = None;
+    let mut native_inputs = Vec::new();
     let mut workspace_inputs = None;
     let mut retained_package = None;
     let prepared_spec = (|| -> Result<_, String> {
@@ -1192,6 +1257,9 @@ fn execute_canonical_inner(
             generated_inputs = source
                 .prepare_dependency_generated(request.request_id, context, &mut spec)
                 .map_err(|error| format!("generated input preparation: {error}"))?;
+            native_inputs = source
+                .prepare_dependency_native(request.request_id, context, &mut spec)
+                .map_err(|error| format!("native input preparation: {error}"))?;
             let inputs = source
                 .prepare_dependency_output(request.request_id, context, &mut spec)
                 .map_err(|error| format!("dependency input mountpoints: {error}"))?;
@@ -1451,6 +1519,14 @@ fn execute_canonical_inner(
             return exec_error(request.request_id);
         }
     }
+    for inputs in &native_inputs {
+        if let Err(error) = inputs.verify() {
+            let _ = control.retain_outputs(Err(format!(
+                "native inputs changed before execution: {error}"
+            )));
+            return exec_error(request.request_id);
+        }
+    }
     // Verification may have spent the remaining lease or execution budget.
     // Do not start a compiler after that final input-preparation boundary.
     if control.reason().is_some() {
@@ -1625,6 +1701,9 @@ fn execute_canonical_inner(
                             inputs.verify()?;
                         }
                         if let Some(inputs) = &generated_inputs {
+                            inputs.verify()?;
+                        }
+                        for inputs in &native_inputs {
                             inputs.verify()?;
                         }
                         Ok(captured)

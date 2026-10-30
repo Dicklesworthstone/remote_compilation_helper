@@ -178,18 +178,31 @@ fn generated_dependency(root: &Path) {
     );
 }
 
-fn generated_native_dependency(root: &Path) {
+fn generated_native_dependency(root: &Path, leaf: bool) {
     // Keep generator intermediates in private TMPDIR: changing the workspace
     // value changes only the archive in the compiler's retained OUT_DIR, not
     // its Rust source, generated Rust, native search path or Cargo directives.
-    write(root, "generated-value.txt", "2\n");
+    write(
+        root,
+        "generated-value.txt",
+        if leaf { "40\n" } else { "2\n" },
+    );
+    write(root, "generated-empty-name.txt", "before\n");
     vendor(
         root,
-        "canonical_dep",
+        if leaf {
+            "canonical_leaf"
+        } else {
+            "canonical_dep"
+        },
         BTreeMap::from([
             (
                 "Cargo.toml",
-                "[package]\nname='canonical_dep'\nversion='1.0.0'\nedition='2021'\n[dependencies]\ncanonical_leaf='=1.0.0'\n",
+                if leaf {
+                    "[package]\nname='canonical_leaf'\nversion='1.0.0'\nedition='2021'\n"
+                } else {
+                    "[package]\nname='canonical_dep'\nversion='1.0.0'\nedition='2021'\n[dependencies]\ncanonical_leaf='=1.0.0'\n"
+                },
             ),
             (
                 "build.rs",
@@ -197,9 +210,12 @@ fn generated_native_dependency(root: &Path) {
     let package = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let input = package.parent().unwrap().parent().unwrap().join("generated-value.txt");
     let value: u32 = std::fs::read_to_string(&input).unwrap().trim().parse().unwrap();
+    let directory_input = package.parent().unwrap().parent().unwrap().join("generated-empty-name.txt");
+    let directory_name = std::fs::read_to_string(&directory_input).unwrap();
     let output = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("native");
     let scratch = std::env::temp_dir().join("canonical-dependency-native-inputs");
     std::fs::create_dir_all(&output).unwrap();
+    std::fs::create_dir_all(output.join("empty").join(directory_name.trim())).unwrap();
     std::fs::create_dir_all(&scratch).unwrap();
     std::fs::write(scratch.join("answer.c"), format!("unsigned int rabs_native_answer(void) {{ return {value}; }}\n")).unwrap();
     assert!(std::process::Command::new("/usr/bin/cc")
@@ -210,6 +226,7 @@ fn generated_native_dependency(root: &Path) {
         .arg("crsD").arg(output.join("librabs_answer.a")).arg(scratch.join("answer.o"))
         .status().unwrap().success());
     println!("cargo:rerun-if-changed={}", input.display());
+    println!("cargo:rerun-if-changed={}", directory_input.display());
     println!("cargo:rustc-link-search=native={}", output.display());
     println!("cargo:rustc-link-lib=static=rabs_answer");
 }
@@ -217,10 +234,33 @@ fn generated_native_dependency(root: &Path) {
             ),
             (
                 "src/lib.rs",
-                "extern \"C\" { fn rabs_native_answer() -> u32; }\npub fn answer()->u32 { canonical_leaf::answer() + unsafe { rabs_native_answer() } }\n",
+                if leaf {
+                    "extern \"C\" { fn rabs_native_answer() -> u32; }\npub fn answer()->u32 { unsafe { rabs_native_answer() } }\n"
+                } else {
+                    "extern \"C\" { fn rabs_native_answer() -> u32; }\npub fn answer()->u32 { canonical_leaf::answer() + unsafe { rabs_native_answer() } }\n"
+                },
             ),
         ]),
     );
+    if leaf {
+        // Cargo propagates the leaf's native search path through this middle
+        // dependency. It has neither a build script nor an OUT_DIR of its own,
+        // so successful worker execution requires the foreign generated root.
+        vendor(
+            root,
+            "canonical_dep",
+            BTreeMap::from([
+                (
+                    "Cargo.toml",
+                    "[package]\nname='canonical_dep'\nversion='1.0.0'\nedition='2021'\n[dependencies]\ncanonical_leaf='=1.0.0'\n",
+                ),
+                (
+                    "src/lib.rs",
+                    "pub fn answer()->u32 { canonical_leaf::answer()+2 }\n",
+                ),
+            ]),
+        );
+    }
 }
 
 fn generated_native_workspace(root: &Path) {
@@ -749,7 +789,7 @@ fn canonical_private_targets_reuse_relocated_builds_and_preserve_current_outputs
     assert_eq!(code, 0, "{output}");
     state(&events, "cold");
     freshness(&output, false, false);
-    let (first_target, first_archives) = delivered_build(owner.path(), 100, &events, 42);
+    let (first_target, first_archives) = delivered_build(owner.path(), 100, &events, &output, 42);
     let initial_families = families();
     assert_eq!(initial_families.len(), 1);
 
@@ -758,7 +798,7 @@ fn canonical_private_targets_reuse_relocated_builds_and_preserve_current_outputs
     assert_eq!(code, 0, "{output}");
     state(&events, "restored");
     freshness(&output, true, true);
-    let (warm_target, warm_archives) = delivered_build(owner.path(), 101, &events, 42);
+    let (warm_target, warm_archives) = delivered_build(owner.path(), 101, &events, &output, 42);
     assert_ne!(first_target, warm_target);
     assert_eq!(first_archives, warm_archives);
     assert!(decisions(&events, "execute").is_empty());
@@ -777,7 +817,7 @@ fn canonical_private_targets_reuse_relocated_builds_and_preserve_current_outputs
     assert_eq!(code, 0, "{output}");
     state(&events, "restored");
     freshness(&output, true, true);
-    delivered_build(owner.path(), 102, &events, 42);
+    delivered_build(owner.path(), 102, &events, &output, 42);
 
     write(
         &second,
@@ -790,7 +830,7 @@ fn canonical_private_targets_reuse_relocated_builds_and_preserve_current_outputs
     // (for example assembler .incbin inputs). Its private state is source-exact.
     state(&events, "cold");
     freshness(&output, false, false);
-    delivered_build(owner.path(), 103, &events, 43);
+    delivered_build(owner.path(), 103, &events, &output, 43);
     let original_families = families()
         .difference(&initial_families)
         .cloned()
@@ -802,7 +842,7 @@ fn canonical_private_targets_reuse_relocated_builds_and_preserve_current_outputs
     assert_eq!(code, 0, "{output}");
     state(&events, "restored");
     freshness(&output, true, false);
-    delivered_build(owner.path(), 104, &events, 143);
+    delivered_build(owner.path(), 104, &events, &output, 143);
 
     profile["command"] = json!("check");
     for number in [105, 106] {
@@ -827,7 +867,7 @@ fn canonical_private_targets_reuse_relocated_builds_and_preserve_current_outputs
     assert_eq!(code, 0, "{output}");
     state(&events, "restored");
     freshness(&output, true, true);
-    delivered_build(owner.path(), 107, &events, 143);
+    delivered_build(owner.path(), 107, &events, &output, 143);
 
     // Ambient host tools belong to the operator's runtime epoch. A changed
     // epoch cannot inherit Cargo's prior fingerprint state under the old one.
@@ -836,7 +876,7 @@ fn canonical_private_targets_reuse_relocated_builds_and_preserve_current_outputs
     assert_eq!(code, 0, "{output}");
     state(&events, "cold");
     freshness(&output, false, false);
-    delivered_build(owner.path(), 108, &events, 143);
+    delivered_build(owner.path(), 108, &events, &output, 143);
 
     // A rejected optional restore must not discard the adapter that captures
     // this command's successful cold Cargo output. The very next invocation
@@ -860,13 +900,13 @@ fn canonical_private_targets_reuse_relocated_builds_and_preserve_current_outputs
         }),
         "corrupted seed was not refused: {output}"
     );
-    delivered_build(owner.path(), 109, &events, 143);
+    delivered_build(owner.path(), 109, &events, &output, 143);
 
     let (code, events, output) = run(owner.path(), 110, &profile);
     assert_eq!(code, 0, "{output}");
     state(&events, "restored");
     freshness(&output, true, true);
-    delivered_build(owner.path(), 110, &events, 143);
+    delivered_build(owner.path(), 110, &events, &output, 143);
 
     // A return to a previous runtime family restores its own complete Cargo
     // state. Neither switching families nor repairing one corrupts the other.
@@ -876,7 +916,7 @@ fn canonical_private_targets_reuse_relocated_builds_and_preserve_current_outputs
         assert_eq!(code, 0, "{output}");
         state(&events, "restored");
         freshness(&output, true, true);
-        delivered_build(owner.path(), number, &events, 143);
+        delivered_build(owner.path(), number, &events, &output, 143);
         assert_eq!(families(), retained_families);
     }
 
@@ -887,7 +927,7 @@ fn canonical_private_targets_reuse_relocated_builds_and_preserve_current_outputs
     assert_eq!(code, 0, "{output}");
     state(&events, "cold");
     freshness(&output, false, false);
-    delivered_build(owner.path(), 113, &events, 143);
+    delivered_build(owner.path(), 113, &events, &output, 143);
     let retained = families();
     assert_eq!(retained.len(), 2);
     assert!(retained.contains(&second_family));
@@ -898,14 +938,14 @@ fn canonical_private_targets_reuse_relocated_builds_and_preserve_current_outputs
     assert_eq!(code, 0, "{output}");
     state(&events, "restored");
     freshness(&output, true, true);
-    delivered_build(owner.path(), 114, &events, 143);
+    delivered_build(owner.path(), 114, &events, &output, 143);
 
     profile["target_cache"]["runtime_epoch"] = json!("native-fixture-v1");
     let (code, events, output) = run(owner.path(), 115, &profile);
     assert_eq!(code, 0, "{output}");
     state(&events, "cold");
     freshness(&output, false, false);
-    delivered_build(owner.path(), 115, &events, 143);
+    delivered_build(owner.path(), 115, &events, &output, 143);
     assert_eq!(families().len(), 2);
 }
 
@@ -1836,25 +1876,43 @@ fn assert_fresh_workspace_units(
         .collect()
 }
 
-fn assert_local_native_workspace(events: &[Value], output: &str) {
-    for decision in ["remote-offer", "hit", "execute"] {
-        assert!(
-            !decisions(events, decision).contains_key("canonical_app"),
-            "the workspace consumer of a propagated native path must remain local and uncached: {output}"
-        );
-    }
-    assert!(
-        events.iter().any(|event| {
-            event["kind"] == "rabsd-live-dependency"
-                && event["crate"] == "canonical_app"
-                && event["decision"] == "shadow"
-                && matches!(
-                    event["reason"].as_str(),
-                    Some("LIVE_DEP_SEARCH_PATH" | "LIVE_DEP_NATIVE_LIB")
-                )
-        }),
-        "the actual workspace invocation must refuse its propagated native input: {output}"
-    );
+/// Resolve Cargo's actual artifact records into the retained target tree.
+/// The pinned Cargo uses per-unit build directories; guessing `debug/deps`
+/// misses valid outputs and would never exercise the worker/cache assertions.
+fn delivered_cargo_outputs(target: &Path, output: &str, name: &str, suffix: &str) -> Vec<PathBuf> {
+    output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| event["reason"] == "compiler-artifact" && event["target"]["name"] == name)
+        .flat_map(|event| event["filenames"].as_array().unwrap().clone())
+        .filter_map(|filename| {
+            let filename = PathBuf::from(filename.as_str().unwrap());
+            (filename
+                .extension()
+                .and_then(|extension| extension.to_str())
+                == Some(suffix))
+            .then_some(filename)
+        })
+        .map(|filename| {
+            let relative = filename.strip_prefix("/__rabs/out/cargo").unwrap();
+            assert!(
+                !relative.as_os_str().is_empty()
+                    && relative
+                        .components()
+                        .all(|part| matches!(part, std::path::Component::Normal(_))),
+                "Cargo reported an escaping artifact: {}",
+                filename.display()
+            );
+            let physical = target.join(relative);
+            assert_eq!(
+                fs::canonicalize(&physical).unwrap(),
+                physical,
+                "Cargo output must resolve inside its ordinary retained target tree"
+            );
+            assert!(fs::symlink_metadata(&physical).unwrap().is_file());
+            physical
+        })
+        .collect()
 }
 
 /// Validate the delivered user output, including a real executable consuming
@@ -1864,6 +1922,7 @@ fn delivered_build(
     root: &Path,
     number: u32,
     events: &[Value],
+    output: &str,
     answer: u32,
 ) -> (PathBuf, BTreeMap<String, Vec<u8>>) {
     let completed = events
@@ -1911,16 +1970,7 @@ fn delivered_build(
 
     let mut archives = BTreeMap::new();
     for name in ["canonical_leaf", "canonical_dep"] {
-        let prefix = format!("lib{name}-");
-        let candidates = fs::read_dir(target.join("debug/deps"))
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|file| file.to_str())
-                    .is_some_and(|file| file.starts_with(&prefix) && file.ends_with(".rlib"))
-            })
-            .collect::<Vec<_>>();
+        let candidates = delivered_cargo_outputs(&target, output, name, "rlib");
         assert_eq!(
             candidates.len(),
             1,
@@ -2040,6 +2090,19 @@ fn canonical_cargo_check_offloads_native_dependency_metadata_replays_and_invalid
 }
 
 #[test]
+#[ignore = "requires full Linux bubblewrap isolation, cc, ar, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual transitive generated native roots, dependency replay and delivered executable validation"]
+fn canonical_cargo_build_offloads_propagated_native_archives_and_invalidates_transitive_consumers()
+{
+    remote_dependency_replay("build", GeneratedDependency::NativeLeaf);
+}
+
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, cc, ar, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual transitive native metadata checks and archive-only cache invalidation"]
+fn canonical_cargo_check_offloads_propagated_native_roots_and_invalidates_transitive_consumers() {
+    remote_dependency_replay("check", GeneratedDependency::NativeLeaf);
+}
+
+#[test]
 #[ignore = "requires full Linux bubblewrap isolation, cc, ar, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual fresh workspace native archive execution, dependency replay and linked binary validation"]
 fn canonical_cargo_build_executes_own_native_workspace_archives_fresh_while_dependencies_replay() {
     remote_native_workspace("build");
@@ -2085,6 +2148,7 @@ fn remote_native_workspace(command: &str) {
                 owner.path(),
                 500 + number,
                 &events,
+                &output,
                 if number == 5 { 44 } else { 43 },
             );
             assert!(retained_targets.insert(target.clone()));
@@ -2096,17 +2160,8 @@ fn remote_native_workspace(command: &str) {
             } else {
                 dependency_archives = Some(archives);
             }
-            let workspace_archives = fs::read_dir(target.join("target/debug/deps"))
-                .unwrap()
-                .map(|entry| entry.unwrap().path())
-                .filter(|path| {
-                    path.file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| {
-                            name.starts_with("libcanonical_app-") && name.ends_with(".rlib")
-                        })
-                })
-                .collect::<Vec<_>>();
+            let workspace_archives =
+                delivered_cargo_outputs(&target.join("target"), &output, "canonical_app", "rlib");
             assert_eq!(workspace_archives.len(), 1, "{output}");
             let archive = read_bounded(&workspace_archives[0]);
             assert!(archive.len() > 8 && archive.starts_with(b"!<arch>\n"));
@@ -2343,6 +2398,7 @@ fn canonical_cargo_check_offloads_binary_example_and_test_harness_metadata_witho
     let mut attempts = BTreeMap::new();
     let mut previous_keys = BTreeSet::new();
     let mut previous_receipt: Option<Value> = None;
+    let mut final_output = String::new();
     for number in 1..=3 {
         if number >= 2 {
             profile["source_root"] = json!(second);
@@ -2461,24 +2517,12 @@ fn canonical_cargo_check_offloads_binary_example_and_test_harness_metadata_witho
                 .count(),
             11 * number as usize
         );
+        final_output = output;
     }
     let target = sole_retained_target(owner.path());
     for (name, count) in &expected {
-        let prefix = format!("lib{name}-");
-        let directory = if name == "metadata_example" {
-            "debug/examples"
-        } else {
-            "debug/deps"
-        };
-        let metadata = fs::read_dir(target.join(directory))
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .filter(|path| {
-                path.file_name()
-                    .unwrap()
-                    .to_str()
-                    .is_some_and(|file| file.starts_with(&prefix) && file.ends_with(".rmeta"))
-            })
+        let metadata = delivered_cargo_outputs(&target, &final_output, name, "rmeta")
+            .into_iter()
             .map(|path| fs::symlink_metadata(path).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(
@@ -2514,6 +2558,7 @@ enum GeneratedDependency {
     Leaf,
     Consumer,
     NativeConsumer,
+    NativeLeaf,
 }
 
 impl GeneratedDependency {
@@ -2522,7 +2567,7 @@ impl GeneratedDependency {
     }
 
     fn assert_answer(self, root: &Path, answer: u32, workspace_edit: bool) {
-        if self == Self::NativeConsumer {
+        if matches!(self, Self::NativeConsumer | Self::NativeLeaf) {
             // FFI cannot be evaluated in a Rust const assertion. The delivered
             // executable calls this assertion after linking the returned rlib,
             // proving that the bundled native object has the current behavior.
@@ -2547,12 +2592,10 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
     profile["command"] = json!(command);
     profile["selection"] = json!({"features":["remote_workspace"]});
     let build = command == "build";
-    // Cargo propagates the dependency's native search path to its consumers.
-    // The workspace lane has no authority to capture another package's OUT_DIR.
-    let workspace_remote = generated != GeneratedDependency::NativeConsumer;
-    let workspace_units: &[&str] = if !workspace_remote {
-        &[]
-    } else if build {
+    // Native fixtures require Cargo's propagated search roots to survive every
+    // eligible consumer: the ordinary workspace library and metadata binary
+    // have no OUT_DIR or direct native-library directive of their own.
+    let workspace_units: &[&str] = if build {
         &["canonical_app"]
     } else {
         &["canonical_app", "canonical_cli"]
@@ -2571,8 +2614,12 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
             generated_dependency(&second);
         }
         GeneratedDependency::NativeConsumer => {
-            generated_native_dependency(&first);
-            generated_native_dependency(&second);
+            generated_native_dependency(&first, false);
+            generated_native_dependency(&second, false);
+        }
+        GeneratedDependency::NativeLeaf => {
+            generated_native_dependency(&first, true);
+            generated_native_dependency(&second, true);
         }
     }
     workspace_execution_feature(&first);
@@ -2594,7 +2641,7 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
             run_with_environment(owner.path(), number, &profile, &environment);
         assert_eq!(code, 0, "{output}\nworker: {:?}", worker.events());
         if build {
-            let (target, archives) = delivered_build(owner.path(), number, &events, 42);
+            let (target, archives) = delivered_build(owner.path(), number, &events, &output, 42);
             assert!(
                 retained_targets.insert(target),
                 "a successful build reused mutable output"
@@ -2648,17 +2695,13 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
             )),
             "{output}"
         );
-        if workspace_remote {
-            assert_fresh_workspace_units(
-                owner.path(),
-                &events,
-                &output,
-                workspace_units,
-                &mut workspace_attempts,
-            );
-        } else {
-            assert_local_native_workspace(&events, &output);
-        }
+        assert_fresh_workspace_units(
+            owner.path(),
+            &events,
+            &output,
+            workspace_units,
+            &mut workspace_attempts,
+        );
         let dependency_keys = offered
             .into_iter()
             .filter(|(name, _)| !workspace_units.contains(&name.as_str()))
@@ -2701,7 +2744,8 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
             run_with_environment(owner.path(), number, &profile, &environment);
         assert_eq!(code, 0, "{output}");
         if build {
-            let (target, archives) = delivered_build(owner.path(), number, &events, answer);
+            let (target, archives) =
+                delivered_build(owner.path(), number, &events, &output, answer);
             assert!(retained_targets.insert(target));
             assert_eq!(
                 Some(&archives),
@@ -2722,41 +2766,25 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
             2,
             "{output}"
         );
-        if workspace_remote {
-            let workspace_keys = assert_fresh_workspace_units(
-                owner.path(),
-                &events,
-                &output,
-                workspace_units,
-                &mut workspace_attempts,
-            );
-            assert_eq!(
-                decisions(&events, "remote-offer"),
-                workspace_keys,
-                "every eligible workspace unit must execute while dependencies replay: {output}"
-            );
-        } else {
-            assert_local_native_workspace(&events, &output);
-            assert!(
-                decisions(&events, "remote-offer").is_empty(),
-                "both native fixture dependencies must replay while the workspace compiles locally: {output}"
-            );
-        }
+        let workspace_keys = assert_fresh_workspace_units(
+            owner.path(),
+            &events,
+            &output,
+            workspace_units,
+            &mut workspace_attempts,
+        );
+        assert_eq!(
+            decisions(&events, "remote-offer"),
+            workspace_keys,
+            "every eligible workspace unit must execute while dependencies replay: {output}"
+        );
         assert!(decisions(&events, "execute").is_empty(), "{output}");
         let next = worker.completed_receipt();
-        if workspace_remote {
-            assert!(
-                next["request_id"].as_u64().unwrap()
-                    > receipt.as_ref().unwrap()["request_id"].as_u64().unwrap(),
-                "workspace execution reused an earlier worker receipt"
-            );
-        } else {
-            assert_eq!(
-                Some(&next),
-                receipt.as_ref(),
-                "warm native dependencies unexpectedly executed again"
-            );
-        }
+        assert!(
+            next["request_id"].as_u64().unwrap()
+                > receipt.as_ref().unwrap()["request_id"].as_u64().unwrap(),
+            "workspace execution reused an earlier worker receipt"
+        );
         receipt = Some(next);
         assert_eq!(
             worker
@@ -2777,7 +2805,10 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
         write(
             &second,
             "generated-value.txt",
-            if generated == GeneratedDependency::Leaf {
+            if matches!(
+                generated,
+                GeneratedDependency::Leaf | GeneratedDependency::NativeLeaf
+            ) {
                 "41"
             } else {
                 "3\n"
@@ -2796,8 +2827,9 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
         code, 0,
         "changed dependency metadata must satisfy the new const result: {output}"
     );
+    let mut changed_archives = None;
     if build {
-        let (target, archives) = delivered_build(owner.path(), 6, &events, 43);
+        let (target, archives) = delivered_build(owner.path(), 6, &events, &output, 43);
         assert!(retained_targets.insert(target));
         let previous = first_archives.as_ref().unwrap();
         if generated.generated_consumer() {
@@ -2811,10 +2843,21 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
                 "changed source or generated input reused stale canonical_leaf archive bytes"
             );
         }
-        assert_ne!(
-            archives["canonical_dep"], previous["canonical_dep"],
-            "changed dependency inputs reused stale consumer archive bytes"
-        );
+        if generated == GeneratedDependency::NativeLeaf {
+            // The middle crate consumes unchanged Rust metadata. Its archive
+            // remains byte-identical, but its key must still bind the changed
+            // foreign native tree and the linked executable must return 43.
+            assert_eq!(
+                archives["canonical_dep"], previous["canonical_dep"],
+                "an archive-only native mutation changed the pure Rust middle archive"
+            );
+        } else {
+            assert_ne!(
+                archives["canonical_dep"], previous["canonical_dep"],
+                "changed dependency inputs reused stale consumer archive bytes"
+            );
+        }
+        changed_archives = Some(archives);
     }
     let changed = decisions(&events, "remote-offer");
     let changed_names: &[&str] = if generated.generated_consumer() {
@@ -2827,17 +2870,13 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
         changed_names.len() + workspace_units.len(),
         "changed dependencies and every eligible workspace unit must execute remotely: {output}"
     );
-    if workspace_remote {
-        assert_fresh_workspace_units(
-            owner.path(),
-            &events,
-            &output,
-            workspace_units,
-            &mut workspace_attempts,
-        );
-    } else {
-        assert_local_native_workspace(&events, &output);
-    }
+    assert_fresh_workspace_units(
+        owner.path(),
+        &events,
+        &output,
+        workspace_units,
+        &mut workspace_attempts,
+    );
     let first_keys = first_keys.unwrap();
     for name in changed_names {
         assert_ne!(
@@ -2866,6 +2905,56 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
         assert!(hits.is_empty(), "{output}");
     }
     assert!(decisions(&events, "execute").is_empty(), "{output}");
+    if generated == GeneratedDependency::NativeLeaf {
+        // The foreign generated tree is more than the archive selected by -l.
+        // Change only an empty subtree; source, Cargo directives and .a bytes
+        // stay identical. Both the provider and its transitive native-path
+        // consumer must get a different identity, including for cargo check
+        // where rustc need not open any of these native files.
+        write(&second, "generated-empty-name.txt", "after\n");
+        let (code, events, output) = run_with_environment(owner.path(), 8, &profile, &environment);
+        assert_eq!(code, 0, "{output}\nworker: {:?}", worker.events());
+        if build {
+            let (target, archives) = delivered_build(owner.path(), 8, &events, &output, 43);
+            assert!(retained_targets.insert(target));
+            assert_eq!(
+                Some(archives),
+                changed_archives,
+                "an empty generated directory changed the compiled Rust/native archive bytes"
+            );
+        }
+        let directory_changed = decisions(&events, "remote-offer");
+        assert_eq!(directory_changed.len(), remote_unit_count, "{output}");
+        assert!(decisions(&events, "hit").is_empty(), "{output}");
+        assert!(decisions(&events, "execute").is_empty(), "{output}");
+        for name in ["canonical_leaf", "canonical_dep"] {
+            assert_ne!(
+                directory_changed[name], changed[name],
+                "changed foreign generated directory retained the {name} key"
+            );
+            assert!(
+                events.iter().any(|event| {
+                    event["kind"] == "rabsd-remote-dependency-executed"
+                        && event["key"] == directory_changed[name]
+                }),
+                "directory-invalidated {name} did not complete remotely: {output}"
+            );
+        }
+        assert_fresh_workspace_units(
+            owner.path(),
+            &events,
+            &output,
+            workspace_units,
+            &mut workspace_attempts,
+        );
+        let next = worker.completed_receipt();
+        assert!(
+            next["request_id"].as_u64().unwrap()
+                >= receipt.as_ref().unwrap()["request_id"].as_u64().unwrap()
+                    + 2 * remote_unit_count as u64,
+            "archive and directory changes did not each acquire new worker executions"
+        );
+    }
     // This fixture's selected script deliberately panics. Cargo must actually
     // run it and preserve that failure, while every dependency cache attempt
     // remains under worker authority rather than local wrapper claims.

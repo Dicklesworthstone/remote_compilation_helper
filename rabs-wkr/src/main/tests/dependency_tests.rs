@@ -408,6 +408,88 @@ fn canonical_native_request(archive: bool) -> Value {
     request
 }
 
+fn canonical_foreign_native_request(archive: bool) -> Value {
+    use rabs_sandbox::source_transfer::{SourceFile, SourceManifest};
+    let mut request = canonical_native_request(archive);
+    let context = &mut request["dependency_context"];
+    context.as_object_mut().unwrap().remove("generated_root");
+    context["generated_directories"] = json!([]);
+    context["env"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|pair| pair[0] != "OUT_DIR");
+    context["native_roots"] = json!([{
+        "path":"/__rabs/out/cargo/debug/build/leaf-hash/out",
+        "prefix":"native/0000", "directories":["empty", "nested"],
+    }]);
+    let files = vec![
+        SourceFile {
+            path: "package/src/lib.rs".into(),
+            len: 1,
+            sha256: [1; 32],
+            executable: false,
+        },
+        SourceFile {
+            path: "native/0000/nested/input.rs".into(),
+            len: 1,
+            sha256: [2; 32],
+            executable: false,
+        },
+        SourceFile {
+            path: "native/0000/nested/libnative.a".into(),
+            len: 8,
+            sha256: [3; 32],
+            executable: false,
+        },
+    ];
+    let manifest = SourceManifest::new(files).unwrap();
+    request["source_manifest"] = json!({
+        "manifest_sha256":rabs_wkr::source_transfer::hex(&manifest.digest()),
+        "files":manifest.files().iter().map(|file| json!({
+            "path":file.path,"bytes":file.len,
+            "sha256":rabs_wkr::source_transfer::hex(&file.sha256),"executable":file.executable,
+        })).collect::<Vec<_>>()
+    });
+    request
+}
+
+#[test]
+fn propagated_native_roots_decode_without_an_out_dir_and_require_exact_owned_inputs() {
+    for archive in [false, true] {
+        let wire = canonical_foreign_native_request(archive);
+        let parsed = parse_exec_request(&wire).unwrap();
+        let context = parsed.dependency_context.unwrap();
+        assert_eq!(context.generated_root(), None);
+        assert!(!context.env().iter().any(|(name, _)| name == "OUT_DIR"));
+        assert_eq!(context.native_roots().len(), 1);
+        assert_eq!(context.native_roots()[0].directories, ["empty", "nested"]);
+        assert_eq!(wire, canonical_foreign_native_request(archive));
+        for roots in [
+            Value::Null,
+            json!([]),
+            json!([{"path":"/usr/lib", "prefix":"native/0000", "directories":[]}]),
+            json!([{"path":"/__rabs/out/cargo/debug/build/leaf-hash/out", "prefix":"native/0001", "directories":["nested"]}]),
+            json!([{"path":"/__rabs/out/cargo/debug/build/leaf-hash/out", "prefix":"native/0000", "directories":[]}]),
+            json!([{"path":"/__rabs/out/cargo/debug/build/leaf-hash/out", "prefix":"native/0000", "directories":["nested"], "host":"untrusted"}]),
+        ] {
+            let mut invalid = wire.clone();
+            invalid["dependency_context"]["native_roots"] = roots;
+            assert!(parse_exec_request(&invalid).is_err());
+        }
+        let mut absent = wire.clone();
+        *absent["args"].as_array_mut().unwrap().last_mut().unwrap() = json!("static=absent");
+        assert!(
+            parse_exec_request(&absent)
+                .unwrap_err()
+                .contains("static native archive is absent")
+        );
+        let mut ordinary = dependency_request();
+        ordinary["dependency_context"]["native_roots"] =
+            wire["dependency_context"]["native_roots"].clone();
+        assert!(parse_exec_request(&ordinary).is_err());
+    }
+}
+
 #[test]
 fn canonical_native_metadata_and_archive_requests_require_closed_generated_inputs() {
     for archive in [false, true] {
@@ -1855,7 +1937,10 @@ fn unnegotiated_dependency_request_never_burns_durable_admission() {
     assert_eq!(hello["dependency_execution_modes"], json!([]));
     assert_eq!(
         hello["dependency_native_inputs"],
-        json!([CANONICAL_NATIVE_METADATA_CAPABILITY]),
+        json!([
+            CANONICAL_NATIVE_METADATA_CAPABILITY,
+            CANONICAL_NATIVE_ROOTS_CAPABILITY
+        ]),
         "input syntax support never substitutes for measured namespace support"
     );
 }

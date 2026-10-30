@@ -26,7 +26,8 @@ use rabs_sandbox::artifact_tree::{
 use rabs_sandbox::cargo_artifacts::{self, CargoArtifactReport};
 use rabs_sandbox::dependency_context::{
     CANONICAL_DEPENDENCY_CONTEXT_VERSION, CANONICAL_NATIVE_METADATA_CAPABILITY,
-    CANONICAL_WORKSPACE_CONTEXT_VERSION, DEPENDENCY_CONTEXT_VERSION, DependencyExecutionMode,
+    CANONICAL_NATIVE_ROOTS_CAPABILITY, CANONICAL_WORKSPACE_CONTEXT_VERSION,
+    DEPENDENCY_CONTEXT_VERSION, DependencyExecutionMode,
 };
 use rabs_sandbox::process_context::{
     COMMAND_CONTEXT_VERSION, CommandContext, MAX_COMMAND_ENV_ENTRIES,
@@ -111,6 +112,27 @@ pub(crate) fn negotiated_dependency_context(
             .is_some_and(|modes| modes.iter().any(|mode| mode == selected.as_str())),
         "worker lacks the required measured dependency execution mode",
     )?;
+    if let Some(roots) = context.get("native_roots") {
+        let roots = roots
+            .as_array()
+            .ok_or_else(|| invalid("native roots must be an array"))?;
+        if !roots.is_empty() {
+            require(
+                version != DEPENDENCY_CONTEXT_VERSION,
+                "propagated native roots require canonical execution",
+            )?;
+            require(
+                hello["dependency_native_inputs"]
+                    .as_array()
+                    .is_some_and(|profiles| {
+                        profiles
+                            .iter()
+                            .any(|profile| profile == CANONICAL_NATIVE_ROOTS_CAPABILITY)
+                    }),
+                "worker lacks the required canonical propagated native roots capability",
+            )?;
+        }
+    }
     if version != DEPENDENCY_CONTEXT_VERSION
         && selected == DependencyExecutionMode::Metadata
         && let Some(arguments) = request.get("args")
@@ -2279,6 +2301,57 @@ mod tests {
                 request["args"] = json!(["-Ldependency=/__rabs/out/cargo/debug/deps", "lib.rs"]);
                 assert!(
                     negotiated_dependency_context(&hello, &request, DeliveryMode::Execute).is_ok()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn propagated_native_roots_require_explicit_capability_before_any_effect() {
+        for version in [
+            CANONICAL_DEPENDENCY_CONTEXT_VERSION,
+            CANONICAL_WORKSPACE_CONTEXT_VERSION,
+        ] {
+            for mode in ["metadata", "rlib"] {
+                let parent = tempfile::tempdir().unwrap();
+                let destination = parent.path().join("refused-native-roots");
+                let mut request = request();
+                request["dependency_context"] = json!({
+                    "version":version, "execution_mode":mode,
+                    "native_roots":[{"path":"/__rabs/out/cargo/debug/build/provider/out", "prefix":"native/0000", "directories":[]}]
+                });
+                request["args"] = json!([
+                    "-Lnative=/__rabs/out/cargo/debug/build/provider/out",
+                    "lib.rs"
+                ]);
+                let mut peer = fixture(&destination);
+                peer.replies[0]["dependency_contexts"] = json!([version]);
+                peer.replies[0]["dependency_execution_modes"] = json!(["metadata", "rlib"]);
+                peer.replies[0]["dependency_native_inputs"] =
+                    json!([CANONICAL_NATIVE_METADATA_CAPABILITY]);
+                let mut hello = peer.replies[0].clone();
+                let failure =
+                    receive_execution(&mut peer, &request, "worker", &destination).unwrap_err();
+                assert!(!failure.execution_may_have_run);
+                assert!(
+                    failure
+                        .detail
+                        .contains("propagated native roots capability")
+                );
+                assert!(peer.sent.is_empty());
+                assert!(!destination.exists());
+
+                hello["dependency_native_inputs"] = json!([
+                    CANONICAL_NATIVE_METADATA_CAPABILITY,
+                    CANONICAL_NATIVE_ROOTS_CAPABILITY
+                ]);
+                assert!(
+                    negotiated_dependency_context(&hello, &request, DeliveryMode::Execute).is_ok()
+                );
+                assert_eq!(
+                    negotiated_dependency_context(&json!({}), &request, DeliveryMode::Resume)
+                        .unwrap(),
+                    None
                 );
             }
         }

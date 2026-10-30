@@ -23,13 +23,13 @@ use crate::coord::remote_dependency_transport::{
 use crate::coord::secure_worker_delivery::{OperationCancellation, parse_worker_pin};
 use crate::coord::source_delivery::SourceUpload;
 use crate::coord::worker_delivery::{Delivery, toolchain_identity_value};
-use crate::edge::live_facts::{GENERATED_ROOT, PACKAGE_ROOT};
+use crate::edge::live_facts::{GENERATED_ROOT, PACKAGE_ROOT, native_snapshot_root};
 use rabs_key::live_dependency::remote::{
     RemoteDependencyOutputClass, remote_dependency_isolation_policy, remote_dependency_key,
     remote_dependency_output_class, remote_dependency_shape, remote_empty_loader_directories,
 };
 use rabs_key::live_dependency::{
-    DependencyDirectoryFact, DependencySourceKind, ToolchainFacts,
+    DependencyDirectoryFact, DependencySourceKind, ToolchainFacts, native_input_directories,
     remote_workspace_execution_isolation_policy, remote_workspace_execution_key,
     remote_workspace_execution_shape, workspace_input_directories,
 };
@@ -38,7 +38,7 @@ use rabs_protocol::input_evidence::ActionInputManifest;
 use rabs_protocol::result_identity::OutputRole;
 use rabs_sandbox::dependency_context::{
     CANONICAL_DEPENDENCY_CONTEXT_VERSION, DEPENDENCY_CONTEXT_VERSION, DependencyArtifactRoot,
-    DependencyExecContext, DependencyExecutionMode,
+    DependencyExecContext, DependencyExecutionMode, DependencyNativeRoot,
 };
 use rabs_sandbox::loader_directories::{LoaderDirectoryWitness, observe_loader_directories};
 use rabs_sandbox::runtime_cohort::observe_runtime_cohort;
@@ -634,6 +634,21 @@ impl RemoteDependencies {
         .map_err(|error| error.to_string())?
         .with_execution_mode(execution_mode(plan)?)
         .with_generated_directories(generated_directories)
+        .map_err(|error| error.to_string())?
+        .with_native_roots(
+            plan.native_roots
+                .iter()
+                .enumerate()
+                .map(|(index, path)| {
+                    Ok(DependencyNativeRoot {
+                        path: path.clone(),
+                        prefix: format!("native/{index:04}"),
+                        directories: native_input_directories(plan, inputs, index)
+                            .map_err(|error| error.to_string())?,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+        )
         .map_err(|error| error.to_string())?;
         verify_execution_policy(plan, &key, context.execution_mode())?;
         loader_witness.verify_absence(|| false).map_err(|error| {
@@ -873,6 +888,20 @@ impl PendingRemote {
                     &generated_paths,
                 )
                 .map_err(|error| settled(format!("prepare generated inputs: {error}")))?;
+        }
+        for (index, native) in request.package.native.iter().enumerate() {
+            let paths = native
+                .files
+                .iter()
+                .map(|(path, _, _)| path.clone())
+                .collect::<Vec<_>>();
+            upload = upload
+                .with_native_snapshot(
+                    Arc::clone(&request.package.snapshot),
+                    &native_snapshot_root(index),
+                    &paths,
+                )
+                .map_err(|error| settled(format!("prepare native inputs: {error}")))?;
         }
         let upload = upload
             .with_dependency_artifacts(dependency_artifacts)
@@ -1159,6 +1188,11 @@ fn dependency_execution_request(
         || context.workspace_execution_only()
             != (plan.source_kind == DependencySourceKind::WorkspaceExecutionOnly)
         || context.generated_root() != plan.generated_root.as_deref()
+        || context
+            .native_roots()
+            .iter()
+            .map(|root| &root.path)
+            .ne(plan.native_roots.iter())
     {
         return Err(
             "worker context does not enforce this dependency output and generated-input contract"
@@ -1195,6 +1229,17 @@ fn context_value(context: &DependencyExecContext) -> Value {
     });
     if context.workspace_execution_only() {
         value["source_directories"] = json!(context.source_directories());
+    }
+    if !context.native_roots().is_empty() {
+        value["native_roots"] = json!(
+            context
+                .native_roots()
+                .iter()
+                .map(|root| json!({
+                    "path":root.path, "prefix":root.prefix, "directories":root.directories,
+                }))
+                .collect::<Vec<_>>()
+        );
     }
     value
 }

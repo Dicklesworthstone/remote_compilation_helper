@@ -31,7 +31,10 @@ pub(super) fn observe(
             let generated = paths
                 .generated_root(logical, physical)
                 .map_err(|reason| InputMiss::Package(FactsMiss::Refused(reason)))?;
-            facts.package_canonical(physical, generated.as_ref())
+            let native = paths
+                .native_roots(logical, physical)
+                .map_err(|reason| InputMiss::Package(FactsMiss::Refused(reason)))?;
+            facts.package_canonical(physical, generated.as_ref(), &native)
         }
         None => {
             if logical.canonical_cargo || physical.canonical_cargo {

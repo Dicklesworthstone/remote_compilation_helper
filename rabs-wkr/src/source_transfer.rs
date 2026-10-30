@@ -515,6 +515,7 @@ impl SourceOwner {
             .ok_or_else(|| refuse("dependency execution source is not completely verified"))?;
         let mut package_present = false;
         let mut generated_present = false;
+        let mut native_present = vec![false; context.native_roots().len()];
         let mut artifact_present = vec![false; context.artifact_roots().len()];
         for file in self.receiver.manifest().files() {
             if let Some(relative) = file.path.strip_prefix("package/") {
@@ -561,6 +562,37 @@ impl SourceOwner {
                 generated_present = true;
                 continue;
             }
+            let mut native_member = false;
+            for (index, root) in context.native_roots().iter().enumerate() {
+                let Some(relative) = file
+                    .path
+                    .strip_prefix(&root.prefix)
+                    .and_then(|suffix| suffix.strip_prefix('/'))
+                else {
+                    continue;
+                };
+                if relative.is_empty()
+                    || root
+                        .directories
+                        .binary_search_by(|path| path.as_str().cmp(relative))
+                        .is_ok()
+                    || relative.match_indices('/').any(|(offset, _)| {
+                        root.directories
+                            .binary_search_by(|path| path.as_str().cmp(&relative[..offset]))
+                            .is_err()
+                    })
+                {
+                    return Err(refuse(
+                        "native file conflicts with its complete directory inventory",
+                    ));
+                }
+                native_present[index] = true;
+                native_member = true;
+                break;
+            }
+            if native_member {
+                continue;
+            }
             let mut declared = false;
             for (index, root) in context.artifact_roots().iter().enumerate() {
                 let Some(name) = file
@@ -600,6 +632,14 @@ impl SourceOwner {
                     .map(|root| bundle.join(&root.prefix)),
             )
             .chain(generated_present.then(|| bundle.join("generated")))
+            .chain(
+                context
+                    .native_roots()
+                    .iter()
+                    .zip(&native_present)
+                    .filter(|(_, present)| **present)
+                    .map(|(root, _)| bundle.join(&root.prefix)),
+            )
         {
             if !std::fs::symlink_metadata(root)?.is_dir() {
                 return Err(refuse(
@@ -612,6 +652,15 @@ impl SourceOwner {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
                 Ok(_) => return Err(refuse("undeclared generated tree in sealed bundle")),
+            }
+        }
+        for (root, present) in context.native_roots().iter().zip(native_present) {
+            if !present {
+                match std::fs::symlink_metadata(bundle.join(&root.prefix)) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                    Ok(_) => return Err(refuse("undeclared native tree in sealed bundle")),
+                }
             }
         }
         Ok(package)
@@ -646,6 +695,34 @@ impl SourceOwner {
         self.prepare_dependency_tree(request_id, context, spec, true)
     }
 
+    /// Give every additional native tree a private read-only backing. Empty
+    /// trees still preserve their complete declared directory topology, and no
+    /// copy aliases the retained source upload or a reusable cache inode.
+    pub(crate) fn prepare_dependency_native(
+        &self,
+        request_id: u64,
+        context: &rabs_sandbox::dependency_context::DependencyExecContext,
+        spec: &mut rabs_sandbox::canonical_namespace::CanonicalNamespaceSpec,
+    ) -> io::Result<Vec<DependencyGeneratedInputs>> {
+        let package = self.dependency_root(request_id, context)?;
+        let mut inputs = Vec::with_capacity(context.native_roots().len());
+        for (index, root) in context.native_roots().iter().enumerate() {
+            inputs.push(
+                self.prepare_dependency_tree_at(
+                    &package,
+                    spec,
+                    &root.path,
+                    &root.directories,
+                    &format!("{}/", root.prefix),
+                    self._directory
+                        .path()
+                        .join(format!("native-inputs-{index:04}")),
+                )?,
+            );
+        }
+        Ok(inputs)
+    }
+
     fn prepare_dependency_tree(
         &self,
         request_id: u64,
@@ -653,8 +730,6 @@ impl SourceOwner {
         spec: &mut rabs_sandbox::canonical_namespace::CanonicalNamespaceSpec,
         workspace: bool,
     ) -> io::Result<Option<DependencyGeneratedInputs>> {
-        use std::io::Read;
-
         let package = self.dependency_root(request_id, context)?;
         let (visible, directories, prefix, backing) = if workspace {
             (
@@ -674,6 +749,31 @@ impl SourceOwner {
                 self._directory.path().join("generated-inputs"),
             )
         };
+        if workspace {
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            builder.create(self._directory.path().join("workspace-inputs"))?;
+        }
+        self.prepare_dependency_tree_at(&package, spec, visible, directories, prefix, backing)
+            .map(Some)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_dependency_tree_at(
+        &self,
+        package: &std::path::Path,
+        spec: &mut rabs_sandbox::canonical_namespace::CanonicalNamespaceSpec,
+        visible: &str,
+        directories: &[String],
+        prefix: &str,
+        backing: std::path::PathBuf,
+    ) -> io::Result<DependencyGeneratedInputs> {
+        use std::io::Read;
+
         let bundle = package
             .parent()
             .ok_or_else(|| io::Error::other("missing dependency bundle"))?;
@@ -723,9 +823,6 @@ impl SourceOwner {
             use std::os::unix::fs::DirBuilderExt;
             builder.mode(0o700);
         }
-        if workspace {
-            builder.create(self._directory.path().join("workspace-inputs"))?;
-        }
         builder.create(&backing)?;
         for directory in directories {
             builder.create(backing.join(directory))?;
@@ -760,7 +857,7 @@ impl SourceOwner {
         }
         let guard = DependencyGeneratedInputs::capture(backing, &files, directories, prefix)?;
         binding.backing = guard.backing.clone();
-        Ok(Some(guard))
+        Ok(guard)
     }
 
     /// Install only this sealed bundle's shared output inputs. Mountpoints are
@@ -976,6 +1073,35 @@ impl SourceOwner {
         } else {
             None
         };
+        let mut native_backings = Vec::with_capacity(context.native_roots().len());
+        for (index, root) in context.native_roots().iter().enumerate() {
+            let visible = Path::new(&root.path);
+            let backing = self
+                ._directory
+                .path()
+                .join(format!("native-inputs-{index:04}"));
+            let mut owned = 0;
+            for bind in &spec.ro_binds {
+                if bind.visible == visible && bind.backing == backing {
+                    owned += 1;
+                } else if overlap(&bind.visible, visible)
+                    && !context.loader_dirs().iter().any(|loader| {
+                        bind.visible == Path::new(loader)
+                            && visible.starts_with(&bind.visible)
+                            && visible != bind.visible
+                    })
+                {
+                    return Err(refuse("mount shadows retained native inputs"));
+                }
+            }
+            if owned != 1
+                || !std::fs::symlink_metadata(&backing)?.is_dir()
+                || std::fs::canonicalize(&backing)? != backing
+            {
+                return Err(refuse("native inputs lack their retained read-only mount"));
+            }
+            native_backings.push(backing);
+        }
         for artifact in context.artifact_roots() {
             let visible = Path::new(&artifact.path);
             if artifact.path == context.out_dir() {
@@ -1047,6 +1173,10 @@ impl SourceOwner {
                 || context
                     .generated_root()
                     .is_some_and(|root| overlap(&bind.visible, Path::new(root)))
+                || context
+                    .native_roots()
+                    .iter()
+                    .any(|root| overlap(&bind.visible, Path::new(&root.path)))
                 || context.artifact_roots().iter().any(|root| {
                     overlap(&bind.visible, Path::new(&root.path))
                         && !(root.path == context.out_dir()
@@ -1057,6 +1187,10 @@ impl SourceOwner {
                 || generated_backing.as_ref().is_some_and(|generated| {
                     std::fs::canonicalize(&bind.backing)
                         .map_or(true, |backing| overlap(&backing, generated))
+                })
+                || native_backings.iter().any(|native| {
+                    std::fs::canonicalize(&bind.backing)
+                        .map_or(true, |backing| overlap(&backing, native))
                 })
             {
                 return Err(refuse("writable mount aliases dependency input bundle"));
@@ -2026,6 +2160,149 @@ mod tests {
         tempfile::TempDir,
     ) {
         generated_dependency_profile_fixture(files, false)
+    }
+
+    fn foreign_native_fixture() -> (
+        SourceOwner,
+        rabs_sandbox::dependency_context::DependencyExecContext,
+        rabs_sandbox::canonical_namespace::CanonicalNamespaceSpec,
+        tempfile::TempDir,
+    ) {
+        use rabs_sandbox::dependency_context::{
+            DependencyExecContext, DependencyExecutionMode, DependencyNativeRoot,
+        };
+        let owner = uploaded_dependency_bundle(&[
+            ("package/src/lib.rs", b"source", false),
+            (
+                "native/0000/nested/libanswer.a",
+                b"retained native archive",
+                false,
+            ),
+        ]);
+        let source = "/__rabs/cargo-home/registry/src/pinned/consumer-1.0.0";
+        let context = DependencyExecContext::new_canonical_cargo(
+            DependencyExecutionMode::Rlib,
+            source.into(),
+            source.into(),
+            "/__rabs/out/cargo/debug/deps".into(),
+            Vec::new(),
+            vec!["/__rabs/out/cargo/debug".into()],
+            Vec::new(),
+            vec![
+                ("HOME".into(), "/__rabs/home".into()),
+                ("CARGO_HOME".into(), "/__rabs/cargo-home".into()),
+                ("CARGO_MANIFEST_DIR".into(), source.into()),
+            ],
+            [7; 32],
+        )
+        .unwrap()
+        .with_native_roots(vec![
+            DependencyNativeRoot {
+                path: "/__rabs/out/cargo/debug/build/a-hash/out".into(),
+                prefix: "native/0000".into(),
+                directories: vec!["empty".into(), "nested".into()],
+            },
+            DependencyNativeRoot {
+                path: "/__rabs/out/cargo/debug/build/b-hash/out".into(),
+                prefix: "native/0001".into(),
+                directories: vec!["empty".into(), "empty/child".into()],
+            },
+        ])
+        .unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        for name in ["toolchain", "output", "empty", "home"] {
+            std::fs::create_dir(runtime.path().join(name)).unwrap();
+        }
+        context
+            .prepare_empty_backings(&runtime.path().join("empty"))
+            .unwrap();
+        let package = owner.dependency_root(91, &context).unwrap();
+        let spec = context
+            .namespace(
+                &package,
+                &runtime.path().join("toolchain"),
+                &runtime.path().join("output"),
+                &runtime.path().join("empty"),
+                &runtime.path().join("home"),
+            )
+            .unwrap();
+        (owner, context, spec, runtime)
+    }
+
+    #[test]
+    fn propagated_native_inputs_retain_bytes_empty_topology_and_private_ownership() {
+        use std::os::unix::fs::MetadataExt;
+        let (owner, context, mut spec, _runtime) = foreign_native_fixture();
+        assert!(context.generated_root().is_none());
+        let inputs = owner
+            .prepare_dependency_native(91, &context, &mut spec)
+            .unwrap();
+        assert_eq!(inputs.len(), 2);
+        owner.protect_dependency(91, &context, &spec).unwrap();
+        for input in &inputs {
+            input.verify().unwrap();
+        }
+        assert_eq!(
+            std::fs::read(inputs[0].backing.join("nested/libanswer.a")).unwrap(),
+            b"retained native archive"
+        );
+        assert!(inputs[0].backing.join("empty").is_dir());
+        assert!(inputs[1].backing.join("empty/child").is_dir());
+        let sealed = owner.receiver.sealed_root().unwrap();
+        assert!(!sealed.join("native/0000/empty").exists());
+        assert!(!sealed.join("native/0001").exists());
+        let retained = std::fs::metadata(sealed.join("native/0000/nested/libanswer.a")).unwrap();
+        let copied = std::fs::metadata(inputs[0].backing.join("nested/libanswer.a")).unwrap();
+        assert_ne!(
+            (retained.dev(), retained.ino()),
+            (copied.dev(), copied.ino())
+        );
+        let absent = context.clone().with_native_roots(Vec::new()).unwrap();
+        assert!(owner.dependency_root(91, &absent).is_err());
+        let mut wrong = context.native_roots().to_vec();
+        wrong[0].directories = vec!["empty".into()];
+        assert!(
+            owner
+                .dependency_root(91, &context.with_native_roots(wrong).unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn propagated_native_inputs_reject_shadow_mounts_writable_aliases_and_mutation() {
+        use rabs_sandbox::canonical_namespace::Bind;
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::Path;
+        let (owner, context, mut spec, runtime) = foreign_native_fixture();
+        let inputs = owner
+            .prepare_dependency_native(91, &context, &mut spec)
+            .unwrap();
+        owner.protect_dependency(91, &context, &spec).unwrap();
+        let visible = Path::new(&context.native_roots()[0].path);
+        let mut missing = spec.clone();
+        missing.ro_binds.retain(|bind| bind.visible != visible);
+        assert!(owner.protect_dependency(91, &context, &missing).is_err());
+        for bind in [
+            Bind::new(&inputs[0].backing, "/scratch"),
+            Bind::new(runtime.path().join("output"), visible),
+            Bind::new(runtime.path().join("output"), visible.join("child")),
+        ] {
+            let mut alias = spec.clone();
+            alias.rw_binds.push(bind);
+            assert!(owner.protect_dependency(91, &context, &alias).is_err());
+        }
+        let mut shadowed = spec;
+        shadowed.ro_binds.push(Bind::new(
+            runtime.path().join("output"),
+            visible.join("nested"),
+        ));
+        assert!(owner.protect_dependency(91, &context, &shadowed).is_err());
+        let archive = inputs[0].backing.join("nested/libanswer.a");
+        std::fs::set_permissions(&archive, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(&archive, b"changed native archive").unwrap();
+        assert!(inputs[0].verify().is_err());
+        std::fs::write(inputs[1].backing.join("unannounced"), b"new input").unwrap();
+        assert!(inputs[1].verify().is_err());
     }
 
     fn generated_dependency_profile_fixture(
