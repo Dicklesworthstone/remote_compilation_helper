@@ -36,7 +36,9 @@
 //! turning the lane on never loses the existing shadow evidence.
 
 use crate::coord::live_dependency::canonical::CanonicalPaths;
-use crate::coord::live_dependency::remote::{PendingRemote, RemoteDependencies};
+use crate::coord::live_dependency::remote::{
+    PendingRemote, PendingSharedRemote, RemoteDependencies, SharedRemoteExecutions,
+};
 use crate::coord::live_dependency::{
     CompletionReport, InstallResult, LiveDecision, LiveDependencyLane, LiveDependencyRequest,
     LocalAttempt, MAX_TRANSCRIPT_BYTES, PendingServe,
@@ -79,6 +81,7 @@ pub struct LiveEdge {
     pub(super) facts: Arc<LiveFacts>,
     reuse_empty_out_dir: bool,
     remote: Option<Arc<RemoteDependencies>>,
+    shared_executions: Option<Arc<SharedRemoteExecutions>>,
     canonical: Option<Arc<CanonicalPaths>>,
     #[cfg(test)]
     pub(super) publication_pause: Option<PublicationPause>,
@@ -115,6 +118,7 @@ impl LiveEdge {
             facts: LiveFacts::new(),
             reuse_empty_out_dir: build_script_reuse::enabled(),
             remote: None,
+            shared_executions: None,
             canonical: None,
             #[cfg(test)]
             publication_pause: None,
@@ -129,6 +133,7 @@ impl LiveEdge {
             facts: LiveFacts::new(),
             reuse_empty_out_dir: false,
             remote: None,
+            shared_executions: None,
             canonical: Some(paths),
             #[cfg(test)]
             publication_pause: None,
@@ -142,9 +147,11 @@ impl LiveEdge {
         lane: LiveDependencyLane,
         paths: Arc<CanonicalPaths>,
         remote: Option<Arc<RemoteDependencies>>,
+        executions: Option<Arc<SharedRemoteExecutions>>,
     ) -> Self {
         let mut live = Self::canonical(lane, paths);
         live.remote = remote;
+        live.shared_executions = executions;
         live
     }
 
@@ -166,7 +173,7 @@ impl LiveEdge {
     ) -> Result<Self, String> {
         let remote = RemoteDependencies::from_canonical_environment(state)
             .map_err(|error| error.to_string())?;
-        Ok(Self::canonical_shared(lane, paths, remote))
+        Ok(Self::canonical_shared(lane, paths, remote, None))
     }
 }
 
@@ -211,6 +218,12 @@ pub(super) enum Decided {
     Remote {
         reply: String,
         pending: Box<PendingRemote>,
+    },
+    /// Join service-owned execution, retaining this caller's independent
+    /// cancellation interest and manifest-specific installation consent.
+    SharedRemote {
+        reply: String,
+        pending: Box<PendingSharedRemote>,
     },
     /// Not eligible: answer through the shadow plane.
     Shadow(crate::edge::shadow::ConsultObservation),
@@ -761,7 +774,10 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
         canonical_paths: live.canonical.clone(),
     };
     let decision = match remote {
-        Some((remote, invocation)) => live.lane.decide_remote(admitted, remote, invocation),
+        Some((remote, invocation)) => {
+            live.lane
+                .decide_remote(admitted, remote, invocation, live.shared_executions.clone())
+        }
         None => live.lane.decide(admitted),
     };
     decision_reply(decision, &key_text, unit, may_wait)
@@ -789,6 +805,18 @@ fn decision_reply(
         LiveDecision::Remote(pending) => {
             log("remote-offer", &[("crate", unit), ("key", key_text)]);
             Decided::Remote {
+                reply: json!({
+                    "kind":"rustc-decision", "decision":"remote", "remote_protocol":1,
+                    "action_key":key_text, "capture_protocol":1,
+                    "compiler_skip_authorized":false,
+                })
+                .to_string(),
+                pending: Box::new(pending),
+            }
+        }
+        LiveDecision::SharedRemote(pending) => {
+            log("shared-remote-offer", &[("crate", unit), ("key", key_text)]);
+            Decided::SharedRemote {
                 reply: json!({
                     "kind":"rustc-decision", "decision":"remote", "remote_protocol":1,
                     "action_key":key_text, "capture_protocol":1,
@@ -1251,8 +1279,15 @@ mod tests {
             activity: CanonicalActivity::new(),
             remote,
         };
-        let first_binding = binding(CanonicalRemote::Shared(Some(Arc::clone(&pool))));
-        let second_binding = binding(CanonicalRemote::Shared(Some(Arc::clone(&pool))));
+        let executions = SharedRemoteExecutions::new(pool.worker_count());
+        let first_binding = binding(CanonicalRemote::Shared {
+            remote: Some(Arc::clone(&pool)),
+            executions: Some(Arc::clone(&executions)),
+        });
+        let second_binding = binding(CanonicalRemote::Shared {
+            remote: Some(Arc::clone(&pool)),
+            executions: Some(Arc::clone(&executions)),
+        });
         let first_state = state.path().join("first-operation-shadow");
         let second_state = state.path().join("second-operation-shadow");
         let first = first_binding
@@ -1266,6 +1301,14 @@ mod tests {
         // parsed equivalent JSON configuration would have different ownership.
         assert!(Arc::ptr_eq(first.remote.as_ref().unwrap(), &pool));
         assert!(Arc::ptr_eq(second.remote.as_ref().unwrap(), &pool));
+        assert!(Arc::ptr_eq(
+            first.shared_executions.as_ref().unwrap(),
+            &executions
+        ));
+        assert!(Arc::ptr_eq(
+            second.shared_executions.as_ref().unwrap(),
+            &executions
+        ));
         assert_eq!(first.remote_worker_count(), 1);
         assert_eq!(second.remote_configuration(), first.remote_configuration());
         assert!(!Arc::ptr_eq(&first.facts, &second.facts));
@@ -1287,11 +1330,15 @@ mod tests {
         // A service that selected local-only remains local-only even though
         // valid operator worker variables are present in this process.
         let local_state = state.path().join("local-operation-shadow");
-        let local = binding(CanonicalRemote::Shared(None))
-            .live_edge(LiveDependencyLane::new(Arc::clone(&coord)), &local_state)
-            .unwrap();
+        let local = binding(CanonicalRemote::Shared {
+            remote: None,
+            executions: None,
+        })
+        .live_edge(LiveDependencyLane::new(Arc::clone(&coord)), &local_state)
+        .unwrap();
         assert_eq!(local.remote_worker_count(), 0);
         assert!(local.remote_configuration().is_none());
+        assert!(local.shared_executions.is_none());
         for remote_protocol in [Value::Null, json!(1)] {
             let request = json!({
                 "kind":"rustc-request", "remote_protocol":remote_protocol,

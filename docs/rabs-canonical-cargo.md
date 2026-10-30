@@ -1466,6 +1466,23 @@ Each profile's `jobs` must be at most `jobs_per_root`, and a root retains its
 admission through process and stream drain. Independent roots can compile
 concurrently while sharing the same coordinator generation. Eligible identical
 dependency actions use the existing singleflight, sampling and replay gates.
+With isolated dependency workers configured, callers that overlap an active
+dependency compilation join one service-owned execution. Cancelling its first
+caller removes only that caller's interest; the worker continues while another
+subscriber remains. The final subscriber's departure requests cancellation,
+and the service keeps the transport owner until it returns verified completion
+or an explicitly uncertain outcome with retained recovery state. Service shutdown
+cancels and joins these owners before releasing coordinator authority.
+
+Each subscriber retains its own input observations and target mapping. Shared
+compilation never writes a target by itself: each caller must accept the exact
+completed manifest before its own bounded installer runs and revalidates its
+inputs. New callers cannot join a completed execution; they pass the ordinary
+cache and verification gates. Execution-only workspace units still require their
+own fresh worker execution. The service bounds active shared producers by the
+configured worker count and retains at most 256 subscriptions, including offers
+waiting for acknowledgment and completed results waiting for installation.
+
 Preparation's Cargo metadata, package selection, rustup and Git subprocesses use
 the same root broker, so preliminary work cannot exceed the configured process
 root limit. Source capture, cache expansion, hashing, materialization and final
@@ -1503,7 +1520,8 @@ Cargo output is bounded at 64 MiB, with a separate 128 MiB protocol limit includ
 planning and driver diagnostics. Disconnecting the client or exceeding an output
 bound cancels and drains that operation; this interface does not create a detached
 recoverable background job. Service shutdown stops admission, cancels and joins
-its active operations, then releases coordinator authority.
+its active operations and shared remote executions, then releases coordinator
+authority.
 
 ### Persistent reuse and command results
 

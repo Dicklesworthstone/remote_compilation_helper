@@ -75,6 +75,7 @@ pub mod remote;
 
 mod capture_pins;
 mod output_capture;
+pub(crate) mod shared_work;
 use capture_pins::CapturePins;
 
 /// Decision-receipt kind binding an action key to its canonical
@@ -94,7 +95,7 @@ pub const MAX_TRANSCRIPT_BYTES: usize = 1024 * 1024;
 const BUNDLE_ROOT_ENCODING: &str = "artifact-bundle-root-v1";
 
 /// Everything the edge observed and keyed for one request.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LiveDependencyRequest {
     /// The exact key and its descriptor.
     pub key: LiveDependencyKey,
@@ -285,6 +286,9 @@ pub enum LiveDecision {
     Execute(LocalAttempt),
     /// Reserved private worker execution, awaiting subscriber acceptance.
     Remote(remote::PendingRemote),
+    /// One service-owned private execution shared by independently consenting
+    /// subscribers. The offer itself grants no destination write authority.
+    SharedRemote(remote::PendingSharedRemote),
     /// Another subscriber owns this action's dispatch. No execution or
     /// destination writer was admitted for this request. A bounded follower
     /// may resubmit its original request; the edge must reobserve its inputs

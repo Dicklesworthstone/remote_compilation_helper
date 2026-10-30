@@ -20,7 +20,7 @@ mod target_state;
 use super::live::{CoordLive, cluster_id};
 use super::live_dependency::LiveDependencyLane;
 use super::live_dependency::canonical::CanonicalPaths;
-use super::live_dependency::remote::RemoteDependencies;
+use super::live_dependency::remote::{RemoteDependencies, SharedRemoteExecutions};
 use super::source_delivery::control::{PreparationControl, PreparationRootGuard};
 use crate::edge::live_facts::{FileSig, read_stable};
 use crate::edge::server::{
@@ -249,6 +249,7 @@ pub(super) struct SharedRuntime {
     coord: Arc<CoordLive>,
     lane: LiveDependencyLane,
     remote: Option<Arc<RemoteDependencies>>,
+    remote_executions: Option<Arc<SharedRemoteExecutions>>,
     roots: Arc<RootPermitBroker>,
     jobs_per_root: u32,
     target_cache_lock: Arc<Mutex<()>>,
@@ -308,6 +309,9 @@ impl SharedRuntime {
                 .with_release_authorization(build_identity.clone(), release_mode),
         );
         let remote = remote(&state.root.join("shadow"))?;
+        let remote_executions = remote
+            .as_ref()
+            .map(|pool| SharedRemoteExecutions::new(pool.worker_count()));
         let stopped = Arc::new(AtomicBool::new(false));
         let controller = Arc::new(ShutdownController::new());
         let options = DaemonRunOptions {
@@ -356,6 +360,7 @@ impl SharedRuntime {
             lane: LiveDependencyLane::new(Arc::clone(&coord)),
             coord,
             remote,
+            remote_executions,
             roots: RootPermitBroker::new(max_roots),
             jobs_per_root,
             target_cache_lock: Arc::new(Mutex::new(())),
@@ -390,6 +395,13 @@ impl SharedRuntime {
             "canonical service still owns active Cargo roots",
         )?;
         self.stopped.store(true, Ordering::Release);
+        // Connections own subscriber interest, not the compiler. Finish every
+        // service-owned transport before releasing coordinator authority or the
+        // input/toolchain roots retained by that execution.
+        let executions = self
+            .remote_executions
+            .as_ref()
+            .map_or(Ok(()), |owner| owner.shutdown());
         let toolchains = self.toolchains.shutdown();
         let server = self
             .server
@@ -402,6 +414,7 @@ impl SharedRuntime {
                 "canonical service coordinator did not drain cleanly",
             )?;
         }
+        executions.map_err(io::Error::other)?;
         toolchains?;
         Ok(())
     }
@@ -449,6 +462,9 @@ impl SharedRuntime {
 impl Drop for SharedRuntime {
     fn drop(&mut self) {
         self.stopped.store(true, Ordering::Release);
+        if let Some(executions) = &self.remote_executions {
+            let _ = executions.shutdown();
+        }
         let _ = self.toolchains.shutdown();
         // Explicit join precedes field destruction, particularly StateOwner's
         // process lock. The last Arc cannot disappear while an operation runs.
@@ -1402,6 +1418,7 @@ fn run_operation(
             Arc::clone(&paths),
             Arc::clone(&activity),
             runtime.remote.clone(),
+            runtime.remote_executions.clone(),
         ),
         None => canonical_edge_work(config, Arc::clone(&paths), Arc::clone(&activity)),
     };
@@ -2664,6 +2681,7 @@ mod tests {
                 },
                 paths,
                 Arc::clone(&activity),
+                None,
                 None,
             );
             let options = DaemonRunOptions {
