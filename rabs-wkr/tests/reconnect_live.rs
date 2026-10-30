@@ -54,6 +54,15 @@ impl Worker {
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }
 
+    fn last_reconnect(&self) -> Value {
+        self.logs()
+            .lines()
+            .rev()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|record| record["kind"] == "worker-reconnect-scheduled")
+            .expect("accepted reconnect must have its scheduling record")
+    }
+
     fn assert_alive(&mut self) {
         assert!(
             self.child.try_wait().unwrap().is_none(),
@@ -160,13 +169,17 @@ fn persistent_worker_reconnects_with_one_process_identity_and_fresh_admission() 
     let address = listener.local_addr().unwrap().to_string();
     let mut worker = Worker::start(&address, root.path(), false);
     let mut prior: Option<Value> = None;
-    for _ in 0..3 {
+    for attempt in 0..3 {
         let mut peer = Peer::accept(&listener, &mut worker);
         let hello = peer.admit();
         if let Some(prior) = &prior {
             for field in ["boot_generation", "incarnation", "request_high_water"] {
                 assert_eq!(hello[field], prior[field], "reconnect changed {field}");
             }
+            let scheduled = worker.last_reconnect();
+            assert_eq!(scheduled["completed_delivery"], false);
+            let ceiling = 250_u64 << (attempt - 1);
+            assert!((ceiling / 2..=ceiling).contains(&scheduled["delay_ms"].as_u64().unwrap()));
         }
         prior = Some(hello);
         worker.assert_alive();
@@ -408,6 +421,14 @@ fn same_process_recovers_complete_result_after_partial_ack_in_either_order() {
         for final_session in [false, true] {
             let mut peer = Peer::accept(&listener, &mut worker);
             let hello = admit_retention(&mut peer);
+            let scheduled = worker.last_reconnect();
+            assert_eq!(scheduled["completed_delivery"], false);
+            if final_session {
+                assert!(
+                    (250..=500).contains(&scheduled["delay_ms"].as_u64().unwrap()),
+                    "a partial ACK must keep the growing backoff: {scheduled}"
+                );
+            }
             for field in ["boot_generation", "incarnation", "request_high_water"] {
                 assert_eq!(hello[field], identity[field]);
             }
@@ -498,6 +519,12 @@ fn same_process_recovers_complete_result_after_partial_ack_in_either_order() {
         // Final ACK reclaimed bytes, not the durable duplicate-execution fence.
         let mut peer = Peer::accept(&listener, &mut worker);
         let hello = admit_retention(&mut peer);
+        let scheduled = worker.last_reconnect();
+        assert_eq!(scheduled["completed_delivery"], true);
+        assert!(
+            (125..=250).contains(&scheduled["delay_ms"].as_u64().unwrap()),
+            "complete acknowledged delivery must reset short-session backoff: {scheduled}"
+        );
         assert_eq!(hello["incarnation"], identity["incarnation"]);
         assert_eq!(hello["retained_result_available"], false);
         peer.send(&artifact_request(50));
@@ -505,6 +532,22 @@ fn same_process_recovers_complete_result_after_partial_ack_in_either_order() {
         peer.send(&resume_request());
         assert_eq!(peer.receive()["kind"], "error");
         worker.assert_alive();
+        drop(peer);
+
+        // The same durable release cannot keep resetting later connections.
+        // These use the actual process supervisor and duplicate-execution/ACK
+        // handling, not a manufactured successful-session counter.
+        for ceiling in [500, 1000] {
+            let mut peer = Peer::accept(&listener, &mut worker);
+            admit_retention(&mut peer);
+            let scheduled = worker.last_reconnect();
+            assert_eq!(scheduled["completed_delivery"], false);
+            assert!((ceiling / 2..=ceiling).contains(&scheduled["delay_ms"].as_u64().unwrap()));
+            peer.send(&output_ack());
+            assert_eq!(peer.receive()["kind"], "error");
+            peer.send(&artifact_request(50));
+            assert_eq!(peer.receive()["reason"], "durable-request-already-admitted");
+        }
     }
 }
 
