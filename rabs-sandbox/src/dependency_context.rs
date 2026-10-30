@@ -36,6 +36,12 @@ pub const CANONICAL_DEPENDENCY_CONTEXT_VERSION: &str = "canonical-dependency-exe
 /// that unit's complete, independently retained OUT_DIR. Metadata checks retain
 /// their existing binary, example and standard/custom harness contract.
 pub const CANONICAL_WORKSPACE_CONTEXT_VERSION: &str = "canonical-workspace-exec-v3";
+/// Separately advertised extension for metadata checks with static native inputs
+/// from the current canonical Cargo OUT_DIR. The existing context versions and
+/// measured metadata namespace remain unchanged; a coordinator must observe this
+/// capability before dispatching native metadata to an older worker. Archive
+/// execution does not require it and keeps its existing policy identity.
+pub const CANONICAL_NATIVE_METADATA_CAPABILITY: &str = "canonical-generated-static-metadata-v1";
 /// Full environments remain bounded by the existing command transport allowance.
 pub const MAX_DEPENDENCY_ENV_ENTRIES: usize = 1024;
 /// Maximum dependency search roots accepted in this bounded execution mode.

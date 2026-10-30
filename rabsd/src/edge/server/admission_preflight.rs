@@ -45,7 +45,7 @@ pub(super) fn workspace_rejection(request: LiveRustcRequest<'_>) -> Option<LiveR
 }
 
 /// Only a retained canonical Cargo operation may prepare generated static
-/// archives. Canonical-looking wrapper paths do not select this entry point;
+/// native inputs. Canonical-looking wrapper paths do not select this entry point;
 /// the driver owns the complete generated-tree capture and worker-only policy.
 pub(super) fn canonical_remote_rejection(request: LiveRustcRequest<'_>) -> Option<LiveRefusal> {
     rejection_for(request, PreflightMode::CanonicalRemoteDependency)
@@ -210,7 +210,7 @@ fn dependency_inputs_rejection(
     // A proc-macro PRODUCER is rejected above, but the ordinary lib/rlib
     // that CONSUMES it cannot enter this class either.
     // Unbound native search paths also refuse above, including those without
-    // -l. Only canonical archive executions may continue with native searches
+    // -l. Only canonical worker executions may continue with native searches
     // wholly inside their retained generated tree. These checks need neither
     // a host probe, source capture, nor dependency enumeration
     // to establish this refusal. Let Cargo make progress immediately rather

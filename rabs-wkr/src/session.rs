@@ -427,6 +427,7 @@ pub fn parse_dependency_context(
 pub fn validate_dependency_execution(
     request: &CanonicalExecRequest,
     artifacts: Option<&ArtifactPlan>,
+    source_manifest: Option<&rabs_sandbox::source_transfer::SourceManifest>,
 ) -> Result<(), String> {
     use rabs_key::invocation::SourceInput;
     use rabs_key::live_dependency::remote::{
@@ -444,9 +445,9 @@ pub fn validate_dependency_execution(
     let invocation = rabs_key::invocation::parse(&argv, None)
         .map_err(|error| format!("dependency invocation: {error:?}"))?;
     let class = remote_dependency_output_class(&invocation).map_err(|error| error.to_string())?;
-    // Native archives are an extension of the closed canonical rlib view for
-    // dependencies and freshly executed workspace units. Metadata execution
-    // and host-native lookup cannot borrow this authority.
+    // Canonical metadata checks and closed rlib execution can consume static
+    // native inputs from their exact retained OUT_DIR. This grants neither
+    // host-native lookup nor local compiler-result authority.
     // The source transfer retains the complete generated tree; the compiler
     // can resolve only these declared directories and its other sealed inputs.
     let native_directories = validate_generated_native_inputs(
@@ -472,6 +473,38 @@ pub fn validate_dependency_execution(
             return Err(
                 "native search directory is absent from the retained generated tree".into(),
             );
+        }
+    }
+    if !native_directories.is_empty() {
+        let manifest = source_manifest.ok_or("native inputs lack a retained source manifest")?;
+        let files = manifest
+            .files()
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<BTreeSet<_>>();
+        let generated = Path::new(
+            context
+                .generated_root()
+                .ok_or("native input lacks OUT_DIR")?,
+        );
+        for library in &invocation.native_libs {
+            let name = library
+                .strip_prefix("static=")
+                .ok_or("native inputs require default-bundle static archives")?;
+            let present = native_directories.iter().any(|directory| {
+                let Ok(relative) = Path::new(directory).strip_prefix(generated) else {
+                    return false;
+                };
+                let path = Path::new("generated")
+                    .join(relative)
+                    .join(format!("lib{name}.a"));
+                path.to_str().is_some_and(|path| files.contains(path))
+            });
+            if !present {
+                return Err(
+                    "static native archive is absent from the retained search directories".into(),
+                );
+            }
         }
     }
     match (context.execution_mode(), class) {
@@ -1014,7 +1047,11 @@ fn execute_canonical_inner(
     // backing. Use D005's existing mount builder and keep the owner alive until
     // the process and drains have resolved and the exact output set is captured.
     let artifact_plan = control.artifact_plan();
-    if let Err(error) = validate_dependency_execution(request, artifact_plan.as_ref()) {
+    if let Err(error) = validate_dependency_execution(
+        request,
+        artifact_plan.as_ref(),
+        source.map(SourceOwner::manifest),
+    ) {
         let _ = control.retain_outputs(Err(error));
         return exec_error(request.request_id);
     }

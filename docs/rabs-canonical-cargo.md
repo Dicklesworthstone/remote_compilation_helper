@@ -1164,6 +1164,26 @@ unchanged. These inputs authorize only an independently supervised compiler
 execution; they do not authorize local result capture or cache the script's
 execution, filesystem observations or side effects.
 
+Canonical metadata checks can also consume static native libraries generated in
+that exact `OUT_DIR`. Each `-L native=...` search directory must belong to the
+captured tree, and every unmodified `-l static=NAME` must resolve to a retained
+`libNAME.a`. The coordinator binds archive bytes, search ordering, directory
+listings and Cargo directives into the key. The worker independently verifies
+the named archives in both the announced manifest and the sealed source tree;
+successful metadata compilation alone is insufficient because rustc need not
+open a static archive while checking types. Eligible dependency results earn
+replay through the existing sampling and release gates. No linker runs and only
+metadata plus dep-info are returned.
+
+This extension requires the worker's explicit
+`canonical-generated-static-metadata-v1` capability in `dependency_native_inputs`.
+An older worker refuses before source upload or compiler dispatch. Native
+metadata has a distinct isolation-policy identity; existing pure-Rust metadata
+and archive identities are unchanged. Dynamic/system libraries, native library
+modifiers and another package's generated directory retain their existing
+refusals. Without the isolated worker path, these checks run under Cargo without
+local dependency-cache authority.
+
 The capture binding comes from the driver's retained mount capability, not from
 a canonical-path flag in a compiler plan. It binds both the physical tree and
 Cargo's recorded logical name through background capture and memo reuse. A
@@ -1241,13 +1261,17 @@ Workspace library builds can also bundle static native archives produced in
 their own build-script `OUT_DIR`. The coordinator captures that complete tree,
 including empty subdirectories and the Cargo output record, and requires each
 declared native search directory and `libNAME.a` to occur in the retained
-evidence. The worker accepts only ordinary rlib output and unmodified
-`-l static=NAME` arguments whose `-L native=...` paths stay within that exact
+evidence. The native inputs use unmodified `-l static=NAME` arguments whose
+`-L native=...` paths stay within that exact
 `OUT_DIR`. Rustc bundles the captured archive inside the closed archive view;
-this step invokes no external linker. Archive bytes participate in the fresh
-execution identity even though rustc's dep-info does not list them.
+this step invokes no external linker. Selected workspace metadata checks accept
+the same exact static inputs when the worker advertises
+`canonical-generated-static-metadata-v1`. Their returned outputs remain metadata
+and dep-info; they do not link a library, executable or test harness. Archive
+bytes participate in the fresh execution identity even though rustc's dep-info
+does not list them and a metadata check may not read them.
 
-This scope excludes native metadata checks, dynamic/system libraries, native
+This scope excludes dynamic/system libraries, native
 library modifiers, and paths propagated from another package's generated tree.
 Those inputs cannot be acquired by spelling an unretained path in rustc argv.
 Workspace native results remain request-owned and are never published or

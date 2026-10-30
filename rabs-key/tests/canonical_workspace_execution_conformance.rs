@@ -948,18 +948,19 @@ fn actual_all_target_metadata_units(
     }
 }
 
-fn actual_native_workspace_archive(
+fn actual_native_workspace_compilation(
     root: &Path,
     workspace: &Path,
     wrapper: &Path,
     toolchain: &Path,
     facts: &ToolchainFacts,
     runtime: &TypedDigest,
+    mode: &str,
 ) {
-    let record = root.join("records-native");
+    let record = root.join(format!("records-native-{mode}"));
     let layout = Layout {
         workspace: workspace.to_owned(),
-        target: root.join("target-native"),
+        target: root.join(format!("target-native-{mode}")),
         cargo_home: root.join("cargo-home"),
         home: root.join("home"),
         toolchain: toolchain.to_owned(),
@@ -968,7 +969,7 @@ fn actual_native_workspace_archive(
         let mut command = cargo(&layout, wrapper, &record);
         command
             .args([
-                "build",
+                mode,
                 "--offline",
                 "--locked",
                 "--jobs=1",
@@ -996,7 +997,7 @@ fn actual_native_workspace_archive(
                     canonical.argv
                 )
             });
-    assert_selected_unit(&graph, &layout, &plan, "build");
+    assert_selected_unit(&graph, &layout, &plan, mode);
     assert_eq!(
         plan.source_kind,
         DependencySourceKind::WorkspaceExecutionOnly
@@ -1066,9 +1067,9 @@ fn actual_native_workspace_archive(
             // Rebuild outside every captured source/generated root, then replace
             // only the static archive. This isolates archive-byte identity from
             // source edits or stale intermediate C/object files in OUT_DIR.
-            let source = root.join("native-next.c");
-            let object = root.join("native-next.o");
-            let replacement = root.join("native-next.a");
+            let source = root.join(format!("native-{mode}-next.c"));
+            let object = root.join(format!("native-{mode}-next.o"));
+            let replacement = root.join(format!("native-{mode}-next.a"));
             fs::write(
                 &source,
                 "unsigned int rabs_workspace_native_answer(void) { return 41; }\n",
@@ -1090,19 +1091,19 @@ fn actual_native_workspace_archive(
         }
         let inputs = observed_inputs(&layout, &plan);
         let identity = key(&plan, &inputs).unwrap();
-        let replay = actual.replay(root, &format!("native-{answer}"));
+        let replay = actual.replay(root, &format!("native-{mode}-{answer}"));
         assert!(
             replay.status.success(),
             "{}",
             String::from_utf8_lossy(&replay.stderr)
         );
         let dep_info = fs::read(output(".d")).unwrap();
-        let rlib = fs::read(output(".rlib")).unwrap();
+        let compiled = fs::read(output(if mode == "build" { ".rlib" } else { ".rmeta" })).unwrap();
         assert!(
             !String::from_utf8_lossy(&dep_info).contains("librabs_workspace_answer.a"),
             "the oracle must cover a real native read absent from rustc dep-info"
         );
-        if let Some((old_inputs, old_dep_info, old_rlib, old_key)) = &previous {
+        if let Some((old_inputs, old_dep_info, old_compiled, old_key)) = &previous {
             assert_eq!(
                 inputs.directory_enumerations,
                 old_inputs.directory_enumerations
@@ -1126,7 +1127,12 @@ fn actual_native_workspace_archive(
                 &dep_info, old_dep_info,
                 "dep-info does not close native archive reads"
             );
-            assert_ne!(&rlib, old_rlib, "real bundled object bytes must change");
+            if mode == "build" {
+                assert_ne!(
+                    &compiled, old_compiled,
+                    "real bundled object bytes must change"
+                );
+            }
             assert_ne!(
                 &identity.action_key, old_key,
                 "archive bytes must bind fresh execution identity"
@@ -1202,17 +1208,40 @@ fn actual_native_workspace_archive(
             key(&foreign, &inputs).is_err(),
             "another package's OUT_DIR is not owned by this request"
         );
-        let mut metadata = plan.clone();
-        metadata.invocation.emit = vec!["dep-info".into(), "metadata".into()];
-        metadata.outputs = rabs_key::output_derivation::derive_workspace_output_declarations(
-            &metadata.invocation,
-            &metadata.host_triple,
-        )
-        .unwrap();
+        let mut dynamic = plan.clone();
+        dynamic.invocation.native_libs = vec!["dylib=rabs_workspace_answer".into()];
         assert!(
-            key(&metadata, &inputs).is_err(),
-            "native inputs cannot use metadata isolation"
+            key(&dynamic, &inputs).is_err(),
+            "captured static archives cannot authorize dynamic native libraries"
         );
+        let mut modified = plan.clone();
+        modified.invocation.native_libs = vec!["static:-bundle=rabs_workspace_answer".into()];
+        assert!(
+            key(&modified, &inputs).is_err(),
+            "modified native libraries retain their independent refusal"
+        );
+
+        if mode == "check" {
+            let names = plan.output_names();
+            assert_eq!(names.len(), 2);
+            assert!(
+                names
+                    .iter()
+                    .all(|name| name.ends_with(".d") || name.ends_with(".rmeta"))
+            );
+            assert!(!compiled.is_empty(), "the library emits real metadata");
+            let mut actual_names = fs::read_dir(&physical_output)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect::<Vec<_>>();
+            actual_names.sort();
+            assert_eq!(
+                actual_names, names,
+                "native metadata checks must not link an archive or executable"
+            );
+            previous = Some((inputs, dep_info, compiled, identity.action_key));
+            continue;
+        }
 
         let main = root.join(format!("native-main-{answer}.rs"));
         let binary = root.join(format!("native-linked-{answer}"));
@@ -1241,7 +1270,7 @@ fn actual_native_workspace_archive(
             checked(&mut Command::new(&binary)).stdout,
             format!("{answer}\n").as_bytes()
         );
-        previous = Some((inputs, dep_info, rlib, identity.action_key));
+        previous = Some((inputs, dep_info, compiled, identity.action_key));
     }
 }
 
@@ -1705,5 +1734,9 @@ fn main() {
         }
     }
     actual_all_target_metadata_units(root, &workspace, &wrapper, &toolchain, &facts, &runtime);
-    actual_native_workspace_archive(root, &workspace, &wrapper, &toolchain, &facts, &runtime);
+    for mode in ["check", "build"] {
+        actual_native_workspace_compilation(
+            root, &workspace, &wrapper, &toolchain, &facts, &runtime, mode,
+        );
+    }
 }

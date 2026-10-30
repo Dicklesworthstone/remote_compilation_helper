@@ -484,6 +484,13 @@ impl DependencyOutputInputs {
 }
 
 impl SourceOwner {
+    /// Exact file inventory of this owned upload. Execution validates native
+    /// lookup against these declared members as well as the sealed bytes; a
+    /// metadata-only compiler need not open a requested static archive itself.
+    pub(crate) fn manifest(&self) -> &SourceManifest {
+        self.receiver.manifest()
+    }
+
     /// The transferred, verified package root for original-path dependency
     /// execution. Every other member must belong to an explicitly declared
     /// retained artifact or generated root; wire paths never select arbitrary

@@ -179,6 +179,9 @@ fn generated_dependency(root: &Path) {
 }
 
 fn generated_native_dependency(root: &Path) {
+    // Keep generator intermediates in private TMPDIR: changing the workspace
+    // value changes only the archive in the compiler's retained OUT_DIR, not
+    // its Rust source, generated Rust, native search path or Cargo directives.
     write(root, "generated-value.txt", "2\n");
     vendor(
         root,
@@ -195,14 +198,16 @@ fn generated_native_dependency(root: &Path) {
     let input = package.parent().unwrap().parent().unwrap().join("generated-value.txt");
     let value: u32 = std::fs::read_to_string(&input).unwrap().trim().parse().unwrap();
     let output = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("native");
+    let scratch = std::env::temp_dir().join("canonical-dependency-native-inputs");
     std::fs::create_dir_all(&output).unwrap();
-    std::fs::write(output.join("answer.c"), format!("unsigned int rabs_native_answer(void) {{ return {value}; }}\n")).unwrap();
+    std::fs::create_dir_all(&scratch).unwrap();
+    std::fs::write(scratch.join("answer.c"), format!("unsigned int rabs_native_answer(void) {{ return {value}; }}\n")).unwrap();
     assert!(std::process::Command::new("/usr/bin/cc")
         .args(["-c", "-fPIC", "-o"])
-        .arg(output.join("answer.o")).arg(output.join("answer.c"))
+        .arg(scratch.join("answer.o")).arg(scratch.join("answer.c"))
         .status().unwrap().success());
     assert!(std::process::Command::new("/usr/bin/ar")
-        .arg("crsD").arg(output.join("librabs_answer.a")).arg(output.join("answer.o"))
+        .arg("crsD").arg(output.join("librabs_answer.a")).arg(scratch.join("answer.o"))
         .status().unwrap().success());
     println!("cargo:rerun-if-changed={}", input.display());
     println!("cargo:rustc-link-search=native={}", output.display());
@@ -221,6 +226,7 @@ fn generated_native_dependency(root: &Path) {
 fn generated_native_workspace(root: &Path) {
     workspace_execution_feature(root);
     write(root, "workspace-native-value.txt", "1\n");
+    write(root, "workspace-native-kind.txt", "static\n");
     write(
         root,
         "build.rs",
@@ -228,6 +234,8 @@ fn generated_native_workspace(root: &Path) {
     let package = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let input = package.join("workspace-native-value.txt");
     let value: u32 = std::fs::read_to_string(&input).unwrap().trim().parse().unwrap();
+    let kind_input = package.join("workspace-native-kind.txt");
+    let kind = std::fs::read_to_string(&kind_input).unwrap();
     let output = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("native");
     std::fs::create_dir_all(&output).unwrap();
     std::fs::write(output.join("answer.c"), format!("unsigned int rabs_workspace_native_answer(void) {{ return {value}; }}\n")).unwrap();
@@ -239,8 +247,9 @@ fn generated_native_workspace(root: &Path) {
         .arg("crsD").arg(output.join("librabs_workspace_answer.a")).arg(output.join("answer.o"))
         .status().unwrap().success());
     println!("cargo:rerun-if-changed={}", input.display());
+    println!("cargo:rerun-if-changed={}", kind_input.display());
     println!("cargo:rustc-link-search=native={}", output.display());
-    println!("cargo:rustc-link-lib=static=rabs_workspace_answer");
+    println!("cargo:rustc-link-lib={}=rabs_workspace_answer", kind.trim());
     println!("cargo:rustc-env=WORKSPACE_NATIVE_EXPECTED={}", 42 + value);
 }
 "#,
@@ -2025,13 +2034,33 @@ fn canonical_cargo_build_bundles_generated_native_archives_replays_and_invalidat
 }
 
 #[test]
+#[ignore = "requires full Linux bubblewrap isolation, cc, ar, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual native-input Cargo checks, worker sampling, cache replay and archive-only invalidation"]
+fn canonical_cargo_check_offloads_native_dependency_metadata_replays_and_invalidates_archives() {
+    remote_dependency_replay("check", GeneratedDependency::NativeConsumer);
+}
+
+#[test]
 #[ignore = "requires full Linux bubblewrap isolation, cc, ar, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual fresh workspace native archive execution, dependency replay and linked binary validation"]
 fn canonical_cargo_build_executes_own_native_workspace_archives_fresh_while_dependencies_replay() {
+    remote_native_workspace("build");
+}
+
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, cc, ar, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual fresh workspace native metadata, dependency replay, invalidation and modifier refusal"]
+fn canonical_cargo_check_executes_own_native_workspace_metadata_fresh_while_dependencies_replay() {
+    remote_native_workspace("check");
+}
+
+fn remote_native_workspace(command: &str) {
     let (owner, mut profile) = native_fixture();
     let source = owner.path().join("source-a");
     generated_native_workspace(&source);
-    profile["command"] = json!("build");
+    let build = command == "build";
+    profile["command"] = json!(command);
     profile["selection"] = json!({"features":["remote_workspace"]});
+    if !build {
+        profile["selection"]["lib"] = json!(true);
+    }
     let (mut worker, environment) = NativeWorker::start(owner.path());
     let mut dependency_keys = None;
     let mut dependency_archives = None;
@@ -2051,35 +2080,46 @@ fn canonical_cargo_build_executes_own_native_workspace_archives_fresh_while_depe
         let (code, events, output) =
             run_with_environment(owner.path(), 500 + number, &profile, &environment);
         assert_eq!(code, 0, "{output}\nworker: {:?}", worker.events());
-        let (target, archives) = delivered_build(
-            owner.path(),
-            500 + number,
-            &events,
-            if number == 5 { 44 } else { 43 },
-        );
-        assert!(retained_targets.insert(target.clone()));
-        if let Some(expected) = &dependency_archives {
-            assert_eq!(
-                &archives, expected,
-                "own workspace native inputs changed the external dependency archives"
+        let archive = if build {
+            let (target, archives) = delivered_build(
+                owner.path(),
+                500 + number,
+                &events,
+                if number == 5 { 44 } else { 43 },
             );
+            assert!(retained_targets.insert(target.clone()));
+            if let Some(expected) = &dependency_archives {
+                assert_eq!(
+                    &archives, expected,
+                    "own workspace native inputs changed the external dependency archives"
+                );
+            } else {
+                dependency_archives = Some(archives);
+            }
+            let workspace_archives = fs::read_dir(target.join("target/debug/deps"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| {
+                            name.starts_with("libcanonical_app-") && name.ends_with(".rlib")
+                        })
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(workspace_archives.len(), 1, "{output}");
+            let archive = read_bounded(&workspace_archives[0]);
+            assert!(archive.len() > 8 && archive.starts_with(b"!<arch>\n"));
+            Some(archive)
         } else {
-            dependency_archives = Some(archives);
-        }
-        let workspace_archives = fs::read_dir(target.join("target/debug/deps"))
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| {
-                        name.starts_with("libcanonical_app-") && name.ends_with(".rlib")
-                    })
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(workspace_archives.len(), 1, "{output}");
-        let archive = read_bounded(&workspace_archives[0]);
-        assert!(archive.len() > 8 && archive.starts_with(b"!<arch>\n"));
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| event["kind"] == "canonical-build-completed"),
+                "metadata checks must not deliver an executable or archive: {output}"
+            );
+            None
+        };
 
         let workspace = assert_fresh_workspace_units(
             owner.path(),
@@ -2094,14 +2134,15 @@ fn canonical_cargo_build_executes_own_native_workspace_archives_fresh_while_depe
                 previous_workspace.as_ref(),
                 "changed own native inputs reused the previous workspace execution key"
             );
-            assert_ne!(
-                Some(&archive),
-                previous_archive.as_ref(),
-                "changed own native inputs reused stale workspace archive bytes"
-            );
+            if build {
+                assert_ne!(
+                    archive, previous_archive,
+                    "changed own native inputs reused stale workspace archive bytes"
+                );
+            }
         }
         previous_workspace = Some(workspace.clone());
-        previous_archive = Some(archive);
+        previous_archive = archive;
         let offered = decisions(&events, "remote-offer");
         if cold {
             assert_eq!(offered.len(), 3, "{output}");
@@ -2184,6 +2225,40 @@ fn canonical_cargo_build_executes_own_native_workspace_archives_fresh_while_depe
                 9 + number as usize - 3
             },
             "each qualifying dependency and every workspace compile must reach the worker"
+        );
+    }
+    if !build {
+        // The exact same stock Cargo check accepts this valid rustc modifier,
+        // but it is outside the worker's default static-bundle contract. It
+        // must compile locally without acquiring execution or cache authority.
+        write(&source, "workspace-native-kind.txt", "static:-bundle\n");
+        let (code, events, output) =
+            run_with_environment(owner.path(), 506, &profile, &environment);
+        assert_eq!(code, 0, "{output}");
+        for decision in ["remote-offer", "hit", "execute"] {
+            assert!(
+                !decisions(&events, decision).contains_key("canonical_app"),
+                "native modifiers must not borrow the worker metadata class: {output}"
+            );
+        }
+        assert!(
+            events.iter().any(|event| {
+                event["kind"] == "rabsd-live-dependency"
+                    && event["crate"] == "canonical_app"
+                    && event["decision"] == "shadow"
+                    && event["reason"] == "LIVE_DEP_NATIVE_LIB"
+            }),
+            "the actual native modifier did not reach admission: {output}"
+        );
+        assert_eq!(
+            Some(&decisions(&events, "hit")),
+            dependency_keys.as_ref(),
+            "unsupported workspace metadata must not disable independent dependency hits: {output}"
+        );
+        assert_eq!(
+            Some(worker.completed_receipt()),
+            receipt,
+            "an unsupported native modifier started a worker compiler"
         );
     }
     let retained = fs::read_dir(owner.path().join("ops"))
@@ -2496,7 +2571,6 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
             generated_dependency(&second);
         }
         GeneratedDependency::NativeConsumer => {
-            assert!(build, "native archive replay requires actual codegen");
             generated_native_dependency(&first);
             generated_native_dependency(&second);
         }

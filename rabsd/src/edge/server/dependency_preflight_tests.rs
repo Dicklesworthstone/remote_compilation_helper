@@ -208,6 +208,21 @@ fn generated_static_archives_reach_only_retained_canonical_remote_planning() {
     assert!(rejection(candidate).is_some());
     assert!(plan_canonical_remote_dependency_action(candidate, HOSTS[0], None).is_ok());
     assert!(plan_canonical_cargo_dependency_action(candidate, HOSTS[0], None).is_err());
+    let mut metadata = argv.clone();
+    *metadata
+        .iter_mut()
+        .find(|arg| arg.starts_with("--emit="))
+        .unwrap() = "--emit=dep-info,metadata".into();
+    let metadata = LiveRustcRequest {
+        argv: &metadata,
+        cwd: package,
+        env: &env,
+    };
+    assert_eq!(canonical_remote_rejection(metadata), None);
+    assert!(remote_rejection(metadata).is_some());
+    assert!(rejection(metadata).is_some());
+    assert!(plan_canonical_remote_dependency_action(metadata, HOSTS[0], None).is_ok());
+    assert!(plan_canonical_cargo_dependency_action(metadata, HOSTS[0], None).is_err());
 
     for extra in [
         "-Lnative=/usr/lib",
@@ -321,8 +336,11 @@ fn workspace_native_archives_reach_only_fresh_planning_with_the_exact_out_dir() 
         env: &env,
         cwd: "/__rabs/workspace",
     };
-    assert!(workspace_rejection(metadata).is_some());
-    assert!(plan_canonical_workspace_execution(metadata, HOSTS[0]).is_err());
+    assert_eq!(workspace_rejection(metadata), None);
+    assert!(plan_canonical_workspace_execution(metadata, HOSTS[0]).is_ok());
+    assert!(rejection(metadata).is_some());
+    assert!(remote_rejection(metadata).is_some());
+    assert!(canonical_remote_rejection(metadata).is_some());
     let mut missing_out_dir = env.clone();
     missing_out_dir.retain(|(name, _)| name != "OUT_DIR");
     let missing_out_dir = LiveRustcRequest {

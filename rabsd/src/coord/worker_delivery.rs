@@ -25,8 +25,8 @@ use rabs_sandbox::artifact_tree::{
 };
 use rabs_sandbox::cargo_artifacts::{self, CargoArtifactReport};
 use rabs_sandbox::dependency_context::{
-    CANONICAL_DEPENDENCY_CONTEXT_VERSION, CANONICAL_WORKSPACE_CONTEXT_VERSION,
-    DEPENDENCY_CONTEXT_VERSION, DependencyExecutionMode,
+    CANONICAL_DEPENDENCY_CONTEXT_VERSION, CANONICAL_NATIVE_METADATA_CAPABILITY,
+    CANONICAL_WORKSPACE_CONTEXT_VERSION, DEPENDENCY_CONTEXT_VERSION, DependencyExecutionMode,
 };
 use rabs_sandbox::process_context::{
     COMMAND_CONTEXT_VERSION, CommandContext, MAX_COMMAND_ENV_ENTRIES,
@@ -111,6 +111,50 @@ pub(crate) fn negotiated_dependency_context(
             .is_some_and(|modes| modes.iter().any(|mode| mode == selected.as_str())),
         "worker lacks the required measured dependency execution mode",
     )?;
+    if version != DEPENDENCY_CONTEXT_VERSION
+        && selected == DependencyExecutionMode::Metadata
+        && let Some(arguments) = request.get("args")
+    {
+        let mut argv = vec![
+            request["program"]
+                .as_str()
+                .ok_or_else(|| invalid("dependency execution program must be a string"))?
+                .to_owned(),
+        ];
+        for argument in arguments
+            .as_array()
+            .ok_or_else(|| invalid("dependency execution args must be an array"))?
+        {
+            argv.push(
+                argument
+                    .as_str()
+                    .ok_or_else(|| invalid("dependency execution args must be strings"))?
+                    .to_owned(),
+            );
+        }
+        let invocation = rabs_key::invocation::parse(&argv, None)
+            .map_err(|error| invalid(format!("dependency execution invocation: {error:?}")))?;
+        if !invocation.native_libs.is_empty()
+            || invocation
+                .lib_search
+                .iter()
+                .any(|search| search.starts_with("native="))
+        {
+            // Use the same argv parser as planning and worker validation. An
+            // ordinary metadata capability does not imply this newer input
+            // class; fail before source/toolchain upload or execution ownership.
+            require(
+                hello["dependency_native_inputs"]
+                    .as_array()
+                    .is_some_and(|profiles| {
+                        profiles
+                            .iter()
+                            .any(|profile| profile == CANONICAL_NATIVE_METADATA_CAPABILITY)
+                    }),
+                "worker lacks the required canonical static native metadata capability",
+            )?;
+        }
+    }
     Ok(Some(NegotiatedDependencyContext {
         version,
         mode: selected,
@@ -2176,6 +2220,107 @@ mod tests {
                 negotiated_dependency_context(&no_execution, &request, DeliveryMode::Execute)
                     .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn native_metadata_negotiates_its_input_extension_without_changing_other_modes() {
+        for version in [
+            CANONICAL_DEPENDENCY_CONTEXT_VERSION,
+            CANONICAL_WORKSPACE_CONTEXT_VERSION,
+        ] {
+            for arguments in [
+                json!(["-Lnative=/__rabs/out/cargo/debug/build/leaf/out", "lib.rs"]),
+                json!([
+                    "-L",
+                    "native=/__rabs/out/cargo/debug/build/leaf/out",
+                    "-l",
+                    "static=leaf",
+                    "lib.rs"
+                ]),
+                json!([
+                    "-Lnative=/__rabs/out/cargo/debug/build/leaf/out",
+                    "-lstatic=leaf",
+                    "lib.rs"
+                ]),
+            ] {
+                let mut request = request();
+                request["args"] = arguments;
+                request["dependency_context"] =
+                    json!({"version":version,"execution_mode":"metadata"});
+                let mut hello = json!({
+                    "dependency_contexts":[version],
+                    "dependency_execution_modes":["metadata", "rlib"],
+                });
+                assert!(
+                    negotiated_dependency_context(&hello, &request, DeliveryMode::Execute).is_err()
+                );
+                assert_eq!(
+                    negotiated_dependency_context(&hello, &request, DeliveryMode::Resume).unwrap(),
+                    None
+                );
+                hello["dependency_native_inputs"] = json!([CANONICAL_NATIVE_METADATA_CAPABILITY]);
+                assert_eq!(
+                    negotiated_dependency_context(&hello, &request, DeliveryMode::Execute).unwrap(),
+                    Some(NegotiatedDependencyContext {
+                        version,
+                        mode: DependencyExecutionMode::Metadata
+                    })
+                );
+                hello
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("dependency_native_inputs");
+                request["dependency_context"]["execution_mode"] = json!("rlib");
+                assert!(
+                    negotiated_dependency_context(&hello, &request, DeliveryMode::Execute).is_ok()
+                );
+                request["dependency_context"]["execution_mode"] = json!("metadata");
+                request["args"] = json!(["-Ldependency=/__rabs/out/cargo/debug/deps", "lib.rs"]);
+                assert!(
+                    negotiated_dependency_context(&hello, &request, DeliveryMode::Execute).is_ok()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn missing_native_metadata_capability_refuses_before_disk_upload_or_dispatch() {
+        for version in [
+            CANONICAL_DEPENDENCY_CONTEXT_VERSION,
+            CANONICAL_WORKSPACE_CONTEXT_VERSION,
+        ] {
+            for offered in [
+                Value::Null,
+                json!(CANONICAL_NATIVE_METADATA_CAPABILITY),
+                json!([]),
+                json!(["canonical-generated-static-rlib-v1"]),
+                json!([{"profile":CANONICAL_NATIVE_METADATA_CAPABILITY}]),
+            ] {
+                let parent = tempfile::tempdir().unwrap();
+                let destination = parent.path().join("refused-native-metadata");
+                let mut request = request();
+                request["dependency_context"] =
+                    json!({"version":version,"execution_mode":"metadata"});
+                request["args"] = json!([
+                    "-Lnative=/__rabs/out/cargo/debug/build/leaf/out",
+                    "-lstatic=leaf",
+                    "lib.rs"
+                ]);
+                let mut peer = fixture(&destination);
+                peer.replies[0]["dependency_contexts"] = json!([version]);
+                peer.replies[0]["dependency_execution_modes"] = json!(["metadata", "rlib"]);
+                peer.replies[0]["dependency_native_inputs"] = offered;
+                let failure =
+                    receive_execution(&mut peer, &request, "worker", &destination).unwrap_err();
+                assert!(!failure.execution_may_have_run);
+                assert!(failure.detail.contains("static native metadata capability"));
+                assert!(
+                    peer.sent.is_empty(),
+                    "no grant, input transfer or execution may precede negotiation"
+                );
+                assert!(!destination.exists());
+            }
         }
     }
 
