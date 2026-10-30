@@ -6,8 +6,10 @@ bootstrap is selected with a test-owned uname, but the locks are Linux locks:
 this does not substitute for running this suite on Darwin. Nothing contacts a
 worker or changes a real RCH registry. Fixtures are retained for inspection.
 """
+import contextlib
 import errno
 import fcntl
+import hashlib
 import os
 from pathlib import Path
 import selectors
@@ -17,11 +19,19 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
 REPO = Path(__file__).resolve().parents[2]
 HOLDER = (REPO / "rch/src/hook/source_lock_holder.sh").read_text()
+SSH_SOURCE = (REPO / "rch/src/hook/ssh.rs").read_text()
+RELEASE_WAITER = SSH_SOURCE.split(
+    'const SOURCE_AUTHORITY_RELEASE_WAITER: &str = r#"', 1)[1].split('"#;', 1)[0]
+CLAIM_REGISTRY = (REPO / "rch/src/hook/source_claim_registry.sh").read_text()
+CLAIM_HELPER_SOURCE = (REPO / "rch-common/src/stale_target_reap.rs").read_text()
+CLAIM_HELPERS = CLAIM_HELPER_SOURCE.split(
+    'pub const SOURCE_CLAIM_RECORD_HELPERS: &str = r#"', 1)[1].split('"#;', 1)[0]
 FLOCK = shutil.which("flock")
 GNU_FLOCK = bool(FLOCK and b"--no-fork" in subprocess.run(
     [FLOCK, "--help"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -234,6 +244,360 @@ class SourceLockHolderTests(unittest.TestCase):
         # must leave the roots before it to other builds.
         eventually(lambda: all(available(path) for path in paths),
                    "waiter monopolized earlier roots while contended")
+
+    def release_registry(self, name="registry"):
+        registry = self.root / name
+        registry.mkdir()
+        for child in ("released", "cancelled", "quarantine"):
+            (registry / child).mkdir()
+        (registry / "metadata.lock").write_bytes(b"")
+        return registry
+
+    def claim_bytes(self, roots):
+        return ("\n".join(sorted(set(map(str, roots)))) + "\n").encode()
+
+    def claim_record(self, registry, token, roots, extension="claim", directory=None):
+        content = self.claim_bytes(roots)
+        digest = hashlib.sha256(content).hexdigest()
+        path = (directory or registry) / f"{token}.{digest}.{extension}"
+        path.write_bytes(content)
+        return path, digest, content
+
+    def registry_transaction(self, registry, token, roots, operation):
+        # Run the exact shared helpers and production transaction, including
+        # cancellation's activity-before-metadata lock order. Starting with a
+        # valid old claim models an admitted invocation, so a full test disk
+        # never requires disabling the fresh-admission headroom checks.
+        content = self.claim_bytes(roots)
+        digest = hashlib.sha256(content).hexdigest()
+        command = [FLOCK, "-x", "--", str(registry / "metadata.lock"),
+                   "/bin/sh", "-c", CLAIM_HELPERS + "\n" + CLAIM_REGISTRY,
+                   "rch-source-registry", str(registry), token, digest, operation]
+        if operation in ("cancel", "finish-cancel"):
+            command = [FLOCK, "-x", "--", str(registry / f"{token}.activity.lock"),
+                       *command]
+        return subprocess.run(command, input=content, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, timeout=20, check=False,
+                              env={**os.environ, "LC_ALL": "C"})
+
+    def start_release_waiter(self, registry, token, binding, mode="source", lock=None,
+                             session_idle=None):
+        lock = lock or registry / "holder.lock"
+        kind = "AUTHORITY" if mode == "source" else "PAIR"
+        release = f"RCH_SOURCE_{kind}_RELEASE:{token}"
+        # The outer production holder owns real kernel locks. Its terminal
+        # execs the production release waiter with those descriptors intact.
+        # Success here means only that the exact request was read: no fixture
+        # manufactures a durable release receipt or an acknowledgment.
+        terminal = ('set -eu; exec 4<&-; printf "%s\\n" "$1"; '
+                    'shift; exec python3 -I -S -c "$@"')
+        holder = self.start([("x", lock)], terminal=terminal,
+                            args=(RELEASE_WAITER, mode, str(registry), token,
+                                  str(binding), release), session_idle=session_idle)
+        self.assertEqual(holder.line(), b"READY")
+        return holder, lock, release
+
+    @contextlib.contextmanager
+    def heartbeat_stream(self, holder):
+        stopped = threading.Event()
+
+        def send_heartbeats():
+            while not stopped.wait(0.1):
+                try:
+                    holder.send("RCH_SOURCE_LOCK_HEARTBEAT\n")
+                except (BrokenPipeError, OSError, ValueError):
+                    # Autonomous cancellation closes this exact child's pipe.
+                    return
+
+        sender = threading.Thread(target=send_heartbeats, name="rch-test-heartbeats")
+        sender.start()
+        try:
+            yield
+        finally:
+            stopped.set()
+            sender.join(timeout=5)
+            self.assertFalse(sender.is_alive(), "fixture heartbeat writer did not stop")
+
+    def assert_heartbeat_session_held(self, holder, lock):
+        # Exceed the two-second test lease: without valid heartbeat framing,
+        # the supervisor would have killed this holder before cancellation.
+        deadline = time.monotonic() + 2.2
+        while time.monotonic() < deadline:
+            self.assertIsNone(holder.process.poll(), "healthy heartbeat session exited")
+            time.sleep(0.1)
+        self.assertFalse(available(lock), "healthy session lost its source lock")
+
+    def assert_release_waiting(self, holder, lock):
+        self.assertIsNone(holder.line(0.6), "release waiter emitted an acknowledgment")
+        self.assertIsNone(holder.process.poll(), "release waiter exited without exact evidence")
+        self.assertFalse(available(lock), "release waiter lost its kernel lock")
+
+    def assert_cancelled_waiter(self, holder, lock):
+        # Keep stdin OPEN until autonomous exit has been observed. Calling
+        # finish() first would let EOF hide the half-open transport defect.
+        holder.process.wait(timeout=5)
+        stdout, stderr = holder.finish()
+        self.assertEqual((holder.process.returncode, stdout), (75, b""), stderr)
+        self.assertIn(b"cancel", stderr.lower())
+        self.assertTrue(available(lock))
+
+    @unittest.skipUnless(FLOCK, "flock required for real cancellation transactions")
+    def test_release_waiter_cancellation_drops_kernel_locks_but_preserves_source_exclusion(self):
+        registry = self.release_registry()
+        roots = [self.root / "project", self.root / "dependency"]
+        active, digest, content = self.claim_record(registry, "aa", roots)
+        holder, lock, _ = self.start_release_waiter(registry, "aa", digest)
+        self.assertFalse(available(lock))
+        result = self.registry_transaction(registry, "aa", roots, "cancel")
+        self.assertEqual((result.returncode, result.stdout), (0, b"owned"), result.stderr)
+        self.assert_cancelled_waiter(holder, lock)
+        cancelling = registry / f"aa.{digest}.cancelling"
+        self.assertEqual(active.read_bytes(), content)
+        self.assertEqual(cancelling.read_bytes(), content)
+        # A released transient lock is NOT permission for another invocation
+        # to overwrite the still-owned tree, even on a full filesystem.
+        overlap = self.registry_transaction(registry, "bb", roots, "try-acquire")
+        self.assertEqual((overlap.returncode, overlap.stdout), (75, b""), overlap.stderr)
+        self.assertIn(b"unfinished overlapping source owner", overlap.stderr)
+        self.assertEqual(active.read_bytes(), content)
+        self.assertEqual(cancelling.read_bytes(), content)
+
+    @unittest.skipUnless(FLOCK, "flock required for real cancellation transactions")
+    def test_release_waiter_partial_request_does_not_hide_cancellation(self):
+        registry = self.release_registry()
+        roots = [self.root / "project"]
+        active, digest, content = self.claim_record(registry, "aa", roots)
+        holder, lock, release = self.start_release_waiter(registry, "aa", digest)
+        holder.send(release[:12])  # No newline; the transport remains open.
+        self.assert_release_waiting(holder, lock)
+        result = self.registry_transaction(registry, "aa", roots, "cancel")
+        self.assertEqual((result.returncode, result.stdout), (0, b"owned"), result.stderr)
+        self.assert_cancelled_waiter(holder, lock)
+        self.assertEqual(active.read_bytes(), content)
+
+    @unittest.skipUnless(FLOCK, "flock required for real cancellation transactions")
+    def test_release_waiter_cancellation_exits_healthy_heartbeat_session_before_expiry(self):
+        registry = self.release_registry()
+        roots = [self.root / "project"]
+        active, digest, content = self.claim_record(registry, "aa", roots)
+        holder, lock, _ = self.start_release_waiter(registry, "aa", digest, session_idle=2)
+        with self.heartbeat_stream(holder):
+            self.assert_heartbeat_session_held(holder, lock)
+            started = time.monotonic()
+            result = self.registry_transaction(registry, "aa", roots, "cancel")
+            self.assertEqual((result.returncode, result.stdout), (0, b"owned"), result.stderr)
+            holder.process.wait(timeout=1.5)
+            self.assertLess(time.monotonic() - started, 1.5)
+        stdout, stderr = holder.finish()
+        self.assertEqual((holder.process.returncode, stdout), (75, b""), stderr)
+        self.assertIn(b"cancel", stderr.lower())
+        self.assertNotIn(b"HEARTBEAT_EXPIRED", stderr)
+        self.assertTrue(available(lock))
+        self.assertEqual(active.read_bytes(), content)
+        self.assertEqual((registry / f"aa.{digest}.cancelling").read_bytes(), content)
+
+    @unittest.skipUnless(FLOCK, "flock required for real cancellation transactions")
+    def test_release_waiter_cleanup_pair_accepts_supervised_explicit_release(self):
+        registry = self.release_registry()
+        pair_root = self.root / "unmaterialized-pair"
+        active, digest, content = self.claim_record(registry, "aa", [pair_root])
+        result = self.registry_transaction(registry, "aa", [pair_root], "cancel")
+        self.assertEqual((result.returncode, result.stdout), (0, b"owned"), result.stderr)
+        holder, lock, release = self.start_release_waiter(
+            registry, "aa", pair_root, mode="cleanup-pair", session_idle=2)
+        with self.heartbeat_stream(holder):
+            self.assert_heartbeat_session_held(holder, lock)
+        # Stop the single heartbeat producer before writing the exact release
+        # frame, matching production serialization and avoiding interleaving.
+        holder.send(release + "\n")
+        holder.process.wait(timeout=5)
+        stdout, stderr = holder.finish()
+        self.assertEqual((holder.process.returncode, stdout, stderr), (0, b"", b""))
+        self.assertTrue(available(lock))
+        self.assertEqual(active.read_bytes(), content)
+        self.assertEqual((registry / f"aa.{digest}.cancelling").read_bytes(), content)
+
+    @unittest.skipUnless(FLOCK, "flock required for real cancellation transactions")
+    def test_release_waiter_pair_cancellation_allows_cleanup_handoff_and_terminal_retry(self):
+        registry = self.release_registry()
+        pair_root = self.root / "unmaterialized-pair"
+        roots = [pair_root, self.root / "dependency"]
+        active, digest, content = self.claim_record(registry, "aa", roots)
+        original, lock, _ = self.start_release_waiter(registry, "aa", pair_root, mode="pair")
+        result = self.registry_transaction(registry, "aa", roots, "cancel")
+        self.assertEqual((result.returncode, result.stdout), (0, b"owned"), result.stderr)
+        self.assert_cancelled_waiter(original, lock)
+        cleanup, _, release = self.start_release_waiter(
+            registry, "aa", pair_root, mode="cleanup-pair", lock=lock)
+        self.assert_release_waiting(cleanup, lock)
+        self.assertEqual(active.read_bytes(), content)
+        # Cancellation recovery must keep its newly acquired pair despite the
+        # fence that stopped the original holder. Only explicit release ends it.
+        cleanup.send(release + "\n")
+        cleanup.process.wait(timeout=5)
+        stdout, stderr = cleanup.finish()
+        self.assertEqual((cleanup.process.returncode, stdout, stderr), (0, b"", b""))
+        self.assertTrue(available(lock))
+        self.assertFalse(pair_root.exists(), "fixture must have no tree requiring retirement")
+        finished = self.registry_transaction(registry, "aa", roots, "finish-cancel")
+        self.assertEqual((finished.returncode, finished.stdout), (0, b""), finished.stderr)
+        receipt = registry / "cancelled" / f"aa.{digest}.claim"
+        cancelling = registry / f"aa.{digest}.cancelling"
+        self.assertFalse(active.exists())
+        self.assertEqual(receipt.read_bytes(), content)
+        self.assertEqual(cancelling.read_bytes(), content)
+        for mode, binding in (("source", digest), ("pair", pair_root)):
+            with self.subTest(mode=mode):
+                retry, _, _ = self.start_release_waiter(registry, "aa", binding, mode, lock)
+                self.assert_cancelled_waiter(retry, lock)
+                self.assertEqual(receipt.read_bytes(), content)
+                self.assertEqual(cancelling.read_bytes(), content)
+
+    @unittest.skipUnless(FLOCK, "flock required for real cancellation transactions")
+    def test_release_waiter_pair_observes_unowned_cancellation_without_claim(self):
+        registry = self.release_registry()
+        pair_root = self.root / "pair-before-source-grant"
+        holder, lock, _ = self.start_release_waiter(registry, "aa", pair_root, mode="pair")
+        result = self.registry_transaction(registry, "aa", [pair_root], "cancel")
+        self.assertEqual((result.returncode, result.stdout), (0, b"unowned"), result.stderr)
+        self.assert_cancelled_waiter(holder, lock)
+        content = self.claim_bytes([pair_root])
+        digest = hashlib.sha256(content).hexdigest()
+        self.assertEqual((registry / "cancelled" / f"aa.{digest}.claim").read_bytes(), content)
+        self.assertFalse((registry / f"aa.{digest}.claim").exists())
+
+    def test_release_waiter_requires_matching_identity_digest_and_exact_pair_root(self):
+        for mode, wrong in (("source", "token"), ("source", "digest"),
+                            ("pair", "token"), ("pair", "root")):
+            with self.subTest(mode=mode, wrong=wrong):
+                registry = self.release_registry(f"registry-{mode}-{wrong}")
+                root = self.root / "pair"
+                observed_root = self.root / "pair-child" if wrong == "root" else root
+                record_token = "bb" if wrong == "token" else "aa"
+                active, digest, content = self.claim_record(registry, record_token, [observed_root])
+                fence, _, _ = self.claim_record(registry, record_token, [observed_root], "cancelling")
+                binding = ("0" * 64 if wrong == "digest" else digest) if mode == "source" else root
+                holder, lock, release = self.start_release_waiter(registry, "aa", binding, mode)
+                self.assert_release_waiting(holder, lock)
+                holder.send(release + "\n")
+                holder.process.wait(timeout=5)
+                stdout, stderr = holder.finish()
+                self.assertEqual((holder.process.returncode, stdout, stderr), (0, b"", b""))
+                self.assertEqual(active.read_bytes(), content)
+                self.assertEqual(fence.read_bytes(), content)
+
+    def test_release_waiter_invalid_or_conflicting_records_never_fabricate_cancellation(self):
+        for defect in ("bad-content", "symlink", "pending", "active-and-terminal",
+                       "released-and-cancelling", "duplicate-digest"):
+            with self.subTest(defect=defect):
+                registry = self.release_registry("registry-" + defect)
+                roots = [self.root / "project"]
+                active, digest, content = self.claim_record(registry, "aa", roots)
+                fence = registry / f"aa.{digest}.cancelling"
+                records = [active]
+                if defect == "active-and-terminal":
+                    receipt, _, _ = self.claim_record(
+                        registry, "aa", roots, directory=registry / "cancelled")
+                    records.append(receipt)
+                elif defect == "symlink":
+                    fence.symlink_to(active)
+                else:
+                    fence.write_bytes(b"/different-roots\n" if defect == "bad-content" else content)
+                    records.append(fence)
+                if defect == "pending":
+                    records.append(self.claim_record(registry, "aa", roots, "pending")[0])
+                elif defect == "released-and-cancelling":
+                    records.append(self.claim_record(
+                        registry, "aa", roots, directory=registry / "released")[0])
+                elif defect == "duplicate-digest":
+                    records.append(self.claim_record(
+                        registry, "aa", [self.root / "different-project"])[0])
+                before = {path: path.read_bytes() for path in records}
+                holder, lock, release = self.start_release_waiter(registry, "aa", digest)
+                self.assert_release_waiting(holder, lock)
+                # The caller's real retirement transaction still validates all
+                # records. The waiter recognizes only the request, never an ack.
+                holder.send(release + "\n")
+                holder.process.wait(timeout=5)
+                stdout, stderr = holder.finish()
+                self.assertEqual((holder.process.returncode, stdout, stderr), (0, b"", b""))
+                self.assertEqual({path: path.read_bytes() for path in records}, before)
+                if defect == "symlink":
+                    self.assertTrue(fence.is_symlink())
+                    self.assertEqual(fence.readlink(), active)
+
+    def test_release_waiter_observes_metadata_snapshot_without_blocking_input(self):
+        registry = self.release_registry()
+        roots = [self.root / "project"]
+        _, digest, _ = self.claim_record(registry, "aa", roots)
+        metadata = os.open(registry / "metadata.lock", os.O_RDWR)
+        try:
+            fcntl.flock(metadata, fcntl.LOCK_EX)
+            self.claim_record(registry, "aa", roots, "cancelling")
+            holder, lock, _ = self.start_release_waiter(registry, "aa", digest)
+            self.assert_release_waiting(holder, lock)
+            # A complete-looking record is not a coherent snapshot while its
+            # publishing transaction still owns the metadata mutex.
+            fcntl.flock(metadata, fcntl.LOCK_UN)
+            self.assert_cancelled_waiter(holder, lock)
+        finally:
+            os.close(metadata)
+        idle_registry = self.release_registry("idle-registry")
+        _, idle_digest, _ = self.claim_record(idle_registry, "aa", roots)
+        metadata = os.open(idle_registry / "metadata.lock", os.O_RDWR)
+        try:
+            fcntl.flock(metadata, fcntl.LOCK_EX)
+            idle, lock, release = self.start_release_waiter(idle_registry, "aa", idle_digest)
+            idle.send(release + "\n")
+            idle.process.wait(timeout=5)
+            stdout, stderr = idle.finish()
+            self.assertEqual((idle.process.returncode, stdout, stderr), (0, b"", b""))
+            self.assertTrue(available(lock))
+        finally:
+            os.close(metadata)
+
+    def test_release_waiter_idle_and_fragmented_exact_request_preserve_protocol(self):
+        registry = self.release_registry()
+        active, digest, content = self.claim_record(registry, "aa", [self.root / "project"])
+        holder, lock, release = self.start_release_waiter(registry, "aa", digest)
+        self.assert_release_waiting(holder, lock)
+        half = len(release) // 2
+        holder.send(release[:half])
+        self.assert_release_waiting(holder, lock)
+        holder.send(release[half:] + "\n")
+        holder.process.wait(timeout=5)
+        stdout, stderr = holder.finish()
+        self.assertEqual((holder.process.returncode, stdout, stderr), (0, b"", b""))
+        self.assertTrue(available(lock))
+        self.assertEqual(active.read_bytes(), content)
+
+    def test_release_waiter_bad_or_oversized_input_never_acknowledges(self):
+        registry = self.release_registry()
+        active, digest, content = self.claim_record(registry, "aa", [self.root / "project"])
+        for defect in ("wrong", "cr", "nul", "oversized"):
+            with self.subTest(defect=defect):
+                holder, lock, release = self.start_release_waiter(registry, "aa", digest)
+                request = {"wrong": "WRONG\n", "cr": release + "\r\n",
+                           "nul": release + "\0\n", "oversized": "x" * 4097}[defect]
+                holder.send(request)
+                holder.process.wait(timeout=5)
+                stdout, stderr = holder.finish()
+                self.assertEqual((holder.process.returncode, stdout), (73, b""), stderr)
+                self.assertTrue(available(lock))
+                self.assertEqual(active.read_bytes(), content)
+
+    def test_release_waiter_eof_without_complete_exact_request_never_acknowledges(self):
+        registry = self.release_registry()
+        active, digest, content = self.claim_record(registry, "aa", [self.root / "project"])
+        for partial in (False, True):
+            with self.subTest(partial=partial):
+                holder, lock, release = self.start_release_waiter(registry, "aa", digest)
+                if partial:
+                    holder.send(release)
+                stdout, stderr = holder.finish()
+                self.assertEqual((holder.process.returncode, stdout), (73, b""), stderr)
+                self.assertTrue(available(lock))
+                self.assertEqual(active.read_bytes(), content)
 
     def test_all_locks_survive_terminal_exec_and_fd4_is_preserved(self):
         paths = [self.root / ("lock-{}".format(i)) for i in range(64)]

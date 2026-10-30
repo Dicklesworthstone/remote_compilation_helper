@@ -43,14 +43,189 @@ const SOURCE_LOCK_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
 const SOURCE_LOCK_HEARTBEAT_FRAME: &[u8] = b"RCH_SOURCE_LOCK_HEARTBEAT\n";
 const REMOTE_SOURCE_AUTHORITY_LOCK_DIR: &str = "/var/tmp/rch-source-authority-locks";
 const SOURCE_AUTHORITY_LOCK_HOLDER: &str = include_str!("source_lock_holder.sh");
+// Observe cancellation without publishing retirement or changing ownership.
+// The heartbeat supervisor remains responsible for transport liveness; this
+// waiter only relinquishes kernel locks for this exact cancelled invocation.
+const SOURCE_AUTHORITY_RELEASE_WAITER: &str = r#"
+import fcntl
+import hashlib
+import os
+import re
+import select
+import stat
+import sys
+
+LIMIT = 32 * 1024 * 1024
+
+def canonical_root(root):
+    return (root.startswith(b"/") and not any(c in root for c in (0, 10, 13))
+            and (root == b"/" or not root.endswith(b"/"))
+            and all(part not in (b"", b".", b"..") for part in root.split(b"/")[1:]
+                    if root != b"/"))
+
+def record(directory, name, digest):
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= LIMIT:
+            raise ValueError("invalid cancellation record")
+        with os.fdopen(fd, "rb", closefd=False) as source:
+            content = source.read(LIMIT + 1)
+        after = os.fstat(fd)
+        named = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        if (not os.path.samestat(before, after) or not os.path.samestat(after, named)
+                or (before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                != (after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+                or len(content) != before.st_size or not content.endswith(b"\n")
+                or hashlib.sha256(content).hexdigest() != digest):
+            raise ValueError("changed cancellation record")
+        roots = content[:-1].split(b"\n")
+        if not all(canonical_root(root) for root in roots):
+            raise ValueError("invalid cancellation roots")
+        content.decode("utf-8")
+        return content, roots
+    finally:
+        os.close(fd)
+
+def cancelled(registry, token, mode, selector):
+    descriptors = []
+    try:
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+        directory = os.open(registry, directory_flags)
+        descriptors.append(directory)
+        mutex = os.open("metadata.lock", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                        dir_fd=directory)
+        descriptors.append(mutex)
+        # Never wait under the source locks for an activity mutex. A coherent
+        # metadata snapshot needs only this nonblocking shared registry lock;
+        # cancellation publishes its fence after draining normal activity.
+        fcntl.flock(mutex, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        mutex_stat = os.fstat(mutex)
+        if (not stat.S_ISREG(mutex_stat.st_mode)
+                or not os.path.samestat(mutex_stat, os.stat(
+                    "metadata.lock", dir_fd=directory, follow_symlinks=False))):
+            return False
+        places = {"": directory}
+        fd = os.open("cancelled", directory_flags, dir_fd=directory)
+        descriptors.append(fd)
+        places["cancelled"] = fd
+        listings = {}
+        if mode == "source":
+            # Healthy source holders need only two name lookups, regardless
+            # of how many other jobs have retained terminal receipts.
+            found = False
+            for place, extension in (("", "cancelling"), ("cancelled", "claim")):
+                try:
+                    os.stat(token + "." + selector + "." + extension,
+                            dir_fd=places[place], follow_symlinks=False)
+                    found = True
+                except FileNotFoundError:
+                    pass
+            if not found:
+                return False
+        else:
+            # A pair can precede source admission and therefore does not yet
+            # know the digest. Discover only its cancellation candidate first.
+            listings = {place: os.listdir(fd) for place, fd in places.items()}
+            if not any(name.startswith(token + ".") and name.endswith(extension)
+                       for place, extension in (("", ".cancelling"), ("cancelled", ".claim"))
+                       for name in listings[place]):
+                return False
+        for place in ("released", "quarantine"):
+            fd = os.open(place, directory_flags, dir_fd=directory)
+            descriptors.append(fd)
+            places[place] = fd
+        records = {}
+        digests = set()
+        for place, fd in places.items():
+            for name in listings[place] if place in listings else os.listdir(fd):
+                if not name.startswith(token + ".") or not name.endswith(
+                        (".claim", ".pending", ".cancelling")):
+                    continue
+                match = re.fullmatch(re.escape(token) + r"\.([a-f0-9]{64})\.(claim|pending|cancelling)", name)
+                if match is None or (place, match[2]) in records:
+                    return False
+                digests.add(match[1])
+                records[place, match[2]] = (fd, name)
+        if len(digests) != 1:
+            return False
+        digest = next(iter(digests))
+        if mode == "source" and digest != selector:
+            return False
+        # Active ownership stays as the overlap fence through cleanup. An
+        # already terminal cancellation may retain its matching cancelling
+        # marker. Pending, released, quarantined or conflicting state is not
+        # permission to hand off even these transient locks.
+        keys = set(records)
+        if keys not in ({("", "claim"), ("", "cancelling")},
+                        {("cancelled", "claim")},
+                        {("cancelled", "claim"), ("", "cancelling")}):
+            return False
+        expected = None
+        for fd, name in records.values():
+            content, roots = record(fd, name, digest)
+            if expected is not None and content != expected:
+                return False
+            if mode == "pair" and os.fsencode(selector) not in roots:
+                return False
+            expected = content
+        return (os.path.samestat(os.fstat(directory), os.stat(registry, follow_symlinks=False))
+                and os.path.samestat(mutex_stat, os.stat(
+                    "metadata.lock", dir_fd=directory, follow_symlinks=False)))
+    except (OSError, ValueError):
+        # Ambiguity grants no handoff. Keep waiting for explicit retirement or
+        # a later valid fence; do not repair, delete or acknowledge any record.
+        return False
+    finally:
+        for fd in reversed(descriptors):
+            os.close(fd)
+
+try:
+    mode, registry, token, selector, release = sys.argv[1:]
+    if (mode not in ("source", "pair", "cleanup-pair")
+            or re.fullmatch(r"[a-f0-9-]{1,128}", token) is None):
+        raise ValueError("invalid source release identity or mode")
+    if mode == "source":
+        if re.fullmatch(r"[a-f0-9]{64}", selector) is None:
+            raise ValueError("invalid source release digest")
+        prefix = "RCH_SOURCE_AUTHORITY_RELEASE:"
+    else:
+        if not canonical_root(os.fsencode(selector)):
+            raise ValueError("invalid source pair root")
+        prefix = "RCH_SOURCE_PAIR_RELEASE:"
+    if release != prefix + token:
+        raise ValueError("invalid source release request")
+    expected = (release + "\n").encode("ascii")
+    incoming = bytearray()
+    requester = select.poll()
+    requester.register(0, select.POLLIN | select.POLLHUP | select.POLLERR)
+    while True:
+        if mode != "cleanup-pair" and cancelled(registry, token, mode, selector):
+            print("RCH: source invocation cancelled; yielding kernel locks without retiring ownership",
+                  file=sys.stderr)
+            sys.exit(75)
+        if requester.poll(250):
+            chunk = os.read(0, 4096)
+            if not chunk:
+                raise ValueError("source release requester disconnected before retirement")
+            incoming.extend(chunk)
+            if not expected.startswith(incoming):
+                raise ValueError("unexpected source release input")
+            if incoming == expected:
+                sys.exit(0)
+except (OSError, ValueError) as error:
+    print("RCH: source release wait failed: {}".format(error), file=sys.stderr)
+    sys.exit(73)
+"#;
 const SOURCE_CLAIM_REGISTRY: &str = include_str!("source_claim_registry.sh");
 const REMOTE_SOURCE_CLAIM_REGISTRY: &str = "/var/tmp/rch-source-authority-locks/claims-v1";
 
 /// Keeps the worker-side advisory locks for a mutable Cargo source closure alive.
 ///
-/// The remote holder blocks on this SSH session's stdin after acquiring every
-/// lock. EOF/HUP releases kernel locks but retains a durable ownership claim.
-/// Only explicit, acknowledged release permits an overlapping future writer.
+/// The remote holder waits for release input after acquiring every lock and
+/// yields kernel locks when this exact grant is fenced for cancellation.
+/// EOF/HUP also releases kernel locks but retains the ownership claim. Only
+/// explicit, acknowledged retirement permits an overlapping future writer.
 /// POSIX sessions also expire without client heartbeats; expiry retains every
 /// durable claim and never terminates a separate compiler/rsync activity.
 pub(super) struct RemoteSourceAuthorityLock {
@@ -562,6 +737,29 @@ pub(crate) fn wrap_remote_source_activity(command: &str, identity: &str) -> anyh
     ))
 }
 
+/// Wait in the holder's foreground process tree. Cancellation relinquishes
+/// kernel locks only; it never changes a claim or acknowledges source release.
+/// The selector is a source digest or one canonical pair root, never the full
+/// closure, so large grants do not become an exec argument.
+fn source_release_waiter_command(
+    mode: &str,
+    registry: &str,
+    identity: &str,
+    selector: &str,
+    release: &str,
+) -> String {
+    let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
+    format!(
+        "python3 -I -S -c {waiter} {mode} {registry} {identity} {selector} {release}",
+        waiter = quote(SOURCE_AUTHORITY_RELEASE_WAITER),
+        mode = quote(mode),
+        registry = quote(registry),
+        identity = quote(identity),
+        selector = quote(selector),
+        release = quote(release),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_durable_source_authority_lock_cmd(
     lock_dir: &str,
@@ -581,10 +779,10 @@ fn build_durable_source_authority_lock_cmd(
     let terminal = format!(
         "set -eu; ready=$1; roots=$(cat <&4); exec 4<&-; \
          printf '%s\\n' \"$roots\" | {transaction}; \
-         printf '%s\\n' \"$ready\"; IFS= read -r request; \
-         [ \"$request\" = {release} ]; \
+         printf '%s\\n' \"$ready\"; {waiter}; \
          printf '%s\\n' \"$roots\" | flock -x -- {activity} {retirement}; \
          printf '%s\\n' {release}",
+        waiter = source_release_waiter_command("source", registry, identity, &digest, &release),
         release = quote(&release),
         activity = quote(&format!("{registry}/{identity}.activity.lock")),
     );
@@ -999,6 +1197,28 @@ pub(super) async fn recover_clean_overlay_source_pair(
     token: &str,
     wait_timeout: Duration,
 ) -> anyhow::Result<RemoteSourceAuthorityLock> {
+    recover_clean_overlay_source_pair_with_mode(
+        worker,
+        source_root,
+        token,
+        wait_timeout,
+        SourcePairRecoveryMode::Normal,
+    )
+    .await
+}
+
+enum SourcePairRecoveryMode {
+    Normal,
+    CancellationCleanup,
+}
+
+async fn recover_clean_overlay_source_pair_with_mode(
+    worker: &WorkerConfig,
+    source_root: &str,
+    token: &str,
+    wait_timeout: Duration,
+    mode: SourcePairRecoveryMode,
+) -> anyhow::Result<RemoteSourceAuthorityLock> {
     validate_source_identity(token)?;
     let lock_path = source_authority_lock_paths(&[source_root.to_owned()])
         .pop()
@@ -1014,8 +1234,7 @@ pub(super) async fn recover_clean_overlay_source_pair(
     let script = format!(
         "set -eu; owner={owner}; root={root}; token={token}; \
          [ ! -L \"$owner\" ] && [ \"$(cat \"$owner\")\" = \"$token\" ]; \
-         printf '%s\\n' {ready}; IFS= read -r request; \
-         [ \"$request\" = {release} ]; [ \"$(cat \"$owner\")\" = \"$token\" ]; \
+         printf '%s\\n' {ready}; {waiter}; [ \"$(cat \"$owner\")\" = \"$token\" ]; \
          [ ! -e \"$root\" ] && [ ! -L \"$root\" ]; \
          printf '%s\\n' {token} > {receipt}; {flush_receipt}; \
          printf 'released\\n' > \"$owner\"; {flush_owner}; printf '%s\\n' {release}",
@@ -1023,6 +1242,18 @@ pub(super) async fn recover_clean_overlay_source_pair(
         root = quote(source_root),
         token = quote(token),
         ready = quote(&ready),
+        waiter = source_release_waiter_command(
+            match mode {
+                SourcePairRecoveryMode::Normal => "pair",
+                // This guard was acquired to complete the cancellation.
+                // Its existing fence must not discard the cleanup lock.
+                SourcePairRecoveryMode::CancellationCleanup => "cleanup-pair",
+            },
+            REMOTE_SOURCE_CLAIM_REGISTRY,
+            token,
+            &canonical_source_authority_root(source_root),
+            &release,
+        ),
         release = quote(&release),
         receipt = quote(&receipt),
         flush_receipt = source_pair_fsync(&receipt),
@@ -1090,7 +1321,14 @@ pub(super) async fn cancel_clean_overlay_source_pair_intent(
     );
     match output.stdout.as_slice() {
         b"owned" => Ok(Some(
-            recover_clean_overlay_source_pair(worker, source_root, token, wait_timeout).await?,
+            recover_clean_overlay_source_pair_with_mode(
+                worker,
+                source_root,
+                token,
+                wait_timeout,
+                SourcePairRecoveryMode::CancellationCleanup,
+            )
+            .await?,
         )),
         b"unowned" => Ok(None),
         _ => anyhow::bail!("invalid cancelled source-pair response"),
@@ -1188,8 +1426,7 @@ fn clean_overlay_source_pair_lock_command(
     let script = format!(
         "{setup}flock -x -- {metadata_lock} sh -c {creation}; \
          owner={owner}; root={root}; token={token}; \
-         printf '%s\\n' {ready}; IFS= read -r request; \
-         [ \"$request\" = {release} ]; [ \"$(cat \"$owner\")\" = \"$token\" ]; \
+         printf '%s\\n' {ready}; {waiter}; [ \"$(cat \"$owner\")\" = \"$token\" ]; \
          [ ! -e \"$root\" ] && [ ! -L \"$root\" ]; \
          printf '%s\\n' {token} > {receipt}; {flush_receipt}; \
          printf 'released\\n' > \"$owner\"; {flush_owner}; printf '%s\\n' {release}",
@@ -1197,6 +1434,13 @@ fn clean_overlay_source_pair_lock_command(
         root = quote(source_root),
         token = quote(token),
         ready = quote(ready),
+        waiter = source_release_waiter_command(
+            "pair",
+            REMOTE_SOURCE_CLAIM_REGISTRY,
+            token,
+            &canonical_source_authority_root(source_root),
+            release,
+        ),
         release = quote(release),
         receipt = quote(&receipt),
         setup = source_registry_setup(REMOTE_SOURCE_CLAIM_REGISTRY),
@@ -3341,7 +3585,7 @@ os.execv({python:?}, [{python:?}] + args)
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn durable_source_cancellation_blocks_overlapping_writers_through_cleanup() {
+    async fn durable_source_cancellation_yields_locks_but_preserves_cleanup() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let directory = source_lock_test_dir();
         let registry = directory.join("registry");
@@ -3353,12 +3597,37 @@ os.execv({python:?}, [{python:?}] + args)
         let mut owner = claim_test_durable_source_closure(&registry, &roots, "ab11", "acquire")
             .await
             .unwrap();
-        drop(owner.stdin.take());
-        owner.child.as_mut().unwrap().wait().await.unwrap();
-        drop(owner);
+        let (contents, digest) = source_claim_roots(&roots).unwrap();
         let cancellation = test_source_intent(&registry, &roots, "ab11", "cancel").await;
         assert!(cancellation.status.success());
         assert_eq!(cancellation.stdout, b"owned");
+        // Keep stdin open: an SSH connection may stay half-open after the
+        // dispatcher has already cancelled this exact grant on another one.
+        // The old holder must yield only its kernel locks, without requiring
+        // EOF or acknowledging a release it never performed.
+        assert!(owner.stdin.is_some());
+        let status = timeout(
+            Duration::from_secs(10),
+            owner.child.as_mut().unwrap().wait(),
+        )
+        .await
+        .expect("cancelled holder kept its kernel locks")
+        .unwrap();
+        assert_eq!(status.code(), Some(75));
+        assert!(
+            join_lock_drain(owner.stdout_drain.as_mut())
+                .await
+                .unwrap()
+                .is_empty(),
+            "kernel-only cancellation handoff must not acknowledge release"
+        );
+        for extension in ["claim", "cancelling"] {
+            assert_eq!(
+                std::fs::read(registry.join(format!("ab11.{digest}.{extension}"))).unwrap(),
+                contents.as_bytes(),
+                "cancellation must retain the exact ownership evidence"
+            );
+        }
         assert!(
             claim_test_durable_source_closure(&registry, &competing, "ab12", "acquire")
                 .await
@@ -3854,7 +4123,7 @@ os.execv({python:?}, [{python:?}] + args)
     ) -> anyhow::Result<RemoteSourceAuthorityLock> {
         let token = uuid::Uuid::new_v4().to_string();
         let ready = format!("ready:{token}");
-        let release = format!("release:{token}");
+        let release = format!("RCH_SOURCE_PAIR_RELEASE:{token}");
         let script = clean_overlay_source_pair_lock_command(
             lock.to_str().unwrap(),
             root.to_str().unwrap(),
@@ -3887,7 +4156,7 @@ os.execv({python:?}, [{python:?}] + args)
         let lock = directory.join("pair.lock");
         let token = uuid::Uuid::new_v4().simple().to_string();
         let ready = format!("ready:{token}");
-        let release = format!("release:{token}");
+        let release = format!("RCH_SOURCE_PAIR_RELEASE:{token}");
         let script = clean_overlay_source_pair_lock_command(
             lock.to_str().unwrap(),
             root.to_str().unwrap(),
