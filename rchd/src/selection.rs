@@ -1327,7 +1327,9 @@ impl WorkerSelector {
         // round, so the request ends AllWorkersBusy instead of failing open to
         // local execution.
         let status = worker.status().await;
-        if !matches!(status, WorkerStatus::Healthy | WorkerStatus::Degraded) {
+        if !matches!(status, WorkerStatus::Healthy | WorkerStatus::Degraded)
+            || !worker.background_network_allowed().await
+        {
             debug!(
                 "Affinity fallback worker {} skipped: status is {:?}",
                 fallback_id, status
@@ -4298,9 +4300,15 @@ where
     Fut: std::future::Future<Output = Result<(), String>>,
 {
     let endpoint = worker.endpoint_snapshot().await;
+    let Some(mut admission) = worker.background_probe().await else {
+        return Some("toolchain_preflight_lifecycle_changed".to_string());
+    };
     {
         let Some(_endpoint_guard) = worker.lock_current_endpoint(&endpoint).await else {
             return Some("toolchain_preflight_endpoint_changed".to_string());
+        };
+        let Some(_publication) = worker.lock_network_publication(&admission).await else {
+            return Some("toolchain_preflight_lifecycle_changed".to_string());
         };
         if let Some(cached) = worker.toolchain_preflight_status(toolchain_name).await
             && cached.is_reusable(TOOLCHAIN_PREFLIGHT_TTL, TOOLCHAIN_PREFLIGHT_TRANSIENT_TTL)
@@ -4315,11 +4323,17 @@ where
 
     // Keep toolchain probes concurrent and reloadable: the configuration guard
     // covers only cache access/publication, never connect or remote execution.
-    let result = probe(endpoint.config.clone()).await;
+    let result = admission.run(probe(endpoint.config.clone())).await;
     let Some(_endpoint_guard) = worker.lock_current_endpoint(&endpoint).await else {
         // A late success cannot authorize the replacement, and a late failure
         // cannot poison its cache. A later selection obtains fresh evidence.
         return Some("toolchain_preflight_endpoint_changed".to_string());
+    };
+    let Some(_publication) = worker.lock_network_publication(&admission).await else {
+        return Some("toolchain_preflight_lifecycle_changed".to_string());
+    };
+    let Some(result) = result else {
+        return Some("toolchain_preflight_lifecycle_changed".to_string());
     };
     match result {
         Ok(()) => {
@@ -8144,7 +8158,7 @@ mod tests {
             let worker = Arc::new(make_worker("retargeted-toolchains", 8, 50.0));
             let original = worker.endpoint_snapshot().await.config;
             let started = Arc::new(tokio::sync::Barrier::new(3));
-            let release = Arc::new(tokio::sync::Barrier::new(3));
+            let release = Arc::new(tokio::sync::Notify::new());
             let mut tasks = Vec::new();
             for (toolchain, old_success) in [("stable", true), ("nightly", false)] {
                 let worker = worker.clone();
@@ -8154,7 +8168,7 @@ mod tests {
                     toolchain_preflight_with(&worker, toolchain, |endpoint| async move {
                         assert_eq!(endpoint.host, "localhost");
                         started.wait().await;
-                        release.wait().await;
+                        release.notified().await;
                         if old_success {
                             Ok(())
                         } else {
@@ -8177,7 +8191,7 @@ mod tests {
             })
             .await
             .expect("preflight I/O must not block endpoint reload");
-            release.wait().await;
+            release.notify_waiters();
             for task in tasks {
                 assert_eq!(
                     tokio::time::timeout(Duration::from_secs(1), task)
@@ -8189,6 +8203,16 @@ mod tests {
                 );
             }
 
+            // Retargeting requires fresh transport evidence before any
+            // background toolchain checks can run against the replacement.
+            assert!(!worker.background_network_allowed().await);
+            worker
+                .record_transport_result(
+                    true,
+                    Duration::from_secs(30),
+                    &CircuitBreakerConfig::default(),
+                )
+                .await;
             // Neither success nor failure was installed in the replacement's
             // cache. Fresh evidence can reach the opposite verdict for each.
             for (toolchain, fresh_success) in [("stable", false), ("nightly", true)] {
@@ -8229,6 +8253,51 @@ mod tests {
                 assert_eq!(cached, fresh);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn offline_worker_disable_cancels_toolchain_preflight_and_rejects_stale_cache() {
+        struct DropSignal(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+
+        let worker = Arc::new(make_worker("disabled-preflight", 8, 50.0));
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let probe_worker = worker.clone();
+        let dropped = cancelled.clone();
+        let task = tokio::spawn(async move {
+            toolchain_preflight_with(&probe_worker, "nightly", |_| async move {
+                let _owned_child = DropSignal(dropped);
+                let _ = started.send(());
+                std::future::pending::<Result<(), String>>().await
+            })
+            .await
+        });
+        ready.await.unwrap();
+        worker.disable(Some("maintenance".into())).await;
+        worker.enable().await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect("disable must cancel the in-flight preflight")
+                .unwrap()
+                .as_deref(),
+            Some("toolchain_preflight_lifecycle_changed")
+        );
+        assert!(cancelled.load(std::sync::atomic::Ordering::Acquire));
+        assert!(worker.toolchain_preflight_status("nightly").await.is_none());
+        assert_eq!(
+            toolchain_preflight_with(&worker, "nightly", |_| async {
+                panic!("explicit enable must still wait for a successful health probe");
+            })
+            .await
+            .as_deref(),
+            Some("toolchain_preflight_lifecycle_changed")
+        );
     }
 
     #[tokio::test]

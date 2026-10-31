@@ -158,7 +158,7 @@ fn config_dir_from_env_value(value: Option<&OsStr>) -> Option<PathBuf> {
 /// Bumping invalidates every operator's cache on next run — they pay one
 /// TOML parse, then the cache repopulates. Cheap insurance against silent
 /// deserialization drift.
-const CACHE_SCHEMA_VERSION: u32 = 5;
+const CACHE_SCHEMA_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SourceFingerprint {
@@ -848,12 +848,16 @@ struct PartialEnvironmentConfig {
 
 #[derive(Debug, Default, Deserialize)]
 struct PartialCircuitConfig {
+    #[serde(alias = "down_after_failures")]
     failure_threshold: Option<u32>,
     success_threshold: Option<u32>,
     error_rate_threshold: Option<f64>,
     window_secs: Option<u64>,
     open_cooldown_secs: Option<u64>,
     half_open_max_probes: Option<u32>,
+    command_failure_threshold: Option<u32>,
+    open_cooldown_max_secs: Option<u64>,
+    recovery_probe_interval_secs: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1028,6 +1032,30 @@ fn merge_toml_overlay(base: &mut toml::Value, overlay: toml::Value) {
     }
 }
 
+/// Shared validation for the file validator and `rch config set`. Reject
+/// accidental zero-delay recovery loops before writing operator settings.
+pub(crate) fn circuit_validation_errors(circuit: &rch_common::CircuitBreakerConfig) -> Vec<String> {
+    let mut errors = Vec::new();
+    for (key, value) in [
+        ("failure_threshold", u64::from(circuit.failure_threshold)),
+        (
+            "recovery_probe_interval_secs",
+            circuit.recovery_probe_interval_secs,
+        ),
+    ] {
+        if value == 0 {
+            errors.push(format!("circuit.{key} must be greater than 0"));
+        }
+    }
+    if !circuit.error_rate_threshold.is_finite()
+        || !(0.0..=1.0).contains(&circuit.error_rate_threshold)
+    {
+        errors
+            .push("circuit.error_rate_threshold must be finite and within [0.0, 1.0]".to_string());
+    }
+    errors
+}
+
 /// Validate a standard RCH config file (config.toml or .rch/config.toml).
 pub fn validate_rch_config_file(path: &Path) -> FileValidation {
     let mut validation = FileValidation::new(path);
@@ -1046,6 +1074,10 @@ pub fn validate_rch_config_file(path: &Path) -> FileValidation {
             return validation;
         }
     };
+
+    for error in circuit_validation_errors(&config.circuit) {
+        validation.error(error);
+    }
 
     if config.compilation.confidence_threshold < 0.0
         || config.compilation.confidence_threshold > 1.0
@@ -1471,6 +1503,9 @@ fn default_sources_map() -> ConfigSourceMap {
         "circuit.window_secs",
         "circuit.open_cooldown_secs",
         "circuit.half_open_max_probes",
+        "circuit.command_failure_threshold",
+        "circuit.open_cooldown_max_secs",
+        "circuit.recovery_probe_interval_secs",
         "output.visibility",
         "output.first_run_complete",
         "self_healing.hook_starts_daemon",
@@ -1753,6 +1788,22 @@ fn apply_layer(
     if let Some(half_open_max_probes) = layer.circuit.half_open_max_probes {
         config.circuit.half_open_max_probes = half_open_max_probes;
         set_source(sources, "circuit.half_open_max_probes", source.clone());
+    }
+    if let Some(threshold) = layer.circuit.command_failure_threshold {
+        config.circuit.command_failure_threshold = threshold;
+        set_source(sources, "circuit.command_failure_threshold", source.clone());
+    }
+    if let Some(cooldown) = layer.circuit.open_cooldown_max_secs {
+        config.circuit.open_cooldown_max_secs = cooldown;
+        set_source(sources, "circuit.open_cooldown_max_secs", source.clone());
+    }
+    if let Some(interval) = layer.circuit.recovery_probe_interval_secs {
+        config.circuit.recovery_probe_interval_secs = interval;
+        set_source(
+            sources,
+            "circuit.recovery_probe_interval_secs",
+            source.clone(),
+        );
     }
 
     if let Some(visibility) = layer.output.visibility {
@@ -2168,6 +2219,15 @@ fn merge_circuit(
     }
     if overlay.half_open_max_probes != default.half_open_max_probes {
         base.half_open_max_probes = overlay.half_open_max_probes;
+    }
+    if overlay.command_failure_threshold != default.command_failure_threshold {
+        base.command_failure_threshold = overlay.command_failure_threshold;
+    }
+    if overlay.open_cooldown_max_secs != default.open_cooldown_max_secs {
+        base.open_cooldown_max_secs = overlay.open_cooldown_max_secs;
+    }
+    if overlay.recovery_probe_interval_secs != default.recovery_probe_interval_secs {
+        base.recovery_probe_interval_secs = overlay.recovery_probe_interval_secs;
     }
 }
 
@@ -3978,6 +4038,61 @@ min_local_time_ms = 2000
         );
         assert_eq!(
             loaded.sources.get("compilation.min_local_time_ms"),
+            Some(&ConfigValueSource::ProjectConfig(project_path))
+        );
+    }
+
+    #[test]
+    fn offline_worker_circuit_settings_load_from_each_source_layer() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let user_path = dir.path().join("user.toml");
+        let project_path = dir.path().join("project.toml");
+        std::fs::write(
+            &user_path,
+            "[circuit]\ndown_after_failures = 7\nopen_cooldown_secs = 900\n\
+             command_failure_threshold = 5\nopen_cooldown_max_secs = 1800\n\
+             recovery_probe_interval_secs = 600\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &project_path,
+            "[circuit]\nfailure_threshold = 3\nrecovery_probe_interval_secs = 300\n",
+        )
+        .unwrap();
+        let no_env = HashMap::new();
+        let user =
+            load_config_with_sources_from_paths(Some(&user_path), None, Some(&no_env)).unwrap();
+        assert_eq!(user.config.circuit.failure_threshold, 7);
+        assert_eq!(user.config.circuit.command_failure_threshold, 5);
+        assert_eq!(user.config.circuit.open_cooldown_max_secs, 1800);
+        assert_eq!(user.config.circuit.recovery_probe_interval_secs, 600);
+        assert_eq!(user.config.circuit.recovery_probe_interval().as_secs(), 900);
+        for key in [
+            "failure_threshold",
+            "command_failure_threshold",
+            "open_cooldown_secs",
+            "open_cooldown_max_secs",
+            "recovery_probe_interval_secs",
+        ] {
+            assert_eq!(
+                user.sources.get(&format!("circuit.{key}")),
+                Some(&ConfigValueSource::UserConfig(user_path.clone()))
+            );
+        }
+
+        let layered = load_config_with_sources_from_paths(
+            Some(&user_path),
+            Some(&project_path),
+            Some(&no_env),
+        )
+        .unwrap();
+        assert_eq!(layered.config.circuit.failure_threshold, 3);
+        assert_eq!(layered.config.circuit.recovery_probe_interval_secs, 300);
+        assert_eq!(layered.config.circuit.open_cooldown_secs, 900);
+        assert_eq!(layered.config.circuit.command_failure_threshold, 5);
+        assert_eq!(
+            layered.sources.get("circuit.recovery_probe_interval_secs"),
             Some(&ConfigValueSource::ProjectConfig(project_path))
         );
     }
@@ -6007,11 +6122,26 @@ total_slots = 0
                 .warnings
                 .iter()
                 .any(|w| w.contains("circuit") || w.contains("threshold"));
-        // Note: May pass if validation doesn't check these specific values
+        assert!(has_circuit_issue, "zero thresholds must be rejected");
         info!(
             "PASS: Circuit breaker thresholds checked (has_issue={})",
             has_circuit_issue
         );
+    }
+
+    #[test]
+    fn offline_worker_config_rejects_zero_probe_interval() {
+        let _guard = test_guard!();
+        let mut file = NamedTempFile::new().expect("create temp file");
+        std::io::Write::write_all(
+            file.as_file_mut(),
+            b"[circuit]\nrecovery_probe_interval_secs = 0\n",
+        )
+        .unwrap();
+        let validation = validate_rch_config_file(file.path());
+        assert!(validation.errors.iter().any(|error| {
+            error.contains("circuit.recovery_probe_interval_secs must be greater than 0")
+        }));
     }
 
     #[test]

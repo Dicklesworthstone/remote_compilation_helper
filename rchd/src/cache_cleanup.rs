@@ -577,6 +577,9 @@ impl CacheCleanupScheduler {
 
     /// Check if a worker is eligible for cleanup.
     async fn is_worker_eligible(&self, worker_state: &WorkerState) -> bool {
+        if !worker_state.background_network_allowed().await {
+            return false;
+        }
         let worker_id = worker_state.config.read().await.id.clone();
 
         // Check worker status
@@ -644,6 +647,10 @@ impl CacheCleanupScheduler {
 
     /// Perform cleanup on a single worker.
     async fn cleanup_worker(&self, worker_state: &WorkerState) -> anyhow::Result<CleanupResult> {
+        let mut admission = worker_state
+            .background_probe()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("worker background connections are suspended"))?;
         let start = Instant::now();
         let config = worker_state.config.read().await.clone();
 
@@ -669,7 +676,10 @@ impl CacheCleanupScheduler {
         let cleanup_cmd = format!("sh -c {}", shell_escape::escape(cleanup_script.into()));
 
         // Execute cleanup via SSH (pooled warm master when available).
-        let result = self.run_remote(&config, &cleanup_cmd).await?;
+        let result = admission
+            .run(self.run_remote(&config, &cleanup_cmd))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("cleanup cancelled by worker state change"))??;
 
         // Update last cleanup time
         {
@@ -1647,14 +1657,42 @@ exec 9>"$__gc_source_registry/metadata.lock"; flock -x 9;
     [ -z "$__gc_reservation" ];
 ) &
 child=$!;
+rch_test_process_identity() {
+    if IFS= read -r rch_test_stat < "/proc/$1/stat"; then :; else return 1; fi;
+    rch_test_fields=${rch_test_stat##*) };
+    set -- $rch_test_fields;
+    [ "$#" -ge 20 ] || return 1;
+    rch_test_parent=$2;
+    shift 19;
+    printf '%s:%s\n' "$rch_test_parent" "$1";
+};
+child_identity=$(rch_test_process_identity "$child");
 attempt=0;
 waiter_seen=0;
 while [ "$waiter_seen" -eq 0 ]; do
-    children=$(cat "/proc/$child/task/$child/children");
+    [ "$(rch_test_process_identity "$child")" = "$child_identity" ] || exit 12;
+    if [ -r "/proc/$child/task/$child/children" ]; then
+        children=$(cat "/proc/$child/task/$child/children");
+    else
+        # Some Linux /proc mounts omit the optional task/children interface.
+        # Enumerate only this still-owned parent's direct children instead.
+        children="";
+        for process_dir in /proc/[0-9]*; do
+            process_id=${process_dir##*/};
+            if process_identity=$(rch_test_process_identity "$process_id" 2>/dev/null) &&
+               [ "${process_identity%%:*}" = "$child" ]; then
+                children="$children $process_id";
+            fi;
+        done;
+    fi;
+    [ "$(rch_test_process_identity "$child")" = "$child_identity" ] || exit 12;
     for waiter in $children; do
-        if name=$(cat "/proc/$waiter/comm") && [ "$name" = flock ] &&
+        if waiter_identity=$(rch_test_process_identity "$waiter" 2>/dev/null) &&
+           [ "${waiter_identity%%:*}" = "$child" ] &&
+           name=$(cat "/proc/$waiter/comm") && [ "$name" = flock ] &&
            descriptor=$(readlink "/proc/$waiter/fd/8") &&
-           [ "$descriptor" = "$__gc_source_registry/metadata.lock" ]; then
+           [ "$descriptor" = "$__gc_source_registry/metadata.lock" ] &&
+           [ "$(rch_test_process_identity "$waiter")" = "$waiter_identity" ]; then
             waiter_seen=1; break;
         fi;
     done;

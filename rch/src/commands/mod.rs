@@ -696,6 +696,9 @@ mod tests {
                 window_secs: 60,
                 open_cooldown_secs: 30,
                 half_open_max_probes: 2,
+                command_failure_threshold: 2,
+                open_cooldown_max_secs: 480,
+                recovery_probe_interval_secs: 300,
             },
             output: ConfigOutputSection {
                 visibility: rch_common::OutputVisibility::None,

@@ -17,7 +17,7 @@
 //! touched.
 
 use crate::workers::WorkerPool;
-use rch_common::bypass_record::AdminDisableStore;
+use rch_common::bypass_record::{AdminDisableRecord, AdminDisableStore};
 use rch_common::orphan_quarantine::{
     QuarantineEvidence, kill_probe_script, parse_quarantine_reason, probe_record_absent,
     probe_verified_dead,
@@ -75,6 +75,7 @@ pub struct OrphanQuarantineService<P: OrphanProber> {
     store: Arc<Mutex<AdminDisableStore>>,
     prober: P,
     interval: Duration,
+    evaluation: Mutex<()>,
 }
 
 impl<P: OrphanProber + 'static> OrphanQuarantineService<P> {
@@ -89,12 +90,14 @@ impl<P: OrphanProber + 'static> OrphanQuarantineService<P> {
             store,
             prober,
             interval,
+            evaluation: Mutex::new(()),
         }
     }
 
     pub fn start(self) -> JoinHandle<()> {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(self.interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 ticker.tick().await;
                 self.evaluate_once().await;
@@ -105,21 +108,17 @@ impl<P: OrphanProber + 'static> OrphanQuarantineService<P> {
     /// One pass over the durable records; returns how many quarantines were
     /// cleared.
     pub async fn evaluate_once(&self) -> usize {
-        let candidates: Vec<(String, String, u64, QuarantineEvidence)> = {
+        let Ok(_evaluation) = self.evaluation.try_lock() else {
+            return 0;
+        };
+        let candidates: Vec<(AdminDisableRecord, QuarantineEvidence)> = {
             let store = self.store.lock().await;
             store
                 .all()
                 .into_iter()
                 .filter_map(|record| {
                     let reason = record.reason.as_deref()?;
-                    parse_quarantine_reason(reason).map(|evidence| {
-                        (
-                            record.worker_id.clone(),
-                            reason.to_owned(),
-                            record.disabled_unix_ms,
-                            evidence,
-                        )
-                    })
+                    parse_quarantine_reason(reason).map(|evidence| (record.clone(), evidence))
                 })
                 .collect()
         };
@@ -131,19 +130,39 @@ impl<P: OrphanProber + 'static> OrphanQuarantineService<P> {
         )
         .unwrap_or(u64::MAX);
         let mut cleared = 0;
-        for (worker_id, reason, disabled_unix_ms, evidence) in candidates {
-            let Some(worker) = self.pool.get(&WorkerId::new(&worker_id)).await else {
+        for (record, evidence) in candidates {
+            let worker_id = &record.worker_id;
+            let Some(worker) = self.pool.get(&WorkerId::new(worker_id)).await else {
                 continue;
             };
-            let config = worker.config.read().await.clone();
+            // Only the exact automatic E104 quarantine authorizes this probe.
+            // A normal operator disable never gets this narrow exception to
+            // the background-network gate, even if it replaces a queued item.
+            let store = self.store.lock().await;
+            if store.get(worker_id) != Some(&record)
+                || worker.disabled_reason().await != record.reason
+            {
+                continue;
+            }
+            let mut revision = worker.network_revision_guard();
+            let endpoint = worker.endpoint_snapshot().await;
+            let config = endpoint.config.clone();
+            drop(store);
             if rch_common::declared_os(&config.tags).as_deref() == Some("windows") {
                 continue;
             }
-            let Some(stdout) = self.prober.probe(config, evidence.clone()).await else {
+            let Some(Ok(Some(stdout))) = revision
+                .run(tokio::time::timeout(
+                    PROBE_TIMEOUT,
+                    self.prober.probe(config, evidence.clone()),
+                ))
+                .await
+            else {
                 debug!(worker = %worker_id, "orphan quarantine probe channel failed; keeping");
                 continue;
             };
-            let quarantine_age = Duration::from_millis(now_ms.saturating_sub(disabled_unix_ms));
+            let quarantine_age =
+                Duration::from_millis(now_ms.saturating_sub(record.disabled_unix_ms));
             let verdict = if probe_verified_dead(&stdout) {
                 "recorded process group verified dead"
             } else if probe_record_absent(&stdout) && quarantine_age >= RECORD_ABSENT_GRACE {
@@ -155,19 +174,22 @@ impl<P: OrphanProber + 'static> OrphanQuarantineService<P> {
             // The operator may have replaced or removed the record while the
             // probe ran; only the exact record that was verified is cleared.
             let mut store = self.store.lock().await;
-            if store
-                .get(&worker_id)
-                .and_then(|record| record.reason.as_deref())
-                != Some(reason.as_str())
-            {
+            let Some(_endpoint) = worker.lock_current_endpoint(&endpoint).await else {
+                continue;
+            };
+            if store.get(worker_id) != Some(&record) || !revision.is_current() {
                 continue;
             }
-            if let Err(error) = store.remove(&worker_id) {
+            if let Err(error) = store.remove(worker_id) {
                 warn!(worker = %worker_id, "could not remove orphan quarantine record: {error}");
                 continue;
             }
-            drop(store);
+            // Operator enable/disable uses the same durable-store lock. Keep
+            // it until the live transition is finished so a newer disable
+            // cannot be erased between removing this record and enabling.
             worker.enable().await;
+            self.pool.notify_endpoint_change();
+            drop(store);
             info!(
                 worker = %worker_id,
                 build_id = evidence.build_id,
@@ -185,7 +207,7 @@ mod tests {
     use super::*;
     use rch_common::bypass_record::AdminDisableRecord;
     use rch_common::orphan_quarantine::quarantine_reason;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct FakeProber {
         stdout: Option<&'static str>,
@@ -370,6 +392,124 @@ mod tests {
         assert_eq!(
             store.get("w1").and_then(|record| record.reason.as_deref()),
             Some("operator: keep out")
+        );
+    }
+
+    struct BlockingProber {
+        started: Arc<tokio::sync::Notify>,
+        canceled: Arc<AtomicBool>,
+    }
+
+    impl OrphanProber for BlockingProber {
+        async fn probe(
+            &self,
+            _worker: WorkerConfig,
+            _evidence: QuarantineEvidence,
+        ) -> Option<String> {
+            struct CancelOnDrop(Arc<AtomicBool>);
+            impl Drop for CancelOnDrop {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+            let _canceled = CancelOnDrop(self.canceled.clone());
+            self.started.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn operator_disable_cancels_an_inflight_orphan_probe_and_keeps_durable_intent() {
+        let (dir, pool, store) = fixture(quarantine_reason(Some(&evidence()))).await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let canceled = Arc::new(AtomicBool::new(false));
+        let service = Arc::new(OrphanQuarantineService::new(
+            pool.clone(),
+            store.clone(),
+            BlockingProber {
+                started: started.clone(),
+                canceled: canceled.clone(),
+            },
+            ORPHAN_QUARANTINE_CHECK_INTERVAL,
+        ));
+        let task = {
+            let service = service.clone();
+            tokio::spawn(async move { service.evaluate_once().await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("automatic quarantine must begin its evidence probe");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), service.evaluate_once())
+                .await
+                .expect("overlapping scan must not start another probe"),
+            0
+        );
+        let worker = pool.get(&WorkerId::new("w1")).await.unwrap();
+        let reason = "operator: laptop intentionally off".to_string();
+        {
+            let mut durable = store.lock().await;
+            durable
+                .upsert(AdminDisableRecord {
+                    worker_id: "w1".into(),
+                    reason: Some(reason.clone()),
+                    disabled_unix_ms: 2,
+                })
+                .unwrap();
+            worker.disable(Some(reason.clone())).await;
+        }
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect("disable must cancel the stalled orphan transport")
+                .unwrap(),
+            0
+        );
+        assert!(canceled.load(Ordering::SeqCst));
+        assert!(worker.is_disabled().await);
+        let restarted = AdminDisableStore::load(dir.path().join("admin_disables.json"));
+        assert_eq!(
+            restarted.get("w1").unwrap().reason.as_deref(),
+            Some(reason.as_str())
+        );
+        assert_eq!(service.evaluate_once().await, 0);
+    }
+
+    struct RenewingProber(Arc<Mutex<AdminDisableStore>>);
+
+    impl OrphanProber for RenewingProber {
+        async fn probe(
+            &self,
+            worker: WorkerConfig,
+            _evidence: QuarantineEvidence,
+        ) -> Option<String> {
+            let mut store = self.0.lock().await;
+            let mut renewed = store.get(worker.id.as_str()).unwrap().clone();
+            // Repeating exactly the same reason is still a NEW decision. A
+            // reason-only comparison would incorrectly clear this record.
+            renewed.disabled_unix_ms += 1;
+            store.upsert(renewed).unwrap();
+            Some("RCH_E104_KILL=verified_dead".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_renewed_quarantine_with_the_same_reason_is_not_cleared_by_an_old_probe() {
+        let (_dir, pool, store) = fixture(quarantine_reason(Some(&evidence()))).await;
+        let service = OrphanQuarantineService::new(
+            pool.clone(),
+            store.clone(),
+            RenewingProber(store.clone()),
+            ORPHAN_QUARANTINE_CHECK_INTERVAL,
+        );
+        assert_eq!(service.evaluate_once().await, 0);
+        assert_eq!(store.lock().await.get("w1").unwrap().disabled_unix_ms, 2);
+        assert!(
+            pool.get(&WorkerId::new("w1"))
+                .await
+                .unwrap()
+                .is_disabled()
+                .await
         );
     }
 }

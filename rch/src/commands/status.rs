@@ -1782,9 +1782,10 @@ async fn self_test_run(
         worker_ids.push(worker);
     } else {
         let workers = load_workers_from_config()?;
-        let disabled = rch_common::bypass_record::AdminDisableStore::load(
+        let disabled = rch_common::bypass_record::AdminDisableStore::try_load(
             rch_common::bypass_record::default_admin_disable_path(),
-        );
+        )
+        .context("Cannot read administrative worker disablement; refusing to select a worker")?;
         let first = default_self_test_worker(&workers, &disabled)
             .ok_or_else(|| anyhow::anyhow!("No workers configured"))?;
         worker_ids.push(first.id.to_string());

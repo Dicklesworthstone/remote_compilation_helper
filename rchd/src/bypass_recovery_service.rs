@@ -34,7 +34,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::interval;
 use tracing::{debug, info, warn};
@@ -109,6 +109,10 @@ fn reset_recovery(record: &mut BypassRecord, config: &WorkerConfig, now_ms: u64)
 
 /// Bytes per gigabyte, for the disk-free-GB → bytes threshold.
 const BYTES_PER_GB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+/// Bound recovery work independently of the number of durable records. Health
+/// probes use their own budget, so a stalled recovery cannot starve liveness.
+const MAX_CONCURRENT_RECOVERY_PROBES: usize = 16;
 
 /// Tunable knobs for the recovery loop and the real SSH prober.
 #[derive(Debug, Clone, PartialEq)]
@@ -832,6 +836,8 @@ pub struct BypassRecoveryService<P: RecoveryProber> {
     prober: Arc<P>,
     config: BypassRecoveryConfig,
     history: Option<Arc<BuildHistory>>,
+    evaluation: Arc<Mutex<()>>,
+    probe_limit: Arc<Semaphore>,
 }
 
 impl<P: RecoveryProber> Clone for BypassRecoveryService<P> {
@@ -842,6 +848,8 @@ impl<P: RecoveryProber> Clone for BypassRecoveryService<P> {
             prober: Arc::clone(&self.prober),
             config: self.config.clone(),
             history: self.history.clone(),
+            evaluation: self.evaluation.clone(),
+            probe_limit: self.probe_limit.clone(),
         }
     }
 }
@@ -861,6 +869,8 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
             prober: Arc::new(prober),
             config,
             history: None,
+            evaluation: Arc::new(Mutex::new(())),
+            probe_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_RECOVERY_PROBES)),
         }
     }
 
@@ -881,6 +891,7 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
             self.replay_pending_disk_faults().await;
             self.reconcile_on_start().await;
             let mut ticker = interval(self.config.check_interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {}
@@ -980,23 +991,32 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
         }
     }
 
-    /// Producer pass: quarantine workers the health monitor has marked plainly
-    /// `Unreachable` (a sustained failure — the health circuit opened) that the
-    /// operator still wants in service and that are not already recorded. This
-    /// is what turns a transient failure into a [`BypassRecord`] so the consumer
-    /// pass can probe it back to health. The failure class is inferred from the
-    /// worker's last error via [`classify_disable_reason`], defaulting to SSH.
+    /// Producer pass: quarantine command/storage failures on workers whose
+    /// transport is still available and whose eligibility is `Unreachable`.
+    /// Connection failures remain owned by the health monitor's recovery clock;
+    /// they must not acquire another independent reconnect loop here. The
+    /// failure class is inferred from the worker's last error via
+    /// [`classify_disable_reason`], defaulting to SSH for legacy evidence.
     ///
     /// Workers already in `TemporaryBypass` / `RecoveredPendingCanary` read as
     /// `Unreachable` at the legacy-status boundary but have a *quarantine*
     /// eligibility (not plain `Unreachable`), so they are not re-detected here.
     pub async fn detect_new_bypasses(&self, now_ms: u64) {
         for worker in self.pool.all_workers().await {
+            // A transport outage has one cheap, bounded recovery owner in the
+            // health monitor. Turning it into a second persisted recovery
+            // workflow would restart SSH independently of that owner's clock.
+            let Some(admission) = worker.background_probe().await else {
+                continue;
+            };
             // The detection and publication must inspect the same endpoint.
             // In particular, a reload resets its circuit and marks it awaiting
             // a first health probe; that is not evidence of a new incident.
             let mut store = self.store.lock().await;
             let config = worker.config.read().await;
+            let Some(_publication) = worker.lock_network_publication(&admission).await else {
+                continue;
+            };
             let lifecycle = worker.lifecycle().await;
             if lifecycle.admin != AdminIntent::Active
                 || lifecycle.eligibility != EligibilityState::Unreachable
@@ -1070,6 +1090,11 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
 
     /// Run one scan: probe every bypassed worker whose backoff window elapsed.
     pub async fn evaluate_once(&self, now_ms: u64) {
+        // A manual scan and the periodic task may race. Share the scan lease
+        // across service clones so a due record cannot run duplicate canaries.
+        let Ok(_evaluation) = self.evaluation.try_lock() else {
+            return;
+        };
         let records: Vec<BypassRecord> = {
             let store = self.store.lock().await;
             store.all().into_iter().cloned().collect()
@@ -1078,6 +1103,9 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
         for record in records {
             let service = self.clone();
             evaluations.spawn(async move {
+                let Ok(_permit) = service.probe_limit.clone().acquire_owned().await else {
+                    return;
+                };
                 service.evaluate_record(record, now_ms).await;
             });
         }
@@ -1089,7 +1117,6 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
     }
 
     async fn evaluate_record(&self, record: BypassRecord, now_ms: u64) {
-        let mut endpoint_changes = self.pool.subscribe_endpoint_changes();
         let worker_id = record.worker_id.clone();
         let Some(worker) = self.pool.get(&WorkerId::new(&worker_id)).await else {
             // A fresh or partial daemon pool cannot prove that an absent worker
@@ -1123,13 +1150,37 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
             return;
         }
 
-        let probe = tokio::select! {
-            probe = self.prober.probe(worker.clone(), record.clone()) => probe,
-            _ = endpoint_changes.changed() => {
-                self.interrupted_trial(&worker, &snapshot, &record, now_ms).await;
-                return;
-            }
+        // This lease is revoked by disablement, endpoint changes, or a newly
+        // detected transport outage. Keep it through the canary, but never
+        // hold worker/store locks over SSH or while awaiting its cancellation.
+        let Some(mut admission) = worker.background_probe().await else {
+            return;
         };
+
+        // A prober has a connect budget and a command budget. Enforce their
+        // total here as well, so a stalled adapter cannot retain a fleet
+        // concurrency permit indefinitely.
+        let deadline = self.config.probe_timeout.saturating_mul(2);
+        let probe = admission
+            .run(tokio::time::timeout(
+                deadline,
+                self.prober.probe(worker.clone(), record.clone()),
+            ))
+            .await;
+        let Some(probe) = probe else {
+            self.interrupted_trial(&worker, &snapshot, &record, now_ms)
+                .await;
+            return;
+        };
+        let probe = probe.unwrap_or(RecoveryProbe {
+            ssh_ok: false,
+            worker_binary_ok: false,
+            protocol_ok: false,
+            toolchain_ok: false,
+            disk_ok: false,
+            load_ok: false,
+            telemetry_ok: false,
+        });
         let mut store = self.store.lock().await;
         let Some(endpoint) = worker.lock_current_endpoint(&snapshot).await else {
             drop(store);
@@ -1137,7 +1188,11 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
             debug!(worker = %worker_id, "discarding recovery probe from a replaced endpoint");
             return;
         };
+        let Some(publication) = worker.lock_network_publication(&admission).await else {
+            return;
+        };
         if store.get(&worker_id) != Some(&record)
+            || !admission.is_current()
             || worker.lifecycle().await.admin == AdminIntent::Disabled
         {
             debug!(worker = %worker_id, "discarding recovery probe superseded by a new failure or operator action");
@@ -1181,15 +1236,21 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
                     worker.enter_bypass(record.failure_class).await;
                     return;
                 }
+                drop(publication);
                 drop(endpoint);
                 drop(store);
-                let outcome = tokio::select! {
-                    outcome = self.prober.canary(worker.clone()) => outcome,
-                    _ = endpoint_changes.changed() => {
-                        self.interrupted_trial(&worker, &snapshot, record.as_ref(), now_ms).await;
-                        return;
-                    }
+                let outcome = admission
+                    .run(tokio::time::timeout(
+                        deadline,
+                        self.prober.canary(worker.clone()),
+                    ))
+                    .await;
+                let Some(outcome) = outcome else {
+                    self.interrupted_trial(&worker, &snapshot, record.as_ref(), now_ms)
+                        .await;
+                    return;
                 };
+                let outcome = outcome.unwrap_or(CanaryOutcome::Failed);
                 let mut store = self.store.lock().await;
                 let Some(_endpoint) = worker.lock_current_endpoint(&snapshot).await else {
                     drop(store);
@@ -1199,7 +1260,11 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
                     debug!(worker = %worker_id, "discarding canary from a replaced endpoint");
                     return;
                 };
+                let Some(_publication) = worker.lock_network_publication(&admission).await else {
+                    return;
+                };
                 if store.get(&worker_id) != Some(record.as_ref())
+                    || !admission.is_current()
                     || worker.lifecycle().await.admin == AdminIntent::Disabled
                 {
                     debug!(worker = %worker_id, "discarding canary superseded by a new failure or operator action");
@@ -1407,6 +1472,16 @@ mod tests {
             pool.add_worker(worker_config(id)).await;
         }
         pool
+    }
+
+    async fn confirm_connection(worker: &WorkerState) {
+        worker
+            .record_transport_result(
+                true,
+                Duration::from_secs(30),
+                &rch_common::CircuitBreakerConfig::default(),
+            )
+            .await;
     }
 
     const T0: u64 = 1_700_000_000_000;
@@ -1745,6 +1820,10 @@ mod tests {
                     _ => unreachable!(),
                 }
                 pool.add_worker(replacement.clone()).await;
+                assert!(!worker.background_network_allowed().await);
+                if !disabled {
+                    confirm_connection(&worker).await;
+                }
                 let service = BypassRecoveryService::new(
                     pool,
                     store.clone(),
@@ -2485,6 +2564,8 @@ mod tests {
                 let persisted = BypassRecordStore::load(store.lock().await.path());
                 assert_eq!(persisted.get("stale"), Some(&current));
 
+                assert!(!worker.background_network_allowed().await);
+                confirm_connection(&worker).await;
                 let fresh = BypassRecoveryService::new(
                     pool,
                     store.clone(),
@@ -2540,6 +2621,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_recovery_scans_share_one_trial_and_disable_cancels_it() {
+        for during_canary in [false, true] {
+            let pool = pool_with(&["blocked"]).await;
+            let store = store();
+            let worker = pool.get(&WorkerId::new("blocked")).await.unwrap();
+            record_worker_bypass(&store, &worker, BypassFailureClass::Ssh, "down", T0).await;
+            let mut record = store.lock().await.get("blocked").cloned().unwrap();
+            record.auto_rejoin.required_consecutive_passes = 1;
+            record.auto_rejoin.canary_required = during_canary;
+            store.lock().await.upsert(record).unwrap();
+            let started = Arc::new(tokio::sync::Notify::new());
+            let canceled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let service = BypassRecoveryService::new(
+                pool,
+                store.clone(),
+                BlockingEndpointProber {
+                    started: started.clone(),
+                    canceled: canceled.clone(),
+                    during_canary,
+                },
+                BypassRecoveryConfig::default(),
+            );
+            let task = {
+                let service = service.clone();
+                tokio::spawn(async move { service.evaluate_once(T0 + 60_000).await })
+            };
+            tokio::time::timeout(Duration::from_secs(1), started.notified())
+                .await
+                .expect("recovery must enter the blocked transport");
+            tokio::time::timeout(Duration::from_secs(1), service.evaluate_once(T0 + 60_000))
+                .await
+                .expect("overlapping scan must not start a duplicate probe or canary");
+            worker.disable(Some("operator maintenance".into())).await;
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect("disable must cancel stalled recovery")
+                .unwrap();
+            assert!(canceled.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(store.lock().await.contains("blocked"));
+            assert_eq!(worker.lifecycle().await.admin, AdminIntent::Disabled);
+            assert!(!worker.lifecycle().await.is_schedulable());
+        }
+    }
+
+    #[tokio::test]
+    async fn unrelated_endpoint_reload_cannot_interrupt_a_canary_but_its_own_retarget_does() {
+        let pool = pool_with(&["blocked", "unrelated"]).await;
+        let store = store();
+        let worker = pool.get(&WorkerId::new("blocked")).await.unwrap();
+        record_worker_bypass(&store, &worker, BypassFailureClass::Ssh, "down", T0).await;
+        let mut record = store.lock().await.get("blocked").cloned().unwrap();
+        record.auto_rejoin.required_consecutive_passes = 1;
+        record.auto_rejoin.canary_required = true;
+        store.lock().await.upsert(record).unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let canceled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let service = BypassRecoveryService::new(
+            pool.clone(),
+            store.clone(),
+            BlockingEndpointProber {
+                started: started.clone(),
+                canceled: canceled.clone(),
+                during_canary: true,
+            },
+            BypassRecoveryConfig::default(),
+        );
+        let mut task = {
+            let service = service.clone();
+            tokio::spawn(async move { service.evaluate_once(T0 + 60_000).await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("canary must enter the blocked transport");
+
+        let mut unrelated = worker_config("unrelated");
+        unrelated.host = "unrelated-new-host".into();
+        pool.add_worker(unrelated).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut task)
+                .await
+                .is_err(),
+            "a global inventory wake must not cancel another worker's canary"
+        );
+        assert!(!canceled.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(worker.is_canary_pending().await);
+
+        let mut replacement = worker_config("blocked");
+        replacement.host = "replacement".into();
+        pool.add_worker(replacement).await;
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("the canary's own endpoint change must cancel immediately")
+            .unwrap();
+        assert!(canceled.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            worker.eligibility().await,
+            EligibilityState::TemporaryBypass
+        );
+
+        confirm_connection(&worker).await;
+        service.evaluate_once(T0 + 60_001).await;
+        assert!(!store.lock().await.contains("blocked"));
+        assert!(worker.lifecycle().await.is_schedulable());
+    }
+
+    #[tokio::test]
+    async fn stalled_recovery_releases_its_permit_within_the_total_probe_budget() {
+        let pool = pool_with(&["blocked", "healthy"]).await;
+        let store = store();
+        for id in ["blocked", "healthy"] {
+            let worker = pool.get(&WorkerId::new(id)).await.unwrap();
+            record_worker_bypass(&store, &worker, BypassFailureClass::Ssh, "down", T0).await;
+            let mut record = store.lock().await.get(id).cloned().unwrap();
+            record.auto_rejoin.required_consecutive_passes = 1;
+            record.auto_rejoin.canary_required = false;
+            store.lock().await.upsert(record).unwrap();
+        }
+        let canceled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let service = BypassRecoveryService::new(
+            pool,
+            store.clone(),
+            BlockingEndpointProber {
+                started: Arc::new(tokio::sync::Notify::new()),
+                canceled: canceled.clone(),
+                during_canary: false,
+            },
+            BypassRecoveryConfig {
+                probe_timeout: Duration::from_millis(10),
+                ..Default::default()
+            },
+        );
+        tokio::time::timeout(Duration::from_secs(1), service.evaluate_once(T0 + 60_000))
+            .await
+            .expect("blackholed recovery may not hang the scan");
+        assert!(canceled.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            service.probe_limit.available_permits(),
+            MAX_CONCURRENT_RECOVERY_PROBES
+        );
+        let records = store.lock().await;
+        assert!(!records.contains("healthy"));
+        let blocked = records.get("blocked").unwrap();
+        assert!(blocked.next_probe_unix_ms > T0 + 60_000);
+        assert_eq!(blocked.consecutive_passes, 0);
+    }
+
+    #[tokio::test]
     async fn retarget_interrupts_stalled_network_and_other_workers_recover_concurrently() {
         for during_canary in [false, true] {
             let pool = pool_with(&["blocked", "healthy"]).await;
@@ -2580,6 +2808,9 @@ mod tests {
                 // The check interval is an hour; only the watch can cancel the
                 // old network future and start recovery of the replacement now.
                 let worker = pool.get(&WorkerId::new("blocked")).await.unwrap();
+                assert!(!worker.background_network_allowed().await);
+                confirm_connection(&worker).await;
+                pool.notify_endpoint_change();
                 while store.lock().await.contains("blocked")
                     || !worker.lifecycle().await.is_schedulable()
                 {
@@ -2831,12 +3062,29 @@ mod tests {
             assert!(store.lock().await.get("retarget-pending-health").is_none());
             assert_eq!(worker.eligibility().await, EligibilityState::Unreachable);
 
-            // A real failure of this replacement still creates a bound record.
+            // A failed connection stays under the health monitor's sole
+            // recovery clock even when the command circuit has opened.
+            worker
+                .record_transport_result(
+                    false,
+                    Duration::from_secs(30),
+                    &rch_common::CircuitBreakerConfig::default(),
+                )
+                .await;
             worker
                 .record_failure(Some("replacement authentication failed".to_string()))
                 .await;
             worker.open_circuit().await;
             svc.detect_new_bypasses(T0 + 1).await;
+            assert!(store.lock().await.get("retarget-pending-health").is_none());
+
+            // Once transport is established, independent command/storage
+            // incidents still enter their ordinary durable recovery workflow.
+            confirm_connection(&worker).await;
+            worker
+                .record_failure(Some("No space left on device".to_string()))
+                .await;
+            svc.detect_new_bypasses(T0 + 2).await;
             let record = store
                 .lock()
                 .await

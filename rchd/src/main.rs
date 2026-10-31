@@ -1144,7 +1144,14 @@ async fn main() -> Result<()> {
     // Workers start with unknown disk; hold them at zero slots until their
     // first capacity probe (normally well under a minute), at most 2 min.
     // Mock transport never reports disk, so it keeps the configured ceiling.
-    let worker_pool = workers::WorkerPool::with_selection_config(&rch_config.selection);
+    // A corrupt/unreadable disable store cannot safely be treated as empty:
+    // that would silently restore workers the operator explicitly took out.
+    let admin_disable_store = Arc::new(Mutex::new(AdminDisableStore::try_load(
+        default_admin_disable_path(),
+    )?));
+    let worker_pool = workers::WorkerPool::with_selection_config(&rch_config.selection)
+        .with_connection_monitoring()
+        .with_admin_disable_store(admin_disable_store.clone());
     let worker_pool = if rch_common::mock::is_mock_enabled() {
         worker_pool
     } else {
@@ -1234,6 +1241,9 @@ async fn main() -> Result<()> {
         info!("SSH connection pooling disabled (per-call SSH sessions)");
         None
     };
+    if let Some(pool) = &ssh_pool {
+        worker_pool.attach_ssh_pool(pool.clone()).await;
+    }
 
     // Ownership is mandatory. An isolated socket gets isolated default storage.
     let history_path = cli
@@ -1433,29 +1443,6 @@ async fn main() -> Result<()> {
         default_bypass_record_path(),
     )));
 
-    // Durable admin disables (bd-8zxz7): re-apply persisted disables to the
-    // freshly-loaded pool BEFORE serving, so an operator disable or a
-    // cpu-capability-fault quarantine survives daemon restarts. A record for a
-    // worker no longer in workers.toml is inert (kept until an enable removes
-    // it, harmless meanwhile).
-    let admin_disable_store = Arc::new(Mutex::new(AdminDisableStore::load(
-        default_admin_disable_path(),
-    )));
-    {
-        let store = admin_disable_store.lock().await;
-        for record in store.all() {
-            let worker_id = rch_common::WorkerId::new(&record.worker_id);
-            if let Some(worker) = worker_pool.get(&worker_id).await {
-                worker.disable(record.reason.clone()).await;
-                info!(
-                    "Re-applied durable admin disable for worker {} (reason: {})",
-                    record.worker_id,
-                    record.reason.as_deref().unwrap_or("none recorded"),
-                );
-            }
-        }
-    }
-
     let context = DaemonContext {
         pool: worker_pool.clone(),
         worker_selector: worker_selector.clone(),
@@ -1522,6 +1509,22 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    if let Some(pool) = &health_ssh_pool {
+        worker_pool.attach_ssh_pool(pool.clone()).await;
+    }
+
+    // Reconcile durable capability/storage quarantine before health can
+    // restore transport and release background services or build admission.
+    let bypass_config = BypassRecoveryConfig::from_remediation(&rch_config.remediation);
+    let bypass_prober = SshRecoveryProber::new(telemetry_store.clone(), bypass_config.clone());
+    let bypass_recovery = BypassRecoveryService::new(
+        worker_pool.clone(),
+        bypass_store.clone(),
+        bypass_prober,
+        bypass_config,
+    )
+    .with_history(context.history.clone());
+    bypass_recovery.reconcile_on_start().await;
 
     // Start health monitor with alert manager integration
     // The health monitor and the telemetry poller both write the authoritative
@@ -1529,6 +1532,8 @@ async fn main() -> Result<()> {
     // (previously the monitor silently used built-in defaults, so the
     // configured thresholds only ever reached the selector's read side).
     let health_config = health::HealthConfig {
+        check_interval: Duration::from_secs(daemon_config.health_check_interval_secs.max(1)),
+        check_timeout: Duration::from_secs(daemon_config.worker_timeout_secs.max(1)),
         circuit: rch_config.circuit.clone(),
         ..health::HealthConfig::default()
     };
@@ -1572,24 +1577,8 @@ async fn main() -> Result<()> {
     let _convergence_loop_handle = convergence_loop.start();
     info!("Convergence loop started");
 
-    // Start the bypass recovery service (bd-session-history-remediation-ocv9i.1.3):
-    // quarantines plainly-unreachable workers into temporary bypass, then probes
-    // them (capabilities/disk/load/telemetry) and runs a canary before any
-    // auto-rejoin. The durable bypass records persist alongside incidents and are
-    // reconciled into live worker lifecycle on startup.
-    // bd-28xs5: source recovery knobs from the central remediation config
-    // (remediation.auto_rejoin + remediation.telemetry_freshness) rather than
-    // rchd-local defaults.
-    let bypass_config = BypassRecoveryConfig::from_remediation(&rch_config.remediation);
-    let bypass_prober = SshRecoveryProber::new(telemetry_store.clone(), bypass_config.clone());
-    let bypass_recovery = BypassRecoveryService::new(
-        worker_pool.clone(),
-        bypass_store.clone(),
-        bypass_prober,
-        bypass_config,
-    )
-    .with_history(context.history.clone());
-    bypass_recovery.reconcile_on_start().await;
+    // Nontransport quarantines retain their richer diagnostic/canary policy;
+    // ordinary offline transport is owned by the bounded health probe above.
     let _bypass_recovery_handle = bypass_recovery.start();
     info!("Bypass recovery service started");
 

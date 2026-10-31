@@ -677,6 +677,9 @@ impl BenchmarkScheduler {
         let Some(worker) = self.pool.get(worker_id).await else {
             return false;
         };
+        if !worker.background_network_allowed().await {
+            return false;
+        }
         let endpoint = worker.endpoint_snapshot().await;
 
         // Check health status
@@ -829,6 +832,10 @@ impl BenchmarkScheduler {
             warn!(worker_id = %worker_id, "Worker not found for benchmark");
             return;
         };
+        let Some(mut admission) = worker.background_probe().await else {
+            self.enqueue(request).await;
+            return;
+        };
 
         if !worker.reserve_slots(1).await {
             warn!(worker_id = %worker_id, "Failed to reserve slot for benchmark");
@@ -867,7 +874,15 @@ impl BenchmarkScheduler {
 
         tokio::spawn(async move {
             let start_time = std::time::Instant::now();
-            let result = execute_benchmark_on_worker(&worker_config, timeout).await;
+            let Some(result) = admission
+                .run(execute_benchmark_on_worker(&worker_config, timeout))
+                .await
+            else {
+                running_map.write().await.remove(&worker_id);
+                pool.release_slots(&worker_id, 1).await;
+                debug!(worker_id = %worker_id, "Benchmark cancelled by worker state change");
+                return;
+            };
             let duration = start_time.elapsed();
 
             match result {
@@ -3652,6 +3667,17 @@ Benchmark complete
 
         let current = worker.endpoint_snapshot().await;
         telemetry.ingest_for_endpoint(sample, TelemetrySource::SshPoll, &current);
+        assert!(
+            !scheduler.is_worker_eligible(&worker_id).await,
+            "fresh telemetry cannot substitute for the replacement's first SSH health probe"
+        );
+        worker
+            .record_transport_result(
+                true,
+                Duration::from_secs(30),
+                &rch_common::CircuitBreakerConfig::default(),
+            )
+            .await;
         assert!(scheduler.is_worker_eligible(&worker_id).await);
         telemetry.ingest(
             make_telemetry_with_load(worker_id.as_str(), 100.0, 100.0, 100.0),

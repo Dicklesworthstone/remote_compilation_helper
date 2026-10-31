@@ -18,7 +18,10 @@ use super::types::{
     ConfigValueSourceInfo, LintIssue, LintSeverity,
 };
 
-const SUPPORTED_CONFIG_KEYS: &str = "general.role, general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, compilation.remote_speedup_threshold, compilation.local_slots, compilation.build_slots, compilation.test_slots, compilation.check_slots, compilation.build_timeout_sec, compilation.test_timeout_sec, compilation.bun_timeout_sec, compilation.external_timeout_enabled, compilation.allow_local_fallback, compilation.remote_build_jobs, selection.disk_gb_per_slot, selection.weights.disk, transfer.compression_level, transfer.exclude_patterns, transfer.exclude_defaults_acknowledged, environment.allowlist, environment.forward_cargo_profile_settings, output.visibility, output.first_run_complete, self_healing.hook_starts_daemon, self_healing.daemon_installs_hooks, self_healing.auto_start_cooldown_secs, self_healing.auto_start_timeout_secs, path_topology.canonical_root, path_topology.alias_root, layer0.enabled, layer0.release_lto_thin, layer0.release_codegen_units_1, layer0.debug_line_tables_only, api.bind, api.token, api.token_file, api.no_token, api.allow_any_addr, dashboard.url";
+const SUPPORTED_CONFIG_KEYS: &str = concat!(
+    "general.role, general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, compilation.remote_speedup_threshold, compilation.local_slots, compilation.build_slots, compilation.test_slots, compilation.check_slots, compilation.build_timeout_sec, compilation.test_timeout_sec, compilation.bun_timeout_sec, compilation.external_timeout_enabled, compilation.allow_local_fallback, compilation.remote_build_jobs, selection.disk_gb_per_slot, selection.weights.disk, transfer.compression_level, transfer.exclude_patterns, transfer.exclude_defaults_acknowledged, environment.allowlist, environment.forward_cargo_profile_settings, output.visibility, output.first_run_complete, self_healing.hook_starts_daemon, self_healing.daemon_installs_hooks, self_healing.auto_start_cooldown_secs, self_healing.auto_start_timeout_secs, path_topology.canonical_root, path_topology.alias_root, layer0.enabled, layer0.release_lto_thin, layer0.release_codegen_units_1, layer0.debug_line_tables_only, api.bind, api.token, api.token_file, api.no_token, api.allow_any_addr, dashboard.url, ",
+    "circuit.failure_threshold, circuit.down_after_failures, circuit.success_threshold, circuit.error_rate_threshold, circuit.window_secs, circuit.open_cooldown_secs, circuit.half_open_max_probes, circuit.command_failure_threshold, circuit.open_cooldown_max_secs, circuit.recovery_probe_interval_secs"
+);
 
 fn print_file_validation(
     label: &str,
@@ -166,6 +169,9 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
                 window_secs: config.circuit.window_secs,
                 open_cooldown_secs: config.circuit.open_cooldown_secs,
                 half_open_max_probes: config.circuit.half_open_max_probes,
+                command_failure_threshold: config.circuit.command_failure_threshold,
+                open_cooldown_max_secs: config.circuit.open_cooldown_max_secs,
+                recovery_probe_interval_secs: config.circuit.recovery_probe_interval_secs,
             },
             output: ConfigOutputSection {
                 visibility: config.output.visibility,
@@ -517,6 +523,30 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
             &value_sources
         )
     );
+    for (key, value) in [
+        (
+            "command_failure_threshold",
+            config.circuit.command_failure_threshold.to_string(),
+        ),
+        (
+            "open_cooldown_max_secs",
+            config.circuit.open_cooldown_max_secs.to_string(),
+        ),
+        (
+            "recovery_probe_interval_secs",
+            config.circuit.recovery_probe_interval_secs.to_string(),
+        ),
+    ] {
+        println!(
+            "  {} = {}",
+            style.key(key),
+            format_with_source(
+                &format!("circuit.{key}"),
+                &style.value(&value),
+                &value_sources
+            )
+        );
+    }
 
     println!("\n{}", style.highlight("[output]"));
     println!(
@@ -756,6 +786,7 @@ pub fn config_get(key: &str, show_sources: bool, ctx: &OutputContext) -> Result<
 
     let normalized_key = match key {
         "first_run_complete" => "output.first_run_complete",
+        "circuit.down_after_failures" => "circuit.failure_threshold",
         _ => key,
     };
 
@@ -1004,6 +1035,24 @@ pub(super) fn collect_value_sources(
         &mut values,
         "circuit.half_open_max_probes",
         config.circuit.half_open_max_probes.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "circuit.command_failure_threshold",
+        config.circuit.command_failure_threshold.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "circuit.open_cooldown_max_secs",
+        config.circuit.open_cooldown_max_secs.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "circuit.recovery_probe_interval_secs",
+        config.circuit.recovery_probe_interval_secs.to_string(),
         sources,
     );
     push_value_source(
@@ -1501,6 +1550,33 @@ pub(crate) fn apply_config_set(config_path: &Path, key: &str, value: &str) -> Re
         "environment.forward_cargo_profile_settings" => {
             config.environment.forward_cargo_profile_settings = parse_bool(value, key)?;
         }
+        "circuit.failure_threshold" | "circuit.down_after_failures" => {
+            config.circuit.failure_threshold = parse_u32(value, key)?;
+        }
+        "circuit.success_threshold" => {
+            config.circuit.success_threshold = parse_u32(value, key)?;
+        }
+        "circuit.error_rate_threshold" => {
+            config.circuit.error_rate_threshold = parse_f64(value, key)?;
+        }
+        "circuit.window_secs" => {
+            config.circuit.window_secs = parse_u64(value, key)?;
+        }
+        "circuit.open_cooldown_secs" => {
+            config.circuit.open_cooldown_secs = parse_u64(value, key)?;
+        }
+        "circuit.half_open_max_probes" => {
+            config.circuit.half_open_max_probes = parse_u32(value, key)?;
+        }
+        "circuit.command_failure_threshold" => {
+            config.circuit.command_failure_threshold = parse_u32(value, key)?;
+        }
+        "circuit.open_cooldown_max_secs" => {
+            config.circuit.open_cooldown_max_secs = parse_u64(value, key)?;
+        }
+        "circuit.recovery_probe_interval_secs" => {
+            config.circuit.recovery_probe_interval_secs = parse_u64(value, key)?;
+        }
         "output.visibility" => {
             let trimmed = value.trim().trim_matches(|c| c == '"');
             let visibility = trimmed
@@ -1592,6 +1668,11 @@ pub(crate) fn apply_config_set(config_path: &Path, key: &str, value: &str) -> Re
             suggestion: "Set only one of force_local or force_remote to true".to_string(),
         }
         .into());
+    }
+
+    if key.starts_with("circuit.") {
+        let errors = config::circuit_validation_errors(&config.circuit);
+        anyhow::ensure!(errors.is_empty(), "{}", errors.join("; "));
     }
 
     let contents = toml::to_string_pretty(&config)?;
@@ -1732,6 +1813,43 @@ fn config_reset_at(config_path: &Path, key: &str, ctx: &OutputContext) -> Result
                 .environment
                 .forward_cargo_profile_settings
                 .to_string()
+        }
+        "circuit.failure_threshold" | "circuit.down_after_failures" => {
+            config.circuit.failure_threshold = defaults.circuit.failure_threshold;
+            config.circuit.failure_threshold.to_string()
+        }
+        "circuit.success_threshold" => {
+            config.circuit.success_threshold = defaults.circuit.success_threshold;
+            config.circuit.success_threshold.to_string()
+        }
+        "circuit.error_rate_threshold" => {
+            config.circuit.error_rate_threshold = defaults.circuit.error_rate_threshold;
+            config.circuit.error_rate_threshold.to_string()
+        }
+        "circuit.window_secs" => {
+            config.circuit.window_secs = defaults.circuit.window_secs;
+            config.circuit.window_secs.to_string()
+        }
+        "circuit.open_cooldown_secs" => {
+            config.circuit.open_cooldown_secs = defaults.circuit.open_cooldown_secs;
+            config.circuit.open_cooldown_secs.to_string()
+        }
+        "circuit.half_open_max_probes" => {
+            config.circuit.half_open_max_probes = defaults.circuit.half_open_max_probes;
+            config.circuit.half_open_max_probes.to_string()
+        }
+        "circuit.command_failure_threshold" => {
+            config.circuit.command_failure_threshold = defaults.circuit.command_failure_threshold;
+            config.circuit.command_failure_threshold.to_string()
+        }
+        "circuit.open_cooldown_max_secs" => {
+            config.circuit.open_cooldown_max_secs = defaults.circuit.open_cooldown_max_secs;
+            config.circuit.open_cooldown_max_secs.to_string()
+        }
+        "circuit.recovery_probe_interval_secs" => {
+            config.circuit.recovery_probe_interval_secs =
+                defaults.circuit.recovery_probe_interval_secs;
+            config.circuit.recovery_probe_interval_secs.to_string()
         }
         "output.visibility" => {
             config.output.visibility = defaults.output.visibility;
@@ -2561,6 +2679,24 @@ pub fn config_diff(ctx: &OutputContext) -> Result<()> {
         defaults.circuit.half_open_max_probes,
         "circuit.half_open_max_probes"
     );
+    diff_field!(
+        "circuit.command_failure_threshold",
+        config.circuit.command_failure_threshold,
+        defaults.circuit.command_failure_threshold,
+        "circuit.command_failure_threshold"
+    );
+    diff_field!(
+        "circuit.open_cooldown_max_secs",
+        config.circuit.open_cooldown_max_secs,
+        defaults.circuit.open_cooldown_max_secs,
+        "circuit.open_cooldown_max_secs"
+    );
+    diff_field!(
+        "circuit.recovery_probe_interval_secs",
+        config.circuit.recovery_probe_interval_secs,
+        defaults.circuit.recovery_probe_interval_secs,
+        "circuit.recovery_probe_interval_secs"
+    );
 
     // Output section
     diff_field!(
@@ -3164,6 +3300,85 @@ mod tests {
         let reset: RchConfig = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(reset.environment.forward_cargo_profile_settings);
         assert_eq!(reset.environment.allowlist, config.environment.allowlist);
+    }
+
+    #[test]
+    fn offline_worker_config_set_get_reset_and_invalid_values() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let settings = [
+            ("circuit.failure_threshold", "7"),
+            ("circuit.success_threshold", "4"),
+            ("circuit.error_rate_threshold", "0.75"),
+            ("circuit.window_secs", "120"),
+            ("circuit.open_cooldown_secs", "900"),
+            ("circuit.half_open_max_probes", "2"),
+            ("circuit.command_failure_threshold", "5"),
+            ("circuit.open_cooldown_max_secs", "1800"),
+            ("circuit.recovery_probe_interval_secs", "600"),
+        ];
+        for (key, value) in settings {
+            apply_config_set(&path, key, value).unwrap();
+            let current: RchConfig =
+                toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let values = collect_value_sources(&current, &Default::default());
+            assert_eq!(
+                values.iter().find(|entry| entry.key == key).unwrap().value,
+                value
+            );
+        }
+        let bytes = std::fs::read_to_string(&path).unwrap();
+        for (key, _) in settings {
+            let bad = if key == "circuit.error_rate_threshold" {
+                "NaN"
+            } else if matches!(
+                key,
+                "circuit.failure_threshold" | "circuit.recovery_probe_interval_secs"
+            ) {
+                "0"
+            } else {
+                "-1"
+            };
+            assert!(apply_config_set(&path, key, bad).is_err(), "{key}={bad}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);
+        }
+        for value in ["-1", "1.5", "18446744073709551616"] {
+            assert!(
+                apply_config_set(&path, "circuit.recovery_probe_interval_secs", value).is_err()
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);
+        }
+        let defaults = collect_value_sources(&RchConfig::default(), &Default::default());
+        for (key, _) in settings {
+            config_reset_at(&path, key, &plain_context()).unwrap();
+            let current: RchConfig =
+                toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let values = collect_value_sources(&current, &Default::default());
+            assert_eq!(
+                values.iter().find(|entry| entry.key == key).unwrap().value,
+                defaults
+                    .iter()
+                    .find(|entry| entry.key == key)
+                    .unwrap()
+                    .value,
+            );
+        }
+        apply_config_set(&path, "circuit.down_after_failures", "8").unwrap();
+        let current: RchConfig = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(current.circuit.failure_threshold, 8);
+        config_reset_at(&path, "circuit.down_after_failures", &plain_context()).unwrap();
+        let current: RchConfig = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            current.circuit.failure_threshold,
+            RchConfig::default().circuit.failure_threshold
+        );
+        // Zero circuit cooldown remains valid for diagnostics; the separate
+        // offline recovery interval still prevents repeated reconnects.
+        apply_config_set(&path, "circuit.open_cooldown_secs", "0").unwrap();
+        let current: RchConfig = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(current.circuit.open_cooldown_secs, 0);
+        assert_eq!(current.circuit.recovery_probe_interval().as_secs(), 300);
     }
 
     /// `[layer0]` keys are settable, resettable and readable from the CLI, so

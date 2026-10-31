@@ -1,0 +1,241 @@
+{
+  "transport": "local OpenSSH with deterministic worker protocol",
+  "binary": {
+    "path": "/workspace/scratch/e43ac90fbdec/rchd-after-verified",
+    "sha256": "09bebeec99d7111895fc8d2617b36b3108cf828d8170dec627542419aa1d11c3"
+  },
+  "configuration": {
+    "failure_threshold": 2,
+    "regression_health_interval_secs": 1,
+    "regression_recovery_probe_interval_secs": 3,
+    "idle_health_interval_secs": 30,
+    "idle_recovery_probe_interval_secs": 300,
+    "idle_open_cooldown_secs": 900
+  },
+  "before_binary": {
+    "path": "/workspace/scratch/e43ac90fbdec/rchd-before-lowmem",
+    "sha256": "028128d26225a44313b857b7ceeec07fa9150ed84f9486cd3db5f1f2ec22cf7f"
+  },
+  "before": {
+    "seconds": 65.040488052,
+    "dial_attempts": 18,
+    "minimum_dial_spacing_seconds": 1.556999450258445e-06,
+    "sampled_peak_live_transport_processes": 1,
+    "daemon_cpu_seconds": 0.08,
+    "peak_daemon_rss_bytes": 33472512,
+    "daemon_log_lines": 86,
+    "total_dial_attempts": 18,
+    "worker_status": {
+      "id": "offline",
+      "host": "offline",
+      "user": "root",
+      "status": "unreachable",
+      "circuit_state": "open",
+      "used_slots": 0,
+      "total_slots": 0,
+      "speed_score": 50.0,
+      "last_error": null,
+      "consecutive_failures": 6,
+      "recovery_in_secs": null,
+      "failure_history": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "pressure_state": "telemetry_gap",
+      "pressure_confidence": "low",
+      "pressure_reason_code": "disk_metrics_unavailable",
+      "pressure_policy_rule": "fail_open_missing_disk_metrics",
+      "pressure_disk_free_gb": null,
+      "pressure_disk_total_gb": null,
+      "pressure_disk_free_ratio": null,
+      "pressure_disk_io_util_pct": null,
+      "pressure_memory_pressure": null,
+      "pressure_telemetry_age_secs": null,
+      "pressure_telemetry_fresh": false,
+      "bypass": {
+        "schema_version": "1.0.0",
+        "worker_id": "offline",
+        "host": "offline",
+        "user": "root",
+        "failure_class": "ssh",
+        "reason_code": "RCH-I004",
+        "state": "temporary_bypass",
+        "first_failure_unix_ms": 1793468003176,
+        "last_failure_unix_ms": 1793468003176,
+        "next_probe_unix_ms": 1793468033176,
+        "backoff": {
+          "current_ms": 30000,
+          "attempts": 0,
+          "max_ms": 900000
+        },
+        "consecutive_failures": 1,
+        "consecutive_passes": 0,
+        "last_diagnostic": "worker unreachable",
+        "auto_rejoin": {
+          "required_consecutive_passes": 2,
+          "canary_required": true
+        },
+        "local_fallback_allowed": true,
+        "details": {
+          "recovery_endpoint_v1": "[\"offline\",\"root\",\"/tmp/rch-offline-paired-verified/before/client\",null]"
+        }
+      }
+    },
+    "disabled": {
+      "seconds": 32.00962334700034,
+      "dial_attempts": 2,
+      "minimum_dial_spacing_seconds": 0.07637598399924173,
+      "sampled_peak_live_transport_processes": 1,
+      "daemon_cpu_seconds": 0.030000000000000013,
+      "peak_daemon_rss_bytes": 27897856,
+      "daemon_log_lines": 8
+    },
+    "disabled_restart": {
+      "seconds": 2.0298223889994915,
+      "dial_attempts": 2,
+      "minimum_dial_spacing_seconds": 0.0919086209996749,
+      "sampled_peak_live_transport_processes": 0,
+      "daemon_cpu_seconds": 0.0,
+      "peak_daemon_rss_bytes": 32612352,
+      "daemon_log_lines": 11,
+      "all_new_dials": 2
+    }
+  },
+  "after": {
+    "seconds": 65.04366397800004,
+    "dial_attempts": 2,
+    "minimum_dial_spacing_seconds": 30.027001919000213,
+    "sampled_peak_live_transport_processes": 0,
+    "daemon_cpu_seconds": 0.05,
+    "peak_daemon_rss_bytes": 32378880,
+    "daemon_log_lines": 31,
+    "total_dial_attempts": 2,
+    "worker_status": {
+      "id": "offline",
+      "host": "offline",
+      "user": "root",
+      "status": "unreachable",
+      "circuit_state": "open",
+      "used_slots": 0,
+      "total_slots": 0,
+      "speed_score": 50.0,
+      "last_error": null,
+      "consecutive_failures": 2,
+      "recovery_in_secs": 865,
+      "failure_history": [
+        false,
+        false
+      ],
+      "pressure_state": "telemetry_gap",
+      "pressure_confidence": "low",
+      "pressure_reason_code": "disk_metrics_unavailable",
+      "pressure_policy_rule": "fail_open_missing_disk_metrics",
+      "pressure_disk_free_gb": null,
+      "pressure_disk_total_gb": null,
+      "pressure_disk_free_ratio": null,
+      "pressure_disk_io_util_pct": null,
+      "pressure_memory_pressure": null,
+      "pressure_telemetry_age_secs": null,
+      "pressure_telemetry_fresh": false
+    },
+    "disabled": {
+      "seconds": 32.0505411969998,
+      "dial_attempts": 0,
+      "minimum_dial_spacing_seconds": null,
+      "sampled_peak_live_transport_processes": 0,
+      "daemon_cpu_seconds": 0.0,
+      "peak_daemon_rss_bytes": 30752768,
+      "daemon_log_lines": 0
+    },
+    "disabled_restart": {
+      "seconds": 2.0184551029997237,
+      "dial_attempts": 0,
+      "minimum_dial_spacing_seconds": null,
+      "sampled_peak_live_transport_processes": 0,
+      "daemon_cpu_seconds": 0.0,
+      "peak_daemon_rss_bytes": 31440896,
+      "daemon_log_lines": 0,
+      "all_new_dials": 0
+    }
+  },
+  "regressions": {
+    "prolonged_outage": {
+      "seconds": 9.213701811000647,
+      "dial_attempts": 3,
+      "minimum_dial_spacing_seconds": 3.0806474560004062,
+      "sampled_peak_live_transport_processes": 0,
+      "daemon_cpu_seconds": 0.05000000000000002,
+      "peak_daemon_rss_bytes": 36704256,
+      "daemon_log_lines": 0
+    },
+    "mixed_fleet_selected": 24,
+    "selection_p95_seconds": 0.012928888000715233,
+    "concurrent_capability_refresh": {
+      "requests": 12,
+      "seconds": 0.26441321600032097,
+      "offline_dial_attempts": 0,
+      "minimum_dial_spacing_seconds": 3.0806474560004062
+    },
+    "recovery_latency_seconds": 3.1236112189999403,
+    "disabled": {
+      "seconds": 4.012500038000326,
+      "dial_attempts": 0,
+      "minimum_dial_spacing_seconds": null,
+      "sampled_peak_live_transport_processes": 0,
+      "daemon_cpu_seconds": 0.019999999999999962,
+      "peak_daemon_rss_bytes": 40038400,
+      "daemon_log_lines": 2
+    },
+    "disabled_restart": {
+      "seconds": 4.038599357999374,
+      "dial_attempts": 0,
+      "minimum_dial_spacing_seconds": null,
+      "sampled_peak_live_transport_processes": 0,
+      "daemon_cpu_seconds": 0.02,
+      "peak_daemon_rss_bytes": 32985088,
+      "daemon_log_lines": 7
+    },
+    "established_connection_loss": {
+      "seconds": 6.228596961000221,
+      "dial_attempts": 2,
+      "minimum_dial_spacing_seconds": 3.078630614000758,
+      "sampled_peak_live_transport_processes": 0,
+      "daemon_cpu_seconds": 0.040000000000000036,
+      "peak_daemon_rss_bytes": 37928960,
+      "daemon_log_lines": 0
+    },
+    "vpn_blackhole": {
+      "seconds": 8.013259108999591,
+      "dial_attempts": 2,
+      "minimum_dial_spacing_seconds": 4.026023551000435,
+      "sampled_peak_live_transport_processes": 1,
+      "daemon_cpu_seconds": 0.06,
+      "peak_daemon_rss_bytes": 37273600,
+      "daemon_log_lines": 0
+    },
+    "unpooled": {
+      "seconds": 6.210741877999681,
+      "dial_attempts": 2,
+      "minimum_dial_spacing_seconds": 3.114746305999688,
+      "sampled_peak_live_transport_processes": 0,
+      "daemon_cpu_seconds": 0.010000000000000009,
+      "peak_daemon_rss_bytes": 35274752,
+      "daemon_log_lines": 0
+    },
+    "saturated_recovery_fleet": {
+      "blackhole_workers": 14,
+      "probe_deadline_seconds": 3,
+      "sampled_peak_blackhole_transports": 12,
+      "sampled_peak_all_transports": 13,
+      "blackhole_transports_before_admissions": 12,
+      "blackhole_transports_after_admissions": 12,
+      "healthy_admissions": 24,
+      "healthy_heartbeats_in_2_2_seconds": 2,
+      "selection_p95_seconds": 0.01443317999928695
+    }
+  }
+}

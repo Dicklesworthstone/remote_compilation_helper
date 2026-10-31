@@ -27,10 +27,9 @@ use rch_common::job_identity::{
 use rch_common::process_identity::{OwnerPresence, ProcessIdentity, owner_presence};
 use rch_common::{
     ApiError, BuildHeartbeatRequest, BuildRecord, BuildStats, BypassRecord, BypassRecordStore,
-    CircuitBreakerConfig, CircuitState, CommandPriority, ErrorCode, ReleaseRequest,
-    RequiredRuntime, SELECTION_RESPONSE_PROTOCOL_VERSION, SavedTimeStats, SelectedWorker,
-    SelectionReason, SelectionRequest, SelectionResponse, WorkerId, WorkerStatus,
-    default_bypass_record_path,
+    CircuitState, CommandPriority, ErrorCode, ReleaseRequest, RequiredRuntime,
+    SELECTION_RESPONSE_PROTOCOL_VERSION, SavedTimeStats, SelectedWorker, SelectionReason,
+    SelectionRequest, SelectionResponse, WorkerId, WorkerStatus, default_bypass_record_path,
 };
 use rch_telemetry::protocol::{TelemetrySource, TestRunRecord, TestRunStats, WorkerTelemetry};
 use rch_telemetry::speedscore::SpeedScore;
@@ -2262,6 +2261,14 @@ async fn handle_telemetry_poll(ctx: &DaemonContext, worker_id: &WorkerId) -> Tel
 
     // 20s (matching TelemetryPollerConfig): a fresh SSH connect+auth+exec to a
     // trans-continental worker can approach/exceed 5s under load.
+    let Some(permission) = worker.background_probe().await else {
+        return TelemetryPollResponse {
+            status: "error".into(),
+            telemetry: None,
+            error: Some("worker background connections are suspended".into()),
+            worker_id: Some(worker_id.to_string()),
+        };
+    };
     match collect_telemetry_from_worker(&worker, Duration::from_secs(20)).await {
         Ok((endpoint, telemetry)) => {
             let Some(_endpoint_guard) = worker.lock_current_endpoint(&endpoint).await else {
@@ -2269,6 +2276,14 @@ async fn handle_telemetry_poll(ctx: &DaemonContext, worker_id: &WorkerId) -> Tel
                     status: "error".to_string(),
                     telemetry: None,
                     error: Some("worker endpoint changed during telemetry collection".to_string()),
+                    worker_id: Some(worker_id.to_string()),
+                };
+            };
+            let Some(_publication) = worker.lock_network_publication(&permission).await else {
+                return TelemetryPollResponse {
+                    status: "error".into(),
+                    telemetry: None,
+                    error: Some("worker lifecycle changed during telemetry collection".into()),
                     worker_id: Some(worker_id.to_string()),
                 };
             };
@@ -4956,14 +4971,16 @@ pub(crate) async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatu
         let circuit_stats = worker.circuit_stats().await;
         let circuit_state = circuit_stats.state();
         let pressure = worker.pressure_assessment().await;
-        let assignable_slots = if worker_accepts_new_builds(status, circuit_state, pressure.state) {
+        let assignable_slots = if worker_accepts_new_builds(status, circuit_state, pressure.state)
+            && worker.background_network_allowed().await
+        {
             available_slots
         } else {
             0
         };
 
         // Count healthy workers
-        if status == WorkerStatus::Healthy {
+        if status == WorkerStatus::Healthy && worker.background_network_allowed().await {
             workers_healthy += 1;
         }
 
@@ -4986,9 +5003,21 @@ pub(crate) async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatu
             CircuitState::HalfOpen => "half_open",
         };
 
-        // Use default circuit config for recovery time calculation
-        let circuit_config = CircuitBreakerConfig::default();
-        let recovery_in_secs = circuit_stats.recovery_remaining_secs(&circuit_config);
+        // Report the actual transport deadline, including a configured long
+        // cooldown. A default-config estimate claimed recovery in 30 seconds
+        // even when the operator requested fifteen minutes.
+        let recovery_in_secs =
+            if status == WorkerStatus::Unreachable && worker.transport_is_down().await {
+                Some(
+                    worker
+                        .next_health_probe_in()
+                        .await
+                        .unwrap_or_default()
+                        .as_secs(),
+                )
+            } else {
+                circuit_stats.recovery_remaining_secs(&ctx.worker_selector.circuit_config)
+            };
 
         worker_infos.push(WorkerStatusInfo {
             id: worker_id.clone(),

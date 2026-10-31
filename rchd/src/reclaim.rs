@@ -494,6 +494,10 @@ impl ReclaimExecutor {
         dry_run: bool,
         start: Instant,
     ) -> anyhow::Result<ReclaimResult> {
+        let mut admission = worker_state
+            .background_probe()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("worker background connections are suspended"))?;
         let config = worker_state.config.read().await.clone();
         let worker_id = config.id.clone();
 
@@ -526,7 +530,10 @@ impl ReclaimExecutor {
             "Starting reclaim operation"
         );
 
-        let result = self.run_remote(&config, &cmd).await?;
+        let result = admission
+            .run(self.run_remote(&config, &cmd))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("reclaim cancelled by worker state change"))??;
         let duration = start.elapsed();
 
         let metrics = parse_reclaim_metrics(&result.stdout);
@@ -605,7 +612,7 @@ impl ReclaimExecutor {
 
             // Skip unhealthy workers (can't SSH to reclaim)
             let status = worker_state.status().await;
-            if status != WorkerStatus::Healthy {
+            if status != WorkerStatus::Healthy || !worker_state.background_network_allowed().await {
                 debug!(worker = %worker_id, status = ?status, "Skipping non-healthy worker for reclaim");
                 continue;
             }

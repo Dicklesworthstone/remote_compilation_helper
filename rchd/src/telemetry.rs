@@ -1,7 +1,7 @@
 //! Telemetry storage and polling for worker metrics.
 
 use crate::events::EventBus;
-use crate::workers::{AdminIntent, WorkerEndpointSnapshot, WorkerPool, WorkerState};
+use crate::workers::{WorkerEndpointSnapshot, WorkerPool, WorkerState};
 use anyhow::Context;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use directories::ProjectDirs;
@@ -475,26 +475,12 @@ impl TelemetryPoller {
     }
 
     async fn should_poll_worker(&self, worker: &WorkerState) -> bool {
-        // Skip ONLY workers the operator has deliberately taken out of service
-        // (admin axis). We MUST keep polling health-excluded workers —
-        // Unreachable, and especially the `TemporaryBypass` /
-        // `RecoveredPendingCanary` quarantine states — because their recovery
-        // gate requires FRESH telemetry (`telemetry_ok`).
-        //
-        // The old code keyed off the legacy `status()`, which collapses every
-        // quarantine (`TemporaryBypass`/`RecoveredPendingCanary`) down to
-        // `Unreachable` and so skipped them. That created the fleet-wide
-        // stranding deadlock of the 2026-07-16 offload meltdown: circuit trips
-        // -> worker quarantined -> poller skips it -> telemetry goes stale ->
-        // `telemetry_ok=false` -> recovery probe `StayBypassed` forever, with a
-        // persisted record that a daemon restart merely re-applies. Gating on
-        // the admin axis instead lets a quarantined-but-recovered worker keep
-        // reporting telemetry so it can actually rejoin. Polling a genuinely
-        // down worker just times out (bounded by the poll concurrency cap +
-        // per-attempt timeout), which is the same cost the health monitor
-        // already pays by checking every worker each cycle.
-        let admin = worker.lifecycle().await.admin;
-        if matches!(admin, AdminIntent::Drained | AdminIntent::Disabled) {
+        // The health monitor owns transport recovery. An offline worker must
+        // not acquire a second reconnect loop through telemetry, even if its
+        // last sample is stale. Keep polling other eligibility quarantines:
+        // their recovery criteria require fresh telemetry, and gating on the
+        // legacy Unreachable status stranded otherwise reachable workers.
+        if !worker.background_network_allowed().await {
             return false;
         }
 
@@ -529,6 +515,10 @@ pub(crate) async fn collect_telemetry_from_worker_pooled(
     ssh_timeout: Duration,
     ssh_pool: Option<Arc<rch_common::SshPool>>,
 ) -> anyhow::Result<(WorkerEndpointSnapshot, WorkerTelemetry)> {
+    let mut admission = worker
+        .background_probe()
+        .await
+        .context("worker background connections are suspended")?;
     // Snapshot the worker config and RELEASE the lock before any SSH work.
     // Holding `worker.config` across the (up to `ssh_timeout`) SSH round-trip
     // blocks writers — and any reader queued behind a pending writer, including
@@ -537,8 +527,18 @@ pub(crate) async fn collect_telemetry_from_worker_pooled(
     // exceeded panic threshold" stalls. Cloning + dropping the guard here keeps
     // selection lock-free while telemetry SSH is in flight.
     let endpoint = worker.endpoint_snapshot().await;
-    let telemetry =
-        collect_telemetry_for_endpoint(endpoint.config.clone(), ssh_timeout, ssh_pool).await?;
+    let telemetry = admission
+        .run(collect_telemetry_for_endpoint(
+            endpoint.config.clone(),
+            ssh_timeout,
+            ssh_pool,
+        ))
+        .await
+        .context("telemetry collection cancelled by worker state change")??;
+    anyhow::ensure!(
+        admission.is_current(),
+        "worker changed during telemetry collection"
+    );
     Ok((endpoint, telemetry))
 }
 
@@ -681,6 +681,12 @@ where
     F: FnMut(rch_common::WorkerConfig) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<WorkerTelemetry>>,
 {
+    // Acquire after the fleet concurrency permit, rather than trusting the
+    // earlier scheduling snapshot. Disabling a queued worker must never start
+    // SSH, and disabling an active poll cancels its transport and retries.
+    let Some(mut admission) = worker.background_probe().await else {
+        return false;
+    };
     // Every retry belongs to this exact endpoint generation. A reload must
     // neither mix old failures with a new host nor admit late old telemetry.
     let endpoint = worker.endpoint_snapshot().await;
@@ -693,12 +699,23 @@ where
             return false;
         }
         let started = std::time::Instant::now();
-        let outcome = tokio::time::timeout(per_attempt, collect(endpoint.config.clone())).await;
+        let Some(outcome) = admission
+            .run(tokio::time::timeout(
+                per_attempt,
+                collect(endpoint.config.clone()),
+            ))
+            .await
+        else {
+            return false;
+        };
         let Some(endpoint_guard) = worker.lock_current_endpoint(&endpoint).await else {
             debug!(
                 worker = worker_id.as_str(),
                 "Discarding telemetry from replaced endpoint"
             );
+            return false;
+        };
+        let Some(publication) = worker.lock_network_publication(&admission).await else {
             return false;
         };
         match outcome {
@@ -729,13 +746,22 @@ where
                 error: format!("hard timeout after {per_attempt:?}"),
             }),
         }
+        drop(publication);
         drop(endpoint_guard);
-        if attempt < TELEMETRY_POLL_ATTEMPTS {
-            tokio::time::sleep(TELEMETRY_RETRY_BACKOFF).await;
+        if attempt < TELEMETRY_POLL_ATTEMPTS
+            && admission
+                .run(tokio::time::sleep(TELEMETRY_RETRY_BACKOFF))
+                .await
+                .is_none()
+        {
+            return false;
         }
     }
 
     let Some(_endpoint_guard) = worker.lock_current_endpoint(&endpoint).await else {
+        return false;
+    };
+    let Some(_publication) = worker.lock_network_publication(&admission).await else {
         return false;
     };
     warn!(
@@ -1223,6 +1249,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_worker_never_enters_telemetry_transport() {
+        let worker = Arc::new(WorkerState::new(create_worker_config("disabled-poll")));
+        worker
+            .disable(Some("powered off for the night".into()))
+            .await;
+        let store = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+        assert!(
+            !poll_worker_with(
+                worker,
+                store,
+                TelemetryPollerConfig::default(),
+                "must-not-connect",
+                |_| async { panic!("disabled telemetry must never dial") },
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn administrative_change_cancels_telemetry_without_retry_or_publication() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for reenable_immediately in [false, true] {
+            let worker = Arc::new(WorkerState::new(create_worker_config("active-poll")));
+            let store = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+            let started = Arc::new(tokio::sync::Notify::new());
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let task = {
+                let worker = worker.clone();
+                let store = store.clone();
+                let started = started.clone();
+                let attempts = attempts.clone();
+                tokio::spawn(async move {
+                    poll_worker_with(
+                        worker,
+                        store,
+                        TelemetryPollerConfig::default(),
+                        "vpn-blackhole",
+                        move |_| {
+                            attempts.fetch_add(1, Ordering::SeqCst);
+                            started.notify_one();
+                            std::future::pending()
+                        },
+                    )
+                    .await
+                })
+            };
+            tokio::time::timeout(Duration::from_secs(1), started.notified())
+                .await
+                .expect("poll must start");
+            worker.disable(Some("maintenance".into())).await;
+            if reenable_immediately {
+                worker.enable().await;
+            }
+            assert!(
+                !tokio::time::timeout(Duration::from_secs(1), task)
+                    .await
+                    .expect("disable must cancel a hung poll immediately")
+                    .unwrap()
+            );
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+            assert!(store.latest("active-poll").is_none());
+            assert_eq!(
+                worker.circuit_stats().await.consecutive_command_failures(),
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn late_poll_results_cannot_replace_new_endpoint_telemetry_or_circuit_evidence() {
         for success in [false, true] {
             for return_to_original in [false, true] {
@@ -1274,9 +1370,13 @@ mod tests {
                 .await
                 .expect("telemetry I/O must not hold the configuration lock");
 
+                assert!(!worker.background_network_allowed().await);
+                let circuit = rch_common::CircuitBreakerConfig::default();
+                worker
+                    .record_transport_result(true, Duration::from_secs(30), &circuit)
+                    .await;
                 // Evidence produced by the replacement must survive a late
                 // old success just as it survives a late old failure.
-                let circuit = rch_common::CircuitBreakerConfig::default();
                 worker.record_command_outcome(false, &circuit).await;
                 store.ingest(
                     make_telemetry("retargeted-telemetry", 42.0, 42.0),
@@ -1408,6 +1508,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transport_outage_suppresses_telemetry_until_health_recovers_without_stranding_bypass()
+    {
+        let pool = WorkerPool::new();
+        let config = create_worker_config("offline-quarantine");
+        pool.add_worker(config.clone()).await;
+        let worker = pool.get(&config.id).await.unwrap();
+        worker
+            .enter_bypass(rch_common::BypassFailureClass::DiskInodePressure)
+            .await;
+        let circuit = rch_common::CircuitBreakerConfig::default();
+        for _ in 0..circuit.failure_threshold {
+            worker
+                .record_transport_result(false, Duration::from_secs(30), &circuit)
+                .await;
+        }
+        assert!(worker.transport_is_down().await);
+        let store = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+        let poller = TelemetryPoller::new(pool, store.clone(), TelemetryPollerConfig::default());
+        assert!(!poller.should_poll_worker(&worker).await);
+        assert!(
+            !poll_worker_with(
+                worker.clone(),
+                store,
+                TelemetryPollerConfig::default(),
+                "must-not-bypass-recovery-cadence",
+                |_| async { panic!("telemetry may not probe an offline transport") },
+            )
+            .await
+        );
+
+        worker
+            .record_transport_result(true, Duration::from_secs(30), &circuit)
+            .await;
+        assert!(poller.should_poll_worker(&worker).await);
+        assert_eq!(
+            worker.lifecycle().await.bypass_cause,
+            Some(rch_common::BypassFailureClass::DiskInodePressure),
+            "transport recovery must preserve independent disk quarantine"
+        );
+    }
+
+    #[tokio::test]
     async fn test_should_poll_worker_disabled() {
         use crate::workers::WorkerPool;
         use rch_common::WorkerId;
@@ -1488,6 +1630,14 @@ mod tests {
                     assert!(worker.update_config(original.clone()).await);
                 }
                 let current = worker.endpoint_snapshot().await;
+                assert!(!poller.should_poll_worker(&worker).await);
+                worker
+                    .record_transport_result(
+                        true,
+                        Duration::from_secs(30),
+                        &rch_common::CircuitBreakerConfig::default(),
+                    )
+                    .await;
                 assert!(
                     store.latest(original.id.as_str()).is_some(),
                     "history is retained"

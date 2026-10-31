@@ -200,6 +200,22 @@ impl<'a> ConfigDisplay<'a> {
             &self.config.circuit.half_open_max_probes.to_string(),
             "circuit.half_open_max_probes",
         );
+        for (key, value) in [
+            (
+                "command_failure_threshold",
+                self.config.circuit.command_failure_threshold.to_string(),
+            ),
+            (
+                "open_cooldown_max_secs",
+                self.config.circuit.open_cooldown_max_secs.to_string(),
+            ),
+            (
+                "recovery_probe_interval_secs",
+                self.config.circuit.recovery_probe_interval_secs.to_string(),
+            ),
+        ] {
+            self.push_config_line(&mut lines, "  ", key, &value, &format!("circuit.{key}"));
+        }
 
         // Output section
         lines.push(format!("{} [output]", Icons::tree_end(self.context)));
@@ -404,6 +420,22 @@ impl<'a> ConfigDisplay<'a> {
             &self.config.circuit.half_open_max_probes.to_string(),
             "circuit.half_open_max_probes",
         );
+        for (key, value) in [
+            (
+                "command_failure_threshold",
+                self.config.circuit.command_failure_threshold.to_string(),
+            ),
+            (
+                "open_cooldown_max_secs",
+                self.config.circuit.open_cooldown_max_secs.to_string(),
+            ),
+            (
+                "recovery_probe_interval_secs",
+                self.config.circuit.recovery_probe_interval_secs.to_string(),
+            ),
+        ] {
+            self.print_plain_value(console, key, &value, &format!("circuit.{key}"));
+        }
 
         // Output section
         console.print_plain("");
@@ -510,6 +542,9 @@ mod tests {
                 window_secs: 60,
                 open_cooldown_secs: 30,
                 half_open_max_probes: 3,
+                command_failure_threshold: 2,
+                open_cooldown_max_secs: 480,
+                recovery_probe_interval_secs: 300,
             },
             output: ConfigOutputSection {
                 visibility: OutputVisibility::Verbose,

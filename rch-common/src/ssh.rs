@@ -134,6 +134,8 @@ struct SshProcessState {
 /// group identity throughout cancellation. After wait(), id() is None, so Drop
 /// cannot signal a group whose PID has since been reused.
 pub(crate) struct OwnedProcessGroup {
+    // Read/write the pipes directly, but reap only through Self::wait so an
+    // unexpected leader exit cannot orphan a proxy before group cleanup.
     pub(crate) child: tokio::process::Child,
 }
 
@@ -143,14 +145,16 @@ impl OwnedProcessGroup {
         Ok(Self { child })
     }
 
-    fn signal_group(&self) {
-        let group = self
-            .child
+    fn unreaped_pid(&self) -> Option<rustix::process::Pid> {
+        self.child
             .id()
             .and_then(|pid| i32::try_from(pid).ok())
             .and_then(rustix::process::Pid::from_raw)
-            .filter(|pid| !pid.is_init());
-        if let Some(group) = group {
+            .filter(|pid| !pid.is_init())
+    }
+
+    fn signal_group(&self) {
+        if let Some(group) = self.unreaped_pid() {
             let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
         }
     }
@@ -158,6 +162,47 @@ impl OwnedProcessGroup {
     pub(crate) fn start_kill(&mut self) -> std::io::Result<()> {
         self.signal_group();
         self.child.start_kill()
+    }
+
+    pub(crate) async fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        // Inspect exit without reaping, then stop remaining group members
+        // while the leader's unreaped PID still prevents reuse. SIGCHLD is
+        // only a readiness hint: subscribe before checking to avoid losing a
+        // fast exit, and recheck after unrelated/coalesced child signals.
+        // rustix exposes waitid on Linux/macOS and the other Unix targets
+        // except those below; their existing cancellation ownership remains.
+        #[cfg(not(any(
+            target_os = "cygwin",
+            target_os = "horizon",
+            target_os = "openbsd",
+            target_os = "redox",
+            target_os = "wasi"
+        )))]
+        if let Some(pid) = self.unreaped_pid() {
+            use rustix::process::{WaitId, WaitIdOptions, waitid};
+            let mut exits = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())?;
+            loop {
+                match waitid(
+                    WaitId::Pid(pid),
+                    WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG,
+                ) {
+                    Ok(Some(_)) => {
+                        self.signal_group();
+                        break;
+                    }
+                    Ok(None) => {
+                        if exits.recv().await.is_none() {
+                            return Err(std::io::Error::other(
+                                "SSH child exit notification closed",
+                            ));
+                        }
+                    }
+                    Err(rustix::io::Errno::INTR) => continue,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        self.child.wait().await
     }
 }
 
@@ -219,7 +264,7 @@ impl OwnedSshProcess {
                     if let Err(error) = child.start_kill() {
                         debug!("Failed to signal owned SSH child: {error}");
                     }
-                    break child.child.wait().await;
+                    break child.wait().await;
                 }
                 let idle_deadline = idle_timeout
                     .filter(|_| current.active_commands == 0)
@@ -228,7 +273,7 @@ impl OwnedSshProcess {
                     () = &mut revoked => {
                         updates.send_modify(|state| state.stopping = true);
                     },
-                    outcome = child.child.wait() => break outcome,
+                    outcome = child.wait() => break outcome,
                     _ = changes.changed() => {},
                     _ = async {
                         if let Some(deadline) = idle_deadline {
@@ -1460,7 +1505,6 @@ pub(crate) async fn system_ssh_execute(
 
         let ((), stdout, stderr) = tokio::try_join!(stdin_fut, stdout_fut, stderr_fut)?;
         let status = child
-            .child
             .wait()
             .await
             .with_context(|| "system ssh command failed to wait for completion")?;
@@ -3248,6 +3292,88 @@ exec sleep 30
         connecting.abort();
         assert!(connecting.await.unwrap_err().is_cancelled());
         fake.assert_reaped().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn unexpected_master_exit_stops_proxy_descendant_before_reaping() {
+        use std::io::Write;
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+
+        let directory = tempfile::tempdir().unwrap();
+        let (input, mut release_exit) = UnixStream::pair().unwrap();
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args([
+                "-c",
+                r#"printf '%s\n' "$$" > "$1/master-pid"
+sleep 30 &
+printf '%s\n' "$!" > "$1/proxy-pid"
+read -r release
+exit 37
+"#,
+                "rch-master-exit-fixture",
+            ])
+            .arg(directory.path())
+            .stdin(std::process::Stdio::from(OwnedFd::from(input)))
+            // This is the actual master's null-output path, not the separate
+            // output-draining cancellation path exercised by self-test tests.
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let process = OwnedSshProcess::spawn(&mut command, None, None).unwrap();
+        let (master, proxy) = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let pid = |name| {
+                    std::fs::read_to_string(directory.path().join(name))
+                        .ok()?
+                        .trim()
+                        .parse::<u32>()
+                        .ok()
+                };
+                if let (Some(master), Some(proxy)) = (pid("master-pid"), pid("proxy-pid")) {
+                    break (master, proxy);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("master and proxy must start before triggering the exit");
+        let proxy_state = std::fs::read_to_string(format!("/proc/{proxy}/stat")).unwrap();
+        assert!(!matches!(
+            proxy_state
+                .rsplit_once(") ")
+                .and_then(|(_, fields)| fields.chars().next()),
+            Some('Z' | 'X')
+        ));
+
+        // Release a natural leader exit; no timeout, disconnect, or caller
+        // cancellation requests group cleanup on behalf of the supervisor.
+        release_exit.write_all(b"exit now\n").unwrap();
+        let status = process
+            .wait_until(Instant::now() + Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(status.code(), Some(37), "preserve the leader's real exit");
+        assert!(!Path::new(&format!("/proc/{master}")).try_exists().unwrap());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let terminated = match std::fs::read_to_string(format!("/proc/{proxy}/stat")) {
+                    Ok(stat) => matches!(
+                        stat.rsplit_once(") ")
+                            .and_then(|(_, fields)| fields.chars().next()),
+                        Some('Z' | 'X')
+                    ),
+                    Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+                };
+                if terminated {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("an unexpected master exit must stop its still-live proxy descendant");
     }
 
     #[tokio::test]

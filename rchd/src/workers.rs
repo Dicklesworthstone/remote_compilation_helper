@@ -8,6 +8,7 @@ use crate::disk_pressure::{
     evaluate_pressure_policy,
 };
 use crate::health::probe_worker_capabilities;
+use rch_common::bypass_record::AdminDisableStore;
 use rch_common::{
     CircuitBreakerConfig, CircuitState, CircuitStats, WorkerCapabilities, WorkerConfig, WorkerId,
     WorkerStatus,
@@ -17,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{RwLock, RwLockReadGuard, watch};
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, RwLockReadGuard, watch};
 use tracing::debug;
 
 // Sized for a *loaded* worker, not an idle one.
@@ -394,9 +395,74 @@ enum DrainCompletionAction {
     },
 }
 
+/// Transport recovery is independent of both operator intent and capability
+/// quarantine. Only the health monitor may dial a transport that is down.
+#[derive(Debug, Default)]
+struct WorkerTransportState {
+    failures: u32,
+    down: bool,
+    next_probe: Option<TransportProbeDeadline>,
+}
+
+/// Store elapsed-time arithmetic instead of adding an operator-supplied u64
+/// duration to Instant. Overflow must never turn a long interval into a probe
+/// that appears immediately due.
+#[derive(Debug, Clone, Copy)]
+struct TransportProbeDeadline {
+    started_at: tokio::time::Instant,
+    interval: Duration,
+}
+
+impl TransportProbeDeadline {
+    fn new(interval: Duration) -> Self {
+        Self {
+            started_at: tokio::time::Instant::now(),
+            interval,
+        }
+    }
+
+    fn remaining(self) -> Duration {
+        self.interval.saturating_sub(self.started_at.elapsed())
+    }
+}
+
+/// Revocable permission for background network I/O. A disable, outage or
+/// endpoint replacement cancels the future (and its owned SSH child) rather
+/// than letting a queued operation dial after the operator's acknowledgement.
+pub(crate) struct BackgroundProbe {
+    changes: watch::Receiver<u64>,
+    revision: u64,
+}
+
+impl BackgroundProbe {
+    pub(crate) fn is_current(&self) -> bool {
+        *self.changes.borrow() == self.revision
+    }
+
+    pub(crate) async fn run<F: std::future::Future>(&mut self, operation: F) -> Option<F::Output> {
+        if !self.is_current() {
+            return None;
+        }
+        tokio::select! {
+            biased;
+            _ = self.changes.changed() => None,
+            result = operation => self.is_current().then_some(result),
+        }
+    }
+}
+
+pub(crate) struct HealthProbePermit {
+    pub(crate) network: BackgroundProbe,
+    /// Recovery uses a fresh, bounded connection rather than reviving either
+    /// warm pool before the worker has proved it can run a command.
+    pub(crate) isolated: bool,
+    _singleflight: OwnedMutexGuard<()>,
+}
+
 /// State of a single worker.
 #[derive(Debug)]
 pub struct WorkerState {
+    id: WorkerId,
     /// Worker configuration.
     pub config: RwLock<WorkerConfig>,
     /// Runtime-only identity: restored ownership must not reuse a generation
@@ -413,6 +479,14 @@ pub struct WorkerState {
     /// consumer, so a bypassed or canary-pending worker stays out of the
     /// scheduler automatically with no extra bookkeeping.
     lifecycle: RwLock<WorkerLifecycle>,
+    transport: Mutex<WorkerTransportState>,
+    connection_ready: AtomicBool,
+    network_changes: watch::Sender<u64>,
+    network_transition: Mutex<()>,
+    health_probe: Arc<Mutex<()>>,
+    /// Both daemon SSH pools obey the same worker lifecycle. Keeping their
+    /// registrations on the worker also covers disables outside the HTTP API.
+    ssh_pools: RwLock<Vec<Arc<rch_common::SshPool>>>,
     /// Number of slots currently in use.
     used_slots: Arc<AtomicU32>,
     /// Speed score from benchmarking (0-100).
@@ -483,6 +557,7 @@ pub(crate) struct CapabilityProbeContext {
     pub config: WorkerConfig,
     started_at: Instant,
     generation: u64,
+    network_revision: u64,
 }
 
 /// Configuration and identity of the endpoint a network operation actually used.
@@ -567,12 +642,19 @@ impl WorkerState {
 
     fn with_disk_slot_policy(config: WorkerConfig, disk_slot_policy: DiskSlotPolicy) -> Self {
         Self {
+            id: config.id.clone(),
             config: RwLock::new(config),
             endpoint_incarnation: Arc::new(WorkerEndpointIncarnation {
                 generation: AtomicU64::new(0),
                 retired: AtomicBool::new(false),
             }),
             lifecycle: RwLock::new(WorkerLifecycle::new()),
+            transport: Mutex::new(WorkerTransportState::default()),
+            connection_ready: AtomicBool::new(true),
+            network_changes: watch::channel(0).0,
+            network_transition: Mutex::new(()),
+            health_probe: Arc::new(Mutex::new(())),
+            ssh_pools: RwLock::new(Vec::new()),
             used_slots: Arc::new(AtomicU32::new(0)),
             speed_score: AtomicU64::new(50.0_f64.to_bits()), // Default mid-range score
             last_latency_ms: AtomicU64::new(0),
@@ -591,6 +673,173 @@ impl WorkerState {
             drain_completion: RwLock::new(DrainCompletionAction::default()),
             disabled_at: AtomicI64::new(0),
         }
+    }
+
+    fn revoke_background_network(&self) {
+        self.network_changes
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+    }
+
+    pub(crate) fn require_connection_probe(&self) {
+        self.connection_ready.store(false, Ordering::Release);
+        self.revoke_background_network();
+    }
+
+    async fn admin_allows_network(&self) -> bool {
+        let admin = self.lifecycle.read().await.admin;
+        !matches!(admin, AdminIntent::Disabled | AdminIntent::Drained)
+            && !matches!(
+                *self.drain_completion.read().await,
+                DrainCompletionAction::Disable { .. }
+            )
+            && !self.is_endpoint_retired()
+    }
+
+    pub(crate) async fn background_network_allowed(&self) -> bool {
+        self.connection_ready.load(Ordering::Acquire) && self.admin_allows_network().await
+    }
+
+    pub(crate) async fn background_probe(&self) -> Option<BackgroundProbe> {
+        let permit = self.network_revision_guard();
+        (self.background_network_allowed().await && permit.is_current()).then_some(permit)
+    }
+
+    /// Capture cancellation only. Recovery of a recorded orphan may use this
+    /// after independently validating its durable evidence; it does not grant
+    /// permission to probe an administratively disabled worker.
+    pub(crate) fn network_revision_guard(&self) -> BackgroundProbe {
+        let changes = self.network_changes.subscribe();
+        let revision = *changes.borrow();
+        BackgroundProbe { changes, revision }
+    }
+
+    /// Fence publication against disable/enable ABA. Endpoint guards protect
+    /// retargeting; this short-lived lock protects the administrative epoch.
+    /// Lock order: endpoint/config, then network publication; never hold it
+    /// during network I/O.
+    pub(crate) async fn lock_network_publication(
+        &self,
+        permit: &BackgroundProbe,
+    ) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        let guard = self.network_transition.lock().await;
+        permit.is_current().then_some(guard)
+    }
+
+    pub(crate) async fn transport_is_down(&self) -> bool {
+        self.transport.lock().await.down
+    }
+
+    pub(crate) async fn next_health_probe_in(&self) -> Option<Duration> {
+        if !self.admin_allows_network().await || self.health_probe.try_lock().is_err() {
+            return None;
+        }
+        Some(
+            self.transport
+                .lock()
+                .await
+                .next_probe
+                .map_or(Duration::ZERO, TransportProbeDeadline::remaining),
+        )
+    }
+
+    pub(crate) async fn attach_ssh_pool(&self, pool: Arc<rch_common::SshPool>) {
+        let _transition = self.network_transition.lock().await;
+        let enabled = self.background_network_allowed().await;
+        pool.set_worker_enabled(&self.id, enabled).await;
+        self.ssh_pools.write().await.push(pool);
+    }
+
+    async fn set_pooled_connections_enabled(&self, enabled: bool) {
+        let pools = self.ssh_pools.read().await.clone();
+        for pool in pools {
+            pool.set_worker_enabled(&self.id, enabled).await;
+        }
+    }
+
+    /// Claim one due health check. The deadline is set on admission as well as
+    /// completion so cancellation cannot turn a slow recovery cadence into a
+    /// retry storm. Different workers never wait for this worker's lock.
+    pub(crate) async fn health_probe_permit(
+        &self,
+        normal_interval: Duration,
+        circuit: &CircuitBreakerConfig,
+    ) -> Option<HealthProbePermit> {
+        let singleflight = self.health_probe.clone().try_lock_owned().ok()?;
+        let changes = self.network_changes.subscribe();
+        let revision = *changes.borrow();
+        let network = BackgroundProbe { changes, revision };
+        if !self.admin_allows_network().await || !network.is_current() {
+            return None;
+        }
+        let mut transport = self.transport.lock().await;
+        if transport
+            .next_probe
+            .is_some_and(|deadline| !deadline.remaining().is_zero())
+        {
+            return None;
+        }
+        let delay = if transport.down {
+            circuit.recovery_probe_interval()
+        } else {
+            normal_interval
+        };
+        transport.next_probe = Some(TransportProbeDeadline::new(delay));
+        Some(HealthProbePermit {
+            network,
+            isolated: !self.connection_ready.load(Ordering::Acquire),
+            _singleflight: singleflight,
+        })
+    }
+
+    /// Apply connection-stage evidence only. Command/storage failures remain
+    /// governed by the existing circuit and bypass policy. A successful full
+    /// health command restores transport service on its first recovery probe.
+    pub(crate) async fn record_transport_result(
+        &self,
+        connected: bool,
+        normal_interval: Duration,
+        circuit: &CircuitBreakerConfig,
+    ) -> (bool, bool) {
+        let mut transport = self.transport.lock().await;
+        let was_down = transport.down;
+        if connected {
+            transport.failures = 0;
+            transport.down = false;
+        } else {
+            transport.failures = transport.failures.saturating_add(1);
+            transport.down |= transport.failures >= circuit.failure_threshold.max(1);
+        }
+        let down = transport.down;
+        let delay = if down {
+            circuit.recovery_probe_interval()
+        } else {
+            normal_interval
+        };
+        if down || was_down {
+            transport.next_probe = Some(TransportProbeDeadline::new(delay));
+        }
+        drop(transport);
+        if connected {
+            // Do not reopen pools after a disable that raced the completed
+            // probe. The health publisher also fences its network generation.
+            let lifecycle = self.lifecycle.read().await;
+            if !matches!(
+                lifecycle.admin,
+                AdminIntent::Disabled | AdminIntent::Drained
+            ) && !matches!(
+                *self.drain_completion.read().await,
+                DrainCompletionAction::Disable { .. }
+            ) && !self.is_endpoint_retired()
+            {
+                self.connection_ready.store(true, Ordering::Release);
+                self.set_pooled_connections_enabled(true).await;
+            }
+        } else {
+            self.connection_ready.store(false, Ordering::Release);
+            self.revoke_background_network();
+            self.set_pooled_connections_enabled(false).await;
+        }
+        (was_down, down)
     }
 
     /// Snapshot the endpoint without retaining a configuration lock during I/O.
@@ -654,9 +903,12 @@ impl WorkerState {
     /// can never credit the ID after a replacement is installed.
     async fn retire_endpoint(&self) {
         let _config = self.config.write().await;
+        let _transition = self.network_transition.lock().await;
         self.endpoint_incarnation
             .retired
             .store(true, Ordering::Release);
+        self.require_connection_probe();
+        self.set_pooled_connections_enabled(false).await;
     }
 
     /// Update configuration, returning whether the connection endpoint changed.
@@ -666,6 +918,10 @@ impl WorkerState {
             let endpoint_changed = !same_endpoint(&config, &new_config);
             self.disk_capacity_generation.fetch_add(1, Ordering::AcqRel);
             if endpoint_changed {
+                let _transition = self.network_transition.lock().await;
+                self.require_connection_probe();
+                *self.transport.lock().await = WorkerTransportState::default();
+                self.set_pooled_connections_enabled(false).await;
                 self.endpoint_incarnation
                     .generation
                     .fetch_add(1, Ordering::AcqRel);
@@ -738,6 +994,10 @@ impl WorkerState {
     /// [`Self::promote_from_canary`], [`Self::apply_health_status`]) move the
     /// two axes independently and must be used for quarantine/recovery.
     pub async fn set_status(&self, status: WorkerStatus) {
+        if status == WorkerStatus::Disabled {
+            self.disable(None).await;
+            return;
+        }
         *self.lifecycle.write().await = WorkerLifecycle::from_worker_status(status);
     }
 
@@ -863,7 +1123,9 @@ impl WorkerState {
             // / `RecoveredPendingCanary` quarantine (eligibility axis) becomes
             // authoritative as soon as it's written, not only on the next
             // selection round.
-            if !lifecycle_accepts_new_builds(*self.lifecycle.read().await) {
+            if !self.connection_ready.load(Ordering::Acquire)
+                || !lifecycle_accepts_new_builds(*self.lifecycle.read().await)
+            {
                 return false;
             }
             let config = self.config.read().await;
@@ -890,6 +1152,7 @@ impl WorkerState {
                     // bypass quarantine landed between our initial read and the
                     // CAS, roll the reservation back.
                     if lifecycle_accepts_new_builds(*self.lifecycle.read().await)
+                        && self.connection_ready.load(Ordering::Acquire)
                         && self.used_slots() <= self.effective_total_slots().await
                     {
                         return true;
@@ -1118,6 +1381,7 @@ impl WorkerState {
             config: config.clone(),
             started_at: Instant::now(),
             generation: self.disk_capacity_generation.load(Ordering::Acquire),
+            network_revision: *self.network_changes.borrow(),
         }
     }
 
@@ -1130,6 +1394,10 @@ impl WorkerState {
         capabilities: WorkerCapabilities,
     ) -> bool {
         let config = self.config.read().await;
+        let _publication = self.network_transition.lock().await;
+        if *self.network_changes.borrow() != context.network_revision {
+            return false;
+        }
         if config.id != context.config.id
             || config.host != context.config.host
             || config.user != context.config.user
@@ -1261,11 +1529,14 @@ impl WorkerState {
     /// Disable the worker with an optional reason.
     /// Sets status to Disabled and records the timestamp and reason.
     pub async fn disable(&self, reason: Option<String>) {
+        let _transition = self.network_transition.lock().await;
         *self.drain_completion.write().await = DrainCompletionAction::StayDrained;
         self.lifecycle
             .write()
             .await
             .set_admin(AdminIntent::Disabled);
+        self.require_connection_probe();
+        self.set_pooled_connections_enabled(false).await;
         *self.disabled_reason.write().await = reason;
         self.disabled_at
             .store(current_unix_secs_for_disabled_at(), Ordering::Relaxed);
@@ -1293,21 +1564,32 @@ impl WorkerState {
 
     /// Start draining a worker that should become disabled once active jobs finish.
     pub async fn drain_then_disable(&self, reason: Option<String>) {
+        let transition = self.network_transition.lock().await;
         *self.drain_completion.write().await = DrainCompletionAction::Disable { reason };
         self.lifecycle
             .write()
             .await
             .set_admin(AdminIntent::Draining);
+        self.require_connection_probe();
+        self.set_pooled_connections_enabled(false).await;
+        drop(transition);
         self.check_drain_complete().await;
     }
 
     /// Enable a previously disabled/draining worker.
     /// Clears disabled reason and timestamp, sets status to Healthy.
     pub async fn enable(&self) {
+        let _transition = self.network_transition.lock().await;
         *self.drain_completion.write().await = DrainCompletionAction::StayDrained;
         // Operator re-enable is an authoritative override: restore both axes to
         // fully in-service (Active + Healthy) and clear any bypass cause.
         *self.lifecycle.write().await = WorkerLifecycle::new();
+        self.revoke_background_network();
+        *self.transport.lock().await = WorkerTransportState::default();
+        // Admission still requires the next health probe for monitored daemon
+        // workers. An explicit enable does not prove the SSH endpoint is up.
+        self.set_pooled_connections_enabled(self.connection_ready.load(Ordering::Acquire))
+            .await;
         *self.disabled_reason.write().await = None;
         self.disabled_at.store(0, Ordering::Relaxed);
         // Also reset the circuit breaker — `WorkerState.circuit` is the single
@@ -1340,6 +1622,7 @@ impl WorkerState {
     /// Plain drains transition to `Drained`, config-removal drains become pruneable, and
     /// drain-before-disable transitions to `Disabled` while preserving the disable reason.
     pub async fn check_drain_complete(&self) {
+        let _transition = self.network_transition.lock().await;
         let used = self.used_slots.load(Ordering::Acquire);
         if used != 0 || self.lifecycle.read().await.admin != AdminIntent::Draining {
             return;
@@ -1363,6 +1646,9 @@ impl WorkerState {
             }
         };
         drop(lifecycle);
+
+        self.revoke_background_network();
+        self.set_pooled_connections_enabled(false).await;
 
         if let Some(reason) = disable_reason {
             *self.disabled_reason.write().await = reason;
@@ -1473,6 +1759,9 @@ pub struct WorkerPool {
     project_lanes: Arc<std::sync::RwLock<HashMap<String, u32>>>,
     /// Broadcast retargets to health and bypass recovery even while they probe.
     endpoint_changes: watch::Sender<u64>,
+    monitor_connections: bool,
+    ssh_pools: Arc<RwLock<Vec<Arc<rch_common::SshPool>>>>,
+    admin_disable_store: Option<Arc<Mutex<AdminDisableStore>>>,
 }
 
 impl WorkerPool {
@@ -1491,7 +1780,30 @@ impl WorkerPool {
             unmeasured_capacity_hold: None,
             project_lanes: Arc::new(std::sync::RwLock::new(HashMap::new())),
             endpoint_changes: watch::channel(0).0,
+            monitor_connections: false,
+            ssh_pools: Arc::new(RwLock::new(Vec::new())),
+            admin_disable_store: None,
         }
+    }
+
+    /// Production pools verify a new/reloaded endpoint before any service can
+    /// dial it or dispatch a build. This also makes restart ordering explicit.
+    pub fn with_connection_monitoring(mut self) -> Self {
+        self.monitor_connections = true;
+        self
+    }
+
+    pub fn with_admin_disable_store(mut self, store: Arc<Mutex<AdminDisableStore>>) -> Self {
+        self.admin_disable_store = Some(store);
+        self
+    }
+
+    pub async fn attach_ssh_pool(&self, pool: Arc<rch_common::SshPool>) {
+        let mut pools = self.ssh_pools.write().await;
+        for worker in self.all_workers().await {
+            worker.attach_ssh_pool(pool.clone()).await;
+        }
+        pools.push(pool);
     }
 
     /// Replace the per-worker project lane counts (`[project_lanes]` in
@@ -1527,7 +1839,7 @@ impl WorkerPool {
         self.endpoint_changes.subscribe()
     }
 
-    fn notify_endpoint_change(&self) {
+    pub(crate) fn notify_endpoint_change(&self) {
         self.endpoint_changes
             .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
@@ -1551,9 +1863,26 @@ impl WorkerPool {
             config,
             self.disk_slot_policy,
         ));
+        // Keep the durable intent lock through registry publication. Otherwise
+        // an enable racing a remove/re-add could publish a stale disable (or
+        // admit a previously disabled ID before its record is applied).
+        let durable = match &self.admin_disable_store {
+            Some(store) => Some(store.lock().await),
+            None => None,
+        };
+        if let Some(record) = durable.as_ref().and_then(|store| store.get(id.as_str())) {
+            state.disable(record.reason.clone()).await;
+        }
+        if self.monitor_connections {
+            state.require_connection_probe();
+        }
         if let Some(hold) = self.unmeasured_capacity_hold {
             state.hold_until_capacity_measured(hold);
         }
+        // Match attach_ssh_pool's pools -> workers order. Only the state that
+        // wins registry insertion may change admission for this worker ID;
+        // a discarded candidate must not revoke the winner's healthy pools.
+        let pools = self.ssh_pools.read().await;
         let mut workers = self.workers.write().await;
         // Check again under write lock
         if let Some(existing) = workers.get(&id) {
@@ -1564,6 +1893,9 @@ impl WorkerPool {
                 self.notify_endpoint_change();
             }
         } else {
+            for pool in pools.iter() {
+                state.attach_ssh_pool(pool.clone()).await;
+            }
             // Publish a reintroduced worker only after restoring its surviving
             // builds. Holding the registry's write lock makes this transfer
             // atomic with release_slots, including a completion that arrived
@@ -1689,7 +2021,9 @@ impl WorkerPool {
         let mut healthy = Vec::new();
         for worker in workers.values() {
             let status = worker.status().await;
-            if status == WorkerStatus::Healthy || status == WorkerStatus::Degraded {
+            if (status == WorkerStatus::Healthy || status == WorkerStatus::Degraded)
+                && worker.connection_ready.load(Ordering::Acquire)
+            {
                 healthy.push(worker.clone());
             }
         }
@@ -2011,33 +2345,56 @@ pub async fn handle_worker_enable(
     match ctx.pool.get(worker_id).await {
         Some(worker) => {
             let old_status = worker.status().await;
-            worker.enable().await;
+            let mut durable = match &ctx.admin_disable_store {
+                Some(store) => Some(store.lock().await),
+                None => None,
+            };
             // Operator re-enable must be DURABLE: delete the worker's persisted
             // bypass record too. `worker.enable()` only resets the in-memory
             // lifecycle/circuit; if the record survives, `reconcile_on_start`
             // re-quarantines the worker from it on the next daemon restart (and
             // the live recovery loop can re-touch it). Mirrors `rejoin`'s
             // `store.remove(worker_id)`. (2026-07-16 offload meltdown follow-up.)
-            if let Some(store) = &ctx.bypass_store {
-                let _ = store.lock().await.remove(worker_id.as_str());
+            if let Some(store) = &ctx.bypass_store
+                && let Err(error) = store.lock().await.remove(worker_id.as_str())
+            {
+                return WorkerStateResponse {
+                    status: "error".into(),
+                    worker_id: worker_id.to_string(),
+                    action: "enable".into(),
+                    new_status: Some(worker_status_label(old_status).into()),
+                    reason: None,
+                    message: Some(format!(
+                        "Worker remains disabled: could not clear durable bypass: {error}"
+                    )),
+                    active_slots: Some(worker.used_slots()),
+                };
             }
             // Same durability rule for the admin-disable record (bd-8zxz7):
             // an enable that leaves the record behind would be undone by the
             // next daemon restart's re-apply pass.
-            if let Some(store) = &ctx.admin_disable_store
-                && let Err(e) = store.lock().await.remove(worker_id.as_str())
+            if let Some(store) = &mut durable
+                && let Err(e) = store.remove(worker_id.as_str())
             {
-                tracing::warn!(
-                    "Failed to remove durable admin-disable record for {}: {}",
-                    worker_id,
-                    e
-                );
+                return WorkerStateResponse {
+                    status: "error".into(),
+                    worker_id: worker_id.to_string(),
+                    action: "enable".into(),
+                    new_status: Some(worker_status_label(old_status).into()),
+                    reason: None,
+                    message: Some(format!(
+                        "Worker remains disabled: could not clear durable disable: {e}"
+                    )),
+                    active_slots: Some(worker.used_slots()),
+                };
             }
+            worker.enable().await;
+            ctx.pool.notify_endpoint_change();
             WorkerStateResponse {
                 status: "ok".to_string(),
                 worker_id: worker_id.to_string(),
                 action: "enable".to_string(),
-                new_status: Some("healthy".to_string()),
+                new_status: Some(worker_status_label(worker.status().await).to_string()),
                 reason: None,
                 message: Some(format!("Worker enabled (was {:?})", old_status)),
                 active_slots: None,
@@ -2065,27 +2422,49 @@ pub async fn handle_worker_disable(
     match ctx.pool.get(worker_id).await {
         Some(worker) => {
             let active_slots = worker.used_slots();
+            let mut durable = match &ctx.admin_disable_store {
+                Some(store) => Some(store.lock().await),
+                None => None,
+            };
+            let mut persistence_error = None;
 
             // Durable admin disable (bd-8zxz7): persist the intent BEFORE the
             // in-memory flip, for both the drain and immediate branches — a
-            // disable that only lives in memory evaporates on daemon restart
-            // (observed live: the ovh-b cpu-capability quarantine rejoined the
-            // pool after a kickstart). Persist failure is logged but does not
-            // block the in-memory disable (fail-open, matches bypass_store).
-            if let Some(store) = &ctx.admin_disable_store {
+            // disable that only lives in memory evaporates on daemon restart.
+            // Persistence failures still stop live traffic, but return an
+            // error so the caller knows restart durability was not achieved.
+            if let Some(store) = &mut durable {
                 let record = rch_common::bypass_record::AdminDisableRecord {
                     worker_id: worker_id.to_string(),
                     reason: reason.clone(),
                     disabled_unix_ms: u64::try_from(chrono::Utc::now().timestamp_millis())
                         .unwrap_or(0),
                 };
-                if let Err(e) = store.lock().await.upsert(record) {
+                if let Err(e) = store.upsert(record) {
                     tracing::warn!(
                         "Failed to persist durable admin-disable record for {}: {}",
                         worker_id,
                         e
                     );
+                    persistence_error = Some(e.to_string());
                 }
+            }
+
+            if let Some(error) = persistence_error {
+                // Stop live traffic even when disk persistence fails, but do
+                // not promise that this disable will survive a restart.
+                worker.disable(reason.clone()).await;
+                return WorkerStateResponse {
+                    status: "error".into(),
+                    worker_id: worker_id.to_string(),
+                    action: "disable".into(),
+                    new_status: Some("disabled".into()),
+                    reason,
+                    message: Some(format!(
+                        "Worker disabled in this daemon; durable state could not be saved: {error}"
+                    )),
+                    active_slots: Some(active_slots),
+                };
             }
 
             if drain_first && active_slots > 0 {
@@ -2160,6 +2539,338 @@ mod tests {
             tags: Vec::new(),
             tools: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn offline_worker_racing_registration_cannot_revoke_the_healthy_winner() {
+        let pool = WorkerPool::new().with_connection_monitoring();
+        let ssh_pool = Arc::new(rch_common::SshPool::new(rch_common::SshOptions {
+            connect_timeout: Duration::ZERO,
+            ..Default::default()
+        }));
+        pool.attach_ssh_pool(ssh_pool.clone()).await;
+        let config = recovered_worker_config("concurrent-registration", 4);
+
+        // Suspend one actual add after it has observed the ID absent and
+        // constructed a candidate. Another add can then publish first.
+        let registrations = pool.ssh_pools.write().await;
+        let late_registration = pool.add_worker(config.clone());
+        tokio::pin!(late_registration);
+        std::future::poll_fn(|context| {
+            assert!(std::future::Future::poll(late_registration.as_mut(), context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(registrations);
+        tokio::time::timeout(Duration::from_secs(1), pool.add_worker(config.clone()))
+            .await
+            .expect("another registration can acquire the shared pool lock and win");
+
+        let winner = pool.get(&config.id).await.unwrap();
+        winner
+            .record_transport_result(
+                true,
+                Duration::from_secs(30),
+                &CircuitBreakerConfig::default(),
+            )
+            .await;
+        assert!(winner.background_network_allowed().await);
+        late_registration.await;
+        assert!(Arc::ptr_eq(&winner, &pool.get(&config.id).await.unwrap()));
+        assert!(winner.background_network_allowed().await);
+        assert_eq!(winner.ssh_pools.read().await.len(), 1);
+
+        // A zero connection budget refuses before any SSH process or socket.
+        // Reaching that refusal proves the losing candidate did not revoke
+        // the already-healthy winner's shared worker-ID pool admission.
+        let error = ssh_pool
+            .get_or_connect(&config)
+            .await
+            .err()
+            .expect("the zero connection budget must refuse without dialing");
+        assert!(
+            format!("{error:#}").contains("SSH connection timed out before spawn"),
+            "the healthy winner lost pooled admission: {error:#}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn offline_worker_retired_endpoint_rejects_late_build_reservations() {
+        let pool = WorkerPool::new();
+        let config = recovered_worker_config("removed-worker", 4);
+        pool.add_worker(config.clone()).await;
+        let retired = pool.get(&config.id).await.unwrap();
+        let old_probe = retired.background_probe().await.unwrap();
+        assert!(pool.remove_worker(&config.id).await);
+        assert!(!old_probe.is_current());
+        assert!(!retired.reserve_slots(1).await);
+        assert_eq!(retired.used_slots(), 0);
+
+        pool.add_worker(config.clone()).await;
+        let replacement = pool.get(&config.id).await.unwrap();
+        assert!(replacement.reserve_slots(1).await);
+        assert!(!retired.reserve_slots(1).await);
+        replacement.release_slots(1).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn offline_worker_day_long_outage_has_one_bounded_probe_per_interval() {
+        let worker = Arc::new(WorkerState::new(recovered_worker_config("offline", 4)));
+        let config = CircuitBreakerConfig::default();
+        let heartbeat = Duration::from_secs(30);
+        let mut attempts = 0;
+        for failure in 1..=config.failure_threshold {
+            let permit = worker
+                .health_probe_permit(heartbeat, &config)
+                .await
+                .unwrap();
+            worker
+                .record_transport_result(false, heartbeat, &config)
+                .await;
+            attempts += 1;
+            assert!(!worker.background_network_allowed().await);
+            assert!(!worker.reserve_slots(1).await);
+            assert_eq!(
+                worker.transport_is_down().await,
+                failure == config.failure_threshold
+            );
+            drop(permit);
+            if failure < config.failure_threshold {
+                tokio::time::advance(heartbeat).await;
+            }
+        }
+
+        // Run an entire virtual day, exercising the real deadline/admission
+        // code. No shortened production interval or sleep timing tolerance.
+        for _ in 0..288 {
+            tokio::time::advance(Duration::from_secs(299)).await;
+            assert!(
+                worker
+                    .health_probe_permit(heartbeat, &config)
+                    .await
+                    .is_none()
+            );
+            assert!(worker.background_probe().await.is_none());
+            tokio::time::advance(Duration::from_secs(1)).await;
+            let permit = worker
+                .health_probe_permit(heartbeat, &config)
+                .await
+                .unwrap();
+            assert!(permit.isolated);
+            // Concurrent consumers cannot turn the due recovery into a fanout.
+            let mut contenders = tokio::task::JoinSet::new();
+            for _ in 0..32 {
+                let worker = worker.clone();
+                let config = config.clone();
+                contenders.spawn(async move {
+                    worker
+                        .health_probe_permit(heartbeat, &config)
+                        .await
+                        .is_none()
+                });
+            }
+            while let Some(result) = contenders.join_next().await {
+                assert!(result.unwrap());
+            }
+            worker
+                .record_transport_result(false, heartbeat, &config)
+                .await;
+            attempts += 1;
+            drop(permit);
+        }
+        assert_eq!(attempts, 291, "3 initial failures + 288 five-minute probes");
+        assert_eq!(worker.lifecycle().await.admin, AdminIntent::Active);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn offline_worker_long_circuit_cooldown_controls_recovery_and_first_success() {
+        let worker = WorkerState::new(recovered_worker_config("vpn", 4));
+        let config = CircuitBreakerConfig {
+            failure_threshold: 1,
+            open_cooldown_secs: 900,
+            ..Default::default()
+        };
+        let heartbeat = Duration::from_secs(30);
+        let initial = worker
+            .health_probe_permit(heartbeat, &config)
+            .await
+            .unwrap();
+        worker
+            .record_transport_result(false, heartbeat, &config)
+            .await;
+        drop(initial);
+        tokio::time::advance(Duration::from_secs(899)).await;
+        assert!(
+            worker
+                .health_probe_permit(heartbeat, &config)
+                .await
+                .is_none()
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let recovery = worker
+            .health_probe_permit(heartbeat, &config)
+            .await
+            .unwrap();
+        assert_eq!(
+            worker
+                .record_transport_result(true, heartbeat, &config)
+                .await,
+            (true, false)
+        );
+        assert!(worker.background_network_allowed().await);
+        assert!(worker.reserve_slots(1).await);
+        worker.release_slots(1).await;
+        drop(recovery);
+        tokio::time::advance(heartbeat).await;
+        assert!(
+            worker
+                .health_probe_permit(heartbeat, &config)
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_worker_disable_revokes_inflight_permission_across_immediate_enable() {
+        let worker = Arc::new(WorkerState::new(recovered_worker_config("disabled", 4)));
+        let mut old = worker.background_probe().await.unwrap();
+        worker.disable(Some("operator maintenance".into())).await;
+        worker.enable().await;
+        assert!(
+            old.run(async { panic!("stale probe reached SSH") })
+                .await
+                .is_none()
+        );
+        assert!(
+            old.run(async { 42 }).await.is_none(),
+            "revocation remains permanent after observing it"
+        );
+        assert!(
+            !worker.reserve_slots(1).await,
+            "enable requests a probe; it does not prove reachability"
+        );
+        assert!(
+            worker
+                .health_probe_permit(Duration::from_secs(30), &CircuitBreakerConfig::default())
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_worker_disable_persists_through_inventory_removal_and_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("admin.json");
+        let mut store = AdminDisableStore::try_load(&path).unwrap();
+        store
+            .upsert(rch_common::bypass_record::AdminDisableRecord {
+                worker_id: "sleeping".into(),
+                reason: Some("operator".into()),
+                disabled_unix_ms: 123,
+            })
+            .unwrap();
+        let store = Arc::new(Mutex::new(store));
+        let pool = WorkerPool::new()
+            .with_connection_monitoring()
+            .with_admin_disable_store(store);
+        pool.add_worker(recovered_worker_config("sleeping", 4))
+            .await;
+        let worker = pool.get(&WorkerId::new("sleeping")).await.unwrap();
+        assert!(worker.is_disabled().await);
+        pool.remove_worker(&WorkerId::new("sleeping")).await;
+        pool.add_worker(recovered_worker_config("sleeping", 4))
+            .await;
+        let worker = pool.get(&WorkerId::new("sleeping")).await.unwrap();
+        assert!(worker.is_disabled().await);
+        assert!(worker.background_probe().await.is_none());
+        assert!(
+            worker
+                .health_probe_permit(Duration::from_secs(30), &CircuitBreakerConfig::default())
+                .await
+                .is_none()
+        );
+        let restarted = WorkerPool::new()
+            .with_connection_monitoring()
+            .with_admin_disable_store(Arc::new(Mutex::new(
+                AdminDisableStore::try_load(path).unwrap(),
+            )));
+        restarted
+            .add_worker(recovered_worker_config("sleeping", 4))
+            .await;
+        assert!(
+            restarted
+                .get(&WorkerId::new("sleeping"))
+                .await
+                .unwrap()
+                .is_disabled()
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_worker_failed_durable_enable_never_changes_live_intent() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("admin.json");
+        let mut store = AdminDisableStore::try_load(&path).unwrap();
+        store
+            .upsert(rch_common::bypass_record::AdminDisableRecord {
+                worker_id: "disabled".into(),
+                reason: Some("operator".into()),
+                disabled_unix_ms: 123,
+            })
+            .unwrap();
+        let pool = WorkerPool::new();
+        pool.add_worker(recovered_worker_config("disabled", 4))
+            .await;
+        let worker = pool.get(&WorkerId::new("disabled")).await.unwrap();
+        worker.disable(Some("operator".into())).await;
+        let store = Arc::new(Mutex::new(store));
+        let mut context = crate::test_daemon_context(pool);
+        context.admin_disable_store = Some(store.clone());
+        std::fs::rename(&path, directory.path().join("saved-admin.json")).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        for _ in 0..2 {
+            let response = handle_worker_enable(&context, &WorkerId::new("disabled")).await;
+            assert_eq!(response.status, "error");
+            assert!(worker.is_disabled().await);
+            assert!(worker.background_probe().await.is_none());
+            assert!(store.lock().await.get("disabled").is_some());
+        }
+        assert!(
+            AdminDisableStore::try_load(path).is_err(),
+            "restart must refuse unreadable intent"
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_worker_failed_durable_disable_stops_live_network_but_reports_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let pool = WorkerPool::new();
+        pool.add_worker(recovered_worker_config("disabled", 4))
+            .await;
+        let worker = pool.get(&WorkerId::new("disabled")).await.unwrap();
+        let mut old_probe = worker.background_probe().await.unwrap();
+        let mut context = crate::test_daemon_context(pool);
+        // A directory cannot be atomically replaced with the state document.
+        context.admin_disable_store = Some(Arc::new(Mutex::new(AdminDisableStore::with_path(
+            directory.path(),
+        ))));
+        let response = handle_worker_disable(
+            &context,
+            &WorkerId::new("disabled"),
+            Some("operator".into()),
+            false,
+        )
+        .await;
+        assert_eq!(response.status, "error");
+        assert_eq!(response.new_status.as_deref(), Some("disabled"));
+        assert!(worker.is_disabled().await);
+        assert!(
+            old_probe
+                .run(async { panic!("disabled operation dialed") })
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]

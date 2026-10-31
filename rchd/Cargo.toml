@@ -81,6 +81,7 @@ rich-ui = ["rich_rust"]
 unix-sockets = []
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3.25.0"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 whoami = "2.1.3"

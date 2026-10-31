@@ -19,6 +19,28 @@ use rch_common::e2e::{
     harness::{HarnessResult, TestHarnessBuilder},
 };
 
+/// Drive the actual daemon, API, persistent state, and owned SSH subprocesses
+/// through outage/recovery/disable races. The transport executable supplies a
+/// deterministic worker protocol; the same fixture also supports real local
+/// OpenSSH handshakes for before/after measurements (`--openssh --before`).
+#[cfg(target_os = "linux")]
+#[test]
+fn offline_worker_process_recovery() {
+    let script = project_root().join("scripts/test_offline_worker_recovery.py");
+    let output = std::process::Command::new("python3")
+        .arg(script)
+        .arg("--binary")
+        .arg(env!("CARGO_BIN_EXE_rchd"))
+        .output()
+        .expect("run offline-worker daemon process fixture with python3");
+    assert!(
+        output.status.success(),
+        "offline-worker process fixture failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
 /// Get the absolute path to the project root directory
 fn project_root() -> PathBuf {
     // The test runs from the crate directory, so we need to go up to workspace root

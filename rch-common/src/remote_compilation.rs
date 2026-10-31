@@ -192,7 +192,7 @@ async fn self_test_command_output(command: &mut Command) -> std::io::Result<Outp
         Ok::<_, std::io::Error>(bytes)
     };
     let (stdout, stderr) = tokio::try_join!(read_stdout, read_stderr)?;
-    let status = process.child.wait().await?;
+    let status = process.wait().await?;
     Ok(Output {
         status,
         stdout,

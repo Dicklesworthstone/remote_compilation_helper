@@ -332,6 +332,9 @@ impl StaleTargetReaper {
 
     /// Whether a worker is in a state where SSH-based sweeping is sensible.
     async fn is_worker_sweepable(&self, worker_state: &WorkerState, worker_id: &WorkerId) -> bool {
+        if !worker_state.background_network_allowed().await {
+            return false;
+        }
         let status = worker_state.status().await;
         if status != WorkerStatus::Healthy {
             debug!(worker = %worker_id, ?status, "Skipping non-healthy worker for stale-target sweep");
@@ -366,6 +369,10 @@ impl StaleTargetReaper {
         worker_state: &WorkerState,
         idle_minutes: u64,
     ) -> anyhow::Result<ReapMetrics> {
+        let mut admission = worker_state
+            .background_probe()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("worker background connections are suspended"))?;
         let start = Instant::now();
         let config = worker_state.config.read().await.clone();
         let worker_id = config.id.clone();
@@ -389,8 +396,12 @@ impl StaleTargetReaper {
 
             debug!(worker = %worker_id, idle_minutes, base = %base, "Starting stale-target sweep");
 
-            let result = self.run_remote(&config, &deprioritized(&cmd)).await;
-            let result = result?;
+            let result = admission
+                .run(self.run_remote(&config, &deprioritized(&cmd)))
+                .await
+                .ok_or_else(|| {
+                    anyhow::anyhow!("stale-target sweep cancelled by worker state change")
+                })??;
             ensure_sweep_command_success(&result)?;
 
             let base_metrics = parse_reap_metrics(&result.stdout).unwrap_or_default();
@@ -546,7 +557,18 @@ mod tests {
         // Shared, checked idle predicate (no -type f) is present (13da097f).
         assert!(cmd.contains("if __gc_source_recent_activity \"$d\" 720; then"));
         assert!(cmd.contains("find \"$1\" -mmin -\"$2\" -print -quit"));
-        assert!(!cmd.contains("-type f"));
+        let idle_predicate = cmd
+            .split_once("__gc_source_recent_activity() {")
+            .unwrap()
+            .1
+            .split_once("\n};")
+            .unwrap()
+            .0;
+        assert!(!idle_predicate.contains("-type f"));
+        // Claim-receipt housekeeping selects files independently of the
+        // directory-only target discovery asserted above. It must not narrow
+        // the source-activity predicate to files and miss directory writes.
+        assert!(cmd.contains("find \"$__gc_tdir\" -maxdepth 1 -type f -name '*.claim'"));
         // Never a bare `target` glob.
         assert!(!cmd.contains("/target "));
         // Metrics counters survive the loop: the `while read` is fed from a temp

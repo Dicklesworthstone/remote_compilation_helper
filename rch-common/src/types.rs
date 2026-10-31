@@ -2153,7 +2153,10 @@ impl Default for SelfTestConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CircuitBreakerConfig {
     /// Consecutive failures to open circuit.
-    #[serde(default = "default_circuit_failure_threshold")]
+    #[serde(
+        default = "default_circuit_failure_threshold",
+        alias = "down_after_failures"
+    )]
     pub failure_threshold: u32,
     /// Consecutive successes to close circuit.
     #[serde(default = "default_circuit_success_threshold")]
@@ -2191,6 +2194,11 @@ pub struct CircuitBreakerConfig {
     /// disable the backoff.
     #[serde(default = "default_circuit_open_cooldown_max_secs")]
     pub open_cooldown_max_secs: u64,
+    /// Minimum interval between single SSH recovery attempts for an offline
+    /// worker. Health checks own these attempts; other background services stay
+    /// quiet. A longer `open_cooldown_secs` also applies to these probes.
+    #[serde(default = "default_recovery_probe_interval_secs")]
+    pub recovery_probe_interval_secs: u64,
 }
 
 impl Default for CircuitBreakerConfig {
@@ -2204,11 +2212,21 @@ impl Default for CircuitBreakerConfig {
             half_open_max_probes: default_circuit_half_open_max_probes(),
             command_failure_threshold: default_circuit_command_failure_threshold(),
             open_cooldown_max_secs: default_circuit_open_cooldown_max_secs(),
+            recovery_probe_interval_secs: default_recovery_probe_interval_secs(),
         }
     }
 }
 
 impl CircuitBreakerConfig {
+    /// A zero setting must not create a busy reconnect loop. One second is
+    /// useful for diagnostics/tests; the production default is five minutes.
+    pub fn recovery_probe_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.recovery_probe_interval_secs
+                .max(self.open_cooldown_secs)
+                .max(1),
+        )
+    }
     /// Effective cooldown (ms) for the given reopen streak, with exponential
     /// backoff capped at `open_cooldown_max_secs`. `reopen_streak` counts
     /// Open transitions since the circuit last closed (1 = first open).
@@ -3554,6 +3572,10 @@ pub fn validate_remote_base(path: &str) -> Result<String, String> {
     Ok(normalized)
 }
 
+fn default_recovery_probe_interval_secs() -> u64 {
+    300
+}
+
 fn default_circuit_failure_threshold() -> u32 {
     3
 }
@@ -4498,11 +4520,13 @@ retry_max = 2
             half_open_max_probes: 2,
             command_failure_threshold: 4,
             open_cooldown_max_secs: 900,
+            recovery_probe_interval_secs: 600,
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: CircuitBreakerConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.command_failure_threshold, 4);
         assert_eq!(parsed.open_cooldown_max_secs, 900);
+        assert_eq!(parsed.recovery_probe_interval_secs, 600);
         assert_eq!(parsed.failure_threshold, 5);
         assert_eq!(parsed.success_threshold, 3);
         assert_eq!(parsed.error_rate_threshold, 0.75);

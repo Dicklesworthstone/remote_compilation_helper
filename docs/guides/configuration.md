@@ -89,12 +89,22 @@ Sections and fields:
   shows the resolved binary and flavour.
 
 ### `[circuit]`
-- `failure_threshold` (u32, default `3`) — Consecutive failures to open.
+
+- `failure_threshold` (u32, default `3`; alias `down_after_failures`) — Consecutive failures to open; consecutive connection failures also mark the worker temporarily offline.
 - `success_threshold` (u32, default `2`) — Consecutive successes to close.
 - `error_rate_threshold` (float, default `0.5`) — Error rate to open in window.
 - `window_secs` (u64, default `60`) — Rolling error window size.
 - `open_cooldown_secs` (u64, default `30`) — Cooldown before half-open.
 - `half_open_max_probes` (u32, default `1`) — Concurrent probes allowed.
+- `command_failure_threshold` (u32, default `2`) — Consecutive remote command failures to open, tracked separately from connection failures.
+- `open_cooldown_max_secs` (u64, default `480`) — Maximum exponential circuit cooldown after repeated reopens, never less than `open_cooldown_secs`.
+- `recovery_probe_interval_secs` (u64, default `300`) — Minimum interval between single bounded SSH attempts while offline. A larger `open_cooldown_secs` also applies. Other background polling waits for recovery; the first successful recovery probe restores transport availability.
+
+These settings support `rch config set`, `get`, `reset`, `show --sources`, and `diff`.
+The failure threshold and recovery probe interval must be positive. Restart
+`rchd` after changing daemon circuit settings. `rch workers disable <id>`
+suppresses connections until an explicit enable; the administrative state is
+durable across daemon restarts.
 
 Example:
 
@@ -122,6 +132,9 @@ error_rate_threshold = 0.5
 window_secs = 60
 open_cooldown_secs = 30
 half_open_max_probes = 1
+command_failure_threshold = 2
+open_cooldown_max_secs = 480
+recovery_probe_interval_secs = 300
 ```
 
 ### `[path_topology]`

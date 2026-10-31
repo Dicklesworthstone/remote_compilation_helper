@@ -346,6 +346,9 @@ pub struct ConfigCircuitSection {
     pub window_secs: u64,
     pub open_cooldown_secs: u64,
     pub half_open_max_probes: u32,
+    pub command_failure_threshold: u32,
+    pub open_cooldown_max_secs: u64,
+    pub recovery_probe_interval_secs: u64,
 }
 
 /// Output configuration section.

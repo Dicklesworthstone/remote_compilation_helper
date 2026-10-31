@@ -25,6 +25,7 @@ use tracing::{info, warn};
 pub const DEFAULT_RUN_CAPACITY: usize = 100;
 pub const DEFAULT_RESULT_CAPACITY: usize = 500;
 const DEFAULT_SELF_TEST_TIMEOUT_SECS: u64 = 300;
+const SELF_TEST_SUSPENDED: &str = "Self-test suspended by worker state change";
 
 /// Type of self-test run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -376,7 +377,21 @@ impl SelfTestService {
         let run_id = self.history.next_id();
         let started_at = Utc::now();
 
-        let workers = self.resolve_workers(options.worker_ids.clone()).await?;
+        let candidates = self.resolve_workers(options.worker_ids.clone()).await?;
+        let mut workers = Vec::with_capacity(candidates.len());
+        for config in candidates {
+            // Explicit entries in a scheduled worker list do not override an
+            // operator disable or the health monitor's transport backoff.
+            if options.run_type == SelfTestRunType::Scheduled {
+                let Some(worker) = self.pool.get(&config.id).await else {
+                    continue;
+                };
+                if !worker.background_network_allowed().await {
+                    continue;
+                }
+            }
+            workers.push(config);
+        }
         // Each test writes a unique marker into the project's main.rs, builds
         // it locally and restores the file. Concurrent tests on ONE tree
         // overwrite and restore each other's marker and queue on one build
@@ -482,16 +497,19 @@ impl SelfTestService {
         } else {
             // "All" means every worker that takes builds. One an operator
             // disabled or is draining is out of rotation on purpose; testing
-            // it only reports a timeout. Name it explicitly to test it anyway.
+            // it only reports a timeout. Named requests get an explicit
+            // suspension result at execution if connections are disabled.
             // The canary cannot run on Windows (see `canary_unsupported`), so
             // those workers are left out rather than counted as failures.
             for worker in workers {
-                if matches!(
-                    worker.status().await,
-                    rch_common::WorkerStatus::Disabled
-                        | rch_common::WorkerStatus::Draining
-                        | rch_common::WorkerStatus::Drained
-                ) {
+                if !worker.background_network_allowed().await
+                    || matches!(
+                        worker.status().await,
+                        rch_common::WorkerStatus::Disabled
+                            | rch_common::WorkerStatus::Draining
+                            | rch_common::WorkerStatus::Drained
+                    )
+                {
                     continue;
                 }
                 let config = worker.config.read().await;
@@ -511,6 +529,12 @@ impl SelfTestService {
         }
 
         for result in results.iter().filter(|r| !r.passed) {
+            // Cancelling maintenance after a state change is not evidence of
+            // worker failure. In particular, a temporary transport outage must
+            // not become a permanent administrative disable through this path.
+            if result.error.as_deref() == Some(SELF_TEST_SUSPENDED) {
+                continue;
+            }
             match self.config.on_failure {
                 SelfTestFailureAction::Alert => {
                     warn!(
@@ -594,7 +618,7 @@ async fn run_single_worker_test(
     project_path: &Path,
     options: &SelfTestRunOptions,
     config: &SelfTestConfig,
-    _pool: &WorkerPool, // Reserved for future use (e.g., status updates)
+    pool: &WorkerPool,
 ) -> SelfTestResultRecord {
     let worker_id = worker.id.to_string();
     let timeout_total = options.timeout;
@@ -610,6 +634,19 @@ async fn run_single_worker_test(
             remote_time_ms: None,
             error: Some(reason),
         };
+    }
+
+    let Some(state) = pool.get(&worker.id).await else {
+        return failed_worker_result(run_id, &worker_id, &anyhow::anyhow!(SELF_TEST_SUSPENDED));
+    };
+    let Some(mut admission) = state.background_probe().await else {
+        return failed_worker_result(run_id, &worker_id, &anyhow::anyhow!(SELF_TEST_SUSPENDED));
+    };
+    let current = state.endpoint_snapshot().await;
+    if crate::workers::WorkerEndpointIdentity::from_config(&current.config)
+        != crate::workers::WorkerEndpointIdentity::from_config(worker)
+    {
+        return failed_worker_result(run_id, &worker_id, &anyhow::anyhow!(SELF_TEST_SUSPENDED));
     }
 
     let retry_loop = async {
@@ -669,7 +706,13 @@ async fn run_single_worker_test(
         }
     };
 
-    match tokio::time::timeout(timeout_total, retry_loop).await {
+    let Some(outcome) = admission
+        .run(tokio::time::timeout(timeout_total, retry_loop))
+        .await
+    else {
+        return failed_worker_result(run_id, &worker_id, &anyhow::anyhow!(SELF_TEST_SUSPENDED));
+    };
+    match outcome {
         Ok(record) => record,
         Err(_elapsed) => SelfTestResultRecord {
             run_id,
@@ -911,6 +954,70 @@ mod tests {
             ids(service.resolve_workers(named).await.unwrap()),
             ["disabled", "up"]
         );
+    }
+
+    #[tokio::test]
+    async fn named_self_tests_cannot_connect_to_suspended_workers_or_disable_transient_failures() {
+        for operator_disabled in [false, true] {
+            let pool = WorkerPool::new();
+            let config = WorkerConfig {
+                id: WorkerId::new("suspended"),
+                host: "suspended.invalid".to_string(),
+                user: "u".to_string(),
+                identity_file: "/dev/null".to_string(),
+                total_slots: 2,
+                priority: 100,
+                tags: vec![],
+                tools: Vec::new(),
+            };
+            pool.add_worker(config.clone()).await;
+            let worker = pool.get(&config.id).await.unwrap();
+            if operator_disabled {
+                worker.disable(Some("operator maintenance".into())).await;
+            } else {
+                worker
+                    .record_transport_result(
+                        false,
+                        Duration::from_secs(30),
+                        &rch_common::CircuitBreakerConfig::default(),
+                    )
+                    .await;
+            }
+            let self_test = SelfTestConfig {
+                on_failure: SelfTestFailureAction::DisableWorker,
+                ..Default::default()
+            };
+            let options = SelfTestRunOptions {
+                run_type: SelfTestRunType::Manual,
+                worker_ids: Some(vec![config.id.clone()]),
+                project_path: None,
+                timeout: Duration::from_secs(600),
+                release_mode: true,
+                retry_count_override: None,
+            };
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                run_single_worker_test(
+                    1,
+                    &config,
+                    Path::new("/nonexistent/self-test-project"),
+                    &options,
+                    &self_test,
+                    &pool,
+                ),
+            )
+            .await
+            .expect("a suspended worker is refused before local or remote work");
+            assert_eq!(result.error.as_deref(), Some(SELF_TEST_SUSPENDED));
+            let service =
+                SelfTestService::new(pool, self_test, Arc::new(SelfTestHistory::new(4, 4)));
+            service.apply_failure_actions(&[result]).await;
+            assert_eq!(worker.is_disabled().await, operator_disabled);
+            assert_eq!(
+                worker.disabled_reason().await,
+                operator_disabled.then(|| "operator maintenance".to_string())
+            );
+        }
     }
 
     #[tokio::test]

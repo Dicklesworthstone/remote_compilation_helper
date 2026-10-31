@@ -30,15 +30,12 @@ pub struct DaemonConfig {
 
     /// Health check interval in seconds.
     ///
-    /// Not read: health probing runs on `HealthConfig`'s own schedule, so
-    /// setting this in daemon.toml changes nothing.
+    /// Normal cadence. Offline workers use `[circuit].recovery_probe_interval_secs`.
     #[serde(default = "default_health_interval")]
     pub health_check_interval_secs: u64,
 
-    /// Worker timeout before marking as unreachable.
-    ///
-    /// Not read: reachability comes from the circuit breaker and SSH
-    /// timeouts in config.toml, so setting this changes nothing.
+    /// Total wall-clock budget for one worker health/recovery probe, including
+    /// SSH setup and its command. Consecutive failures govern down-marking.
     #[serde(default = "default_worker_timeout")]
     pub worker_timeout_secs: u64,
 
