@@ -7603,7 +7603,11 @@ mod tests {
         let _guard = test_guard!();
         for (selection, expected_overlay, expected_dependencies) in [
             (vec!["--no-overlay"], None, Vec::<String>::new()),
-            (vec!["--overlay-path", "src/lib.rs"], Some("src/lib.rs"), vec![]),
+            (
+                vec!["--overlay-path", "src/lib.rs"],
+                Some("src/lib.rs"),
+                vec![],
+            ),
             (
                 vec!["--no-overlay", "--dependency-base", "../dep=HEAD"],
                 None,
@@ -7629,7 +7633,10 @@ mod tests {
                     assert_eq!(no_overlay, expected_overlay.is_none());
                     assert_eq!(
                         overlay_path,
-                        expected_overlay.map(PathBuf::from).into_iter().collect::<Vec<_>>()
+                        expected_overlay
+                            .map(PathBuf::from)
+                            .into_iter()
+                            .collect::<Vec<_>>()
                     );
                     assert_eq!(dependency_base, expected_dependencies);
                     assert_eq!(command, ["cargo", "check"]);

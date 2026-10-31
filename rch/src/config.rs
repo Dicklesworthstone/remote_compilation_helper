@@ -957,7 +957,8 @@ fn load_partial_config(path: &Path) -> Result<PartialRchConfig> {
         std::fs::read_to_string(path).with_context(|| format!("Failed to read {:?}", path))?;
     let mut value: toml::Value =
         toml::from_str(&content).with_context(|| format!("Failed to parse {:?}", path))?;
-    canonicalize_config_aliases(&mut value);
+    canonicalize_config_aliases(&mut value)
+        .with_context(|| format!("Invalid configuration aliases in {:?}", path))?;
     let parsed: PartialRchConfig = value
         .try_into()
         .with_context(|| format!("Failed to decode partial config for {:?}", path))?;
@@ -969,7 +970,8 @@ fn load_config_overlay(base: RchConfig, path: &Path) -> Result<RchConfig> {
         std::fs::read_to_string(path).with_context(|| format!("Failed to read {:?}", path))?;
     let mut overlay: toml::Value =
         toml::from_str(&content).with_context(|| format!("Failed to parse {:?}", path))?;
-    canonicalize_config_aliases(&mut overlay);
+    canonicalize_config_aliases(&mut overlay)
+        .with_context(|| format!("Invalid configuration aliases in {:?}", path))?;
     let mut merged =
         toml::Value::try_from(base).context("Failed to encode base RCH config as TOML")?;
     merge_toml_overlay(&mut merged, overlay);
@@ -978,12 +980,25 @@ fn load_config_overlay(base: RchConfig, path: &Path) -> Result<RchConfig> {
         .with_context(|| format!("Failed to decode merged config for {:?}", path))
 }
 
-fn canonicalize_config_aliases(value: &mut toml::Value) {
+fn canonicalize_config_aliases(value: &mut toml::Value) -> Result<()> {
     let toml::Value::Table(root) = value else {
-        return;
+        return Ok(());
     };
+    if let Some(toml::Value::Table(circuit)) = root.get_mut("circuit") {
+        // The base/default layer already contains failure_threshold. Rename
+        // the alias before merging so it overrides that field instead of
+        // making Serde see two names for it. Two names in this same raw layer
+        // remain an error, including when their values happen to be equal.
+        anyhow::ensure!(
+            !(circuit.contains_key("failure_threshold")
+                && circuit.contains_key("down_after_failures")),
+            "duplicate field `circuit.failure_threshold`: \
+             `failure_threshold` and its alias `down_after_failures` are both set"
+        );
+        canonicalize_table_key(circuit, "down_after_failures", "failure_threshold");
+    }
     let Some(toml::Value::Table(self_healing)) = root.get_mut("self_healing") else {
-        return;
+        return Ok(());
     };
 
     canonicalize_table_key(
@@ -1001,6 +1016,7 @@ fn canonicalize_config_aliases(value: &mut toml::Value) {
         "auto_start_timeout",
         "auto_start_timeout_secs",
     );
+    Ok(())
 }
 
 fn canonicalize_table_key(table: &mut toml::Table, alias: &str, canonical: &str) {
@@ -4095,6 +4111,128 @@ min_local_time_ms = 2000
             layered.sources.get("circuit.recovery_probe_interval_secs"),
             Some(&ConfigValueSource::ProjectConfig(project_path))
         );
+    }
+
+    #[test]
+    fn offline_worker_failure_alias_precedence_and_cache_roundtrip() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("user.toml");
+        let project_path = dir.path().join("project.toml");
+        let no_env = HashMap::new();
+        for (user_key, project_key) in [
+            ("down_after_failures", "failure_threshold"),
+            ("failure_threshold", "down_after_failures"),
+        ] {
+            std::fs::write(
+                &user_path,
+                format!("[circuit]\n{user_key} = 9\nopen_cooldown_secs = 900\n"),
+            )
+            .unwrap();
+            let project_threshold = RchConfig::default().circuit.failure_threshold;
+            std::fs::write(
+                &project_path,
+                format!("[circuit]\n{project_key} = {project_threshold}\n"),
+            )
+            .unwrap();
+            let user = load_config_uncached_from_paths(Some(&user_path), None).unwrap();
+            assert_eq!(user.circuit.failure_threshold, 9);
+            assert_eq!(
+                load_partial_config(&user_path)
+                    .unwrap()
+                    .circuit
+                    .failure_threshold,
+                Some(9)
+            );
+            let uncached =
+                load_config_uncached_from_paths(Some(&user_path), Some(&project_path)).unwrap();
+            let tracked = load_config_with_sources_from_paths(
+                Some(&user_path),
+                Some(&project_path),
+                Some(&no_env),
+            )
+            .unwrap();
+            assert_eq!(uncached.circuit.failure_threshold, project_threshold);
+            assert_eq!(tracked.config.circuit.failure_threshold, project_threshold);
+            assert_eq!(tracked.config.circuit.open_cooldown_secs, 900);
+            assert_eq!(
+                tracked.sources.get("circuit.failure_threshold"),
+                Some(&ConfigValueSource::ProjectConfig(project_path.clone()))
+            );
+            assert_eq!(
+                tracked.sources.get("circuit.open_cooldown_secs"),
+                Some(&ConfigValueSource::UserConfig(user_path.clone()))
+            );
+            assert!(!tracked.sources.contains_key("circuit.down_after_failures"));
+
+            // The real cache payload stores this merged config, then the hit
+            // path calls into_config. Unit tests intentionally cannot access
+            // the operator's process-global cache directory.
+            let payload = CachedConfig {
+                schema_version: CACHE_SCHEMA_VERSION,
+                source_fingerprints: vec![
+                    source_fingerprint(user_path.clone()),
+                    source_fingerprint(project_path.clone()),
+                ],
+                socket_path_from_default: true,
+                config: uncached,
+            };
+            let bytes = serde_json::to_vec(&payload).unwrap();
+            let cached: CachedConfig = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(cached.source_fingerprints, payload.source_fingerprints);
+            let restored = cached.into_config();
+            assert_eq!(restored.circuit.failure_threshold, project_threshold);
+            assert_eq!(restored.circuit.open_cooldown_secs, 900);
+            let canonical: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(
+                canonical["config"]["circuit"]
+                    .get("down_after_failures")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn offline_worker_failure_alias_conflicts_are_rejected_per_layer() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("user.toml");
+        let project_path = dir.path().join("project.toml");
+        let no_env = HashMap::new();
+        for fields in [
+            "failure_threshold = 7\ndown_after_failures = 8\n",
+            "down_after_failures = 8\nfailure_threshold = 7\n",
+            "failure_threshold = 7\ndown_after_failures = 7\n",
+        ] {
+            for conflict_in_project in [false, true] {
+                let (conflicting, valid) = if conflict_in_project {
+                    (&project_path, &user_path)
+                } else {
+                    (&user_path, &project_path)
+                };
+                std::fs::write(conflicting, format!("[circuit]\n{fields}")).unwrap();
+                std::fs::write(valid, "[circuit]\nfailure_threshold = 3\n").unwrap();
+                let error = load_config_uncached_from_paths(Some(&user_path), Some(&project_path))
+                    .unwrap_err();
+                let message = format!("{error:#}");
+                assert!(
+                    message.contains("duplicate field `circuit.failure_threshold`"),
+                    "{message}"
+                );
+                assert!(message.contains("down_after_failures"), "{message}");
+                assert!(message.contains(conflicting.to_str().unwrap()), "{message}");
+                assert!(load_partial_config(conflicting).is_err());
+                assert!(
+                    load_config_with_sources_from_paths(
+                        Some(&user_path),
+                        Some(&project_path),
+                        Some(&no_env),
+                    )
+                    .is_err()
+                );
+                assert!(!validate_rch_config_file(conflicting).errors.is_empty());
+            }
+        }
     }
 
     #[test]
