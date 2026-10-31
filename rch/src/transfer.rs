@@ -6331,6 +6331,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
     ) -> Command {
         let identity_file = shellexpand::tilde(&worker.identity_file);
         let mut cmd = Command::new("ssh");
+        crate::commands::jobs::configure_automatic_recovery_ssh(&mut cmd);
         cmd.arg("-o").arg("BatchMode=yes");
         cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
         cmd.arg("-o").arg(format!(
@@ -7752,8 +7753,14 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
     }
 
     fn build_rsync_ssh_command(&self, identity_file: &str) -> String {
+        let automatic_options = crate::commands::jobs::automatic_recovery_ssh_options();
+        let automatic_prefix = if automatic_options.is_empty() {
+            String::new()
+        } else {
+            format!("{automatic_options} ")
+        };
         let mut command = format!(
-            "ssh {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes",
+            "ssh {automatic_prefix}{} -o StrictHostKeyChecking=accept-new -o BatchMode=yes",
             rch_common::ssh_utils::identity_shell_args(identity_file)
         );
 
@@ -7766,7 +7773,8 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                 }
             }
 
-            if self.ssh_options.control_master
+            if automatic_options.is_empty()
+                && self.ssh_options.control_master
                 && let Some(idle) = self.ssh_options.control_persist_idle
             {
                 let control_dir = self.rsync_control_dir();
@@ -15358,6 +15366,64 @@ Number of files transferred: 42
             .expect("destination");
         assert!(level < destination, "{args:?}");
         assert!(args.contains(&"StrictHostKeyChecking=accept-new".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn offline_worker_automatic_recovery_contains_direct_and_rsync_ssh() {
+        let _guard = test_guard!();
+        let worker = flavour_test_worker();
+        let mut pipeline = flavour_test_pipeline(RsyncFlavor::Unknown, 0);
+        let manual = pipeline.build_rsync_ssh_command(&worker.identity_file);
+        assert!(!manual.contains("ConnectionAttempts=1"));
+        pipeline.ssh_options.control_master = true;
+        pipeline.ssh_options.control_persist_idle = Some(Duration::from_secs(600));
+        for can_disable_background in [false, true] {
+            crate::commands::jobs::run_automatic_recovery(
+                can_disable_background,
+                std::future::pending::<()>(),
+                async {
+                    let args = command_args(&pipeline.worker_ssh_command(&worker, &["sh", "-s"]));
+                    let destination = args
+                        .iter()
+                        .position(|arg| arg == "ubuntu@worker.example")
+                        .unwrap();
+                    let nested = pipeline.build_rsync_ssh_command(&worker.identity_file);
+                    for expected in [
+                        "ConnectionAttempts=1",
+                        "ControlMaster=no",
+                        "ControlPersist=no",
+                        "ControlPath=none",
+                    ] {
+                        let position = args.iter().position(|arg| arg == expected).unwrap();
+                        assert!(position < destination, "{args:?}");
+                        assert!(nested.contains(expected), "{nested}");
+                    }
+                    assert_eq!(
+                        args.iter().any(|arg| arg == "ForkAfterAuthentication=no"),
+                        can_disable_background
+                    );
+                    assert_eq!(
+                        nested.contains("ForkAfterAuthentication=no"),
+                        can_disable_background
+                    );
+                    assert!(!nested.contains("ControlMaster=auto"), "{nested}");
+                    assert!(!nested.contains("ControlPersist=600"), "{nested}");
+                },
+            )
+            .await
+            .unwrap();
+        }
+        pipeline.ssh_options.control_master = false;
+        assert_eq!(
+            pipeline.build_rsync_ssh_command(&worker.identity_file),
+            manual
+        );
+        let manual_direct = command_args(&pipeline.worker_ssh_command(&worker, &["sh", "-s"]));
+        assert!(
+            !manual_direct
+                .iter()
+                .any(|arg| arg == "ConnectionAttempts=1")
+        );
     }
 
     #[test]

@@ -1480,7 +1480,12 @@ async fn main() -> Result<()> {
     // Finish dead client leases that still own worker source (bd-nalyr). An
     // isolated test pool must not reconcile the operator's real leases.
     if !isolated_worker_pool(&cli.socket, cli.workers_config.as_deref(), &shared_socket) {
-        let _lease_recovery = lease_recovery::start(context.events.clone(), cli.socket.clone());
+        let _lease_recovery = lease_recovery::start(
+            context.events.clone(),
+            cli.socket.clone(),
+            admin_disable_store.clone(),
+            context.pool.clone(),
+        );
     }
 
     let worker_status_panel = Arc::new(Mutex::new(

@@ -17,16 +17,22 @@
 use crate::api::is_process_alive;
 use crate::api::{lease_blocks_restart, lease_owns_unretired_source};
 use crate::events::EventBus;
+use crate::workers::{BackgroundProbe, OwnedRecoveryAdmission, WorkerPool};
+use rch_common::bypass_record::{AdminDisableStore, AdminNetworkPermit};
 use rch_common::job_identity::{
     DurableJobLease, default_job_lease_directory, source_recovery_resources_retired,
 };
 use rch_common::process_identity::{OwnerPresence, owner_presence};
+use rch_common::ssh::{OwnedProcessGroup, ssh_can_disable_background};
+use rch_common::{WorkerConfig, WorkerId};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::sync::Mutex;
 use tokio::task::{Id, JoinSet};
 use tokio::time::Instant;
 use tracing::{info, warn};
@@ -50,6 +56,33 @@ const RECOVER_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Retry delay after the first failure; doubles per failure up to the cap.
 const BACKOFF_BASE: Duration = Duration::from_secs(10 * 60);
 const BACKOFF_MAX: Duration = Duration::from_secs(6 * 60 * 60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryOutcome {
+    Recovered,
+    /// Administrative disable or a known current-endpoint transport outage.
+    /// Neither establishes lease completion nor counts as a failed recovery.
+    Deferred,
+}
+
+struct RecoveryAdmission {
+    admin: AdminNetworkPermit,
+    network: Option<BackgroundProbe>,
+}
+
+impl RecoveryAdmission {
+    async fn run<F: Future>(&mut self, operation: F) -> Option<F::Output> {
+        self.admin
+            .run(async {
+                match &mut self.network {
+                    Some(network) => network.run(operation).await,
+                    None => Some(operation.await),
+                }
+            })
+            .await
+            .flatten()
+    }
+}
 
 /// A settled, identity-bound delivery result whose source resources are retired.
 /// This selects a reconciliation attempt; the client still reloads under its
@@ -378,7 +411,7 @@ impl Backoff {
 struct RecoveryQueue {
     pending: VecDeque<RecoveryCandidate>,
     running: HashMap<Id, RecoveryCandidate>,
-    tasks: JoinSet<Result<(), String>>,
+    tasks: JoinSet<Result<RecoveryOutcome, String>>,
     backoff: Backoff,
     starts_remaining: usize,
 }
@@ -395,14 +428,35 @@ impl RecoveryQueue {
         self.starts_remaining = MAX_RECOVERIES_PER_CYCLE;
     }
 
+    #[cfg(test)]
     fn start_ready<F, R>(&mut self, now: Instant, mut run: F)
     where
         F: FnMut(RecoveryCandidate) -> R,
         R: Future<Output = Result<(), String>> + Send + 'static,
     {
+        self.start_ready_if(
+            now,
+            |_| true,
+            move |candidate| {
+                let operation = run(candidate);
+                async move { operation.await.map(|()| RecoveryOutcome::Recovered) }
+            },
+        );
+    }
+
+    fn start_ready_if<F, R>(
+        &mut self,
+        now: Instant,
+        allowed: impl Fn(&RecoveryCandidate) -> bool,
+        mut run: F,
+    ) where
+        F: FnMut(RecoveryCandidate) -> R,
+        R: Future<Output = Result<RecoveryOutcome, String>> + Send + 'static,
+    {
         while self.starts_remaining > 0 && self.running.len() < MAX_RECOVERIES_PER_CYCLE {
             let next = self.pending.iter().position(|candidate| {
-                self.backoff.ready(&candidate.wrapper_id, now)
+                allowed(candidate)
+                    && self.backoff.ready(&candidate.wrapper_id, now)
                     && !self.running.values().any(|running| {
                         running.wrapper_id == candidate.wrapper_id
                             || running.worker_id == candidate.worker_id
@@ -419,7 +473,9 @@ impl RecoveryQueue {
         }
     }
 
-    async fn next_completed(&mut self) -> Option<(RecoveryCandidate, Result<(), String>)> {
+    async fn next_completed(
+        &mut self,
+    ) -> Option<(RecoveryCandidate, Result<RecoveryOutcome, String>)> {
         let joined = self.tasks.join_next_with_id().await?;
         let (task_id, outcome) = match joined {
             Ok((id, outcome)) => (id, outcome),
@@ -433,7 +489,7 @@ impl RecoveryQueue {
         if outcome.is_err() {
             self.backoff
                 .record_failure(&candidate.wrapper_id, Instant::now());
-        } else {
+        } else if outcome == Ok(RecoveryOutcome::Recovered) {
             self.backoff.failures.remove(&candidate.wrapper_id);
         }
         Some((candidate, outcome))
@@ -442,7 +498,12 @@ impl RecoveryQueue {
 
 /// Start the recovery loop. `socket` is this daemon's socket; the child
 /// `rch` is pointed at it so it never reconciles against another daemon.
-pub(crate) fn start(events: EventBus, socket: PathBuf) -> tokio::task::JoinHandle<()> {
+pub(crate) fn start(
+    events: EventBus,
+    socket: PathBuf,
+    admin_store: Arc<Mutex<AdminDisableStore>>,
+    pool: WorkerPool,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let rch = match std::env::current_exe() {
             Ok(exe) => exe.with_file_name("rch"),
@@ -461,12 +522,13 @@ pub(crate) fn start(events: EventBus, socket: PathBuf) -> tokio::task::JoinHandl
                     if let Some((candidate, outcome)) = completed {
                         let id = candidate.wrapper_id;
                         match outcome {
-                            Ok(()) => {
+                            Ok(RecoveryOutcome::Recovered) => {
                                 info!(wrapper_id = %id, "Recovered dead client lease");
                                 events.emit("lease_auto_recovered", &serde_json::json!({
                                     "wrapper_id": id,
                                 }));
                             }
+                            Ok(RecoveryOutcome::Deferred) => {}
                             Err(error) => {
                                 let failures = queue.backoff.failures[&id].0;
                                 warn!(wrapper_id = %id, failures, "Dead client lease recovery failed: {error}");
@@ -492,35 +554,134 @@ pub(crate) fn start(events: EventBus, socket: PathBuf) -> tokio::task::JoinHandl
                     }
                 }
             }
-            queue.start_ready(Instant::now(), |candidate| {
-                let rch = rch.clone();
-                let socket = socket.clone();
-                async move { recover(&rch, &socket, &candidate).await }
-            });
+            // Dormant workers consume neither the per-scan budget nor a lane.
+            // Keep them queued, with existing backoff and durable ownership,
+            // so enabling/recovery resumes them on the next normal scan.
+            let eligible = eligible_recoveries(
+                &queue.pending,
+                &admin_store,
+                &pool,
+                &default_job_lease_directory(),
+            )
+            .await;
+            queue.start_ready_if(
+                Instant::now(),
+                |candidate| eligible.contains(&candidate.wrapper_id),
+                |candidate| {
+                    let rch = rch.clone();
+                    let socket = socket.clone();
+                    let admin_store = admin_store.clone();
+                    let pool = pool.clone();
+                    async move { recover(&rch, &socket, &candidate, &admin_store, &pool).await }
+                },
+            );
         }
     })
 }
 
-/// Run `rch jobs recover` for one lease; the error is the tail of its stderr.
-async fn recover(rch: &Path, socket: &Path, candidate: &RecoveryCandidate) -> Result<(), String> {
-    recover_in(
-        rch,
-        socket,
-        &default_job_lease_directory(),
-        &candidate.wrapper_id,
-        Some(candidate),
-    )
-    .await
+async fn eligible_recoveries(
+    candidates: &VecDeque<RecoveryCandidate>,
+    admin_store: &Mutex<AdminDisableStore>,
+    pool: &WorkerPool,
+    lease_dir: &Path,
+) -> HashSet<String> {
+    let mut eligible = HashSet::new();
+    for candidate in candidates {
+        // Invalid journals still run through the ordinary error/backoff path;
+        // only explicit administrative or matching outage evidence defers.
+        if !matches!(
+            recovery_admission(admin_store, pool, lease_dir, candidate).await,
+            Ok(None)
+        ) {
+            eligible.insert(candidate.wrapper_id.clone());
+        }
+    }
+    eligible
 }
 
-async fn recover_in(
+/// Run `rch jobs recover` for one lease; the error is the tail of its stderr.
+async fn recover(
     rch: &Path,
     socket: &Path,
+    candidate: &RecoveryCandidate,
+    admin_store: &Mutex<AdminDisableStore>,
+    pool: &WorkerPool,
+) -> Result<RecoveryOutcome, String> {
+    let directory = default_job_lease_directory();
+    let Some(mut admission) = recovery_admission(admin_store, pool, &directory, candidate).await?
+    else {
+        return Ok(RecoveryOutcome::Deferred);
+    };
+    let result = admission
+        .run(tokio::time::timeout(RECOVER_KILL_AFTER, async {
+            // Probe locally in the daemon's owned process before spawning the
+            // CLI. A hard stop of that CLI cannot orphan a separate -G group.
+            let can_disable_background =
+                ssh_can_disable_background(Path::new("ssh"), Duration::from_secs(10))
+                    .await
+                    .map_err(|error| format!("recovery SSH capability probe failed: {error:#}"))?;
+            recover_in_with_policy(
+                rch,
+                socket,
+                &directory,
+                &candidate.wrapper_id,
+                Some(candidate),
+                Some(can_disable_background),
+            )
+            .await
+        }))
+        .await;
+    match result {
+        None => Ok(RecoveryOutcome::Deferred),
+        Some(Ok(result)) => result.map(|()| RecoveryOutcome::Recovered),
+        Some(Err(_)) => Err("automatic lease recovery exceeded its total deadline".into()),
+    }
+}
+
+async fn recovery_admission(
+    admin_store: &Mutex<AdminDisableStore>,
+    pool: &WorkerPool,
     lease_dir: &Path,
+    candidate: &RecoveryCandidate,
+) -> Result<Option<RecoveryAdmission>, String> {
+    let Some(admin) = admin_store
+        .lock()
+        .await
+        .automatic_network_permit(&candidate.worker_id)
+    else {
+        return Ok(None);
+    };
+    let before = read_lease(lease_dir, &candidate.wrapper_id)?;
+    check_candidate(&before, &candidate.wrapper_id, Some(candidate))?;
+    let network = if let Some(recipe) = &before.recovery {
+        let endpoint: WorkerConfig = serde_json::from_value(recipe["worker"].clone())
+            .map_err(|error| format!("recovery has no valid admitted worker endpoint: {error}"))?;
+        if endpoint.id.as_str() != candidate.worker_id {
+            return Err("recovery worker endpoint contradicts its admitted worker ID".into());
+        }
+        if let Some(worker) = pool.get(&WorkerId::new(&candidate.worker_id)).await {
+            match worker.owned_recovery_admission(&endpoint).await {
+                OwnedRecoveryAdmission::Deferred => return Ok(None),
+                OwnedRecoveryAdmission::Historical => None,
+                OwnedRecoveryAdmission::Current(network) => Some(network),
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if !admin.is_current() {
+        return Ok(None);
+    }
+    Ok(Some(RecoveryAdmission { admin, network }))
+}
+
+fn check_candidate(
+    before: &DurableJobLease,
     wrapper_id: &str,
     candidate: Option<&RecoveryCandidate>,
 ) -> Result<(), String> {
-    let before = read_lease(lease_dir, wrapper_id)?;
     if let Some(candidate) = candidate
         && (candidate.wrapper_id != wrapper_id
             || before.identity.remote_build_id != Some(candidate.build_id)
@@ -528,15 +689,48 @@ async fn recover_in(
     {
         return Err("recovery admission changed after scanning; client was not started".into());
     }
-    let child = tokio::process::Command::new(rch)
+    Ok(())
+}
+
+#[cfg(test)]
+async fn recover_in(
+    rch: &Path,
+    socket: &Path,
+    lease_dir: &Path,
+    wrapper_id: &str,
+    candidate: Option<&RecoveryCandidate>,
+) -> Result<(), String> {
+    recover_in_with_policy(rch, socket, lease_dir, wrapper_id, candidate, None).await
+}
+
+async fn recover_in_with_policy(
+    rch: &Path,
+    socket: &Path,
+    lease_dir: &Path,
+    wrapper_id: &str,
+    candidate: Option<&RecoveryCandidate>,
+    automatic_ssh: Option<bool>,
+) -> Result<(), String> {
+    let before = read_lease(lease_dir, wrapper_id)?;
+    check_candidate(&before, wrapper_id, candidate)?;
+    let mut command = tokio::process::Command::new(rch);
+    command
         .args(["jobs", "recover", wrapper_id, "--timeout-secs"])
         .arg(RECOVER_TIMEOUT_SECS.to_string())
         .env("RCH_SOCKET_PATH", socket)
-        .stdin(Stdio::null())
+        .stdin(if automatic_ssh.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
+        .stderr(Stdio::piped());
+    if let Some(can_disable_background) = automatic_ssh {
+        command
+            .arg("--daemon-managed")
+            .arg(can_disable_background.to_string());
+    }
+    let child = OwnedProcessGroup::spawn(&mut command)
         .map_err(|error| format!("cannot run {}: {error}", rch.display()))?;
     let (status, stderr) = collect_recovery_child(child, RECOVER_KILL_AFTER).await?;
     if status.success() {
@@ -584,13 +778,23 @@ async fn drain_recovery_stderr(
 /// pipe after its parent exits; neither a completed wait nor full diagnostics
 /// alone establishes recovery completion. No reader task is detached.
 async fn collect_recovery_child(
-    mut child: tokio::process::Child,
+    mut child: OwnedProcessGroup,
     budget: Duration,
 ) -> Result<(ExitStatus, Vec<u8>), String> {
-    let mut stderr = child
-        .stderr
-        .take()
+    let stderr = child
+        .take_stderr()
         .ok_or_else(|| "recovery child has no diagnostic pipe".to_owned())?;
+    collect_recovery_child_stream(child, stderr, budget).await
+}
+
+async fn collect_recovery_child_stream(
+    mut child: OwnedProcessGroup,
+    mut stderr: impl AsyncRead + Unpin,
+    budget: Duration,
+) -> Result<(ExitStatus, Vec<u8>), String> {
+    // Child::wait closes its stdin on some platforms. Keep the parent lifetime
+    // pipe independently owned until collection ends or admission is revoked.
+    let _parent_lifetime = child.take_stdin();
     let mut tail = Vec::with_capacity(RECOVER_STDERR_TAIL_BYTES);
     let completed = tokio::time::timeout(budget, async {
         tokio::try_join!(child.wait(), drain_recovery_stderr(&mut stderr, &mut tail))
@@ -604,8 +808,8 @@ async fn collect_recovery_child(
             budget.as_millis()
         ),
     };
-    // kill_on_drop covers cancellation of this entire future. On our own
-    // timeout/error path, explicitly wait for the direct child to be reaped.
+    // The owned group covers cancellation of this entire future, including
+    // SSH and ProxyCommand descendants. On timeout/error also reap its leader.
     // Worker processes are governed by durable source ownership, not by this
     // local child's PID, and no remote completion is inferred from killing it.
     let _ = child.start_kill();
@@ -676,6 +880,368 @@ mod tests {
             build_id: 7,
             worker_id: worker.to_owned(),
             heartbeat_unix_ms: 0,
+        }
+    }
+
+    fn owned_recovery_fixture(
+        directory: &Path,
+        endpoint: &WorkerConfig,
+    ) -> (DurableJobLease, RecoveryCandidate) {
+        let mut owned = lease(
+            1,
+            4242,
+            serde_json::json!({
+                "worker": endpoint,
+                "source_roots": ["/owned/source"],
+                "retired": false,
+            }),
+        );
+        owned.worker_id = Some(endpoint.id.to_string());
+        std::fs::write(
+            directory.join(format!("{}.json", owned.identity.local_wrapper_id)),
+            serde_json::to_vec(&owned).unwrap(),
+        )
+        .unwrap();
+        let candidate = candidate(&owned.identity.local_wrapper_id, endpoint.id.as_str());
+        (owned, candidate)
+    }
+
+    fn recovery_worker(id: &str) -> WorkerConfig {
+        WorkerConfig {
+            id: WorkerId::new(id),
+            host: "historical-owned.invalid".into(),
+            user: "builder".into(),
+            identity_file: "/owned/key".into(),
+            total_slots: 8,
+            ..Default::default()
+        }
+    }
+
+    fn operator_disable(worker_id: &str) -> rch_common::bypass_record::AdminDisableRecord {
+        rch_common::bypass_record::AdminDisableRecord {
+            worker_id: worker_id.to_owned(),
+            reason: Some("intentional maintenance".into()),
+            disabled_unix_ms: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_worker_lease_recovery_keeps_operator_disable_across_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let endpoint = recovery_worker("removed-worker");
+        let (owned, candidate) = owned_recovery_fixture(directory.path(), &endpoint);
+        let store_path = directory.path().join("admin.json");
+        let store = Mutex::new(AdminDisableStore::with_path(&store_path));
+        let pool = WorkerPool::new();
+        // Historical ownership is recoverable even with no current inventory.
+        let mut admitted = recovery_admission(&store, &pool, directory.path(), &candidate)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(admitted.run(async { 7 }).await, Some(7));
+        store
+            .lock()
+            .await
+            .upsert(operator_disable(endpoint.id.as_str()))
+            .unwrap();
+        assert!(
+            admitted
+                .run(async { panic!("revoked recovery was polled") })
+                .await
+                .is_none()
+        );
+        assert!(
+            recovery_admission(&store, &pool, directory.path(), &candidate)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(store);
+
+        let restarted = Mutex::new(AdminDisableStore::try_load(&store_path).unwrap());
+        pool.add_worker(endpoint.clone()).await;
+        assert!(
+            recovery_admission(&restarted, &pool, directory.path(), &candidate)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        pool.remove_worker(&endpoint.id).await;
+        assert!(
+            recovery_admission(&restarted, &pool, directory.path(), &candidate)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        restarted.lock().await.remove(endpoint.id.as_str()).unwrap();
+        assert!(
+            recovery_admission(&restarted, &pool, directory.path(), &candidate)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            read_lease(directory.path(), &candidate.wrapper_id).unwrap(),
+            owned
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn offline_worker_lease_recovery_defers_only_matching_transport_outages() {
+        let directory = tempfile::tempdir().unwrap();
+        let endpoint = recovery_worker("same-id");
+        let (owned, candidate) = owned_recovery_fixture(directory.path(), &endpoint);
+        let store = Mutex::new(AdminDisableStore::with_path(
+            directory.path().join("admin.json"),
+        ));
+        let pool = WorkerPool::new();
+        pool.add_worker(endpoint.clone()).await;
+        let worker = pool.get(&endpoint.id).await.unwrap();
+        worker.restore_slots(2).unwrap();
+        worker
+            .enter_bypass(rch_common::bypass_record::BypassFailureClass::DiskInodePressure)
+            .await;
+        worker.open_circuit().await;
+        assert!(
+            recovery_admission(&store, &pool, directory.path(), &candidate)
+                .await
+                .unwrap()
+                .is_some(),
+            "storage/circuit quarantine must not suppress owned recovery"
+        );
+        let circuit = rch_common::CircuitBreakerConfig {
+            failure_threshold: 1,
+            ..Default::default()
+        };
+        worker
+            .record_transport_result(false, Duration::from_secs(30), &circuit)
+            .await;
+        let mut queue = RecoveryQueue::default();
+        let mut same_worker_leases = vec![candidate.clone()];
+        for _ in 0..20 {
+            same_worker_leases.push(owned_recovery_fixture(directory.path(), &endpoint).1);
+        }
+        queue
+            .backoff
+            .record_failure(&candidate.wrapper_id, Instant::now());
+        let original_backoff = queue.backoff.failures[&candidate.wrapper_id];
+        for _ in 0..12 {
+            queue.refresh(same_worker_leases.clone());
+            let eligible =
+                eligible_recoveries(&queue.pending, &store, &pool, directory.path()).await;
+            assert!(eligible.is_empty());
+            queue.start_ready_if(
+                Instant::now(),
+                |item| eligible.contains(&item.wrapper_id),
+                |_| async {
+                    panic!("a different lease bypassed the worker's slow transport recovery")
+                },
+            );
+            assert!(queue.running.is_empty());
+            assert_eq!(queue.starts_remaining, MAX_RECOVERIES_PER_CYCLE);
+            assert_eq!(
+                queue.backoff.failures[&candidate.wrapper_id],
+                original_backoff
+            );
+            tokio::time::advance(RECOVERY_INTERVAL).await;
+        }
+        let (_, healthy_peer) =
+            owned_recovery_fixture(directory.path(), &recovery_worker("healthy-peer"));
+        same_worker_leases.push(healthy_peer.clone());
+        queue.refresh(same_worker_leases);
+        let eligible = eligible_recoveries(&queue.pending, &store, &pool, directory.path()).await;
+        assert_eq!(eligible, HashSet::from([healthy_peer.wrapper_id.clone()]));
+        queue.start_ready_if(
+            Instant::now(),
+            |item| eligible.contains(&item.wrapper_id),
+            |_| async { Ok(RecoveryOutcome::Recovered) },
+        );
+        assert_eq!(queue.running.len(), 1);
+        assert_eq!(
+            queue.next_completed().await.unwrap().0.wrapper_id,
+            healthy_peer.wrapper_id
+        );
+        assert_eq!(
+            queue.backoff.failures[&candidate.wrapper_id],
+            original_backoff
+        );
+        assert_eq!(worker.used_slots(), 2);
+        worker
+            .record_transport_result(true, Duration::from_secs(30), &circuit)
+            .await;
+        assert!(
+            recovery_admission(&store, &pool, directory.path(), &candidate)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // Reusing an ID at another host cannot redirect or suppress the old
+        // endpoint named by the durable recipe, even when today's host is down.
+        pool.remove_worker(&endpoint.id).await;
+        pool.add_worker(WorkerConfig {
+            host: "new-unrelated.invalid".into(),
+            ..endpoint.clone()
+        })
+        .await;
+        let replacement = pool.get(&endpoint.id).await.unwrap();
+        replacement.restore_slots(3).unwrap();
+        replacement
+            .record_transport_result(false, Duration::from_secs(30), &circuit)
+            .await;
+        let historical = recovery_admission(&store, &pool, directory.path(), &candidate)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(historical.network.is_none());
+        assert_eq!(worker.used_slots(), 2);
+        assert_eq!(replacement.used_slots(), 3);
+        assert_eq!(
+            read_lease(directory.path(), &candidate.wrapper_id).unwrap(),
+            owned
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn offline_worker_lease_deferral_preserves_existing_retry_backoff() {
+        let mut queue = RecoveryQueue::default();
+        let candidate = candidate("already-failed", "worker");
+        queue
+            .backoff
+            .record_failure(&candidate.wrapper_id, Instant::now());
+        let original = queue.backoff.failures[&candidate.wrapper_id];
+        tokio::time::advance(BACKOFF_BASE).await;
+        queue.refresh(vec![candidate.clone()]);
+        queue.start_ready_if(
+            Instant::now(),
+            |_| true,
+            |_| async { Ok(RecoveryOutcome::Deferred) },
+        );
+        let (finished, outcome) = queue.next_completed().await.unwrap();
+        assert_eq!(finished.wrapper_id, candidate.wrapper_id);
+        assert_eq!(outcome, Ok(RecoveryOutcome::Deferred));
+        assert_eq!(queue.backoff.failures[&candidate.wrapper_id], original);
+        assert!(queue.running.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn offline_worker_lease_recovery_revocation_stops_owned_cli_and_proxy() {
+        struct AbortOnDrop(tokio::task::AbortHandle);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        for cause in ["disable", "disable-enable", "transport-down"] {
+            let directory = tempfile::tempdir().unwrap();
+            let endpoint = recovery_worker("owned-worker");
+            let (owned, candidate) = owned_recovery_fixture(directory.path(), &endpoint);
+            let store = Arc::new(Mutex::new(AdminDisableStore::with_path(
+                directory.path().join("admin.json"),
+            )));
+            let pool = WorkerPool::new();
+            pool.add_worker(endpoint.clone()).await;
+            let worker = pool.get(&endpoint.id).await.unwrap();
+            worker.restore_slots(2).unwrap();
+            let mut admitted = recovery_admission(&store, &pool, directory.path(), &candidate)
+                .await
+                .unwrap()
+                .unwrap();
+            let child = fake_rch(
+                directory.path(),
+                "sleep 30 &\nprintf '%s %s\\n' $$ $! >\"$(dirname \"$0\")/pids\"\nwait\n",
+            );
+            let pid_path = directory.path().join("pids");
+            let lease_dir = directory.path().to_owned();
+            let socket = directory.path().join("daemon.sock");
+            let id = candidate.wrapper_id.clone();
+            let task = tokio::spawn(async move {
+                admitted
+                    .run(recover_in_with_policy(
+                        &child,
+                        &socket,
+                        &lease_dir,
+                        &id,
+                        Some(&candidate),
+                        Some(true),
+                    ))
+                    .await
+            });
+            let _abort = AbortOnDrop(task.abort_handle());
+            let identities: Vec<u32> = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Ok(pids) = std::fs::read_to_string(&pid_path) {
+                        let pids: Vec<u32> = pids
+                            .split_whitespace()
+                            .filter_map(|pid| pid.parse().ok())
+                            .collect();
+                        if pids.len() == 2 {
+                            break pids;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("recovery fixture started both CLI and proxy");
+            let mut unrelated = tokio::process::Command::new("sleep")
+                .arg("30")
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            if cause == "transport-down" {
+                let circuit = rch_common::CircuitBreakerConfig {
+                    failure_threshold: 1,
+                    ..Default::default()
+                };
+                worker
+                    .record_transport_result(false, Duration::from_secs(30), &circuit)
+                    .await;
+            } else {
+                let mut store = store.lock().await;
+                store
+                    .upsert(operator_disable(endpoint.id.as_str()))
+                    .unwrap();
+                if cause == "disable-enable" {
+                    store.remove(endpoint.id.as_str()).unwrap();
+                }
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_secs(5), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_none(),
+                "{cause}"
+            );
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let leader_reaped = !Path::new(&format!("/proc/{}", identities[0])).exists();
+                    let proxy_stopped =
+                        match std::fs::read_to_string(format!("/proc/{}/stat", identities[1])) {
+                            Ok(stat) => matches!(
+                                stat.rsplit_once(") ")
+                                    .and_then(|(_, fields)| fields.chars().next()),
+                                Some('Z' | 'X')
+                            ),
+                            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+                        };
+                    if leader_reaped && proxy_stopped {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("revocation must reap the CLI and stop its ProxyCommand");
+            assert!(unrelated.try_wait().unwrap().is_none());
+            unrelated.kill().await.unwrap();
+            assert_eq!(worker.used_slots(), 2, "{cause}");
+            assert_eq!(
+                read_lease(directory.path(), &owned.identity.local_wrapper_id).unwrap(),
+                owned
+            );
         }
     }
 
@@ -832,24 +1398,44 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn fixture_child(script: &str) -> tokio::process::Child {
-        tokio::process::Command::new("/bin/sh")
-            .args(["-c", script])
+    async fn fixture_child(script: &str) -> (OwnedProcessGroup, u32) {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_path = directory.path().join("pid");
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                &format!("printf '%s\\n' $$ >\"$1\"; {script}"),
+                "rch-recovery-test",
+            ])
+            .arg(&pid_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap()
+            .stderr(Stdio::piped());
+        let child = OwnedProcessGroup::spawn(&mut command).unwrap();
+        let pid = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(bytes) = std::fs::read_to_string(&pid_path)
+                    && let Ok(pid) = bytes.trim().parse()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("fixture wrote its owned process identity");
+        (child, pid)
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn recovery_child_streams_large_diagnostics_and_preserves_nonzero_exit() {
-        let child = fixture_child(
+        let (child, _) = fixture_child(
             "awk 'BEGIN { for (i=0; i<32768; i++) print \"0123456789abcdef\" }' >&2; \
              printf 'final recovery failure\\n' >&2; exit 7",
-        );
+        )
+        .await;
         let (status, tail) = collect_recovery_child(child, Duration::from_secs(10))
             .await
             .unwrap();
@@ -861,8 +1447,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn recovery_timeout_reaps_the_direct_child_before_returning() {
-        let child = fixture_child("exec sleep 30");
-        let pid = child.id().unwrap();
+        let (child, pid) = fixture_child("exec sleep 30").await;
         let error = collect_recovery_child(child, Duration::from_millis(100))
             .await
             .unwrap_err();
@@ -875,22 +1460,25 @@ mod tests {
     async fn recovery_deadline_also_bounds_a_pipe_retained_after_child_exit() {
         // Keep the pipe open in a separately owned child so cleanup is explicit,
         // while presenting the same EOF condition as an inherited descriptor.
-        let mut holder = fixture_child("exec sleep 30");
-        let mut child = fixture_child("exit 0");
+        let (mut holder, _) = fixture_child("exec sleep 30").await;
+        let (mut child, _) = fixture_child("exit 0").await;
         assert!(child.wait().await.unwrap().success());
-        child.stderr = holder.stderr.take();
-        let error = collect_recovery_child(child, Duration::from_millis(100))
-            .await
-            .unwrap_err();
-        holder.kill().await.unwrap();
+        let error = collect_recovery_child_stream(
+            child,
+            holder.take_stderr().unwrap(),
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+        holder.start_kill().unwrap();
+        holder.wait().await.unwrap();
         assert!(error.contains("diagnostic EOF"), "{error}");
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn cancelling_recovery_does_not_detach_its_child_or_pipe_reader() {
-        let child = fixture_child("exec sleep 30");
-        let pid = child.id().unwrap();
+        let (child, pid) = fixture_child("exec sleep 30").await;
         let task = tokio::spawn(collect_recovery_child(child, Duration::from_secs(60)));
         tokio::task::yield_now().await;
         task.abort();

@@ -1030,7 +1030,7 @@ mod tests {
         let ssh = root.join("ssh");
         std::fs::write(
             &ssh,
-            "#!/bin/sh\nfor arg do command=$arg; done\nexec /bin/sh -c \"$command\"\n",
+            "#!/bin/sh\nif [ \"$1\" = -G ]; then printf 'hostname none\\nforkafterauthentication no\\n'; exit 0; fi\nfor arg do command=$arg; done\nexec /bin/sh -c \"$command\"\n",
         )
         .unwrap();
         std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();

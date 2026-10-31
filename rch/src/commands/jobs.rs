@@ -26,12 +26,23 @@ pub enum JobsAction {
         /// Emit the original opt-in invocation's retained Cargo JSON on stdout
         #[arg(long)]
         cargo_json: bool,
+        /// Internal daemon admission: stdin lifetime and SSH foreground support.
+        #[arg(long, hide = true, action = clap::ArgAction::Set)]
+        daemon_managed: Option<bool>,
     },
 }
 
 pub async fn run(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()> {
     #[cfg(unix)]
     {
+        if let Some(JobsAction::Recover {
+            daemon_managed: Some(can_disable_background),
+            ..
+        }) = &action
+        {
+            return run_daemon_managed_recovery(*can_disable_background, run_unix(action, ctx))
+                .await;
+        }
         run_unix(action, ctx).await
     }
     #[cfg(not(unix))]
@@ -39,6 +50,117 @@ pub async fn run(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()> 
         let _ = (action, ctx);
         anyhow::bail!("durable jobs require Unix daemon IPC")
     }
+}
+
+#[cfg(unix)]
+async fn run_daemon_managed_recovery(
+    can_disable_background: bool,
+    operation: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    // The daemon owns this exact process group. Never signal a shell's group
+    // if the internal option was invoked outside that contract.
+    let group = rustix::process::getpid();
+    anyhow::ensure!(
+        rustix::process::getpgrp() == group,
+        "daemon-managed recovery must own its process group"
+    );
+    let parent =
+        rustix::io::dup(std::io::stdin()).context("duplicate daemon recovery lifetime pipe")?;
+    match run_automatic_recovery(
+        can_disable_background,
+        automatic_recovery_parent_closed(parent),
+        operation,
+    )
+    .await
+    {
+        Some(result) => result,
+        None => {
+            // EOF also covers daemon death/restart. Every automatic transport
+            // remains in this group; its live leader pins identity, so no stale
+            // PID or remote build is signalled. Dropping operation first closes
+            // heartbeat writers without retiring their durable source claims.
+            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+            anyhow::bail!("daemon recovery permission ended; journal retained")
+        }
+    }
+}
+
+#[cfg(unix)]
+tokio::task_local! {
+    /// Set only around the daemon's recover command. Manual recovery keeps
+    /// its existing SSH configuration and retry behavior.
+    static AUTOMATIC_RECOVERY_SSH: bool;
+}
+
+#[cfg(unix)]
+pub(crate) async fn run_automatic_recovery<F, C>(
+    can_disable_background: bool,
+    parent_closed: C,
+    operation: F,
+) -> Option<F::Output>
+where
+    F: std::future::Future,
+    C: std::future::Future,
+{
+    AUTOMATIC_RECOVERY_SSH
+        .scope(can_disable_background, async {
+            tokio::select! {
+                biased;
+                _ = parent_closed => None,
+                result = operation => Some(result),
+            }
+        })
+        .await
+}
+
+/// Read the private parent pipe without a blocking stdin thread, which would
+/// otherwise keep the CLI runtime alive after successful recovery. Any data,
+/// EOF, or read error closes the admission; the daemon sends no input frames.
+#[cfg(unix)]
+async fn automatic_recovery_parent_closed(parent: std::os::fd::OwnedFd) -> std::io::Result<()> {
+    let flags = rustix::fs::fcntl_getfl(&parent)?;
+    rustix::fs::fcntl_setfl(&parent, flags | rustix::fs::OFlags::NONBLOCK)?;
+    let mut byte = [0u8];
+    // Observe an already-closed parent before polling any recovery work; a
+    // newly registered AsyncFd may not receive its first readiness event yet.
+    match rustix::io::read(&parent, &mut byte) {
+        Ok(_) => return Ok(()),
+        Err(rustix::io::Errno::AGAIN) => {}
+        Err(error) => return Err(error.into()),
+    }
+    let parent = tokio::io::unix::AsyncFd::new(parent)?;
+    loop {
+        let mut ready = parent.readable().await?;
+        if let Ok(result) = ready.try_io(|parent| {
+            rustix::io::read(parent.get_ref(), &mut byte).map_err(std::io::Error::from)
+        }) {
+            return result.map(|_| ());
+        }
+    }
+}
+
+/// Apply before the destination so command-line policy takes precedence over
+/// the user's SSH config. These builders are polled in the recovery task;
+/// their spawned helper tasks only drain pipes or write existing heartbeats.
+#[cfg(unix)]
+pub(crate) fn configure_automatic_recovery_ssh(command: &mut tokio::process::Command) {
+    if let Ok(can_disable_background) = AUTOMATIC_RECOVERY_SSH.try_with(|value| *value) {
+        rch_common::ssh::configure_oneshot_ssh(command, can_disable_background);
+    }
+}
+
+/// Fixed, shell-safe options for rsync's nested SSH. Keep them before later
+/// options so automatic recovery cannot reuse or fork a user control master.
+#[cfg(unix)]
+pub(crate) fn automatic_recovery_ssh_options() -> String {
+    let mut command = tokio::process::Command::new("ssh");
+    configure_automatic_recovery_ssh(&mut command);
+    command
+        .as_std()
+        .get_args()
+        .map(|arg| arg.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn owner_presence(lease: &DurableJobLease) -> OwnerPresence {
@@ -514,6 +636,7 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
             wrapper_id,
             timeout_secs,
             cargo_json,
+            daemon_managed: _,
         } => (wrapper_id, true, false, timeout_secs, cargo_json),
         JobsAction::Cancel { wrapper_id } => (wrapper_id, false, true, 30, false),
     };
@@ -890,6 +1013,183 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::fd::AsFd;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn offline_worker_automatic_recovery_ssh_policy_is_scoped() {
+        assert!(automatic_recovery_ssh_options().is_empty());
+        for can_disable_background in [false, true] {
+            let options = run_automatic_recovery(
+                can_disable_background,
+                std::future::pending::<()>(),
+                async { automatic_recovery_ssh_options() },
+            )
+            .await
+            .unwrap();
+            for expected in [
+                "ConnectionAttempts=1",
+                "ControlMaster=no",
+                "ControlPersist=no",
+                "ControlPath=none",
+            ] {
+                assert!(options.contains(expected), "{options}");
+            }
+            assert_eq!(
+                options.contains("ForkAfterAuthentication=no"),
+                can_disable_background
+            );
+            assert!(automatic_recovery_ssh_options().is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn offline_worker_automatic_recovery_parent_pipe_revokes_before_and_during_work() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct WorkGuard(Arc<AtomicBool>);
+        impl Drop for WorkGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        for initially_closed in [false, true] {
+            let (parent, client) = std::os::unix::net::UnixStream::pair().unwrap();
+            let closed = Arc::new(AtomicBool::new(false));
+            let observed = closed.clone();
+            let (started, started_rx) = tokio::sync::oneshot::channel();
+            let mut parent = Some(parent);
+            if initially_closed {
+                drop(parent.take());
+            }
+            let run = tokio::spawn(async move {
+                run_automatic_recovery(
+                    true,
+                    automatic_recovery_parent_closed(client.into()),
+                    async {
+                        assert!(!initially_closed, "a closed daemon pipe must refuse work");
+                        let _guard = WorkGuard(observed);
+                        started.send(()).unwrap();
+                        std::future::pending::<()>().await
+                    },
+                )
+                .await
+            });
+            if !initially_closed {
+                started_rx.await.unwrap();
+                assert!(!run.is_finished());
+                drop(parent.take());
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_secs(5), run)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(closed.load(Ordering::SeqCst), !initially_closed);
+        }
+        assert!(automatic_recovery_ssh_options().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn offline_worker_automatic_recovery_parent_loss_stops_descendants() {
+        use std::os::unix::process::ExitStatusExt as _;
+        use std::process::Stdio;
+
+        const CHILD_DIRECTORY: &str = "RCH_TEST_AUTO_RECOVERY_PARENT_LOSS";
+        if let Some(directory) = std::env::var_os(CHILD_DIRECTORY) {
+            let pid_path = std::path::PathBuf::from(directory).join("pids");
+            run_daemon_managed_recovery(true, async {
+                // Model a raw SSH child and its ProxyCommand in the CLI group.
+                let mut command = tokio::process::Command::new("/bin/sh");
+                command
+                    .args([
+                        "-c",
+                        "sleep 30 & printf '%s %s\\n' $$ $! >\"$1\"; wait",
+                        "rch-proxy",
+                    ])
+                    .arg(pid_path)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .kill_on_drop(true);
+                let mut transport = command.spawn().unwrap();
+                transport.wait().await.unwrap();
+                anyhow::bail!("parent-loss fixture transport unexpectedly completed")
+            })
+            .await
+            .unwrap();
+            panic!("daemon parent loss must terminate this owned CLI group");
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let pid_path = directory.path().join("pids");
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", "commands::jobs::tests::offline_worker_automatic_recovery_parent_loss_stops_descendants", "--nocapture"])
+            .env(CHILD_DIRECTORY, directory.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut child = rch_common::ssh::OwnedProcessGroup::spawn(&mut command).unwrap();
+        let lifetime = child.take_stdin().unwrap();
+        let identities: Vec<u32> = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(pids) = std::fs::read_to_string(&pid_path) {
+                    let pids: Vec<u32> = pids
+                        .split_whitespace()
+                        .filter_map(|pid| pid.parse().ok())
+                        .collect();
+                    if pids.len() == 2 {
+                        break pids;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("child CLI started its transport and proxy");
+        let mut unrelated = tokio::process::Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        drop(lifetime);
+        let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .expect("EOF from a lost daemon must stop automatic recovery")
+            .unwrap();
+        assert_eq!(
+            status.signal(),
+            Some(9),
+            "the CLI must stop its own group on daemon loss"
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let stopped = identities.iter().all(|pid| {
+                    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                        Ok(stat) => matches!(
+                            stat.rsplit_once(") ")
+                                .and_then(|(_, fields)| fields.chars().next()),
+                            Some('Z' | 'X')
+                        ),
+                        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+                    }
+                });
+                if stopped {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("daemon loss must not leave SSH or ProxyCommand descendants alive");
+        assert!(unrelated.try_wait().unwrap().is_none());
+        unrelated.kill().await.unwrap();
+    }
 
     #[cfg(unix)]
     #[test]

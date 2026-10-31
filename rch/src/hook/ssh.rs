@@ -1819,6 +1819,7 @@ async fn spawn_source_authority_lock(
     let identity_file = shellexpand::tilde(&worker.identity_file);
     let destination = format!("{}@{}", worker.user, worker.host);
     let mut cmd = Command::new("ssh");
+    crate::commands::jobs::configure_automatic_recovery_ssh(&mut cmd);
     cmd.arg("-o").arg("BatchMode=yes");
     cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
     cmd.arg("-o").arg("ConnectTimeout=10");
@@ -2088,6 +2089,7 @@ async fn run_offload_ssh_command_with_optional_stdin(
     let destination = format!("{}@{}", worker.user, worker.host);
 
     let mut cmd = Command::new("ssh");
+    crate::commands::jobs::configure_automatic_recovery_ssh(&mut cmd);
     cmd.arg("-o").arg("BatchMode=yes");
     cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
     // The per-file verifier after the rsync barrier also requires clean stderr.
