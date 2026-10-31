@@ -34,7 +34,7 @@ use rabs_asupersync::obligations::ObligationSet;
 use rabs_asupersync::process_groups::ManagedProcessGroup;
 use rabs_asupersync::region_tree::Attribution;
 use rabs_asupersync::root_permits::{RootPermit, RootPermitBroker};
-use rabs_asupersync::stream_drain::{DrainLimits, DrainedOutput};
+use rabs_asupersync::stream_drain::{DrainLimits, DrainedOutput, LiveOutputFiles};
 use rabs_protocol::release_authorization::ReleaseAuthorizationMode;
 use rabs_sandbox::canonical_mounts::{CanonicalMountPlan, UnitMount};
 use rabs_sandbox::canonical_namespace::{
@@ -45,11 +45,13 @@ use rabs_sandbox::cargo_check::{
 };
 use rabs_sandbox::cargo_home::CargoHomeProjection;
 use rabs_sandbox::cargo_target::state::{PrivateTreeSnapshot, SourceTimestamps};
+use rabs_sandbox::process_context::CommandContext;
 use rabs_sandbox::source_transfer::{MAX_SOURCE_BYTES, SourceManifest};
 use rabs_sandbox::toolchain_cache::{CAPACITY as TOOLCHAIN_CAPACITY, ToolchainPool};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Write};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -100,9 +102,45 @@ struct Profile {
     jobs: u32,
     #[serde(default = "default_timeout")]
     timeout_seconds: u64,
+    /// Literal application inputs for Cargo and its descendants. No values are
+    /// inherited from the client or service process, and tool/control variables
+    /// remain owned by the canonical driver.
+    #[serde(default, deserialize_with = "project_environment")]
+    env: BTreeMap<String, String>,
     /// Private Cargo freshness across invocations. The operator must advance
     /// the epoch when host tools/libraries visible through /usr change.
     target_cache: Option<TargetCacheConfig>,
+}
+
+fn project_environment<'de, D>(deserializer: D) -> Result<BTreeMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct EnvironmentVisitor;
+    impl<'de> serde::de::Visitor<'de> for EnvironmentVisitor {
+        type Value = BTreeMap<String, String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an object of unique literal environment bindings")
+        }
+
+        fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+        where
+            M: serde::de::MapAccess<'de>,
+        {
+            let mut environment = BTreeMap::new();
+            while let Some((name, value)) = map.next_entry::<String, String>()? {
+                if environment.insert(name, value).is_some() {
+                    return Err(serde::de::Error::custom(
+                        "duplicate canonical environment name",
+                    ));
+                }
+            }
+            Ok(environment)
+        }
+    }
+
+    deserializer.deserialize_map(EnvironmentVisitor)
 }
 
 fn default_manifest() -> String {
@@ -589,14 +627,21 @@ impl OperationOutput {
         }
     }
 
-    fn cargo_output(&self, directory: PathBuf, inherit_stdin: bool) -> CargoOutput {
-        match self {
+    fn cargo_output(&self, directory: PathBuf, inherit_stdin: bool) -> io::Result<CargoOutput> {
+        Ok(match self {
             Self::Inherit => CargoOutput::Inherit { inherit_stdin },
-            Self::Captured { cargo_maximum, .. } => CargoOutput::Capture {
+            Self::Captured {
+                stdout,
+                stderr,
+                maximum,
+                used,
+                cargo_maximum,
+            } => CargoOutput::Stream {
                 directory,
-                maximum: *cargo_maximum,
+                maximum: (*cargo_maximum).min(maximum.saturating_sub(*used)),
+                files: LiveOutputFiles::new(stdout.try_clone()?, stderr.try_clone()?)?,
             },
-        }
+        })
     }
 }
 
@@ -618,6 +663,7 @@ impl Profile {
             cache.validate()?;
         }
         self.compilation_args()?;
+        self.command_environment()?;
         require(
             relative_member(&self.manifest),
             "manifest must be an ordinary relative path",
@@ -804,6 +850,50 @@ impl Profile {
         )
     }
 
+    /// Use the same exact environment for retained request identity, canonical
+    /// Cargo planning and execution. CommandContext owns identifier, value and
+    /// aggregate bounds, including the additional driver-owned entries.
+    fn command_environment(&self) -> io::Result<Vec<(String, String)>> {
+        require(
+            !self.env.keys().any(|name| {
+                matches!(
+                    name.as_str(),
+                    "CARGO" | "RUSTC" | "RUSTDOC" | "RUSTFLAGS" | "RUSTDOCFLAGS" | "GLIBC_TUNABLES"
+                ) || [
+                    "CARGO_", "RUSTUP_", "RUSTC_", "RUSTDOC_", "CLIPPY_", "RABS_", "RCH_", "LD_",
+                    "DYLD_",
+                ]
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+            }),
+            "canonical env cannot replace worker, compiler or preparation controls",
+        )?;
+        let mut environment = vec![
+            ("CARGO_INCREMENTAL".into(), "0".into()),
+            ("CARGO_TARGET_DIR".into(), TARGET.into()),
+            ("RUSTC".into(), RUSTC.into()),
+        ];
+        if self.command == CompilationCommand::Test {
+            environment.push(("RUSTDOC".into(), RUSTDOC.into()));
+        }
+        if self.command == CompilationCommand::Clippy {
+            environment.push(("CARGO".into(), CARGO.into()));
+        }
+        environment.extend(
+            self.env
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone())),
+        );
+        let cwd = self.cwd();
+        let context = CommandContext::new(
+            cwd.to_str()
+                .ok_or_else(|| invalid("canonical manifest path must be UTF-8"))?,
+            environment,
+        )
+        .map_err(|error| invalid(error.to_string()))?;
+        Ok(context.environment().to_vec())
+    }
+
     fn source_specification(&self) -> io::Result<Value> {
         let mut source = json!({"manifest":self.manifest});
         if let Some(vendor) = &self.vendor {
@@ -812,14 +902,7 @@ impl Profile {
         if let Some(home) = &self.cargo_home_source {
             source["cargo_home_source"] = json!(home);
         }
-        let mut environment =
-            json!({"CARGO_INCREMENTAL":"0", "CARGO_TARGET_DIR":TARGET, "RUSTC":RUSTC});
-        if self.command == CompilationCommand::Test {
-            environment["RUSTDOC"] = json!(RUSTDOC);
-        }
-        if self.command == CompilationCommand::Clippy {
-            environment["CARGO"] = json!(CARGO);
-        }
+        let environment: BTreeMap<_, _> = self.command_environment()?.into_iter().collect();
         Ok(json!({
             "kind":"canonical-exec", "request_id":1, "program":self.program(),
             "args":self.compilation_args()?, "toolchain_source":self.toolchain_root,
@@ -1151,17 +1234,7 @@ fn run_operation(
         unit: "cargo".into(),
         backing: target_root.clone(),
     });
-    plan.extra_env.extend([
-        ("CARGO_TARGET_DIR".into(), TARGET.into()),
-        ("CARGO_INCREMENTAL".into(), "0".into()),
-        ("RUSTC".into(), RUSTC.into()),
-    ]);
-    if profile.command == CompilationCommand::Test {
-        plan.extra_env.push(("RUSTDOC".into(), RUSTDOC.into()));
-    }
-    if profile.command == CompilationCommand::Clippy {
-        plan.extra_env.push(("CARGO".into(), CARGO.into()));
-    }
+    plan.extra_env.extend(profile.command_environment()?);
     let mut spec = plan.to_spec().map_err(|error| invalid(error.to_string()))?;
     spec.cwd = profile.cwd();
     // Source and HOME are immutable inside the build. In particular, mounting
@@ -1475,7 +1548,8 @@ fn run_operation(
     let cargo_output = output.cargo_output(
         owner.path().join("compilation-drain"),
         profile.inherits_stdin(),
-    );
+    )?;
+    let streamed = matches!(&cargo_output, CargoOutput::Stream { .. });
     let result = execute_controlled(
         &spec,
         &support,
@@ -1514,7 +1588,9 @@ fn run_operation(
     if let Some(retained) = &retained_toolchain {
         retained.image().verify_retained_generation(cancelled)?;
     }
-    output.replay(&compiled)?;
+    if !streamed {
+        output.replay(&compiled)?;
+    }
     output.line(&receipt.to_json_line())?;
     if (compiled.status.success()
         || (matches!(
@@ -1726,8 +1802,18 @@ fn capture_wrapper(source: &Path, destination: &Path) -> io::Result<()> {
 }
 
 enum CargoOutput {
-    Capture { directory: PathBuf, maximum: u64 },
-    Inherit { inherit_stdin: bool },
+    Capture {
+        directory: PathBuf,
+        maximum: u64,
+    },
+    Stream {
+        directory: PathBuf,
+        maximum: u64,
+        files: LiveOutputFiles,
+    },
+    Inherit {
+        inherit_stdin: bool,
+    },
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1745,13 +1831,24 @@ fn execute_controlled(
     let launch = build_canonical_argv(spec, support, program, args)
         .map_err(|error| invalid(error.to_string()))?;
     let mut command = command_for(&launch);
-    let (limits, maximum) = match output {
+    let (limits, maximum, live_files) = match output {
         CargoOutput::Capture { directory, maximum } => {
             command
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
-            (DrainLimits::new(directory), maximum)
+            (DrainLimits::new(directory), maximum, None)
+        }
+        CargoOutput::Stream {
+            directory,
+            maximum,
+            files,
+        } => {
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            (DrainLimits::new(directory), maximum, Some(files))
         }
         CargoOutput::Inherit { inherit_stdin } => {
             // Only the explicit noninteractive run/bench executor consumes
@@ -1774,6 +1871,7 @@ fn execute_controlled(
                     spill_dir: PathBuf::new(),
                 },
                 0,
+                None,
             )
         }
     };
@@ -1794,12 +1892,19 @@ fn execute_controlled(
     let start = Instant::now();
     let mut cancelled = false;
     let mut timed_out = false;
-    let drained = process.wait_with_bounded_drain_budget(&limits, maximum, || {
+    let streamed = live_files.is_some();
+    let stop_requested = || {
         cancelled |=
             stopped.load(Ordering::Acquire) || shared.is_some_and(|runtime| !runtime.healthy());
         timed_out |= start.elapsed() >= timeout;
         cancelled || timed_out
-    });
+    };
+    let drained = match live_files {
+        Some(files) => {
+            process.wait_with_bounded_drain_files(&limits, maximum, files, stop_requested)
+        }
+        None => process.wait_with_bounded_drain_budget(&limits, maximum, stop_requested),
+    };
     let unresolved = match &drained {
         Ok(output) => output.residual_group_members != 0,
         Err(_) => !rabs_asupersync::process_groups::members_from_proc(group).is_empty(),
@@ -1816,11 +1921,24 @@ fn execute_controlled(
         ));
     }
     let output = drained?;
+    if streamed {
+        // The exact prefixes already reached the service's private files.
+        // Charge them once, without appending the final capture again. The
+        // drain's quota was capped to this destination's remaining allowance.
+        let bytes = output
+            .stdout
+            .total_bytes()
+            .checked_add(output.stderr.total_bytes())
+            .ok_or_else(|| invalid("canonical diagnostic length overflow"))?;
+        destination.reserve(bytes)?;
+    }
     cancelled |=
         stopped.load(Ordering::Acquire) || shared.is_some_and(|runtime| !runtime.healthy());
     timed_out |= start.elapsed() >= timeout;
     if cancelled || timed_out {
-        destination.replay(&output)?;
+        if !streamed {
+            destination.replay(&output)?;
+        }
         return Err(io::Error::new(
             if timed_out {
                 io::ErrorKind::TimedOut
@@ -2015,7 +2133,14 @@ mod tests {
     fn profile_rejects_ambient_authority_fields_and_path_traversal() {
         let value = json!({"version":PROFILE_VERSION, "source_root":"/source", "toolchain_root":"/toolchain",
             "state_root":"/state", "operation_root":"/operations", "wrapper":"/bin/rabs-wrap", "env":{"LD_PRELOAD":"/bad"}});
-        assert!(serde_json::from_value::<Profile>(value).is_err());
+        let profile: Profile = serde_json::from_value(value).unwrap();
+        assert!(
+            profile
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("cannot replace worker, compiler or preparation controls")
+        );
         for path in [
             "",
             "../Cargo.toml",
@@ -2035,6 +2160,168 @@ mod tests {
         ] {
             assert!(!plain_absolute(Path::new(path)));
         }
+    }
+
+    fn application_environment_profile() -> Profile {
+        serde_json::from_value(json!({
+            "version":PROFILE_VERSION, "source_root":"/source", "toolchain_root":"/toolchain",
+            "state_root":"/state", "operation_root":"/operations", "wrapper":"/bin/rabs-wrap"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn explicit_application_inputs_are_literal_and_identical_in_request_and_namespace() {
+        let inputs = BTreeMap::from([
+            ("APP_VERSION".into(), "v1 '雪' $(touch never)".into()),
+            ("GIT_COMMIT".into(), "abcdef123456".into()),
+            ("EMPTY".into(), String::new()),
+            ("MULTILINE".into(), "first\nsecond\t".into()),
+            ("SOURCE_DATE_EPOCH".into(), "1700000000".into()),
+        ]);
+        for command in [
+            CompilationCommand::Check,
+            CompilationCommand::Build,
+            CompilationCommand::Test,
+            CompilationCommand::Clippy,
+            CompilationCommand::Run,
+            CompilationCommand::Bench,
+        ] {
+            let mut profile = application_environment_profile();
+            profile.command = command;
+            profile.env = inputs.clone();
+            let specification = profile.source_specification().unwrap();
+            let mut expected = inputs.clone();
+            expected.extend([
+                ("CARGO_INCREMENTAL".into(), "0".into()),
+                ("CARGO_TARGET_DIR".into(), TARGET.into()),
+                ("RUSTC".into(), RUSTC.into()),
+            ]);
+            if command == CompilationCommand::Test {
+                expected.insert("RUSTDOC".into(), RUSTDOC.into());
+            }
+            if command == CompilationCommand::Clippy {
+                expected.insert("CARGO".into(), CARGO.into());
+            }
+            assert_eq!(specification["command_context"]["env"], json!(expected));
+            let mut mounts = CanonicalMountPlan::new(
+                "/private/toolchain",
+                "/private/source",
+                "/private/cargo",
+                "/private/home",
+            );
+            mounts.extra_env = profile.command_environment().unwrap();
+            let actual: BTreeMap<_, _> = mounts.to_spec().unwrap().env.into_iter().collect();
+            for (name, value) in expected {
+                assert_eq!(actual[&name], value, "{command:?}: {name}");
+            }
+            assert_eq!(actual["HOME"], "/__rabs/home");
+            assert!(!actual.contains_key("RABS_SOCKET_PATH"));
+        }
+    }
+
+    #[test]
+    fn project_environment_refuses_controls_before_root_access_without_echoing_values() {
+        for name in [
+            "PATH",
+            "HOME",
+            "CARGO_HOME",
+            "TMPDIR",
+            "RUSTUP_HOME",
+            "RUSTUP_TOOLCHAIN",
+            "LANG",
+            "LC_ALL",
+            "TZ",
+            "MAKEFLAGS",
+            "CARGO_MAKEFLAGS",
+            "MFLAGS",
+            "NUM_JOBS",
+            "CARGO",
+            "RUSTC",
+            "RUSTDOC",
+            "RUSTFLAGS",
+            "RUSTDOCFLAGS",
+            "GLIBC_TUNABLES",
+            "CARGO_INCREMENTAL",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "CARGO_BUILD_RUSTC_WRAPPER",
+            "CARGO_TARGET_DIR",
+            "CARGO_PROFILE_DEV_OPT_LEVEL",
+            "CARGO_NET_OFFLINE",
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "RUSTC_BOOTSTRAP",
+            "RUSTDOC_LOG",
+            "CLIPPY_ARGS",
+            "CLIPPY_CONF_DIR",
+            "RABS_SOCKET_PATH",
+            "RABS_COORD_TLS_KEY",
+            "RCH_REQUIRE_REMOTE",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "DYLD_LIBRARY_PATH",
+        ] {
+            let mut profile = application_environment_profile();
+            profile
+                .env
+                .insert(name.into(), "never-echo-this-value".into());
+            let error = profile.validate().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{name}: {error}");
+            assert!(
+                error.to_string().contains("cannot replace"),
+                "{name}: {error}"
+            );
+            assert!(!error.to_string().contains("never-echo-this-value"));
+        }
+        for name in ["", "1BAD", "BAD-NAME", "A=B", "雪", "A\n"] {
+            let mut profile = application_environment_profile();
+            profile
+                .env
+                .insert(name.into(), "never-echo-this-value".into());
+            let error = profile.validate().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("environment name"));
+            assert!(!error.to_string().contains("never-echo-this-value"));
+        }
+    }
+
+    #[test]
+    fn project_environment_bounds_include_driver_controls_and_preserve_empty_values() {
+        let mut profile = application_environment_profile();
+        profile.env = (0..253)
+            .map(|index| (format!("APP_{index}"), String::new()))
+            .collect();
+        assert_eq!(profile.command_environment().unwrap().len(), 256);
+        profile.command = CompilationCommand::Test;
+        assert!(profile.command_environment().is_err());
+        profile.env.remove("APP_252");
+        assert_eq!(profile.command_environment().unwrap().len(), 256);
+        profile.env.clear();
+        profile.env.insert("A".repeat(256), String::new());
+        assert!(profile.command_environment().is_ok());
+        profile.env.insert("B".repeat(257), String::new());
+        assert!(profile.command_environment().is_err());
+        profile.env = BTreeMap::from([("VALUE".into(), "x".repeat(64 * 1024))]);
+        assert!(profile.command_environment().is_ok());
+        profile.env.insert("OTHER".into(), "x".repeat(64 * 1024));
+        assert!(profile.command_environment().is_err());
+        profile.env = BTreeMap::from([("VALUE".into(), "x".repeat(64 * 1024 + 1))]);
+        assert!(profile.command_environment().is_err());
+        profile.env.insert("VALUE".into(), "before\0after".into());
+        assert!(profile.command_environment().is_err());
+    }
+
+    #[test]
+    fn native_profile_rejects_duplicate_project_environment_bindings() {
+        let original = r#"{"version":"canonical-compile-local-v1","source_root":"/source","toolchain_root":"/toolchain","state_root":"/state","operation_root":"/operations","wrapper":"/bin/rabs-wrap","env":{"INPUT":"first","INPUT":"second"}}"#;
+        let error = serde_json::from_str::<Profile>(original).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate canonical environment name")
+        );
+        assert!(!error.to_string().contains("first"));
+        assert!(!error.to_string().contains("second"));
     }
 
     #[test]
@@ -3305,6 +3592,38 @@ mod tests {
         let mut changed = ReuseKeyFixture::new();
         changed.spec.cwd = "/__rabs/workspace/member".into();
         assert_ne!(changed.key(), original);
+    }
+
+    #[test]
+    fn private_target_families_separate_absent_empty_and_changed_application_inputs() {
+        let mut identities = BTreeSet::new();
+        for value in [None, Some(""), Some("first"), Some("second")] {
+            let mut profile = application_environment_profile();
+            if let Some(value) = value {
+                profile.env.insert("APP_VERSION".into(), value.into());
+            }
+            let mut fixture = ReuseKeyFixture::new();
+            fixture
+                .spec
+                .env
+                .extend(profile.command_environment().unwrap());
+            assert!(identities.insert(fixture.key()));
+        }
+        let identity = |encoded: &str| {
+            let mut profile = application_environment_profile();
+            profile.env = serde_json::from_str(encoded).unwrap();
+            let mut fixture = ReuseKeyFixture::new();
+            fixture
+                .spec
+                .env
+                .extend(profile.command_environment().unwrap());
+            fixture.key()
+        };
+        assert_eq!(
+            identity(r#"{"Z_LAST":"z","A_FIRST":"a"}"#),
+            identity(r#"{"A_FIRST":"a","Z_LAST":"z"}"#),
+            "profile object order is not an application input"
+        );
     }
 
     #[test]

@@ -128,7 +128,8 @@ class CanonicalEnvironment(unittest.TestCase):
 
     def test_literal_application_inputs_reach_every_command_and_both_dispatch_modes(self):
         values = {"APP_VERSION":"v1 '雪' $(touch never)", "EMPTY":"", "MULTILINE":"a\nb\t",
-                  "SOURCE_DATE_EPOCH":"1700000000", "RUST_BACKTRACE":"1"}
+                  "SOURCE_DATE_EPOCH":"1700000000", "RUST_BACKTRACE":"1",
+                  "GIT_COMMIT":"abcdef123456"}
         self.profile["env"] = values
         for daemon in (False, True):
             if daemon:

@@ -1,9 +1,18 @@
 # Environment inputs for canonical Cargo
 
-A `canonical-cargo-v1` profile can supply an optional `env` object to
-`cargo rabs --rabs-canonical`. This connects application build inputs to the
-existing native `env-cwd-v1` context for `build`, `check`, `clippy`, `test`, and
-`test --no-run`, in both direct worker and daemon-job modes.
+Canonical profiles can supply an optional `env` object:
+
+- `canonical-cargo-v1` with `cargo rabs --rabs-canonical`, for direct worker
+  execution and daemon-owned jobs.
+- `canonical-compile-local-v1` with `cargo rabs --rabs-canonical-local` or
+  `rabsd --canonical-compile-local`, for local canonical execution and the shared
+  canonical compilation service.
+
+Application build inputs reach the existing native `env-cwd-v1` context for
+`build`, `check`, `clippy`, `test`, `run` and `bench`, including compilation-only
+`test --no-run` and `bench --no-run` commands. The local canonical driver uses
+one complete explicit environment for its retained request, canonical Cargo
+unit planning and execution.
 
 Add this field to an otherwise valid profile:
 
@@ -20,8 +29,10 @@ Add this field to an otherwise valid profile:
 The values are literal UTF-8 strings. There is no shell expansion, interpolation,
 path rewriting, `.env` loading, or lookup in the dispatcher's environment.
 An empty string differs from an omitted variable. A profile's `APP_VERSION`
-therefore becomes the worker's value even when the dispatcher has a different
-one. Variables not explicitly selected remain absent from the request.
+therefore becomes the build's value even when the dispatcher or shared service
+has a different one. Variables not explicitly selected remain absent from the
+request. Each shared-service operation retains its own environment; submitting a
+build never changes another operation or the running service process.
 
 The worker's existing environment-clearing namespace launcher applies the
 context. Cargo may then supply its own standard variables to build scripts and
@@ -74,8 +85,9 @@ compiler-result caching or permit ambient host environment capture.
 
 ## Ownership and limits
 
-Values are written to private `spec.json` and retained in the prepared request;
-they are sent to the selected worker. **This is not a secret-delivery channel.**
+Values are written to private `spec.json` or the local operation's retained
+`profile.json` and preserved in the prepared request; remote inputs are sent to
+the selected worker. **This is not a secret-delivery channel.**
 Do not place credentials in the profile. The launcher neither copies ambient
 credentials into the worker context nor adds profile values to the local native
 driver's environment. Source preparation, TLS, daemon selection and recovery
@@ -98,12 +110,20 @@ replace the captured compiler, change output locations, inject a wrapper, alter
 Clippy's supported lint contract, or replace the worker's jobserver. Without
 `env`, the existing pinned environment is unchanged.
 
+Explicit profile inputs such as `GIT_COMMIT` are permitted: they reach the build,
+not the host source preparer's Git configuration. Captured Cargo `[env]` tables
+retain their separate `GIT_*` restriction because Cargo reads those tables
+during source preparation too.
+
 ## Identity and recovery
 
-The exact context is part of the saved native request; profile key order is
-normalized. The existing worker target-state key already includes the final
-execution environment. This feature does not omit inputs from that key, alter
-sampling or publication, or grant permission to skip a compiler.
+The exact context is part of the saved native request; environment key order is
+normalized. Worker and local canonical private-target keys include the final
+execution environment, and compiler action keys include application bindings.
+Omission, an explicitly empty value and a changed value select different
+identities. This feature does not omit inputs from those keys, alter sampling or
+publication, or grant permission to skip a compiler. Cargo continues to decide
+freshness within a compatible private target tree.
 
 Changing the profile affects only a new operation. `cargo rabs --rabs-recover`
 continues to use the saved prepared request or original daemon-owned job, not
@@ -114,6 +134,7 @@ Run the frontend regression suite with:
 
 ```sh
 python3 -I -S scripts/tests/test_cargo_rabs_environment.py -v
+python3 -I -S scripts/tests/test_cargo_rabs_local.py -v
 ```
 
 These tests execute the production Python launcher and real filesystem/process

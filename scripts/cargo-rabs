@@ -108,6 +108,12 @@ and never falls back or retries. Native namespace, source capture, release
 authorization, sampling and publication gates remain mandatory. An unavailable
 namespace or nightly unit-graph capability is an error. Preparation still
 captures the locked graph; selecting features does not narrow the upload boundary.
+An optional env object supplies literal application inputs to canonical Cargo,
+build scripts, compilers, tests and programs. The same values reach unit planning
+and execution and participate in private target and compiler action identities.
+They are retained in the private profile, never copied from the client or service
+environment. Toolchain, Cargo, loader, jobserver and RABS/RCH
+control variables are reserved; use env for non-secret project inputs only.
 
 Canonical mode: cargo rabs --rabs-canonical PROFILE.json -- build --bin NAME
 It runs the existing rabsd source/toolchain preparation and pinned-TLS worker
@@ -1230,10 +1236,16 @@ def canonical_command_environment(values, clippy=False, incremental=False):
     an environment alternative to a refused command-line option. Only this
     request receives the values, never the local preparation/control process.
     """
-    import re
     environment = {"CARGO_INCREMENTAL": "1" if incremental else "0"}
     if clippy:
         environment.update(CARGO="/__rabs/toolchain/bin/cargo", RUSTC="/__rabs/toolchain/bin/rustc")
+    return canonical_environment(values, environment)
+
+
+def canonical_environment(values, controls):
+    """Validate literal application inputs alongside the driver's exact controls."""
+    import re
+    environment = dict(controls)
     if type(values) is not dict or len(values) + len(environment) > 256:
         raise SetupError("canonical env must be an object within the native entry limit")
     reserved = {
@@ -1835,12 +1847,13 @@ def canonical_local_profile(path):
     """Validate retained intent before writing; the native driver checks it again."""
     profile = canonical_profile_object(path)
     required = {"version", "source_root", "toolchain_root", "state_root", "operation_root", "wrapper"}
-    optional = {"manifest", "vendor", "cargo_home_source", "jobs", "timeout_seconds", "command", "selection", "target_cache", "service_socket"}
+    optional = {"manifest", "vendor", "cargo_home_source", "jobs", "timeout_seconds", "command", "selection", "target_cache", "service_socket", "env"}
     if (not required <= profile.keys() or profile.keys() - required - optional
             or profile["version"] != "canonical-compile-local-v1"):
         raise SetupError("invalid canonical-compile-local-v1 profile fields")
     if profile.get("command", "check") not in ("check", "build", "test", "clippy", "run", "bench"):
         raise SetupError("local canonical command must be check, build, clippy, test, run or bench")
+    canonical_local_environment(profile)
     for name, maximum in (("jobs", 4096), ("timeout_seconds", 7200)):
         if name in profile and (type(profile[name]) is not int or not 1 <= profile[name] <= maximum):
             raise SetupError("local canonical " + name + " must be an integer from 1 to " + str(maximum))
@@ -1941,6 +1954,19 @@ def canonical_local_profile(path):
     return profile
 
 
+def canonical_local_environment(profile):
+    """Match the native driver's complete explicit environment and count budget."""
+    controls = {
+        "CARGO_INCREMENTAL": "0", "CARGO_TARGET_DIR": "/__rabs/out/cargo",
+        "RUSTC": "/__rabs/toolchain/bin/rustc",
+    }
+    if profile.get("command", "check") == "test":
+        controls["RUSTDOC"] = "/__rabs/toolchain/bin/rustdoc"
+    if profile.get("command", "check") == "clippy":
+        controls["CARGO"] = "/__rabs/toolchain/bin/cargo"
+    return canonical_environment(profile.get("env", {}), controls)
+
+
 def canonical_local_service_command(profile):
     """The shared service has closed stdin; no client descriptor is forwarded."""
     command = profile.get("command", "check")
@@ -1967,6 +1993,7 @@ def canonical_local_invocation(profile_path, args, env):
     # empty selection is written, preserving Cargo's ordinary default targets.
     profile["command"] = args[0] if args else "check"
     profile["selection"] = selection
+    canonical_local_environment(profile)
     canonical_local_service_command(profile)
     if profile["command"] == "clippy":
         binaries = Path(profile["toolchain_root"]) / "bin"

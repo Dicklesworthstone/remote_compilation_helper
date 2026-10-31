@@ -135,6 +135,7 @@ class CanonicalLocalCargo(unittest.TestCase):
         self.assertEqual(stdout, b"")
         self.assertEqual(list(self.operations.iterdir()), operations)
         self.assertEqual(len(self.records()) if self.record.exists() else 0, count)
+        return stderr
 
     def test_exec_handoff_preserves_pid_status_raw_streams_stdin_and_native_policy_environment(self):
         original = self.profile_path.read_bytes()
@@ -159,6 +160,100 @@ class CanonicalLocalCargo(unittest.TestCase):
         self.assertEqual(self.profile_path.read_bytes(), original)
         self.assertNotIn("env", record["profile"])
         self.assertNotIn("AMBIENT_INPUT", retained.read_text())
+
+    def test_literal_environment_reaches_all_local_and_service_commands_without_reconfiguring_driver(self):
+        values = {"APP_VERSION": "v1 '雪' $(touch never)", "EMPTY": "", "MULTILINE": "a\nb\t",
+                  "SOURCE_DATE_EPOCH": "1700000000", "RUST_BACKTRACE": "1",
+                  "GIT_COMMIT": "abcdef123456"}
+        self.profile["env"] = values
+        self.save()
+        env = dict(self.env, APP_VERSION="client-only", RABS_COORD_TLS_KEY="/private/driver-key")
+        commands = (["check", "--workspace"], ["build", "--lib"],
+                    ["clippy", "--", "-Dwarnings"], ["test"], ["bench", "--no-run"])
+        for service in (False, True):
+            if service:
+                self.select_service()
+            for args in commands + (() if service else (["run", "--", "literal argument"], ["bench"])):
+                with self.subTest(service=service, args=args):
+                    status, _, stderr, _ = self.invoke(args, env)
+                    self.assertEqual(status, 0, stderr.decode(errors="replace"))
+                    record = self.records()[-1]
+                    self.assertEqual(record["profile"]["env"], values)
+                    self.assertEqual(record["environment"]["APP_VERSION"], "client-only")
+                    self.assertEqual(record["environment"]["RABS_COORD_TLS_KEY"], "/private/driver-key")
+                    self.assertNotIn("MULTILINE", record["environment"])
+                    self.assertNotIn("AMBIENT_INPUT", record["profile"]["env"])
+                    self.assertNotIn("RABS_COORD_TLS_KEY", record["profile"]["env"])
+                    self.assertFalse((self.root / "never").exists())
+
+    def test_project_input_omission_empty_and_changes_retain_distinct_native_intent(self):
+        retained = []
+        for values in ({}, {"APP_VERSION": ""}, {"APP_VERSION": "one"}, {"APP_VERSION": "two"}):
+            self.profile["env"] = values
+            self.save()
+            status, _, stderr, _ = self.invoke(["build"])
+            self.assertEqual(status, 0, stderr.decode(errors="replace"))
+            retained.append(self.records()[-1]["profile"]["env"])
+        self.assertEqual(len({json.dumps(value, sort_keys=True) for value in retained}), 4)
+        self.assertNotIn("APP_VERSION", retained[0])
+        self.assertEqual(retained[1]["APP_VERSION"], "")
+
+    def test_invalid_project_environment_refuses_before_retaining_or_starting_any_operation(self):
+        for value in (None, False, 1, [], "A=B", {"": "v"}, {"1BAD": "v"}, {"BAD-NAME": "v"},
+                      {"A=B": "v"}, {"雪": "v"}, {"A" * 257: "v"}, {"A\0": "v"},
+                      {"A": None}, {"A": True}, {"A": 17}, {"A": []}, {"A": {}},
+                      {"A": "x\0y"}, {"A": "\udcff"}):
+            with self.subTest(value=repr(value)):
+                self.profile["env"] = value
+                self.save()
+                self.assert_refused(["check"])
+
+    def test_project_environment_cannot_change_namespace_toolchain_or_service_controls(self):
+        for name in (
+            "PATH", "HOME", "CARGO_HOME", "TMPDIR", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN",
+            "LANG", "LC_ALL", "TZ", "MAKEFLAGS", "CARGO_MAKEFLAGS", "MFLAGS", "NUM_JOBS",
+            "CARGO", "RUSTC", "RUSTDOC", "RUSTFLAGS", "RUSTDOCFLAGS", "GLIBC_TUNABLES",
+            "CARGO_INCREMENTAL", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_RUSTC_WRAPPER",
+            "CARGO_TARGET_DIR", "CARGO_PROFILE_DEV_OPT_LEVEL", "CARGO_NET_OFFLINE",
+            "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "RUSTC_BOOTSTRAP", "RUSTDOC_LOG",
+            "CLIPPY_ARGS", "CLIPPY_CONF_DIR", "RABS_SOCKET_PATH", "RABS_COORD_TLS_KEY",
+            "RCH_REQUIRE_REMOTE", "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH",
+        ):
+            with self.subTest(name=name):
+                self.profile["env"] = {name: "private-value-never-in-errors"}
+                self.save()
+                stderr = self.assert_refused(["check"])
+                self.assertNotIn(b"private-value-never-in-errors", stderr)
+
+    def test_environment_entry_budget_includes_controls_for_actual_selected_command(self):
+        self.profile["env"] = {"APP_" + str(index): "" for index in range(253)}
+        self.save()
+        status, _, stderr, _ = self.invoke(["check"])
+        self.assertEqual(status, 0, stderr.decode(errors="replace"))
+        self.assertEqual(len(launcher.canonical_local_environment(self.profile)), 256)
+        for command in ("test", "clippy"):
+            self.assert_refused([command])
+        self.profile["env"].pop("APP_252")
+        self.save()
+        for command in ("test", "clippy"):
+            status, _, stderr, _ = self.invoke([command])
+            self.assertEqual(status, 0, stderr.decode(errors="replace"))
+
+    def test_project_environment_uses_native_string_and_aggregate_byte_limits(self):
+        profile = {"command": "check", "env": {"A" * 256: "x" * (64 * 1024)}}
+        context = launcher.canonical_local_environment(profile)
+        self.assertEqual(context["A" * 256], profile["env"]["A" * 256])
+        for environment in ({"A" * 257: ""}, {"A": "x" * (64 * 1024 + 1)},
+                            {"A": "x" * (64 * 1024), "B": "x" * (64 * 1024)}):
+            with self.subTest(environment_lengths={k: len(v) for k, v in environment.items()}):
+                with self.assertRaises(launcher.SetupError):
+                    launcher.canonical_local_environment({"command": "check", "env": environment})
+
+    def test_duplicate_project_environment_bindings_refuse_native_handoff(self):
+        original = self.profile_path.read_text()
+        for fragment in ('"env":{"A":"first","A":"second"},', '"env":{},"env":{"A":"v"},'):
+            self.profile_path.write_text(original.replace("{", "{" + fragment, 1))
+            self.assert_refused(["build"])
 
     def test_default_check_replaces_saved_selection_with_cargo_defaults(self):
         self.profile["command"] = "test"
