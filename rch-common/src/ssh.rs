@@ -128,6 +128,47 @@ struct SshProcessState {
     outcome: Option<std::result::Result<ExitStatus, String>>,
 }
 
+/// A local process and its descendants share one owned process group. This
+/// covers SSH proxy commands and rsync's SSH child as well as the direct child.
+/// Keep the child unreaped until its output has drained: its PID then pins the
+/// group identity throughout cancellation. After wait(), id() is None, so Drop
+/// cannot signal a group whose PID has since been reused.
+pub(crate) struct OwnedProcessGroup {
+    pub(crate) child: tokio::process::Child,
+}
+
+impl OwnedProcessGroup {
+    pub(crate) fn spawn(command: &mut tokio::process::Command) -> std::io::Result<Self> {
+        let child = command.process_group(0).kill_on_drop(true).spawn()?;
+        Ok(Self { child })
+    }
+
+    fn signal_group(&self) {
+        let group = self
+            .child
+            .id()
+            .and_then(|pid| i32::try_from(pid).ok())
+            .and_then(rustix::process::Pid::from_raw)
+            .filter(|pid| !pid.is_init());
+        if let Some(group) = group {
+            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+        }
+    }
+
+    pub(crate) fn start_kill(&mut self) -> std::io::Result<()> {
+        self.signal_group();
+        self.child.start_kill()
+    }
+}
+
+impl Drop for OwnedProcessGroup {
+    fn drop(&mut self) {
+        self.signal_group();
+        // Child's kill_on_drop also covers direct-child cleanup if the group
+        // signal raced normal exit. Tokio retains responsibility for reaping.
+    }
+}
+
 /// Owns a foreground SSH process from spawn through wait/reap. Dropping a
 /// connect future or a client requests termination; the supervisor retains the
 /// child and socket directory until it has reaped the child.
@@ -157,7 +198,7 @@ impl OwnedSshProcess {
                 .is_none_or(PoolWorkerAdmission::is_current),
             "SSH worker pool admission was revoked"
         );
-        let mut child = command.kill_on_drop(true).spawn()?;
+        let mut child = OwnedProcessGroup::spawn(command)?;
         let (state, mut changes) = watch::channel(SshProcessState {
             active_commands: 0,
             idle_since: Instant::now(),
@@ -178,7 +219,7 @@ impl OwnedSshProcess {
                     if let Err(error) = child.start_kill() {
                         debug!("Failed to signal owned SSH child: {error}");
                     }
-                    break child.wait().await;
+                    break child.child.wait().await;
                 }
                 let idle_deadline = idle_timeout
                     .filter(|_| current.active_commands == 0)
@@ -187,7 +228,7 @@ impl OwnedSshProcess {
                     () = &mut revoked => {
                         updates.send_modify(|state| state.stopping = true);
                     },
-                    outcome = child.wait() => break outcome,
+                    outcome = child.child.wait() => break outcome,
                     _ = changes.changed() => {},
                     _ = async {
                         if let Some(deadline) = idle_deadline {
@@ -1251,6 +1292,7 @@ pub use crate::ssh_utils::identities_only_args;
 ///
 /// Argv layout:
 /// `ssh -i <identity_file> -o BatchMode=yes -o ConnectTimeout=8 -o
+///   ConnectionAttempts=1 -o ControlMaster=no -o ControlPersist=no -o ControlPath=none -o
 ///   StrictHostKeyChecking=accept-new -o ServerAliveInterval=<secs>
 ///   <user>@<host> <command>`
 ///
@@ -1272,7 +1314,7 @@ pub(crate) fn system_ssh_argv(
     let identity_path = shellexpand::tilde(&config.identity_file);
     let destination = format!("{}@{}", config.user, config.host);
 
-    let mut argv: Vec<OsString> = Vec::with_capacity(12);
+    let mut argv: Vec<OsString> = Vec::with_capacity(24);
     argv.push(OsString::from("ssh"));
     argv.push(OsString::from("-i"));
     argv.push(OsString::from(identity_path.as_ref()));
@@ -1283,6 +1325,17 @@ pub(crate) fn system_ssh_argv(
     argv.push(OsString::from("BatchMode=yes"));
     argv.push(OsString::from("-o"));
     argv.push(OsString::from("ConnectTimeout=8"));
+    // This fallback opens its own connection. Never attach to an unrelated
+    // master, inherit extra dials, or leave a persistent master behind.
+    for option in [
+        "ConnectionAttempts=1",
+        "ControlMaster=no",
+        "ControlPersist=no",
+        "ControlPath=none",
+    ] {
+        argv.push(OsString::from("-o"));
+        argv.push(OsString::from(option));
+    }
     argv.push(OsString::from("-o"));
     argv.push(OsString::from("StrictHostKeyChecking=accept-new"));
     if !server_alive_interval.is_zero() {
@@ -1327,10 +1380,8 @@ pub async fn write_ssh_command_stdin(
 ///
 /// Mirrors the openssh-crate path's size cap (`MAX_OUTPUT_SIZE`), timeout
 /// semantics (tokio timeout that bails on expiry), and `CommandResult`
-/// shape. The local ssh process is set `kill_on_drop(true)` so a timeout
-/// cannot leak an `ssh` child — the openssh-crate timeout path likewise
-/// relies on the caller to drop the child (and warns about the leak risk);
-/// here we get a hard SIGKILL on drop instead. Output reads are
+/// shape. The local ssh process and proxy descendants belong to an owned
+/// process group, killed on timeout or cancellation. Output reads are
 /// concurrent over `tokio::io::BufReader` to avoid a single-stream back-
 /// pressure deadlock (same pattern as the openssh path). `env_clear()` is
 /// used so a hostile / noisy environment from the calling daemon cannot
@@ -1360,7 +1411,8 @@ pub(crate) async fn system_ssh_execute(
         crate::util::mask_sensitive_command(command)
     );
 
-    let mut child = Command::new("ssh")
+    let mut process = Command::new("ssh");
+    process
         .args(args)
         .env_clear()
         .stdin(if input.is_some() {
@@ -1369,20 +1421,18 @@ pub(crate) async fn system_ssh_execute(
             Stdio::null()
         })
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| {
-            format!(
-                "failed to spawn system ssh for {} (Windows fallback)",
-                config.id
-            )
-        })?;
+        .stderr(Stdio::piped());
+    let mut child = OwnedProcessGroup::spawn(&mut process).with_context(|| {
+        format!(
+            "failed to spawn system ssh for {} (Windows fallback)",
+            config.id
+        )
+    })?;
 
     let execution = async {
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        let stdin = child.stdin.take();
+        let stdout = child.child.stdout.take();
+        let stderr = child.child.stderr.take();
+        let stdin = child.child.stdin.take();
 
         let stdin_fut = async {
             if let (Some(stdin), Some(input)) = (stdin, input) {
@@ -1410,6 +1460,7 @@ pub(crate) async fn system_ssh_execute(
 
         let ((), stdout, stderr) = tokio::try_join!(stdin_fut, stdout_fut, stderr_fut)?;
         let status = child
+            .child
             .wait()
             .await
             .with_context(|| "system ssh command failed to wait for completion")?;
@@ -1435,10 +1486,9 @@ pub(crate) async fn system_ssh_execute(
             })
         }
         Err(_) => {
-            // `kill_on_drop(true)` ensures the local ssh process is
-            // SIGKILLed when `child` drops here, so no ssh child can leak
-            // even if the remote end is wedged. This only owns the local
-            // SSH child; remote process termination is not guaranteed.
+            // Dropping the owner kills the local SSH process group, including
+            // proxy children, even if the remote end is wedged. Remote process
+            // termination is not guaranteed by local process ownership.
             warn!(
                 "system-ssh command timed out on {} after {:?}",
                 config.id, command_timeout
@@ -1475,6 +1525,16 @@ pub struct SshPool {
     controls: RwLock<HashMap<WorkerId, Arc<PoolWorkerControl>>>,
     /// Default SSH options.
     options: SshOptions,
+}
+
+impl std::fmt::Debug for SshPool {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Diagnostics must never wait on an authenticating client's locks.
+        formatter
+            .debug_struct("SshPool")
+            .field("options", &self.options)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SshPool {

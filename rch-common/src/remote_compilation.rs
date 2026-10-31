@@ -15,7 +15,7 @@ use crate::binary_hash::{
 use crate::gc_roots::{remote_cargo_home_base_prelude, remote_cargo_home_expr};
 use crate::mock::{self, MockConfig, MockRsync, MockRsyncConfig, MockSshClient};
 use crate::rsync_flavor::{RsyncFlavor, configure_rsync_remote_args, resolve_rsync_cached};
-use crate::ssh::{SshClient, SshOptions};
+use crate::ssh::{OwnedProcessGroup, SshClient, SshOptions};
 use crate::test_change::{TestChangeGuard, TestCodeChange};
 use crate::types::WorkerConfig;
 use anyhow::{Context, Result, bail};
@@ -23,8 +23,9 @@ use serde::{Deserialize, Serialize};
 use shell_escape::escape;
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Output, Stdio};
 use std::time::{Duration, Instant};
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -163,6 +164,40 @@ fn join_remote_path(base: &str, child: &str) -> String {
     } else {
         format!("{base}/{child}")
     }
+}
+
+/// Cancellation of a self-test must stop both cargo and rsync's SSH child.
+/// Drain pipes before reaping the group leader, retaining its PID ownership
+/// even if it exits while a descendant still holds an output pipe open.
+async fn self_test_command_output(command: &mut Command) -> std::io::Result<Output> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut process = OwnedProcessGroup::spawn(command)?;
+    let stdout = process.child.stdout.take();
+    let stderr = process.child.stderr.take();
+    let read_stdout = async {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = stdout {
+            pipe.read_to_end(&mut bytes).await?;
+        }
+        Ok::<_, std::io::Error>(bytes)
+    };
+    let read_stderr = async {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = stderr {
+            pipe.read_to_end(&mut bytes).await?;
+        }
+        Ok::<_, std::io::Error>(bytes)
+    };
+    let (stdout, stderr) = tokio::try_join!(read_stdout, read_stderr)?;
+    let status = process.child.wait().await?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 impl Default for RemoteCompilationTest {
@@ -447,6 +482,19 @@ impl RemoteCompilationTest {
         remote_cargo_home_expr(&format!("{worker_id}-{session_id}"))
     }
 
+    fn rsync_ssh_command(&self) -> String {
+        // Self-tests own these short-lived transfers. User SSH settings must
+        // not multiply attempts, borrow another master, or fork a persistent
+        // connection that outlives administrative disablement.
+        format!(
+            "ssh {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
+             -o ConnectionAttempts=1 -o ConnectTimeout={} \
+             -o ControlMaster=no -o ControlPersist=no -o ControlPath=none",
+            crate::ssh_utils::identity_shell_args(&self.worker.identity_file),
+            self.ssh_options.connect_timeout.as_secs().max(1),
+        )
+    }
+
     /// Build the project locally.
     async fn build_local(&self) -> Result<()> {
         let mut cmd = Command::new(resolve_cargo_binary());
@@ -472,8 +520,7 @@ impl RemoteCompilationTest {
             if self.release_mode { "--release" } else { "" }
         );
 
-        let output = cmd
-            .output()
+        let output = self_test_command_output(&mut cmd)
             .await
             .context("Failed to execute cargo build")?;
 
@@ -542,8 +589,6 @@ impl RemoteCompilationTest {
             resolved.flavor.remote_path_arg(&remote_path)
         );
 
-        let identity_file = shellexpand::tilde(&self.worker.identity_file);
-
         let mut cmd = Command::new(&resolved.path);
         configure_rsync_remote_args(cmd.as_std_mut());
         cmd.arg("-az")
@@ -561,10 +606,7 @@ impl RemoteCompilationTest {
             .arg("--exclude")
             .arg(".git/")
             .arg("-e")
-            .arg(format!(
-                "ssh {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes",
-                crate::ssh_utils::identity_shell_args(identity_file.as_ref())
-            ))
+            .arg(self.rsync_ssh_command())
             .arg(format!("{}/", self.test_project.display()))
             .arg(&destination)
             .stdout(Stdio::piped())
@@ -575,7 +617,9 @@ impl RemoteCompilationTest {
             cmd.as_std().get_args().collect::<Vec<_>>()
         );
 
-        let output = cmd.output().await.context("Failed to execute rsync")?;
+        let output = self_test_command_output(&mut cmd)
+            .await
+            .context("Failed to execute rsync")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -702,8 +746,6 @@ impl RemoteCompilationTest {
             self.remote_project_path().trim_end_matches('/')
         );
 
-        let identity_file = shellexpand::tilde(&self.worker.identity_file);
-
         let mut cmd = Command::new(&resolved.path);
         configure_rsync_remote_args(cmd.as_std_mut());
         cmd.arg("-az")
@@ -716,10 +758,7 @@ impl RemoteCompilationTest {
             .arg("--no-owner")
             .arg("--no-group")
             .arg("-e")
-            .arg(format!(
-                "ssh {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes",
-                crate::ssh_utils::identity_shell_args(identity_file.as_ref())
-            ))
+            .arg(self.rsync_ssh_command())
             .arg(&remote_target)
             .arg(format!("{}/", local_dest.display()))
             .stdout(Stdio::piped())
@@ -730,7 +769,9 @@ impl RemoteCompilationTest {
             cmd.as_std().get_args().collect::<Vec<_>>()
         );
 
-        let output = cmd.output().await.context("Failed to retrieve artifacts")?;
+        let output = self_test_command_output(&mut cmd)
+            .await
+            .context("Failed to retrieve artifacts")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -753,6 +794,150 @@ mod tests {
     use crate::test_guard;
     use crate::testing::{TestLogger, TestPhase};
     use crate::types::WorkerId;
+
+    #[tokio::test]
+    async fn offline_worker_self_test_owned_command_preserves_output_and_status() {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "printf 'build output'; printf 'build diagnostic' >&2; exit 7",
+        ]);
+        let output = self_test_command_output(&mut command).await.unwrap();
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(output.stdout, b"build output");
+        assert_eq!(output.stderr, b"build diagnostic");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn offline_worker_self_test_cancellation_stops_owned_descendants() {
+        for leader_exits in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().to_path_buf();
+            let task = tokio::spawn(async move {
+                let mut command = Command::new("sh");
+                command
+                    .args([
+                        "-c",
+                        r#"printf '%s\n' "$$" > "$1/parent"
+sleep 30 &
+printf '%s\n' "$!" > "$1/child"
+if [ "$2" = exit ]; then exit 0; fi
+wait
+"#,
+                        "rch-self-test-child-tree",
+                    ])
+                    .arg(root)
+                    .arg(if leader_exits { "exit" } else { "wait" });
+                self_test_command_output(&mut command).await
+            });
+            let (parent, child) = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let pid = |name| {
+                        std::fs::read_to_string(directory.path().join(name))
+                            .ok()?
+                            .trim()
+                            .parse::<u32>()
+                            .ok()
+                    };
+                    if let (Some(parent), Some(child)) = (pid("parent"), pid("child")) {
+                        break (parent, child);
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the fixture must start both real processes");
+            assert!(!task.is_finished(), "the descendant still holds its pipes");
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let parent_reaped =
+                        !Path::new(&format!("/proc/{parent}")).try_exists().unwrap();
+                    let child_terminated =
+                        match std::fs::read_to_string(format!("/proc/{child}/stat")) {
+                            Ok(stat) => matches!(
+                                stat.rsplit_once(") ")
+                                    .and_then(|(_, fields)| fields.chars().next()),
+                                Some('Z' | 'X')
+                            ),
+                            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+                        };
+                    if parent_reaped && child_terminated {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("cancellation must reap the owned leader and stop its SSH-like descendant");
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_worker_self_test_ssh_policy_overrides_user_reconnect_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let ssh_config = directory.path().join("ssh-config");
+        std::fs::write(
+            &ssh_config,
+            "Host *\n ControlMaster auto\n ControlPersist 600\n\
+             ControlPath /tmp/rch-self-test-inherited\n ConnectionAttempts 9\n ConnectTimeout 120\n",
+        )
+        .unwrap();
+        let mut test = RemoteCompilationTest::default();
+        test.ssh_options.connect_timeout = Duration::from_secs(7);
+        test.worker.host = "fixture.invalid".into();
+        test.worker.user = "builder".into();
+        test.worker.tags = vec![crate::types::os_tag("windows")];
+        test.worker.identity_file = directory
+            .path()
+            .join("key with spaces")
+            .display()
+            .to_string();
+
+        let mut rsync_shell = Command::new("sh");
+        rsync_shell
+            .arg("-c")
+            .arg(format!(
+                "{} -G -F \"$1\" fixture.invalid",
+                test.rsync_ssh_command()
+            ))
+            .arg("rch-self-test-ssh-config")
+            .arg(&ssh_config);
+        let windows_argv = crate::ssh::system_ssh_argv(
+            &test.worker,
+            &crate::ssh::RemoteShellCommand {
+                command: "sh -s".into(),
+                stdin_script: None,
+            },
+            Duration::ZERO,
+        );
+        let mut windows_shell = Command::new(&windows_argv[0]);
+        windows_shell
+            .args(["-G", "-F"])
+            .arg(&ssh_config)
+            .args(&windows_argv[1..]);
+        for (mut command, expected_timeout) in [(rsync_shell, 7), (windows_shell, 8)] {
+            // OpenSSH -G resolves real precedence without connecting anywhere.
+            let output = self_test_command_output(&mut command).await.unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let resolved = String::from_utf8(output.stdout).unwrap();
+            for expected in [
+                "controlmaster false".to_string(),
+                "controlpersist no".to_string(),
+                "connectionattempts 1".to_string(),
+                format!("connecttimeout {expected_timeout}"),
+            ] {
+                assert!(resolved.lines().any(|line| line == expected), "{resolved}");
+            }
+            assert!(!resolved.contains("controlpath /tmp/rch-self-test-inherited"));
+        }
+    }
 
     #[test]
     fn returned_canary_requires_readable_nonempty_marker_and_preserves_drift_policy() {
