@@ -1193,6 +1193,14 @@ runtime and verifies it against the keyed runtime cohort, then creates private
 output and HOME trees. The outer Cargo workspace, Cargo home,
 control socket and persistent CAS are not exposed to that compiler.
 
+The worker can reuse one of four process-owned runtime images instead of
+copying the same ELF libraries for every compilation. A lease binds the verified
+toolchain, ordered loader paths, runtime cohort and current output filesystem;
+active images cannot be evicted. Reuse still verifies the retained bytes and
+independently remeasures the host before and after execution. The
+`worker-runtime-acquired` event distinguishes captured, reused and private images.
+See [runtime ownership and limits](rabs-worker-delivery.md#reuse-retained-compiler-runtimes).
+
 For a library with `OUT_DIR`, the coordinator requires Cargo's completed
 `root-output` record to name that exact canonical path and captures its byte-exact
 persisted stdout alongside every file and directory in the generated tree.

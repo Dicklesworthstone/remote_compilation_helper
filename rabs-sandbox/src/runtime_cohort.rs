@@ -20,6 +20,9 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
+mod pool;
+pub use pool::{MAX_RETAINED_RUNTIMES, RuntimeLease, RuntimePool, RuntimeRequest};
+
 /// Fixed identity domain shared with the remote dependency key builder.
 pub const RUNTIME_COHORT_DOMAIN: &str = "rabs.rustc-host-runtime.v2";
 
@@ -152,6 +155,45 @@ impl RetainedRuntime {
         }
     }
 
+    /// Verify the retained bytes against this execution's output filesystem.
+    ///
+    /// A runtime lease can outlive the output directory used for its original
+    /// capture. Reuse must measure the current attempt's filesystem and CPU/
+    /// kernel contract, never an earlier attempt's disposable path.
+    ///
+    /// # Errors
+    /// Has [`Self::verify`]'s refusals, including a changed filesystem class.
+    pub fn verify_on_filesystem(
+        &self,
+        filesystem_root: &Path,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<(), RuntimeCohortError> {
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.verify_on_filesystem(filesystem_root, &cancelled)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (filesystem_root, cancelled);
+            Err(RuntimeCohortError::Unsupported(
+                "Linux ELF runtime required",
+            ))
+        }
+    }
+
+    fn remove_owned(&self) -> Result<(), RuntimeCohortError> {
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.owner.remove_owned()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(RuntimeCohortError::Unsupported(
+                "Linux ELF runtime required",
+            ))
+        }
+    }
+
     pub(crate) fn append_mounts(
         &self,
         args: &mut Vec<OsString>,
@@ -229,7 +271,7 @@ mod linux {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::path::Component;
     use std::process::{Command, Stdio};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::{Duration, UNIX_EPOCH};
 
     const MAX_PROBE_BYTES: u64 = 64 * 1024;
@@ -263,15 +305,17 @@ mod linux {
 
     /// A create-new private child; the held root and parent descriptors prevent
     /// a replaced pathname from acquiring this owner's cleanup authority.
-    struct RuntimeDirectory {
+    pub(super) struct RuntimeDirectory {
         path: PathBuf,
         handle: File,
         parent_path: PathBuf,
         parent_handle: File,
+        removed: AtomicBool,
+        preserve: AtomicBool,
     }
 
     impl RuntimeDirectory {
-        fn new(parent: &Path) -> Result<Self, RuntimeCohortError> {
+        pub(super) fn new(parent: &Path) -> Result<Self, RuntimeCohortError> {
             if !parent.is_absolute() {
                 return Err(invalid("runtime retention parent is not absolute"));
             }
@@ -315,6 +359,8 @@ mod linux {
                             handle,
                             parent_path,
                             parent_handle,
+                            removed: AtomicBool::new(false),
+                            preserve: AtomicBool::new(false),
                         };
                         result.verify_owner()?;
                         return Ok(result);
@@ -326,7 +372,53 @@ mod linux {
             Err(invalid("runtime retention child name budget exhausted"))
         }
 
-        fn verify_owner(&self) -> Result<(), RuntimeCohortError> {
+        pub(super) fn path(&self) -> &Path {
+            &self.path
+        }
+
+        pub(super) fn preserve(&self) {
+            self.preserve.store(true, Ordering::Release);
+        }
+
+        pub(super) fn remove_owned(&self) -> Result<(), RuntimeCohortError> {
+            if self.removed.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            if self.preserve.load(Ordering::Acquire) {
+                return Err(invalid(
+                    "runtime storage requires retention after failed cleanup",
+                ));
+            }
+            self.verify_owner()?;
+            fs::remove_dir_all(&self.path)?;
+            self.removed.store(true, Ordering::Release);
+            Ok(())
+        }
+
+        pub(super) fn remove_empty(&self) -> Result<(), RuntimeCohortError> {
+            if self.removed.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            if self.preserve.load(Ordering::Acquire) {
+                return Err(invalid(
+                    "runtime storage requires retention after failed cleanup",
+                ));
+            }
+            self.verify_owner()?;
+            // Pool containers may hold a capture whose inner owner refused
+            // cleanup. Never recursively erase such an uncertain child.
+            fs::remove_dir(&self.path)?;
+            self.removed.store(true, Ordering::Release);
+            Ok(())
+        }
+
+        pub(super) fn verify_owner(&self) -> Result<(), RuntimeCohortError> {
+            if self.removed.load(Ordering::Acquire) {
+                return Err(invalid("retained runtime owner was released"));
+            }
+            if self.preserve.load(Ordering::Acquire) {
+                return Err(invalid("runtime storage is closed after uncertain cleanup"));
+            }
             let held = self.handle.metadata()?;
             let named = fs::symlink_metadata(&self.path)?;
             let parent = fs::symlink_metadata(&self.parent_path)?;
@@ -395,9 +487,7 @@ mod linux {
         fn drop(&mut self) {
             // Only the create-new child is reclaimed, never the supplied spill
             // parent. A replaced child or parent is left untouched.
-            if self.verify_owner().is_ok() {
-                let _ = fs::remove_dir_all(&self.path);
-            }
+            let _ = self.remove_owned();
         }
     }
 
@@ -531,7 +621,7 @@ mod linux {
 
     pub(super) struct RuntimeSnapshot {
         pub(super) cohort: TypedDigest,
-        owner: RuntimeDirectory,
+        pub(super) owner: RuntimeDirectory,
         tree: RuntimeTree,
         filesystem_root: PathBuf,
         ambient: Vec<u8>,
@@ -542,8 +632,16 @@ mod linux {
             &self,
             cancelled: &dyn Fn() -> bool,
         ) -> Result<(), RuntimeCohortError> {
+            self.verify_on_filesystem(&self.filesystem_root, cancelled)
+        }
+
+        pub(super) fn verify_on_filesystem(
+            &self,
+            filesystem_root: &Path,
+            cancelled: &dyn Fn() -> bool,
+        ) -> Result<(), RuntimeCohortError> {
             self.tree.verify(&self.owner, cancelled)?;
-            if ambient_profile(&self.filesystem_root)? != self.ambient {
+            if ambient_profile(filesystem_root)? != self.ambient {
                 return Err(invalid(
                     "runtime CPU, kernel or filesystem identity changed",
                 ));
@@ -1485,7 +1583,7 @@ mod linux {
         }
     }
 
-    fn filesystem_profile(root: &Path) -> Result<Vec<u8>, RuntimeCohortError> {
+    pub(super) fn filesystem_profile(root: &Path) -> Result<Vec<u8>, RuntimeCohortError> {
         let directory = ProbeDirectory::new(root)?;
         let path = directory.0.join("case");
         let file = OpenOptions::new()

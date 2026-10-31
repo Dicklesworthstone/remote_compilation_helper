@@ -21,7 +21,7 @@ use rabs_sandbox::generated_source::MAX_GENERATED_DIRECTORIES;
 use rabs_sandbox::process_context::{
     COMMAND_CONTEXT_VERSION, CommandContext, MAX_COMMAND_ENV_ENTRIES,
 };
-use rabs_sandbox::runtime_cohort::RetainedRuntime;
+use rabs_sandbox::runtime_cohort::{RuntimeLease, RuntimePool, RuntimeRequest};
 use rabs_sandbox::toolchain_dataset::{TOOLCHAIN_DATASET_VERSION, ToolchainIdentity};
 
 pub(crate) mod toolchain_pool;
@@ -851,6 +851,7 @@ pub struct ExecutionResources<'a> {
     pub slots: u32,
     pub host_budget: Option<&'a crate::host_budget::HostBudget>,
     pub source_cache: Option<&'a crate::source_transfer::SourceCache>,
+    pub runtime_pool: Option<&'a RuntimePool>,
     pub target_cache: Option<(
         &'a std::sync::Arc<crate::target_cache::TargetCache>,
         crate::target_cache::TargetCacheScope,
@@ -864,6 +865,7 @@ impl ExecutionResources<'_> {
             slots,
             host_budget: None,
             source_cache: None,
+            runtime_pool: None,
             target_cache: None,
         }
     }
@@ -965,7 +967,7 @@ fn attempt_private_directory(prefix: &str) -> std::io::Result<tempfile::TempDir>
     builder.tempdir()
 }
 
-/// Capture the selected host ELF runtime into independently owned storage.
+/// Acquire the selected host ELF runtime in independently owned storage.
 /// The caller retains this owner through process cleanup and diagnostic drains;
 /// dependency namespaces never expose the live host /usr tree.
 fn prepare_dependency_runtime(
@@ -973,26 +975,28 @@ fn prepare_dependency_runtime(
     toolchain: &toolchain_pool::ToolchainLease,
     artifacts: Option<&PreparedArtifacts>,
     retention_parent: &std::path::Path,
+    pool: Option<&RuntimePool>,
     control: &ExecutionControl,
-) -> Result<RetainedRuntime, String> {
+) -> Result<RuntimeLease, String> {
     let artifacts = artifacts.ok_or("dependency runtime capture lacks private output storage")?;
     let loader_paths = context
         .loader_search_paths(toolchain.root())
         .map_err(|error| error.to_string())?;
     std::fs::create_dir_all(retention_parent).map_err(|error| error.to_string())?;
-    let runtime = rabs_sandbox::runtime_cohort::retain_runtime_cohort(
-        &toolchain.root().join("bin/rustc"),
-        toolchain.root(),
-        &loader_paths,
-        artifacts.backing(),
-        retention_parent,
-        || control.reason().is_some(),
-    )
-    .map_err(|error| error.to_string())?;
-    if runtime.cohort().bytes != *context.runtime_cohort_sha256() {
-        return Err("captured host runtime differs from the dependency context".to_owned());
+    let compiler = toolchain.root().join("bin/rustc");
+    let request = RuntimeRequest {
+        compiler: &compiler,
+        toolchain_root: toolchain.root(),
+        toolchain_identity: toolchain.identity(),
+        loader_search_paths: &loader_paths,
+        expected_cohort: context.runtime_cohort_sha256(),
+        filesystem_root: artifacts.backing(),
+    };
+    match pool {
+        Some(pool) => pool.acquire(request, || control.reason().is_some()),
+        None => RuntimeLease::private(request, retention_parent, || control.reason().is_some()),
     }
-    Ok(runtime)
+    .map_err(|error| error.to_string())
 }
 
 /// Verify the retained bytes and reobserve the host before spawn and after
@@ -1002,7 +1006,7 @@ fn verify_dependency_runtime(
     context: &DependencyExecContext,
     toolchain: &toolchain_pool::ToolchainLease,
     artifacts: Option<&PreparedArtifacts>,
-    runtime: &RetainedRuntime,
+    runtime: &RuntimeLease,
     control: &ExecutionControl,
 ) -> Result<(), String> {
     runtime
@@ -1432,7 +1436,14 @@ fn execute_canonical_inner(
         .dependency_context
         .as_ref()
         .map(|context| {
-            prepare_dependency_runtime(context, &toolchain, artifacts.as_ref(), spill_root, control)
+            prepare_dependency_runtime(
+                context,
+                &toolchain,
+                artifacts.as_ref(),
+                spill_root,
+                resources.runtime_pool,
+                control,
+            )
         })
         .transpose()
     {
@@ -1442,6 +1453,15 @@ fn execute_canonical_inner(
             return exec_error(request.request_id);
         }
     };
+    if let Some(runtime) = &dependency_runtime {
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "kind":"worker-runtime-acquired", "request_id":request.request_id,
+                "disposition":runtime.disposition(),
+            })
+        );
+    }
     let launch = if let Some(context) = &request.dependency_context {
         let runtime = dependency_runtime
             .as_ref()

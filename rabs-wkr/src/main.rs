@@ -755,6 +755,20 @@ fn main() {
             }
         }
     };
+    let runtime_pool = if cfg!(target_os = "linux") {
+        match rabs_sandbox::runtime_cohort::RuntimePool::new(
+            journal.storage_root(),
+            rabs_sandbox::runtime_cohort::MAX_RETAINED_RUNTIMES,
+        ) {
+            Ok(pool) => Some(std::sync::Arc::new(pool)),
+            Err(error) => {
+                eprintln!("rabs-wkr: runtime ownership unavailable: {error}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
     let report = probe_capability(&worker_id);
     eprintln!(
         "{{\"v\":1,\"kind\":\"rabs-wkr-boot\",\"worker_id\":{},\"canonical\":{},\"slots\":{},\"dependency_execution_modes\":{}}}",
@@ -778,6 +792,7 @@ fn main() {
             host_budget,
             target_cache,
             source_cache,
+            runtime_pool,
         },
     ));
 }
@@ -2108,6 +2123,7 @@ async fn session_loop(
             let host_budget = resources.host_budget.clone();
             let source_cache = resources.source_cache.clone();
             let target_cache = resources.target_cache.clone();
+            let runtime_pool = resources.runtime_pool.clone();
             let id = request.request_id;
             let retention = retain_result
                 .then(|| RetentionTarget::from_admitted(&journal_root, id, recipient.clone()))
@@ -2123,6 +2139,7 @@ async fn session_loop(
                     slots,
                     host_budget: host_budget.as_deref(),
                     source_cache: source_cache.as_ref(),
+                    runtime_pool: runtime_pool.as_deref(),
                     target_cache: target_cache.as_ref().map(|cache| (cache, target_scope)),
                 };
                 match source.as_ref() {

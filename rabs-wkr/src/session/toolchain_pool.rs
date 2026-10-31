@@ -144,6 +144,9 @@ impl ToolchainLease {
     pub(crate) fn root(&self) -> &Path {
         self.dataset.toolchain.root()
     }
+    pub(super) fn identity(&self) -> &ToolchainIdentity {
+        self.dataset.toolchain.identity()
+    }
     pub(crate) fn entry_count(&self) -> io::Result<usize> {
         self.dataset
             .toolchain

@@ -462,6 +462,27 @@ rights. Recovered outputs pass through the same original input checks, result
 capture and publication rules as an uninterrupted delivery. Workspace results
 retain their existing request-owned scope and do not become action-cache hits.
 
+### Reuse retained compiler runtimes
+
+A Linux worker retains up to four independently captured ELF runtime images
+within its process. The key binds the complete verified toolchain identity,
+compiler, ordered loader paths, requested runtime cohort and current output
+filesystem profile. Concurrent requests for the same image share preparation;
+an idle image can be evicted, while an active lease prevents deletion. If every
+retained image is busy, the execution receives an ordinary private capture.
+Each capture retains the existing bounds of 256 MiB of external libraries and
+4 MiB of loader-cache data.
+
+Warm acquisition avoids copying the runtime again. It still checks all retained
+bytes against the current attempt's filesystem, and the worker independently
+remeasures the host runtime before execution and after process cleanup and
+diagnostic drains. The original attempt's temporary output directory is not
+needed for reuse. Leases keep storage alive across reconnect and pool shutdown.
+Failed cleanup preserves uncertain storage and prevents further allocation;
+existing healthy leases can finish. Images are not adopted across restarts.
+The `worker-runtime-acquired` event reports `captured`, `reused` or `private`.
+This reuse does not expand the eligible compiler action classes.
+
 ### Reuse uploaded sources and dependency archives
 
 Workers retain digest-verified source bytes across sessions and restarts.
