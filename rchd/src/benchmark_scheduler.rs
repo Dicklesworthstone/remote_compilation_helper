@@ -24,7 +24,7 @@ use tracing::{debug, info, warn};
 use crate::disk_pressure::{DiskPressurePolicyConfig, PressureState, evaluate_pressure_policy};
 use crate::events::EventBus;
 use crate::telemetry::TelemetryStore;
-use crate::workers::{WorkerPool, WorkerState};
+use crate::workers::{BackgroundProbe, WorkerEndpointSnapshot, WorkerPool, WorkerState};
 
 /// Priority levels for benchmark requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -261,13 +261,13 @@ fn speedscore_from_total(score: f64, measured_at: DateTime<Utc>) -> SpeedScore {
 /// Persistence failures are surfaced as warnings but never fail the benchmark.
 async fn commit_benchmark_score(
     telemetry: &TelemetryStore,
-    pool: &WorkerPool,
+    worker: &WorkerState,
     worker_id: &WorkerId,
     score: &SpeedScore,
 ) {
-    if let Some(worker) = pool.get(worker_id).await {
-        worker.set_speed_score(selection_speedscore(score).unwrap_or(50.0));
-    }
+    // The caller holds this exact endpoint's publication guards. Looking up
+    // the reusable worker ID here could credit a different machine.
+    worker.set_speed_score(selection_speedscore(score).unwrap_or(50.0));
     if let Err(error) = telemetry
         .record_speedscore(worker_id.as_str(), score.clone())
         .await
@@ -367,7 +367,116 @@ pub struct BenchmarkScheduler {
 #[derive(Debug, Clone)]
 struct RunningBenchmark {
     request: ScheduledBenchmarkRequest,
+    /// A retry keeps its logical request ID but always gets a new attempt ID.
+    attempt_id: String,
+    finishing: bool,
     started_at: DateTime<Utc>,
+    worker: Arc<WorkerState>,
+    endpoint: WorkerEndpointSnapshot,
+    network: BackgroundProbe,
+}
+
+impl RunningBenchmark {
+    async fn new(request: ScheduledBenchmarkRequest, worker: Arc<WorkerState>) -> Self {
+        let network = worker.network_revision_guard();
+        let endpoint = worker.endpoint_snapshot().await;
+        Self {
+            request,
+            attempt_id: uuid::Uuid::new_v4().to_string(),
+            finishing: false,
+            started_at: Utc::now(),
+            worker,
+            endpoint,
+            network,
+        }
+    }
+}
+
+/// Own one claimed completion while keeping its scheduling marker visible.
+/// Neither a retry nor NewWorker detection may race asynchronous publication.
+struct BenchmarkCompletion {
+    active: Arc<RwLock<HashMap<WorkerId, RunningBenchmark>>>,
+    running: RunningBenchmark,
+    slot_released: bool,
+    finished: bool,
+}
+
+impl BenchmarkCompletion {
+    async fn release_slot(&mut self) {
+        if !self.slot_released {
+            // release_slots decrements synchronously before its drain-complete
+            // await; cancellation there must not release this reservation again.
+            self.slot_released = true;
+            self.running.worker.release_slots(1).await;
+        }
+    }
+
+    async fn finish(mut self) {
+        self.release_slot().await;
+        remove_finished_benchmark(
+            &self.active,
+            &self.running.request.worker_id,
+            &self.running.attempt_id,
+        )
+        .await;
+        self.finished = true;
+    }
+}
+
+impl Drop for BenchmarkCompletion {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let active = self.active.clone();
+        let worker = self.running.worker.clone();
+        let worker_id = self.running.request.worker_id.clone();
+        let attempt_id = self.running.attempt_id.clone();
+        let slot_released = self.slot_released;
+        // A publication can be cancelled while waiting for its endpoint,
+        // storage, or map lock. Keep ownership until a cleanup task removes
+        // this exact marker, without holding the map across any slow work.
+        tokio::spawn(async move {
+            if !slot_released {
+                worker.release_slots(1).await;
+            }
+            remove_finished_benchmark(&active, &worker_id, &attempt_id).await;
+        });
+    }
+}
+
+async fn remove_finished_benchmark(
+    running: &RwLock<HashMap<WorkerId, RunningBenchmark>>,
+    worker_id: &WorkerId,
+    attempt_id: &str,
+) {
+    let mut running = running.write().await;
+    if running
+        .get(worker_id)
+        .is_some_and(|current| current.attempt_id == attempt_id && current.finishing)
+    {
+        running.remove(worker_id);
+    }
+}
+
+/// Claim completion once without removing the in-progress scheduling marker.
+async fn claim_running_benchmark(
+    active: &Arc<RwLock<HashMap<WorkerId, RunningBenchmark>>>,
+    worker_id: &WorkerId,
+    attempt_id: &str,
+) -> Option<BenchmarkCompletion> {
+    let mut running = active.write().await;
+    let current = running.get_mut(worker_id)?;
+    if current.attempt_id != attempt_id || current.finishing {
+        return None;
+    }
+    current.finishing = true;
+    Some(BenchmarkCompletion {
+        active: active.clone(),
+        running: current.clone(),
+        slot_released: false,
+        finished: false,
+    })
 }
 
 /// Handle for sending manual benchmark triggers.
@@ -844,25 +953,32 @@ impl BenchmarkScheduler {
             return;
         }
 
-        // Get worker config for SSH connection
-        let worker_config = worker.config.read().await.clone();
-
-        // Track as running
-        let running = RunningBenchmark {
-            request: request.clone(),
-            started_at: Utc::now(),
+        // Retain the exact reservation owner and network generation through
+        // completion. Reload can remove/reintroduce the ID during execution.
+        let mut running = RunningBenchmark::new(request.clone(), worker.clone()).await;
+        running.network = admission.clone();
+        let attempt_id = running.attempt_id.clone();
+        let worker_config = running.endpoint.config.clone();
+        let tracked = {
+            let mut active = self.running.write().await;
+            if active.contains_key(&worker_id) || !admission.is_current() {
+                false
+            } else {
+                active.insert(worker_id.clone(), running);
+                true
+            }
         };
-        self.running
-            .write()
-            .await
-            .insert(worker_id.clone(), running);
+        if !tracked {
+            worker.release_slots(1).await;
+            self.enqueue(request).await;
+            return;
+        }
 
         // Emit started event
         self.events
             .emit("benchmark_started", &benchmark_started_event_data(&request));
 
         // Spawn benchmark execution task
-        let pool = self.pool.clone();
         let events = self.events.clone();
         let timeout = self.config.benchmark_timeout;
         let consecutive_failures = self.consecutive_failures.clone();
@@ -874,248 +990,309 @@ impl BenchmarkScheduler {
 
         tokio::spawn(async move {
             let start_time = std::time::Instant::now();
-            let Some(result) = admission
+            let result = admission
                 .run(execute_benchmark_on_worker(&worker_config, timeout))
-                .await
+                .await;
+            let Some(mut completion) =
+                claim_running_benchmark(&running_map, &worker_id, &attempt_id).await
             else {
-                running_map.write().await.remove(&worker_id);
-                pool.release_slots(&worker_id, 1).await;
-                debug!(worker_id = %worker_id, "Benchmark cancelled by worker state change");
                 return;
             };
-            let duration = start_time.elapsed();
+            completion.release_slot().await;
+            let running = &completion.running;
+            async {
+                let Some(result) = result else {
+                    debug!(worker_id = %worker_id, "Benchmark cancelled by worker state change");
+                    return;
+                };
+                let duration = start_time.elapsed();
+                let Some(_endpoint) = running
+                    .worker
+                    .lock_current_endpoint(&running.endpoint)
+                    .await
+                else {
+                    return;
+                };
+                let Some(_publication) = running
+                    .worker
+                    .lock_network_publication(&running.network)
+                    .await
+                else {
+                    return;
+                };
 
-            match result {
-                Ok((score, _exec_duration)) => {
-                    info!(
-                        worker_id = %worker_id,
-                        request_id = %request_id,
-                        score = score.total,
-                        duration_ms = duration.as_millis(),
-                        "Benchmark completed successfully"
-                    );
-
-                    // Persist the score and hydrate live selection state BEFORE
-                    // emitting completion, so the next scheduler pass observes
-                    // the persisted score and does not re-enqueue the worker as
-                    // NewWorker (issue #40).
-                    commit_benchmark_score(&telemetry, &pool, &worker_id, &score).await;
-
-                    // Remove from running
-                    running_map.write().await.remove(&worker_id);
-
-                    // Release slot
-                    pool.release_slots(&worker_id, 1).await;
-
-                    // Reset consecutive failure counter on success
-                    consecutive_failures.write().await.remove(&worker_id);
-                    last_failure.write().await.remove(&worker_id);
-
-                    // Emit completed event
-                    events.emit(
-                        "benchmark_completed",
-                        &benchmark_completed_event_data(&request_id, &worker_id, &score, duration),
-                    );
-                }
-                Err(e) => {
-                    let error_msg = e.to_string();
-                    let retryable = is_retryable_error(&error_msg);
-
-                    warn!(
-                        worker_id = %worker_id,
-                        request_id = %request_id,
-                        error = %error_msg,
-                        retryable = retryable,
-                        "Benchmark failed"
-                    );
-
-                    // Remove from running
-                    let running = running_map.write().await.remove(&worker_id);
-
-                    // Release slot
-                    pool.release_slots(&worker_id, 1).await;
-
-                    // Track consecutive failures
-                    let consecutive_count = {
-                        let mut failures = consecutive_failures.write().await;
-                        let count = failures.entry(worker_id.clone()).or_insert(0);
-                        *count += 1;
-                        *count
-                    };
-                    last_failure
-                        .write()
-                        .await
-                        .insert(worker_id.clone(), std::time::Instant::now());
-
-                    // Emit failed event
-                    events.emit(
-                        "benchmark_failed",
-                        &benchmark_failed_event_data(
-                            &request_id,
-                            &worker_id,
-                            &error_msg,
-                            retryable,
-                            consecutive_count,
-                        ),
-                    );
-
-                    // Emit alert if threshold exceeded
-                    if consecutive_count >= alert_threshold {
-                        warn!(
+                match result {
+                    Ok((score, _exec_duration)) => {
+                        info!(
                             worker_id = %worker_id,
-                            consecutive_failures = consecutive_count,
-                            threshold = alert_threshold,
-                            "Worker benchmark repeatedly failing - alerting"
+                            request_id = %request_id,
+                            score = score.total,
+                            duration_ms = duration.as_millis(),
+                            "Benchmark completed successfully"
                         );
+
+                        // Persist the score and hydrate live selection state BEFORE
+                        // emitting completion, so the next scheduler pass observes
+                        // the persisted score and does not re-enqueue the worker as
+                        // NewWorker (issue #40).
+                        commit_benchmark_score(&telemetry, &running.worker, &worker_id, &score)
+                            .await;
+
+                        // Reset consecutive failure counter on success
+                        consecutive_failures.write().await.remove(&worker_id);
+                        last_failure.write().await.remove(&worker_id);
+
+                        // Emit completed event
                         events.emit(
-                            "benchmark_alert_repeated_failures",
-                            &serde_json::json!({
-                                "worker_id": worker_id.as_str(),
-                                "consecutive_failures": consecutive_count,
-                                "threshold": alert_threshold,
-                                "last_error": error_msg,
-                            }),
+                            "benchmark_completed",
+                            &benchmark_completed_event_data(
+                                &request_id,
+                                &worker_id,
+                                &score,
+                                duration,
+                            ),
                         );
                     }
+                    Err(e) => {
+                        let error_msg = e.to_string();
+                        let retryable = is_retryable_error(&error_msg);
 
-                    // Re-queue if retryable
-                    if should_requeue_failed_benchmark(
-                        retryable,
-                        consecutive_count,
-                        alert_threshold,
-                    ) && let Some(running) = running
-                    {
-                        let mut req = running.request;
-                        req.priority = BenchmarkPriority::Low;
-                        req.requested_at = Utc::now();
+                        warn!(
+                            worker_id = %worker_id,
+                            request_id = %request_id,
+                            error = %error_msg,
+                            retryable = retryable,
+                            "Benchmark failed"
+                        );
 
-                        let mut queue = pending_queue.lock().await;
-                        queue.push_back(req);
+                        // Track consecutive failures
+                        let consecutive_count = {
+                            let mut failures = consecutive_failures.write().await;
+                            let count = failures.entry(worker_id.clone()).or_insert(0);
+                            *count += 1;
+                            *count
+                        };
+                        last_failure
+                            .write()
+                            .await
+                            .insert(worker_id.clone(), std::time::Instant::now());
+
+                        // Emit failed event
+                        events.emit(
+                            "benchmark_failed",
+                            &benchmark_failed_event_data(
+                                &request_id,
+                                &worker_id,
+                                &error_msg,
+                                retryable,
+                                consecutive_count,
+                            ),
+                        );
+
+                        // Emit alert if threshold exceeded
+                        if consecutive_count >= alert_threshold {
+                            warn!(
+                                worker_id = %worker_id,
+                                consecutive_failures = consecutive_count,
+                                threshold = alert_threshold,
+                                "Worker benchmark repeatedly failing - alerting"
+                            );
+                            events.emit(
+                                "benchmark_alert_repeated_failures",
+                                &serde_json::json!({
+                                    "worker_id": worker_id.as_str(),
+                                    "consecutive_failures": consecutive_count,
+                                    "threshold": alert_threshold,
+                                    "last_error": error_msg,
+                                }),
+                            );
+                        }
+
+                        // Re-queue if retryable
+                        if should_requeue_failed_benchmark(
+                            retryable,
+                            consecutive_count,
+                            alert_threshold,
+                        ) {
+                            let mut req = running.request.clone();
+                            req.priority = BenchmarkPriority::Low;
+                            req.requested_at = Utc::now();
+
+                            let mut queue = pending_queue.lock().await;
+                            queue.push_back(req);
+                        }
                     }
                 }
             }
+            .await;
+            completion.finish().await;
         });
     }
 
-    /// Mark a benchmark as completed.
-    pub async fn mark_completed(&self, worker_id: &WorkerId, score: f64, duration: Duration) {
-        let running = self.running.write().await.remove(worker_id);
+    /// Complete one execution attempt. Retries retain the logical request ID,
+    /// so only the attempt ID can identify the reservation being completed.
+    pub async fn mark_completed(
+        &self,
+        worker_id: &WorkerId,
+        attempt_id: &str,
+        score: f64,
+        duration: Duration,
+    ) {
+        let completion = claim_running_benchmark(&self.running, worker_id, attempt_id).await;
 
-        if let Some(running) = running {
-            let score = speedscore_from_total(score, Utc::now());
+        if let Some(mut completion) = completion {
+            completion.release_slot().await;
+            let running = &completion.running;
+            async {
+                let Some(_endpoint) = running
+                    .worker
+                    .lock_current_endpoint(&running.endpoint)
+                    .await
+                else {
+                    return;
+                };
+                let Some(_publication) = running
+                    .worker
+                    .lock_network_publication(&running.network)
+                    .await
+                else {
+                    return;
+                };
+                let score = speedscore_from_total(score, Utc::now());
 
-            info!(
-                worker_id = %worker_id,
-                request_id = %running.request.request_id,
-                score = score.total,
-                duration_ms = duration.as_millis(),
-                "Benchmark completed"
-            );
+                info!(
+                    worker_id = %worker_id,
+                    request_id = %running.request.request_id,
+                    score = score.total,
+                    duration_ms = duration.as_millis(),
+                    "Benchmark completed"
+                );
 
-            // Persist through the same single write path as the scheduler's
-            // own execution task (issue #40).
-            commit_benchmark_score(&self.telemetry, &self.pool, worker_id, &score).await;
+                // Persist through the same single write path as the scheduler's
+                // own execution task (issue #40).
+                commit_benchmark_score(&self.telemetry, &running.worker, worker_id, &score).await;
 
-            // Release slot
-            self.pool.release_slots(worker_id, 1).await;
+                // Credit the worker's circuit breaker: a completed benchmark is a
+                // successful round-trip to the worker, so it should count toward
+                // closing/keeping-closed the authoritative WorkerState.circuit that
+                // selection reads (the circuit is otherwise only advanced by the
+                // health monitor). Without this, benchmark success touched neither
+                // circuit store — a documented gap in the unification.
+                running.worker.record_success().await;
 
-            // Credit the worker's circuit breaker: a completed benchmark is a
-            // successful round-trip to the worker, so it should count toward
-            // closing/keeping-closed the authoritative WorkerState.circuit that
-            // selection reads (the circuit is otherwise only advanced by the
-            // health monitor). Without this, benchmark success touched neither
-            // circuit store — a documented gap in the unification.
-            if let Some(worker) = self.pool.get(worker_id).await {
-                worker.record_success().await;
+                // Reset consecutive failure counter on success
+                self.consecutive_failures.write().await.remove(worker_id);
+                self.last_failure.write().await.remove(worker_id);
+
+                // Emit completed event
+                self.events.emit(
+                    "benchmark_completed",
+                    &benchmark_completed_event_data(
+                        &running.request.request_id,
+                        worker_id,
+                        &score,
+                        duration,
+                    ),
+                );
             }
-
-            // Reset consecutive failure counter on success
-            self.consecutive_failures.write().await.remove(worker_id);
-            self.last_failure.write().await.remove(worker_id);
-
-            // Emit completed event
-            self.events.emit(
-                "benchmark_completed",
-                &benchmark_completed_event_data(
-                    &running.request.request_id,
-                    worker_id,
-                    &score,
-                    duration,
-                ),
-            );
+            .await;
+            completion.finish().await;
         }
     }
 
-    /// Mark a benchmark as failed.
-    pub async fn mark_failed(&self, worker_id: &WorkerId, error: &str, retryable: bool) {
-        let running = self.running.write().await.remove(worker_id);
+    /// Fail one execution attempt without consuming a newer retry's ownership.
+    pub async fn mark_failed(
+        &self,
+        worker_id: &WorkerId,
+        attempt_id: &str,
+        error: &str,
+        retryable: bool,
+    ) {
+        let completion = claim_running_benchmark(&self.running, worker_id, attempt_id).await;
 
-        if let Some(running) = running {
-            warn!(
-                worker_id = %worker_id,
-                request_id = %running.request.request_id,
-                error = error,
-                retryable = retryable,
-                "Benchmark failed"
-            );
-
-            // Release slot
-            self.pool.release_slots(worker_id, 1).await;
-
-            // Track consecutive failures and check for alert threshold
-            let consecutive_count = {
-                let mut failures = self.consecutive_failures.write().await;
-                let count = failures.entry(worker_id.clone()).or_insert(0);
-                *count += 1;
-                *count
-            };
-            self.last_failure
-                .write()
-                .await
-                .insert(worker_id.clone(), std::time::Instant::now());
-
-            // Emit failed event
-            self.events.emit(
-                "benchmark_failed",
-                &benchmark_failed_event_data(
-                    &running.request.request_id,
-                    worker_id,
-                    error,
-                    retryable,
-                    consecutive_count,
-                ),
-            );
-
-            // Emit alert if consecutive failure threshold exceeded
-            if consecutive_count >= self.config.consecutive_failure_alert_threshold {
+        if let Some(mut completion) = completion {
+            completion.release_slot().await;
+            let running = &completion.running;
+            async {
+                let Some(_endpoint) = running
+                    .worker
+                    .lock_current_endpoint(&running.endpoint)
+                    .await
+                else {
+                    return;
+                };
+                let Some(_publication) = running
+                    .worker
+                    .lock_network_publication(&running.network)
+                    .await
+                else {
+                    return;
+                };
                 warn!(
                     worker_id = %worker_id,
-                    consecutive_failures = consecutive_count,
-                    threshold = self.config.consecutive_failure_alert_threshold,
-                    "Worker benchmark repeatedly failing - alerting"
+                    request_id = %running.request.request_id,
+                    error = error,
+                    retryable = retryable,
+                    "Benchmark failed"
                 );
-                self.events.emit(
-                    "benchmark_alert_repeated_failures",
-                    &serde_json::json!({
-                        "worker_id": worker_id.as_str(),
-                        "consecutive_failures": consecutive_count,
-                        "threshold": self.config.consecutive_failure_alert_threshold,
-                        "last_error": error,
-                    }),
-                );
-            }
 
-            // Re-queue if retryable (with lower priority)
-            if should_requeue_failed_benchmark(
-                retryable,
-                consecutive_count,
-                self.config.consecutive_failure_alert_threshold,
-            ) {
-                let mut request = running.request;
-                request.priority = BenchmarkPriority::Low;
-                request.requested_at = Utc::now(); // Reset timestamp
-                self.enqueue(request).await;
+                // Track consecutive failures and check for alert threshold
+                let consecutive_count = {
+                    let mut failures = self.consecutive_failures.write().await;
+                    let count = failures.entry(worker_id.clone()).or_insert(0);
+                    *count += 1;
+                    *count
+                };
+                self.last_failure
+                    .write()
+                    .await
+                    .insert(worker_id.clone(), std::time::Instant::now());
+
+                // Emit failed event
+                self.events.emit(
+                    "benchmark_failed",
+                    &benchmark_failed_event_data(
+                        &running.request.request_id,
+                        worker_id,
+                        error,
+                        retryable,
+                        consecutive_count,
+                    ),
+                );
+
+                // Emit alert if consecutive failure threshold exceeded
+                if consecutive_count >= self.config.consecutive_failure_alert_threshold {
+                    warn!(
+                        worker_id = %worker_id,
+                        consecutive_failures = consecutive_count,
+                        threshold = self.config.consecutive_failure_alert_threshold,
+                        "Worker benchmark repeatedly failing - alerting"
+                    );
+                    self.events.emit(
+                        "benchmark_alert_repeated_failures",
+                        &serde_json::json!({
+                            "worker_id": worker_id.as_str(),
+                            "consecutive_failures": consecutive_count,
+                            "threshold": self.config.consecutive_failure_alert_threshold,
+                            "last_error": error,
+                        }),
+                    );
+                }
+
+                // Re-queue if retryable (with lower priority)
+                if should_requeue_failed_benchmark(
+                    retryable,
+                    consecutive_count,
+                    self.config.consecutive_failure_alert_threshold,
+                ) {
+                    let mut request = running.request.clone();
+                    request.priority = BenchmarkPriority::Low;
+                    request.requested_at = Utc::now(); // Reset timestamp
+                    self.enqueue(request).await;
+                }
             }
+            .await;
+            completion.finish().await;
         }
     }
 
@@ -1149,18 +1326,28 @@ async fn execute_benchmark_on_worker(
     worker: &rch_common::WorkerConfig,
     timeout: Duration,
 ) -> anyhow::Result<(SpeedScore, Duration)> {
-    let (command, input) = benchmark_ssh_command(worker, timeout);
-    debug!(
-        worker_id = %worker.id,
-        host = %worker.host,
-        "Executing benchmark via SSH"
-    );
-    execute_benchmark_process(command, input, timeout).await
+    // Include the local client probe in the same budget as authentication,
+    // execution and cleanup. Admission cancellation also owns this probe.
+    tokio::time::timeout(timeout, async {
+        let can_disable_background =
+            rch_common::ssh::ssh_can_disable_background(std::path::Path::new("ssh"), timeout)
+                .await?;
+        let (command, input) = benchmark_ssh_command(worker, timeout, can_disable_background);
+        debug!(
+            worker_id = %worker.id,
+            host = %worker.host,
+            "Executing benchmark via SSH"
+        );
+        execute_benchmark_process(command, input, timeout).await
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("Benchmark timed out after {:?}", timeout))?
 }
 
 fn benchmark_ssh_command(
     worker: &rch_common::WorkerConfig,
     timeout: Duration,
+    can_disable_background: bool,
 ) -> (tokio::process::Command, Option<String>) {
     use tokio::process::Command;
 
@@ -1178,6 +1365,9 @@ fn benchmark_ssh_command(
     // Build SSH command to run benchmark on worker
     let mut cmd = Command::new("ssh");
     cmd.arg("-o").arg("BatchMode=yes");
+    // Every benchmark owns one foreground transport. Inheriting a retry loop
+    // or a persistent/forked mux would let it outlive disablement or timeout.
+    rch_common::ssh::configure_oneshot_ssh(&mut cmd, can_disable_background);
     cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
     cmd.arg("-o")
         .arg(format!("ConnectTimeout={}", timeout.as_secs().min(30)));
@@ -1252,25 +1442,18 @@ async fn execute_benchmark_process(
     });
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
-    // Defense in depth: if the surrounding task is dropped mid-flight (e.g.
-    // a panic, scheduler shutdown, or a parent select! losing the race),
-    // the spawned ssh process should not outlive us. The explicit
-    // `child.kill().await` calls below cover the timeout/IO error paths;
-    // `kill_on_drop` covers the panic-unwind/cancellation paths.
-    cmd.kill_on_drop(true);
-
-    let mut child = cmd
-        .spawn()
+    // A ProxyCommand can keep dialing after its SSH parent dies. Own the
+    // entire process group through output draining and reaping, including
+    // cancellation when the worker goes offline or an operator disables it.
+    let mut child = rch_common::ssh::OwnedProcessGroup::spawn(&mut cmd)
         .map_err(|e| anyhow::anyhow!("Failed to spawn SSH command: {}", e))?;
     let stdout = child
-        .stdout
-        .take()
+        .take_stdout()
         .ok_or_else(|| anyhow::anyhow!("Failed to capture stdout from SSH command"))?;
     let stderr = child
-        .stderr
-        .take()
+        .take_stderr()
         .ok_or_else(|| anyhow::anyhow!("Failed to capture stderr from SSH command"))?;
-    let stdin = child.stdin.take();
+    let stdin = child.take_stdin();
 
     let mut stdout_buf = Vec::new();
     let mut stderr_buf = Vec::new();
@@ -1294,12 +1477,12 @@ async fn execute_benchmark_process(
     match tokio::time::timeout(timeout, read_future).await {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => {
-            let _ = child.kill().await;
+            let _ = child.start_kill();
             let _ = child.wait().await; // Prevent zombie
             return Err(anyhow::anyhow!("Failed to read benchmark output: {}", e));
         }
         Err(_) => {
-            let _ = child.kill().await;
+            let _ = child.start_kill();
             let _ = child.wait().await; // Prevent zombie
             return Err(anyhow::anyhow!("Benchmark timed out after {:?}", timeout));
         }
@@ -1314,7 +1497,7 @@ async fn execute_benchmark_process(
             ));
         }
         Err(_) => {
-            let _ = child.kill().await;
+            let _ = child.start_kill();
             let _ = child.wait().await; // Prevent zombie
             return Err(anyhow::anyhow!(
                 "Benchmark process hung after closing output"
@@ -1735,13 +1918,32 @@ mod tests {
         }
     }
 
+    async fn test_running_benchmark(
+        request: ScheduledBenchmarkRequest,
+        pool: &WorkerPool,
+    ) -> RunningBenchmark {
+        let worker = pool.get(&request.worker_id).await.unwrap_or_else(|| {
+            Arc::new(WorkerState::new(make_worker_config(
+                request.worker_id.as_str(),
+            )))
+        });
+        RunningBenchmark::new(request, worker).await
+    }
+
+    async fn test_running_attempt_id(
+        scheduler: &BenchmarkScheduler,
+        worker_id: &WorkerId,
+    ) -> String {
+        scheduler.running.read().await[worker_id].attempt_id.clone()
+    }
+
     #[test]
     fn test_benchmark_ssh_command_keeps_posix_command_out_of_windows_argv() {
         for os in ["linux", "Windows"] {
             let mut worker = make_worker_config("worker-1");
             worker.tags = vec![rch_common::types::os_tag(os)];
             worker.identity_file = "/private/key with spaces".into();
-            let (command, input) = benchmark_ssh_command(&worker, Duration::from_secs(300));
+            let (command, input) = benchmark_ssh_command(&worker, Duration::from_secs(300), true);
             let argv: Vec<_> = command.as_std().get_args().collect();
             assert_eq!(command.as_std().get_program(), "ssh");
             assert!(argv.contains(&std::ffi::OsStr::new("ConnectTimeout=30")));
@@ -1777,6 +1979,72 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn test_benchmark_ssh_config_cannot_reenable_retries_or_background_multiplexing() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("ssh_config");
+        let supports_foreground = rch_common::ssh::ssh_can_disable_background(
+            std::path::Path::new("ssh"),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        let mut contents = String::from(
+            "Host *\n  ConnectionAttempts 9\n  ControlMaster auto\n  ControlPersist 600\n  ControlPath /tmp/unrelated-benchmark-master\n",
+        );
+        if supports_foreground {
+            contents.push_str("  ForkAfterAuthentication yes\n");
+        }
+        std::fs::write(&config, contents).unwrap();
+        let (command, _) = benchmark_ssh_command(
+            &make_worker_config("worker-1"),
+            Duration::from_secs(5),
+            supports_foreground,
+        );
+        // Use the real local client's configuration resolver. -G never dials
+        // the target, and -F confines the inherited settings to this fixture.
+        let output = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::process::Command::new("ssh")
+                .args(["-G", "-T", "-F"])
+                .arg(&config)
+                .args(command.as_std().get_args())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let resolved = String::from_utf8(output.stdout).unwrap();
+        for expected in [
+            "connectionattempts 1",
+            "controlmaster false",
+            "controlpersist no",
+        ] {
+            assert!(resolved.lines().any(|line| line == expected), "{resolved}");
+        }
+        assert!(
+            !resolved
+                .lines()
+                .any(|line| line.starts_with("controlpath ")),
+            "an owned transport must not borrow an unrelated master: {resolved}"
+        );
+        if supports_foreground {
+            assert!(
+                resolved
+                    .lines()
+                    .any(|line| line == "forkafterauthentication no"),
+                "{resolved}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn test_benchmark_process_executes_both_shell_transports_and_parses_components() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1799,7 +2067,7 @@ mod tests {
         for os in ["linux", "windows"] {
             let mut worker = make_worker_config("worker-1");
             worker.tags = vec![rch_common::types::os_tag(os)];
-            let (ssh, input) = benchmark_ssh_command(&worker, Duration::from_secs(5));
+            let (ssh, input) = benchmark_ssh_command(&worker, Duration::from_secs(5), true);
             let mut shell = tokio::process::Command::new("sh");
             shell
                 .arg("-c")
@@ -1927,6 +2195,145 @@ mod tests {
             })
             .await
             .expect("owned foreground child must be killed and reaped");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct BenchmarkFixtureProcess {
+        pid: i32,
+        started_at: String,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl BenchmarkFixtureProcess {
+        fn state(pid: i32) -> Option<(char, String)> {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            let (_, fields) = stat.rsplit_once(") ")?;
+            let mut fields = fields.split_whitespace();
+            let state = fields.next()?.chars().next()?;
+            let started_at = fields.nth(18)?.to_string();
+            Some((state, started_at))
+        }
+
+        fn is_alive(&self) -> bool {
+            Self::state(self.pid).is_some_and(|(state, started_at)| {
+                started_at == self.started_at && !matches!(state, 'Z' | 'X')
+            })
+        }
+
+        async fn read(path: &std::path::Path) -> Self {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Ok(contents) = std::fs::read_to_string(path)
+                        && let Ok(pid) = contents.trim().parse::<i32>()
+                        && let Some((_, started_at)) = Self::state(pid)
+                    {
+                        break Self { pid, started_at };
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("fixture must report the process identity before cancellation")
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for BenchmarkFixtureProcess {
+        fn drop(&mut self) {
+            // Also clean up after an assertion failure on the old transport.
+            // Never signal a reused PID belonging to an unrelated process.
+            if self.is_alive() {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(self.pid),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn offline_worker_benchmark_stops_proxy_on_disable_timeout_and_exit() {
+        for termination in ["disable", "timeout", "exit"] {
+            let directory = tempfile::tempdir().unwrap();
+            let worker = WorkerState::new(make_worker_config("worker-1"));
+            assert!(worker.reserve_slots(2).await);
+            let mut admission = worker.background_probe().await.unwrap();
+            let mut unrelated = tokio::process::Command::new("sleep")
+                .arg("30")
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut command = tokio::process::Command::new("sh");
+            command
+                .args([
+                    "-c",
+                    r#"printf '%s\n' "$$" > "$1/leader"
+sleep 30 </dev/null >/dev/null 2>&1 &
+printf '%s\n' "$!" > "$1/proxy"
+if [ "$2" = exit ]; then
+    while [ ! -e "$1/release" ]; do sleep 0.01; done
+    printf '%s\n' '{"score":72.5}'
+    exit 0
+fi
+wait
+"#,
+                    "benchmark-proxy-fixture",
+                ])
+                .arg(directory.path())
+                .arg(termination);
+            let timeout = if termination == "timeout" {
+                Duration::from_secs(1)
+            } else {
+                Duration::from_secs(30)
+            };
+            let task = tokio::spawn(async move {
+                admission
+                    .run(execute_benchmark_process(command, None, timeout))
+                    .await
+            });
+            let leader = BenchmarkFixtureProcess::read(&directory.path().join("leader")).await;
+            let proxy = BenchmarkFixtureProcess::read(&directory.path().join("proxy")).await;
+            assert!(proxy.is_alive());
+            match termination {
+                "disable" => worker.disable(Some("operator disabled".into())).await,
+                "exit" => std::fs::write(directory.path().join("release"), b"release").unwrap(),
+                _ => {}
+            }
+            let result = tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("benchmark termination must be bounded")
+                .unwrap();
+            match termination {
+                "disable" => assert!(result.is_none(), "disable must revoke the running probe"),
+                "timeout" => assert!(
+                    result
+                        .unwrap()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("Benchmark timed out")
+                ),
+                "exit" => assert_eq!(result.unwrap().unwrap().0.total, 72.5),
+                _ => unreachable!(),
+            }
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while proxy.is_alive()
+                    || std::path::Path::new(&format!("/proc/{}", leader.pid)).exists()
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the SSH leader must be reaped and its proxy descendant stopped");
+            assert!(unrelated.try_wait().unwrap().is_none());
+            assert_eq!(
+                worker.used_slots(),
+                2,
+                "probe cleanup must preserve build reservations"
+            );
+            unrelated.kill().await.unwrap();
+            unrelated.wait().await.unwrap();
         }
     }
 
@@ -2123,25 +2530,27 @@ mod tests {
             let mut running = scheduler.running.write().await;
             running.insert(
                 WorkerId::new("w1"),
-                RunningBenchmark {
-                    request: ScheduledBenchmarkRequest::new(
+                test_running_benchmark(
+                    ScheduledBenchmarkRequest::new(
                         WorkerId::new("w1"),
                         BenchmarkPriority::Normal,
                         BenchmarkReason::Scheduled,
                     ),
-                    started_at: Utc::now(),
-                },
+                    &scheduler.pool,
+                )
+                .await,
             );
             running.insert(
                 WorkerId::new("w2"),
-                RunningBenchmark {
-                    request: ScheduledBenchmarkRequest::new(
+                test_running_benchmark(
+                    ScheduledBenchmarkRequest::new(
                         WorkerId::new("w2"),
                         BenchmarkPriority::Normal,
                         BenchmarkReason::Scheduled,
                     ),
-                    started_at: Utc::now(),
-                },
+                    &scheduler.pool,
+                )
+                .await,
             );
         }
 
@@ -2247,14 +2656,15 @@ mod tests {
             let mut running = scheduler.running.write().await;
             running.insert(
                 worker_id.clone(),
-                RunningBenchmark {
-                    request: ScheduledBenchmarkRequest::new(
+                test_running_benchmark(
+                    ScheduledBenchmarkRequest::new(
                         worker_id.clone(),
                         BenchmarkPriority::Normal,
                         BenchmarkReason::Scheduled,
                     ),
-                    started_at: Utc::now(),
-                },
+                    &pool,
+                )
+                .await,
             );
         }
 
@@ -2266,7 +2676,12 @@ mod tests {
 
         // Mark completed
         scheduler
-            .mark_completed(&worker_id, 75.0, Duration::from_secs(30))
+            .mark_completed(
+                &worker_id,
+                &test_running_attempt_id(&scheduler, &worker_id).await,
+                75.0,
+                Duration::from_secs(30),
+            )
             .await;
 
         // Check running is empty
@@ -2285,6 +2700,387 @@ mod tests {
         assert_eq!(event["event"], "benchmark_completed");
         assert_eq!(event["data"]["job_id"], event["data"]["request_id"]);
         assert_eq!(event["data"]["speedscore"]["total"], 75.0);
+    }
+
+    #[tokio::test]
+    async fn offline_worker_benchmark_completion_preserves_endpoint_and_admin_ownership() {
+        use rch_telemetry::storage::TelemetryStorage;
+
+        for change in ["replace", "retarget", "disable-enable"] {
+            for success in [false, true] {
+                let pool = WorkerPool::new();
+                let worker_id = WorkerId::new("benchmark-owner");
+                let mut config = make_worker_config(worker_id.as_str());
+                pool.add_worker(config.clone()).await;
+                let original = pool.get(&worker_id).await.unwrap();
+                // One active build and one optional benchmark have separate
+                // reservations. Completion may release only the latter.
+                assert!(original.reserve_slots(2).await);
+                let request = ScheduledBenchmarkRequest::new(
+                    worker_id.clone(),
+                    BenchmarkPriority::Normal,
+                    BenchmarkReason::Scheduled,
+                );
+                let running = RunningBenchmark::new(request, original.clone()).await;
+                let attempt_id = running.attempt_id.clone();
+                let telemetry = Arc::new(TelemetryStore::new(
+                    Duration::from_secs(300),
+                    Some(Arc::new(TelemetryStorage::new_in_memory().unwrap())),
+                ));
+                let events = EventBus::new(16);
+                let mut emitted = events.subscribe();
+                let (scheduler, _) = BenchmarkScheduler::new(
+                    make_test_config(),
+                    pool.clone(),
+                    telemetry.clone(),
+                    events,
+                );
+                scheduler
+                    .running
+                    .write()
+                    .await
+                    .insert(worker_id.clone(), running);
+
+                match change {
+                    "replace" => {
+                        assert!(pool.remove_worker(&worker_id).await);
+                        config.host = "replacement".into();
+                        pool.add_worker(config.clone()).await;
+                        assert!(pool.get(&worker_id).await.unwrap().reserve_slots(2).await);
+                    }
+                    "retarget" => {
+                        config.host = "replacement".into();
+                        pool.add_worker(config.clone()).await;
+                    }
+                    "disable-enable" => {
+                        original.disable(Some("operator disabled".into())).await;
+                        original.enable().await;
+                    }
+                    _ => unreachable!(),
+                }
+                let current = pool.get(&worker_id).await.unwrap();
+                let prior_score = current.get_speed_score();
+                if success {
+                    scheduler
+                        .mark_completed(&worker_id, &attempt_id, 75.0, Duration::from_secs(1))
+                        .await;
+                } else {
+                    scheduler
+                        .mark_failed(&worker_id, &attempt_id, "connection refused", true)
+                        .await;
+                }
+                assert_eq!(
+                    original.used_slots(),
+                    1,
+                    "active build remains owned after {change}"
+                );
+                if change == "replace" {
+                    assert_eq!(
+                        current.used_slots(),
+                        2,
+                        "old completion must not release replacement builds"
+                    );
+                }
+                assert_eq!(current.get_speed_score(), prior_score);
+                assert!(
+                    telemetry
+                        .latest_speedscore(worker_id.as_str())
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(scheduler.running_count().await, 0);
+                assert_eq!(scheduler.pending_count().await, 0);
+                assert!(scheduler.consecutive_failures.read().await.is_empty());
+                assert!(
+                    emitted.try_recv().is_err(),
+                    "stale completion must not publish an event"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_worker_benchmark_duplicate_completion_cannot_release_new_request() {
+        let pool = WorkerPool::new();
+        let worker_id = WorkerId::new("benchmark-duplicate");
+        pool.add_worker(make_worker_config(worker_id.as_str()))
+            .await;
+        let worker = pool.get(&worker_id).await.unwrap();
+        assert!(worker.reserve_slots(2).await);
+        let events = EventBus::new(16);
+        let mut emitted = events.subscribe();
+        let (scheduler, _) = BenchmarkScheduler::new(
+            make_test_config(),
+            pool.clone(),
+            Arc::new(TelemetryStore::new(Duration::from_secs(300), None)),
+            events,
+        );
+        let request = ScheduledBenchmarkRequest::new(
+            worker_id.clone(),
+            BenchmarkPriority::Normal,
+            BenchmarkReason::Scheduled,
+        );
+        let running = RunningBenchmark::new(request, worker.clone()).await;
+        let completed_id = running.attempt_id.clone();
+        scheduler
+            .running
+            .write()
+            .await
+            .insert(worker_id.clone(), running);
+        tokio::join!(
+            scheduler.mark_completed(&worker_id, &completed_id, 75.0, Duration::from_secs(1)),
+            scheduler.mark_completed(&worker_id, &completed_id, 75.0, Duration::from_secs(1)),
+            scheduler.mark_failed(&worker_id, &completed_id, "late failure", false),
+        );
+        assert_eq!(worker.used_slots(), 1);
+        assert_eq!(scheduler.running_count().await, 0);
+        assert!(emitted.try_recv().is_ok());
+        assert!(
+            emitted.try_recv().is_err(),
+            "only the first completion publishes"
+        );
+
+        assert!(worker.reserve_slots(1).await);
+        let next = ScheduledBenchmarkRequest::new(
+            worker_id.clone(),
+            BenchmarkPriority::Normal,
+            BenchmarkReason::Scheduled,
+        );
+        let running = RunningBenchmark::new(next, worker.clone()).await;
+        let next_id = running.attempt_id.clone();
+        scheduler
+            .running
+            .write()
+            .await
+            .insert(worker_id.clone(), running);
+        scheduler
+            .mark_completed(&worker_id, &completed_id, 99.0, Duration::from_secs(1))
+            .await;
+        scheduler
+            .mark_failed(&worker_id, &completed_id, "late old failure", true)
+            .await;
+        assert_eq!(
+            worker.used_slots(),
+            2,
+            "late duplicate cannot release the next benchmark"
+        );
+        assert_eq!(scheduler.running_count().await, 1);
+        assert_eq!(
+            test_running_attempt_id(&scheduler, &worker_id).await,
+            next_id
+        );
+        assert!(emitted.try_recv().is_err());
+        scheduler
+            .mark_completed(&worker_id, &next_id, 75.0, Duration::from_secs(1))
+            .await;
+        assert_eq!(worker.used_slots(), 1);
+    }
+
+    #[tokio::test]
+    async fn offline_worker_benchmark_retry_rejects_completion_from_previous_attempt() {
+        let pool = WorkerPool::new();
+        let worker_id = WorkerId::new("benchmark-retry");
+        pool.add_worker(make_worker_config(worker_id.as_str()))
+            .await;
+        let worker = pool.get(&worker_id).await.unwrap();
+        assert!(worker.reserve_slots(2).await);
+        let events = EventBus::new(16);
+        let mut emitted = events.subscribe();
+        let (scheduler, _) = BenchmarkScheduler::new(
+            make_test_config(),
+            pool,
+            Arc::new(TelemetryStore::new(Duration::from_secs(300), None)),
+            events,
+        );
+        let request = ScheduledBenchmarkRequest::new(
+            worker_id.clone(),
+            BenchmarkPriority::Normal,
+            BenchmarkReason::Scheduled,
+        );
+        let logical_id = request.request_id.clone();
+        let first = RunningBenchmark::new(request, worker.clone()).await;
+        let first_attempt = first.attempt_id.clone();
+        scheduler
+            .running
+            .write()
+            .await
+            .insert(worker_id.clone(), first);
+        scheduler
+            .mark_failed(&worker_id, &first_attempt, "connection refused", true)
+            .await;
+        assert_eq!(worker.used_slots(), 1);
+
+        // Consume the real retry emitted by mark_failed, preserving its
+        // logical request identity exactly as the scheduler does.
+        let retried = scheduler.pending_queue.lock().await.pop_front().unwrap();
+        assert_eq!(retried.request_id, logical_id);
+        assert!(worker.reserve_slots(1).await);
+        let retry = RunningBenchmark::new(retried, worker.clone()).await;
+        let retry_attempt = retry.attempt_id.clone();
+        assert_ne!(retry_attempt, first_attempt);
+        scheduler
+            .running
+            .write()
+            .await
+            .insert(worker_id.clone(), retry);
+        while let Ok(event) = emitted.try_recv() {
+            let event: serde_json::Value = serde_json::from_str(&event).unwrap();
+            assert_eq!(event["data"]["request_id"], logical_id);
+        }
+
+        tokio::join!(
+            scheduler.mark_completed(&worker_id, &first_attempt, 99.0, Duration::from_secs(1)),
+            scheduler.mark_failed(&worker_id, &first_attempt, "delayed old failure", true),
+        );
+        assert_eq!(
+            worker.used_slots(),
+            2,
+            "a late result cannot release the retry"
+        );
+        assert_eq!(
+            test_running_attempt_id(&scheduler, &worker_id).await,
+            retry_attempt
+        );
+        assert_eq!(scheduler.pending_count().await, 0);
+        assert_eq!(scheduler.consecutive_failures.read().await[&worker_id], 1);
+        assert!(emitted.try_recv().is_err());
+
+        scheduler
+            .mark_completed(&worker_id, &retry_attempt, 75.0, Duration::from_secs(1))
+            .await;
+        assert_eq!(worker.used_slots(), 1);
+        let event: serde_json::Value = serde_json::from_str(&emitted.try_recv().unwrap()).unwrap();
+        assert_eq!(event["event"], "benchmark_completed");
+        assert_eq!(event["data"]["request_id"], logical_id);
+    }
+
+    #[tokio::test]
+    async fn offline_worker_benchmark_finishing_blocks_rescheduling_and_cleans_up_on_cancel() {
+        use rch_telemetry::storage::TelemetryStorage;
+
+        for cancel in [false, true] {
+            let pool = WorkerPool::new();
+            let worker_id = WorkerId::new("benchmark-finishing");
+            pool.add_worker(make_worker_config(worker_id.as_str()))
+                .await;
+            let worker = pool.get(&worker_id).await.unwrap();
+            assert!(worker.reserve_slots(2).await);
+            let telemetry = Arc::new(TelemetryStore::new(
+                Duration::from_secs(300),
+                Some(Arc::new(TelemetryStorage::new_in_memory().unwrap())),
+            ));
+            let (scheduler, _) = BenchmarkScheduler::new(
+                make_test_config(),
+                pool,
+                telemetry.clone(),
+                EventBus::new(16),
+            );
+            let scheduler = Arc::new(scheduler);
+            let running = RunningBenchmark::new(
+                ScheduledBenchmarkRequest::new(
+                    worker_id.clone(),
+                    BenchmarkPriority::Normal,
+                    BenchmarkReason::Scheduled,
+                ),
+                worker.clone(),
+            )
+            .await;
+            let attempt_id = running.attempt_id.clone();
+            let network = running.network.clone();
+            // Hold publication immediately before score persistence. This is
+            // a deterministic scheduling window, with no filesystem timing.
+            let publication = worker.lock_network_publication(&network).await.unwrap();
+            scheduler
+                .running
+                .write()
+                .await
+                .insert(worker_id.clone(), running);
+            let completing = {
+                let scheduler = scheduler.clone();
+                let worker_id = worker_id.clone();
+                let attempt_id = attempt_id.clone();
+                tokio::spawn(async move {
+                    scheduler
+                        .mark_completed(&worker_id, &attempt_id, 75.0, Duration::from_secs(1))
+                        .await;
+                })
+            };
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let finishing = scheduler
+                        .running
+                        .read()
+                        .await
+                        .get(&worker_id)
+                        .is_some_and(|running| running.finishing);
+                    if finishing && worker.used_slots() == 1 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("completion must claim and release its own reservation");
+            assert!(
+                telemetry
+                    .latest_speedscore(worker_id.as_str())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                scheduler.should_benchmark(&worker).await.is_none(),
+                "finishing remains in progress until publication finishes"
+            );
+            scheduler
+                .mark_failed(
+                    &worker_id,
+                    &attempt_id,
+                    "duplicate during persistence",
+                    true,
+                )
+                .await;
+            assert_eq!(worker.used_slots(), 1);
+            assert_eq!(scheduler.pending_count().await, 0);
+
+            if cancel {
+                completing.abort();
+                assert!(completing.await.unwrap_err().is_cancelled());
+                drop(publication);
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while scheduler.running_count().await != 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("cancelled publication must retire its finishing marker");
+                assert!(
+                    telemetry
+                        .latest_speedscore(worker_id.as_str())
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            } else {
+                drop(publication);
+                completing.await.unwrap();
+                assert_eq!(scheduler.running_count().await, 0);
+                assert!(
+                    telemetry
+                        .latest_speedscore(worker_id.as_str())
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+                assert!(scheduler.should_benchmark(&worker).await.is_none());
+            }
+            assert_eq!(
+                worker.used_slots(),
+                1,
+                "cleanup may not release the active build"
+            );
+        }
     }
 
     /// Regression for issue #40: a successful legacy benchmark must persist its
@@ -2322,15 +3118,17 @@ mod tests {
             let mut running = scheduler.running.write().await;
             running.insert(
                 worker_id.clone(),
-                RunningBenchmark {
-                    request: first,
-                    started_at: Utc::now(),
-                },
+                test_running_benchmark(first, &pool).await,
             );
         }
         worker.reserve_slots(1).await;
         scheduler
-            .mark_completed(&worker_id, 75.0, Duration::from_secs(30))
+            .mark_completed(
+                &worker_id,
+                &test_running_attempt_id(&scheduler, &worker_id).await,
+                75.0,
+                Duration::from_secs(30),
+            )
             .await;
 
         // The next pass must NOT re-enqueue as NewWorker: the legacy result is
@@ -2512,7 +3310,7 @@ mod tests {
         let worker = pool.get(&worker_id).await.unwrap();
         let score =
             parse_benchmark_output(r#"{"score":100,"raw":{"cpu_ops_per_second":750000}}"#).unwrap();
-        commit_benchmark_score(&telemetry, &pool, &worker_id, &score).await;
+        commit_benchmark_score(&telemetry, &worker, &worker_id, &score).await;
         assert!((worker.get_speed_score() - 75.0).abs() < 1e-9);
 
         let restarted_pool = WorkerPool::new();
@@ -2578,14 +3376,15 @@ mod tests {
             let mut running = scheduler.running.write().await;
             running.insert(
                 worker_id.clone(),
-                RunningBenchmark {
-                    request: ScheduledBenchmarkRequest::new(
+                test_running_benchmark(
+                    ScheduledBenchmarkRequest::new(
                         worker_id.clone(),
                         BenchmarkPriority::High, // Started as high priority
                         BenchmarkReason::NewWorker,
                     ),
-                    started_at: Utc::now(),
-                },
+                    &pool,
+                )
+                .await,
             );
         }
 
@@ -2596,7 +3395,12 @@ mod tests {
 
         // Mark failed with retryable
         scheduler
-            .mark_failed(&worker_id, "SSH connection failed", true)
+            .mark_failed(
+                &worker_id,
+                &test_running_attempt_id(&scheduler, &worker_id).await,
+                "SSH connection failed",
+                true,
+            )
             .await;
 
         // Check it was re-queued with Low priority
@@ -2632,14 +3436,15 @@ mod tests {
             let mut running = scheduler.running.write().await;
             running.insert(
                 worker_id.clone(),
-                RunningBenchmark {
-                    request: ScheduledBenchmarkRequest::new(
+                test_running_benchmark(
+                    ScheduledBenchmarkRequest::new(
                         worker_id.clone(),
                         BenchmarkPriority::Normal,
                         BenchmarkReason::Scheduled,
                     ),
-                    started_at: Utc::now(),
-                },
+                    &pool,
+                )
+                .await,
             );
         }
 
@@ -2650,7 +3455,12 @@ mod tests {
 
         // Mark failed without retry
         scheduler
-            .mark_failed(&worker_id, "Worker removed", false)
+            .mark_failed(
+                &worker_id,
+                &test_running_attempt_id(&scheduler, &worker_id).await,
+                "Worker removed",
+                false,
+            )
             .await;
 
         // Check it was NOT re-queued
@@ -2675,18 +3485,24 @@ mod tests {
 
         scheduler.running.write().await.insert(
             worker_id.clone(),
-            RunningBenchmark {
-                request: ScheduledBenchmarkRequest::new(
+            test_running_benchmark(
+                ScheduledBenchmarkRequest::new(
                     worker_id.clone(),
                     BenchmarkPriority::High,
                     BenchmarkReason::NewWorker,
                 ),
-                started_at: Utc::now(),
-            },
+                &pool,
+            )
+            .await,
         );
         worker.reserve_slots(1).await;
         scheduler
-            .mark_failed(&worker_id, "Benchmark timed out after 300s", true)
+            .mark_failed(
+                &worker_id,
+                &test_running_attempt_id(&scheduler, &worker_id).await,
+                "Benchmark timed out after 300s",
+                true,
+            )
             .await;
         scheduler.pending_queue.lock().await.clear();
 
@@ -2723,14 +3539,15 @@ mod tests {
                 let mut running = scheduler.running.write().await;
                 running.insert(
                     worker_id.clone(),
-                    RunningBenchmark {
-                        request: ScheduledBenchmarkRequest::new(
+                    test_running_benchmark(
+                        ScheduledBenchmarkRequest::new(
                             worker_id.clone(),
                             BenchmarkPriority::Normal,
                             BenchmarkReason::Scheduled,
                         ),
-                        started_at: Utc::now(),
-                    },
+                        pool,
+                    )
+                    .await,
                 );
             }
             // Reserve a slot
@@ -2742,7 +3559,12 @@ mod tests {
         // Simulate first benchmark run and failure
         simulate_running_benchmark(&scheduler, &pool, &worker_id).await;
         scheduler
-            .mark_failed(&worker_id, "Connection timeout", true)
+            .mark_failed(
+                &worker_id,
+                &test_running_attempt_id(&scheduler, &worker_id).await,
+                "Connection timeout",
+                true,
+            )
             .await;
 
         // Check consecutive failure count is 1
@@ -2753,7 +3575,14 @@ mod tests {
 
         // Simulate second benchmark run and failure (should trigger alert with threshold=2)
         simulate_running_benchmark(&scheduler, &pool, &worker_id).await;
-        scheduler.mark_failed(&worker_id, "SSH error", true).await;
+        scheduler
+            .mark_failed(
+                &worker_id,
+                &test_running_attempt_id(&scheduler, &worker_id).await,
+                "SSH error",
+                true,
+            )
+            .await;
 
         // Check consecutive failure count incremented to 2
         {
@@ -2764,7 +3593,12 @@ mod tests {
         // Simulate third benchmark run and successful completion - should reset counter
         simulate_running_benchmark(&scheduler, &pool, &worker_id).await;
         scheduler
-            .mark_completed(&worker_id, 75.0, Duration::from_secs(30))
+            .mark_completed(
+                &worker_id,
+                &test_running_attempt_id(&scheduler, &worker_id).await,
+                75.0,
+                Duration::from_secs(30),
+            )
             .await;
 
         // Check counter is reset (removed)
@@ -3072,25 +3906,27 @@ mod tests {
             let mut running = scheduler.running.write().await;
             running.insert(
                 WorkerId::new("w1"),
-                RunningBenchmark {
-                    request: ScheduledBenchmarkRequest::new(
+                test_running_benchmark(
+                    ScheduledBenchmarkRequest::new(
                         WorkerId::new("w1"),
                         BenchmarkPriority::High,
                         BenchmarkReason::NewWorker,
                     ),
-                    started_at: Utc::now(),
-                },
+                    &scheduler.pool,
+                )
+                .await,
             );
             running.insert(
                 WorkerId::new("w2"),
-                RunningBenchmark {
-                    request: ScheduledBenchmarkRequest::new(
+                test_running_benchmark(
+                    ScheduledBenchmarkRequest::new(
                         WorkerId::new("w2"),
                         BenchmarkPriority::Normal,
                         BenchmarkReason::Scheduled,
                     ),
-                    started_at: Utc::now(),
-                },
+                    &scheduler.pool,
+                )
+                .await,
             );
         }
 
@@ -3113,14 +3949,15 @@ mod tests {
             let mut running = scheduler.running.write().await;
             running.insert(
                 worker_id.clone(),
-                RunningBenchmark {
-                    request: ScheduledBenchmarkRequest::new(
+                test_running_benchmark(
+                    ScheduledBenchmarkRequest::new(
                         worker_id.clone(),
                         BenchmarkPriority::Normal,
                         BenchmarkReason::Scheduled,
                     ),
-                    started_at: Utc::now(),
-                },
+                    &scheduler.pool,
+                )
+                .await,
             );
         }
 
@@ -3305,7 +4142,12 @@ mod tests {
         // Mark completed on non-existent running benchmark
         // This should be a no-op, not panic
         scheduler
-            .mark_completed(&WorkerId::new("ghost"), 50.0, Duration::from_secs(10))
+            .mark_completed(
+                &WorkerId::new("ghost"),
+                "missing-request",
+                50.0,
+                Duration::from_secs(10),
+            )
             .await;
 
         assert_eq!(scheduler.running_count().await, 0);
@@ -3323,23 +4165,24 @@ mod tests {
         // Mark failed on non-existent running benchmark
         // This should be a no-op, not panic
         scheduler
-            .mark_failed(&WorkerId::new("ghost"), "error", true)
+            .mark_failed(&WorkerId::new("ghost"), "missing-request", "error", true)
             .await;
 
         assert_eq!(scheduler.running_count().await, 0);
         assert_eq!(scheduler.pending_count().await, 0);
     }
 
-    #[test]
-    fn test_running_benchmark_clone() {
-        let running = RunningBenchmark {
-            request: ScheduledBenchmarkRequest::new(
+    #[tokio::test]
+    async fn test_running_benchmark_clone() {
+        let running = test_running_benchmark(
+            ScheduledBenchmarkRequest::new(
                 WorkerId::new("clone-running"),
                 BenchmarkPriority::High,
                 BenchmarkReason::NewWorker,
             ),
-            started_at: Utc::now(),
-        };
+            &WorkerPool::new(),
+        )
+        .await;
 
         let cloned = running.clone();
         assert_eq!(cloned.request.worker_id, running.request.worker_id);

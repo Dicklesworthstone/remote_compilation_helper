@@ -482,17 +482,40 @@ impl RemoteCompilationTest {
         remote_cargo_home_expr(&format!("{worker_id}-{session_id}"))
     }
 
-    fn rsync_ssh_command(&self) -> String {
+    fn rsync_ssh_command(&self, can_disable_background: bool) -> String {
         // Self-tests own these short-lived transfers. User SSH settings must
         // not multiply attempts, borrow another master, or fork a persistent
         // connection that outlives administrative disablement.
-        format!(
+        let mut command = format!(
             "ssh {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
              -o ConnectionAttempts=1 -o ConnectTimeout={} \
              -o ControlMaster=no -o ControlPersist=no -o ControlPath=none",
             crate::ssh_utils::identity_shell_args(&self.worker.identity_file),
             self.ssh_options.connect_timeout.as_secs().max(1),
-        )
+        );
+        if can_disable_background {
+            command.push_str(" -o ForkAfterAuthentication=no");
+        }
+        command
+    }
+
+    async fn rsync_output(&self, command: &mut Command) -> Result<Output> {
+        // The local capability probe and transfer share one deadline. Older
+        // clients cannot fork through this unsupported configuration setting;
+        // newer clients must override it before loading the user's config.
+        tokio::time::timeout(self.timeout, async {
+            let can_disable_background = crate::ssh::ssh_can_disable_background(
+                Path::new("ssh"),
+                self.ssh_options.connect_timeout.min(self.timeout),
+            )
+            .await?;
+            command
+                .arg("-e")
+                .arg(self.rsync_ssh_command(can_disable_background));
+            self_test_command_output(command).await.map_err(Into::into)
+        })
+        .await
+        .context("Self-test rsync timed out during SSH capability detection or transfer")?
     }
 
     /// Build the project locally.
@@ -605,8 +628,6 @@ impl RemoteCompilationTest {
             .arg("target/")
             .arg("--exclude")
             .arg(".git/")
-            .arg("-e")
-            .arg(self.rsync_ssh_command())
             .arg(format!("{}/", self.test_project.display()))
             .arg(&destination)
             .stdout(Stdio::piped())
@@ -617,7 +638,8 @@ impl RemoteCompilationTest {
             cmd.as_std().get_args().collect::<Vec<_>>()
         );
 
-        let output = self_test_command_output(&mut cmd)
+        let output = self
+            .rsync_output(&mut cmd)
             .await
             .context("Failed to execute rsync")?;
 
@@ -757,8 +779,6 @@ impl RemoteCompilationTest {
             )
             .arg("--no-owner")
             .arg("--no-group")
-            .arg("-e")
-            .arg(self.rsync_ssh_command())
             .arg(&remote_target)
             .arg(format!("{}/", local_dest.display()))
             .stdout(Stdio::piped())
@@ -769,7 +789,8 @@ impl RemoteCompilationTest {
             cmd.as_std().get_args().collect::<Vec<_>>()
         );
 
-        let output = self_test_command_output(&mut cmd)
+        let output = self
+            .rsync_output(&mut cmd)
             .await
             .context("Failed to retrieve artifacts")?;
 
@@ -879,10 +900,19 @@ wait
     async fn offline_worker_self_test_ssh_policy_overrides_user_reconnect_settings() {
         let directory = tempfile::tempdir().unwrap();
         let ssh_config = directory.path().join("ssh-config");
+        let can_disable_background = crate::ssh::ssh_can_disable_background(
+            std::path::Path::new("ssh"),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
         std::fs::write(
             &ssh_config,
-            "Host *\n ControlMaster auto\n ControlPersist 600\n\
-             ControlPath /tmp/rch-self-test-inherited\n ConnectionAttempts 9\n ConnectTimeout 120\n",
+            format!(
+                "Host *\n ControlMaster auto\n ControlPersist 600\n\
+                 ControlPath /tmp/rch-self-test-inherited\n ConnectionAttempts 9\n ConnectTimeout 120\n{}",
+                if can_disable_background { " ForkAfterAuthentication yes\n" } else { "" },
+            ),
         )
         .unwrap();
         let mut test = RemoteCompilationTest::default();
@@ -901,7 +931,7 @@ wait
             .arg("-c")
             .arg(format!(
                 "{} -G -F \"$1\" fixture.invalid",
-                test.rsync_ssh_command()
+                test.rsync_ssh_command(can_disable_background)
             ))
             .arg("rch-self-test-ssh-config")
             .arg(&ssh_config);
@@ -912,6 +942,7 @@ wait
                 stdin_script: None,
             },
             Duration::ZERO,
+            can_disable_background,
         );
         let mut windows_shell = Command::new(&windows_argv[0]);
         windows_shell
@@ -936,6 +967,32 @@ wait
                 assert!(resolved.lines().any(|line| line == expected), "{resolved}");
             }
             assert!(!resolved.contains("controlpath /tmp/rch-self-test-inherited"));
+            if can_disable_background {
+                assert!(
+                    resolved
+                        .lines()
+                        .any(|line| line == "forkafterauthentication no")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn self_test_rsync_foreground_option_is_capability_gated() {
+        let test = RemoteCompilationTest::default();
+        let old_client = test.rsync_ssh_command(false);
+        let new_client = test.rsync_ssh_command(true);
+        assert!(!old_client.contains("ForkAfterAuthentication"));
+        assert!(new_client.ends_with(" -o ForkAfterAuthentication=no"));
+        for command in [old_client, new_client] {
+            for option in [
+                "ConnectionAttempts=1",
+                "ControlMaster=no",
+                "ControlPersist=no",
+                "ControlPath=none",
+            ] {
+                assert!(command.contains(option), "{command}");
+            }
         }
     }
 

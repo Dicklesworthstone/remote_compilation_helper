@@ -133,16 +133,35 @@ struct SshProcessState {
 /// Keep the child unreaped until its output has drained: its PID then pins the
 /// group identity throughout cancellation. After wait(), id() is None, so Drop
 /// cannot signal a group whose PID has since been reused.
-pub(crate) struct OwnedProcessGroup {
+pub struct OwnedProcessGroup {
     // Read/write the pipes directly, but reap only through Self::wait so an
     // unexpected leader exit cannot orphan a proxy before group cleanup.
     pub(crate) child: tokio::process::Child,
 }
 
 impl OwnedProcessGroup {
-    pub(crate) fn spawn(command: &mut tokio::process::Command) -> std::io::Result<Self> {
+    /// Spawn a foreground child in its own process group, owned until reaped.
+    ///
+    /// # Errors
+    /// Returns the underlying process-spawn error.
+    pub fn spawn(command: &mut tokio::process::Command) -> std::io::Result<Self> {
         let child = command.process_group(0).kill_on_drop(true).spawn()?;
         Ok(Self { child })
+    }
+
+    /// Take the child's input pipe without exposing its reaping operations.
+    pub fn take_stdin(&mut self) -> Option<tokio::process::ChildStdin> {
+        self.child.stdin.take()
+    }
+
+    /// Take the child's output pipe without exposing its reaping operations.
+    pub fn take_stdout(&mut self) -> Option<tokio::process::ChildStdout> {
+        self.child.stdout.take()
+    }
+
+    /// Take the child's error pipe without exposing its reaping operations.
+    pub fn take_stderr(&mut self) -> Option<tokio::process::ChildStderr> {
+        self.child.stderr.take()
     }
 
     fn unreaped_pid(&self) -> Option<rustix::process::Pid> {
@@ -159,12 +178,20 @@ impl OwnedProcessGroup {
         }
     }
 
-    pub(crate) fn start_kill(&mut self) -> std::io::Result<()> {
+    /// Signal the owned process group and child without waiting for exit.
+    ///
+    /// # Errors
+    /// Returns an error if signalling the direct child fails.
+    pub fn start_kill(&mut self) -> std::io::Result<()> {
         self.signal_group();
         self.child.start_kill()
     }
 
-    pub(crate) async fn wait(&mut self) -> std::io::Result<ExitStatus> {
+    /// Reap the child after stopping any remaining descendants in its group.
+    ///
+    /// # Errors
+    /// Returns an error if exit notification or waiting for the child fails.
+    pub async fn wait(&mut self) -> std::io::Result<ExitStatus> {
         // Inspect exit without reaping, then stop remaining group members
         // while the leader's unreaped PID still prevents reuse. SIGCHLD is
         // only a readiness hint: subscribe before checking to avoid losing a
@@ -666,7 +693,7 @@ impl SshClient {
         // directives. Older clients do not understand ForkAfterAuthentication;
         // a global IgnoreUnknown override would break the user's own list.
         let can_disable_background =
-            ssh_can_disable_background(ssh_program, control_dir.clone(), deadline).await?;
+            ssh_can_disable_background_in(ssh_program, control_dir.clone(), deadline).await?;
         let mut command = self.master_command(
             ssh_program,
             destination,
@@ -1142,7 +1169,44 @@ fn ssh_control_directory() -> PathBuf {
     }
 }
 
-async fn ssh_can_disable_background(
+/// Check whether a local SSH client accepts `ForkAfterAuthentication=no`.
+///
+/// One-shot transports must disable an inherited background setting to keep
+/// their process group owned. Older SSH clients lack this setting; inspect
+/// their built-in configuration without evaluating the user's SSH config or
+/// replacing the user's `IgnoreUnknown` list. No remote connection is made.
+///
+/// # Errors
+/// Returns an error if the local client probe fails or exceeds `timeout`.
+pub async fn ssh_can_disable_background(ssh_program: &Path, timeout: Duration) -> Result<bool> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .context("SSH client probe timeout exceeds the supported clock range")?;
+    let control_dir = Arc::new(tempfile::tempdir().context("SSH client probe directory")?);
+    ssh_can_disable_background_in(ssh_program, control_dir, deadline).await
+}
+
+/// Configure one owned foreground SSH attempt, without borrowing or creating
+/// a persistent control master. Call before appending the SSH destination.
+/// Pass the result of [`ssh_can_disable_background`] for old-client support.
+pub fn configure_oneshot_ssh(command: &mut tokio::process::Command, can_disable_background: bool) {
+    for option in oneshot_ssh_options(can_disable_background) {
+        command.arg("-o").arg(option);
+    }
+}
+
+fn oneshot_ssh_options(can_disable_background: bool) -> impl Iterator<Item = &'static str> {
+    [
+        "ConnectionAttempts=1",
+        "ControlMaster=no",
+        "ControlPersist=no",
+        "ControlPath=none",
+    ]
+    .into_iter()
+    .chain(can_disable_background.then_some("ForkAfterAuthentication=no"))
+}
+
+async fn ssh_can_disable_background_in(
     ssh_program: &Path,
     control_dir: Arc<tempfile::TempDir>,
     deadline: Instant,
@@ -1338,6 +1402,7 @@ pub use crate::ssh_utils::identities_only_args;
 /// Argv layout:
 /// `ssh -i <identity_file> -o BatchMode=yes -o ConnectTimeout=8 -o
 ///   ConnectionAttempts=1 -o ControlMaster=no -o ControlPersist=no -o ControlPath=none -o
+///   ForkAfterAuthentication=no (when supported) -o
 ///   StrictHostKeyChecking=accept-new -o ServerAliveInterval=<secs>
 ///   <user>@<host> <command>`
 ///
@@ -1355,6 +1420,7 @@ pub(crate) fn system_ssh_argv(
     config: &WorkerConfig,
     command: &RemoteShellCommand,
     server_alive_interval: Duration,
+    can_disable_background: bool,
 ) -> Vec<OsString> {
     let identity_path = shellexpand::tilde(&config.identity_file);
     let destination = format!("{}@{}", config.user, config.host);
@@ -1372,12 +1438,7 @@ pub(crate) fn system_ssh_argv(
     argv.push(OsString::from("ConnectTimeout=8"));
     // This fallback opens its own connection. Never attach to an unrelated
     // master, inherit extra dials, or leave a persistent master behind.
-    for option in [
-        "ConnectionAttempts=1",
-        "ControlMaster=no",
-        "ControlPersist=no",
-        "ControlPath=none",
-    ] {
+    for option in oneshot_ssh_options(can_disable_background) {
         argv.push(OsString::from("-o"));
         argv.push(OsString::from(option));
     }
@@ -1443,13 +1504,24 @@ pub(crate) async fn system_ssh_execute(
     use tokio::io::AsyncReadExt;
     use tokio::process::Command;
 
+    let start = std::time::Instant::now();
+    let deadline = Instant::now()
+        .checked_add(command_timeout)
+        .context("SSH command timeout exceeds the supported clock range")?;
+    let control_dir = Arc::new(tempfile::tempdir().context("SSH client probe directory")?);
+    let can_disable_background =
+        ssh_can_disable_background_in(Path::new("ssh"), control_dir, deadline).await?;
     let prepared = remote_shell_command(config, command);
-    let argv = system_ssh_argv(config, &prepared, server_alive_interval);
+    let argv = system_ssh_argv(
+        config,
+        &prepared,
+        server_alive_interval,
+        can_disable_background,
+    );
     let input = prepared.stdin_script;
     // Drop the program name — `Command::new("ssh")` is the standard form.
     let args = argv.into_iter().skip(1);
 
-    let start = std::time::Instant::now();
     debug!(
         "system-ssh executing on {}: {}",
         config.id,
@@ -1511,7 +1583,7 @@ pub(crate) async fn system_ssh_execute(
         Ok::<_, anyhow::Error>((status, stdout, stderr))
     };
 
-    match tokio::time::timeout(command_timeout, execution).await {
+    match tokio::time::timeout_at(deadline, execution).await {
         Ok(result) => {
             let (status, stdout, stderr) = result?;
             let duration = start.elapsed();
@@ -2706,7 +2778,7 @@ mod tests {
         let _guard = test_guard!();
         let cfg = windows_worker("wsurf");
         let command = remote_shell_command(&cfg, "uname -a");
-        let argv = system_ssh_argv(&cfg, &command, Duration::from_secs(2));
+        let argv = system_ssh_argv(&cfg, &command, Duration::from_secs(2), true);
         let s: Vec<String> = argv
             .iter()
             .map(|o| o.to_string_lossy().into_owned())
@@ -2736,18 +2808,51 @@ mod tests {
     }
 
     #[test]
+    fn test_system_ssh_argv_owns_one_attempt_without_changing_unknown_option_policy() {
+        let cfg = windows_worker("windows");
+        let command = remote_shell_command(&cfg, "echo ok");
+        for supports_foreground in [false, true] {
+            let argv = system_ssh_argv(&cfg, &command, Duration::ZERO, supports_foreground);
+            let options: Vec<_> = argv
+                .windows(2)
+                .filter(|pair| pair[0] == "-o")
+                .map(|pair| pair[1].to_string_lossy())
+                .collect();
+            for expected in [
+                "ConnectionAttempts=1",
+                "ControlMaster=no",
+                "ControlPersist=no",
+                "ControlPath=none",
+            ] {
+                assert!(options.iter().any(|option| option == expected), "{argv:?}");
+            }
+            assert_eq!(
+                options
+                    .iter()
+                    .any(|option| option == "ForkAfterAuthentication=no"),
+                supports_foreground,
+            );
+            assert!(
+                options
+                    .iter()
+                    .all(|option| !option.starts_with("IgnoreUnknown="))
+            );
+        }
+    }
+
+    #[test]
     fn test_system_ssh_script_transport_keeps_posix_argv_and_exact_stdin_reader() {
         let _guard = test_guard!();
         let linux = worker_config("linux", "1.2.3.4", "root", "~/.ssh/id_rsa");
         let windows = windows_worker("windows");
         let script = "printf '%s\\n' '%PATH% !VAR! & | < > ^ $()'\nprintf done";
         let prepared = remote_shell_command(&linux, script);
-        let argv = system_ssh_argv(&linux, &prepared, Duration::ZERO);
+        let argv = system_ssh_argv(&linux, &prepared, Duration::ZERO, true);
         assert_eq!(argv.last().unwrap(), script);
         assert!(prepared.stdin_script.is_none());
         for command in [script, "sh -s", "", "sh -s\n"] {
             let prepared = remote_shell_command(&windows, command);
-            let argv = system_ssh_argv(&windows, &prepared, Duration::ZERO);
+            let argv = system_ssh_argv(&windows, &prepared, Duration::ZERO, true);
             assert_eq!(argv.last().unwrap(), "sh -s");
             assert_eq!(prepared.stdin_script.is_none(), command == "sh -s");
         }
@@ -2873,7 +2978,7 @@ mod tests {
         let _guard = test_guard!();
         let cfg = windows_worker("wsurf");
         let command = remote_shell_command(&cfg, "echo hi");
-        let argv = system_ssh_argv(&cfg, &command, Duration::from_secs(0));
+        let argv = system_ssh_argv(&cfg, &command, Duration::from_secs(0), true);
         let s: Vec<String> = argv
             .iter()
             .map(|o| o.to_string_lossy().into_owned())
@@ -2893,7 +2998,7 @@ mod tests {
         let _guard = test_guard!();
         let cfg = windows_worker("wsurf");
         let command = remote_shell_command(&cfg, "true");
-        let argv = system_ssh_argv(&cfg, &command, Duration::from_secs(60));
+        let argv = system_ssh_argv(&cfg, &command, Duration::from_secs(60), true);
         let s: Vec<String> = argv
             .iter()
             .map(|o| o.to_string_lossy().into_owned())
@@ -2911,7 +3016,7 @@ mod tests {
         let mut cfg = windows_worker("wsurf");
         cfg.identity_file = "~/.ssh/operator_key".to_string();
         let command = remote_shell_command(&cfg, "true");
-        let argv = system_ssh_argv(&cfg, &command, Duration::from_secs(2));
+        let argv = system_ssh_argv(&cfg, &command, Duration::from_secs(2), true);
         let s: Vec<String> = argv
             .iter()
             .map(|o| o.to_string_lossy().into_owned())
@@ -2947,11 +3052,11 @@ mod tests {
         let mut cfg = windows_worker("wsurf");
         cfg.identity_file = key;
         let command = remote_shell_command(&cfg, "true");
-        let argv = system_ssh_argv(&cfg, &command, Duration::ZERO);
+        let argv = system_ssh_argv(&cfg, &command, Duration::ZERO, true);
         assert!(argv.contains(&OsString::from("IdentitiesOnly=yes")));
 
         cfg.identity_file = "/nonexistent/rch/worker_key".to_string();
-        let argv = system_ssh_argv(&cfg, &command, Duration::ZERO);
+        let argv = system_ssh_argv(&cfg, &command, Duration::ZERO, true);
         assert!(!argv.contains(&OsString::from("IdentitiesOnly=yes")));
     }
 
@@ -3241,9 +3346,10 @@ exec sleep 30
         )
         .unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
-        let capability = ssh_can_disable_background(Path::new("ssh"), directory.clone(), deadline)
-            .await
-            .unwrap();
+        let capability =
+            ssh_can_disable_background_in(Path::new("ssh"), directory.clone(), deadline)
+                .await
+                .unwrap();
         let client = SshClient::new(WorkerConfig::default(), SshOptions::default());
         let master = client.master_command(
             Path::new("ssh"),
