@@ -1302,15 +1302,18 @@ changing it also changes the journal identity. Jobs sharing a worker name, key
 pin, listener endpoint, or conflicting paths cannot execute concurrently.
 
 After a short connection delivers a normally completed result and both output
-owners acknowledge it, the worker reconnects with 125–250 ms of jitter. Its
+owners durably acknowledge it, the worker earns one immediate reconnect. Its
 `worker-reconnect-scheduled` record reports `completed_delivery: true` only when
-that connection advances the durable request/release state. A fully delivered
-compiler error also counts as useful work. Completing retained-result recovery
-resets the delay once; repeated acknowledgments do not. Empty sessions, partial
+that connection advances the durable request/release state, with `delay_ms: 0`.
+A fully delivered compiler error also counts as useful work. Completing
+retained-result recovery earns the same one attempt; repeated acknowledgments
+do not. If the immediate attempt fails, ordinary 125–250 ms jitter resumes and
+subsequent failures increase the delay. Empty sessions, partial
 delivery, cancelled execution and unresolved results keep the existing
-exponential outage backoff, capped at 15–30 seconds of jitter. This prevents a
-sequence of successful short compilations from accumulating outage delays;
-an idle worker whose listener is absent still backs off normally.
+exponential outage backoff, capped at 15–30 seconds of jitter. Successful short
+compilations therefore do not incur a mandatory reconnect timer. Shutdown still
+prevents a new connection, and an idle worker whose listener is absent backs off
+normally.
 
 Status reports `queued`, `running`, `cancelling`, `completed`, `cancelled`,
 `failed_before_start`, or `uncertain`. Check `succeeded`, `exit_code`, `stop_reason`,

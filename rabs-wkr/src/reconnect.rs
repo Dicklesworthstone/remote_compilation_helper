@@ -81,7 +81,8 @@ impl DeliveryProgress {
     }
 }
 
-/// Equal jitter avoids both synchronized fleet reconnects and zero-delay spins.
+/// Equal jitter avoids synchronized outage retries. A newly accepted result
+/// earns one immediate reconnect; unsuccessful or empty sessions never do.
 /// Entropy is derived from the already-random process incarnation; it is used
 /// ONLY for scheduling and grants no security or execution authority.
 struct Backoff {
@@ -107,8 +108,14 @@ impl Backoff {
         // successful admission also must not reset an outage's backoff. A short
         // compile whose complete result was durably accepted IS useful work:
         // the coordinator deliberately closes that one-operation connection.
-        // Do not turn a series of successful small compiles into 30s reconnects.
-        if completed_delivery || admitted_for.is_some_and(|elapsed| elapsed >= STABLE_SESSION) {
+        // Its newly advanced delivery frontier earns exactly one immediate
+        // attempt. If that attempt finds no listener, the following failure
+        // starts normal jitter again; stale ACKs cannot earn another attempt.
+        if completed_delivery {
+            self.ceiling_ms = INITIAL_DELAY_MS;
+            return Duration::ZERO;
+        }
+        if admitted_for.is_some_and(|elapsed| elapsed >= STABLE_SESSION) {
             self.ceiling_ms = INITIAL_DELAY_MS;
         }
         self.entropy ^= self.entropy << 13;
@@ -315,6 +322,8 @@ pub(super) fn run(
             })
         );
         // The timer/signal task holds no execution lease or network session.
+        // Even an earned immediate attempt checks shutdown before the zero
+        // timer, then the loop checks again before opening a new connection.
         // The exclusive journal lock remains held, including during backoff.
         let handle = runtime.handle();
         let shutdown = controller.subscribe();
@@ -372,7 +381,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_short_deliveries_reset_a_saturated_outage_without_busy_retry() {
+    fn new_deliveries_earn_immediate_reconnect_but_failures_resume_jitter() {
         let mut backoff = Backoff::new(19);
         for _ in 0..20 {
             backoff.next(None, false);
@@ -380,12 +389,17 @@ mod tests {
         assert_eq!(backoff.ceiling_ms, MAX_DELAY_MS);
         for _ in 0..100 {
             let delay = backoff.next(Some(Duration::from_millis(1)), true);
-            assert!(delay >= Duration::from_millis(INITIAL_DELAY_MS / 2));
-            assert!(delay <= Duration::from_millis(INITIAL_DELAY_MS));
+            assert_eq!(delay, Duration::ZERO);
+            assert_eq!(backoff.ceiling_ms, INITIAL_DELAY_MS);
         }
-        let unproductive = backoff.next(Some(Duration::from_millis(1)), false);
-        assert!(unproductive >= Duration::from_millis(INITIAL_DELAY_MS));
-        assert!(unproductive <= Duration::from_millis(INITIAL_DELAY_MS * 2));
+        // The immediate reconnect failed before admission. It must not earn a
+        // second immediate attempt or consume another completed-delivery flag.
+        let failed = backoff.next(None, false);
+        assert!(failed >= Duration::from_millis(INITIAL_DELAY_MS / 2));
+        assert!(failed <= Duration::from_millis(INITIAL_DELAY_MS));
+        let empty_session = backoff.next(Some(Duration::from_millis(1)), false);
+        assert!(empty_session >= Duration::from_millis(INITIAL_DELAY_MS));
+        assert!(empty_session <= Duration::from_millis(INITIAL_DELAY_MS * 2));
         for _ in 0..20 {
             backoff.next(None, false);
         }
@@ -418,6 +432,22 @@ mod tests {
         assert!(!completed.advanced_to(empty));
         assert!(completed.advanced_to(DeliveryProgress::from_status(Some(8), &status(8))));
         assert!(!completed.advanced_to(DeliveryProgress::from_status(Some(6), &status(6))));
+
+        let mut backoff = Backoff::new(23);
+        assert_eq!(
+            backoff.next(None, empty.advanced_to(completed)),
+            Duration::ZERO,
+        );
+        for after in [
+            completed,
+            empty,
+            DeliveryProgress::from_status(Some(6), &status(6)),
+        ] {
+            assert!(
+                !backoff.next(None, completed.advanced_to(after)).is_zero(),
+                "replayed, empty or older journal state cannot earn a reconnect",
+            );
+        }
 
         let mut pending = status(7);
         pending["receipt"]["retained_result_released"] = json!(false);
@@ -521,6 +551,10 @@ mod tests {
                     assert!(
                         backoff_or_shutdown(controller.subscribe(), Duration::from_secs(30)).await
                     );
+                    assert!(
+                        backoff_or_shutdown(controller.subscribe(), Duration::ZERO).await,
+                        "shutdown must win over an earned immediate reconnect",
+                    );
                     let running = ShutdownController::new();
                     assert!(!backoff_or_shutdown(running.subscribe(), Duration::ZERO).await);
                 })
@@ -558,7 +592,7 @@ mod tests {
     /// shell for a canonical compiler; this is not a fleet benchmark.
     #[cfg(target_os = "linux")]
     #[test]
-    fn short_process_results_reset_backoff_only_after_durable_delivery() {
+    fn real_short_process_deliveries_earn_immediate_following_sessions() {
         use rabs_asupersync::process_groups::ManagedProcessGroup;
         use rabs_asupersync::region_tree::Attribution;
         use rabs_asupersync::stream_drain::DrainLimits;
@@ -621,8 +655,13 @@ mod tests {
                 assert_eq!(result["kind"], "exec-result");
                 assert_eq!(result["exit_code"], exit_code);
                 assert_eq!(result["executed"], true);
-                assert_eq!(result["stdout_sha256"], sha256_hex(b"short-work"));
-                assert_eq!(result["stdout_bytes"], 10);
+                assert_eq!(result["request_id"], id);
+                let expected_output = format!("short-work-{id}");
+                assert_eq!(
+                    result["stdout_sha256"],
+                    sha256_hex(expected_output.as_bytes())
+                );
+                assert_eq!(result["stdout_bytes"], expected_output.len());
                 assert_eq!(result["stderr_bytes"], 0);
                 writeln!(
                     peer.get_mut(),
@@ -681,8 +720,9 @@ mod tests {
                                         command
                                             .args([
                                                 "-c",
-                                                "printf short-work; exit \"$RABS_TEST_EXIT\"",
+                                                "printf 'short-work-%s' \"$RABS_TEST_ID\"; exit \"$RABS_TEST_EXIT\"",
                                             ])
+                                            .env("RABS_TEST_ID", id.to_string())
                                             .env("RABS_TEST_EXIT", exit_code.to_string())
                                             .stdin(Stdio::null())
                                             .stdout(Stdio::piped())
@@ -741,11 +781,23 @@ mod tests {
             assert!(before.advanced_to(after));
             assert!(!after.advanced_to(DeliveryProgress::read(&journal)));
             let delay = backoff.next(Some(started.elapsed()), before.advanced_to(after));
-            assert!(delay <= Duration::from_millis(INITIAL_DELAY_MS));
+            assert_eq!(delay, Duration::ZERO);
+            assert_eq!(backoff.ceiling_ms, INITIAL_DELAY_MS);
             assert_eq!(
                 journal.status(id)["receipt"]["retained_result_released"],
                 true
             );
+            // Exercise the same native timer/shutdown boundary as the real
+            // supervisor before the next actual TCP/process session begins.
+            let handle = runtime.handle();
+            crate::block_on_worker_runtime(&runtime, async move {
+                handle
+                    .spawn(async move {
+                        let running = ShutdownController::new();
+                        assert!(!backoff_or_shutdown(running.subscribe(), delay).await);
+                    })
+                    .await
+            });
         }
     }
 
