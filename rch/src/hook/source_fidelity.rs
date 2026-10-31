@@ -3219,6 +3219,8 @@ mod tests {
         dependencies: Vec<(PathBuf, CleanOverlaySpec)>,
     ) -> CleanOverlaySpec {
         CleanOverlaySpec {
+            repository_root: PathBuf::from("/fixture"),
+            invocation_directory: PathBuf::new(),
             base_commit: base_commit.to_owned(),
             tree_object: tree_object.to_owned(),
             overlay_paths,

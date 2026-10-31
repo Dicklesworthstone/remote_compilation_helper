@@ -77,6 +77,11 @@ pub(crate) struct RecoveryRecipe {
     /// recovery cannot downgrade it to ordinary glob-only Cargo delivery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     caller_json_policy: Option<PathBuf>,
+    /// Selected source namespace used to project Cargo manifest/source paths.
+    /// Execution and output phases keep `project_root` as the invocation cwd.
+    /// Missing in legacy journals, whose source root was their invocation root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    caller_json_local_source_root: Option<PathBuf>,
     /// Persist the first caller-visible paths and bytes before worker release.
     /// Recovery must not project a later build's shared target files instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -115,6 +120,12 @@ pub(crate) struct RecoveryRecipe {
 }
 
 impl RecoveryRecipe {
+    fn caller_local_source_root(&self) -> &Path {
+        self.caller_json_local_source_root
+            .as_deref()
+            .unwrap_or(&self.project_root)
+    }
+
     fn source_resources_retired(&self) -> bool {
         (self.source_roots.is_empty() || self.sources_released)
             && (self.pair.is_none() || self.pair_released)
@@ -987,6 +998,7 @@ impl RecoverySession {
             cargo_stdout: None,
             cargo_stderr: None,
             caller_json_policy: None,
+            caller_json_local_source_root: None,
             caller_delivery: None,
             phases: Vec::new(),
             exit_code: None,
@@ -1169,6 +1181,7 @@ impl RecoverySession {
             cargo_stdout: None,
             cargo_stderr: None,
             caller_json_policy: None,
+            caller_json_local_source_root: None,
             caller_delivery: None,
             phases,
             exit_code: None,
@@ -1335,7 +1348,12 @@ impl RecoverySession {
                 .any(|phase| phase.output_gate && phase.cargo_outputs.is_none())
     }
 
-    pub(crate) fn request_caller_json(&mut self, remote_project_root: &Path) -> anyhow::Result<()> {
+    pub(crate) fn request_caller_json(
+        &mut self,
+        remote_project_root: &Path,
+        local_source_root: &Path,
+    ) -> anyhow::Result<()> {
+        let canonical_local_source_root = local_source_root.canonicalize()?;
         anyhow::ensure!(
             !self.recipe.execution_started
                 && self.recipe.exit_code.is_none()
@@ -1348,11 +1366,22 @@ impl RecoverySession {
                 && !remote_project_root
                     .to_string_lossy()
                     .chars()
-                    .any(char::is_control),
+                    .any(char::is_control)
+                && local_source_root.is_absolute()
+                && !local_source_root
+                    .to_string_lossy()
+                    .chars()
+                    .any(char::is_control)
+                && self
+                    .recipe
+                    .project_root
+                    .canonicalize()?
+                    .starts_with(&canonical_local_source_root),
             "caller Cargo JSON requires a fresh admitted named-binary contract"
         );
         let mut next_recipe = self.recipe.clone();
         next_recipe.caller_json_policy = Some(remote_project_root.to_owned());
+        next_recipe.caller_json_local_source_root = Some(local_source_root.to_owned());
         self.persist_next_recipe(next_recipe)
     }
 
@@ -1440,7 +1469,7 @@ impl RecoverySession {
             if let Some(project) = self.recipe.caller_json_policy.as_deref() {
                 let receipt = self.recipe.cargo_stdout.as_ref().context("caller Cargo output requires complete retained producer evidence before publication")?;
                 anyhow::ensure!(receipt.exit_code == 0 && receipt.blake3 == blake3::hash(stdout).to_hex().to_string(), "caller Cargo output contradicts its retained producer receipt");
-                let source_root = self.recipe.project_root.canonicalize()?;
+                let source_root = self.recipe.caller_local_source_root().canonicalize()?;
                 contract.required_files.extend(capture.validate_caller_metadata(
                     stdout,
                     &[Path::new(configured_root), canonical_remote_root],
@@ -1678,7 +1707,7 @@ impl RecoverySession {
             .as_ref()
             .context("caller Cargo JSON has no output contract")?
             .verify_staged(&delivery_source)?;
-        let source_root = self.recipe.project_root.canonicalize()?;
+        let source_root = self.recipe.caller_local_source_root().canonicalize()?;
         let capture = self
             .recipe
             .cargo_output_capture
@@ -3158,10 +3187,14 @@ fn load_recipe(writer: &DurableLeaseWriter) -> anyhow::Result<RecoveryRecipe> {
         "Cargo output evidence is attached to an unrelated recovery phase"
     );
     if let Some(project) = recipe.caller_json_policy.as_ref() {
+        let local_source = recipe.caller_local_source_root();
         anyhow::ensure!(
             recipe.prepared
                 && project.is_absolute()
                 && !project.to_string_lossy().chars().any(char::is_control)
+                && local_source.is_absolute()
+                && !local_source.to_string_lossy().chars().any(char::is_control)
+                && recipe.project_root.starts_with(local_source)
                 && !WorkerPlatform::from_worker(&recipe.worker).is_windows()
                 && recipe
                     .cargo_output_capture
@@ -3171,7 +3204,9 @@ fn load_recipe(writer: &DurableLeaseWriter) -> anyhow::Result<RecoveryRecipe> {
         );
     } else {
         anyhow::ensure!(
-            recipe.cargo_stderr.is_none() && recipe.caller_delivery.is_none(),
+            recipe.cargo_stderr.is_none()
+                && recipe.caller_delivery.is_none()
+                && recipe.caller_json_local_source_root.is_none(),
             "retained caller Cargo output has no original opt-in policy"
         );
     }
@@ -4199,6 +4234,105 @@ mod tests {
         )
         .unwrap();
         (directory, writer, worker)
+    }
+
+    #[test]
+    fn clean_overlay_subdirectory_recovery_keeps_source_authority_and_cwd_outputs_separate() {
+        let _guard = test_guard!();
+        let (directory, writer, worker) = admitted_preparation_fixture();
+        let repository_root = directory.path().join("checkout");
+        let spec = CleanOverlaySpec {
+            repository_root: repository_root.clone(),
+            invocation_directory: "crates/app/src".into(),
+            base_commit: "a".repeat(40),
+            tree_object: "b".repeat(40),
+            overlay_paths: Vec::new(),
+            overlay_fingerprint: "c".repeat(64),
+            submodules: Vec::new(),
+            dependencies: Vec::new(),
+            primary_directory: None,
+        };
+        std::fs::create_dir_all(spec.invocation_root()).unwrap();
+        let remote_source = "/data/tmp/rch/selected/app";
+        let remote_target = "/data/tmp/rch/targets/subdirectory-pool";
+        let source_roots = vec![remote_source.to_owned(), remote_target.to_owned()];
+        let identity = "0123456789abcdef0123456789abcdef";
+        RecoverySession::begin(
+            &writer,
+            &worker,
+            source_roots.clone(),
+            None,
+            Some(remote_source.into()),
+            None,
+            TransferConfig::default(),
+            spec.invocation_root(),
+            identity.into(),
+        )
+        .unwrap();
+        let source = TransferPipeline::new(
+            repository_root,
+            "subdirectory".into(),
+            identity.into(),
+            TransferConfig::default(),
+        )
+        .with_build_id(Some(41))
+        .with_remote_path_override(remote_source)
+        .with_remote_cargo_target_dir_override(remote_target);
+        let pipeline = clean_overlay_execution_pipeline(source, &spec);
+        let remote_cwd = format!("{remote_source}/crates/app/src");
+        assert_eq!(pipeline.remote_path(), remote_cwd);
+        assert_eq!(pipeline.remote_cargo_target_dir(), remote_target);
+        assert_eq!(
+            pipeline.remote_pgid_file_path(),
+            Some(TransferPipeline::remote_pgid_file_path_for_root(
+                &remote_cwd,
+                41
+            ))
+        );
+        assert_ne!(
+            pipeline.remote_pgid_file_path(),
+            Some(TransferPipeline::remote_pgid_file_path_for_root(
+                remote_source,
+                41
+            ))
+        );
+        let local_target = spec.invocation_root().join("../../../returned-target");
+        let session = RecoverySession::prepare(
+            &writer,
+            &worker,
+            &pipeline,
+            source_roots.clone(),
+            None,
+            Some(remote_source.into()),
+            None,
+            TransferConfig::default(),
+            spec.invocation_root(),
+            Some(&local_target),
+            Some(CompilationKind::CargoBuild),
+            "cargo build --manifest-path ../Cargo.toml --target-dir ../../../returned-target",
+            &["results".into()],
+            identity.into(),
+        )
+        .unwrap();
+        let persisted = reload_publication(&session).recipe;
+        assert_eq!(persisted.project_root, spec.invocation_root());
+        assert_eq!(persisted.source_roots, source_roots);
+        assert_eq!(persisted.retire_root.as_deref(), Some(remote_source));
+        let target = persisted
+            .phases
+            .iter()
+            .find(|phase| phase.name == "target")
+            .unwrap();
+        assert_eq!(target.remote, remote_target);
+        assert_eq!(target.local, local_target);
+        let results = persisted
+            .phases
+            .iter()
+            .find(|phase| phase.name == "result:results")
+            .unwrap();
+        assert_eq!(results.remote, remote_cwd);
+        assert_eq!(results.local, spec.invocation_root());
+        assert_eq!(results.result_dir.as_deref(), Some(Path::new("results")));
     }
 
     #[tokio::test]
@@ -7629,7 +7763,9 @@ mod tests {
             missing_result: None,
         });
         session.recipe.prepared = true;
-        session.request_caller_json(&remote).unwrap();
+        session
+            .request_caller_json(&remote, &session.recipe.project_root.clone())
+            .unwrap();
         session.starting_execution().unwrap();
         session.completed(0).unwrap();
 
@@ -7680,6 +7816,50 @@ mod tests {
             std::fs::write(stage.join(output_relative).join(name), name.as_bytes()).unwrap();
         }
         (directory, session)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clean_overlay_subdirectory_caller_json_recovers_ancestor_source_mapping() {
+        let _guard = test_guard!();
+        let (_directory, mut session) = caller_delivery_fixture(false, true);
+        let source_root = session.recipe.project_root.clone();
+        let cwd = source_root.join("nested/src");
+        std::fs::create_dir_all(&cwd).unwrap();
+        session.recipe.project_root = cwd.clone();
+        let remote_source = session.recipe.caller_json_policy.clone().unwrap();
+        let project = session
+            .recipe
+            .phases
+            .iter_mut()
+            .find(|phase| phase.name == "project")
+            .unwrap();
+        project.local = cwd.clone();
+        project.remote = remote_source
+            .join("nested/src")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        session.persist().unwrap();
+        let mut recovered = reload_publication(&session);
+        assert_eq!(recovered.recipe.project_root, cwd);
+        assert_eq!(recovered.recipe.caller_local_source_root(), source_root);
+        let receipt = recovered.recipe.cargo_stdout.clone().unwrap();
+        recovered
+            .install_cargo_artifact_evidence(&receipt.read().unwrap(), &receipt.remote_root)
+            .unwrap();
+        recovered.publish("custom-target").await.unwrap();
+        recovered.returned(0).unwrap();
+        let projected = recovered.caller_cargo_json().await.unwrap();
+        for line in std::str::from_utf8(&projected).unwrap().lines() {
+            let record: serde_json::Value = serde_json::from_str(line).unwrap();
+            if record["reason"] == "compiler-artifact" {
+                assert_eq!(
+                    record["manifest_path"],
+                    serde_json::json!(source_root.join("Cargo.toml"))
+                );
+            }
+        }
     }
 
     #[cfg(unix)]

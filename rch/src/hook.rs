@@ -149,6 +149,8 @@ const RCH_DISABLE_TARGET_REUSE_ENV: &str = "RCH_DISABLE_TARGET_REUSE";
 /// can therefore materialize an immutable base and upload only these paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct CleanOverlaySpec {
+    repository_root: PathBuf,
+    invocation_directory: PathBuf,
     base_commit: String,
     tree_object: String,
     overlay_paths: Vec<PathBuf>,
@@ -168,6 +170,22 @@ struct CleanOverlaySubmodule {
 }
 
 impl CleanOverlaySpec {
+    fn invocation_root(&self) -> PathBuf {
+        self.repository_root.join(&self.invocation_directory)
+    }
+
+    fn remote_invocation_root(&self, repository_root: &str) -> String {
+        if self.invocation_directory.as_os_str().is_empty() {
+            repository_root.to_owned()
+        } else {
+            format!(
+                "{}/{}",
+                repository_root.trim_end_matches('/'),
+                self.invocation_directory.display()
+            )
+        }
+    }
+
     pub(super) fn base_commit(&self) -> &str {
         &self.base_commit
     }
@@ -191,6 +209,12 @@ impl CleanOverlaySpec {
             "[RCH] clean-overlay receipt: base={} overlay-fingerprint={} tree={}",
             self.base_commit, self.overlay_fingerprint, self.tree_object
         );
+        if !self.invocation_directory.as_os_str().is_empty() {
+            receipt.push_str(&format!(
+                " invocation-directory={}",
+                self.invocation_directory.display()
+            ));
+        }
         for submodule in &self.submodules {
             receipt.push_str(&format!(
                 " submodule={}@{} submodule-tree={}",
@@ -271,6 +295,8 @@ fn selection_project_for_execution(
     hasher.update(spec.base_commit().as_bytes());
     hasher.update(b"\0");
     hasher.update(spec.overlay_fingerprint().as_bytes());
+    hasher.update(b"\0invocation-directory\0");
+    hasher.update(spec.invocation_directory.as_os_str().as_encoded_bytes());
     for (root, dependency) in &spec.dependencies {
         hasher.update(b"\0dependency\0");
         hasher.update(root.as_os_str().as_encoded_bytes());
@@ -3681,14 +3707,15 @@ async fn git_show_optional(
 }
 
 fn is_selected_cargo_metadata(path: &Path) -> bool {
-    path.file_name().is_some_and(|name| name == "Cargo.toml")
-        || (path
-            .parent()
-            .and_then(Path::file_name)
-            .is_some_and(|name| name == ".cargo")
-            && path
-                .file_name()
-                .is_some_and(|name| name == "config" || name == "config.toml"))
+    path.file_name().is_some_and(|name| {
+        name == "Cargo.toml" || name == "rust-toolchain" || name == "rust-toolchain.toml"
+    }) || (path
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == ".cargo")
+        && path
+            .file_name()
+            .is_some_and(|name| name == "config" || name == "config.toml"))
 }
 
 /// Inventory only the immutable base and explicitly selected overlays. Never
@@ -3853,7 +3880,8 @@ async fn validate_clean_overlay_cargo_sources(
             );
         }
     }
-    let mut primary_manifest = primary_directory.join("Cargo.toml");
+    let invocation_directory = primary_directory.join(&spec.invocation_directory);
+    let mut primary_manifest = None;
     let mut manifest_selected = false;
     let mut inline_configs = Vec::new();
     let (tokens, cargo_index) = cargo_target_dir::managed_clean_overlay_cargo_tokens(command)?;
@@ -3897,7 +3925,8 @@ async fn validate_clean_overlay_cargo_sources(
                     !Path::new(value).is_absolute(),
                     "absolute manifest path is not selected"
                 );
-                let path = validate_selected_cargo_path(&entries, &primary_directory.join(value))?;
+                let path =
+                    validate_selected_cargo_path(&entries, &invocation_directory.join(value))?;
                 anyhow::ensure!(
                     matches!(entries.get(&path), Some(SelectedCargoEntry::File(Some(_)))),
                     "Cargo manifest argument is not selected Cargo metadata: {}",
@@ -3911,7 +3940,7 @@ async fn validate_clean_overlay_cargo_sources(
                 // Retain the selected logical manifest location. The common
                 // validator refuses file aliases whose Cargo-relative source
                 // base would differ from the resolved metadata location.
-                primary_manifest = primary_directory.join(value);
+                primary_manifest = Some(invocation_directory.join(value));
             } else {
                 // Inline TOML is parsed by the same dependency-path validator.
                 // File-based --config needs an explicit selected-file mapping;
@@ -3924,65 +3953,90 @@ async fn validate_clean_overlay_cargo_sources(
         }
         index += 1;
     }
+    let primary_manifest = match primary_manifest {
+        Some(path) => path,
+        None => {
+            selected_clean_overlay_manifest(&entries, &invocation_directory, primary_directory)?
+        }
+    };
     validate_selected_cargo_tree_at(&entries, &primary_manifest)?;
     for value in inline_configs {
-        validate_selected_cargo_config_at(&entries, &primary_manifest, primary_directory, value)?;
+        validate_selected_cargo_config_at(
+            &entries,
+            &primary_manifest,
+            &invocation_directory,
+            value,
+        )?;
     }
     spec.verify_overlay_unchanged(project_root)?;
     Ok(())
+}
+
+/// Match Cargo's upward manifest search within the selected primary Git root.
+/// A dirty or untracked nearer manifest cannot alter this search.
+fn selected_clean_overlay_manifest(
+    entries: &std::collections::BTreeMap<PathBuf, rch_common::cargo_path_deps::SelectedCargoEntry>,
+    invocation_directory: &Path,
+    repository_directory: &Path,
+) -> anyhow::Result<PathBuf> {
+    for directory in invocation_directory.ancestors() {
+        anyhow::ensure!(
+            directory.starts_with(repository_directory),
+            "clean-overlay Cargo manifest search escaped the selected Git root"
+        );
+        let candidate = directory.join("Cargo.toml");
+        if entries.contains_key(&candidate) {
+            return Ok(candidate);
+        }
+        if directory == repository_directory {
+            break;
+        }
+    }
+    anyhow::bail!(
+        "no selected Cargo.toml in invocation directory {} or its selected ancestors",
+        invocation_directory.display()
+    )
 }
 
 async fn detect_clean_overlay_toolchain(
     project_root: &Path,
     spec: &CleanOverlaySpec,
 ) -> anyhow::Result<Option<ToolchainInfo>> {
-    let toml_path = Path::new("rust-toolchain.toml");
-    let legacy_path = Path::new("rust-toolchain");
-    let toml_contents = if spec.overlay_paths().iter().any(|path| path == toml_path) {
-        Some(
-            std::fs::read_to_string(project_root.join(toml_path))
-                .context("read overlaid rust-toolchain.toml")?,
-        )
-    } else {
-        git_show_optional(project_root, spec.base_commit(), "rust-toolchain.toml").await?
-    };
-    if let Some(contents) = toml_contents {
-        let document = toml::from_str::<toml::Value>(&contents)
-            .context("parse rust-toolchain.toml from clean-overlay base")?;
-        let channel = document
-            .get("toolchain")
-            .and_then(|toolchain| toolchain.get("channel"))
-            .and_then(toml::Value::as_str)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "rust-toolchain.toml in clean-overlay base has no toolchain.channel"
-                )
-            })?;
-        return Ok(Some(parse_channel_string(channel)?));
-    }
+    use rch_common::cargo_path_deps::{SelectedCargoEntry, validate_selected_cargo_path};
 
-    let legacy_contents = if spec.overlay_paths().iter().any(|path| path == legacy_path) {
-        Some(
-            std::fs::read_to_string(project_root.join(legacy_path))
-                .context("read overlaid rust-toolchain")?,
-        )
-    } else {
-        git_show_optional(project_root, spec.base_commit(), "rust-toolchain").await?
-    };
-    if let Some(contents) = legacy_contents {
-        if let Ok(document) = toml::from_str::<toml::Value>(&contents)
-            && let Some(channel) = document
-                .get("toolchain")
-                .and_then(|toolchain| toolchain.get("channel"))
-                .and_then(toml::Value::as_str)
-        {
+    let entries = selected_clean_overlay_cargo_tree(project_root, spec).await?;
+    for directory in spec.invocation_directory.ancestors() {
+        for name in ["rust-toolchain", "rust-toolchain.toml"] {
+            let path = directory.join(name);
+            if !entries.contains_key(&path) {
+                continue;
+            }
+            let resolved = validate_selected_cargo_path(&entries, &path)?;
+            anyhow::ensure!(
+                resolved == path,
+                "selected toolchain file may not be a symlink: {}",
+                path.display()
+            );
+            let Some(SelectedCargoEntry::File(Some(contents))) = entries.get(&path) else {
+                anyhow::bail!("selected toolchain file is not UTF-8: {}", path.display());
+            };
+            if let Ok(document) = toml::from_str::<toml::Value>(contents)
+                && let Some(channel) = document
+                    .get("toolchain")
+                    .and_then(|toolchain| toolchain.get("channel"))
+                    .and_then(toml::Value::as_str)
+            {
+                return Ok(Some(parse_channel_string(channel)?));
+            }
+            anyhow::ensure!(
+                name != "rust-toolchain.toml",
+                "selected rust-toolchain.toml has no valid toolchain.channel: {}",
+                path.display()
+            );
+            let channel = contents.trim();
+            anyhow::ensure!(!channel.is_empty(), "selected rust-toolchain is empty");
             return Ok(Some(parse_channel_string(channel)?));
         }
-        let channel = contents.trim();
-        if channel.is_empty() {
-            anyhow::bail!("rust-toolchain in clean-overlay base is empty");
-        }
-        return Ok(Some(parse_channel_string(channel)?));
     }
 
     // No committed override means the remote worker's default toolchain is the
@@ -4018,15 +4072,25 @@ async fn prepare_clean_overlay_spec(
     let git_toplevel = git_output(project_root, &["rev-parse", "--show-toplevel"]).await?;
     let git_toplevel = std::fs::canonicalize(&git_toplevel)
         .with_context(|| format!("canonicalize Git toplevel {git_toplevel}"))?;
-    let canonical_project_root = std::fs::canonicalize(project_root)
+    let canonical_invocation_root = std::fs::canonicalize(project_root)
         .with_context(|| format!("canonicalize project root {}", project_root.display()))?;
-    if git_toplevel != canonical_project_root {
-        anyhow::bail!(
-            "clean-overlay exec must run from the Git toplevel (current: {}, toplevel: {})",
-            canonical_project_root.display(),
-            git_toplevel.display()
+    let relative_invocation = canonical_invocation_root
+        .strip_prefix(&git_toplevel)
+        .context("clean-overlay invocation is outside its Git toplevel")?;
+    let invocation_directory = if relative_invocation.as_os_str().is_empty() {
+        PathBuf::new()
+    } else {
+        let relative = normalize_repository_relative_path(
+            "clean-overlay invocation directory",
+            relative_invocation,
+        )?;
+        anyhow::ensure!(
+            !relative.to_string_lossy().ends_with(' '),
+            "clean-overlay invocation directory may not end in whitespace"
         );
-    }
+        relative
+    };
+    let canonical_project_root = git_toplevel;
 
     let commit_expression = format!("{base}^{{commit}}");
     let base_commit = git_output(
@@ -4088,8 +4152,16 @@ async fn prepare_clean_overlay_spec(
     validate_clean_overlay_against_base(&canonical_project_root, &overlay_paths, &base_entries)?;
     let overlay_fingerprint =
         clean_overlay_selected_fingerprint(&canonical_project_root, &overlay_paths, &submodules)?;
+    validate_clean_overlay_invocation_directory(
+        &canonical_project_root,
+        &invocation_directory,
+        &base_entries,
+        &overlay_paths,
+    )?;
 
     Ok(Some(CleanOverlaySpec {
+        repository_root: canonical_project_root,
+        invocation_directory,
         base_commit,
         tree_object,
         overlay_paths,
@@ -4100,18 +4172,81 @@ async fn prepare_clean_overlay_spec(
     }))
 }
 
+/// The command's cwd must exist in the selected snapshot, with the same exact
+/// directory spelling. An unselected local directory or a selected symlink
+/// cannot silently redirect execution into different source bytes.
+fn validate_clean_overlay_invocation_directory(
+    repository_root: &Path,
+    relative: &Path,
+    base_entries: &[CleanBaseTreeEntry],
+    overlays: &[PathBuf],
+) -> anyhow::Result<()> {
+    if relative.as_os_str().is_empty() {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        !relative.components().any(|component| component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case(".git"))),
+        "clean-overlay invocation may not enter Git metadata"
+    );
+    validate_clean_overlay_live_path(repository_root, relative)?;
+    anyhow::ensure!(
+        repository_root.join(relative).is_dir(),
+        "clean-overlay invocation must be a directory"
+    );
+    for entry in base_entries {
+        anyhow::ensure!(
+            !relative.starts_with(&entry.path),
+            "clean-overlay invocation directory crosses a selected file or symlink: {}",
+            entry.path.display()
+        );
+        for (selected, requested) in entry.path.components().zip(relative.components()) {
+            if selected == requested {
+                continue;
+            }
+            anyhow::ensure!(
+                !selected
+                    .as_os_str()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&requested.as_os_str().to_string_lossy()),
+                "clean-overlay invocation aliases differently spelled selected path: {}",
+                entry.path.display()
+            );
+            break;
+        }
+    }
+    anyhow::ensure!(
+        base_entries
+            .iter()
+            .any(|entry| entry.path.starts_with(relative))
+            || overlays
+                .iter()
+                .any(|overlay| { overlay.starts_with(relative) || relative.starts_with(overlay) }),
+        "clean-overlay invocation directory is absent from the selected base and overlays: {}",
+        relative.display()
+    );
+    Ok(())
+}
+
 /// Bind every external repository explicitly; never infer a sibling revision
 /// from ambient working-tree bytes. The first supported layout is sibling Git
 /// roots, materialized together under one leased container.
 async fn bind_clean_overlay_dependencies(
-    primary: &Path,
+    invocation_root: &Path,
     spec: &mut CleanOverlaySpec,
     bindings: &[String],
 ) -> anyhow::Result<()> {
     if bindings.is_empty() {
         return Ok(());
     }
-    let primary = std::fs::canonicalize(primary)?;
+    let invocation_root = std::fs::canonicalize(invocation_root)?;
+    anyhow::ensure!(
+        invocation_root == spec.invocation_root(),
+        "clean-overlay invocation directory changed before dependency selection"
+    );
+    let primary = &spec.repository_root;
     let parent = primary
         .parent()
         .ok_or_else(|| anyhow::anyhow!("missing primary parent"))?;
@@ -4130,10 +4265,10 @@ async fn bind_clean_overlay_dependencies(
             !path.is_empty() && !revision.is_empty(),
             "empty dependency path or revision"
         );
-        let root = std::fs::canonicalize(primary.join(path))
+        let root = std::fs::canonicalize(invocation_root.join(path))
             .with_context(|| format!("resolve selected dependency root {path}"))?;
         anyhow::ensure!(
-            root != primary && root.parent() == Some(parent),
+            &root != primary && root.parent() == Some(parent),
             "--dependency-base currently requires sibling Git roots: {}",
             root.display()
         );
@@ -4523,14 +4658,14 @@ pub async fn run_exec(
         )
         || job_needs_rust_toolchain;
     let toolchain = if needs_rust_toolchain {
-        if let (Some(root), Some(spec)) = (project_root.as_deref(), clean_overlay_spec.as_ref()) {
-            detect_clean_overlay_toolchain(root, spec).await?
-        } else if let Some(name) = rustup_toolchain_from_command_tokens(&command_parts) {
+        if let Some(name) = rustup_toolchain_from_command_tokens(&command_parts) {
             // An explicit `RUSTUP_TOOLCHAIN=…` / `cargo +…` in the delegated
             // command outranks the ambient project toolchain (rustup's own
             // precedence), so preflight and the component gate must check the
             // toolchain the remote cargo will actually use (issue #63).
             parse_channel_string(&name).ok()
+        } else if let Some(spec) = clean_overlay_spec.as_ref() {
+            detect_clean_overlay_toolchain(&spec.repository_root, spec).await?
         } else {
             project_root
                 .as_ref()

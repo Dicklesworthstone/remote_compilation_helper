@@ -948,7 +948,15 @@ fn cargo_subcommand_is_nextest(tokens: &[String], cargo_index: usize) -> bool {
 /// The outer command prefixes run first, so the guard sees Cargo's effective
 /// environment. This checks ordinary filesystem state, not atomic protection
 /// against an adversary changing paths between inspection and execution.
-pub(super) fn guard_clean_overlay_cargo_config(command: &str) -> anyhow::Result<String> {
+pub(super) fn guard_clean_overlay_cargo_config(
+    command: &str,
+    selected_repository_root: &str,
+) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        selected_repository_root.starts_with('/')
+            && !selected_repository_root.chars().any(char::is_control),
+        "selected Cargo configuration root must be an absolute Unix path"
+    );
     let (mut tokens, cargo_index) = managed_clean_overlay_cargo_tokens(command)?;
     let guard = r#"rch_config_refuse() {
     printf '%s\n' 'RCH-E413 clean-overlay unselected Cargo configuration' >&2
@@ -971,11 +979,20 @@ case "${CARGO_HOME-}" in
 esac
 rch_config_directory "$CARGO_HOME"
 rch_config_absent "$CARGO_HOME"
-rch_config_parent=$(pwd -P) || rch_config_refuse
-case "$rch_config_parent" in
+rch_config_current=$(pwd -P) || rch_config_refuse
+case "$1" in
     /*) ;;
     *) rch_config_refuse ;;
 esac
+rch_config_directory "$1"
+rch_config_parent=$(CDPATH= cd -P "$1" && pwd -P) || rch_config_refuse
+shift
+if [ "$rch_config_parent" != / ]; then
+    case "$rch_config_current" in
+        "$rch_config_parent"|"$rch_config_parent"/*) ;;
+        *) rch_config_refuse ;;
+    esac
+fi
 while [ "$rch_config_parent" != / ]; do # ubs:ignore — compares a directory path with filesystem root, not a secret.
     rch_config_parent=${rch_config_parent%/*}
     [ -n "$rch_config_parent" ] || rch_config_parent=/
@@ -993,6 +1010,7 @@ exec "$@""#;
             "-c".to_string(),
             guard.to_string(),
             "rch-clean-overlay-config".to_string(),
+            selected_repository_root.to_string(),
         ],
     );
     Ok(join_exec_command(&tokens))
@@ -1402,7 +1420,8 @@ mod managed_build_dir_tests {
                 super::ManagedCargoCommand::new(command, Some(pool.to_str().unwrap())).unwrap();
             let stamped =
                 super::bind_build_source_stamp(plan.execution_command(), &"a".repeat(40)).unwrap();
-            let guarded = super::guard_clean_overlay_cargo_config(&stamped).unwrap();
+            let guarded =
+                super::guard_clean_overlay_cargo_config(&stamped, root.to_str().unwrap()).unwrap();
             // Fixed, fixture-owned commands only. timeout also bounds compiler
             // descendants; no test relies on an indefinitely running child.
             let output = Command::new("/usr/bin/timeout") // ubs:ignore — native Cargo regression in an owned temporary project.
@@ -1910,14 +1929,20 @@ mod managed_build_dir_tests {
         }
 
         fn run(&self, prefix: &str) -> std::process::Output {
+            self.run_from(prefix, &self.project)
+        }
+
+        fn run_from(&self, prefix: &str, directory: &Path) -> std::process::Output {
             let command = format!(
                 "{prefix} {} test -- 'literal $value; with spaces'",
                 shell_words::quote(self.cargo.to_str().unwrap())
             );
-            let guarded = super::guard_clean_overlay_cargo_config(&command).unwrap();
+            let guarded =
+                super::guard_clean_overlay_cargo_config(&command, self.project.to_str().unwrap())
+                    .unwrap();
             std::process::Command::new("/bin/sh") // ubs:ignore — executes the quoted guard under test with owned fixture argv.
                 .args(["-c", &guarded])
-                .current_dir(&self.project)
+                .current_dir(directory)
                 .env_clear()
                 .env("PATH", "/usr/bin:/bin")
                 .env("CARGO_HOME", &self.home)
@@ -1954,6 +1979,38 @@ mod managed_build_dir_tests {
             std::fs::read_to_string(&fixture.sentinel).unwrap(),
             "test\n--\nliteral $value; with spaces\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clean_overlay_subdirectory_config_guard_allows_selected_ancestors_only() {
+        let fixture = ConfigGuardFixture::new();
+        let nested = fixture.project.join("crates/app/src");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir(fixture.project.join(".cargo")).unwrap();
+        std::fs::write(
+            fixture.project.join(".cargo/config.toml"),
+            "[build]\njobs=1\n",
+        )
+        .unwrap();
+        let output = fixture.run_from("", &nested);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            std::fs::read_to_string(&fixture.sentinel).unwrap(),
+            "test\n--\nliteral $value; with spaces\n"
+        );
+
+        let outside = ConfigGuardFixture::new();
+        let nested = outside.project.join("crates/app/src");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir(outside.root.join(".cargo")).unwrap();
+        std::fs::write(outside.root.join(".cargo/config"), "[build]\njobs=1\n").unwrap();
+        outside.assert_refused(&outside.run_from("", &nested));
+
+        let escaped = ConfigGuardFixture::new();
+        let sibling = escaped.root.join("project-other");
+        std::fs::create_dir(&sibling).unwrap();
+        escaped.assert_refused(&escaped.run_from("", &sibling));
     }
 
     #[cfg(unix)]

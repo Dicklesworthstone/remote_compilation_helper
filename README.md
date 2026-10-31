@@ -1270,6 +1270,29 @@ Explicit clean-overlay execution also admits the read-only `cargo fmt --check`
 diagnostic, which the ordinary interception classifier intentionally leaves
 local.
 
+On Unix workers, clean-overlay commands can start below the Git root. RCH
+materializes the entire selected repository and executes from the corresponding
+selected subdirectory. Cargo discovers the nearest selected ancestor manifest
+and toolchain; dirty or untracked nearer files do not change that choice.
+Relative command arguments, `--manifest-path`, `--dependency-base`, target
+destinations, and job result directories retain their caller-directory basis.
+`--overlay-path` always remains relative to the Git root:
+
+```bash
+cd crates/app/src
+rch exec --base HEAD --clean-overlay --overlay-path crates/app/src/lib.rs \
+  -- cargo test --manifest-path ../Cargo.toml
+```
+
+The invocation directory must exist in the selected base or overlays, with an
+unambiguous spelling and no selected file or symlink ancestor. Trailing-space
+directory names are refused. The receipt names the invocation directory, and
+recovery keeps command/output locations separate from the full source roots.
+Named Cargo JSON outputs use the full selected source root to map ancestor
+manifests back to the caller, including after detached recovery. Source leases
+and retirement retain the complete selected roots. Disk-growth accounting
+still covers the full primary source root.
+
 Initialized Git submodules are materialized recursively at the exact gitlink
 commits in the selected base. Their dirty working files and current checkout
 revisions do not affect the selected bytes. Each submodule must have the pinned
@@ -1338,9 +1361,10 @@ Selected manifest-file symlinks are refused because resolving their bytes must
 not change Cargo's relative source base; unreferenced aliases remain data.
 All inventory paths/symlinks and selected Cargo configuration retain their
 containment checks. File-based `--config`, configuration includes, and changes to Cargo's
-working directory are refused. On the worker, any Cargo-home or ancestor
-configuration is refused before Cargo starts, even if that configuration would
-be harmless. Cargo clean-overlay jobs currently require a Unix worker for this
+working directory through `-C` or wrapper `--chdir` are refused. On the worker,
+selected ancestor configuration within the primary Git root is allowed;
+Cargo-home configuration and configuration above that root are refused before
+Cargo starts, even if harmless. Cargo clean-overlay jobs require a Unix worker for this
 check. These checks do not sandbox arbitrary file reads by build scripts.
 The client re-fingerprints overlays after upload and refuses execution if their
 contents changed during admission or transfer.

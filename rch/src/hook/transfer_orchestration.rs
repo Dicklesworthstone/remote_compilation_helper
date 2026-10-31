@@ -706,6 +706,23 @@ pub(super) async fn execute_remote_compilation(
     outcome
 }
 
+/// Source upload and ownership retain the whole selected Git root. Only after
+/// upload may execution and artifact retrieval adopt the caller's directory.
+/// Preserve the already granted target path and full-root disk supervision.
+fn clean_overlay_execution_pipeline(
+    pipeline: TransferPipeline,
+    spec: &CleanOverlaySpec,
+) -> TransferPipeline {
+    let source_root = pipeline.remote_path();
+    let target_root = pipeline.remote_cargo_target_dir();
+    pipeline
+        .with_local_root(spec.invocation_root())
+        .with_retrieval_reference_root(spec.invocation_root())
+        .with_remote_path_override(spec.remote_invocation_root(&source_root))
+        .with_remote_cargo_target_dir_override(target_root)
+        .with_disk_source_root(source_root)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_remote_compilation_inner(
     worker: &SelectedWorker,
@@ -767,7 +784,8 @@ async fn execute_remote_compilation_inner(
         None
     };
 
-    // Get current working directory and normalize it to the canonical project root.
+    // Source authority covers the whole selected Git root. The invocation cwd
+    // remains the command/artifact basis even when it is below that root.
     let project_root =
         std::env::current_dir().map_err(|e| TransferError::NoProjectRoot { source: e })?;
     let normalized_project = normalize_project_path_with_policy(&project_root, topology_policy)
@@ -781,12 +799,32 @@ async fn execute_remote_compilation_inner(
     for decision in normalized_project.decision_trace() {
         reporter.verbose(&format!("[RCH] project path normalized: {}", decision));
     }
-    let normalized_project_root = normalized_project.canonical_path().to_path_buf();
+    let normalized_invocation_root = normalized_project.canonical_path().to_path_buf();
+    let normalized_project_root = if let Some(spec) = clean_overlay {
+        anyhow::ensure!(
+            normalized_invocation_root == spec.invocation_root(),
+            "clean-overlay invocation directory changed after admission"
+        );
+        let root = normalize_project_path_with_policy(&spec.repository_root, topology_policy)
+            .context("selected Git root is outside the configured source topology")?;
+        anyhow::ensure!(
+            root.canonical_path() == spec.repository_root,
+            "clean-overlay Git root changed after admission"
+        );
+        spec.repository_root.clone()
+    } else {
+        normalized_invocation_root.clone()
+    };
 
     // Windows workers have no Unix canonical/alias projects topology and cargo
     // needs drive-letter paths, so their whole remote layout lives under the
     // Windows build base and syncs via tar-over-ssh (no rsync/streaming).
     let worker_is_windows = WorkerPlatform::from_worker(&worker_config).is_windows();
+    anyhow::ensure!(
+        !worker_is_windows
+            || clean_overlay.is_none_or(|spec| spec.invocation_directory.as_os_str().is_empty()),
+        "clean-overlay invocation from a Git subdirectory requires a Unix worker"
+    );
     if reporter.cargo_json_stdout {
         anyhow::ensure!(
             !worker_is_windows
@@ -806,7 +844,7 @@ async fn execute_remote_compilation_inner(
         Some(
             super::artifact_patterns::direct_compiler::validate_go_build_output(
                 command,
-                &normalized_project_root,
+                &normalized_invocation_root,
             )
             .await?,
         )
@@ -1223,6 +1261,16 @@ async fn execute_remote_compilation_inner(
         .map(|entry| entry.local_root.clone())
         .collect::<Vec<_>>();
     let sync_manifest = build_sync_closure_manifest(&sync_plan, &normalized_project_root);
+    let primary_remote_source_root = sync_plan
+        .iter()
+        .find(|entry| entry.is_primary)
+        .context("sync plan has no primary source root")?
+        .remote_root
+        .clone();
+    let remote_invocation_root = clean_overlay.map_or_else(
+        || primary_remote_source_root.clone(),
+        |spec| spec.remote_invocation_root(&primary_remote_source_root),
+    );
 
     let output_ctx = OutputContext::detect();
     let console = RchConsole::with_context(output_ctx);
@@ -1234,12 +1282,8 @@ async fn execute_remote_compilation_inner(
         && reporter.visibility != OutputVisibility::None
         && !worker_is_windows
         && !reporter.cargo_json_stdout;
-    let remote_pgid_file = build_id.and_then(|id| {
-        sync_plan
-            .iter()
-            .find(|entry| entry.is_primary)
-            .map(|entry| TransferPipeline::remote_pgid_file_path_for_root(&entry.remote_root, id))
-    });
+    let remote_pgid_file = build_id
+        .map(|id| TransferPipeline::remote_pgid_file_path_for_root(&remote_invocation_root, id));
     if let Some(loop_ref) = heartbeat_loop.as_ref() {
         loop_ref.set_remote_pgid_file(remote_pgid_file);
         loop_ref.update_phase(BuildHeartbeatPhase::SyncUp, Some("sync_start".to_string()));
@@ -1524,7 +1568,7 @@ async fn execute_remote_compilation_inner(
             overlay_remote_root.clone(),
             retained_source_root.clone(),
             transfer_config.clone(),
-            normalized_project_root.clone(),
+            normalized_invocation_root.clone(),
             recovery_identity.clone(),
         )?;
     }
@@ -1979,6 +2023,11 @@ async fn execute_remote_compilation_inner(
             normalized_project_root.display()
         )
     })?;
+    let pipeline = if let Some(spec) = clean_overlay {
+        clean_overlay_execution_pipeline(pipeline, spec)
+    } else {
+        pipeline
+    };
     let owned_command = if owned_source_content_pair {
         Some(validate_owned_source_content_closure(
             &prepared_source_roots,
@@ -2045,7 +2094,7 @@ async fn execute_remote_compilation_inner(
                         overlay_remote_root.clone(),
                         retained_source_root.clone(),
                         transfer_config.clone(),
-                        normalized_project_root.clone(),
+                        normalized_invocation_root.clone(),
                         forwarded_cargo_target_dir.as_deref(),
                         kind,
                         policy_command,
@@ -2061,7 +2110,10 @@ async fn execute_remote_compilation_inner(
         recovery_session
             .as_mut()
             .context("caller Cargo JSON has no admitted recovery session")?
-            .request_caller_json(Path::new(&pipeline.remote_path()))?;
+            .request_caller_json(
+                Path::new(&primary_remote_source_root),
+                &normalized_project_root,
+            )?;
     }
     let pipeline = match recovery_session.as_ref() {
         Some(session) => session.completion_pipeline(pipeline),
@@ -2289,7 +2341,12 @@ async fn execute_remote_compilation_inner(
         )?)
     } else {
         clean_overlay_cargo
-            .then(|| super::cargo_target_dir::guard_clean_overlay_cargo_config(command))
+            .then(|| {
+                super::cargo_target_dir::guard_clean_overlay_cargo_config(
+                    command,
+                    &primary_remote_source_root,
+                )
+            })
             .transpose()?
     };
     let guarded_command = guarded_command.as_deref().unwrap_or(command);
@@ -2666,6 +2723,8 @@ async fn execute_remote_compilation_inner(
     {
         let evidence = if reporter.cargo_json_stdout {
             pipeline
+                .clone()
+                .with_remote_path_override(&primary_remote_source_root)
                 .read_cargo_stdout_evidence(&worker_config, &remote_root, 0)
                 .await
         } else {
@@ -2697,7 +2756,13 @@ async fn execute_remote_compilation_inner(
     }
     if reporter.cargo_json_stdout && !result.success() {
         let evidence = pipeline
-            .read_cargo_stdout_evidence(&worker_config, &pipeline.remote_path(), result.exit_code)
+            .clone()
+            .with_remote_path_override(&primary_remote_source_root)
+            .read_cargo_stdout_evidence(
+                &worker_config,
+                &primary_remote_source_root,
+                result.exit_code,
+            )
             .await?;
         recovery_session
             .as_mut()
@@ -3543,6 +3608,7 @@ mod tests {
     use super::clean_overlay_source_pair_pool_name;
     use super::foreign_artifact_gate_disabled_from_value;
     use super::{CleanOverlaySpec, clean_overlay_freshness_identity};
+    use std::path::PathBuf;
 
     #[cfg(unix)]
     #[tokio::test]
@@ -3831,6 +3897,8 @@ mod tests {
     #[test]
     fn source_pair_freshness_identity_binds_overlays_and_canonical_dependency_closure() {
         let leaf = CleanOverlaySpec {
+            repository_root: PathBuf::from("/fixture"),
+            invocation_directory: PathBuf::new(),
             base_commit: "a".repeat(40),
             tree_object: "b".repeat(40),
             overlay_paths: Vec::new(),

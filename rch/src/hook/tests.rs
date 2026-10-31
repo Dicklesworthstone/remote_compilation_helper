@@ -499,6 +499,46 @@ async fn clean_overlay_dependency_binding_captures_committed_tree_and_ignores_pe
 }
 
 #[tokio::test]
+async fn clean_overlay_subdirectory_dependency_bindings_resolve_from_caller_directory() {
+    let _guard = test_guard!();
+    let (_parent, app, dep) = retained_clean_overlay_sibling_fixture().await;
+    let cwd = app.join("src");
+    let mut spec = prepare_clean_overlay_spec(&cwd, Some("HEAD".into()), true, vec![], true)
+        .await
+        .unwrap()
+        .unwrap();
+    bind_clean_overlay_dependencies(&cwd, &mut spec, &["../../dep=HEAD".into()])
+        .await
+        .unwrap();
+    assert_eq!(spec.repository_root, std::fs::canonicalize(&app).unwrap());
+    assert_eq!(spec.dependencies[0].0, std::fs::canonicalize(&dep).unwrap());
+    assert_eq!(spec.primary_directory.as_deref(), Some(Path::new("app")));
+    for command in ["cargo check", "cargo check --manifest-path ../Cargo.toml"] {
+        validate_clean_overlay_cargo_sources(&app, &spec, command)
+            .await
+            .unwrap();
+    }
+    let mut wrong = prepare_clean_overlay_spec(&cwd, Some("HEAD".into()), true, vec![], true)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        bind_clean_overlay_dependencies(&cwd, &mut wrong, &["../dep=HEAD".into()])
+            .await
+            .is_err()
+    );
+    assert!(
+        validate_clean_overlay_cargo_sources(
+            &app,
+            &spec,
+            "cargo check --manifest-path ../../../Cargo.toml"
+        )
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test]
 async fn clean_overlay_dependency_bindings_refuse_duplicate_non_sibling_and_missing_revisions() {
     let _guard = test_guard!();
     let (parent, app, _dep) = retained_clean_overlay_sibling_fixture().await;
@@ -656,6 +696,465 @@ async fn clean_overlay_spec_accepts_base_only_and_resolves_commit() {
 }
 
 #[tokio::test]
+async fn clean_overlay_subdirectory_keeps_full_root_and_literal_manifest_semantics() {
+    let _guard = test_guard!();
+    let root = init_clean_overlay_test_repo().keep();
+    std::fs::create_dir_all(root.join("crates/app/src")).unwrap();
+    std::fs::write(
+        root.join("crates/app/Cargo.toml"),
+        "[package]\nname='nested-app'\nversion='0.1.0'\n[workspace]\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("crates/app/src/lib.rs"), "pub fn nested() {}\n").unwrap();
+    commit_clean_overlay_submodule_fixture(&root).await;
+    // This nearer manifest is deliberately outside the selected source. Cargo
+    // on the materialized snapshot must still discover crates/app/Cargo.toml.
+    std::fs::write(root.join("crates/app/src/Cargo.toml"), "not valid TOML").unwrap();
+    std::fs::write(root.join("src/lib.rs"), "pub fn selected_overlay() {}\n").unwrap();
+    let spec = prepare_clean_overlay_spec(
+        &root.join("crates/app/src"),
+        Some("HEAD".into()),
+        true,
+        vec![PathBuf::from("src/lib.rs")],
+        false,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(spec.repository_root, std::fs::canonicalize(&root).unwrap());
+    assert_eq!(spec.invocation_directory, Path::new("crates/app/src"));
+    assert_eq!(spec.overlay_paths(), &[PathBuf::from("src/lib.rs")]);
+    assert!(
+        spec.execution_receipt()
+            .contains("invocation-directory=crates/app/src")
+    );
+    for command in [
+        "cargo check",
+        "cargo check --manifest-path ../Cargo.toml",
+        "cargo check --manifest-path=../../../Cargo.toml",
+        "cargo check --config 'paths=[\"../../..\"]'",
+    ] {
+        validate_clean_overlay_cargo_sources(&root, &spec, command)
+            .await
+            .unwrap_or_else(|error| panic!("{command}: {error:#}"));
+    }
+    for command in [
+        "cargo check --manifest-path Cargo.toml",
+        "cargo check --manifest-path ../../../../Cargo.toml",
+        "cargo check --config 'paths=[\"../../../..\"]'",
+        "cargo -C .. check",
+        "env --chdir=.. cargo check",
+    ] {
+        assert!(
+            validate_clean_overlay_cargo_sources(&root, &spec, command)
+                .await
+                .is_err(),
+            "must refuse unselected command: {command}"
+        );
+    }
+    let root_spec = prepare_clean_overlay_spec(
+        &root,
+        Some("HEAD".into()),
+        true,
+        vec![PathBuf::from("src/lib.rs")],
+        false,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(root_spec.overlay_fingerprint(), spec.overlay_fingerprint());
+    assert_ne!(
+        selection_project_for_execution("app", Some(&root_spec), uuid::Uuid::from_u128(1)),
+        selection_project_for_execution("app", Some(&spec), uuid::Uuid::from_u128(1)),
+        "execution identity includes cwd even for identical source bytes"
+    );
+}
+
+#[tokio::test]
+async fn clean_overlay_subdirectory_requires_a_selected_exact_directory() {
+    let _guard = test_guard!();
+    let root = init_clean_overlay_test_repo().keep();
+    std::fs::create_dir_all(root.join("unselected/nested")).unwrap();
+    std::fs::write(
+        root.join("unselected/nested/file"),
+        "selected only by overlay",
+    )
+    .unwrap();
+    let error = prepare_clean_overlay_spec(
+        &root.join("unselected/nested"),
+        Some("HEAD".into()),
+        true,
+        vec![],
+        true,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("absent from the selected"),
+        "{error:#}"
+    );
+    prepare_clean_overlay_spec(
+        &root.join("unselected/nested"),
+        Some("HEAD".into()),
+        true,
+        vec![PathBuf::from("unselected/nested/file")],
+        false,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    std::fs::write(root.join("file-before"), "selected file").unwrap();
+    commit_clean_overlay_submodule_fixture(&root).await;
+    std::fs::rename(root.join("file-before"), root.join("retained-file-before")).unwrap();
+    std::fs::create_dir(root.join("file-before")).unwrap();
+    std::fs::write(root.join("file-before/new"), "unselected directory").unwrap();
+    let error = prepare_clean_overlay_spec(
+        &root.join("file-before"),
+        Some("HEAD".into()),
+        true,
+        vec![],
+        true,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("selected file or symlink"),
+        "{error:#}"
+    );
+    std::fs::create_dir(root.join("trailing-space ")).unwrap();
+    let error = prepare_clean_overlay_spec(
+        &root.join("trailing-space "),
+        Some("HEAD".into()),
+        true,
+        vec![],
+        true,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("whitespace"), "{error:#}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn clean_overlay_subdirectory_refuses_a_selected_symlink_replaced_by_live_directory() {
+    let _guard = test_guard!();
+    let root = init_clean_overlay_test_repo().keep();
+    std::os::unix::fs::symlink("src", root.join("selected-link")).unwrap();
+    commit_clean_overlay_submodule_fixture(&root).await;
+    std::fs::rename(root.join("selected-link"), root.join("retained-link")).unwrap();
+    std::fs::create_dir(root.join("selected-link")).unwrap();
+    let error = prepare_clean_overlay_spec(
+        &root.join("selected-link"),
+        Some("HEAD".into()),
+        true,
+        vec![],
+        true,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("selected file or symlink"),
+        "{error:#}"
+    );
+}
+
+#[tokio::test]
+async fn clean_overlay_subdirectory_discovers_only_selected_ancestor_toolchains() {
+    let _guard = test_guard!();
+    let root = init_clean_overlay_test_repo().keep();
+    std::fs::create_dir_all(root.join("nested/src")).unwrap();
+    std::fs::write(root.join("nested/src/input"), "selected directory").unwrap();
+    std::fs::write(
+        root.join("rust-toolchain.toml"),
+        "[toolchain]\nchannel='stable'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("nested/rust-toolchain.toml"),
+        "[toolchain]\nchannel='beta'\n",
+    )
+    .unwrap();
+    commit_clean_overlay_submodule_fixture(&root).await;
+    std::fs::write(
+        root.join("nested/rust-toolchain.toml"),
+        "unselected broken toolchain",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("nested/src/rust-toolchain"),
+        "unselected-nearer-toolchain",
+    )
+    .unwrap();
+    let spec = prepare_clean_overlay_spec(
+        &root.join("nested/src"),
+        Some("HEAD".into()),
+        true,
+        vec![],
+        true,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        detect_clean_overlay_toolchain(&root, &spec)
+            .await
+            .unwrap()
+            .unwrap()
+            .rustup_toolchain(),
+        parse_channel_string("beta").unwrap().rustup_toolchain()
+    );
+    // A directory overlay selects its toolchain files too, including the
+    // legacy filename whose precedence is the same as rustup's own search.
+    std::fs::write(
+        root.join("nested/rust-toolchain.toml"),
+        "[toolchain]\nchannel='stable'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("nested/src/rust-toolchain"),
+        "nightly-2026-08-31\n",
+    )
+    .unwrap();
+    let overlay = prepare_clean_overlay_spec(
+        &root.join("nested/src"),
+        Some("HEAD".into()),
+        true,
+        vec!["nested".into()],
+        false,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        detect_clean_overlay_toolchain(&root, &overlay)
+            .await
+            .unwrap()
+            .unwrap()
+            .rustup_toolchain(),
+        parse_channel_string("nightly-2026-08-31")
+            .unwrap()
+            .rustup_toolchain()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn clean_overlay_subdirectory_real_git_archive_and_cargo_preserve_selected_cwd() {
+    use std::io::Read as _;
+
+    let _guard = test_guard!();
+    let root = init_clean_overlay_test_repo().keep();
+    std::fs::create_dir_all(root.join("crates/app/src")).unwrap();
+    std::fs::create_dir(root.join(".cargo")).unwrap();
+    std::fs::write(
+        root.join("crates/app/Cargo.toml"),
+        "[package]\nname='selected_nested_app'\nversion='0.1.0'\nedition='2024'\n[workspace]\n[[bin]]\nname='nested'\npath='src/main.rs'\n",
+    ).unwrap();
+    std::fs::write(
+        root.join("crates/app/src/main.rs"),
+        "fn main() { assert_eq!(env!(\"RCH_SELECTED_ANCESTOR\"), \"selected\"); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("crates/app/src/lib.rs"),
+        "#[test] fn inherited_config() { assert_eq!(env!(\"RCH_SELECTED_ANCESTOR\"), \"selected\"); assert_eq!(env!(\"RCH_LITERAL_ARGUMENT\"), \"spaces $ ;\"); }\n",
+    ).unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "compile_error!(\"wrong manifest selected\");\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join(".cargo/config.toml"),
+        "[env]\nRCH_SELECTED_ANCESTOR='selected'\n",
+    )
+    .unwrap();
+    commit_clean_overlay_submodule_fixture(&root).await;
+    std::fs::write(
+        root.join(".cargo/config.toml"),
+        "[env]\nRCH_SELECTED_ANCESTOR='dirty'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("crates/app/src/Cargo.toml"),
+        "unselected manifest trap",
+    )
+    .unwrap();
+    let spec = prepare_clean_overlay_spec(
+        &root.join("crates/app/src"),
+        Some("HEAD".into()),
+        true,
+        vec![],
+        true,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let archive = TransferPipeline::create_selected_git_archive(&root, spec.base_commit(), &[])
+        .await
+        .unwrap();
+    let storage = tempfile::tempdir().unwrap().keep();
+    let selected_root = storage.join("selected source");
+    std::fs::create_dir(&selected_root).unwrap();
+    tar::Archive::new(archive.reopen().unwrap())
+        .unpack(&selected_root)
+        .unwrap();
+    assert!(!selected_root.join(".git").exists());
+    assert!(!selected_root.join("crates/app/src/Cargo.toml").exists());
+    let remote_cwd = PathBuf::from(spec.remote_invocation_root(selected_root.to_str().unwrap()));
+    let cargo_home = storage.join("cargo-home");
+    let bin = storage.join("bin");
+    std::fs::create_dir(&cargo_home).unwrap();
+    std::fs::create_dir(&bin).unwrap();
+    let mut cargo = PathBuf::from(env!("CARGO"));
+    if std::fs::metadata(&cargo).unwrap().len() <= 8 * 1024
+        && std::fs::read_to_string(&cargo)
+            .unwrap()
+            .lines()
+            .any(|line| line.starts_with("# rch-toolchain-wrap-version:"))
+    {
+        cargo.set_file_name("cargo-rch-real");
+    }
+    let mut magic = [0; 4];
+    std::fs::File::open(&cargo)
+        .unwrap()
+        .read_exact(&mut magic)
+        .unwrap();
+    assert_eq!(&magic, b"\x7fELF", "fixture requires native Cargo");
+    let cargo_bin = cargo.parent().unwrap();
+    std::os::unix::fs::symlink(&cargo, bin.join("cargo")).unwrap();
+    let path = std::env::join_paths([
+        bin,
+        cargo_bin.to_path_buf(),
+        PathBuf::from("/usr/bin"),
+        PathBuf::from("/bin"),
+    ])
+    .unwrap();
+    let reporter = HookReporter::new(OutputVisibility::None);
+    let target = storage.join("managed-target");
+    for (explicit, caller_json) in [(false, false), (true, false), (true, true)] {
+        let mut tokens = if caller_json {
+            vec![
+                "cargo".to_owned(),
+                "build".into(),
+                "--offline".into(),
+                "--bin".into(),
+                "nested".into(),
+                "--message-format=json".into(),
+            ]
+        } else {
+            vec![
+                "cargo".to_owned(),
+                "test".into(),
+                "--offline".into(),
+                "--lib".into(),
+            ]
+        };
+        if explicit {
+            tokens.extend(["--manifest-path".into(), "../Cargo.toml".into()]);
+        }
+        tokens.extend(["--target-dir".into(), "../../../returned-target".into()]);
+        if !caller_json {
+            tokens.extend([
+                "--config".into(),
+                "env.RCH_LITERAL_ARGUMENT='spaces $ ;'".into(),
+            ]);
+        }
+        let command = join_exec_command(&tokens);
+        validate_clean_overlay_cargo_sources(&root, &spec, &command)
+            .await
+            .unwrap();
+        let local_target = resolve_forwarded_cargo_target_dir_with_lookup(
+            Some(CompilationKind::CargoTest),
+            &spec.invocation_root(),
+            &reporter,
+            |_| None,
+            Some(&tokens),
+        )
+        .unwrap();
+        assert_eq!(
+            local_target,
+            spec.invocation_root().join("../../../returned-target")
+        );
+        let rewritten = rewrite_cargo_target_dir_command_for_remote(
+            &command,
+            Some(&tokens),
+            Some(&local_target),
+            &reporter,
+        );
+        let plan =
+            cargo_target_dir::ManagedCargoCommand::new(&rewritten, Some(target.to_str().unwrap()))
+                .unwrap();
+        let guarded = cargo_target_dir::guard_clean_overlay_cargo_config(
+            plan.execution_command(),
+            selected_root.to_str().unwrap(),
+        )
+        .unwrap();
+        let output = std::process::Command::new("/usr/bin/timeout")
+            .args(["--kill-after=5", "120", "/bin/sh", "-c", &guarded])
+            .current_dir(&remote_cwd)
+            .env_clear()
+            .env("PATH", &path)
+            .env("HOME", &storage)
+            .env("CARGO_HOME", &cargo_home)
+            .env("CARGO_TARGET_DIR", &target)
+            .env("CARGO_BUILD_JOBS", "1")
+            .env("RUSTC", cargo_bin.join("rustc"))
+            .env("RUSTUP_AUTO_INSTALL", "0")
+            .env("RCH_CARGO_WRAPPER_BYPASS", "1")
+            .env("RCH_CARGO_WRAPPER_ORIGIN", "rch")
+            .output()
+            .unwrap();
+        std::fs::write(
+            storage.join(format!("cargo-{explicit}-{caller_json}.stdout")),
+            &output.stdout,
+        )
+        .unwrap();
+        std::fs::write(
+            storage.join(format!("cargo-{explicit}-{caller_json}.stderr")),
+            &output.stderr,
+        )
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{output:?}; retained {}",
+            storage.display()
+        );
+        if caller_json {
+            let capture = cargo_output_contract::CargoOutputCapture::for_command(
+                Some(CompilationKind::CargoBuild),
+                &command,
+            )
+            .unwrap();
+            assert!(
+                capture
+                    .validate_caller_metadata(&output.stdout, &[&target], &[&selected_root], &root,)
+                    .is_ok()
+            );
+            assert!(
+                capture
+                    .validate_caller_metadata(
+                        &output.stdout,
+                        &[&target],
+                        &[&remote_cwd],
+                        &spec.invocation_root(),
+                    )
+                    .is_err(),
+                "cwd alone cannot map the actual ancestor manifest"
+            );
+        } else {
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{output:?}"
+            );
+        }
+    }
+    assert!(target.join("debug/deps").is_dir());
+    assert!(!selected_root.join("returned-target").exists());
+}
+
+#[tokio::test]
 async fn clean_overlay_execution_receipt_names_the_resolved_base_and_content_fingerprint() {
     let _guard = test_guard!();
     let repo = init_clean_overlay_test_repo();
@@ -695,6 +1194,8 @@ async fn clean_overlay_execution_receipt_names_the_resolved_base_and_content_fin
 fn clean_overlay_selection_identity_is_source_bound_and_per_job() {
     let _guard = test_guard!();
     let spec = CleanOverlaySpec {
+        repository_root: PathBuf::from("/fixture"),
+        invocation_directory: PathBuf::new(),
         base_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
         tree_object: "0123456789abcdef0123456789abcdef01234567".to_string(),
         overlay_paths: vec![PathBuf::from("src/lib.rs")],

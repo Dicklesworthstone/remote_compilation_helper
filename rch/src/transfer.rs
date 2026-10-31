@@ -2822,6 +2822,9 @@ pub struct TransferPipeline {
     deadline_marker: String,
     /// Absolute worker headroom and allocated-output growth reservation.
     disk_budget: Option<rch_common::BuildDiskBudget>,
+    /// Whole selected source root when execution is rebased to a subdirectory.
+    /// Disk supervision must keep accounting for writes above the command cwd.
+    disk_source_root: Option<String>,
     /// Local project root.
     project_root: PathBuf,
     /// Caller-owned tree used to distinguish source from artifact roots. A
@@ -3003,6 +3006,7 @@ impl TransferPipeline {
         Self {
             deadline_marker: format!("RCH_EXTERNAL_DEADLINE:{}", uuid::Uuid::new_v4()),
             disk_budget: None,
+            disk_source_root: None,
             retrieval_reference_root: project_root.clone(),
             project_root,
             project_id: safe_project_id,
@@ -3276,6 +3280,11 @@ impl TransferPipeline {
 
     pub(crate) fn with_retrieval_reference_root(mut self, root: PathBuf) -> Self {
         self.retrieval_reference_root = root;
+        self
+    }
+
+    pub(crate) fn with_disk_source_root(mut self, root: String) -> Self {
+        self.disk_source_root = Some(root);
         self
     }
 
@@ -5055,8 +5064,12 @@ impl TransferPipeline {
         // Native compilers, custom jobs, and package managers also write in
         // the owned workspace. Inode deduplication avoids charging nested
         // target/temporary directories twice; the initial checkout is baseline.
-        if !outputs.contains(&self.remote_path()) {
-            outputs.push(self.remote_path());
+        let source_root = self
+            .disk_source_root
+            .clone()
+            .unwrap_or_else(|| self.remote_path());
+        if !outputs.contains(&source_root) {
+            outputs.push(source_root);
         }
         let probes = outputs.clone();
         let plan = serde_json::json!({
@@ -5149,7 +5162,12 @@ exit \"$__rch_disk_status\"; }}"
         {
             return None;
         }
-        failure.roots = vec![self.remote_path(), self.remote_cargo_target_dir()];
+        failure.roots = vec![
+            self.disk_source_root
+                .clone()
+                .unwrap_or_else(|| self.remote_path()),
+            self.remote_cargo_target_dir(),
+        ];
         Some(failure)
     }
 
@@ -12834,6 +12852,48 @@ Number of files transferred: 42
                 .stderr
                 .split_inclusive('\n')
                 .any(|line| pipeline.parse_disk_usage_marker(line).is_some())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn clean_overlay_subdirectory_disk_budget_counts_growth_above_execution_cwd() {
+        let _guard = test_guard!();
+        let source = tempfile::tempdir().unwrap().keep();
+        let cwd = source.join("nested");
+        std::fs::create_dir(&cwd).unwrap();
+        let pipeline = disk_budget_test_pipeline(&cwd, Some(7), 15)
+            .with_disk_source_root(source.to_str().unwrap().to_owned())
+            .with_disk_budget(Some(rch_common::BuildDiskBudget {
+                max_growth_bytes: 1 << 20,
+                min_free_bytes: 1 << 20,
+            }));
+        let output = run_external_timeout_fixture(
+            &source,
+            &pipeline.build_remote_command(
+                "head -c 2097152 /dev/zero > ../parent-output; exec sleep 20",
+                None,
+            ),
+        )
+        .await;
+        let result = CommandResult {
+            exit_code: output.status.code().unwrap(),
+            stdout: String::from_utf8(output.stdout).unwrap(),
+            stderr: String::from_utf8(output.stderr).unwrap(),
+            duration_ms: 0,
+        };
+        let error = pipeline.ensure_remote_disk_budget(&result).unwrap_err();
+        let failure = error
+            .downcast_ref::<RemoteBuildDiskBudgetExceeded>()
+            .unwrap();
+        assert!(failure.started, "{result:?}");
+        assert_eq!(failure.reason, "growth");
+        assert!(failure.roots.contains(&source.to_str().unwrap().to_owned()));
+        assert_eq!(
+            std::fs::metadata(source.join("parent-output"))
+                .unwrap()
+                .len(),
+            2 << 20
         );
     }
 
