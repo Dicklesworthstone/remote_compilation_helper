@@ -1,0 +1,1029 @@
+{
+  "schema_version": 1,
+  "issue": {
+    "number": 128,
+    "url": "https://github.com/Dicklesworthstone/remote_compilation_helper/issues/128",
+    "reported_version": "RCH 1.x on Linux"
+  },
+  "recorded_on": "2026-10-31",
+  "provenance": {
+    "baseline_revision": "4a3fac5fe34db3685bd2ebd4467a5b80dad9e609",
+    "measured_candidate_base_revision": "406e982564f58e33c148607ab40bda9cb2fa6bff",
+    "incorporated_main_revision": "c78bd9398918d55c3134831728fa0059d20cde26",
+    "upstream_integration": [
+      {
+        "from": "4a3fac5fe34db3685bd2ebd4467a5b80dad9e609",
+        "to": "406e982564f58e33c148607ab40bda9cb2fa6bff",
+        "commits": 2,
+        "description": "Pinned Git-submodule support; no changes to rch-common or rchd production paths."
+      },
+      {
+        "from": "406e982564f58e33c148607ab40bda9cb2fa6bff",
+        "to": "c78bd9398918d55c3134831728fa0059d20cde26",
+        "commits": 6,
+        "description": "RABS delivery/admission and RCH clean-overlay/source-content changes; no changes to rch-common or rchd. CLI validation must use the incorporated source."
+      }
+    ],
+    "baseline_binary": {
+      "path": "/tmp/rch-target-baseline/debug/rchd",
+      "sha256": "8eedeaa98e8e56265e54ced2b4bf5e00be4ab985bc935085086c2331de8e4986"
+    },
+    "measured_candidate_binary": {
+      "path": "/tmp/rch-target-candidate/debug/rchd",
+      "sha256": "7a45c2811ffa8bdeda8297a31c1ce381ddba92b5d1fb18c35de0145e078f9baf"
+    },
+    "final_integration_binaries": {
+      "scope": "Executables after the administrative-persistence correction and CLI alias fix, used by the completed final daemon/job lifecycle suites. These hashes do not replace the earlier process-measurement executable identity.",
+      "rch": {
+        "path": "/tmp/rch-target-candidate/debug/rch",
+        "sha256": "e2487b83d5aeefcc0dc506c048d96b8be3b3ad31b9c0e569673fb6285e13a340",
+        "size_bytes": 114944464
+      },
+      "rchd": {
+        "path": "/tmp/rch-target-candidate/debug/rchd",
+        "sha256": "d92ac5721f892808108c1fb059bcce630131d781b0d5ca113a2ec866963cbe22",
+        "size_bytes": 81494960
+      }
+    },
+    "candidate_scope": "Working-tree issue-128 changes are identified by executable hash. The earlier process measurements precede the final common-store correction requiring a durable clear of volatile-only disable intent; that correction has a separate completed common-suite rerun below. Final executable builds, CLI regressions, and lifecycle suites have their own later evidence and binary identities.",
+    "toolchain": {
+      "channel": "nightly-2026-08-31",
+      "rustc": "1.100.0-nightly (908501772 2026-08-30)",
+      "commit": "90850177249efe0321573c569aec5d12b257f8d6"
+    },
+    "build_environment": {
+      "CARGO_BUILD_JOBS": "1",
+      "CARGO_PROFILE_DEV_DEBUG": "0",
+      "CARGO_PROFILE_TEST_DEBUG": "0",
+      "CARGO_INCREMENTAL": "0",
+      "RUSTFLAGS": "-Zthreads=1 -Zmir-opt-level=0 -Zunstable-options --jobs-backend=1"
+    },
+    "harness": "scripts/test_offline_worker_recovery.py",
+    "earlier_evidence": "offline_worker_issue_128.json",
+    "earlier_evidence_note": "The original a1fe627c comparison and its raw JSON are preserved separately and are not relabeled as current-main results."
+  },
+  "measurement_limits": [
+    "Local deterministic worker protocols exercise actual daemon scheduling/reservations and SSH process lifecycles. OpenSSH mode performs real local client/server authentication; subprocess mode instruments a local SSH protocol fixture.",
+    "No external worker, actual remote compilation, live Tailscale/VPN traffic, or original RCH 1.x executable was measured. The reporter's traffic/log rates were not reproduced or claimed.",
+    "Current-main baseline idle disable/restart and authenticated-session freeze cases already passed. These cases are preservation checks, not newly fixed behavior.",
+    "Process peaks are sampled; a fast refused dial can have sampled peak zero while the independently recorded dial count is nonzero.",
+    "Small local p95 samples, CPU accounting and RSS observations are retained without a general latency, CPU or memory performance claim. The measured candidate's disabled-phase CPU time can be higher than baseline."
+  ],
+  "raw_process_results": {
+    "initial_current_main_baseline_synthetic": {
+      "source_path": "/tmp/rch-128-current-main-fixture/results.json",
+      "source_sha256": "39a4a839cc9664b4d4f9db53067d531ea8b4019f938d72f1d4bf2fb3f8ad8743",
+      "source_size_bytes": 1988,
+      "results": {
+        "revision": "4a3fac5fe34db3685bd2ebd4467a5b80dad9e609",
+        "binary": {
+          "path": "/tmp/rch-target-baseline/debug/rchd",
+          "sha256": "8eedeaa98e8e56265e54ced2b4bf5e00be4ab985bc935085086c2331de8e4986"
+        },
+        "idle": {
+          "seconds": 65.00316407399987,
+          "dial_attempts": 2,
+          "minimum_dial_spacing_seconds": 30.005664971000442,
+          "sampled_peak_live_transport_processes": 0,
+          "daemon_cpu_seconds": 0.04,
+          "peak_daemon_rss_bytes": 34906112,
+          "daemon_log_lines": 28,
+          "total_dial_attempts": 2,
+          "worker_status": {
+            "id": "offline",
+            "host": "offline",
+            "user": "root",
+            "status": "unreachable",
+            "circuit_state": "open",
+            "used_slots": 0,
+            "total_slots": 0,
+            "speed_score": 50,
+            "last_error": null,
+            "consecutive_failures": 2,
+            "recovery_in_secs": 865,
+            "failure_history": [
+              false,
+              false
+            ],
+            "pressure_state": "telemetry_gap",
+            "pressure_confidence": "low",
+            "pressure_reason_code": "disk_metrics_unavailable",
+            "pressure_policy_rule": "fail_open_missing_disk_metrics",
+            "pressure_disk_free_gb": null,
+            "pressure_disk_total_gb": null,
+            "pressure_disk_free_ratio": null,
+            "pressure_disk_io_util_pct": null,
+            "pressure_memory_pressure": null,
+            "pressure_telemetry_age_secs": null,
+            "pressure_telemetry_fresh": false
+          },
+          "disabled": {
+            "seconds": 32.03147597499992,
+            "dial_attempts": 0,
+            "minimum_dial_spacing_seconds": null,
+            "sampled_peak_live_transport_processes": 0,
+            "daemon_cpu_seconds": 0,
+            "peak_daemon_rss_bytes": 37965824,
+            "daemon_log_lines": 0
+          },
+          "disabled_restart": {
+            "seconds": 2.031884746999822,
+            "dial_attempts": 0,
+            "minimum_dial_spacing_seconds": null,
+            "sampled_peak_live_transport_processes": 0,
+            "daemon_cpu_seconds": 0,
+            "peak_daemon_rss_bytes": 33914880,
+            "daemon_log_lines": 0,
+            "all_new_dials": 0
+          }
+        }
+      }
+    },
+    "matched_current_main_openssh": {
+      "source_path": "/tmp/rch-128-candidate-openssh/results.json",
+      "source_sha256": "42ae103e628972982ed410e51ba8be5b65dcd3f805b535fe42d81f3c54b00d6b",
+      "source_size_bytes": 8096,
+      "results": {
+        "transport": "local OpenSSH with deterministic worker protocol",
+        "binary": {
+          "path": "/tmp/rch-target-candidate/debug/rchd",
+          "sha256": "7a45c2811ffa8bdeda8297a31c1ce381ddba92b5d1fb18c35de0145e078f9baf"
+        },
+        "configuration": {
+          "failure_threshold": 2,
+          "regression_health_interval_secs": 1,
+          "regression_recovery_probe_interval_secs": 3,
+          "idle_health_interval_secs": 30,
+          "idle_recovery_probe_interval_secs": 300,
+          "idle_open_cooldown_secs": 900
+        },
+        "before_binary": {
+          "path": "/tmp/rch-target-baseline/debug/rchd",
+          "sha256": "8eedeaa98e8e56265e54ced2b4bf5e00be4ab985bc935085086c2331de8e4986"
+        },
+        "before": {
+          "seconds": 65.01377518399931,
+          "dial_attempts": 2,
+          "minimum_dial_spacing_seconds": 29.99315857200054,
+          "sampled_peak_live_transport_processes": 0,
+          "daemon_cpu_seconds": 0.019999999999999997,
+          "peak_daemon_rss_bytes": 34643968,
+          "daemon_log_lines": 31,
+          "total_dial_attempts": 2,
+          "worker_status": {
+            "id": "offline",
+            "host": "offline",
+            "user": "root",
+            "status": "unreachable",
+            "circuit_state": "open",
+            "used_slots": 0,
+            "total_slots": 0,
+            "speed_score": 50,
+            "last_error": null,
+            "consecutive_failures": 2,
+            "recovery_in_secs": 865,
+            "failure_history": [
+              false,
+              false
+            ],
+            "pressure_state": "telemetry_gap",
+            "pressure_confidence": "low",
+            "pressure_reason_code": "disk_metrics_unavailable",
+            "pressure_policy_rule": "fail_open_missing_disk_metrics",
+            "pressure_disk_free_gb": null,
+            "pressure_disk_total_gb": null,
+            "pressure_disk_free_ratio": null,
+            "pressure_disk_io_util_pct": null,
+            "pressure_memory_pressure": null,
+            "pressure_telemetry_age_secs": null,
+            "pressure_telemetry_fresh": false
+          },
+          "disabled": {
+            "seconds": 32.013557918000515,
+            "dial_attempts": 0,
+            "minimum_dial_spacing_seconds": null,
+            "sampled_peak_live_transport_processes": 0,
+            "daemon_cpu_seconds": 0.020000000000000004,
+            "peak_daemon_rss_bytes": 37732352,
+            "daemon_log_lines": 0
+          },
+          "disabled_restart": {
+            "seconds": 2.0269743249991734,
+            "dial_attempts": 0,
+            "minimum_dial_spacing_seconds": null,
+            "sampled_peak_live_transport_processes": 0,
+            "daemon_cpu_seconds": 0,
+            "peak_daemon_rss_bytes": 34406400,
+            "daemon_log_lines": 0,
+            "all_new_dials": 0
+          }
+        },
+        "after": {
+          "seconds": 65.01094836899938,
+          "dial_attempts": 2,
+          "minimum_dial_spacing_seconds": 29.96987040299973,
+          "sampled_peak_live_transport_processes": 1,
+          "daemon_cpu_seconds": 0.03,
+          "peak_daemon_rss_bytes": 30859264,
+          "daemon_log_lines": 28,
+          "total_dial_attempts": 2,
+          "worker_status": {
+            "id": "offline",
+            "host": "offline",
+            "user": "root",
+            "status": "unreachable",
+            "circuit_state": "open",
+            "used_slots": 0,
+            "total_slots": 0,
+            "speed_score": 50,
+            "last_error": null,
+            "consecutive_failures": 2,
+            "recovery_in_secs": 865,
+            "failure_history": [
+              false,
+              false
+            ],
+            "pressure_state": "telemetry_gap",
+            "pressure_confidence": "low",
+            "pressure_reason_code": "disk_metrics_unavailable",
+            "pressure_policy_rule": "fail_open_missing_disk_metrics",
+            "pressure_disk_free_gb": null,
+            "pressure_disk_total_gb": null,
+            "pressure_disk_free_ratio": null,
+            "pressure_disk_io_util_pct": null,
+            "pressure_memory_pressure": null,
+            "pressure_telemetry_age_secs": null,
+            "pressure_telemetry_fresh": false
+          },
+          "disabled": {
+            "seconds": 32.04689270900053,
+            "dial_attempts": 0,
+            "minimum_dial_spacing_seconds": null,
+            "sampled_peak_live_transport_processes": 0,
+            "daemon_cpu_seconds": 1.41,
+            "peak_daemon_rss_bytes": 29192192,
+            "daemon_log_lines": 0
+          },
+          "disabled_restart": {
+            "seconds": 2.0255102240007545,
+            "dial_attempts": 0,
+            "minimum_dial_spacing_seconds": null,
+            "sampled_peak_live_transport_processes": 0,
+            "daemon_cpu_seconds": 0.01,
+            "peak_daemon_rss_bytes": 31440896,
+            "daemon_log_lines": 0,
+            "all_new_dials": 0
+          }
+        },
+        "regressions": {
+          "prolonged_outage": {
+            "seconds": 9.20111273099974,
+            "dial_attempts": 3,
+            "minimum_dial_spacing_seconds": 3.0658248499985348,
+            "sampled_peak_live_transport_processes": 1,
+            "daemon_cpu_seconds": 0.05000000000000002,
+            "peak_daemon_rss_bytes": 36421632,
+            "daemon_log_lines": 0
+          },
+          "mixed_fleet_selected": 24,
+          "selection_p95_seconds": 0.011608138998781214,
+          "concurrent_capability_refresh": {
+            "requests": 12,
+            "seconds": 0.2388930609995441,
+            "offline_dial_attempts": 0,
+            "minimum_dial_spacing_seconds": 3.0658248499985348
+          },
+          "recovery_latency_seconds": 3.1055078919998778,
+          "disabled": {
+            "seconds": 4.020944572999724,
+            "dial_attempts": 0,
+            "minimum_dial_spacing_seconds": null,
+            "sampled_peak_live_transport_processes": 0,
+            "daemon_cpu_seconds": 0.030000000000000027,
+            "peak_daemon_rss_bytes": 39890944,
+            "daemon_log_lines": 2
+          },
+          "disabled_restart": {
+            "seconds": 4.016902355999264,
+            "dial_attempts": 0,
+            "minimum_dial_spacing_seconds": null,
+            "sampled_peak_live_transport_processes": 0,
+            "daemon_cpu_seconds": 0.019999999999999997,
+            "peak_daemon_rss_bytes": 32940032,
+            "daemon_log_lines": 7
+          },
+          "established_connection_loss": {
+            "seconds": 6.207477433999884,
+            "dial_attempts": 2,
+            "minimum_dial_spacing_seconds": 3.083535079000285,
+            "sampled_peak_live_transport_processes": 1,
+            "daemon_cpu_seconds": 0.04000000000000001,
+            "peak_daemon_rss_bytes": 37761024,
+            "daemon_log_lines": 0
+          },
+          "vpn_blackhole": {
+            "seconds": 8.017013984999721,
+            "dial_attempts": 2,
+            "minimum_dial_spacing_seconds": 3.9978336179992766,
+            "sampled_peak_live_transport_processes": 1,
+            "daemon_cpu_seconds": 0.07,
+            "peak_daemon_rss_bytes": 37629952,
+            "daemon_log_lines": 0
+          },
+          "unpooled": {
+            "seconds": 6.234620036999331,
+            "dial_attempts": 2,
+            "minimum_dial_spacing_seconds": 3.1034257570008776,
+            "sampled_peak_live_transport_processes": 1,
+            "daemon_cpu_seconds": 0.010000000000000009,
+            "peak_daemon_rss_bytes": 35971072,
+            "daemon_log_lines": 0
+          },
+          "authenticated_transport_freeze": {
+            "frozen_authenticated_transports": 2,
+            "outage": {
+              "seconds": 6.241296170001078,
+              "dial_attempts": 1,
+              "minimum_dial_spacing_seconds": null,
+              "sampled_peak_live_transport_processes": 1,
+              "daemon_cpu_seconds": 0.03999999999999998,
+              "peak_daemon_rss_bytes": 39813120,
+              "daemon_log_lines": 0
+            },
+            "healthy_peer_admissions": 12,
+            "recovery_latency_seconds": 0.9241656590002094,
+            "disabled": {
+              "seconds": 3.2263656470004207,
+              "dial_attempts": 0,
+              "minimum_dial_spacing_seconds": null,
+              "sampled_peak_live_transport_processes": 0,
+              "daemon_cpu_seconds": 0.010000000000000009,
+              "peak_daemon_rss_bytes": 40206336,
+              "daemon_log_lines": 2
+            },
+            "disabled_restart": {
+              "seconds": 3.2157409800001915,
+              "dial_attempts": 0,
+              "minimum_dial_spacing_seconds": null,
+              "sampled_peak_live_transport_processes": 0,
+              "daemon_cpu_seconds": 0.019999999999999997,
+              "peak_daemon_rss_bytes": 33177600,
+              "daemon_log_lines": 7
+            },
+            "reservation_slots_preserved_until_explicit_release": 3
+          },
+          "saturated_recovery_fleet": {
+            "blackhole_workers": 14,
+            "probe_deadline_seconds": 3,
+            "sampled_peak_blackhole_transports": 12,
+            "sampled_peak_all_transports": 13,
+            "blackhole_transports_before_admissions": 12,
+            "blackhole_transports_after_admissions": 12,
+            "healthy_admissions": 24,
+            "healthy_heartbeats_in_2_2_seconds": 2,
+            "selection_p95_seconds": 0.0744557160014665
+          }
+        }
+      }
+    },
+    "candidate_synthetic": {
+      "source_path": "/tmp/rch-128-candidate-synthetic/results.json",
+      "source_sha256": "9d4a4acf86c59de4a2bfe75313d1bc77ce3c2cc458601efb4b975d26eaf73a3f",
+      "source_size_bytes": 4275,
+      "results": {
+        "transport": "SSH subprocess fixture",
+        "binary": {
+          "path": "/tmp/rch-target-candidate/debug/rchd",
+          "sha256": "7a45c2811ffa8bdeda8297a31c1ce381ddba92b5d1fb18c35de0145e078f9baf"
+        },
+        "configuration": {
+          "failure_threshold": 2,
+          "regression_health_interval_secs": 1,
+          "regression_recovery_probe_interval_secs": 3,
+          "idle_health_interval_secs": 30,
+          "idle_recovery_probe_interval_secs": 300,
+          "idle_open_cooldown_secs": 900
+        },
+        "regressions": {
+          "prolonged_outage": {
+            "seconds": 9.216075801999978,
+            "dial_attempts": 2,
+            "minimum_dial_spacing_seconds": 3.1597819390008226,
+            "sampled_peak_live_transport_processes": 0,
+            "daemon_cpu_seconds": 0.05,
+            "peak_daemon_rss_bytes": 36691968,
+            "daemon_log_lines": 0
+          },
+          "mixed_fleet_selected": 24,
+          "selection_p95_seconds": 0.017633855999520165,
+          "concurrent_capability_refresh": {
+            "requests": 12,
+            "seconds": 0.2190800690004835,
+            "offline_dial_attempts": 0,
+            "minimum_dial_spacing_seconds": 3.1417658119989937
+          },
+          "recovery_latency_seconds": 3.3151649900009943,
+          "disabled": {
+            "seconds": 4.015805936000106,
+            "dial_attempts": 0,
+            "minimum_dial_spacing_seconds": null,
+            "sampled_peak_live_transport_processes": 0,
+            "daemon_cpu_seconds": 0.020000000000000018,
+            "peak_daemon_rss_bytes": 40103936,
+            "daemon_log_lines": 2
+          },
+          "disabled_restart": {
+            "seconds": 4.031448465999347,
+            "dial_attempts": 0,
+            "minimum_dial_spacing_seconds": null,
+            "sampled_peak_live_transport_processes": 0,
+            "daemon_cpu_seconds": 0.02,
+            "peak_daemon_rss_bytes": 33251328,
+            "daemon_log_lines": 7
+          },
+          "established_connection_loss": {
+            "seconds": 6.240137623000919,
+            "dial_attempts": 2,
+            "minimum_dial_spacing_seconds": 3.1327430679993995,
+            "sampled_peak_live_transport_processes": 1,
+            "daemon_cpu_seconds": 0.04999999999999999,
+            "peak_daemon_rss_bytes": 38572032,
+            "daemon_log_lines": 0
+          },
+          "vpn_blackhole": {
+            "seconds": 8.045880341998782,
+            "dial_attempts": 2,
+            "minimum_dial_spacing_seconds": 3.987144591001197,
+            "sampled_peak_live_transport_processes": 1,
+            "daemon_cpu_seconds": 0.06,
+            "peak_daemon_rss_bytes": 37441536,
+            "daemon_log_lines": 0
+          },
+          "unpooled": {
+            "seconds": 6.224793841000064,
+            "dial_attempts": 2,
+            "minimum_dial_spacing_seconds": 3.119156673999896,
+            "sampled_peak_live_transport_processes": 0,
+            "daemon_cpu_seconds": 0.010000000000000009,
+            "peak_daemon_rss_bytes": 35807232,
+            "daemon_log_lines": 0
+          },
+          "authenticated_transport_freeze": {
+            "frozen_authenticated_transports": 2,
+            "outage": {
+              "seconds": 6.236572210998929,
+              "dial_attempts": 1,
+              "minimum_dial_spacing_seconds": null,
+              "sampled_peak_live_transport_processes": 1,
+              "daemon_cpu_seconds": 0.06,
+              "peak_daemon_rss_bytes": 40325120,
+              "daemon_log_lines": 0
+            },
+            "healthy_peer_admissions": 12,
+            "recovery_latency_seconds": 0.9119626210012939,
+            "disabled": {
+              "seconds": 3.245884338999531,
+              "dial_attempts": 0,
+              "minimum_dial_spacing_seconds": null,
+              "sampled_peak_live_transport_processes": 0,
+              "daemon_cpu_seconds": 0.020000000000000018,
+              "peak_daemon_rss_bytes": 40587264,
+              "daemon_log_lines": 2
+            },
+            "disabled_restart": {
+              "seconds": 3.205534478000118,
+              "dial_attempts": 0,
+              "minimum_dial_spacing_seconds": null,
+              "sampled_peak_live_transport_processes": 0,
+              "daemon_cpu_seconds": 0.019999999999999997,
+              "peak_daemon_rss_bytes": 32960512,
+              "daemon_log_lines": 7
+            },
+            "reservation_slots_preserved_until_explicit_release": 3
+          },
+          "saturated_recovery_fleet": {
+            "blackhole_workers": 14,
+            "probe_deadline_seconds": 3,
+            "sampled_peak_blackhole_transports": 12,
+            "sampled_peak_all_transports": 13,
+            "blackhole_transports_before_admissions": 12,
+            "blackhole_transports_after_admissions": 12,
+            "healthy_admissions": 24,
+            "healthy_heartbeats_in_2_2_seconds": 2,
+            "selection_p95_seconds": 0.026289016001101118
+          }
+        }
+      }
+    }
+  },
+  "baseline_authenticated_freeze": {
+    "evidence_kind": "Two successful focused run_warm_transport_freeze invocations against the 4a3fac5f baseline; observed summaries, not newly generated full results.json files.",
+    "synthetic_fixture": {
+      "fixture_path": "/tmp/rch-warm-baseline-review-l77ya_tj/fixture",
+      "files": {
+        "ssh-events.jsonl": {
+          "sha256": "d44e855249904d929ad843374e342d6fa6666f4466adc940549680758e3bc49c",
+          "size_bytes": 21923
+        },
+        "daemon.log": {
+          "sha256": "356f9db29ba6270594b643f2350626509d810a354ae4c1073fdccf11740df33b",
+          "size_bytes": 22863
+        }
+      },
+      "observed": {
+        "passed": true,
+        "frozen_authenticated_transports": 2,
+        "outage_observation_seconds_approx": 6.2,
+        "dial_attempts": 1,
+        "sampled_peak_live_transport_processes": 1,
+        "healthy_peer_admissions": 12,
+        "recovery_latency_seconds_approx": 0.91,
+        "disabled_dial_attempts": 0,
+        "disabled_restart_dial_attempts": 0,
+        "reservation_slots_preserved_until_explicit_release": 3
+      }
+    },
+    "local_openssh_fixture": {
+      "fixture_path": "/tmp/rch-warm-openssh-baseline-review-cwrfrh7p/fixture",
+      "files": {
+        "ssh-events.jsonl": {
+          "sha256": "46053a5c1c7a3febc29fb1072cc0958c6d5e5fcac6e663231b307d88467cdc02",
+          "size_bytes": 17521
+        },
+        "daemon.log": {
+          "sha256": "9400b3118d1543fbb3ebbeeaea7f3115a582d95b13d969191cbdfc595867b48d",
+          "size_bytes": 22990
+        }
+      },
+      "observed": {
+        "passed": true,
+        "frozen_authenticated_transports": 2,
+        "outage_observation_seconds_approx": 6.2,
+        "dial_attempts": 1,
+        "sampled_peak_live_transport_processes": 1,
+        "healthy_peer_admissions": 12,
+        "recovery_latency_seconds_approx": 0.91,
+        "disabled_dial_attempts": 0,
+        "disabled_restart_dial_attempts": 0,
+        "reservation_slots_preserved_until_explicit_release": 3
+      }
+    },
+    "harness_correction": "The initial warm-fixture setup timed out before injecting any outage because the second pool had not warmed. The fixture now exercises actual toolchain preflight to establish both authenticated pools; both focused baseline reruns passed. The failed setup is not production failure evidence."
+  },
+  "baseline_regression_evidence": {
+    "baseline": "4a3fac5fe34db3685bd2ebd4467a5b80dad9e609",
+    "method": "Focused added regressions executed against the baseline implementation. Expected failures demonstrate remaining defects; console logs are embedded below.",
+    "reproduced_failures": [
+      {
+        "test": "benchmark_scheduler::tests::offline_worker_benchmark_stops_proxy_on_disable_timeout_and_exit",
+        "observed": "Revoking benchmark network permission did not stop the SSH proxy descendant; the ownership assertion timed out."
+      },
+      {
+        "test": "orphan_quarantine::tests::removal_while_waiting_for_durable_intent_never_probes_a_retired_endpoint",
+        "observed": "Retired-endpoint prober called once; expected zero."
+      },
+      {
+        "test": "workers::tests::offline_worker_enable_racing_replacement_changes_current_incarnation",
+        "observed": "Successful enable affected a retired worker object rather than the current replacement."
+      },
+      {
+        "test": "cancellation::tests::offline_worker_many_owned_cancellations_wait_for_one_health_recovery",
+        "observed": "Before virtual time was advanced, the SSH fixture logged a physical subprocess dial and returned a confirmed cancellation receipt despite current-endpoint transport-down evidence; baseline returned cancelled and released one slot instead of deferring.",
+        "observed_status": "cancelled",
+        "expected_status": "deferred",
+        "observed_slots_released": 1,
+        "observed_dial_log": "257560\n"
+      }
+    ],
+    "already_passing_case": {
+      "test": "workers::tests::offline_worker_disable_racing_replacement_remains_durable",
+      "status": "passed"
+    },
+    "logs": {
+      "concurrency_and_process_ownership": {
+        "source_path": "/tmp/rch-baseline-regressions.log",
+        "source_sha256": "376b41da95faf1e9b638bc2892b8452d73b421c82e653dc4d89b7f59c1e1c8ae",
+        "source_size_bytes": 3893,
+        "text": " Downloading crates ...\n  Downloaded serial_test v4.0.1\n  Downloaded quick-error v1.2.3\n  Downloaded serial_test_derive v4.0.1\n  Downloaded rand_xorshift v0.4.0\n  Downloaded rusty-fork v0.3.1\n  Downloaded proptest v1.11.0\n  Downloaded unarray v0.1.4\n  Downloaded wait-timeout v0.2.1\n    Blocking waiting for file lock on build directory\n   Compiling tokio v1.53.1\n   Compiling tokio-util v0.7.19\n   Compiling h2 v0.4.19\n   Compiling hyper v1.11.1\n   Compiling hyper-util v0.1.20\n   Compiling tower v0.5.3\n   Compiling tokio-stream v0.1.19\n   Compiling hyper-timeout v0.5.2\n   Compiling bit-vec v0.8.0\n   Compiling bit-set v0.8.0\n   Compiling tonic v0.14.6\n   Compiling tower-http v0.6.11\n   Compiling reqwest v0.13.5\n   Compiling opentelemetry_sdk v0.32.1\n   Compiling tonic-prost v0.14.6\n   Compiling fancy-regex v0.18.0\n   Compiling rich_rust v0.2.3\n   Compiling openssh v0.11.6\n   Compiling tonic-types v0.14.6\n   Compiling opentelemetry-proto v0.32.0\n   Compiling opentelemetry-http v0.32.0\n   Compiling wait-timeout v0.2.1\n   Compiling quick-error v1.2.3\n   Compiling rusty-fork v0.3.1\n   Compiling rch-common v2.1.34 (/workspace/scratch/8a5910f9cc83/rch-baseline-4a3fac5/rch-common)\n   Compiling opentelemetry-otlp v0.32.0\n   Compiling rand_xorshift v0.4.0\n   Compiling serial_test_derive v4.0.1\n   Compiling unarray v0.1.4\n   Compiling proptest v1.11.0\n   Compiling axum v0.8.9\n   Compiling serial_test v4.0.1\n   Compiling tokio-cron-scheduler v0.15.1\n   Compiling rch-telemetry v2.1.34 (/workspace/scratch/8a5910f9cc83/rch-baseline-4a3fac5/rch-telemetry)\n   Compiling rchd v2.1.34 (/workspace/scratch/8a5910f9cc83/rch-baseline-4a3fac5/rchd)\n    Finished `test` profile [unoptimized] target(s) in 2m 28s\n     Running unittests src/main.rs (/tmp/rch-target-baseline/debug/build/rchd/f7b2068d0df87851/out/rchd-f7b2068d0df87851)\n\nrunning 4 tests\ntest benchmark_scheduler::tests::offline_worker_benchmark_stops_proxy_on_disable_timeout_and_exit ... FAILED\ntest orphan_quarantine::tests::removal_while_waiting_for_durable_intent_never_probes_a_retired_endpoint ... FAILED\ntest workers::tests::offline_worker_disable_racing_replacement_remains_durable ... ok\ntest workers::tests::offline_worker_enable_racing_replacement_changes_current_incarnation ... FAILED\n\nfailures:\n\n---- benchmark_scheduler::tests::offline_worker_benchmark_stops_proxy_on_disable_timeout_and_exit stdout ----\n\nthread 'benchmark_scheduler::tests::offline_worker_benchmark_stops_proxy_on_disable_timeout_and_exit' (213481) panicked at rchd/src/benchmark_scheduler.rs:2060:14:\nthe SSH leader must be reaped and its proxy descendant stopped: Elapsed(())\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n---- orphan_quarantine::tests::removal_while_waiting_for_durable_intent_never_probes_a_retired_endpoint stdout ----\n\nthread 'orphan_quarantine::tests::removal_while_waiting_for_durable_intent_never_probes_a_retired_endpoint' (213574) panicked at rchd/src/orphan_quarantine.rs:454:9:\nassertion `left == right` failed: a stale candidate must not start a probe whose result cannot be published\n  left: 1\n right: 0\n\n---- workers::tests::offline_worker_enable_racing_replacement_changes_current_incarnation stdout ----\n\nthread 'workers::tests::offline_worker_enable_racing_replacement_changes_current_incarnation' (213576) panicked at rchd/src/workers.rs:2867:9:\nsuccessful enable must affect the current worker, not only a retired Arc\n\n\nfailures:\n    benchmark_scheduler::tests::offline_worker_benchmark_stops_proxy_on_disable_timeout_and_exit\n    orphan_quarantine::tests::removal_while_waiting_for_durable_intent_never_probes_a_retired_endpoint\n    workers::tests::offline_worker_enable_racing_replacement_changes_current_incarnation\n\ntest result: FAILED. 1 passed; 3 failed; 0 ignored; 0 measured; 1904 filtered out; finished in 3.03s\n\nerror: test failed, to rerun pass `-p rchd --bin rchd`\n"
+      },
+      "real_time_owned_cancellation_dial": {
+        "source_path": "/tmp/rch-baseline-owned-outage-real-time.log",
+        "source_sha256": "db65c4c39f8ec776bd14fd586478bd60ac4a998a91ff0fbddf739c1125f0e570",
+        "source_size_bytes": 2039,
+        "text": "   Compiling rchd v2.1.34 (/workspace/scratch/8a5910f9cc83/rch-baseline-4a3fac5/rchd)\n    Finished `test` profile [unoptimized] target(s) in 1m 01s\n     Running unittests src/main.rs (/tmp/rch-target-baseline/debug/build/rchd/f7b2068d0df87851/out/rchd-f7b2068d0df87851)\n\nrunning 1 test\ntest cancellation::tests::offline_worker_many_owned_cancellations_wait_for_one_health_recovery ... FAILED\n\nfailures:\n\n---- cancellation::tests::offline_worker_many_owned_cancellations_wait_for_one_health_recovery stdout ----\n\nthread 'cancellation::tests::offline_worker_many_owned_cancellations_wait_for_one_health_recovery' (257557) panicked at rchd/src/cancellation.rs:3528:9:\nisolated admin cancellation fixture failed: Output { status: ExitStatus(unix_wait_status(25856)), stdout: \"\\nrunning 1 test\\ntest cancellation::tests::offline_worker_many_owned_cancellations_wait_for_one_health_recovery ... FAILED\\n\\nfailures:\\n\\nfailures:\\n    cancellation::tests::offline_worker_many_owned_cancellations_wait_for_one_health_recovery\\n\\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1908 filtered out; finished in 0.06s\\n\\n\", stderr: \"\\nthread 'cancellation::tests::offline_worker_many_owned_cancellations_wait_for_one_health_recovery' (257559) panicked at rchd/src/cancellation.rs:3618:13:\\nassertion `left == right` failed: CancelBuildResponse { status: \\\"cancelled\\\", build_id: 30089518505787393, worker_id: Some(\\\"offline-owned-builds\\\"), project_id: Some(\\\"owned-0\\\"), message: Some(\\\"Build forcefully terminated\\\"), slots_released: 1 }; dials=Ok(\\\"257560\\\\n\\\")\\n  left: \\\"cancelled\\\"\\n right: \\\"deferred\\\"\\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\\n\" }\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    cancellation::tests::offline_worker_many_owned_cancellations_wait_for_one_health_recovery\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1908 filtered out; finished in 0.07s\n\nerror: test failed, to rerun pass `-p rchd --bin rchd`\n"
+      }
+    },
+    "excluded_evidence": "An earlier virtual-clock-only owned-cancellation attempt is not used to establish a network dial. The embedded real-time log is the baseline dial/receipt proof."
+  },
+  "existing_cli_configuration_defect": {
+    "test": "config::tests::offline_worker_circuit_settings_load_from_each_source_layer",
+    "observed": "The actual CLI test executable passed 206 selected tests and failed this existing test because an alias-only circuit.down_after_failures overlay was merged into defaults containing circuit.failure_threshold, producing a duplicate-field deserialization error.",
+    "classification": "Existing product defect, not a fixture failure.",
+    "baseline_attribution": {
+      "method": "The complete pre-fix rch/src/config.rs file, including the test and layered loader, is byte-identical at the starting baseline and incorporated main. The failure was observed in the candidate CLI before editing this file; no separate baseline executable rerun is claimed.",
+      "source_path": "rch/src/config.rs",
+      "baseline_revision": "4a3fac5fe34db3685bd2ebd4467a5b80dad9e609",
+      "incorporated_main_revision": "c78bd9398918d55c3134831728fa0059d20cde26",
+      "source_sha256_at_both_revisions": "f4459cdb9676d1b3fc42f3c9764ab15bc98c92f3115da377d548c712d87b8ee8",
+      "source_size_bytes_at_both_revisions": 258972
+    },
+    "daemon_scope": "rchd directly deserializes a single RchConfig file. Its alias-only file already works; it does not merge the raw alias into a serialized default layer.",
+    "log": {
+      "source_path": "/tmp/rch-cli-recovery-tests-alias-failure.log",
+      "source_sha256": "c20f26853ea5bbcc8a6dcd3c836850d028eeadc5b0efd0d61f2c706a029735ff",
+      "source_size_bytes": 17294,
+      "test_summary": "test result: FAILED. 206 passed; 1 failed; 0 ignored; 0 measured; 3738 filtered out; finished in 0.23s",
+      "failure_excerpt": "called `Result::unwrap()` on an `Err` value: Failed to decode merged config for \"/tmp/.tmpdI2QtK/user.toml\"\n\nCaused by:\n    duplicate field `failure_threshold`\n    in `circuit`"
+    },
+    "fix": "Canonicalize the circuit alias independently in each raw file before merging. Reject alias plus canonical name within one file with path context. Preserve canonical provenance and cross-file overrides, including explicit resets to defaults.",
+    "added_coverage": [
+      "offline_worker_failure_alias_precedence_and_cache_roundtrip",
+      "offline_worker_failure_alias_conflicts_are_rejected_per_layer"
+    ]
+  },
+  "validation": {
+    "earlier_daemon_unit_attempt": {
+      "status": "failed_fixture_then_corrected",
+      "passed": 1922,
+      "failed": 1,
+      "ignored": 0,
+      "log": {
+        "source_path": "/tmp/rch-candidate-daemon-tests.log",
+        "source_sha256": "afea4dfdf73c9c40cb47ecdddae432cb690a01e18fe03b4ed1ece6ab2fd2e1bd",
+        "source_size_bytes": 151547,
+        "test_summary": "test result: FAILED. 1922 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 132.02s"
+      },
+      "failing_test": "cancellation::tests::offline_worker_many_owned_cancellations_wait_for_one_health_recovery",
+      "cause": "After 900 seconds of Tokio virtual-time advancement, resuming that clock retained its offset relative to std::time::Instant. The existing cancellation deadline converted from std::Instant appeared already expired, so post-health confirmation failed before any SSH attempt.",
+      "correction": "Keep all virtual outage assertions unchanged; perform the positive real SSH, historical-endpoint and absent-inventory assertions on a fresh real-time Tokio runtime. Assertions were retained and the complete 1923-test daemon rerun passed.",
+      "baseline_distinction": "The reproduced baseline outage dial occurs before virtual time is paused and is established by its separate embedded real-time subprocess/receipt log."
+    },
+    "daemon_unit_suite": {
+      "status": "passed",
+      "passed": 1923,
+      "failed": 0,
+      "ignored": 0,
+      "log": {
+        "source_path": "/tmp/rch-final-daemon-tests.log",
+        "source_sha256": "7e45bf91dc7e6db38fc9a8d6d309ece99b4255a07be2aa0aa48666e21443bed2",
+        "source_size_bytes": 149844,
+        "test_summaries": [
+          "test result: ok. 1923 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 132.62s"
+        ],
+        "completed_test_lines": [],
+        "diagnostic_summary": [
+          "    Finished `test` profile [unoptimized] target(s) in 57.38s"
+        ],
+        "sigkill_count": 0,
+        "tail_without_rustc_command": [
+          "test cleanup::tests::shutdown_retains_live_quiet_job_while_normal_stale_cleanup_still_runs has been running for over 60 seconds",
+          "test cleanup::tests::shutdown_retains_live_quiet_job_while_normal_stale_cleanup_still_runs ... ok",
+          "test cleanup::tests::observer_recovery_retains_resuming_job_and_reaps_real_stale_jobs ... ok",
+          "",
+          "test result: ok. 1923 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 132.62s",
+          ""
+        ]
+      },
+      "scope": "Completed candidate daemon suite; subsequent upstream integration did not change daemon/common production sources. The final common-store durability correction is separately verified below."
+    },
+    "common_unit_suite": {
+      "status": "passed",
+      "passed": 2497,
+      "failed": 0,
+      "ignored": 8,
+      "log": {
+        "source_path": "/tmp/rch-final-common-tests.log",
+        "source_sha256": "a063b43309246342130699aa75763b90592c74a59a43bac15652905e6524425a",
+        "source_size_bytes": 187020,
+        "test_summaries": [
+          "test result: ok. 2497 passed; 0 failed; 8 ignored; 0 measured; 0 filtered out; finished in 26.59s"
+        ],
+        "completed_test_lines": [],
+        "diagnostic_summary": [
+          "    Finished `test` profile [unoptimized] target(s) in 46.29s"
+        ],
+        "sigkill_count": 0,
+        "tail_without_rustc_command": [
+          "test ui::progress::tests::rate_limiter_now_ns_returns_elapsed ... ok",
+          "test stale_target_reap::tests::worker_sweep_survives_a_candidate_removed_while_it_waits_for_the_registry ... ok",
+          "test toolchain::worker_cache::tests::worker_bootstrap_isolates_python_without_changing_cargo_inputs ... ok",
+          "",
+          "test result: ok. 2497 passed; 0 failed; 8 ignored; 0 measured; 0 filtered out; finished in 26.59s",
+          ""
+        ]
+      }
+    },
+    "common_unit_suite_after_final_durability_correction": {
+      "status": "passed",
+      "passed": 2497,
+      "failed": 0,
+      "ignored": 8,
+      "log": {
+        "source_path": "/tmp/rch-durability-common-tests.log",
+        "source_sha256": "28dd4f4a8befed74ae1635638b8bd788a13061fcc94514808e9ba0986da685b0",
+        "source_size_bytes": 187074,
+        "test_summaries": [
+          "test result: ok. 2497 passed; 0 failed; 8 ignored; 0 measured; 0 filtered out; finished in 29.46s"
+        ],
+        "completed_test_lines": [],
+        "diagnostic_summary": [
+          "    Finished `test` profile [unoptimized] target(s) in 4m 10s"
+        ],
+        "sigkill_count": 0,
+        "tail_without_rustc_command": [
+          "test ui::progress::tests::rate_limiter_now_ns_returns_elapsed ... ok",
+          "test stale_target_reap::tests::worker_sweep_survives_a_candidate_removed_while_it_waits_for_the_registry ... ok",
+          "test toolchain::worker_cache::tests::worker_bootstrap_isolates_python_without_changing_cargo_inputs ... ok",
+          "",
+          "test result: ok. 2497 passed; 0 failed; 8 ignored; 0 measured; 0 filtered out; finished in 29.46s",
+          ""
+        ]
+      },
+      "scope": "Includes repeated failed enables and rename-before-directory-sync failure recovery for volatile-only administrative disable intent."
+    },
+    "daemon_offline_regressions_after_final_durability_correction": {
+      "status": "passed",
+      "passed": 30,
+      "failed": 0,
+      "ignored": 0,
+      "filtered_out": 1893,
+      "source_path": "/tmp/rch-durability-daemon-tests.log",
+      "source_sha256": "e0fe8021bd2d14fb2a854ad9b164b79abc67e074de02c17cdc531f3392d49b5e",
+      "source_size_bytes": 3693,
+      "test_summary": "test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 1893 filtered out; finished in 3.09s"
+    },
+    "formatting": {
+      "status": "passed",
+      "log": {
+        "source_path": "/tmp/rch-final-fmt-check.log",
+        "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "source_size_bytes": 0,
+        "test_summaries": [],
+        "completed_test_lines": [],
+        "diagnostic_summary": [],
+        "sigkill_count": 0,
+        "tail_without_rustc_command": []
+      },
+      "evidence": "The coordinating runner reported successful exit; cargo fmt --check is silent on success."
+    },
+    "openssh_process_suite": {
+      "status": "passed",
+      "source": "raw_process_results.matched_current_main_openssh",
+      "scope": "One completed invocation measured baseline and candidate idle/disable/restart phases and all candidate regressions."
+    },
+    "synthetic_process_suite": {
+      "status": "passed",
+      "source": "raw_process_results.candidate_synthetic",
+      "scope": "Completed full regression-only invocation."
+    },
+    "workspace_all_targets_check": {
+      "status": "blocked",
+      "dependency": "asupersync 0.5.0, pinned Git revision 78b64636e99fea4ea2d868096576021dd3b8e519",
+      "features": [
+        "proc-macros",
+        "test-internals",
+        "tls"
+      ],
+      "failure": "Dependency rustc terminated with signal 9 (SIGKILL) during metadata/typechecking; no workspace pass is claimed.",
+      "log": {
+        "source_path": "/tmp/rch-workspace-check.log",
+        "source_sha256": "ca6e4f8623728c33e394a9d01500da613b6190efa9f8260a1c2da57584659cae",
+        "source_size_bytes": 32476,
+        "test_summaries": [],
+        "completed_test_lines": [],
+        "diagnostic_summary": [
+          "error: could not compile `asupersync` (lib)"
+        ],
+        "sigkill_count": 1,
+        "tail_without_rustc_command": [
+          "   Compiling asupersync-macros v0.5.0 (https://github.com/Dicklesworthstone/asupersync.git?rev=78b64636e99fea4ea2d868096576021dd3b8e519#78b64636)",
+          "   Compiling visibility v0.1.1",
+          "error: could not compile `asupersync` (lib)",
+          "",
+          "Caused by:"
+        ]
+      }
+    },
+    "workspace_all_targets_clippy": {
+      "status": "blocked",
+      "dependency": "asupersync 0.5.0, pinned Git revision 78b64636e99fea4ea2d868096576021dd3b8e519",
+      "features": [
+        "proc-macros",
+        "test-internals",
+        "tls"
+      ],
+      "failure": "Dependency rustc terminated with signal 9 (SIGKILL); the full workspace lint gate did not complete.",
+      "log": {
+        "source_path": "/tmp/rch-workspace-clippy.log",
+        "source_sha256": "9cc00565f2ca89888c244502961bb3767b2c512b18e3f83a99ad8206b9aa752c",
+        "source_size_bytes": 22735,
+        "test_summaries": [],
+        "completed_test_lines": [],
+        "diagnostic_summary": [
+          "error: could not compile `asupersync` (lib)"
+        ],
+        "sigkill_count": 1,
+        "tail_without_rustc_command": [
+          "    Checking rabs-action v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabs-action)",
+          "    Checking asupersync v0.5.0 (https://github.com/Dicklesworthstone/asupersync.git?rev=78b64636e99fea4ea2d868096576021dd3b8e519#78b64636)",
+          "error: could not compile `asupersync` (lib)",
+          "",
+          "Caused by:"
+        ]
+      }
+    },
+    "cli_build": {
+      "status": "passed",
+      "initial_attempt": {
+        "status": "blocked",
+        "dependency": "registry asupersync 0.5.0",
+        "failure": "Dependency compiler terminated with signal 9 (SIGKILL).",
+        "log": {
+          "source_path": "/tmp/rch-candidate-cli-build.log",
+          "source_sha256": "2365c18e0578ae50ac4adbd478e23a95c623ab38a7a5ff48de771c942b6c60a4",
+          "source_size_bytes": 21062,
+          "test_summaries": [],
+          "completed_test_lines": [],
+          "diagnostic_summary": [
+            "error: could not compile `asupersync` (lib)"
+          ],
+          "sigkill_count": 1,
+          "tail_without_rustc_command": [
+            "   Compiling icu_locale_core v2.3.0",
+            "   Compiling asupersync v0.5.0",
+            "error: could not compile `asupersync` (lib)",
+            "",
+            "Caused by:"
+          ]
+        }
+      },
+      "retry": {
+        "status": "interrupted_resource_pressure",
+        "log": {
+          "source_path": "/tmp/rch-candidate-cli-build-tuned.log",
+          "source_sha256": "54f05349b160f22ad71df242e1c0347b326aeeb64412278f125f1acf509d1e53",
+          "source_size_bytes": 17109,
+          "test_summaries": [],
+          "completed_test_lines": [],
+          "diagnostic_summary": [
+            "error: could not compile `asupersync` (lib)",
+            "Owned registry dependency compiler terminated with SIGTERM after measured memory thrashing."
+          ],
+          "sigkill_count": 0,
+          "tail_without_rustc_command": [
+            "    Blocking waiting for file lock on build directory",
+            "   Compiling asupersync v0.5.0",
+            "error: could not compile `asupersync` (lib)"
+          ]
+        },
+        "note": "The verified owned compiler was stopped with pidfd SIGTERM. Over a five-second sample, user CPU did not advance, physical reads increased by 670 MB, and the shared cgroup remained at its 8 GiB limit. No unrelated process was signalled."
+      },
+      "successful_retry": {
+        "status": "passed",
+        "build_setting": "Package-specific hint-mostly-unused for asupersync in both dev and test profiles; no dependency source or enabled features changed.",
+        "log": {
+          "source_path": "/tmp/rch-candidate-cli-build-hinted.log",
+          "source_sha256": "b5452b763cc898aea0459b6d040b6900a44e59eb8609f94a7ecd8f2b67adb9f8",
+          "source_size_bytes": 5939,
+          "summary": "Finished `dev` profile [unoptimized] target(s) in 7m 03s"
+        }
+      },
+      "rebuild_after_cli_alias_fix": {
+        "status": "passed",
+        "log": {
+          "source_path": "/tmp/rch-final-cli-build.log",
+          "source_sha256": "48a10adad989f25ca61fddcbbbb7e79a50551dbe0ec54410364001fa90529f49",
+          "source_size_bytes": 150,
+          "summary": "Finished `dev` profile [unoptimized] target(s) in 48.63s"
+        }
+      }
+    },
+    "cli_recovery_tests": {
+      "status": "passed",
+      "prior_invocation": {
+        "status": "invalid_target",
+        "log": {
+          "source_path": "/tmp/rch-cli-recovery-tests.log",
+          "source_sha256": "b14e40a784eeb545d3e21933f30d2b4e70667b98da23ce2c3305a0ac2a8bb345",
+          "source_size_bytes": 49,
+          "test_summaries": [],
+          "completed_test_lines": [],
+          "diagnostic_summary": [
+            "error: no library targets found in package `rch`"
+          ],
+          "sigkill_count": 0,
+          "tail_without_rustc_command": [
+            "error: no library targets found in package `rch`"
+          ]
+        },
+        "note": "rch is a binary package; the earlier --lib invocation ran no tests."
+      },
+      "initial_executable_attempt": {
+        "status": "failed_existing_product_defect",
+        "passed": 206,
+        "failed": 1,
+        "ignored": 0,
+        "filtered_out": 3738,
+        "evidence": "existing_cli_configuration_defect"
+      },
+      "retry_after_alias_fix": {
+        "status": "passed",
+        "passed": 209,
+        "failed": 0,
+        "ignored": 0,
+        "filtered_out": 3738,
+        "source_path": "/tmp/rch-cli-recovery-tests-hinted.log",
+        "source_sha256": "21645a81af7ab7bf8136dc1e9457e5766fa7775a40527453e9eb35ff22a62d88",
+        "source_size_bytes": 16431,
+        "test_summary": "test result: ok. 209 passed; 0 failed; 0 ignored; 0 measured; 3738 filtered out; finished in 0.24s"
+      }
+    },
+    "focused_cli_check": {
+      "status": "passed",
+      "command": "cargo check --locked -p rch --all-targets",
+      "source_path": "/tmp/rch-focused-cli-check.log",
+      "source_sha256": "16da21ed72804f673e5c3bcb09360506c8ee7629bdca0e393a8e1abde20a84da",
+      "source_size_bytes": 8075,
+      "summary": "Finished dev profile successfully, including all CLI test targets, after incorporating c78bd939."
+    },
+    "cli_binary_strict_clippy": {
+      "status": "passed",
+      "command": "cargo clippy --locked -p rch --bin rch -- -D warnings",
+      "source_path": "/tmp/rch-focused-cli-clippy.log",
+      "source_sha256": "aba6c1021b8a392fb5d0af8717eef2e324f45c067d095c1d127f25a9e36446e4",
+      "source_size_bytes": 580
+    },
+    "daemon_common_strict_clippy": {
+      "status": "passed",
+      "scope": "rchd and rch-common, all targets, warnings denied",
+      "command": "cargo clippy --locked -p rch-common -p rchd --all-targets -- -D warnings",
+      "source_path": "/tmp/rch-focused-clippy.log",
+      "source_sha256": "bd270fb7b6bc286d102dcb9b804a8959c89f9e9bfe978dc673bb22795af84493",
+      "source_size_bytes": 6145
+    },
+    "daemon_lifecycle_suite": {
+      "status": "passed",
+      "passed": 17,
+      "failed": 0,
+      "ignored": 0,
+      "scope": "Final rebuilt CLI after the alias fix and daemon built with the final common-store durability correction; includes offline_worker_process_recovery and maintenance/ownership integration cases.",
+      "initial_attempt": {
+        "status": "incomplete",
+        "selected_tests": 17,
+        "failure": "A nested CLI dependency compilation was killed with SIGKILL, then the integration harness terminated with SIGTERM. Some cases completed, but the suite did not.",
+        "log": {
+          "source_path": "/tmp/rch-daemon-lifecycle-tests.log",
+          "source_sha256": "a2f8b162b04458f044188bb6ba9558226e2777715cb7f7b5ea1ab54c4625610c",
+          "source_size_bytes": 20762,
+          "test_summaries": [],
+          "completed_test_lines": [
+            "test maintenance_integration::linux_daemon_crash_starts_open_and_old_incarnation_cannot_release_or_shutdown ... ok",
+            "test maintenance_integration::linux_protocol_operator_signals_recover_admission_and_fence_successors ... ok",
+            "test maintenance_integration::linux_restart_scan_distinguishes_live_recycled_old_boot_and_uncertain_owners ... ok",
+            "test maintenance_integration::linux_unrenewed_live_maintenance_expires_and_cannot_reopen_its_successor ... ok",
+            "test maintenance_integration::linux_waiting_wrapper_does_not_deadlock_drain_or_lose_its_live_lease ... ok"
+          ],
+          "diagnostic_summary": [
+            "    Finished `test` profile [unoptimized] target(s) in 25.19s",
+            "  process didn't exit successfully: `/tmp/rch-target-candidate/debug/build/rchd/9abce5b40bc29ae6/out/daemon_lifecycle-9abce5b40bc29ae6 --test-threads=1` (signal: 15, SIGTERM: termination signal)"
+          ],
+          "sigkill_count": 1,
+          "tail_without_rustc_command": [
+            "test maintenance_integration::linux_unrenewed_live_maintenance_expires_and_cannot_reopen_its_successor ... ok",
+            "test maintenance_integration::linux_waiting_wrapper_does_not_deadlock_drain_or_lose_its_live_lease ... ok",
+            "test offline_worker_process_recovery ... error: test failed, to rerun pass `-p rchd --test daemon_lifecycle`",
+            "",
+            "Caused by:"
+          ]
+        }
+      },
+      "final_attempt": {
+        "status": "passed",
+        "source_path": "/tmp/rch-final-daemon-lifecycle-tests.log",
+        "source_sha256": "9f82a9319a0452a176e88ba944e6c1163ab6bd372ee24a9a8702a5c3e5c38aae",
+        "source_size_bytes": 1562,
+        "test_summary": "test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 121.75s"
+      }
+    },
+    "jobs_lifecycle_suite": {
+      "status": "passed",
+      "passed": 8,
+      "failed": 0,
+      "ignored": 0,
+      "scope": "Final rebuilt CLI; original-owner attachment, cancellation receipts, completion races, and recovery-journal preservation.",
+      "source_path": "/tmp/rch-final-jobs-lifecycle-tests.log",
+      "source_sha256": "8015522d63cec30c990ae33a27ce27893d473700ae516d36957f3de5121dee05",
+      "source_size_bytes": 1007,
+      "test_summary": "test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.20s"
+    },
+    "cli_all_targets_strict_clippy": {
+      "status": "passed",
+      "scope": "rch all targets, warnings denied, after the final CLI alias correction.",
+      "source_path": "/tmp/rch-cli-all-targets-clippy.log",
+      "source_sha256": "0cffbae2b6080fe846217711e052b9b51c8458f5d31d094b154aaeb063cb3c83",
+      "source_size_bytes": 362,
+      "summary": "Finished `dev` profile [unoptimized] target(s) in 1m 33s; no errors."
+    },
+    "resource_attribution": "The shared cgroup has an 8 GiB memory limit and observed OOM-kill events. Cumulative counters do not identify individual prior killed compilers; SIGKILL is the exact logged failure."
+  }
+}

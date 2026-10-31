@@ -102,6 +102,23 @@ instead of being treated as an empty list. Failed persistence is returned as an
 error: a failed disable still stops live traffic, and a failed enable leaves the
 worker disabled.
 
+Automatic cancellation and abandoned-client recovery obey this administrative
+intent too. When an active job's admitted endpoint matches the current worker
+and that transport is down, automatic cleanup waits for health recovery instead
+of letting separate job retries create their own connection loop. This does not
+block cleanup solely because of storage pressure or a command failure on a
+reachable worker. Historical endpoints belonging to removed or retargeted
+workers retain their existing bounded recovery path; cleanup never redirects
+an old job to its replacement.
+
+Deferring or cancelling an automatic recovery attempt retains its active build,
+slot reservation, and durable recovery journal. Stopping local SSH processes is
+not proof that a remote build has terminated. Explicit user cancellation and
+`rch jobs recover` remain available as operator-requested actions and do not
+enable the worker. Automatic SSH transports, including their proxy descendants,
+are owned through cancellation and timeout, so disabling a worker cannot leave
+a detached transport reconnecting in the background.
+
 ## Verifying offline handling
 
 The Linux process regression uses actual daemon processes, Unix sockets, and an
