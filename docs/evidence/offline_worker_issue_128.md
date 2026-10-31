@@ -184,3 +184,41 @@ directory. `/proc` must describe the executing PID namespace. Omitting
 `daemon_lifecycle::offline_worker_process_recovery` integration test invokes that
 default fixture automatically. No worker credentials, external worker hosts,
 live VPN, or queued compilation workload are needed.
+
+
+## Matched baseline vs final recovery/scheduling comparison
+
+After the final snapshot was published, one additional matched local comparison
+was run specifically to quantify recovery latency and scheduling behavior on the
+pristine baseline versus the exact final implementation.
+
+Both daemons used the same deterministic local worker fixture and the same
+35-second refused-endpoint outage phase. The normal health interval was 30
+seconds. The final implementation used a 3-second recovery interval. During the
+outage, 24 scheduling requests were issued against a mixed healthy/offline fleet,
+and after the endpoint became reachable a pinned reservation was polled every
+250 ms until the recovered worker was accepted.
+
+The first attempted comparison, which required the baseline to reach an
+`Unreachable` state within 70 seconds, was discarded because the baseline
+remained `Degraded`; no timing numbers from that attempt are used below. The
+completed comparison instead records the actual state and polls admission
+unconditionally.
+
+| Observation | Pristine baseline | Final implementation |
+| --- | ---: | ---: |
+| Healthy-worker selections during outage | 24 / 24 | 24 / 24 |
+| Offline-worker selections during outage | 0 | 0 |
+| Selection p95 over the 24-request local sample | 24.97 ms | 15.55 ms |
+| First authenticated successful health command after endpoint recovery | 25.083 s | 1.079 s |
+| First successful pinned reservation on recovered worker | 25.498 s | 1.596 s |
+| Unsuccessful 250 ms pinned-admission polls before success | 100 | 6 |
+| Recovery observation censored | no | no |
+| Final worker state | Healthy / Closed / 64 slots | Healthy / Closed / 64 slots |
+
+This is a single local deterministic-worker comparison, not a live VPN or remote
+compilation benchmark. The 250 ms admission polling cadence limits timing
+resolution. The result isolates the practical effect of coordinated recovery:
+healthy scheduling remains available during the outage in both versions, while
+the final implementation detects endpoint recovery and restores admission much
+sooner under the configured recovery policy.
