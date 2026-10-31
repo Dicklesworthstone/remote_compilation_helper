@@ -1260,7 +1260,7 @@ a fresh isolated worker path, and then uploads only the literal repository-
 relative `--overlay-path` selections. Modified and untracked files are
 supported; selected deletions, absolute/traversing paths, Git metadata,
 non-ASCII/backslash/control-character paths, case-only or otherwise ambiguous
-filesystem spellings, overlay symlinks, empty overlay directories, submodules,
+filesystem spellings, overlay symlinks, empty overlay directories,
 and Git archive `export-ignore`/`export-subst` attributes fail closed. Exactly
 one of one-or-more `--overlay-path` options or `--no-overlay` is required.
 Clean-overlay mode also implies remote-only execution even when
@@ -1269,6 +1269,17 @@ back to the ambient local tree.
 Explicit clean-overlay execution also admits the read-only `cargo fmt --check`
 diagnostic, which the ordinary interception classifier intentionally leaves
 local.
+
+Initialized Git submodules are materialized recursively at the exact gitlink
+commits in the selected base. Their dirty working files and current checkout
+revisions do not affect the selected bytes. Each submodule must have the pinned
+commit locally; RCH never fetches or updates a checkout during admission. Missing
+pins, uninitialized or symlinked submodule roots, archive-transform attributes
+in any selected repository, and overlays inside or containing a submodule fail
+closed. The source fingerprint and execution receipt bind every submodule path,
+commit, and Git tree. Admission allows at most 1,024 submodules and 32 nesting
+levels, including queued descendants. Composed archives preserve executable
+permissions and symlinks and refuse case-aliased destination paths.
 
 On Unix workers, pooled Cargo builds use a stable source path paired with a
 versioned target cache. Jobs sharing that pair wait until the preceding job

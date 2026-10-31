@@ -2804,8 +2804,11 @@ pub(crate) fn configure_clean_git_command(command: &mut Command) {
     }
     command
         .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_NO_LAZY_FETCH", "1")
         .env("GIT_ATTR_NOSYSTEM", "1")
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .arg("-c")
+        .arg("protocol.allow=never")
         .arg("-c")
         .arg("core.attributesFile=/dev/null")
         .arg("-c")
@@ -5980,6 +5983,114 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         Ok(archive_file)
     }
 
+    /// Compose archives from the selected commit of every initialized
+    /// submodule. Reading the object databases preserves pinned bytes even
+    /// when a worktree is dirty or checked out at a different revision.
+    /// The one completed archive is then reused unchanged by transport retries.
+    #[cfg(unix)]
+    pub(crate) async fn create_selected_git_archive(
+        git_root: &Path,
+        base_commit: &str,
+        submodules: &[(PathBuf, String)],
+    ) -> Result<tempfile::NamedTempFile> {
+        let base = Self::create_git_archive(git_root, base_commit).await?;
+        if submodules.is_empty() {
+            return Ok(base);
+        }
+        let mut archives = vec![(PathBuf::new(), base)];
+        for (path, commit) in submodules {
+            anyhow::ensure!(
+                !path.as_os_str().is_empty()
+                    && path
+                        .components()
+                        .all(|part| matches!(part, std::path::Component::Normal(_))),
+                "submodule archive prefix must be repository-relative"
+            );
+            archives.push((
+                path.clone(),
+                Self::create_git_archive(&git_root.join(path), commit).await?,
+            ));
+        }
+        tokio::task::spawn_blocking(move || {
+            use std::io::Write as _;
+
+            let mut combined = tempfile::Builder::new()
+                .prefix("rch-clean-overlay-submodules-")
+                .suffix(".tar")
+                .tempfile()
+                .context("create composed Git archive")?;
+            {
+                let mut builder =
+                    tar::Builder::new(std::io::BufWriter::new(combined.as_file_mut()));
+                let mut prefixes = std::collections::BTreeMap::new();
+                let mut entry_kinds = std::collections::BTreeMap::new();
+                for (prefix, source) in archives {
+                    let mut archive = tar::Archive::new(source.reopen()?);
+                    for entry in archive.entries()? {
+                        let mut entry = entry?;
+                        let entry_type = entry.header().entry_type();
+                        // Git's global PAX header records the individual
+                        // commit. The execution receipt binds all commits;
+                        // propagating each global header would leave only the
+                        // last repository's comment on the combined archive.
+                        if entry_type.is_pax_global_extensions() {
+                            continue;
+                        }
+                        anyhow::ensure!(
+                            entry_type.is_file() || entry_type.is_dir() || entry_type.is_symlink(),
+                            "unsupported Git archive entry type"
+                        );
+                        let relative = entry.path()?.into_owned();
+                        anyhow::ensure!(
+                            relative
+                                .components()
+                                .all(|part| matches!(part, std::path::Component::Normal(_))),
+                            "Git archive entry escapes its selected repository"
+                        );
+                        let path = prefix.join(relative);
+                        let mut component_path = PathBuf::new();
+                        for component in path.components() {
+                            component_path.push(component.as_os_str());
+                            if let Some(existing) = prefixes.insert(
+                                component_path.to_string_lossy().to_ascii_lowercase(),
+                                component_path.clone(),
+                            ) {
+                                anyhow::ensure!(
+                                    existing == component_path,
+                                    "selected Git archives contain case-aliased paths"
+                                );
+                            }
+                        }
+                        if let Some(was_directory) =
+                            entry_kinds.insert(path.clone(), entry_type.is_dir())
+                        {
+                            anyhow::ensure!(
+                                was_directory && entry_type.is_dir(),
+                                "selected Git archives contain overlapping files"
+                            );
+                        }
+                        let mut header = entry.header().clone();
+                        header.set_size(entry.size());
+                        if entry_type.is_symlink() {
+                            let target = entry
+                                .link_name()?
+                                .context("Git archive symlink is missing its target")?
+                                .into_owned();
+                            builder.append_link(&mut header, path, target)?;
+                        } else {
+                            builder.append_data(&mut header, path, &mut entry)?;
+                        }
+                    }
+                }
+                builder.finish()?;
+                builder.get_mut().flush()?;
+            }
+            Ok(combined)
+        })
+        .await
+        .context("compose selected Git archives")?
+    }
+
     /// Materialize an immutable Git commit directly into this pipeline's fresh
     /// remote project root without creating a local branch, worktree, clone, or
     /// staging directory. Windows streams the archive to tar over SSH; POSIX
@@ -5990,6 +6101,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         worker: &WorkerConfig,
         git_root: &Path,
         base_commit: &str,
+        submodules: &[(PathBuf, String)],
     ) -> Result<CleanOverlayMaterialization> {
         if use_mock_transport(worker) {
             return Ok(CleanOverlayMaterialization {
@@ -6007,7 +6119,8 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                 }],
             });
         }
-        let archive_file = Self::create_git_archive(git_root, base_commit).await?;
+        let archive_file =
+            Self::create_selected_git_archive(git_root, base_commit, submodules).await?;
         let archive_path = archive_file.path().to_path_buf();
         let payload_bytes = archive_file
             .as_file()
@@ -14234,7 +14347,7 @@ Number of files transferred: 42
         );
         let worker = estimate_test_worker();
         let error = pipeline
-            .materialize_git_archive(&worker, directory.path(), &base)
+            .materialize_git_archive(&worker, directory.path(), &base, &[])
             .await
             .unwrap_err()
             .context("materialize the immutable source base");
@@ -14273,7 +14386,7 @@ Number of files transferred: 42
                 ),
             );
             let error = pipeline
-                .materialize_git_archive(&worker, directory.path(), &base)
+                .materialize_git_archive(&worker, directory.path(), &base, &[])
                 .await
                 .unwrap_err();
             assert!(error.downcast_ref::<TransferAttemptsExhausted>().is_some());
@@ -14288,7 +14401,7 @@ Number of files transferred: 42
             ),
         );
         let error = pipeline
-            .materialize_git_archive(&worker, directory.path(), &"0".repeat(40))
+            .materialize_git_archive(&worker, directory.path(), &"0".repeat(40), &[])
             .await
             .unwrap_err();
         assert!(
@@ -14319,7 +14432,7 @@ Number of files transferred: 42
         );
         pipeline.transfer_config.sync_timeout_ms = Some(1_000);
         let error = pipeline
-            .materialize_git_archive(&estimate_test_worker(), directory.path(), &base)
+            .materialize_git_archive(&estimate_test_worker(), directory.path(), &base, &[])
             .await
             .unwrap_err();
         assert!(started.exists(), "controlled child emitted its diagnostic");
@@ -21970,10 +22083,11 @@ exec /usr/bin/rsync "$@" -e "sh -c 'if [ \"\$1\" = -l ]; then shift 2; fi; shift
                 "{key} must be removed from clean Git commands: {environment:?}"
             );
         }
-        assert!(environment.iter().any(|(key, value)| {
-            *key == "GIT_NO_REPLACE_OBJECTS"
-                && value.is_some_and(|value| value == std::ffi::OsStr::new("1"))
-        }));
+        for flag in ["GIT_NO_REPLACE_OBJECTS", "GIT_NO_LAZY_FETCH"] {
+            assert!(environment.iter().any(|(key, value)| {
+                *key == flag && value.is_some_and(|value| value == std::ffi::OsStr::new("1"))
+            }));
+        }
         let args = command
             .as_std()
             .get_args()
@@ -21982,6 +22096,10 @@ exec /usr/bin/rsync "$@" -e "sh -c 'if [ \"\$1\" = -l ]; then shift 2; fi; shift
         assert!(
             args.windows(2)
                 .any(|window| { window == ["-c", "core.attributesFile=/dev/null"] })
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["-c", "protocol.allow=never"])
         );
         assert!(
             args.windows(2)

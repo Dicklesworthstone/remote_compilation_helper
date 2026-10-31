@@ -1779,8 +1779,18 @@ async fn execute_remote_compilation_inner(
         let sync_attempt = if let Some(spec) = root_overlay {
             spec.verify_archive_attributes(&entry.local_root).await?;
             spec.verify_overlay_unchanged(&entry.local_root)?;
+            let submodule_archives = spec
+                .submodules
+                .iter()
+                .map(|submodule| (submodule.path.clone(), submodule.base_commit.clone()))
+                .collect::<Vec<_>>();
             let base_materialization = match root_pipeline
-                .materialize_git_archive(&worker_config, &entry.local_root, spec.base_commit())
+                .materialize_git_archive(
+                    &worker_config,
+                    &entry.local_root,
+                    spec.base_commit(),
+                    &submodule_archives,
+                )
                 .await
             {
                 Ok(materialization) => materialization,
@@ -3825,6 +3835,7 @@ mod tests {
             tree_object: "b".repeat(40),
             overlay_paths: Vec::new(),
             overlay_fingerprint: "c".repeat(64),
+            submodules: Vec::new(),
             dependencies: Vec::new(),
             primary_directory: None,
         };

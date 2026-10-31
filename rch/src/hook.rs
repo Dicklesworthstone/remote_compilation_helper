@@ -153,8 +153,18 @@ pub(super) struct CleanOverlaySpec {
     tree_object: String,
     overlay_paths: Vec<PathBuf>,
     overlay_fingerprint: String,
+    submodules: Vec<CleanOverlaySubmodule>,
     dependencies: Vec<(PathBuf, CleanOverlaySpec)>,
     primary_directory: Option<PathBuf>,
+}
+
+/// One gitlink selected by the immutable superproject tree. Paths are relative
+/// to the primary repository, including for recursively nested submodules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CleanOverlaySubmodule {
+    path: PathBuf,
+    base_commit: String,
+    tree_object: String,
 }
 
 impl CleanOverlaySpec {
@@ -181,6 +191,14 @@ impl CleanOverlaySpec {
             "[RCH] clean-overlay receipt: base={} overlay-fingerprint={} tree={}",
             self.base_commit, self.overlay_fingerprint, self.tree_object
         );
+        for submodule in &self.submodules {
+            receipt.push_str(&format!(
+                " submodule={}@{} submodule-tree={}",
+                submodule.path.display(),
+                submodule.base_commit,
+                submodule.tree_object
+            ));
+        }
         for (root, spec) in &self.dependencies {
             receipt.push_str(&format!(
                 " dependency-root={} commit={} tree={} overlay-fingerprint={}",
@@ -189,6 +207,14 @@ impl CleanOverlaySpec {
                 spec.tree_object,
                 spec.overlay_fingerprint
             ));
+            for submodule in &spec.submodules {
+                receipt.push_str(&format!(
+                    " dependency-submodule={}@{} submodule-tree={}",
+                    root.join(&submodule.path).display(),
+                    submodule.base_commit,
+                    submodule.tree_object
+                ));
+            }
         }
         receipt
     }
@@ -197,11 +223,20 @@ impl CleanOverlaySpec {
         &self,
         project_root: &Path,
     ) -> anyhow::Result<()> {
-        validate_clean_overlay_archive_attributes(project_root, &self.base_commit).await
+        validate_clean_overlay_archive_attributes(project_root, &self.base_commit).await?;
+        for submodule in &self.submodules {
+            let root = clean_overlay_submodule_root(project_root, &submodule.path).await?;
+            validate_clean_overlay_archive_attributes(&root, &submodule.base_commit).await?;
+        }
+        Ok(())
     }
 
     pub(super) fn verify_overlay_unchanged(&self, project_root: &Path) -> anyhow::Result<()> {
-        let current = clean_overlay_fingerprint(project_root, &self.overlay_paths)?;
+        let current = clean_overlay_selected_fingerprint(
+            project_root,
+            &self.overlay_paths,
+            &self.submodules,
+        )?;
         if current != self.overlay_fingerprint {
             anyhow::bail!(
                 "clean-overlay input changed after admission (expected {}, found {}); refusing remote execution",
@@ -3372,6 +3407,154 @@ fn clean_overlay_fingerprint(
     Ok(hasher.finalize().to_hex().to_string())
 }
 
+fn clean_overlay_selected_fingerprint(
+    project_root: &Path,
+    overlay_paths: &[PathBuf],
+    submodules: &[CleanOverlaySubmodule],
+) -> anyhow::Result<String> {
+    let overlay = clean_overlay_fingerprint(project_root, overlay_paths)?;
+    if submodules.is_empty() {
+        return Ok(overlay);
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"rch-clean-overlay-submodules-v1\0");
+    for bytes in
+        std::iter::once(overlay.as_bytes()).chain(submodules.iter().flat_map(|submodule| {
+            [
+                submodule.path.as_os_str().as_encoded_bytes(),
+                submodule.base_commit.as_bytes(),
+                submodule.tree_object.as_bytes(),
+            ]
+        }))
+    {
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// An empty/uninitialized gitlink directory makes `git -C` discover its parent
+/// repository. Require its own worktree and reject aliasing before reading any
+/// object, otherwise the selected pin could be resolved in the wrong database.
+async fn clean_overlay_submodule_root(project_root: &Path, path: &Path) -> anyhow::Result<PathBuf> {
+    validate_clean_overlay_live_path(project_root, path).with_context(|| {
+        format!(
+            "clean-overlay submodule {} must be initialized at its selected path",
+            path.display()
+        )
+    })?;
+    let root = project_root.join(path);
+    let toplevel = git_output(&root, &["rev-parse", "--show-toplevel"])
+        .await
+        .with_context(|| format!("inspect initialized submodule {}", path.display()))?;
+    anyhow::ensure!(
+        std::fs::canonicalize(&root)? == std::fs::canonicalize(&toplevel)?,
+        "clean-overlay submodule {} is not initialized as its own Git worktree",
+        path.display()
+    );
+    Ok(root)
+}
+
+/// Traverse gitlinks from selected objects, never from the working index or a
+/// submodule's current HEAD. No fetch/update is performed: missing pins refuse
+/// admission, while dirty and newer checkouts remain completely untouched.
+async fn select_clean_overlay_submodules(
+    project_root: &Path,
+    base_entries: &[CleanBaseTreeEntry],
+) -> anyhow::Result<Vec<CleanOverlaySubmodule>> {
+    let mut pending = Vec::new();
+    queue_clean_overlay_submodules(base_entries, Path::new(""), 1, 0, &mut pending)?;
+    let mut selected = Vec::new();
+    let mut prefixes = std::collections::BTreeMap::new();
+    while let Some((path, base_commit, depth)) = pending.pop() {
+        let path = normalize_clean_overlay_path(&path)?;
+        anyhow::ensure!(
+            !path.components().any(|component| component
+                .as_os_str()
+                .to_str()
+                .is_some_and(|name| name.eq_ignore_ascii_case(".git"))),
+            "clean-overlay submodule path contains Git metadata: {}",
+            path.display()
+        );
+        let mut prefix = PathBuf::new();
+        for component in path.components() {
+            prefix.push(component.as_os_str());
+            if let Some(existing) = prefixes.insert(
+                prefix.to_string_lossy().to_ascii_lowercase(),
+                prefix.clone(),
+            ) {
+                anyhow::ensure!(
+                    existing == prefix,
+                    "clean-overlay submodules have case-aliased paths: {} and {}",
+                    existing.display(),
+                    prefix.display()
+                );
+            }
+        }
+        let root = clean_overlay_submodule_root(project_root, &path).await?;
+        let commit = git_output(
+            &root,
+            &["rev-parse", "--verify", &format!("{base_commit}^{{commit}}")],
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "clean-overlay submodule {} is missing pinned commit {base_commit}; initialize/fetch it before execution",
+                path.display()
+            )
+        })?;
+        anyhow::ensure!(
+            commit == base_commit,
+            "submodule pin did not resolve exactly"
+        );
+        validate_clean_overlay_archive_attributes(&root, &base_commit).await?;
+        let tree_object = git_output(
+            &root,
+            &["rev-parse", "--verify", &format!("{base_commit}^{{tree}}")],
+        )
+        .await?;
+        let tree =
+            git_output_bytes(&root, &["ls-tree", "-rz", "--full-tree", &base_commit]).await?;
+        queue_clean_overlay_submodules(
+            &parse_clean_base_tree(&tree)?,
+            &path,
+            depth + 1,
+            selected.len() + 1,
+            &mut pending,
+        )?;
+        selected.push(CleanOverlaySubmodule {
+            path,
+            base_commit,
+            tree_object,
+        });
+    }
+    selected.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(selected)
+}
+
+const MAX_CLEAN_OVERLAY_SUBMODULES: usize = 1_024;
+const MAX_CLEAN_OVERLAY_SUBMODULE_DEPTH: usize = 32;
+
+fn queue_clean_overlay_submodules(
+    entries: &[CleanBaseTreeEntry],
+    prefix: &Path,
+    depth: usize,
+    selected_count: usize,
+    pending: &mut Vec<(PathBuf, String, usize)>,
+) -> anyhow::Result<()> {
+    for entry in entries.iter().filter(|entry| entry.mode == 0o160000) {
+        anyhow::ensure!(
+            depth <= MAX_CLEAN_OVERLAY_SUBMODULE_DEPTH
+                && selected_count + pending.len() < MAX_CLEAN_OVERLAY_SUBMODULES,
+            "clean-overlay submodule inventory exceeds the limit of {} repositories or {} nested submodules",
+            MAX_CLEAN_OVERLAY_SUBMODULES,
+            MAX_CLEAN_OVERLAY_SUBMODULE_DEPTH
+        );
+        pending.push((prefix.join(&entry.path), entry.object_id.clone(), depth));
+    }
+    Ok(())
+}
+
 async fn git_output_bytes(project_root: &Path, args: &[&str]) -> anyhow::Result<Vec<u8>> {
     let mut command = Command::new("git");
     configure_clean_git_command(&mut command);
@@ -3547,25 +3730,49 @@ async fn selected_clean_overlay_cargo_tree(
     }
 
     spec.verify_overlay_unchanged(project_root)?;
-    let tree = git_output_bytes(
-        project_root,
-        &["ls-tree", "-rz", "--full-tree", spec.base_commit()],
-    )
-    .await?;
-    let base = parse_clean_base_tree(&tree)?;
     let mut entries = BTreeMap::new();
-    for entry in &base {
-        let selected = match entry.mode {
-            0o100644 | 0o100755 => SelectedCargoEntry::File(None),
-            0o120000 => SelectedCargoEntry::Symlink(
-                String::from_utf8(
-                    git_output_bytes(project_root, &["cat-file", "blob", &entry.object_id]).await?,
-                )
-                .with_context(|| format!("non-UTF-8 selected symlink {}", entry.path.display()))?,
-            ),
-            _ => anyhow::bail!("unsupported selected Git mode for {}", entry.path.display()),
+    let mut base_objects = BTreeMap::new();
+    let repositories = std::iter::once((Path::new(""), spec.base_commit())).chain(
+        spec.submodules
+            .iter()
+            .map(|submodule| (submodule.path.as_path(), submodule.base_commit.as_str())),
+    );
+    for (prefix, commit) in repositories {
+        let root = if prefix.as_os_str().is_empty() {
+            project_root.to_path_buf()
+        } else {
+            clean_overlay_submodule_root(project_root, prefix).await?
         };
-        entries.insert(entry.path.clone(), selected);
+        let tree = git_output_bytes(&root, &["ls-tree", "-rz", "--full-tree", commit]).await?;
+        for entry in parse_clean_base_tree(&tree)? {
+            let path = prefix.join(&entry.path);
+            if entry.mode == 0o160000 {
+                anyhow::ensure!(
+                    spec.submodules.iter().any(|submodule| {
+                        submodule.path == path && submodule.base_commit == entry.object_id
+                    }),
+                    "selected Git tree contains an unbound submodule: {}",
+                    path.display()
+                );
+                continue;
+            }
+            let selected = match entry.mode {
+                0o100644 | 0o100755 => SelectedCargoEntry::File(None),
+                0o120000 => SelectedCargoEntry::Symlink(
+                    String::from_utf8(
+                        git_output_bytes(&root, &["cat-file", "blob", &entry.object_id]).await?,
+                    )
+                    .with_context(|| format!("non-UTF-8 selected symlink {}", path.display()))?,
+                ),
+                _ => anyhow::bail!("unsupported selected Git mode for {}", path.display()),
+            };
+            anyhow::ensure!(
+                entries.insert(path.clone(), selected).is_none(),
+                "overlapping selected submodule inventory: {}",
+                path.display()
+            );
+            base_objects.insert(path, (root.clone(), entry.object_id));
+        }
     }
     for overlay in spec.overlay_paths() {
         add_overlay(project_root, overlay, &mut entries)?;
@@ -3597,16 +3804,13 @@ async fn selected_clean_overlay_cargo_tree(
             std::fs::read(project_root.join(&target))
                 .with_context(|| format!("read selected Cargo metadata {}", target.display()))?
         } else {
-            let entry = base
-                .iter()
-                .find(|entry| entry.path == target)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "selected Cargo metadata has no base object: {}",
-                        target.display()
-                    )
-                })?;
-            git_output_bytes(project_root, &["cat-file", "blob", &entry.object_id]).await?
+            let (root, object_id) = base_objects.get(&target).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "selected Cargo metadata has no base object: {}",
+                    target.display()
+                )
+            })?;
+            git_output_bytes(root, &["cat-file", "blob", object_id]).await?
         };
         entries.insert(
             target.clone(),
@@ -3850,12 +4054,8 @@ async fn prepare_clean_overlay_spec(
     )
     .await?;
     let base_entries = parse_clean_base_tree(&base_tree)?;
-    if let Some(gitlink) = base_entries.iter().find(|entry| entry.mode == 0o160000) {
-        anyhow::bail!(
-            "clean-overlay does not support Git submodules yet (found {})",
-            gitlink.path.display()
-        );
-    }
+    let submodules =
+        select_clean_overlay_submodules(&canonical_project_root, &base_entries).await?;
 
     let mut normalized_paths = BTreeSet::new();
     for path in overlay_paths {
@@ -3871,19 +4071,30 @@ async fn prepare_clean_overlay_spec(
                 normalized.display()
             );
         }
+        if let Some(submodule) = submodules.iter().find(|submodule| {
+            normalized.starts_with(&submodule.path) || submodule.path.starts_with(&normalized)
+        }) {
+            anyhow::bail!(
+                "clean-overlay path {} overlaps pinned submodule {}; submodule overlays are unsupported",
+                normalized.display(),
+                submodule.path.display()
+            );
+        }
         validate_clean_overlay_live_path(&canonical_project_root, &normalized)?;
         normalized_paths.insert(normalized);
     }
 
     let overlay_paths = normalized_paths.into_iter().collect::<Vec<_>>();
     validate_clean_overlay_against_base(&canonical_project_root, &overlay_paths, &base_entries)?;
-    let overlay_fingerprint = clean_overlay_fingerprint(&canonical_project_root, &overlay_paths)?;
+    let overlay_fingerprint =
+        clean_overlay_selected_fingerprint(&canonical_project_root, &overlay_paths, &submodules)?;
 
     Ok(Some(CleanOverlaySpec {
         base_commit,
         tree_object,
         overlay_paths,
         overlay_fingerprint,
+        submodules,
         dependencies: Vec::new(),
         primary_directory: None,
     }))

@@ -699,6 +699,7 @@ fn clean_overlay_selection_identity_is_source_bound_and_per_job() {
         tree_object: "0123456789abcdef0123456789abcdef01234567".to_string(),
         overlay_paths: vec![PathBuf::from("src/lib.rs")],
         overlay_fingerprint: "first-overlay-fingerprint".to_string(),
+        submodules: Vec::new(),
         dependencies: Vec::new(),
         primary_directory: None,
     };
@@ -1009,7 +1010,7 @@ async fn clean_overlay_spec_rejects_empty_overlay_directory() {
 }
 
 #[tokio::test]
-async fn clean_overlay_spec_rejects_gitlinks() {
+async fn clean_overlay_spec_rejects_uninitialized_gitlinks() {
     let _guard = test_guard!();
     let repo = init_clean_overlay_test_repo();
     let head = std::process::Command::new("git")
@@ -1039,11 +1040,403 @@ async fn clean_overlay_spec_rejects_gitlinks() {
     let error =
         prepare_clean_overlay_spec(repo.path(), Some("HEAD".to_string()), true, vec![], true)
             .await
-            .expect_err("gitlink must fail closed");
+            .expect_err("uninitialized gitlink must fail closed");
+    assert!(error.to_string().contains("must be initialized"));
+}
+
+async fn commit_clean_overlay_submodule_fixture(root: &Path) -> String {
+    git_output(root, &["add", "."]).await.unwrap();
+    git_output(
+        root,
+        &[
+            "commit",
+            "-q",
+            "--no-gpg-sign",
+            "-m",
+            "selected submodule fixture",
+        ],
+    )
+    .await
+    .unwrap();
+    git_output(root, &["rev-parse", "HEAD"]).await.unwrap()
+}
+
+#[cfg(unix)]
+async fn retained_clean_overlay_submodule_fixture() -> (PathBuf, PathBuf, String) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_parent, app, upstream) = retained_clean_overlay_sibling_fixture().await;
+    let long_name = format!("{}.txt", "long-submodule-name-".repeat(8));
+    std::fs::write(upstream.join(&long_name), "pinned long-name bytes\n").unwrap();
+    std::os::unix::fs::symlink(&long_name, upstream.join("selected-link")).unwrap();
+    std::fs::write(upstream.join("tool.sh"), "#!/bin/sh\nprintf pinned\\n\n").unwrap();
+    std::fs::set_permissions(
+        upstream.join("tool.sh"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    commit_clean_overlay_submodule_fixture(&upstream).await;
+    git_output(
+        &app,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            upstream.to_str().unwrap(),
+            "vendor/dep",
+        ],
+    )
+    .await
+    .unwrap();
+    let module = app.join("vendor/dep");
+    for (key, value) in [
+        ("user.name", "RCH Test"),
+        ("user.email", "rch-test@example.invalid"),
+        ("core.hooksPath", "/dev/null"),
+    ] {
+        git_output(&module, &["config", key, value]).await.unwrap();
+    }
+    std::fs::write(
+        app.join("Cargo.toml"),
+        "[package]\nname='app'\nversion='0.1.0'\n[workspace]\n[dependencies]\ndep={path='vendor/dep'}\n",
+    )
+    .unwrap();
+    commit_clean_overlay_submodule_fixture(&app).await;
+    let pin = git_output(&module, &["rev-parse", "HEAD"]).await.unwrap();
+    (app, module, pin)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn clean_overlay_submodule_archive_and_cargo_inventory_use_pin_not_dirty_or_newer_head() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = test_guard!();
+    let (app, module, pin) = retained_clean_overlay_submodule_fixture().await;
+    std::fs::write(
+        module.join("Cargo.toml"),
+        "[package]\nname='dep'\nversion='0.1.0'\n[dependencies]\nforeign={path='../../../unselected'}\n",
+    )
+    .unwrap();
+    std::fs::write(module.join("src/lib.rs"), "pub fn newer() {}\n").unwrap();
+    let newer = commit_clean_overlay_submodule_fixture(&module).await;
+    assert_ne!(newer, pin);
+    std::fs::write(module.join("src/lib.rs"), "dirty bytes are not selected\n").unwrap();
+    std::fs::write(module.join("untracked.txt"), "ambient new file\n").unwrap();
+
+    let spec = prepare_clean_overlay_spec(&app, Some("HEAD".into()), true, vec![], true)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(spec.submodules.len(), 1);
+    assert_eq!(spec.submodules[0].base_commit, pin);
+    validate_clean_overlay_cargo_sources(&app, &spec, "cargo check")
+        .await
+        .unwrap();
+    spec.verify_overlay_unchanged(&app).unwrap();
+    spec.verify_archive_attributes(&app).await.unwrap();
+    let selected = spec
+        .submodules
+        .iter()
+        .map(|module| (module.path.clone(), module.base_commit.clone()))
+        .collect::<Vec<_>>();
+    let archive =
+        TransferPipeline::create_selected_git_archive(&app, spec.base_commit(), &selected)
+            .await
+            .unwrap();
+    let destination = tempfile::tempdir().unwrap().keep();
+    tar::Archive::new(archive.reopen().unwrap())
+        .unpack(&destination)
+        .unwrap();
+    let delivered = destination.join("vendor/dep");
+    assert_eq!(
+        std::fs::read_to_string(delivered.join("src/lib.rs")).unwrap(),
+        "pub fn value() -> u32 { 1 }\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(delivered.join("selected-link")).unwrap(),
+        "pinned long-name bytes\n"
+    );
+    assert!(
+        std::fs::symlink_metadata(delivered.join("selected-link"))
+            .unwrap()
+            .is_symlink()
+    );
+    assert_eq!(
+        std::fs::metadata(delivered.join("tool.sh"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
+    assert!(!delivered.join("untracked.txt").exists());
+    assert!(!delivered.join(".git").exists());
+    assert!(!destination.join(".git").exists());
+    assert_eq!(
+        git_output(&module, &["rev-parse", "HEAD"]).await.unwrap(),
+        newer
+    );
+    assert_eq!(
+        std::fs::read_to_string(module.join("src/lib.rs")).unwrap(),
+        "dirty bytes are not selected\n"
+    );
+    assert!(
+        spec.execution_receipt()
+            .contains(&format!("submodule=vendor/dep@{pin}"))
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn clean_overlay_submodule_pin_changes_fingerprint_and_receipt() {
+    let _guard = test_guard!();
+    let (app, module, _) = retained_clean_overlay_submodule_fixture().await;
+    let first = prepare_clean_overlay_spec(&app, Some("HEAD".into()), true, vec![], true)
+        .await
+        .unwrap()
+        .unwrap();
+    std::fs::write(module.join("src/lib.rs"), "pub fn value() -> u32 { 2 }\n").unwrap();
+    let pin = commit_clean_overlay_submodule_fixture(&module).await;
+    let unchanged = prepare_clean_overlay_spec(&app, Some("HEAD".into()), true, vec![], true)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.overlay_fingerprint, unchanged.overlay_fingerprint);
+    commit_clean_overlay_submodule_fixture(&app).await;
+    let changed = prepare_clean_overlay_spec(&app, Some("HEAD".into()), true, vec![], true)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(changed.submodules[0].base_commit, pin);
+    assert_ne!(first.overlay_fingerprint, changed.overlay_fingerprint);
+    assert_ne!(first.execution_receipt(), changed.execution_receipt());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn clean_overlay_submodules_reject_overlays_missing_pins_and_parent_repository_fallback() {
+    let _guard = test_guard!();
+    let (app, module, _) = retained_clean_overlay_submodule_fixture().await;
+    for path in ["vendor", "vendor/dep", "vendor/dep/src/lib.rs"] {
+        let error = prepare_clean_overlay_spec(
+            &app,
+            Some("HEAD".into()),
+            true,
+            vec![PathBuf::from(path)],
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("overlaps pinned submodule"),
+            "{error:#}"
+        );
+    }
+    let missing = "f".repeat(40);
+    git_output(
+        &app,
+        &[
+            "update-index",
+            "--cacheinfo",
+            &format!("160000,{missing},vendor/dep"),
+        ],
+    )
+    .await
+    .unwrap();
+    git_output(
+        &app,
+        &["commit", "-q", "--no-gpg-sign", "-m", "unfetched pin"],
+    )
+    .await
+    .unwrap();
+    let error = prepare_clean_overlay_spec(&app, Some("HEAD".into()), true, vec![], true)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("missing pinned commit"),
+        "{error:#}"
+    );
+
+    std::fs::rename(&module, app.join("parked-submodule")).unwrap();
+    std::fs::create_dir(&module).unwrap();
+    let error = prepare_clean_overlay_spec(&app, Some("HEAD".into()), true, vec![], true)
+        .await
+        .unwrap_err();
     assert!(
         error
             .to_string()
-            .contains("does not support Git submodules")
+            .contains("not initialized as its own Git worktree"),
+        "{error:#}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn clean_overlay_submodule_archive_attributes_are_checked_at_admission_and_before_transfer() {
+    let _guard = test_guard!();
+    let (app, module, _) = retained_clean_overlay_submodule_fixture().await;
+    let spec = prepare_clean_overlay_spec(&app, Some("HEAD".into()), true, vec![], true)
+        .await
+        .unwrap()
+        .unwrap();
+    let attributes = git_output(&module, &["rev-parse", "--git-path", "info/attributes"])
+        .await
+        .unwrap();
+    std::fs::write(&attributes, "src/lib.rs export-ignore\n").unwrap();
+    let error = spec.verify_archive_attributes(&app).await.unwrap_err();
+    assert!(error.to_string().contains("info/attributes"), "{error:#}");
+    std::fs::write(&attributes, "").unwrap();
+    std::fs::write(module.join(".gitattributes"), "src/lib.rs export-subst\n").unwrap();
+    commit_clean_overlay_submodule_fixture(&module).await;
+    commit_clean_overlay_submodule_fixture(&app).await;
+    let error = prepare_clean_overlay_spec(&app, Some("HEAD".into()), true, vec![], true)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("non-checkout-equivalent"),
+        "{error:#}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn clean_overlay_submodule_recursion_preserves_nested_pins_and_rejects_replaced_roots() {
+    let _guard = test_guard!();
+    let (app, module, _) = retained_clean_overlay_submodule_fixture().await;
+    let leaf_source = init_clean_overlay_test_repo().keep();
+    std::fs::write(
+        leaf_source.join("Cargo.toml"),
+        "[package]\nname='leaf'\nversion='0.1.0'\n[workspace]\n",
+    )
+    .unwrap();
+    std::fs::write(leaf_source.join("src/lib.rs"), "pub fn leaf() {}\n").unwrap();
+    let leaf_pin = commit_clean_overlay_submodule_fixture(&leaf_source).await;
+    git_output(
+        &module,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            leaf_source.to_str().unwrap(),
+            "nested/leaf",
+        ],
+    )
+    .await
+    .unwrap();
+    std::fs::write(
+        module.join("Cargo.toml"),
+        "[package]\nname='dep'\nversion='0.1.0'\n[workspace]\n[dependencies]\nleaf={path='nested/leaf'}\n",
+    ).unwrap();
+    commit_clean_overlay_submodule_fixture(&module).await;
+    commit_clean_overlay_submodule_fixture(&app).await;
+    let leaf = module.join("nested/leaf");
+    std::fs::write(leaf.join("src/lib.rs"), "unselected nested dirt\n").unwrap();
+    let spec = prepare_clean_overlay_spec(&app, Some("HEAD".into()), true, vec![], true)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(spec.submodules.len(), 2);
+    assert_eq!(spec.submodules[1].path, Path::new("vendor/dep/nested/leaf"));
+    assert_eq!(spec.submodules[1].base_commit, leaf_pin);
+    validate_clean_overlay_cargo_sources(&app, &spec, "cargo check")
+        .await
+        .unwrap();
+    let selected = spec
+        .submodules
+        .iter()
+        .map(|entry| (entry.path.clone(), entry.base_commit.clone()))
+        .collect::<Vec<_>>();
+    let archive =
+        TransferPipeline::create_selected_git_archive(&app, spec.base_commit(), &selected)
+            .await
+            .unwrap();
+    let destination = tempfile::tempdir().unwrap().keep();
+    tar::Archive::new(archive.reopen().unwrap())
+        .unpack(&destination)
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(destination.join("vendor/dep/nested/leaf/src/lib.rs")).unwrap(),
+        "pub fn leaf() {}\n"
+    );
+    assert!(!destination.join("vendor/dep/nested/leaf/.git").exists());
+    let parked = module.join("nested/parked-leaf");
+    std::fs::rename(&leaf, &parked).unwrap();
+    std::os::unix::fs::symlink(&parked, &leaf).unwrap();
+    let error = spec.verify_archive_attributes(&app).await.unwrap_err();
+    assert!(format!("{error:#}").contains("symlink"), "{error:#}");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn clean_overlay_submodule_archive_refuses_case_aliased_parent_directories() {
+    let _guard = test_guard!();
+    let (app, _, _) = retained_clean_overlay_submodule_fixture().await;
+    std::fs::create_dir(app.join("Vendor")).unwrap();
+    std::fs::write(
+        app.join("Vendor/peer.txt"),
+        "ambiguous destination directory\n",
+    )
+    .unwrap();
+    commit_clean_overlay_submodule_fixture(&app).await;
+    let spec = prepare_clean_overlay_spec(&app, Some("HEAD".into()), true, vec![], true)
+        .await
+        .unwrap()
+        .unwrap();
+    let selected = spec
+        .submodules
+        .iter()
+        .map(|entry| (entry.path.clone(), entry.base_commit.clone()))
+        .collect::<Vec<_>>();
+    let error = TransferPipeline::create_selected_git_archive(&app, spec.base_commit(), &selected)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("case-aliased paths"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn clean_overlay_submodule_inventory_bounds_include_queued_children() {
+    let link = CleanBaseTreeEntry {
+        mode: 0o160000,
+        object_id: "a".repeat(40),
+        path: PathBuf::from("child"),
+    };
+    let mut pending = Vec::new();
+    queue_clean_overlay_submodules(
+        std::slice::from_ref(&link),
+        Path::new("parent"),
+        MAX_CLEAN_OVERLAY_SUBMODULE_DEPTH,
+        MAX_CLEAN_OVERLAY_SUBMODULES - 1,
+        &mut pending,
+    )
+    .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert!(
+        queue_clean_overlay_submodules(
+            std::slice::from_ref(&link),
+            Path::new("parent"),
+            1,
+            MAX_CLEAN_OVERLAY_SUBMODULES - 1,
+            &mut pending,
+        )
+        .is_err()
+    );
+    assert!(
+        queue_clean_overlay_submodules(
+            &[link],
+            Path::new("parent"),
+            MAX_CLEAN_OVERLAY_SUBMODULE_DEPTH + 1,
+            0,
+            &mut Vec::new(),
+        )
+        .is_err()
     );
 }
 

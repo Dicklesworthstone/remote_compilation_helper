@@ -3223,6 +3223,7 @@ mod tests {
             tree_object: tree_object.to_owned(),
             overlay_paths,
             overlay_fingerprint: overlay_fingerprint.to_owned(),
+            submodules: Vec::new(),
             dependencies,
             primary_directory: None,
         }
