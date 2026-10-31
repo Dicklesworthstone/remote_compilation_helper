@@ -429,6 +429,7 @@ impl TransportProbeDeadline {
 /// Revocable permission for background network I/O. A disable, outage or
 /// endpoint replacement cancels the future (and its owned SSH child) rather
 /// than letting a queued operation dial after the operator's acknowledgement.
+#[derive(Debug, Clone)]
 pub(crate) struct BackgroundProbe {
     changes: watch::Receiver<u64>,
     revision: u64,
@@ -457,6 +458,15 @@ pub(crate) struct HealthProbePermit {
     /// warm pool before the worker has proved it can run a command.
     pub(crate) isolated: bool,
     _singleflight: OwnedMutexGuard<()>,
+}
+
+/// Transport evidence may defer owned-work recovery only for the endpoint
+/// that evidence describes. Administrative intent is checked independently
+/// by worker ID, including when the owned endpoint is no longer in inventory.
+pub(crate) enum OwnedRecoveryAdmission {
+    Deferred,
+    Historical,
+    Current(BackgroundProbe),
 }
 
 /// State of a single worker.
@@ -727,6 +737,32 @@ impl WorkerState {
 
     pub(crate) async fn transport_is_down(&self) -> bool {
         self.transport.lock().await.down
+    }
+
+    /// Keep automatic cancellation/recovery from becoming extra outage probes
+    /// between the worker's bounded health checks. This does not grant build
+    /// ownership or adopt today's config: callers still use their immutable
+    /// admitted endpoint. Matching coordinates include recovered snapshots
+    /// from a prior daemon; they do not require a current runtime incarnation.
+    pub(crate) async fn owned_recovery_admission(
+        &self,
+        owned: &WorkerConfig,
+    ) -> OwnedRecoveryAdmission {
+        let permit = self.network_revision_guard();
+        let current = self.config.read().await;
+        if self.is_endpoint_retired() || !permit.is_current() {
+            return OwnedRecoveryAdmission::Deferred;
+        }
+        if !same_endpoint(&current, owned) {
+            return OwnedRecoveryAdmission::Historical;
+        }
+        if self.transport_is_down().await || !permit.is_current() {
+            return OwnedRecoveryAdmission::Deferred;
+        }
+        // Readiness/circuit/storage quarantine cannot veto termination of
+        // already-owned work. A subsequent transport failure or retarget
+        // revokes this permit without holding the config lock across SSH.
+        OwnedRecoveryAdmission::Current(permit)
     }
 
     pub(crate) async fn next_health_probe_in(&self) -> Option<Duration> {
@@ -1870,8 +1906,11 @@ impl WorkerPool {
             Some(store) => Some(store.lock().await),
             None => None,
         };
-        if let Some(record) = durable.as_ref().and_then(|store| store.get(id.as_str())) {
-            state.disable(record.reason.clone()).await;
+        if let Some(record) = durable
+            .as_ref()
+            .and_then(|store| store.effective_disable(id.as_str()))
+        {
+            state.disable(record.reason).await;
         }
         if self.monitor_connections {
             state.require_connection_probe();
@@ -2342,13 +2381,18 @@ pub async fn handle_worker_enable(
     ctx: &DaemonContext,
     worker_id: &WorkerId,
 ) -> WorkerStateResponse {
-    match ctx.pool.get(worker_id).await {
+    // Resolve the ID only after serializing durable intent, and retain the
+    // registry lease through the live change. Otherwise reload can replace a
+    // worker while this handler waits, and an acknowledged enable can affect
+    // only a retired Arc. Match add_worker: durable store -> registry -> worker.
+    let mut durable = match &ctx.admin_disable_store {
+        Some(store) => Some(store.lock().await),
+        None => None,
+    };
+    let workers = ctx.pool.workers.read().await;
+    match workers.get(worker_id) {
         Some(worker) => {
             let old_status = worker.status().await;
-            let mut durable = match &ctx.admin_disable_store {
-                Some(store) => Some(store.lock().await),
-                None => None,
-            };
             // Operator re-enable must be DURABLE: delete the worker's persisted
             // bypass record too. `worker.enable()` only resets the in-memory
             // lifecycle/circuit; if the record survives, `reconcile_on_start`
@@ -2419,13 +2463,18 @@ pub async fn handle_worker_disable(
     reason: Option<String>,
     drain_first: bool,
 ) -> WorkerStateResponse {
-    match ctx.pool.get(worker_id).await {
+    // Keep the same store -> registry -> worker order as enable and insertion.
+    // A concurrent remove/re-add must either precede this lookup or inherit the
+    // disable after publication; it cannot remain active behind a successful
+    // response that changed only its retired predecessor.
+    let mut durable = match &ctx.admin_disable_store {
+        Some(store) => Some(store.lock().await),
+        None => None,
+    };
+    let workers = ctx.pool.workers.read().await;
+    match workers.get(worker_id) {
         Some(worker) => {
             let active_slots = worker.used_slots();
-            let mut durable = match &ctx.admin_disable_store {
-                Some(store) => Some(store.lock().await),
-                None => None,
-            };
             let mut persistence_error = None;
 
             // Durable admin disable (bd-8zxz7): persist the intent BEFORE the
@@ -2611,6 +2660,68 @@ mod tests {
         assert!(replacement.reserve_slots(1).await);
         assert!(!retired.reserve_slots(1).await);
         replacement.release_slots(1).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn offline_worker_owned_recovery_uses_only_matching_transport_evidence() {
+        let config = recovered_worker_config("owned-recovery", 4);
+        let worker = WorkerState::new(config.clone());
+        worker.require_connection_probe();
+        worker.open_circuit().await;
+        worker
+            .enter_bypass(BypassFailureClass::DiskInodePressure)
+            .await;
+        assert!(!worker.background_network_allowed().await);
+        // Admission/readiness and storage/circuit quarantine cannot prohibit
+        // recovery of a process group that this worker already owns.
+        let OwnedRecoveryAdmission::Current(mut permit) =
+            worker.owned_recovery_admission(&config).await
+        else {
+            panic!("non-transport quarantine blocked owned recovery");
+        };
+        let operation = permit.run(std::future::pending::<()>());
+        tokio::pin!(operation);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(operation.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let circuit = CircuitBreakerConfig {
+            failure_threshold: 1,
+            ..Default::default()
+        };
+        worker
+            .record_transport_result(false, Duration::from_secs(30), &circuit)
+            .await;
+        assert!(
+            operation.await.is_none(),
+            "new outage must revoke in-flight recovery"
+        );
+        assert!(matches!(
+            worker.owned_recovery_admission(&config).await,
+            OwnedRecoveryAdmission::Deferred
+        ));
+
+        let historical = WorkerConfig {
+            host: "old-owned.example".into(),
+            ..config.clone()
+        };
+        assert!(matches!(
+            worker.owned_recovery_admission(&historical).await,
+            OwnedRecoveryAdmission::Historical
+        ));
+        worker
+            .record_transport_result(true, Duration::from_secs(30), &circuit)
+            .await;
+        assert!(matches!(
+            worker.owned_recovery_admission(&config).await,
+            OwnedRecoveryAdmission::Current(_)
+        ));
+        assert_eq!(
+            worker.eligibility().await,
+            EligibilityState::TemporaryBypass
+        );
+        assert_eq!(worker.circuit_state().await, Some(CircuitState::Open));
     }
 
     #[tokio::test(start_paused = true)]
@@ -2808,6 +2919,171 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn offline_worker_enable_racing_replacement_changes_current_incarnation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("admin.json");
+        let store = Arc::new(Mutex::new(AdminDisableStore::try_load(&path).unwrap()));
+        let pool = WorkerPool::new()
+            .with_connection_monitoring()
+            .with_admin_disable_store(store.clone());
+        let config = recovered_worker_config("replaced", 4);
+        let id = config.id.clone();
+        pool.add_worker(config.clone()).await;
+        let original = pool.get(&id).await.unwrap();
+        let mut context = crate::test_daemon_context(pool.clone());
+        context.admin_disable_store = Some(store);
+        assert_eq!(
+            handle_worker_disable(&context, &id, Some("operator".into()), false)
+                .await
+                .status,
+            "ok"
+        );
+
+        // Suspend the real API handler while reading the old incarnation's
+        // status. Previously it had already resolved an Arc, but had not yet
+        // acquired the durable intent lock, so reload could replace that Arc.
+        let lifecycle = original.lifecycle.write().await;
+        let enable = handle_worker_enable(&context, &id);
+        tokio::pin!(enable);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(enable.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+
+        let replacement = async {
+            assert!(pool.remove_worker(&id).await);
+            pool.add_worker(config.clone()).await;
+        };
+        tokio::pin!(replacement);
+        let replaced_early = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(replacement.as_mut(), cx).is_ready())
+        })
+        .await;
+
+        drop(lifecycle);
+        let response = tokio::time::timeout(Duration::from_secs(1), enable)
+            .await
+            .expect("enable must complete after its status read is released");
+        assert_eq!(response.status, "ok");
+        if !replaced_early {
+            tokio::time::timeout(Duration::from_secs(1), replacement)
+                .await
+                .expect("replacement must complete after administrative publication");
+        }
+
+        let current = pool.get(&id).await.unwrap();
+        assert!(!Arc::ptr_eq(&original, &current));
+        assert!(original.is_endpoint_retired());
+        assert!(
+            !current.is_disabled().await,
+            "successful enable must affect the current worker, not only a retired Arc"
+        );
+        assert!(!current.background_network_allowed().await);
+        assert!(
+            current
+                .health_probe_permit(Duration::from_secs(30), &CircuitBreakerConfig::default())
+                .await
+                .is_some(),
+            "the replacement may now prove connectivity and automatically resume"
+        );
+        assert!(
+            AdminDisableStore::try_load(&path)
+                .unwrap()
+                .get(id.as_str())
+                .is_none()
+        );
+
+        let restarted = WorkerPool::new()
+            .with_connection_monitoring()
+            .with_admin_disable_store(Arc::new(Mutex::new(
+                AdminDisableStore::try_load(path).unwrap(),
+            )));
+        restarted.add_worker(config.clone()).await;
+        assert!(!restarted.get(&id).await.unwrap().is_disabled().await);
+    }
+
+    #[tokio::test]
+    async fn offline_worker_disable_racing_replacement_remains_durable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("admin.json");
+        let store = Arc::new(Mutex::new(AdminDisableStore::try_load(&path).unwrap()));
+        let pool = WorkerPool::new()
+            .with_connection_monitoring()
+            .with_admin_disable_store(store.clone());
+        let config = recovered_worker_config("replaced", 4);
+        let id = config.id.clone();
+        pool.add_worker(config.clone()).await;
+        let original = pool.get(&id).await.unwrap();
+        original
+            .record_transport_result(
+                true,
+                Duration::from_secs(30),
+                &CircuitBreakerConfig::default(),
+            )
+            .await;
+        let mut old_probe = original.background_probe().await.unwrap();
+        let mut context = crate::test_daemon_context(pool.clone());
+        context.admin_disable_store = Some(store);
+
+        // Keep disable pending at the real transport publication boundary while
+        // a remove/re-add tries to publish a replacement for the same worker ID.
+        let transition = original.network_transition.lock().await;
+        let disable = handle_worker_disable(&context, &id, Some("operator".into()), false);
+        tokio::pin!(disable);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(disable.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let replacement = async {
+            assert!(pool.remove_worker(&id).await);
+            pool.add_worker(config.clone()).await;
+        };
+        tokio::pin!(replacement);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(replacement.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(transition);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), disable)
+                .await
+                .expect("disable must complete after transport publication is released")
+                .status,
+            "ok"
+        );
+        tokio::time::timeout(Duration::from_secs(1), replacement)
+            .await
+            .expect("replacement must complete after disable publishes its intent");
+
+        let current = pool.get(&id).await.unwrap();
+        assert!(!Arc::ptr_eq(&original, &current));
+        assert!(current.is_disabled().await);
+        assert!(!current.background_network_allowed().await);
+        assert!(
+            current
+                .health_probe_permit(Duration::from_secs(30), &CircuitBreakerConfig::default())
+                .await
+                .is_none()
+        );
+        assert!(
+            old_probe
+                .run(async { panic!("a replaced and disabled probe must never dial") })
+                .await
+                .is_none()
+        );
+        let restarted = WorkerPool::new()
+            .with_connection_monitoring()
+            .with_admin_disable_store(Arc::new(Mutex::new(
+                AdminDisableStore::try_load(path).unwrap(),
+            )));
+        restarted.add_worker(config.clone()).await;
+        assert!(restarted.get(&id).await.unwrap().is_disabled().await);
+    }
+
+    #[tokio::test]
     async fn offline_worker_failed_durable_enable_never_changes_live_intent() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("admin.json");
@@ -2870,6 +3146,73 @@ mod tests {
                 .run(async { panic!("disabled operation dialed") })
                 .await
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_worker_failed_disable_survives_inventory_replacement_in_this_daemon() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("admin.json");
+        let store = Arc::new(Mutex::new(AdminDisableStore::with_path(&path)));
+        let pool = WorkerPool::new()
+            .with_connection_monitoring()
+            .with_admin_disable_store(store.clone());
+        let config = recovered_worker_config("failed-save", 4);
+        let id = config.id.clone();
+        pool.add_worker(config.clone()).await;
+        let original = pool.get(&id).await.unwrap();
+        let mut context = crate::test_daemon_context(pool.clone());
+        context.admin_disable_store = Some(store.clone());
+        std::fs::create_dir(&path).unwrap();
+        let response =
+            handle_worker_disable(&context, &id, Some("operator: powered off".into()), false).await;
+        assert_eq!(
+            response.status, "error",
+            "failed save must remain visible to the operator"
+        );
+        assert!(store.lock().await.get(id.as_str()).is_none());
+        assert!(original.is_disabled().await);
+        assert!(pool.remove_worker(&id).await);
+        pool.add_worker(config.clone()).await;
+        let replacement = pool.get(&id).await.unwrap();
+        assert!(!Arc::ptr_eq(&original, &replacement));
+        assert!(replacement.is_disabled().await);
+        assert_eq!(
+            replacement.disabled_reason().await.as_deref(),
+            Some("operator: powered off")
+        );
+        assert!(replacement.background_probe().await.is_none());
+        assert!(
+            replacement
+                .health_probe_permit(Duration::from_secs(30), &CircuitBreakerConfig::default())
+                .await
+                .is_none()
+        );
+        assert!(
+            store
+                .lock()
+                .await
+                .automatic_network_permit(id.as_str())
+                .is_none()
+        );
+
+        // This was deliberately not a successful durable disable. After the
+        // obstruction is moved away, restart sees the unchanged empty disk
+        // state; retaining live intent must not invent a persistence guarantee.
+        std::fs::rename(&path, directory.path().join("obstruction")).unwrap();
+        let restarted = WorkerPool::new()
+            .with_connection_monitoring()
+            .with_admin_disable_store(Arc::new(Mutex::new(
+                AdminDisableStore::try_load(&path).unwrap(),
+            )));
+        restarted.add_worker(config).await;
+        let after_restart = restarted.get(&id).await.unwrap();
+        assert!(!after_restart.is_disabled().await);
+        assert!(
+            after_restart
+                .health_probe_permit(Duration::from_secs(30), &CircuitBreakerConfig::default())
+                .await
+                .is_some()
         );
     }
 

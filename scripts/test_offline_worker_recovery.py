@@ -33,6 +33,7 @@ import sys
 import tempfile
 import threading
 import time
+from urllib.parse import quote
 
 
 SCRIPT = Path(__file__).resolve()
@@ -130,6 +131,17 @@ def fake_ssh(root, arguments):
             time.sleep(0.1)
     if control:
         worker = Path(control).read_text()
+        # A warm master can stay present while its authenticated transport
+        # stops answering. Model that separately from a failed initial dial:
+        # local control checks still succeed, but remote commands cannot run.
+        if mode_for(root, worker) == "blackhole":
+            deadline = time.monotonic() + 60
+            while Path(control).exists() and time.monotonic() < deadline:
+                if mode_for(root, worker) == "healthy":
+                    break
+                time.sleep(0.05)
+            else:
+                return 255
         worker_reply(root, worker, " ".join(arguments))
         return 0
     print("fixture refused unexpected SSH invocation", arguments, file=sys.stderr)
@@ -316,6 +328,27 @@ class DaemonFixture:
                 except ProcessLookupError:
                     pass
 
+    def freeze_worker(self, worker):
+        """Keep established SSH sessions alive but unable to answer commands."""
+        self.set_modes(**{worker: "blackhole"})
+        frozen = []
+        for dial in self.dials(worker):
+            if not transport_stats(dial)[1]:
+                continue
+            try:
+                # Freeze only transport groups owned by this fixture. Stopping
+                # the whole group also covers OpenSSH privilege-separation and
+                # ProxyCommand children, whose parent alone may not carry I/O.
+                group = os.getpgid(dial["pid"])
+                assert group not in (self.process.pid, os.getpgrp()), group
+                assert os.getsid(dial["pid"]) == self.process.pid, dial
+                os.killpg(group, signal.SIGSTOP)
+                frozen.append(dial)
+            except ProcessLookupError:
+                pass
+        assert frozen, "the worker must have an established transport to freeze"
+        return frozen
+
     def select(self, worker=None):
         query = f"GET /select-worker?project=offline-fixture-{next(self.selections)}&cores=1&runtime=none"
         if worker:
@@ -473,6 +506,96 @@ def run_saturated_fleet(binary, root, openssh):
         fixture.stop()
 
 
+def run_warm_transport_freeze(binary, root, openssh):
+    fixture = DaemonFixture(binary, root, openssh=openssh,
+                            modes={"offline": "healthy", "healthy": "healthy"})
+    try:
+        fixture.start()
+        for worker in ("offline", "healthy"):
+            wait_until(lambda: fixture.status(worker)["status"].lower() == "healthy"
+                       and fixture.status(worker)["total_slots"] > 0, 8, f"warm {worker}")
+        # Capability discovery shares the health pool. Warm the separate
+        # background pool through selection's real toolchain preflight rather
+        # than waiting for telemetry's first eligible 30-second poll.
+        toolchain = quote(json.dumps({"channel": "stable", "date": None,
+                                     "full_version": "rustc 1.100.0"}))
+        reservation = fixture.request(
+            "GET /select-worker?project=warm-freeze-owned-reservation&cores=3"
+            f"&runtime=none&worker=offline&hook_pid={os.getpid()}&toolchain={toolchain}")
+        selected = reservation.get("worker")
+        assert selected and selected["id"] == "offline", reservation
+        build_id = reservation.get("build_id") or selected.get("build_id")
+        assert build_id, reservation
+        # Both pools must be authenticated before the fault; a failed initial
+        # dial exercises a different recovery path.
+        wait_until(lambda: sum(transport_stats(dial)[1] > 0
+                               for dial in fixture.dials("offline")) >= 2,
+                   8, "both authenticated pools warm")
+
+        def assert_reservation_owned():
+            snapshot = fixture.request("GET /status")
+            active = next(build for build in snapshot["active_builds"] if build["id"] == build_id)
+            worker = next(worker for worker in snapshot["workers"] if worker["id"] == "offline")
+            assert active["worker_id"] == "offline" and active["slots"] == 3, active
+            assert worker["used_slots"] == 3, worker
+
+        assert_reservation_owned()
+        frozen = fixture.freeze_worker("offline")
+        wait_until(lambda: fixture.status("offline")["status"].lower() == "unreachable",
+                   10, "authenticated transport deadline and down marking")
+        wait_until(lambda: all(not transport_stats(dial)[1] for dial in frozen),
+                   3, "frozen authenticated transports reaped")
+        assert_reservation_owned()
+        assert fixture.select("offline") is None
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            selected = list(executor.map(lambda _: fixture.select(), range(12)))
+        assert all(worker and worker["id"] == "healthy" for worker in selected), selected
+        outage = fixture.observe(6.2, "offline")
+        assert 1 <= outage["dial_attempts"] <= 3, outage
+        assert outage["sampled_peak_live_transport_processes"] <= 1, outage
+        if outage["minimum_dial_spacing_seconds"] is not None:
+            assert outage["minimum_dial_spacing_seconds"] >= 3, outage
+        assert_reservation_owned()
+
+        fixture.set_modes(offline="healthy")
+        recovery_started = time.monotonic()
+        wait_until(lambda: fixture.status("offline")["status"].lower() == "healthy"
+                   and fixture.status("offline")["total_slots"] > 0,
+                   8, "authenticated transport recovery")
+        recovery_seconds = time.monotonic() - recovery_started
+        assert_reservation_owned()
+        assert fixture.select("offline")["id"] == "offline"
+
+        # Administrative disablement and daemon restart revoke background
+        # transports, but never manufacture completion of an owned build.
+        response = fixture.request("POST /workers/offline/disable?reason=warm-freeze-fixture")
+        assert response.get("status") == "ok", response
+        assert_reservation_owned()
+        disabled_count = len(fixture.dials("offline"))
+        disabled = fixture.observe(3.2, "offline")
+        assert disabled["dial_attempts"] == 0, disabled
+        fixture.stop()
+        fixture.start()
+        restarted = fixture.observe(3.2, "offline")
+        assert len(fixture.dials("offline")) == disabled_count, fixture.dials("offline")
+        assert fixture.status("offline")["status"].lower() == "disabled"
+        assert_reservation_owned()
+        response = fixture.request(
+            f"POST /release-worker?worker=offline&slots=3&exit_code=0&build_id={build_id}")
+        assert response == {}, response
+        assert fixture.status("offline")["used_slots"] == 0
+        assert all(build["id"] != build_id for build in fixture.request("GET /status")["active_builds"])
+        return {
+            "frozen_authenticated_transports": len(frozen),
+            "outage": outage, "healthy_peer_admissions": len(selected),
+            "recovery_latency_seconds": recovery_seconds,
+            "disabled": disabled, "disabled_restart": restarted,
+            "reservation_slots_preserved_until_explicit_release": 3,
+        }
+    finally:
+        fixture.stop()
+
+
 def run_regressions(binary, root, openssh):
     results = {}
     fixture = DaemonFixture(binary, root / "recovery", openssh=openssh)
@@ -603,6 +726,8 @@ def run_regressions(binary, root, openssh):
         results["unpooled"] = unpooled
     finally:
         fixture.stop()
+    results["authenticated_transport_freeze"] = run_warm_transport_freeze(
+        binary, root / "warm-freeze", openssh)
     results["saturated_recovery_fleet"] = run_saturated_fleet(binary, root / "saturated", openssh)
     return results
 

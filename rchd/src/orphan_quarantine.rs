@@ -146,7 +146,18 @@ impl<P: OrphanProber + 'static> OrphanQuarantineService<P> {
             }
             let mut revision = worker.network_revision_guard();
             let endpoint = worker.endpoint_snapshot().await;
+            // The registry lookup can predate removal while the durable store
+            // is busy. Reject that incarnation before dialing: capturing its
+            // already-revoked epoch would otherwise authorize a probe whose
+            // result can never pass the publication check below.
+            let Some(endpoint_guard) = worker.lock_current_endpoint(&endpoint).await else {
+                continue;
+            };
+            if !revision.is_current() {
+                continue;
+            }
             let config = endpoint.config.clone();
+            drop(endpoint_guard);
             drop(store);
             if rch_common::declared_os(&config.tags).as_deref() == Some("windows") {
                 continue;
@@ -393,6 +404,90 @@ mod tests {
             store.get("w1").and_then(|record| record.reason.as_deref()),
             Some("operator: keep out")
         );
+    }
+
+    #[tokio::test]
+    async fn removal_while_waiting_for_durable_intent_never_probes_a_retired_endpoint() {
+        let (dir, initial_pool, store) = fixture(quarantine_reason(Some(&evidence()))).await;
+        let id = WorkerId::new("w1");
+        let config = initial_pool
+            .get(&id)
+            .await
+            .unwrap()
+            .config
+            .read()
+            .await
+            .clone();
+        // Use production insertion semantics: a replacement inherits durable
+        // intent under the same store lock used by administrative requests.
+        let pool = WorkerPool::new().with_admin_disable_store(store.clone());
+        pool.add_worker(config.clone()).await;
+        let original = pool.get(&id).await.unwrap();
+        let service = OrphanQuarantineService::new(
+            pool.clone(),
+            store.clone(),
+            prober(Some("RCH_E104_KILL=verified_dead")),
+            ORPHAN_QUARANTINE_CHECK_INTERVAL,
+        );
+
+        // Put another store waiter between the candidate snapshot and its
+        // admission check. Tokio's FIFO mutex lets us pause the actual service
+        // after it has resolved the worker Arc, without sleeps or test hooks.
+        let initial_lock = store.lock().await;
+        let evaluation = service.evaluate_once();
+        tokio::pin!(evaluation);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(evaluation.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(initial_lock);
+        let competing_lock = store.lock();
+        tokio::pin!(competing_lock);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(competing_lock.as_mut(), cx).is_pending());
+            assert!(std::future::Future::poll(evaluation.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let durable = competing_lock.await;
+
+        assert!(pool.remove_worker(&id).await);
+        assert!(original.is_endpoint_retired());
+        let replacement = pool.add_worker(config);
+        tokio::pin!(replacement);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(replacement.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(durable);
+
+        let (cleared, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(evaluation, replacement)
+        })
+        .await
+        .expect("replacement and stale admission must not wait for probe I/O");
+        assert_eq!(cleared, 0);
+        assert_eq!(
+            service.prober.calls.load(Ordering::SeqCst),
+            0,
+            "a stale candidate must not start a probe whose result cannot be published"
+        );
+        let current = pool.get(&id).await.unwrap();
+        assert!(!Arc::ptr_eq(&original, &current));
+        assert!(current.is_disabled().await);
+        assert!(
+            AdminDisableStore::load(dir.path().join("admin_disables.json"))
+                .get("w1")
+                .is_some()
+        );
+
+        // The narrow evidence-based recovery exception remains live for the
+        // current endpoint; only the obsolete incarnation was refused.
+        assert_eq!(service.evaluate_once().await, 1);
+        assert_eq!(service.prober.calls.load(Ordering::SeqCst), 1);
+        assert!(!current.is_disabled().await);
     }
 
     struct BlockingProber {

@@ -46,6 +46,7 @@ use std::path::{Path, PathBuf};
 use schemars::generate::SchemaSettings;
 use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 
 use crate::incident::IncidentReasonCode;
 use crate::schema_versions::{SchemaComponent, current_version};
@@ -646,6 +647,48 @@ pub fn default_admin_disable_path() -> PathBuf {
     default_bypass_record_path().with_file_name("admin_disables.json")
 }
 
+/// Revocable administrative permission for automatic recovery of owned work.
+///
+/// This follows a worker ID across inventory replacement, independently of
+/// health and endpoint identity. It never authorizes a different SSH target:
+/// the caller must still use its immutable build ownership evidence.
+#[derive(Debug)]
+pub struct AdminNetworkPermit {
+    intent: watch::Receiver<AdminNetworkIntent>,
+    revision: u64,
+}
+
+#[derive(Debug, Clone)]
+struct AdminNetworkIntent {
+    disabled: Option<AdminDisableRecord>,
+    revision: u64,
+}
+
+impl AdminNetworkPermit {
+    /// Every administrative change invalidates an old permit, including a
+    /// disable followed immediately by enable. A closed store fails closed.
+    #[must_use]
+    pub fn is_current(&self) -> bool {
+        let intent = self.intent.borrow();
+        intent.disabled.is_none()
+            && intent.revision == self.revision
+            && self.intent.has_changed().is_ok()
+    }
+
+    /// Stop automatic work when administrative intent changes. The operation
+    /// must own its transport so dropping it also stops its SSH descendants.
+    pub async fn run<F: std::future::Future>(&mut self, operation: F) -> Option<F::Output> {
+        if !self.is_current() {
+            return None;
+        }
+        tokio::select! {
+            biased;
+            _ = self.intent.changed() => None,
+            result = operation => self.is_current().then_some(result),
+        }
+    }
+}
+
 /// A single-document, atomically-persisted store of current
 /// [`AdminDisableRecord`]s keyed by worker id. Administrative intent cannot be
 /// reconstructed by probing a worker, so unreadable/corrupt state must fail
@@ -654,6 +697,9 @@ pub fn default_admin_disable_path() -> PathBuf {
 pub struct AdminDisableStore {
     path: PathBuf,
     records: BTreeMap<String, AdminDisableRecord>,
+    /// Runtime generations survive worker removal/re-add; startup reconstructs
+    /// permission from durable records before automatic recovery can begin.
+    network_intent: BTreeMap<String, watch::Sender<AdminNetworkIntent>>,
 }
 
 impl AdminDisableStore {
@@ -663,6 +709,7 @@ impl AdminDisableStore {
         Self {
             path: path.into(),
             records: BTreeMap::new(),
+            network_intent: BTreeMap::new(),
         }
     }
 
@@ -721,7 +768,11 @@ impl AdminDisableStore {
                 ));
             }
         }
-        Ok(Self { path, records })
+        Ok(Self {
+            path,
+            records,
+            network_intent: BTreeMap::new(),
+        })
     }
 
     /// The store file path.
@@ -730,16 +781,65 @@ impl AdminDisableStore {
         &self.path
     }
 
-    /// The current record for a worker, if disabled.
+    /// The last successfully persisted record for a worker, if disabled.
     #[must_use]
     pub fn get(&self, worker_id: &str) -> Option<&AdminDisableRecord> {
         self.records.get(worker_id)
+    }
+
+    /// Effective intent for this daemon, including a disable whose save failed.
+    /// Inventory replacement must preserve that live refusal and its reason;
+    /// a new daemon can reconstruct only the successfully persisted records.
+    #[must_use]
+    pub fn effective_disable(&self, worker_id: &str) -> Option<AdminDisableRecord> {
+        match self.network_intent.get(worker_id) {
+            Some(intent) => intent.borrow().disabled.clone(),
+            None => self.records.get(worker_id).cloned(),
+        }
     }
 
     /// All current records, ordered by worker id.
     #[must_use]
     pub fn all(&self) -> Vec<&AdminDisableRecord> {
         self.records.values().collect()
+    }
+
+    /// Admit automatic recovery independently of current inventory/health.
+    /// Disabled IDs are refused even if their worker is currently absent.
+    pub fn automatic_network_permit(&mut self, worker_id: &str) -> Option<AdminNetworkPermit> {
+        let disabled = self.records.get(worker_id).cloned();
+        let intent = self
+            .network_intent
+            .entry(worker_id.to_string())
+            .or_insert_with(|| {
+                watch::channel(AdminNetworkIntent {
+                    disabled,
+                    revision: 0,
+                })
+                .0
+            });
+        let current = intent.borrow().clone();
+        current.disabled.is_none().then(|| AdminNetworkPermit {
+            intent: intent.subscribe(),
+            revision: current.revision,
+        })
+    }
+
+    fn publish_network_intent(&mut self, worker_id: &str, disabled: Option<AdminDisableRecord>) {
+        let intent = self
+            .network_intent
+            .entry(worker_id.to_string())
+            .or_insert_with(|| {
+                watch::channel(AdminNetworkIntent {
+                    disabled: None,
+                    revision: 0,
+                })
+                .0
+            });
+        intent.send_modify(|intent| {
+            intent.disabled = disabled;
+            intent.revision = intent.revision.wrapping_add(1);
+        });
     }
 
     /// Record a worker disable and persist the store.
@@ -750,6 +850,10 @@ impl AdminDisableStore {
                 "administrative disable worker id cannot be empty",
             ));
         }
+        // Stop live recovery even if persistence fails. The API already keeps
+        // the live worker disabled on that error; background owned-work SSH
+        // must obey the same intent, including for absent/retired endpoints.
+        self.publish_network_intent(&record.worker_id, Some(record.clone()));
         let mut proposed = self.records.clone();
         proposed.insert(record.worker_id.clone(), record);
         self.persist(&proposed)?;
@@ -761,12 +865,16 @@ impl AdminDisableStore {
     /// removed record, if any.
     pub fn remove(&mut self, worker_id: &str) -> std::io::Result<Option<AdminDisableRecord>> {
         let removed = self.records.get(worker_id).cloned();
-        if removed.is_some() {
+        // A failed disable may have completed its rename before directory
+        // sync failed. Even a volatile-only intent therefore needs a durable
+        // clear before enable can be acknowledged or live traffic restored.
+        if removed.is_some() || self.effective_disable(worker_id).is_some() {
             let mut proposed = self.records.clone();
             proposed.remove(worker_id);
             self.persist(&proposed)?;
             self.records = proposed;
         }
+        self.publish_network_intent(worker_id, None);
         Ok(removed)
     }
 
@@ -1428,6 +1536,149 @@ mod tests {
             let restarted = AdminDisableStore::try_load(&saved).unwrap();
             assert_eq!(restarted.all(), store.all());
         }
+    }
+
+    #[tokio::test]
+    async fn admin_network_permits_revoke_owned_work_and_fence_disable_enable_aba() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AdminDisableStore::with_path(dir.path().join("state.json"));
+        let mut permit = store.automatic_network_permit("absent-worker").unwrap();
+        let obsolete = store.automatic_network_permit("absent-worker").unwrap();
+        let peer = store.automatic_network_permit("healthy-peer").unwrap();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let operation = permit.run(async {
+            let _owned = Dropped(dropped.clone());
+            std::future::pending::<()>().await;
+        });
+        tokio::pin!(operation);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(operation.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        store
+            .upsert(AdminDisableRecord {
+                worker_id: "absent-worker".into(),
+                reason: Some("operator".into()),
+                disabled_unix_ms: 123,
+            })
+            .unwrap();
+        store.remove("absent-worker").unwrap();
+        assert!(operation.await.is_none());
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(
+            !obsolete.is_current(),
+            "enable cannot revive the old admission"
+        );
+        assert!(
+            peer.is_current(),
+            "an unrelated worker must keep its admission"
+        );
+        let mut enabled = store.automatic_network_permit("absent-worker").unwrap();
+        assert_eq!(enabled.run(async { 42 }).await, Some(42));
+    }
+
+    #[test]
+    fn admin_network_permits_honor_restart_and_failed_disable_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut store = AdminDisableStore::with_path(&path);
+        store
+            .upsert(AdminDisableRecord {
+                worker_id: "disabled".into(),
+                reason: Some("operator".into()),
+                disabled_unix_ms: 123,
+            })
+            .unwrap();
+        let mut restarted = AdminDisableStore::try_load(&path).unwrap();
+        assert!(restarted.automatic_network_permit("disabled").is_none());
+        assert!(
+            restarted
+                .automatic_network_permit("absent-worker")
+                .is_some()
+        );
+
+        // A failed save still stops live recovery. Block the parent with a
+        // regular file so neither disable nor enable can claim persistence,
+        // including when these tests run with root filesystem privileges.
+        let blocked_parent = dir.path().join("blocked-parent");
+        std::fs::write(&blocked_parent, "obstruction").unwrap();
+        let volatile_path = blocked_parent.join("state.json");
+        let mut unwritable = AdminDisableStore::with_path(&volatile_path);
+        let permit = unwritable
+            .automatic_network_permit("absent-worker")
+            .unwrap();
+        let volatile = AdminDisableRecord {
+            worker_id: "absent-worker".into(),
+            reason: Some("operator".into()),
+            disabled_unix_ms: 456,
+        };
+        assert!(unwritable.upsert(volatile.clone()).is_err());
+        assert!(!permit.is_current());
+        assert!(
+            unwritable
+                .automatic_network_permit("absent-worker")
+                .is_none()
+        );
+        assert!(unwritable.get("absent-worker").is_none());
+        assert_eq!(
+            unwritable
+                .effective_disable("absent-worker")
+                .unwrap()
+                .reason
+                .as_deref(),
+            Some("operator")
+        );
+        for _ in 0..3 {
+            assert!(unwritable.remove("absent-worker").is_err());
+            assert!(unwritable.get("absent-worker").is_none());
+            assert_eq!(
+                unwritable.effective_disable("absent-worker"),
+                Some(volatile.clone())
+            );
+            assert!(
+                unwritable
+                    .automatic_network_permit("absent-worker")
+                    .is_none()
+            );
+        }
+
+        // Model the other possible failed-save outcome: rename succeeded but
+        // directory sync did not. Restore the parent, then write that disabled
+        // disk state without changing the original store's volatile-only view.
+        std::fs::rename(&blocked_parent, dir.path().join("parent-obstruction")).unwrap();
+        let mut disk = AdminDisableStore::with_path(&volatile_path);
+        disk.upsert(volatile).unwrap();
+        assert!(
+            AdminDisableStore::try_load(&volatile_path)
+                .unwrap()
+                .get("absent-worker")
+                .is_some()
+        );
+        assert!(unwritable.remove("absent-worker").unwrap().is_none());
+        assert!(unwritable.effective_disable("absent-worker").is_none());
+        assert!(
+            AdminDisableStore::try_load(&volatile_path)
+                .unwrap()
+                .get("absent-worker")
+                .is_none()
+        );
+        assert!(
+            unwritable
+                .automatic_network_permit("absent-worker")
+                .is_some()
+        );
+        assert!(!permit.is_current());
     }
 
     #[test]
