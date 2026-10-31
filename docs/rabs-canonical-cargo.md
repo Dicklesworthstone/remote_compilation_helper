@@ -1742,7 +1742,14 @@ This allows workspace crates to stay fresh without granting them action-cache
 publication or skipping Cargo's current command.
 
 The persistent service serializes target-cache I/O around open/restore and around
-completed capture, releasing that lock while Cargo runs. A command may continue
+completed capture, releasing that lock while Cargo runs. Waiting for this lock,
+scanning and hashing inputs, and copying target state observe the requesting
+operation's cancellation. A disconnected or cancelled caller stops this work
+and releases its admission; an interrupted restore cannot start a cold compiler.
+An interrupted capture leaves the previous committed seed usable and the partial
+candidate unpublished for ordinary recovery. A cancellation arriving after the
+short atomic publication preserves that completed seed and stops output delivery.
+A command may continue
 from its independent target even if another command replaces or evicts the seed
 it restored. Each successful save reopens its current compatibility family and
 recalculates aggregate retention before publication; the last successful completed
@@ -1768,7 +1775,8 @@ build selected a different family.
 
 The `canonical-compilation-started` stderr record reports
 `private_target_state` as `disabled`, `cold` or `restored`. A failed optional
-restore keeps its partial copy unmounted and runs the current command cold;
+restore keeps its partial copy unmounted and runs the current command cold,
+unless the operation was cancelled;
 a failed save preserves Cargo's actual result. Both report a
 `canonical-target-state-unavailable` diagnostic. A new seed is saved only after
 complete compiler/session/coordinator drain and either successful Cargo execution

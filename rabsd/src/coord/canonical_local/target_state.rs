@@ -48,6 +48,17 @@ fn require(condition: bool, message: &str) -> io::Result<()> {
     }
 }
 
+fn checkpoint(stopped: &dyn Fn() -> bool) -> io::Result<()> {
+    if stopped() {
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "canonical target cache operation cancelled",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn default_max_bytes() -> u64 {
     1024 * 1024 * 1024
 }
@@ -247,14 +258,21 @@ fn generation_members(path: &Path, parent: &File, complete: bool) -> io::Result<
 /// An interrupted first copy can contain no regular files, which is correctly
 /// outside the artifact inventory's nonempty-output contract. Such pending
 /// state is still reclaimable after this separate, bounded no-follow check.
-fn validate_directory_only_tree(root: &File) -> io::Result<()> {
-    fn visit(directory: &File, depth: usize, count: &mut usize) -> io::Result<()> {
+fn validate_directory_only_tree(root: &File, stopped: &dyn Fn() -> bool) -> io::Result<()> {
+    fn visit(
+        directory: &File,
+        depth: usize,
+        count: &mut usize,
+        stopped: &dyn Fn() -> bool,
+    ) -> io::Result<()> {
+        checkpoint(stopped)?;
         require(
             depth <= 32,
             "pending target directory depth exceeds its bound",
         )?;
         let mut entries = Dir::read_from(directory)?;
         while let Some(entry) = entries.read() {
+            checkpoint(stopped)?;
             let entry = entry?;
             if matches!(entry.file_name().to_bytes(), b"." | b"..") {
                 continue;
@@ -278,27 +296,30 @@ fn validate_directory_only_tree(root: &File) -> io::Result<()> {
                     && metadata.mode() & 0o700 == 0o700,
                 "pending target directory is not ordinary owner-accessible state",
             )?;
-            visit(&child, depth + 1, count)?;
+            visit(&child, depth + 1, count, stopped)?;
         }
         Ok(())
     }
     let mut count = 0;
-    visit(root, 0, &mut count)
+    visit(root, 0, &mut count, stopped)
 }
 
 /// One publication transaction, retained below a checked parent directory.
-struct TargetFamily {
+struct TargetFamily<'a> {
     root: PathBuf,
     owner: File,
     parent: File,
+    stopped: &'a dyn Fn() -> bool,
 }
 
-impl TargetFamily {
-    fn open(root: PathBuf, parent: &File) -> io::Result<Self> {
+impl<'a> TargetFamily<'a> {
+    fn open(root: PathBuf, parent: &File, stopped: &'a dyn Fn() -> bool) -> io::Result<Self> {
+        checkpoint(stopped)?;
         Ok(Self {
             owner: open_child_directory(parent, child_name(&root)?)?,
             parent: parent.try_clone()?,
             root,
+            stopped,
         })
     }
 
@@ -314,8 +335,10 @@ impl TargetFamily {
     }
 
     fn recover(&self) -> io::Result<()> {
+        checkpoint(self.stopped)?;
         self.verify_owner()?;
         for entry in fs::read_dir(&self.root)? {
+            checkpoint(self.stopped)?;
             let entry = entry?;
             require(
                 matches!(
@@ -337,6 +360,7 @@ impl TargetFamily {
             } else {
                 let _previous = generation_members(&previous, &self.owner, true)?;
                 self.verify_owner()?;
+                checkpoint(self.stopped)?;
                 publish_new_directory(&previous, &seed)?;
             }
         }
@@ -344,6 +368,7 @@ impl TargetFamily {
     }
 
     fn remove_generation(&self, name: &str) -> io::Result<()> {
+        checkpoint(self.stopped)?;
         require(
             matches!(name, "pending" | "previous" | "seed"),
             "invalid target generation name",
@@ -365,10 +390,22 @@ impl TargetFamily {
             // and its hard bound. Rust's recursive removal does not follow
             // symbolic links; malformed or excessive trees refuse before it.
             if let Err(error) =
-                TreeInventory::scan_complete_private(&target, MAX_PRIVATE_TREE_BYTES, &|| false)
-                && validate_directory_only_tree(target_owner).is_err()
+                TreeInventory::scan_complete_private(&target, MAX_PRIVATE_TREE_BYTES, &self.stopped)
             {
-                return Err(error);
+                // Cancellation is not evidence of an invalid tree and must
+                // never enter recovery's alternate cleanup path.
+                if error.kind() == io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+                if let Err(directory_error) =
+                    validate_directory_only_tree(target_owner, self.stopped)
+                {
+                    return Err(if directory_error.kind() == io::ErrorKind::Interrupted {
+                        directory_error
+                    } else {
+                        error
+                    });
+                }
             }
         }
         self.verify_owner()?;
@@ -389,12 +426,14 @@ impl TargetFamily {
                 "private target tree changed before cleanup",
             )?;
         }
+        checkpoint(self.stopped)?;
         fs::remove_dir_all(&path)?;
         self.owner.sync_all()?;
         self.verify_owner()
     }
 
     fn load_seed(&self) -> io::Result<Option<SeedPayload>> {
+        checkpoint(self.stopped)?;
         self.verify_owner()?;
         let seed = self.root.join("seed");
         if !present_directory(&seed, &self.owner)? {
@@ -403,6 +442,7 @@ impl TargetFamily {
         let _generation = generation_members(&seed, &self.owner, true)?;
         let metadata = seed.join(METADATA);
         let (_, bytes) = read_stable(&metadata, MAX_SNAPSHOT_METADATA_BYTES)?;
+        checkpoint(self.stopped)?;
         private_metadata(&metadata)?;
         let envelope: SeedEnvelope = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
         require(
@@ -413,11 +453,13 @@ impl TargetFamily {
         envelope.payload.target.validate()?;
         envelope.payload.source_times.validate()?;
         envelope.payload.source_manifest()?;
+        checkpoint(self.stopped)?;
         self.verify_owner()?;
         Ok(Some(envelope.payload))
     }
 
     fn promote(&self) -> io::Result<()> {
+        checkpoint(self.stopped)?;
         self.verify_owner()?;
         // Recency is only retention policy. Never alter a target or source
         // timestamp to manufacture Cargo freshness.
@@ -428,6 +470,7 @@ impl TargetFamily {
     }
 
     fn remove_empty(&self) -> io::Result<()> {
+        checkpoint(self.stopped)?;
         self.verify_owner()?;
         require(
             fs::read_dir(&self.root)?.next().is_none(),
@@ -462,8 +505,8 @@ fn family_key(name: &OsStr) -> io::Result<[u8; 32]> {
     Ok(key)
 }
 
-struct RetainedFamily {
-    family: TargetFamily,
+struct RetainedFamily<'a> {
+    family: TargetFamily<'a>,
     key: [u8; 32],
     bytes: u64,
     used: SystemTime,
@@ -471,14 +514,19 @@ struct RetainedFamily {
 
 /// No global mutable index is needed: the StateOwner's cache-I/O lock serializes
 /// writers, and each bounded directory is its own recoverable transaction.
-struct TargetFamilies {
-    root: TargetFamily,
+struct TargetFamilies<'a> {
+    root: TargetFamily<'a>,
     max_bytes: u64,
     max_families: usize,
 }
 
-impl TargetFamilies {
-    fn open(state_parent: &Path, config: &TargetCacheConfig) -> io::Result<Self> {
+impl<'a> TargetFamilies<'a> {
+    fn open(
+        state_parent: &Path,
+        config: &TargetCacheConfig,
+        stopped: &'a dyn Fn() -> bool,
+    ) -> io::Result<Self> {
+        checkpoint(stopped)?;
         private_directory(state_parent)?;
         let parent = open_directory(state_parent)?;
         let path = state_parent.join(FAMILIES_ROOT);
@@ -488,13 +536,14 @@ impl TargetFamilies {
             Err(error) => return Err(error),
         }
         Ok(Self {
-            root: TargetFamily::open(path, &parent)?,
+            root: TargetFamily::open(path, &parent, stopped)?,
             max_bytes: config.max_bytes,
             max_families: config.max_families,
         })
     }
 
-    fn family(&self, key: &[u8; 32]) -> io::Result<TargetFamily> {
+    fn family(&self, key: &[u8; 32]) -> io::Result<TargetFamily<'a>> {
+        checkpoint(self.root.stopped)?;
         self.root.verify_owner()?;
         let path = self.root.root.join(family_name(key));
         match create_private(&path) {
@@ -502,16 +551,18 @@ impl TargetFamilies {
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
         }
-        TargetFamily::open(path, &self.root.owner)
+        TargetFamily::open(path, &self.root.owner, self.root.stopped)
     }
 
     /// Validate names and the hard entry count before traversing any family.
     /// One extra directory permits a new family's in-flight candidate while
     /// all committed seeds remain available until publication succeeds.
-    fn retained(&self) -> io::Result<Vec<RetainedFamily>> {
+    fn retained(&self) -> io::Result<Vec<RetainedFamily<'a>>> {
+        checkpoint(self.root.stopped)?;
         self.root.verify_owner()?;
         let mut names = Vec::new();
         for entry in fs::read_dir(&self.root.root)? {
+            checkpoint(self.root.stopped)?;
             let entry = entry?;
             let key = family_key(&entry.file_name())?;
             require(
@@ -522,7 +573,7 @@ impl TargetFamilies {
         }
         let mut retained = Vec::new();
         for (path, key) in names {
-            let family = TargetFamily::open(path, &self.root.owner)?;
+            let family = TargetFamily::open(path, &self.root.owner, self.root.stopped)?;
             family.recover()?;
             let seed = match family.load_seed() {
                 Ok(Some(seed)) if seed.key == key => seed,
@@ -530,6 +581,7 @@ impl TargetFamilies {
                     family.remove_empty()?;
                     continue;
                 }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => return Err(error),
                 // Metadata is not serving authority unless it matches this
                 // exact family. Retire through the same bounded, no-follow
                 // cleanup used by single-family recovery.
@@ -584,13 +636,14 @@ impl TargetFamilies {
     /// A crash leaves the directory entirely at the old name or the new one;
     /// existing v2 state wins if an older binary later recreated the v1 name.
     fn migrate(&self, state_parent: &Path) -> io::Result<bool> {
+        checkpoint(self.root.stopped)?;
         self.root.verify_owner()?;
         let path = state_parent.join(LEGACY_ROOT);
         let parent = &self.root.parent;
         if !present_directory(&path, parent)? {
             return Ok(false);
         }
-        let legacy = TargetFamily::open(path, parent)?;
+        let legacy = TargetFamily::open(path, parent, self.root.stopped)?;
         legacy.recover()?;
         let seed = match legacy.load_seed() {
             Ok(Some(seed)) => seed,
@@ -598,6 +651,7 @@ impl TargetFamilies {
                 legacy.remove_empty()?;
                 return Ok(false);
             }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => return Err(error),
             Err(_) => {
                 legacy.remove_generation("seed")?;
                 legacy.remove_empty()?;
@@ -612,6 +666,7 @@ impl TargetFamilies {
         }
         legacy.verify_owner()?;
         self.root.verify_owner()?;
+        checkpoint(self.root.stopped)?;
         rustix::fs::renameat_with(
             parent,
             OsStr::new(LEGACY_ROOT),
@@ -622,7 +677,11 @@ impl TargetFamilies {
         parent.sync_all()?;
         self.root.owner.sync_all()?;
         self.root.verify_owner()?;
-        let moved = TargetFamily::open(self.root.root.join(name), &self.root.owner)?;
+        let moved = TargetFamily::open(
+            self.root.root.join(name),
+            &self.root.owner,
+            self.root.stopped,
+        )?;
         let before = legacy.owner.metadata()?;
         let after = moved.owner.metadata()?;
         require(
@@ -636,31 +695,34 @@ impl TargetFamilies {
 /// One private operation's source observations. The selected family is retained
 /// only for its initial restore; concurrent roots may replace or evict that
 /// family while this operation compiles in its independent target directory.
-pub(super) struct TargetState {
-    families: TargetFamilies,
-    family: TargetFamily,
+pub(super) struct TargetState<'a> {
+    families: TargetFamilies<'a>,
+    family: TargetFamily<'a>,
     key: [u8; 32],
     max_bytes: u64,
     workspace: PathBuf,
     manifest: SourceManifest,
     source_times: SourceTimestamps,
+    stopped: &'a dyn Fn() -> bool,
 }
 
-impl TargetState {
+impl<'a> TargetState<'a> {
     pub fn open(
         state_parent: &Path,
         config: &TargetCacheConfig,
         key: [u8; 32],
         workspace: &Path,
         manifest: &SourceManifest,
+        stopped: &'a dyn Fn() -> bool,
     ) -> io::Result<Self> {
+        checkpoint(stopped)?;
         config.validate()?;
         require(
             !workspace.starts_with(state_parent) && !state_parent.starts_with(workspace),
             "private target cache and runtime workspace must be disjoint",
         )?;
-        let source_times = SourceTimestamps::capture(workspace, manifest, &|| false)?;
-        let families = TargetFamilies::open(state_parent, config)?;
+        let source_times = SourceTimestamps::capture(workspace, manifest, &stopped)?;
+        let families = TargetFamilies::open(state_parent, config, stopped)?;
         // Restore aggregate bounds before migration can introduce one family,
         // then enforce the same limits before creating this operation's slot.
         families.prune(Some(key))?;
@@ -676,6 +738,7 @@ impl TargetState {
             workspace: workspace.to_path_buf(),
             manifest: manifest.clone(),
             source_times,
+            stopped,
         })
     }
 
@@ -691,18 +754,22 @@ impl TargetState {
     /// operation, including after an unusable target seed was encountered.
     pub fn restore(&mut self, fresh_empty_target: &Path) -> io::Result<bool> {
         let result = self.restore_inner(fresh_empty_target);
+        if matches!(&result, Err(error) if error.kind() == io::ErrorKind::Interrupted) {
+            return result;
+        }
         if result.is_err() {
             // Timestamp restoration may have failed after changing only part
             // of the independent workspace. Re-observe its exact input bytes
             // and current times before a cold Cargo execution can become a
             // replacement seed. The sealed source is never retimed.
             self.source_times =
-                SourceTimestamps::capture(&self.workspace, &self.manifest, &|| false)?;
+                SourceTimestamps::capture(&self.workspace, &self.manifest, &self.stopped)?;
         }
         result
     }
 
     fn restore_inner(&mut self, fresh_empty_target: &Path) -> io::Result<bool> {
+        checkpoint(self.stopped)?;
         self.families.root.verify_owner()?;
         // Normally open and restore are one caller-owned critical section.
         // Rebind here as well so a later restore never treats an evicted
@@ -720,6 +787,7 @@ impl TargetState {
         }) {
             Ok(Some(seed)) => seed,
             Ok(None) => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => return Err(error),
             Err(error) => {
                 // Unreadable metadata cannot establish a bounded compatible
                 // generation. Retire it through the existing checked cleanup;
@@ -734,7 +802,7 @@ impl TargetState {
             "private restore target and runtime workspace must be disjoint",
         )?;
         require(
-            SourceTimestamps::capture(&self.workspace, &self.manifest, &|| false)?
+            SourceTimestamps::capture(&self.workspace, &self.manifest, &self.stopped)?
                 == self.source_times,
             "runtime workspace changed before target restoration",
         )?;
@@ -749,10 +817,10 @@ impl TargetState {
         seed.target.restore_into_with_cloner(
             &self.family.root.join("seed/target"),
             fresh_empty_target,
-            &|| false,
+            &self.stopped,
             try_verified_reflink,
         )?;
-        wanted.restore_exact(&self.workspace, &self.manifest, &|| false)?;
+        wanted.restore_exact(&self.workspace, &self.manifest, &self.stopped)?;
         self.verify_owner()?;
         self.source_times = wanted;
         self.family.promote()?;
@@ -765,13 +833,14 @@ impl TargetState {
     /// Snapshotting and cloning finish before the old seed is moved aside.
     /// The caller holds the same cache-I/O lock used for open plus restore.
     pub fn capture(&self, target: &Path) -> io::Result<()> {
+        checkpoint(self.stopped)?;
         self.families.root.verify_owner()?;
         require(
-            SourceTimestamps::capture(&self.workspace, &self.manifest, &|| false)?
+            SourceTimestamps::capture(&self.workspace, &self.manifest, &self.stopped)?
                 == self.source_times,
             "runtime workspace changed during Cargo execution",
         )?;
-        let snapshot = PrivateTreeSnapshot::capture(target, self.max_bytes, &|| false)?;
+        let snapshot = PrivateTreeSnapshot::capture(target, self.max_bytes, &self.stopped)?;
         // Another root may have replaced this seed, evicted its whole family,
         // or removed our initially empty slot while Cargo ran. Never use the
         // old family descriptor or a remembered aggregate inventory to publish.
@@ -803,9 +872,9 @@ impl TargetState {
         create_private(&pending)?;
         let copied = pending.join("target");
         create_private(&copied)?;
-        snapshot.restore_into_with_cloner(target, &copied, &|| false, try_verified_reflink)?;
+        snapshot.restore_into_with_cloner(target, &copied, &self.stopped, try_verified_reflink)?;
         require(
-            SourceTimestamps::capture(&self.workspace, &self.manifest, &|| false)?
+            SourceTimestamps::capture(&self.workspace, &self.manifest, &self.stopped)?
                 == self.source_times,
             "runtime workspace changed during target capture",
         )?;
@@ -840,6 +909,11 @@ impl TargetState {
         family.verify_owner()?;
         let _pending = generation_members(&pending, &family.owner, true)?;
         let seed = family.root.join("seed");
+        // No cancellation may turn an incomplete candidate into a replacement.
+        // After this checkpoint the two short renames finish one recoverable
+        // publication; a later cancellation keeps that valid generation and
+        // leaves retirement/pruning for the next admitted cache operation.
+        checkpoint(self.stopped)?;
         if present_directory(&seed, &family.owner)? {
             publish_new_directory(&seed, &previous)?;
         }
@@ -857,6 +931,7 @@ impl TargetState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::fs::{FileTimes, Permissions};
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::time::{Duration, UNIX_EPOCH};
@@ -905,7 +980,7 @@ mod tests {
         let manifest = source(workspace.path(), b"source");
         let target = private();
         completed_target(target.path(), value);
-        TargetState::open(state, settings, key, workspace.path(), &manifest)
+        TargetState::open(state, settings, key, workspace.path(), &manifest, &|| false)
             .unwrap()
             .capture(target.path())
             .unwrap();
@@ -919,7 +994,8 @@ mod tests {
         let workspace = private();
         let manifest = source(workspace.path(), b"source");
         let mut cache =
-            TargetState::open(state, settings, key, workspace.path(), &manifest).unwrap();
+            TargetState::open(state, settings, key, workspace.path(), &manifest, &|| false)
+                .unwrap();
         let target = private();
         cache
             .restore(target.path())
@@ -932,6 +1008,186 @@ mod tests {
             .unwrap()
             .set_times(FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(seconds)))
             .unwrap();
+    }
+
+    #[test]
+    fn cancelled_open_keeps_committed_and_pending_generations_untouched() {
+        let state = private();
+        let key = [50; 32];
+        capture_family(state.path(), &config(), key, b"committed artifact");
+        let family = family_path(state.path(), key);
+        let metadata = fs::read(family.join("seed/metadata.json")).unwrap();
+        create_private(&family.join("pending")).unwrap();
+        create_private(&family.join("pending/target")).unwrap();
+        fs::write(family.join("pending/target/partial"), b"retained partial").unwrap();
+        let workspace = private();
+        let manifest = source(workspace.path(), b"source");
+        let result = TargetState::open(
+            state.path(),
+            &config(),
+            key,
+            workspace.path(),
+            &manifest,
+            &|| true,
+        );
+        assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::Interrupted));
+        assert_eq!(
+            fs::read(family.join("seed/metadata.json")).unwrap(),
+            metadata
+        );
+        assert_eq!(
+            fs::read(family.join("seed/target/artifact")).unwrap(),
+            b"committed artifact"
+        );
+        assert_eq!(
+            fs::read(family.join("pending/target/partial")).unwrap(),
+            b"retained partial"
+        );
+    }
+
+    #[test]
+    fn cancelled_restore_stops_at_copy_and_keeps_the_seed_and_source_times() {
+        let state = private();
+        let key = [51; 32];
+        let bytes = vec![0x31; 512 * 1024];
+        capture_family(state.path(), &config(), key, &bytes);
+        last_used(state.path(), key, 123);
+        let family = family_path(state.path(), key);
+        let metadata = fs::read(family.join("seed/metadata.json")).unwrap();
+        let recency = fs::metadata(&family).unwrap().modified().unwrap();
+        let workspace = private();
+        let manifest = source(workspace.path(), b"source");
+        let candidate = private();
+        let observed_cancel = Cell::new(false);
+        let extra_polls = Cell::new(0);
+        let stopped = || {
+            if observed_cancel.get() {
+                extra_polls.set(extra_polls.get() + 1);
+                return true;
+            }
+            // This becomes true only after the real restore has started
+            // creating its independent target, not at method entry.
+            let cancelled = candidate.path().join("artifact").exists();
+            observed_cancel.set(cancelled);
+            cancelled
+        };
+        let mut cache = TargetState::open(
+            state.path(),
+            &config(),
+            key,
+            workspace.path(),
+            &manifest,
+            &stopped,
+        )
+        .unwrap();
+        let source_times = cache.source_times.clone();
+        assert_eq!(
+            cache.restore(candidate.path()).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert!(observed_cancel.get());
+        assert_eq!(
+            extra_polls.get(),
+            0,
+            "cancellation must not rehash for cold fallback"
+        );
+        assert_eq!(cache.source_times, source_times);
+        assert_eq!(
+            SourceTimestamps::capture(workspace.path(), &manifest, &|| false).unwrap(),
+            source_times
+        );
+        assert_eq!(
+            fs::read(family.join("seed/metadata.json")).unwrap(),
+            metadata
+        );
+        assert_eq!(
+            fs::read(family.join("seed/target/artifact")).unwrap(),
+            bytes
+        );
+        assert_eq!(fs::metadata(&family).unwrap().modified().unwrap(), recency);
+        drop(cache);
+        assert_eq!(restore_family(state.path(), &config(), key), Some(bytes));
+    }
+
+    #[test]
+    fn cancelled_capture_keeps_old_seed_and_unpublished_copy_for_recovery() {
+        let state = private();
+        let key = [52; 32];
+        capture_family(state.path(), &config(), key, b"committed artifact");
+        let family = family_path(state.path(), key);
+        let metadata = fs::read(family.join("seed/metadata.json")).unwrap();
+        let workspace = private();
+        let manifest = source(workspace.path(), b"source");
+        let target = private();
+        completed_target(target.path(), &vec![0x52; 512 * 1024]);
+        let stopped = || family.join("pending/target/artifact").exists();
+        let cache = TargetState::open(
+            state.path(),
+            &config(),
+            key,
+            workspace.path(),
+            &manifest,
+            &stopped,
+        )
+        .unwrap();
+        assert_eq!(
+            cache.capture(target.path()).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert!(family.join("pending/target/artifact").is_file());
+        assert!(!family.join("pending/metadata.json").exists());
+        assert!(!family.join("previous").exists());
+        assert_eq!(
+            fs::read(family.join("seed/metadata.json")).unwrap(),
+            metadata
+        );
+        assert_eq!(
+            fs::read(family.join("seed/target/artifact")).unwrap(),
+            b"committed artifact"
+        );
+        drop(cache);
+        // An independently admitted operation performs normal recovery and
+        // still restores the last fully published generation.
+        assert_eq!(
+            restore_family(state.path(), &config(), key).as_deref(),
+            Some(b"committed artifact".as_slice())
+        );
+    }
+
+    #[test]
+    fn cancelled_seed_validation_never_retires_a_valid_generation() {
+        let state = private();
+        let key = [53; 32];
+        capture_family(state.path(), &config(), key, b"committed artifact");
+        let family_path = family_path(state.path(), key);
+        let metadata = fs::read(family_path.join("seed/metadata.json")).unwrap();
+        let parent = open_directory(&state.path().join(FAMILIES_ROOT)).unwrap();
+        let polls = Cell::new(0);
+        let armed = Cell::new(false);
+        let stopped = || {
+            if !armed.get() {
+                return false;
+            }
+            polls.set(polls.get() + 1);
+            polls.get() >= 2
+        };
+        let family = TargetFamily::open(family_path.clone(), &parent, &stopped).unwrap();
+        armed.set(true);
+        // The first poll admits the bounded read; cancellation is observed
+        // after the bytes arrive, before the descriptor is treated as usable.
+        assert!(matches!(
+            family.load_seed(),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted
+        ));
+        assert_eq!(polls.get(), 2);
+        assert_eq!(
+            fs::read(family_path.join("seed/metadata.json")).unwrap(),
+            metadata
+        );
+        assert_eq!(
+            fs::read(family_path.join("seed/target/artifact")).unwrap(),
+            b"committed artifact"
+        );
     }
 
     #[test]
@@ -1036,6 +1292,7 @@ mod tests {
             [16; 32],
             workspace.path(),
             &manifest,
+            &|| false,
         )
         .unwrap();
         let oversized = private();
@@ -1058,7 +1315,7 @@ mod tests {
             restore_family(state.path(), &settings, [16; 32]).as_deref(),
             Some(b"cccc".as_slice())
         );
-        let families = TargetFamilies::open(state.path(), &settings)
+        let families = TargetFamilies::open(state.path(), &settings, &|| false)
             .unwrap()
             .retained()
             .unwrap();
@@ -1081,6 +1338,7 @@ mod tests {
             [40; 32],
             first_workspace.path(),
             &first_manifest,
+            &|| false,
         )
         .unwrap();
         assert!(!first.restore(first_target.path()).unwrap());
@@ -1096,6 +1354,7 @@ mod tests {
             [41; 32],
             second_workspace.path(),
             &second_manifest,
+            &|| false,
         )
         .unwrap();
         assert!(!second.restore(second_target.path()).unwrap());
@@ -1134,6 +1393,7 @@ mod tests {
             [42; 32],
             workspace.path(),
             &manifest,
+            &|| false,
         )
         .unwrap();
         assert!(inflight.restore(target.path()).unwrap());
@@ -1148,7 +1408,7 @@ mod tests {
             restore_family(state.path(), &settings, [42; 32]).as_deref(),
             Some(b"ccc".as_slice())
         );
-        let retained = TargetFamilies::open(state.path(), &settings)
+        let retained = TargetFamilies::open(state.path(), &settings, &|| false)
             .unwrap()
             .retained()
             .unwrap();
@@ -1174,6 +1434,7 @@ mod tests {
             key,
             first_workspace.path(),
             &first_manifest,
+            &|| false,
         )
         .unwrap();
         assert!(first.restore(first_target.path()).unwrap());
@@ -1186,6 +1447,7 @@ mod tests {
             key,
             second_workspace.path(),
             &second_manifest,
+            &|| false,
         )
         .unwrap();
         assert!(second.restore(second_target.path()).unwrap());
@@ -1232,9 +1494,15 @@ mod tests {
             let workspace = private();
             let manifest = source(workspace.path(), b"source");
             let target = private();
-            let mut inflight =
-                TargetState::open(state.path(), &small, [45; 32], workspace.path(), &manifest)
-                    .unwrap();
+            let mut inflight = TargetState::open(
+                state.path(),
+                &small,
+                [45; 32],
+                workspace.path(),
+                &manifest,
+                &|| false,
+            )
+            .unwrap();
             assert!(!inflight.restore(target.path()).unwrap());
             let roomy = TargetCacheConfig {
                 max_bytes: 8,
@@ -1253,7 +1521,7 @@ mod tests {
             completed_target(target.path(), b"new");
             let refused = inflight.capture(target.path()).unwrap_err();
             assert!(refused.to_string().contains("retention budget changed"));
-            let retained = TargetFamilies::open(state.path(), &roomy)
+            let retained = TargetFamilies::open(state.path(), &roomy, &|| false)
                 .unwrap()
                 .retained()
                 .unwrap();
@@ -1287,6 +1555,7 @@ mod tests {
                 [18; 32],
                 workspace.path(),
                 &manifest,
+                &|| false,
             )
             .unwrap();
             assert!(family_path(state.path(), [17; 32]).join("seed").exists());
@@ -1450,7 +1719,8 @@ mod tests {
                     &config(),
                     [29; 32],
                     workspace.path(),
-                    &manifest
+                    &manifest,
+                    &|| false,
                 )
                 .is_err()
             );
@@ -1502,6 +1772,7 @@ mod tests {
             [1; 32],
             first_workspace.path(),
             &manifest,
+            &|| false,
         )
         .unwrap();
         let empty = private();
@@ -1522,6 +1793,7 @@ mod tests {
             [1; 32],
             next_workspace.path(),
             &manifest,
+            &|| false,
         )
         .unwrap();
         let target = private();
@@ -1555,6 +1827,7 @@ mod tests {
             [2; 32],
             first_workspace.path(),
             &first_manifest,
+            &|| false,
         )
         .unwrap();
         first.capture(target.path()).unwrap();
@@ -1573,6 +1846,7 @@ mod tests {
             [3; 32],
             workspace.path(),
             &manifest,
+            &|| false,
         )
         .unwrap();
         assert!(!incompatible.restore(empty.path()).unwrap());
@@ -1584,6 +1858,7 @@ mod tests {
             [2; 32],
             workspace.path(),
             &manifest,
+            &|| false,
         )
         .unwrap();
         assert!(edited.restore(empty.path()).unwrap());
@@ -1622,6 +1897,7 @@ mod tests {
                 [4; 32],
                 workspace.path(),
                 &manifest,
+                &|| false,
             )
             .unwrap();
             cache.capture(target.path()).unwrap();
@@ -1651,6 +1927,7 @@ mod tests {
                     [4; 32],
                     workspace.path(),
                     &manifest,
+                    &|| false,
                 )
                 .unwrap();
             }
@@ -1676,6 +1953,7 @@ mod tests {
                 [4; 32],
                 workspace.path(),
                 &manifest,
+                &|| false,
             )
             .unwrap();
             let fresh = private();
@@ -1706,6 +1984,7 @@ mod tests {
                 [9; 32],
                 workspace.path(),
                 &manifest,
+                &|| false,
             )
             .unwrap();
             cache.capture(target.path()).unwrap();
@@ -1741,6 +2020,7 @@ mod tests {
                 [9; 32],
                 next_workspace.path(),
                 &manifest,
+                &|| false,
             )
             .unwrap();
             let next_target = private();
@@ -1773,6 +2053,7 @@ mod tests {
             [10; 32],
             old_workspace.path(),
             &old_manifest,
+            &|| false,
         )
         .unwrap()
         .capture(old_target.path())
@@ -1788,6 +2069,7 @@ mod tests {
             [10; 32],
             edited_workspace.path(),
             &edited_manifest,
+            &|| false,
         )
         .unwrap();
         let candidate = private();
@@ -1810,6 +2092,7 @@ mod tests {
             [10; 32],
             edited_workspace.path(),
             &edited_manifest,
+            &|| false,
         )
         .unwrap();
         assert!(next.restore(candidate.path()).unwrap());
@@ -1840,6 +2123,7 @@ mod tests {
                 [5; 32],
                 workspace.path(),
                 &manifest,
+                &|| false,
             )
             .unwrap();
             cache.capture(target.path()).unwrap();
@@ -1861,6 +2145,7 @@ mod tests {
                 [5; 32],
                 workspace.path(),
                 &manifest,
+                &|| false,
             )
             .unwrap();
             let restored = private();
@@ -1891,6 +2176,7 @@ mod tests {
             [6; 32],
             workspace.path(),
             &manifest,
+            &|| false,
         )
         .unwrap();
         cache.capture(target.path()).unwrap();
@@ -1919,7 +2205,8 @@ mod tests {
                 &config(),
                 [7; 32],
                 workspace.path(),
-                &manifest
+                &manifest,
+                &|| false,
             )
             .is_err()
         );
@@ -1954,7 +2241,8 @@ mod tests {
                 &config(),
                 [8; 32],
                 workspace.path(),
-                &manifest
+                &manifest,
+                &|| false,
             )
             .is_err()
         );

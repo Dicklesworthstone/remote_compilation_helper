@@ -58,7 +58,7 @@ use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt,
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use target_state::{TargetCacheConfig, TargetState};
@@ -296,6 +296,38 @@ pub(super) struct SharedRuntime {
     release_mode: ReleaseAuthorizationMode,
     stopped: Arc<AtomicBool>,
     server: Mutex<Option<ServerOwner>>,
+}
+
+/// Cache restoration and capture can copy gigabytes. A cancelled root must
+/// leave the queue promptly even while another root owns that I/O, and must
+/// recheck its interest after acquiring the lock before touching cache state.
+fn acquire_target_cache_lock<'a>(
+    lock: &'a Mutex<()>,
+    stopped: &impl Fn() -> bool,
+) -> io::Result<MutexGuard<'a, ()>> {
+    loop {
+        if stopped() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "canonical target cache admission cancelled",
+            ));
+        }
+        match lock.try_lock() {
+            Ok(guard) => {
+                if stopped() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "canonical target cache admission cancelled",
+                    ));
+                }
+                return Ok(guard);
+            }
+            Err(TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(10)),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(io::Error::other("canonical target cache lock poisoned"));
+            }
+        }
+    }
 }
 
 impl SharedRuntime {
@@ -1358,16 +1390,12 @@ fn run_operation(
     };
     let mut target_state = None;
     if target_reuse_enabled && let Some(config) = &profile.target_cache {
-        let mut prepare = || -> io::Result<(TargetState, Option<PathBuf>)> {
+        let mut prepare = || -> io::Result<(TargetState<'_>, Option<PathBuf>)> {
             let _cache_guard = shared
                 .as_ref()
-                .map(|runtime| {
-                    runtime
-                        .target_cache_lock
-                        .lock()
-                        .map_err(|_| io::Error::other("canonical target cache lock poisoned"))
-                })
+                .map(|runtime| acquire_target_cache_lock(&runtime.target_cache_lock, &cancelled))
                 .transpose()?;
+            preparation.checkpoint()?;
             let (_, wrapper) = read_stable(&control.join("rabs-wrap"), 128 * 1024 * 1024)?;
             let key = TargetReuseContext {
                 request: &request,
@@ -1383,12 +1411,19 @@ fn run_operation(
                 closed_dependency_execution: graph.requires_closed_dependency_execution(),
             }
             .key(config)?;
-            let mut cache =
-                TargetState::open(&state_root, config, key, &workspace, workspace_manifest)?;
+            let mut cache = TargetState::open(
+                &state_root,
+                config,
+                key,
+                &workspace,
+                workspace_manifest,
+                &cancelled,
+            )?;
             let candidate = owner.path().join("restored-target");
             let restored = match create_private(&candidate).and_then(|()| cache.restore(&candidate))
             {
                 Ok(restored) => restored.then_some(candidate),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => return Err(error),
                 Err(error) => {
                     // A failed optional restore still permits a successful
                     // cold Cargo execution to replace the seed in this run.
@@ -1413,9 +1448,11 @@ fn run_operation(
                     private_target_state = "restored";
                 }
             }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => return Err(error),
             Err(error) => output.warning("restore", &error)?,
         }
     }
+    preparation.checkpoint()?;
     // A failed restore remains in unmounted private staging. The live endpoint
     // receives only the completely selected target's retained inode capability.
     let paths = CanonicalPaths::new_with_retained_toolchain(
@@ -1606,30 +1643,22 @@ fn run_operation(
         let capture = || -> io::Result<()> {
             let _cache_guard = shared
                 .as_ref()
-                .map(|runtime| {
-                    runtime
-                        .target_cache_lock
-                        .lock()
-                        .map_err(|_| io::Error::other("canonical target cache lock poisoned"))
-                })
+                .map(|runtime| acquire_target_cache_lock(&runtime.target_cache_lock, &cancelled))
                 .transpose()?;
+            preparation.checkpoint()?;
             cache.capture(&target_root)
         };
         if let Err(error) = capture() {
+            if error.kind() == io::ErrorKind::Interrupted {
+                return Err(error);
+            }
             output.warning("capture", &error)?;
         }
     }
-    // Optional target capture can outlive the client connection. Preserve its
-    // valid cache generation, but do not retain a deliverable whose owner is
-    // already known to have cancelled or lost coordinator authority.
-    if let Some(runtime) = &shared
-        && (stopped.load(Ordering::Acquire) || !runtime.healthy())
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::Interrupted,
-            "canonical operation cancelled before output delivery",
-        ));
-    }
+    // Capture stops with its owner. If cancellation arrived just after its
+    // atomic publication, preserve the valid seed but never deliver outputs
+    // to a cancelled caller or one that lost coordinator authority.
+    preparation.checkpoint()?;
     if compiled.status.success()
         && (profile.command == CompilationCommand::Build || profile.no_run())
     {
@@ -2819,6 +2848,59 @@ mod tests {
             |_| Ok(None),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn cancelled_target_cache_waiter_leaves_while_another_root_keeps_the_lock() {
+        let lock = Arc::new(Mutex::new(()));
+        let held = lock.lock().unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (polled, observe_poll) = std::sync::mpsc::sync_channel(1);
+        let (completed, observe_completion) = std::sync::mpsc::channel();
+        let waiter = {
+            let lock = Arc::clone(&lock);
+            let cancelled = Arc::clone(&cancelled);
+            std::thread::spawn(move || {
+                let result = acquire_target_cache_lock(&lock, &|| {
+                    let _ = polled.try_send(());
+                    cancelled.load(Ordering::Acquire)
+                })
+                .map(|_guard| ());
+                completed.send(result).unwrap();
+            })
+        };
+        observe_poll.recv_timeout(Duration::from_secs(2)).unwrap();
+        cancelled.store(true, Ordering::Release);
+        let result = observe_completion
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        waiter.join().unwrap();
+        assert!(matches!(lock.try_lock(), Err(TryLockError::WouldBlock)));
+        drop(held);
+        assert!(acquire_target_cache_lock(&lock, &|| false).is_ok());
+    }
+
+    #[test]
+    fn target_cache_lock_rechecks_cancellation_before_admitting_state_changes() {
+        let lock = Mutex::new(());
+        assert_eq!(
+            acquire_target_cache_lock(&lock, &|| true)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
+        let polls = std::cell::Cell::new(0);
+        let result = acquire_target_cache_lock(&lock, &|| {
+            polls.set(polls.get() + 1);
+            polls.get() >= 2
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert_eq!(polls.get(), 2);
+        assert!(
+            lock.try_lock().is_ok(),
+            "cancelled admission must release its lock"
+        );
     }
 
     #[test]
