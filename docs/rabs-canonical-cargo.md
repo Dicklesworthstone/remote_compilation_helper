@@ -468,9 +468,26 @@ existing source byte and file limits. The metadata probe checks each resolved
 Git package's full locked identity, contained manifest and target paths, and the
 bytes and executable modes of its checkout against the selected objects.
 
-Credential-bearing URLs, object alternates, partial clones, Git submodules and
-symlinks are outside this cached Git profile. Missing or unsupported inputs
-refuse before remote execution.
+Pinned Git submodules are included recursively from the exact gitlinks and
+committed `.gitmodules` blobs in the selected trees. The approved Cargo home
+must contain every child commit in its Git databases; mutable checkouts, their
+current revisions and local `.gitmodules` edits are not source inputs. Cargo
+resolves each original absolute or relative submodule URL offline from the
+captured databases, and the preparer verifies the complete nested checkout
+against the selected blob hashes and executable modes. Changing a selected
+submodule pin changes the captured source identity.
+
+Submodule declarations require confined relative paths and ordinary URLs
+without credentials. Configuration includes, command-valued updates and
+settings that skip the pinned checkout are refused. Capture admits at most 64
+selected databases and distinct commit revisions, with at most 16 nested
+submodule levels; the expanded files also share the existing source limits.
+Missing child objects fail preparation without fetching or using checkout
+contents as a substitute.
+
+Credential-bearing URLs, object alternates, partial clones and symlinks remain
+outside this cached Git profile. Missing or unsupported inputs refuse before
+remote execution.
 Manifests, lockfiles and captured project configuration retain their original
 bytes; no source replacement is synthesized for this mode.
 

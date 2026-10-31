@@ -21,6 +21,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 const MAX_DATABASES: usize = 64;
+const MAX_SUBMODULE_DEPTH: usize = 16;
 #[cfg(target_os = "linux")]
 const MAX_OBJECT_FILES: usize = 512;
 #[cfg(target_os = "linux")]
@@ -168,7 +169,7 @@ fn locked_packages(lock: &toml::Value) -> io::Result<BTreeSet<GitIdentity>> {
     Ok(result)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct GitMember {
     object: String,
     size: u64,
@@ -176,9 +177,10 @@ struct GitMember {
     executable: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct CapturedCommit {
     members: BTreeMap<String, GitMember>,
+    submodules: BTreeMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -504,11 +506,15 @@ fn parse_tree_controlled(
     count: &mut usize,
     control: &PreparationControl<'_>,
 ) -> io::Result<CapturedCommit> {
-    require(
-        bytes.last() == Some(&0),
-        "Git tree listing is empty or truncated",
-    )?;
+    if bytes.is_empty() {
+        return Ok(CapturedCommit {
+            members: BTreeMap::new(),
+            submodules: BTreeMap::new(),
+        });
+    }
+    require(bytes.last() == Some(&0), "Git tree listing is truncated")?;
     let mut members = BTreeMap::new();
+    let mut submodules = BTreeMap::new();
     for row in bytes[..bytes.len() - 1].split(|byte| *byte == 0) {
         control.checkpoint()?;
         let tab = row
@@ -520,22 +526,26 @@ fn parse_tree_controlled(
             .split_whitespace()
             .collect::<Vec<_>>();
         require(
-            fields.len() == 4
-                && matches!(fields[0], "100644" | "100755")
-                && fields[1] == "blob"
-                && object_id(fields[2]),
-            "captured Git sources support regular files only, not symlinks or submodules",
+            fields.len() == 4 && object_id(fields[2]),
+            "invalid Git tree header",
         )?;
         let path = std::str::from_utf8(&row[tab + 1..])
             .map_err(|_| invalid("Git source path is not UTF-8"))?;
+        require(tree_path(path), "Git source tree contains an unsafe path")?;
+        if fields[0] == "160000" {
+            require(
+                fields[1] == "commit"
+                    && fields[3] == "-"
+                    && !members.contains_key(path)
+                    && submodules.insert(path.into(), fields[2].into()).is_none()
+                    && submodules.len() <= MAX_DATABASES,
+                "invalid, duplicate or excessive Git submodule pin",
+            )?;
+            continue;
+        }
         require(
-            path.len() <= 4096
-                && !path.contains(['\\', ':', '"'])
-                && !path.chars().any(char::is_control)
-                && path.split('/').all(|part| {
-                    !part.is_empty() && !matches!(part, "." | ".." | ".git" | ".gitmodules")
-                }),
-            "Git source tree contains an unsafe path or unsupported submodule declaration",
+            matches!(fields[0], "100644" | "100755") && fields[1] == "blob",
+            "captured Git sources support regular files and pinned submodules only",
         )?;
         let size = fields[3]
             .parse::<u64>()
@@ -550,21 +560,198 @@ fn parse_tree_controlled(
                 invalid("Git and registry sources exceed their aggregate expanded file bound")
             })?;
         require(
-            members
-                .insert(
-                    path.into(),
-                    GitMember {
-                        object: fields[2].into(),
-                        size,
-                        #[cfg(unix)]
-                        executable: fields[0] == "100755",
-                    },
-                )
-                .is_none(),
+            !submodules.contains_key(path)
+                && members
+                    .insert(
+                        path.into(),
+                        GitMember {
+                            object: fields[2].into(),
+                            size,
+                            #[cfg(unix)]
+                            executable: fields[0] == "100755",
+                        },
+                    )
+                    .is_none(),
             "duplicate Git tree path",
         )?;
     }
-    Ok(CapturedCommit { members })
+    require(
+        submodules.is_empty() || members.contains_key(".gitmodules"),
+        "pinned Git submodules require the committed .gitmodules declaration",
+    )?;
+    Ok(CapturedCommit {
+        members,
+        submodules,
+    })
+}
+
+fn tree_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 4096
+        && !path.contains(['\\', ':', '"'])
+        && !path.chars().any(char::is_control)
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && !matches!(part, "." | ".." | ".git"))
+}
+
+/// Parse only the selected commit's configuration blob. Git's own parser
+/// preserves quoted names and values; --no-includes prevents configuration
+/// outside that object from being consulted. No user config is imported.
+fn validate_submodules(
+    tool: &GitTools,
+    repository: &Path,
+    scratch: &Path,
+    commit: &CapturedCommit,
+    control: &PreparationControl<'_>,
+) -> io::Result<()> {
+    let Some(member) = commit.members.get(".gitmodules") else {
+        return Ok(());
+    };
+    require(
+        member.size <= OUTPUT_LIMIT,
+        "Git submodule declarations exceed their bound",
+    )?;
+    let mut command = git_command(tool, repository, scratch);
+    command.args([
+        "config",
+        "--no-includes",
+        "--blob",
+        &member.object,
+        "--null",
+        "--list",
+    ]);
+    let bytes = run(command, scratch, OUTPUT_LIMIT, None, control)?;
+    validate_submodule_config(&bytes, &commit.submodules)
+}
+
+fn validate_submodule_config(bytes: &[u8], pins: &BTreeMap<String, String>) -> io::Result<()> {
+    require(
+        bytes.is_empty() || bytes.last() == Some(&0),
+        "Git submodule configuration is truncated",
+    )?;
+    if bytes.is_empty() {
+        return require(
+            pins.is_empty(),
+            "Git submodule pins have no committed declarations",
+        );
+    }
+    let mut modules = BTreeMap::<&str, BTreeMap<&str, &str>>::new();
+    for row in bytes[..bytes.len() - 1].split(|byte| *byte == 0) {
+        let text = std::str::from_utf8(row)
+            .map_err(|_| invalid("Git submodule configuration is not UTF-8"))?;
+        let (key, value) = text
+            .split_once('\n')
+            .ok_or_else(|| invalid("Git submodule configuration requires explicit values"))?;
+        let (name, field) = key
+            .strip_prefix("submodule.")
+            .and_then(|key| key.rsplit_once('.'))
+            .ok_or_else(|| {
+                invalid("Git submodule declarations cannot include other configuration")
+            })?;
+        require(
+            tree_path(name)
+                && name.len() <= 512
+                && value.len() <= 4096
+                && !value.chars().any(char::is_control),
+            "Git submodule declaration has an unsafe name or value",
+        )?;
+        let valid = match field {
+            "path" => tree_path(value),
+            "url" if value.starts_with("./") || value.starts_with("../") => {
+                !value.contains(['?', '#', '\\', ':', '@'])
+            }
+            "url" => validate_url(value).is_ok(),
+            "branch" => !value.is_empty(),
+            "update" => value == "checkout",
+            "ignore" => matches!(value, "all" | "dirty" | "untracked" | "none"),
+            "shallow" => matches!(value, "true" | "false"),
+            "fetchrecursesubmodules" => matches!(value, "true" | "false" | "on-demand"),
+            _ => false,
+        };
+        require(
+            valid,
+            "unsupported or unsafe committed Git submodule setting",
+        )?;
+        require(
+            modules
+                .entry(name)
+                .or_default()
+                .insert(field, value)
+                .is_none()
+                && modules.len() <= MAX_DATABASES,
+            "duplicate or excessive committed Git submodule settings",
+        )?;
+    }
+    let mut paths = BTreeSet::new();
+    for fields in modules.values() {
+        let path = fields
+            .get("path")
+            .ok_or_else(|| invalid("Git submodule declaration has no path"))?;
+        require(
+            fields.contains_key("url") && paths.insert(*path),
+            "Git submodule declaration has no URL or duplicates another path",
+        )?;
+    }
+    require(
+        pins.keys().all(|path| paths.contains(path.as_str())),
+        "Git submodule pin has no matching committed path and URL",
+    )
+}
+
+/// Gitlinks name complete child commits. Expand their verified member hashes
+/// for later checkout validation without reading any mutable checkout bytes.
+fn flatten_commit(
+    revision: &str,
+    commits: &BTreeMap<String, CapturedCommit>,
+    ancestors: &mut Vec<String>,
+    remaining: &mut u64,
+    count: &mut usize,
+    control: &PreparationControl<'_>,
+) -> io::Result<CapturedCommit> {
+    control.checkpoint()?;
+    require(
+        ancestors.len() <= MAX_SUBMODULE_DEPTH && !ancestors.iter().any(|old| old == revision),
+        "Git submodule nesting is cyclic or exceeds its depth bound",
+    )?;
+    let commit = commits
+        .get(revision)
+        .ok_or_else(|| invalid("approved Cargo home is missing a pinned Git submodule commit"))?;
+    let mut result = CapturedCommit {
+        members: BTreeMap::new(),
+        submodules: commit.submodules.clone(),
+    };
+    for (path, member) in &commit.members {
+        control.checkpoint()?;
+        *remaining = remaining
+            .checked_sub(member.size)
+            .ok_or_else(|| invalid("expanded Git sources exceed the source byte budget"))?;
+        *count = count
+            .checked_add(1)
+            .filter(|count| *count <= MAX_ARCHIVE_MEMBERS)
+            .ok_or_else(|| invalid("expanded Git sources exceed the source file bound"))?;
+        result.members.insert(path.clone(), member.clone());
+    }
+    ancestors.push(revision.to_owned());
+    for (prefix, child) in &commit.submodules {
+        let child = flatten_commit(child, commits, ancestors, remaining, count, control)?;
+        for (path, member) in child.members {
+            control.checkpoint()?;
+            let path = format!("{prefix}/{path}");
+            require(
+                tree_path(&path),
+                "expanded Git submodule path exceeds its bound",
+            )?;
+            // The recursive visit charged this delivered member once. Prefixing
+            // its path must not charge it again at each ancestor repository.
+            require(
+                result.members.insert(path, member).is_none(),
+                "expanded Git submodule collides with another captured member",
+            )?;
+        }
+    }
+    ancestors.pop();
+    Ok(result)
 }
 
 // Cargo discovers manifests recursively in a Git repository. Check path-bearing
@@ -671,203 +858,302 @@ impl GitCache {
             tool,
             scratch,
         };
-        let mut files = BTreeMap::new();
+        let mut files_by_database = BTreeMap::<String, CapturedFiles>::new();
         let mut found = BTreeSet::new();
         let mut databases = 0_usize;
+        let names = database_names(root, control)?;
+        let mut requested = revisions.clone();
+        let mut pending = revisions.clone();
+        let mut selected_by_database = BTreeMap::<String, BTreeSet<String>>::new();
+        let mut trees = BTreeMap::<String, CapturedCommit>::new();
+        let mut manifests = BTreeMap::<String, toml::Value>::new();
+        // Bound raw unique tree inspection independently from the final checkout
+        // layout. Flattening below charges each delivered member exactly once,
+        // including separate occurrences of a commit mounted at multiple paths.
+        let mut inspected_remaining = *expanded_remaining;
+        let mut inspected_members = *expanded_members;
         let deadline = Instant::now() + CAPTURE_TIMEOUT;
-        for name in database_names(root, control)? {
-            checkpoint(deadline, control)?;
-            let temporary = tempfile::Builder::new()
-                .prefix("objects-")
-                .tempdir_in(&captured.scratch)?;
-            let repository = temporary.path().join("view");
-            minimal_repository(&repository, &revisions)?;
-            let view = object_view(root, &name, &repository, control)?;
-            let mut probe = git_command(&captured.tool, &repository, &captured.scratch);
-            probe.args(["cat-file", "--batch-check"]);
-            let input = revisions
-                .iter()
-                .map(|revision| format!("{revision}\n"))
-                .collect::<String>();
-            let output = run(
-                probe,
-                &captured.scratch,
-                OUTPUT_LIMIT,
-                Some(input.as_bytes()),
-                control,
-            )?;
-            let text =
-                std::str::from_utf8(&output).map_err(|_| invalid("invalid Git commit probe"))?;
-            let mut selected = BTreeSet::new();
-            let rows = text.lines().collect::<Vec<_>>();
-            require(
-                rows.len() == revisions.len(),
-                "Git commit probe returned an incomplete result",
-            )?;
-            for (revision, row) in revisions.iter().zip(rows) {
-                if row == format!("{revision} missing") {
+        // A parent tree can introduce a child pin whose database was already
+        // visited. Iterate the bounded, newly discovered revision set to closure
+        // instead of depending on cache directory ordering. Cargo itself later
+        // selects each original URL's namespace during frozen resolution.
+        while !pending.is_empty() {
+            let mut discovered = BTreeSet::new();
+            for name in &names {
+                checkpoint(deadline, control)?;
+                let temporary = tempfile::Builder::new()
+                    .prefix("objects-")
+                    .tempdir_in(&captured.scratch)?;
+                let repository = temporary.path().join("view");
+                minimal_repository(&repository, &pending)?;
+                let view = object_view(root, name, &repository, control)?;
+                let mut probe = git_command(&captured.tool, &repository, &captured.scratch);
+                probe.args(["cat-file", "--batch-check"]);
+                let input = pending
+                    .iter()
+                    .map(|revision| format!("{revision}\n"))
+                    .collect::<String>();
+                let output = run(
+                    probe,
+                    &captured.scratch,
+                    OUTPUT_LIMIT,
+                    Some(input.as_bytes()),
+                    control,
+                )?;
+                let text = std::str::from_utf8(&output)
+                    .map_err(|_| invalid("invalid Git commit probe"))?;
+                let mut selected = BTreeSet::new();
+                let rows = text.lines().collect::<Vec<_>>();
+                require(
+                    rows.len() == pending.len(),
+                    "Git commit probe returned an incomplete result",
+                )?;
+                for (revision, row) in pending.iter().zip(rows) {
+                    if row == format!("{revision} missing") {
+                        continue;
+                    }
+                    let fields = row.split_whitespace().collect::<Vec<_>>();
+                    require(
+                        fields.len() == 3
+                            && fields[0] == revision
+                            && fields[1] == "commit"
+                            && fields[2]
+                                .parse::<u64>()
+                                .is_ok_and(|size| size <= OUTPUT_LIMIT),
+                        "locked Git revision is not a bounded commit object",
+                    )?;
+                    selected.insert(revision.clone());
+                }
+                if selected.is_empty() {
+                    view.verify_unchanged(control)?;
                     continue;
                 }
-                let fields = row.split_whitespace().collect::<Vec<_>>();
+                if !selected_by_database.contains_key(name) {
+                    databases += 1;
+                }
                 require(
-                    fields.len() == 3
-                        && fields[0] == revision
-                        && fields[1] == "commit"
-                        && fields[2]
-                            .parse::<u64>()
-                            .is_ok_and(|size| size <= OUTPUT_LIMIT),
-                    "locked Git revision is not a bounded commit object",
+                    databases <= MAX_DATABASES,
+                    "too many selected Cargo Git databases",
                 )?;
-                selected.insert(revision.clone());
-            }
-            if selected.is_empty() {
-                view.verify_unchanged(control)?;
-                continue;
-            }
-            databases += 1;
-            require(
-                databases <= MAX_DATABASES,
-                "too many selected Cargo Git databases",
-            )?;
-            for revision in &selected {
+                for revision in &selected {
+                    checkpoint(deadline, control)?;
+                    let mut command = git_command(&captured.tool, &repository, &captured.scratch);
+                    command.args(["ls-tree", "-r", "-l", "-z", revision]);
+                    let output = run(command, &captured.scratch, OUTPUT_LIMIT, None, control)?;
+                    let (mut revision_remaining, mut revision_members) =
+                        if trees.contains_key(revision) {
+                            (*expanded_remaining, *expanded_members)
+                        } else {
+                            (inspected_remaining, inspected_members)
+                        };
+                    let commit = parse_tree_controlled(
+                        &output,
+                        &mut revision_remaining,
+                        &mut revision_members,
+                        control,
+                    )?;
+                    validate_submodules(
+                        &captured.tool,
+                        &repository,
+                        &captured.scratch,
+                        &commit,
+                        control,
+                    )?;
+                    discovered.extend(commit.submodules.values().cloned());
+                    for (path, member) in &commit.members {
+                        control.checkpoint()?;
+                        if Path::new(path)
+                            .file_name()
+                            .is_some_and(|name| name == "Cargo.toml")
+                        {
+                            checkpoint(deadline, control)?;
+                            require(
+                                member.size <= OUTPUT_LIMIT,
+                                "Git Cargo manifest exceeds its bound",
+                            )?;
+                            let mut command =
+                                git_command(&captured.tool, &repository, &captured.scratch);
+                            command.args(["cat-file", "blob", &member.object]);
+                            let bytes =
+                                run(command, &captured.scratch, OUTPUT_LIMIT, None, control)?;
+                            if let Ok(text) = std::str::from_utf8(&bytes)
+                                && let Ok(value) = toml::from_str::<toml::Value>(text)
+                            {
+                                // A submodule package may inherit a workspace or
+                                // path dependency from its parent repository. Check
+                                // the completed pinned layout below, not a child
+                                // repository artificially treated as a source root.
+                                manifests.insert(member.object.clone(), value);
+                            }
+                        }
+                    }
+                    if let Some(prior) = trees.get(revision) {
+                        require(
+                            prior == &commit,
+                            "the same pinned Git commit has conflicting object trees",
+                        )?;
+                    } else {
+                        inspected_remaining = revision_remaining;
+                        inspected_members = revision_members;
+                        trees.insert(revision.clone(), commit);
+                    }
+                    found.insert(revision.clone());
+                }
+                let retained = selected_by_database.entry(name.clone()).or_default();
+                retained.extend(selected);
+                let selected = retained;
+                // Repacking an already selected database replaces only our private
+                // in-memory projection. No original cache file or checkout changes.
+                if let Some(previous) = files_by_database.remove(name) {
+                    for bytes in previous.into_values() {
+                        remaining = remaining
+                            .checked_add(bytes.len() as u64)
+                            .ok_or_else(|| invalid("captured Git byte budget overflow"))?;
+                    }
+                }
                 checkpoint(deadline, control)?;
-                let mut command = git_command(&captured.tool, &repository, &captured.scratch);
-                command.args(["ls-tree", "-r", "-l", "-z", revision]);
-                let output = run(command, &captured.scratch, OUTPUT_LIMIT, None, control)?;
-                let commit =
-                    parse_tree_controlled(&output, expanded_remaining, expanded_members, control)?;
-                for (path, member) in &commit.members {
+                let mut enumerate = git_command(&captured.tool, &repository, &captured.scratch);
+                enumerate
+                    .args([
+                        "rev-list",
+                        "--objects",
+                        "--no-object-names",
+                        "--no-walk=unsorted",
+                    ])
+                    .args(&*selected);
+                let output = run(enumerate, &captured.scratch, OUTPUT_LIMIT, None, control)?;
+                let text = std::str::from_utf8(&output)
+                    .map_err(|_| invalid("invalid selected Git object list"))?;
+                let objects = text.lines().collect::<BTreeSet<_>>();
+                require(
+                    !objects.is_empty()
+                        && objects.len() <= MAX_ARCHIVE_MEMBERS * 2
+                        && objects.iter().all(|object| object_id(object)),
+                    "selected Git object closure exceeds its bound",
+                )?;
+                let input = objects
+                    .iter()
+                    .map(|object| format!("{object}\n"))
+                    .collect::<String>();
+                let mut pack = git_command(&captured.tool, &repository, &captured.scratch);
+                pack.args([
+                    "pack-objects",
+                    "--stdout",
+                    "--no-reuse-delta",
+                    "--no-reuse-object",
+                    "--window=0",
+                    "--threads=1",
+                ]);
+                checkpoint(deadline, control)?;
+                let packed = run(
+                    pack,
+                    &captured.scratch,
+                    remaining,
+                    Some(input.as_bytes()),
+                    control,
+                )?;
+                let generated = temporary.path().join("captured");
+                minimal_repository(&generated, selected)?;
+                let incoming = temporary.path().join("selected.pack");
+                control.write_all(File::create(&incoming)?, &packed)?;
+                let mut index = git_command(&captured.tool, &generated, &captured.scratch);
+                index
+                    .args(["index-pack", "--strict", "--threads=1"])
+                    .arg(&incoming);
+                checkpoint(deadline, control)?;
+                let output = run(index, &captured.scratch, OUTPUT_LIMIT, None, control)?;
+                let digest = std::str::from_utf8(&output)
+                    .map_err(|_| invalid("invalid generated Git pack identity"))?
+                    .trim();
+                require(object_id(digest), "invalid generated Git pack identity")?;
+                let stem = format!("objects/pack/pack-{digest}");
+                fs::rename(&incoming, generated.join(format!("{stem}.pack")))?;
+                fs::rename(
+                    incoming.with_extension("idx"),
+                    generated.join(format!("{stem}.idx")),
+                )?;
+                let mut verify = git_command(&captured.tool, &generated, &captured.scratch);
+                verify.args(["fsck", "--full", "--strict", "--no-reflogs"]);
+                checkpoint(deadline, control)?;
+                run(verify, &captured.scratch, OUTPUT_LIMIT, None, control)?;
+                view.verify_unchanged(control)?;
+                let mut packed = Some(packed);
+                let mut files = BTreeMap::new();
+                for path in [
+                    "config".to_owned(),
+                    "HEAD".to_owned(),
+                    "shallow".to_owned(),
+                    "refs/heads/rabs-captured".to_owned(),
+                    format!("{stem}.pack"),
+                    format!("{stem}.idx"),
+                ] {
                     control.checkpoint()?;
+                    let bytes = if path.ends_with(".pack") {
+                        packed
+                            .take()
+                            .ok_or_else(|| invalid("duplicate generated Git pack"))?
+                    } else {
+                        control.read_bounded(
+                            File::open(generated.join(&path))?,
+                            remaining.saturating_add(1),
+                        )?
+                    };
+                    remaining = remaining.checked_sub(bytes.len() as u64).ok_or_else(|| {
+                        invalid("captured Git pack exceeds the aggregate source byte budget")
+                    })?;
+                    require(
+                        files
+                            .insert(format!("git/db/{name}/{path}"), bytes)
+                            .is_none(),
+                        "duplicate captured Git cache path",
+                    )?;
+                }
+                files_by_database.insert(name.clone(), files);
+            }
+            require(
+                pending.is_subset(&found),
+                "approved Cargo home is missing a locked Git commit or pinned submodule; fetch the complete locked graph before preparing",
+            )?;
+            pending = discovered.difference(&requested).cloned().collect();
+            requested.extend(pending.iter().cloned());
+            require(
+                requested.len() <= MAX_DATABASES,
+                "locked Git and submodule revision closure exceeds its bound",
+            )?;
+        }
+        checkpoint(deadline, control)?;
+        require(
+            found == requested,
+            "approved Cargo home is missing a locked Git commit; fetch the complete locked graph before preparing",
+        )?;
+        for (name, selected) in selected_by_database {
+            for revision in selected.intersection(&revisions) {
+                let commit = flatten_commit(
+                    revision,
+                    &trees,
+                    &mut Vec::new(),
+                    expanded_remaining,
+                    expanded_members,
+                    control,
+                )?;
+                for (path, member) in &commit.members {
                     if Path::new(path)
                         .file_name()
                         .is_some_and(|name| name == "Cargo.toml")
+                        && let Some(value) = manifests.get(&member.object)
                     {
-                        checkpoint(deadline, control)?;
-                        require(
-                            member.size <= OUTPUT_LIMIT,
-                            "Git Cargo manifest exceeds its bound",
+                        validate_tree_manifest(
+                            Path::new(path).parent().unwrap_or(Path::new("")),
+                            value,
                         )?;
-                        let mut command =
-                            git_command(&captured.tool, &repository, &captured.scratch);
-                        command.args(["cat-file", "blob", &member.object]);
-                        let bytes = run(command, &captured.scratch, OUTPUT_LIMIT, None, control)?;
-                        if let Ok(text) = std::str::from_utf8(&bytes)
-                            && let Ok(value) = toml::from_str::<toml::Value>(text)
-                        {
-                            validate_tree_manifest(
-                                Path::new(path).parent().unwrap_or(Path::new("")),
-                                &value,
-                            )?;
-                        }
                     }
                 }
                 captured
                     .commits
                     .insert((name.clone(), revision.clone()), commit);
-                found.insert(revision.clone());
-            }
-            checkpoint(deadline, control)?;
-            let mut enumerate = git_command(&captured.tool, &repository, &captured.scratch);
-            enumerate
-                .args([
-                    "rev-list",
-                    "--objects",
-                    "--no-object-names",
-                    "--no-walk=unsorted",
-                ])
-                .args(&selected);
-            let output = run(enumerate, &captured.scratch, OUTPUT_LIMIT, None, control)?;
-            let text = std::str::from_utf8(&output)
-                .map_err(|_| invalid("invalid selected Git object list"))?;
-            let objects = text.lines().collect::<BTreeSet<_>>();
-            require(
-                !objects.is_empty()
-                    && objects.len() <= MAX_ARCHIVE_MEMBERS * 2
-                    && objects.iter().all(|object| object_id(object)),
-                "selected Git object closure exceeds its bound",
-            )?;
-            let input = objects
-                .iter()
-                .map(|object| format!("{object}\n"))
-                .collect::<String>();
-            let mut pack = git_command(&captured.tool, &repository, &captured.scratch);
-            pack.args([
-                "pack-objects",
-                "--stdout",
-                "--no-reuse-delta",
-                "--no-reuse-object",
-                "--window=0",
-                "--threads=1",
-            ]);
-            checkpoint(deadline, control)?;
-            let packed = run(
-                pack,
-                &captured.scratch,
-                remaining,
-                Some(input.as_bytes()),
-                control,
-            )?;
-            let generated = temporary.path().join("captured");
-            minimal_repository(&generated, &selected)?;
-            let incoming = temporary.path().join("selected.pack");
-            control.write_all(File::create(&incoming)?, &packed)?;
-            let mut index = git_command(&captured.tool, &generated, &captured.scratch);
-            index
-                .args(["index-pack", "--strict", "--threads=1"])
-                .arg(&incoming);
-            checkpoint(deadline, control)?;
-            let output = run(index, &captured.scratch, OUTPUT_LIMIT, None, control)?;
-            let digest = std::str::from_utf8(&output)
-                .map_err(|_| invalid("invalid generated Git pack identity"))?
-                .trim();
-            require(object_id(digest), "invalid generated Git pack identity")?;
-            let stem = format!("objects/pack/pack-{digest}");
-            fs::rename(&incoming, generated.join(format!("{stem}.pack")))?;
-            fs::rename(
-                incoming.with_extension("idx"),
-                generated.join(format!("{stem}.idx")),
-            )?;
-            let mut verify = git_command(&captured.tool, &generated, &captured.scratch);
-            verify.args(["fsck", "--full", "--strict", "--no-reflogs"]);
-            checkpoint(deadline, control)?;
-            run(verify, &captured.scratch, OUTPUT_LIMIT, None, control)?;
-            view.verify_unchanged(control)?;
-            let mut packed = Some(packed);
-            for path in [
-                "config".to_owned(),
-                "HEAD".to_owned(),
-                "shallow".to_owned(),
-                "refs/heads/rabs-captured".to_owned(),
-                format!("{stem}.pack"),
-                format!("{stem}.idx"),
-            ] {
-                control.checkpoint()?;
-                let bytes = if path.ends_with(".pack") {
-                    packed
-                        .take()
-                        .ok_or_else(|| invalid("duplicate generated Git pack"))?
-                } else {
-                    control.read_bounded(
-                        File::open(generated.join(&path))?,
-                        remaining.saturating_add(1),
-                    )?
-                };
-                remaining = remaining.checked_sub(bytes.len() as u64).ok_or_else(|| {
-                    invalid("captured Git pack exceeds the aggregate source byte budget")
-                })?;
-                require(
-                    files
-                        .insert(format!("git/db/{name}/{path}"), bytes)
-                        .is_none(),
-                    "duplicate captured Git cache path",
-                )?;
             }
         }
-        checkpoint(deadline, control)?;
-        require(
-            found == revisions,
-            "approved Cargo home is missing a locked Git commit; fetch the complete locked graph before preparing",
-        )?;
+        let files = files_by_database.into_values().flatten().collect();
         Ok((captured, files))
     }
 
@@ -1162,10 +1448,182 @@ mod tests {
             format!("160000 commit {oid} -\tsubmodule\0"),
             format!("100644 blob {oid} 3\t../outside\0"),
             format!("100644 blob {oid} 3\t.git/config\0"),
-            format!("100644 blob {oid} 3\t.gitmodules\0"),
         ] {
             assert!(parse_tree(row.as_bytes(), &mut 100, &mut 0).is_err());
         }
+        let selected = format!(
+            "100644 blob {oid} 3\t.gitmodules\0\
+            160000 commit {oid} -\tvendor/child\0"
+        );
+        let tree = parse_tree(selected.as_bytes(), &mut 3, &mut 0).unwrap();
+        assert_eq!(tree.submodules["vendor/child"], oid);
+        assert!(parse_tree(&[], &mut 0, &mut 0).unwrap().members.is_empty());
+    }
+
+    #[test]
+    fn committed_submodule_settings_require_confined_paths_pinned_updates_and_no_includes() {
+        let pins = BTreeMap::from([("vendor/nested module".into(), "a".repeat(40))]);
+        let prefix = b"submodule.nested module.path\nvendor/nested module\0";
+        for url in [
+            "../child",
+            "./child",
+            "https://example.invalid/child.git",
+            "file:///approved/child",
+        ] {
+            let mut bytes = prefix.to_vec();
+            bytes.extend_from_slice(format!("submodule.nested module.url\n{url}\0").as_bytes());
+            bytes.extend_from_slice(
+                b"submodule.nested module.branch\nmain\0submodule.nested module.update\ncheckout\0",
+            );
+            validate_submodule_config(&bytes, &pins).unwrap();
+        }
+        for extra in [
+            "include.path\n/other/config\0",
+            "submodule.nested module.update\n!execute-program\0",
+            "submodule.nested module.update\nnone\0",
+            "submodule.nested module.path\nother\0",
+            "submodule.duplicate.path\nvendor/nested module\0submodule.duplicate.url\n../other\0",
+            "submodule../escape.path\nother\0submodule../escape.url\n../other\0",
+        ] {
+            let mut bytes = prefix.to_vec();
+            bytes.extend_from_slice(b"submodule.nested module.url\n../child\0");
+            bytes.extend_from_slice(extra.as_bytes());
+            assert!(validate_submodule_config(&bytes, &pins).is_err(), "{extra}");
+        }
+        for path in [
+            "../escape",
+            "/absolute",
+            ".git/objects",
+            "nested//child",
+            "nested/./child",
+        ] {
+            let bytes = format!("submodule.child.path\n{path}\0submodule.child.url\n../child\0");
+            assert!(
+                validate_submodule_config(bytes.as_bytes(), &pins).is_err(),
+                "{path}"
+            );
+        }
+        for url in [
+            "https://user:secret@example.invalid/child",
+            "!program",
+            "/unscoped/path",
+            "../child\\other",
+        ] {
+            let mut bytes = prefix.to_vec();
+            bytes.extend_from_slice(format!("submodule.nested module.url\n{url}\0").as_bytes());
+            assert!(validate_submodule_config(&bytes, &pins).is_err(), "{url}");
+        }
+        assert!(validate_submodule_config(prefix, &pins).is_err());
+        assert!(validate_submodule_config(&[], &pins).is_err());
+        assert!(validate_submodule_config(b"submodule.x.path\nx", &pins).is_err());
+    }
+
+    #[test]
+    fn pinned_submodule_member_closure_is_recursive_bounded_and_cycle_checked() {
+        let root = "a".repeat(40);
+        let middle = "b".repeat(40);
+        let leaf = "c".repeat(40);
+        let blob = "d".repeat(40);
+        let mut commits = BTreeMap::from([
+            (
+                root.clone(),
+                CapturedCommit {
+                    members: BTreeMap::new(),
+                    submodules: BTreeMap::from([("vendor".into(), middle.clone())]),
+                },
+            ),
+            (
+                middle.clone(),
+                CapturedCommit {
+                    members: BTreeMap::new(),
+                    submodules: BTreeMap::from([("nested".into(), leaf.clone())]),
+                },
+            ),
+            (
+                leaf.clone(),
+                CapturedCommit {
+                    members: BTreeMap::from([(
+                        "value.rs".into(),
+                        GitMember {
+                            object: blob.clone(),
+                            size: 17,
+                            #[cfg(unix)]
+                            executable: true,
+                        },
+                    )]),
+                    submodules: BTreeMap::new(),
+                },
+            ),
+        ]);
+        let control = PreparationControl::uncontrolled();
+        let mut remaining = 17;
+        let mut members = 0;
+        let result = flatten_commit(
+            &root,
+            &commits,
+            &mut Vec::new(),
+            &mut remaining,
+            &mut members,
+            &control,
+        )
+        .unwrap();
+        assert_eq!((remaining, members), (0, 1));
+        assert_eq!(result.members["vendor/nested/value.rs"].object, blob);
+        #[cfg(unix)]
+        assert!(result.members["vendor/nested/value.rs"].executable);
+        assert!(
+            flatten_commit(&root, &commits, &mut Vec::new(), &mut 16, &mut 0, &control).is_err()
+        );
+        assert!(
+            flatten_commit(
+                &root,
+                &commits,
+                &mut Vec::new(),
+                &mut 17,
+                &mut MAX_ARCHIVE_MEMBERS,
+                &control
+            )
+            .is_err()
+        );
+        commits
+            .get_mut(&root)
+            .unwrap()
+            .submodules
+            .insert("second".into(), middle.clone());
+        let mut remaining = 34;
+        let mut members = 0;
+        let result = flatten_commit(
+            &root,
+            &commits,
+            &mut Vec::new(),
+            &mut remaining,
+            &mut members,
+            &control,
+        )
+        .unwrap();
+        assert_eq!((remaining, members), (0, 2));
+        assert_eq!(result.members["second/nested/value.rs"].object, blob);
+        assert!(
+            flatten_commit(&root, &commits, &mut Vec::new(), &mut 33, &mut 0, &control).is_err()
+        );
+        commits.get_mut(&root).unwrap().submodules.remove("second");
+        commits
+            .get_mut(&leaf)
+            .unwrap()
+            .submodules
+            .insert("cycle".into(), root.clone());
+        assert!(
+            flatten_commit(&root, &commits, &mut Vec::new(), &mut 100, &mut 0, &control).is_err()
+        );
+        commits.get_mut(&leaf).unwrap().submodules.clear();
+        commits
+            .get_mut(&middle)
+            .unwrap()
+            .submodules
+            .insert("missing".into(), "e".repeat(40));
+        assert!(
+            flatten_commit(&root, &commits, &mut Vec::new(), &mut 100, &mut 0, &control).is_err()
+        );
     }
 
     #[test]

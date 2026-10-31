@@ -610,6 +610,492 @@ fn cached_git_fixture(selector: &str) -> (Fixture, String) {
     (fixture, revision)
 }
 
+fn submodule_git(owner: &Path, repository: &Path, label: &str, args: &[&str]) -> String {
+    let mut git = command("git");
+    git.arg("-C")
+        .arg(repository)
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+        ])
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null");
+    let (status, stdout, stderr) =
+        Process::spawn(owner, label, &mut git).wait(Duration::from_secs(15));
+    assert!(
+        status.success(),
+        "{label}: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+    String::from_utf8(stdout).unwrap().trim().to_owned()
+}
+
+fn cached_git_submodule_fixture() -> (Fixture, BTreeMap<String, String>) {
+    let owner = private_tempdir();
+    let origins = owner.path().join("origins");
+    let anchor = owner.path().join("approved-source");
+    let home = owner.path().join("approved-cargo-home");
+    let cargo = fs::canonicalize(std::env::var_os("CARGO").expect("Cargo test runner")).unwrap();
+    let rustc = cargo.parent().unwrap().join("rustc");
+    assert!(
+        rustc.is_file(),
+        "submodule fixture requires the installed toolchain"
+    );
+    let mut pins = BTreeMap::new();
+    for (name, child, path) in [
+        ("leaf", None, ""),
+        ("middle", Some("leaf"), "nested"),
+        ("outer", Some("middle"), "vendor"),
+    ] {
+        let repository = origins.join(name);
+        fs::create_dir_all(&repository).unwrap();
+        submodule_git(
+            owner.path(),
+            &repository,
+            &format!("{name}-init"),
+            &["init", "--initial-branch=main"],
+        );
+        if let Some(child) = child {
+            let url = format!("file://{}", origins.join(child).display());
+            submodule_git(
+                owner.path(),
+                &repository,
+                &format!("{name}-submodule"),
+                &[
+                    "-c",
+                    "protocol.file.allow=always",
+                    "submodule",
+                    "add",
+                    "--",
+                    &url,
+                    path,
+                ],
+            );
+            // Cargo resolves a relative child URL from the exact parent's
+            // original URL. No rewritten private destination enters the blob.
+            submodule_git(
+                owner.path(),
+                &repository,
+                &format!("{name}-relative-url"),
+                &[
+                    "config",
+                    "--file",
+                    ".gitmodules",
+                    &format!("submodule.{path}.url"),
+                    &format!("../{child}"),
+                ],
+            );
+        } else {
+            write(&repository, "value.rs", "pub const VALUE:u32=40;\n");
+            write(&repository, "README.md", "pinned child input\n");
+            write(&repository, "helper.sh", "#!/bin/sh\nprintf pinned\n");
+            fs::set_permissions(
+                repository.join("helper.sh"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        if name == "outer" {
+            write(
+                &repository,
+                "Cargo.toml",
+                "[package]\nname='git_dep'\nversion='1.0.0'\nedition='2021'\nreadme='vendor/nested/README.md'\n",
+            );
+            write(
+                &repository,
+                "src/lib.rs",
+                "include!(\"../vendor/nested/value.rs\"); pub fn answer()->u32 { VALUE }\n",
+            );
+        }
+        submodule_git(
+            owner.path(),
+            &repository,
+            &format!("{name}-add"),
+            &["add", "."],
+        );
+        submodule_git(
+            owner.path(),
+            &repository,
+            &format!("{name}-commit"),
+            &["commit", "--no-gpg-sign", "-m", "pinned input"],
+        );
+        let revision = submodule_git(
+            owner.path(),
+            &repository,
+            &format!("{name}-revision"),
+            &["rev-parse", "HEAD"],
+        );
+        pins.insert(name.to_owned(), revision);
+    }
+    write(
+        &anchor,
+        "Cargo.toml",
+        "[workspace]\nmembers=['app']\nresolver='2'\n",
+    );
+    write(
+        &anchor,
+        "app/Cargo.toml",
+        format!(
+            "[package]\nname='vendor_app'\nversion='0.1.0'\nedition='2021'\n[dependencies]\ngit_dep={{git='file://{}',rev='{}'}}\n",
+            origins.join("outer").display(),
+            pins["outer"],
+        ),
+    );
+    write(
+        &anchor,
+        "app/src/main.rs",
+        "fn main(){println!(\"{}:{}\",git_dep::answer()+2,env!(\"BUILD_LABEL\"));}\n",
+    );
+    let mut generate = command(&cargo);
+    generate
+        .current_dir(&anchor)
+        .arg("generate-lockfile")
+        .env("CARGO_HOME", &home)
+        .env("RUSTC", &rustc)
+        .env("CARGO_NET_GIT_FETCH_WITH_CLI", "true")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null");
+    let (status, _, stderr) =
+        Process::spawn(owner.path(), "submodule-lock", &mut generate).wait(Duration::from_secs(30));
+    assert!(status.success(), "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(fs::read_dir(home.join("git/db")).unwrap().count(), 3);
+    fs::rename(&origins, owner.path().join("retired-origins")).unwrap();
+    let specification = json!({"kind":"canonical-exec","request_id":92,
+        "program":"/__rabs/toolchain/bin/cargo","args":["build","--frozen","--jobs=1","-p","vendor_app"],
+        "toolchain_backing":cargo.parent().and_then(Path::parent).unwrap(),
+        "timeout_ms":90000,"jobserver_grant":1,
+        "cargo_source":{"manifest":"Cargo.toml","cargo_home_source":home},
+        "command_context":{"version":"env-cwd-v1","cwd":"/__rabs/workspace",
+            "env":{"CARGO_TARGET_DIR":"/__rabs/out/build","CARGO_INCREMENTAL":"0","BUILD_LABEL":LABEL}},
+        "artifacts":{"unit":"build","files":["debug/vendor_app"],"tree":"tree-files-v1"}});
+    (
+        Fixture {
+            owner,
+            anchor,
+            cargo,
+            rustc,
+            specification,
+        },
+        pins,
+    )
+}
+
+#[test]
+fn cached_git_submodules_rebuild_frozen_from_pins_despite_newer_dirty_checkouts() {
+    use rabs_sandbox::cargo_home::{CAPTURED_GIT_CONFIG, ISOLATED_GIT_CARGO_HOME_SOURCE_VERSION};
+    let (fixture, pins) = cached_git_submodule_fixture();
+    let home = fixture.owner.path().join("approved-cargo-home");
+    let namespaces = fs::read_dir(home.join("git/db"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect::<Vec<_>>();
+    let outer = namespaces
+        .iter()
+        .find(|name| name.starts_with("outer-"))
+        .unwrap();
+    let checkout = fs::read_dir(home.join("git/checkouts").join(outer))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let nested = checkout.join("vendor/nested");
+    write(&nested, "value.rs", "pub const VALUE:u32=99;\n");
+    submodule_git(
+        fixture.owner.path(),
+        &nested,
+        "newer-checkout-add",
+        &["add", "value.rs"],
+    );
+    submodule_git(
+        fixture.owner.path(),
+        &nested,
+        "newer-checkout-commit",
+        &[
+            "commit",
+            "--no-gpg-sign",
+            "-m",
+            "newer checkout must not ship",
+        ],
+    );
+    assert_ne!(
+        submodule_git(
+            fixture.owner.path(),
+            &nested,
+            "newer-checkout-head",
+            &["rev-parse", "HEAD"]
+        ),
+        pins["leaf"]
+    );
+    write(
+        &nested,
+        "value.rs",
+        "compile_error!(\"dirty submodule checkout was imported\");\n",
+    );
+    write(&nested, "unlisted-private.txt", PRIVATE_MARKER);
+    write(&checkout, ".gitmodules", PRIVATE_MARKER);
+    for namespace in &namespaces {
+        write(
+            &home.join("git/db").join(namespace),
+            "config",
+            PRIVATE_MARKER,
+        );
+    }
+    let original_lock = fs::read(fixture.anchor.join("Cargo.lock")).unwrap();
+    let (bundle, request) = fixture.prepared();
+    let manifest = rabsd::coord::source_delivery::request_manifest(&request)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        request["cargo_home"]["version"],
+        ISOLATED_GIT_CARGO_HOME_SOURCE_VERSION
+    );
+    assert_eq!(
+        manifest
+            .files()
+            .iter()
+            .filter(|file| file.path.starts_with("rabs-cargo-home/git/db/"))
+            .count(),
+        18
+    );
+    assert!(
+        !manifest
+            .files()
+            .iter()
+            .any(|file| file.path.contains("git/checkouts"))
+    );
+    for namespace in &namespaces {
+        let root = bundle.join("source/rabs-cargo-home/git/db").join(namespace);
+        assert_eq!(fs::read(root.join("config")).unwrap(), CAPTURED_GIT_CONFIG);
+        let name = namespace.split('-').next().unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("HEAD")).unwrap(),
+            format!("{}\n", pins[name])
+        );
+    }
+    let projection = CargoHomeProjection::for_version(
+        ISOLATED_GIT_CARGO_HOME_SOURCE_VERSION,
+        "rabs-cargo-home",
+        &manifest,
+    )
+    .unwrap();
+    let mut received = SourceReceiver::create(
+        &fixture.owner.path().join("received-submodules"),
+        manifest.clone(),
+    )
+    .unwrap();
+    for file in manifest.files() {
+        let bytes = fs::read(bundle.join("source").join(&file.path)).unwrap();
+        for (index, chunk) in bytes.chunks(MAX_SOURCE_CHUNK).enumerate() {
+            received
+                .write_chunk(
+                    &file.path,
+                    (index * MAX_SOURCE_CHUNK) as u64,
+                    chunk,
+                    Sha256::digest(chunk).into(),
+                )
+                .unwrap();
+        }
+    }
+    received.seal().unwrap();
+    fs::rename(&home, fixture.owner.path().join("retired-approved-home")).unwrap();
+    fs::rename(
+        &fixture.anchor,
+        fixture.owner.path().join("retired-workspace"),
+    )
+    .unwrap();
+    let projected = projection
+        .prepare(
+            &received,
+            &fixture.owner.path().join("runtime-submodule-home"),
+            || false,
+        )
+        .unwrap();
+    let workspace = projected.projected_workspace().unwrap();
+    let target = fixture.owner.path().join("submodule-target");
+    let mut cargo = command(&fixture.cargo);
+    cargo
+        .current_dir(workspace)
+        .args(["build", "--frozen", "--jobs=1", "-p", "vendor_app"])
+        .arg("--target-dir")
+        .arg(&target)
+        .env("CARGO_HOME", projected.root())
+        .env("RUSTC", &fixture.rustc)
+        .env("CARGO_INCREMENTAL", "0")
+        .env("BUILD_LABEL", LABEL);
+    let (status, _, stderr) =
+        Process::spawn(fixture.owner.path(), "submodule-frozen-build", &mut cargo)
+            .wait(Duration::from_secs(90));
+    assert!(status.success(), "{}", String::from_utf8_lossy(&stderr));
+    let (status, stdout, stderr) = Process::spawn(
+        fixture.owner.path(),
+        "submodule-binary",
+        &mut command(target.join("debug/vendor_app")),
+    )
+    .wait(Duration::from_secs(5));
+    assert!(status.success(), "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(stdout, format!("42:{LABEL}\n").as_bytes());
+    assert_eq!(
+        fs::read(workspace.join("Cargo.lock")).unwrap(),
+        original_lock
+    );
+    let checkout = fs::read_dir(projected.root().join("git/checkouts").join(outer))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert_eq!(
+        fs::read_to_string(checkout.join("vendor/nested/value.rs")).unwrap(),
+        "pub const VALUE:u32=40;\n"
+    );
+    assert!(
+        fs::metadata(checkout.join("vendor/nested/helper.sh"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o111
+            != 0
+    );
+    assert!(!checkout.join("vendor/nested/unlisted-private.txt").exists());
+}
+
+#[test]
+fn cached_git_submodule_missing_objects_refuse_without_using_original_checkouts() {
+    let (fixture, _) = cached_git_submodule_fixture();
+    let home = fixture.owner.path().join("approved-cargo-home");
+    let database = fs::read_dir(home.join("git/db"))
+        .unwrap()
+        .map(Result::unwrap)
+        .find(|entry| entry.file_name().to_str().unwrap().starts_with("leaf-"))
+        .unwrap()
+        .path();
+    fs::rename(
+        &database,
+        fixture.owner.path().join("retired-child-database"),
+    )
+    .unwrap();
+    let lock = fs::read(fixture.anchor.join("Cargo.lock")).unwrap();
+    let (bundle, status, _, stderr) = fixture.prepare("missing-submodule");
+    assert!(!status.success());
+    assert!(
+        String::from_utf8_lossy(&stderr).contains("pinned submodule"),
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(!bundle.join("request.json").exists());
+    assert_eq!(fs::read(fixture.anchor.join("Cargo.lock")).unwrap(), lock);
+}
+
+#[test]
+fn cached_git_submodule_pin_changes_replace_the_captured_child_object_identity() {
+    let (fixture, pins) = cached_git_submodule_fixture();
+    let (first_bundle, first_request) = fixture.prepared();
+    let first_manifest = rabsd::coord::source_delivery::request_manifest(&first_request)
+        .unwrap()
+        .unwrap();
+    let home = fixture.owner.path().join("approved-cargo-home");
+    let leaf_namespace = fs::read_dir(home.join("git/db"))
+        .unwrap()
+        .map(Result::unwrap)
+        .find(|entry| entry.file_name().to_str().unwrap().starts_with("leaf-"))
+        .unwrap()
+        .file_name();
+    let origins = fixture.owner.path().join("origins");
+    fs::rename(fixture.owner.path().join("retired-origins"), &origins).unwrap();
+    let leaf = origins.join("leaf");
+    write(&leaf, "value.rs", "pub const VALUE:u32=41;\n");
+    submodule_git(
+        fixture.owner.path(),
+        &leaf,
+        "repin-leaf-add",
+        &["add", "value.rs"],
+    );
+    submodule_git(
+        fixture.owner.path(),
+        &leaf,
+        "repin-leaf-commit",
+        &["commit", "--no-gpg-sign", "-m", "changed pinned input"],
+    );
+    let new_leaf = submodule_git(
+        fixture.owner.path(),
+        &leaf,
+        "repin-leaf-head",
+        &["rev-parse", "HEAD"],
+    );
+    let mut child = new_leaf.clone();
+    for (name, path) in [("middle", "nested"), ("outer", "vendor")] {
+        let repository = origins.join(name);
+        submodule_git(
+            fixture.owner.path(),
+            &repository,
+            &format!("repin-{name}-index"),
+            &["update-index", "--cacheinfo", "160000", &child, path],
+        );
+        submodule_git(
+            fixture.owner.path(),
+            &repository,
+            &format!("repin-{name}-commit"),
+            &["commit", "--no-gpg-sign", "-m", "changed child pin"],
+        );
+        child = submodule_git(
+            fixture.owner.path(),
+            &repository,
+            &format!("repin-{name}-head"),
+            &["rev-parse", "HEAD"],
+        );
+    }
+    let manifest_path = fixture.anchor.join("app/Cargo.toml");
+    let manifest = fs::read_to_string(&manifest_path).unwrap();
+    fs::write(manifest_path, manifest.replace(&pins["outer"], &child)).unwrap();
+    let mut generate = command(&fixture.cargo);
+    generate
+        .current_dir(&fixture.anchor)
+        .arg("generate-lockfile")
+        .env("CARGO_HOME", &home)
+        .env("RUSTC", &fixture.rustc)
+        .env("CARGO_NET_GIT_FETCH_WITH_CLI", "true")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null");
+    let (status, _, stderr) = Process::spawn(fixture.owner.path(), "repin-lock", &mut generate)
+        .wait(Duration::from_secs(30));
+    assert!(status.success(), "{}", String::from_utf8_lossy(&stderr));
+    fs::rename(&origins, fixture.owner.path().join("retired-origins")).unwrap();
+    let (second_bundle, status, _, stderr) = fixture.prepare("repinned-bundle");
+    assert!(status.success(), "{}", String::from_utf8_lossy(&stderr));
+    let request: Value =
+        serde_json::from_slice(&fs::read(second_bundle.join("request.json")).unwrap()).unwrap();
+    let second_manifest = rabsd::coord::source_delivery::request_manifest(&request)
+        .unwrap()
+        .unwrap();
+    assert_ne!(first_manifest.digest(), second_manifest.digest());
+    let child_root = Path::new("source/rabs-cargo-home/git/db").join(&leaf_namespace);
+    assert_eq!(
+        fs::read_to_string(first_bundle.join(&child_root).join("HEAD")).unwrap(),
+        format!("{}\n", pins["leaf"])
+    );
+    assert_eq!(
+        fs::read_to_string(second_bundle.join(&child_root).join("HEAD")).unwrap(),
+        format!("{new_leaf}\n")
+    );
+    let packs = |bundle: &Path| {
+        fs::read_dir(bundle.join(&child_root).join("objects/pack"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    assert_ne!(
+        packs(&first_bundle),
+        packs(&second_bundle),
+        "the child bytes, not just Cargo.lock, must change the delivered identity"
+    );
+}
+
 #[test]
 fn cached_git_reference_selectors_build_locked_commits_after_origin_and_refs_move() {
     use rabs_sandbox::cargo_home::ISOLATED_GIT_CARGO_HOME_SOURCE_VERSION;
