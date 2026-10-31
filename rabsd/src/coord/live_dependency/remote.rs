@@ -202,6 +202,7 @@ impl WorkerConfiguration {
 struct PendingActionClaim {
     actions: Arc<Mutex<HashSet<TypedDigest>>>,
     key: TypedDigest,
+    availability: Arc<PoolAvailability>,
 }
 
 impl Drop for PendingActionClaim {
@@ -213,6 +214,11 @@ impl Drop for PendingActionClaim {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         actions.remove(&self.key);
+        drop(actions);
+        // Worker capacity can become visible before the completed producer's
+        // action claim drops. Wake queued affine requests again only after the
+        // key is free, so a same-key successor cannot miss its admission wake.
+        self.availability.notify();
     }
 }
 
@@ -274,6 +280,7 @@ struct PoolReservation {
     _release: CapacityRelease,
 }
 
+#[derive(Debug)]
 enum WorkerProbe {
     Reserved(PoolReservation),
     /// No actual worker or persistent admission is held. An absolute expiry
@@ -327,6 +334,7 @@ impl DependencyWorkerPool {
         Ok(PendingActionClaim {
             actions: Arc::clone(&self.pending),
             key: key.clone(),
+            availability: Arc::clone(&self.availability),
         })
     }
 
@@ -355,6 +363,20 @@ impl DependencyWorkerPool {
 
     fn probe_worker(&self) -> io::Result<WorkerProbe> {
         self.probe_worker_excluding(&HashSet::new())
+    }
+
+    /// Claim the action before taking a worker. A key-conflict WouldBlock is
+    /// distinct from Waiting for physical capacity: another key may still run.
+    /// Retain an acquired claim while queued, releasing it on caller loss.
+    fn probe_claimed_worker(
+        &self,
+        key: &TypedDigest,
+        claim: &mut Option<PendingActionClaim>,
+    ) -> io::Result<WorkerProbe> {
+        if claim.is_none() {
+            *claim = Some(self.try_claim(key)?);
+        }
+        self.probe_worker()
     }
 
     fn probe_worker_excluding(&self, attempted: &HashSet<String>) -> io::Result<WorkerProbe> {
@@ -968,9 +990,10 @@ impl RemoteDependencies {
 }
 
 impl LiveDependencyLane {
-    /// A normal sampled cache hit may serve immediately. Shared misses claim
-    /// bounded queue admission; affine misses reserve their worker immediately.
-    /// Neither creates a local attempt under a remote isolation key.
+    /// A normal sampled cache hit may serve immediately. A service queues both
+    /// shared dependency misses and fresh request-owned workspace executions.
+    /// Standalone requests reserve their worker immediately. No alternative
+    /// creates a local attempt under a remote isolation key.
     #[must_use]
     pub fn decide_remote(
         &self,
@@ -1001,15 +1024,36 @@ impl LiveDependencyLane {
         // Only an existing service-owned execution may share its current
         // private result. Completed flights reject new joins, which keeps
         // ordinary replay and verification sampling on the path above.
-        let shared = shared.filter(|_| !request.is_execution_only());
         if let Some(executions) = &shared
+            && !request.is_execution_only()
             && let Some(subscription) = executions.try_join(&request.key.action_key)
         {
-            return LiveDecision::SharedRemote(PendingSharedRemote::joined(
+            return queued_decision(PendingSharedRemote::joined(
                 Arc::clone(&self.coord),
                 request,
                 invocation.validation,
                 subscription,
+                executions,
+            ));
+        }
+        if request.is_execution_only()
+            && let Some(executions) = &shared
+        {
+            // Each accepted workspace request gets its own bounded queue
+            // membership. It acquires the action claim and physical worker
+            // only when dispatched; matching keys never join another result.
+            // This also lets a second same-key caller wait without holding a
+            // worker or repeatedly rebuilding its input observations.
+            return queued_decision(PendingSharedRemote::starter(
+                Arc::clone(executions),
+                PendingRemote {
+                    lane: self.clone(),
+                    request,
+                    remote,
+                    invocation,
+                    reservation: None,
+                    action_claim: None,
+                },
             ));
         }
         match self.coord.submitted_actor(&request.key.action_key) {
@@ -1036,12 +1080,12 @@ impl LiveDependencyLane {
                     remote,
                     invocation,
                     reservation,
-                    action_claim,
+                    action_claim: Some(action_claim),
                 };
                 match shared {
-                    Some(executions) => LiveDecision::SharedRemote(PendingSharedRemote::starter(
-                        executions, pending,
-                    )),
+                    Some(executions) => {
+                        queued_decision(PendingSharedRemote::starter(executions, pending))
+                    }
                     None => LiveDecision::Remote(pending),
                 }
             }
@@ -1051,8 +1095,18 @@ impl LiveDependencyLane {
     }
 }
 
-/// Action ownership retained through publication. Standalone/affine offers
-/// already own a worker; a shared queued offer receives one only at dispatch.
+fn queued_decision(offer: io::Result<PendingSharedRemote>) -> LiveDecision {
+    match offer {
+        Ok(pending) => LiveDecision::SharedRemote(pending),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => LiveDecision::InFlight,
+        Err(error) => LiveDecision::PassThrough(format!("remote queue admission: {error}")),
+    }
+}
+
+/// Action ownership retained through publication or request-owned capture.
+/// Standalone offers own a worker; service offers receive one at dispatch.
+/// A queued workspace request claims its action key only when reaching the
+/// FIFO head, preserving fresh serial attempts for matching request keys.
 #[derive(Debug)]
 pub struct PendingRemote {
     lane: LiveDependencyLane,
@@ -1060,7 +1114,7 @@ pub struct PendingRemote {
     remote: Arc<RemoteDependencies>,
     invocation: RemoteInvocation,
     reservation: Option<PoolReservation>,
-    action_claim: PendingActionClaim,
+    action_claim: Option<PendingActionClaim>,
 }
 
 impl PendingRemote {
@@ -1093,9 +1147,11 @@ impl PendingRemote {
             remote,
             invocation,
             reservation,
-            action_claim: _action_claim,
+            action_claim,
         } = self;
         let settled = |reason: String| (reason, true);
+        let _action_claim = action_claim
+            .ok_or_else(|| settled("remote action has no admitted action claim".into()))?;
         let reservation = reservation
             .ok_or_else(|| settled("remote action has no admitted worker reservation".into()))?;
         if cancellation.is_cancelled() {
@@ -2124,7 +2180,7 @@ mod worker_pool_tests {
             .map(|configuration| configuration.expect("explicit pool"))
     }
 
-    fn pool(state: &Path, count: u16) -> DependencyWorkerPool {
+    pub(super) fn pool(state: &Path, count: u16) -> DependencyWorkerPool {
         let configured = configured(&(1..=count).map(endpoint).collect::<Vec<_>>()).unwrap();
         DependencyWorkerPool::new(
             configured
@@ -2316,6 +2372,84 @@ mod worker_pool_tests {
         drop(claims);
         assert!(pool.pending.lock().unwrap().is_empty());
         assert!(pool.try_claim(&extra).is_ok());
+    }
+
+    #[test]
+    fn queued_same_key_request_waits_for_claim_release_without_blocking_other_workers() {
+        let pool = pool(Path::new("/private/queued-workspace-pool"), 2);
+        let signal = Arc::new(shared::QueueSignal::default());
+        pool.availability.watch(&signal);
+        let mut first_claim = None;
+        let WorkerProbe::Reserved(first) = pool
+            .probe_claimed_worker(&key(1), &mut first_claim)
+            .unwrap()
+        else {
+            panic!("first workspace request should own a worker");
+        };
+        let mut successor_claim = None;
+        assert_eq!(
+            pool.probe_claimed_worker(&key(1), &mut successor_claim)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(successor_claim.is_none());
+        // Key contention is not worker saturation: unrelated ready work must
+        // still be able to occupy the spare worker in the same dispatch pass.
+        let mut unrelated_claim = None;
+        let WorkerProbe::Reserved(unrelated) = pool
+            .probe_claimed_worker(&key(2), &mut unrelated_claim)
+            .unwrap()
+        else {
+            panic!("a same-key waiter must not strand spare capacity");
+        };
+        assert_ne!(first.worker(), unrelated.worker());
+        drop(first);
+        let after_worker_release = signal.version();
+        assert_eq!(
+            pool.probe_claimed_worker(&key(1), &mut successor_claim)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(signal.version(), after_worker_release);
+        drop(first_claim);
+        assert_ne!(signal.version(), after_worker_release);
+        let WorkerProbe::Reserved(successor) = pool
+            .probe_claimed_worker(&key(1), &mut successor_claim)
+            .unwrap()
+        else {
+            panic!("the successor must resume after its key is actually free");
+        };
+        assert_ne!(successor.worker(), unrelated.worker());
+        drop((successor, successor_claim, unrelated, unrelated_claim));
+        assert!(pool.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cancelled_queued_claim_releases_its_key_without_acquiring_a_busy_worker() {
+        let pool = pool(Path::new("/private/cancelled-workspace-pool"), 1);
+        let blocker = pool.try_reserve(&key(1)).unwrap();
+        let signal = Arc::new(shared::QueueSignal::default());
+        pool.availability.watch(&signal);
+        let mut queued_claim = None;
+        assert!(matches!(
+            pool.probe_claimed_worker(&key(2), &mut queued_claim)
+                .unwrap(),
+            WorkerProbe::Waiting(_)
+        ));
+        assert!(queued_claim.is_some());
+        assert_eq!(pool.pending.lock().unwrap().len(), 2);
+        let observed = signal.version();
+        // Dropping a cancelled FIFO entry drops this claim. No request ID,
+        // worker lease, native producer or transport ever belonged to it.
+        drop(queued_claim);
+        assert_ne!(signal.version(), observed);
+        let replacement = pool.try_claim(&key(2)).unwrap();
+        assert!(pool.try_reserve_worker().is_err());
+        assert_eq!(blocker.0.worker(), "worker-1");
+        drop((replacement, blocker));
+        assert!(pool.pending.lock().unwrap().is_empty());
     }
 
     #[test]

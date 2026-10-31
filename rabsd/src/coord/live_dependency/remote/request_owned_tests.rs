@@ -21,7 +21,7 @@ const DEP_INFO: &[u8] = b"/__rabs/out/lib.rmeta:\n";
 const CLUSTER: &str = "request-owned-install-tests";
 
 pub(super) struct Fixture {
-    root: tempfile::TempDir,
+    pub(super) root: tempfile::TempDir,
     cas: Arc<LiveCas>,
     coord: Arc<CoordLive>,
     key: TypedDigest,
@@ -165,7 +165,7 @@ impl Fixture {
         ExpectedOutputs::Exactly(BTreeSet::from(["out/lib.rlib".to_owned()]))
     }
 
-    fn install(
+    pub(super) fn install(
         &self,
         result: RequestOwnedResult,
         destination: &Path,
@@ -182,7 +182,7 @@ impl Fixture {
         )
     }
 
-    fn assert_unpublished(&self) {
+    pub(super) fn assert_unpublished(&self) {
         let mut store = self.cas.store().lock().unwrap();
         assert!(store.published_manifest_key(&self.key).unwrap().is_none());
         assert!(

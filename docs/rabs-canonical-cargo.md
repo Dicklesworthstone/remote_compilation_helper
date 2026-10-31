@@ -1559,17 +1559,24 @@ Each profile's `jobs` must be at most `jobs_per_root`, and a root retains its
 admission through process and stream drain. Independent roots can compile
 concurrently while sharing the same coordinator generation. Eligible identical
 dependency actions use the existing singleflight, sampling and replay gates.
-With isolated dependency workers configured, acknowledged dependency requests
-enter a bounded service-owned FIFO queue when the pool is busy or cooling down.
-Callers requesting the same queued or active action join one execution. Queued
-requests retain their captured inputs without occupying a worker or creating a
-compiler lease or a waiting producer thread. A dispatcher wakes on admission,
-worker release, cancellation or the next connection-cooldown deadline.
-Cancelling its first caller removes only that caller's interest; the worker
-continues while another subscriber remains. The final subscriber's departure requests cancellation,
-and the service keeps the transport owner until it returns verified completion
-or an explicitly uncertain outcome with retained recovery state. Service shutdown
-cancels and joins these owners before releasing coordinator authority.
+With isolated dependency workers configured, acknowledged dependency and
+workspace requests enter the same bounded service-owned queue when the pool is
+busy or cooling down. Identical dependency requests join one queued or active
+execution. Each workspace request instead gets its own queue identity and
+executes afresh, even when its inputs match another caller's. Waiting requests
+retain their captured inputs without occupying a worker, creating a compiler
+lease or starting a waiting producer thread. The dispatcher wakes on admission,
+worker or action-key release, cancellation and connection-cooldown deadlines.
+
+Workspace requests for the same action retain FIFO order. A request waiting for
+an earlier execution of that key does not prevent unrelated ready actions from
+using idle workers. Cancelling a workspace caller removes only its own queued
+or running work. For a shared dependency execution, cancelling one subscriber
+removes only that subscriber's interest; the final departure requests
+cancellation. The service retains each started transport until verified
+completion or an explicitly uncertain outcome with retained recovery state.
+Service shutdown cancels and joins these owners before releasing coordinator
+authority.
 
 An actual transport interruption before the coordinator starts writing the
 compiler execution request can now move that same producer to an available
@@ -1592,22 +1599,29 @@ worker execution or local fallback. The admitted and failover events report
 the participating workers; admission events also report the actual generation,
 attempt and lease identities for diagnosis.
 
-Each subscriber retains its own input observations and target mapping. Shared
-compilation never writes a target by itself: each caller must accept the exact
-completed manifest before its own bounded installer runs and revalidates its
-inputs. New callers cannot join a completed execution; they pass the ordinary
-cache and verification gates. Execution-only workspace units still require their
-own fresh worker execution. The service bounds active shared producers by the
-configured worker count, retains at most 256 subscriptions, and admits at most
-256 distinct action claims across unacknowledged offers, queued requests and
-active work. Joined offers waiting for acknowledgment and completed results
-waiting for installation retain their subscription slots. Queued work has a
-five-minute admission budget. If that expires before dispatch, the caller gets
-an action-bound failure confirming that no execution began and may compile
-locally. Losing the final queued subscriber promptly releases the queued inputs;
-it never waits for a busy worker to become free. These scheduling bounds apply
-to the shared dependency lane; execution-only workspace requests still obtain
-their own worker reservation.
+Each subscriber retains its own input observations and target mapping.
+Compilation never writes a target by itself: each caller must acknowledge the
+exact completed manifest before its own bounded installer runs and revalidates
+its inputs. New dependency callers cannot join a completed execution; they pass
+the ordinary cache and verification gates. A workspace result remains owned by
+one request and can be consumed only once. Queuing does not publish it, add
+verification evidence, authorize replay or make workspace actions cacheable.
+
+The service bounds active producers by the configured worker count and retains
+at most 256 requests across both dependency and workspace classes. This combined
+limit includes offers awaiting acknowledgment, queued requests, active work and
+completed results awaiting installation; identical workspace keys still count
+as separate requests. The service reports `queued-request-owned` and a distinct
+`queue_request_id` for accepted workspace demand. This identifier is local to
+the service and identifies queue ownership, not a compiler attempt or worker
+request.
+
+Queued work has a five-minute admission budget. Expiry before dispatch returns
+an action-bound failure confirming that execution did not begin, allowing the
+caller to compile locally. Cancelling a queued workspace request or losing the
+final queued dependency subscriber promptly releases that demand and its
+retained inputs without waiting for a busy worker. Execution uncertainty after
+dispatch retains the existing recovery and fallback restrictions.
 
 Remote actions also reuse verified dependency input bytes across overlapping
 artifact inventories. The coordinator retains immutable bytes for the exact

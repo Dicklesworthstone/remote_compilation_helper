@@ -1372,6 +1372,344 @@ fn canonical_shared_remote_queue_coalesces_and_survives_origin_cancellation() {
 }
 
 #[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; queues identical fresh workspace compilations behind a busy authenticated worker"]
+fn canonical_shared_workspace_queue_keeps_fresh_executions_and_cancels_one_waiter() {
+    use rabs_cas::metadata_store::{RabsMetadataStore, SqlValue};
+
+    let (owner, mut profile) = native_fixture();
+    let root = owner.path();
+    let source = root.join("source-a");
+    // Every caller captures the same complete workspace. No dependency or
+    // caller-specific source label can accidentally give it a different key.
+    write(
+        &source,
+        "Cargo.toml",
+        "[package]\nname='canonical_app'\nversion='0.1.0'\nedition='2021'\n",
+    );
+    write(
+        &source,
+        "Cargo.lock",
+        "version=4\n\n[[package]]\nname='canonical_app'\nversion='0.1.0'\n",
+    );
+    write(&source, "src/lib.rs", "pub fn answer()->u32 { 42 }\n");
+    write(
+        &source,
+        "src/main.rs",
+        "fn main() { println!(\"{}\", canonical_app::answer()); }\n",
+    );
+    let (mut worker, environment) = NativeWorker::start(root);
+    let socket = root.join("canonical-service.sock");
+    let service_profile = root.join("shared-workspace-queue-service.json");
+    fs::write(
+        &service_profile,
+        serde_json::to_vec(&json!({
+            "version":"canonical-compile-service-v1", "state_root":root.join("state"),
+            "socket":socket, "max_roots":3, "jobs_per_root":1,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    profile["command"] = json!("build");
+    profile["service_socket"] = json!(socket);
+    profile["timeout_seconds"] = json!(600);
+    let mut command = shared_service_command(root);
+    command
+        .envs(environment.iter().map(|(name, value)| (name, value)))
+        .arg("--canonical-compile-service")
+        .arg(service_profile);
+    let mut service = SharedServiceChild::spawn(root, "shared-workspace-queue-service", command);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !socket.exists()
+        || !service
+            .events()
+            .iter()
+            .any(|event| event["kind"] == "canonical-service-listening")
+    {
+        service.assert_running();
+        assert!(Instant::now() < deadline, "{}", service.diagnostics());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let mut first = shared_service_client(root, 5250, &profile);
+    let deadline = Instant::now() + Duration::from_secs(240);
+    let key = loop {
+        let events = service.events();
+        let offered = decisions(&events, "shared-remote-offer");
+        if let Some(key) = offered.get("canonical_app")
+            && events.iter().any(|event| {
+                event["kind"] == "rabsd-remote-dependency-admitted" && event["key"] == *key
+            })
+        {
+            break key.clone();
+        }
+        service.assert_running();
+        first.assert_running();
+        assert!(Instant::now() < deadline, "{}", service.diagnostics());
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    let paused = PausedNativeWorker::pause(&worker);
+    let journal = read_bounded(&worker.state.join("requests.json"));
+    let state: Value = serde_json::from_slice(&journal).unwrap();
+    assert!(
+        state.get("last").is_some_and(Value::is_null),
+        "the native worker must be paused before a compiler lease begins: {state}"
+    );
+
+    let operations = || {
+        fs::read_dir(root.join("ops"))
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .as_encoded_bytes()
+                    .starts_with(b"rabs-compile-")
+                    && entry.file_type().unwrap().is_dir()
+            })
+            .map(|entry| entry.path())
+            .collect::<BTreeSet<_>>()
+    };
+    let first_operations = operations();
+    assert_eq!(first_operations.len(), 1);
+    let requests = || {
+        fs::read_dir(root.join("state/canonical-compile-v1/shadow/dependency-workers"))
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| entry.file_name().as_encoded_bytes().starts_with(b"result-"))
+            .map(|entry| entry.path())
+            .collect::<BTreeSet<_>>()
+    };
+    // Capture the actual allocated wire request before delivery removes its
+    // recovery directory. Reading the worker's final receipt later cannot
+    // accidentally mistake the survivor's request for this first execution.
+    let first_requests = requests();
+    assert_eq!(first_requests.len(), 1);
+    let request_directory = first_requests.first().unwrap();
+    let request: Value =
+        serde_json::from_slice(&read_bounded(&request_directory.join("request.json"))).unwrap();
+    let recovery: Value =
+        serde_json::from_slice(&read_bounded(&request_directory.join("recovery.json"))).unwrap();
+    assert_eq!(recovery["action_key"], key);
+    assert_eq!(recovery["request_id"], request["request_id"]);
+    let first_request_id = request["request_id"].as_u64().unwrap();
+    assert_ne!(first_request_id, 0);
+
+    let subscriptions = |events: &[Value]| {
+        let matching = events
+            .iter()
+            .filter(|event| {
+                event["kind"] == "rabsd-shared-remote-subscribed" && event["key"] == key
+            })
+            .collect::<Vec<_>>();
+        let identities = matching
+            .iter()
+            .map(|event| {
+                assert_eq!(
+                    event["disposition"], "queued-request-owned",
+                    "fresh workspace requests must never join another execution: {events:?}"
+                );
+                event["queue_request_id"].as_str().unwrap().to_owned()
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            identities.len(),
+            matching.len(),
+            "each workspace caller must retain its own queue identity: {events:?}"
+        );
+        identities
+    };
+    let mut queued = shared_service_client(root, 5251, &profile);
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while subscriptions(&service.events()).len() < 2 {
+        service.assert_running();
+        first.assert_running();
+        queued.assert_running();
+        assert!(
+            Instant::now() < deadline,
+            "second identical workspace request did not queue independently: {}",
+            service.diagnostics()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let queued_operations = operations();
+    assert_eq!(queued_operations.len(), 2);
+    let queued_operation = queued_operations
+        .difference(&first_operations)
+        .next()
+        .unwrap()
+        .clone();
+    let mut survivor = shared_service_client(root, 5252, &profile);
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while subscriptions(&service.events()).len() < 3 {
+        service.assert_running();
+        first.assert_running();
+        queued.assert_running();
+        survivor.assert_running();
+        assert!(
+            Instant::now() < deadline,
+            "third identical workspace request did not queue independently: {}",
+            service.diagnostics()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let all_operations = operations();
+    assert_eq!(all_operations.len(), 3);
+    assert_eq!(requests(), first_requests);
+    assert_eq!(read_bounded(&worker.state.join("requests.json")), journal);
+    assert_eq!(
+        service
+            .events()
+            .iter()
+            .filter(|event| {
+                event["kind"] == "rabsd-remote-dependency-admitted" && event["key"] == key
+            })
+            .count(),
+        1,
+        "queued workspace callers must not mint execution authority while the worker is busy"
+    );
+
+    let (code, events, output) = queued.finish(Duration::from_secs(15), true);
+    assert_ne!(code, 0, "{output}");
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["kind"] == "canonical-build-completed")
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while queued_operation.exists()
+        || !service.events().iter().any(|event| {
+            event["kind"] == "canonical-service-session-error"
+                && event["reason"].as_str().is_some_and(|reason| {
+                    reason.contains("canonical client disconnected; its operation was drained")
+                })
+        })
+    {
+        service.assert_running();
+        first.assert_running();
+        survivor.assert_running();
+        assert!(
+            Instant::now() < deadline,
+            "cancelled workspace waiter retained its operation or blocked its peers: {}",
+            service.diagnostics()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(operations().len(), 2);
+    assert_eq!(requests(), first_requests);
+    assert_eq!(read_bounded(&worker.state.join("requests.json")), journal);
+    assert_eq!(
+        service
+            .events()
+            .iter()
+            .filter(|event| {
+                event["kind"] == "rabsd-remote-dependency-admitted" && event["key"] == key
+            })
+            .count(),
+        1,
+        "cancelling a queued caller must not admit another execution while the worker is paused"
+    );
+
+    drop(paused);
+    let (code, events, output) = first.finish(Duration::from_secs(240), false);
+    assert_eq!(code, 0, "{output}\n{}", service.diagnostics());
+    let first_target =
+        assert_shared_service_build(root, 5250, &events, &output, "42\n", "disabled");
+    let (code, events, output) = survivor.finish(Duration::from_secs(240), false);
+    assert_eq!(code, 0, "{output}\n{}", service.diagnostics());
+    let survivor_target =
+        assert_shared_service_build(root, 5252, &events, &output, "42\n", "disabled");
+    assert_ne!(first_target, survivor_target);
+    let receipt = worker.completed_receipt();
+    assert!(
+        receipt["request_id"].as_u64().unwrap() > first_request_id,
+        "the surviving caller must execute a distinct worker request: {receipt}"
+    );
+    let events = service.events();
+    assert_eq!(subscriptions(&events).len(), 3);
+    for kind in [
+        "rabsd-remote-dependency-admitted",
+        "rabsd-remote-dependency-executed",
+    ] {
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["kind"] == kind && event["key"] == key)
+                .count(),
+            2,
+            "only the two surviving callers may execute this identical workspace action: {events:?}"
+        );
+    }
+    let admissions = events
+        .iter()
+        .filter(|event| event["kind"] == "rabsd-remote-dependency-admitted" && event["key"] == key)
+        .collect::<Vec<_>>();
+    for field in ["generation_id", "attempt_id", "execution_lease_id"] {
+        let identities = admissions
+            .iter()
+            .map(|event| {
+                assert_eq!(event["purpose"], "primary");
+                event[field].as_str().unwrap()
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            identities.len(),
+            2,
+            "workspace executions must acquire distinct {field}: {admissions:?}"
+        );
+    }
+    assert!(
+        !events.iter().any(|event| {
+            event["key"] == key
+                && (matches!(
+                    event["kind"].as_str(),
+                    Some(
+                        "rabsd-remote-dependency-failed" | "rabsd-remote-dependency-install-failed"
+                    )
+                ) || (event["kind"] == "rabsd-live-dependency"
+                    && matches!(
+                        event["decision"].as_str(),
+                        Some("execute" | "hit" | "served")
+                    )))
+        }),
+        "local fallback or cache replay cannot satisfy fresh queued workspace execution: {events:?}"
+    );
+    assert!(all_operations.iter().all(|path| !path.exists()));
+    service.finish(Duration::from_secs(15), true);
+    worker.finish();
+
+    // Open the production store only after the service has released it. Two
+    // successful installations must leave no reusable workspace publication.
+    let cas =
+        rabsd::janitor::store::mount_and_reconcile(&root.join("state/canonical-compile-v1/cas"))
+            .unwrap();
+    let mut store = cas.store().lock().unwrap();
+    assert!(store.published_manifest_key_str(&key).unwrap().is_none());
+    assert!(!store.has_serving_state_key(&key).unwrap());
+    assert!(!store.has_evidence_key(&key).unwrap());
+    assert!(
+        store
+            .query(
+                "SELECT attempt_hex FROM verification_samples WHERE action_key = ?1",
+                &[SqlValue::Text(key.clone())],
+            )
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .query(
+                "SELECT decision FROM decision_receipts WHERE kind = ?1 AND subject = ?2",
+                &[
+                    SqlValue::Text(rabsd::coord::live_dependency::LIVE_TRANSCRIPT_RECEIPT.into()),
+                    SqlValue::Text(key),
+                ],
+            )
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 #[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual TLS upload loss retries on a second worker within one action generation"]
 fn canonical_shared_remote_failover_preserves_generation_and_surviving_subscriber() {
     let (owner, mut origin_profile) = native_fixture();

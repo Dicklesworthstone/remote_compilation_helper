@@ -5,17 +5,22 @@
 //! capacity becomes available. Other offers may join that open queued or active
 //! flight. Losing a subscriber releases only its interest. The service owns and
 //! joins the dispatcher and transports after the originating edge exits.
+//! Workspace requests use the same FIFO and capacity bounds, but each has a
+//! unique private queue identity and exactly one result owner. Matching action
+//! keys never join or replay workspace output; every request executes afresh.
 
 use super::super::shared_work::{
     DeferredLaunch, LaunchStatus, SharedWork, Subscription, WorkError,
 };
 use super::{
-    CoordLive, LiveDependencyRequest, MAX_PENDING_ACTIONS, OperationCancellation, PendingRemote,
-    PendingRemoteInstall, RemoteInstallAuthority, RemoteOutput, RemoteResult, RemoteValidation,
+    CoordLive, DependencyWorkerPool, LiveDependencyRequest, MAX_PENDING_ACTIONS,
+    OperationCancellation, PendingActionClaim, PendingRemote, PendingRemoteInstall,
+    RemoteInstallAuthority, RemoteOutput, RemoteResult, RemoteValidation, RequestOwnedResult,
     TypedDigest, WorkerProbe,
 };
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
+use std::io;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -79,7 +84,7 @@ impl QueueSignal {
 
 struct QueuedRemote {
     pending: Option<PendingRemote>,
-    launch: DeferredLaunch<TypedDigest, SharedRemoteResult>,
+    launch: DeferredLaunch<FlightKey, SharedRemoteResult>,
     cancellation: OperationCancellation,
     deadline: Instant,
 }
@@ -102,13 +107,88 @@ struct Dispatcher {
     failure: Option<String>,
 }
 
-/// The canonical service's bounded owner of all shared remote producer threads.
+/// Dependency cohorts can be joined by their exact key. A workspace request's
+/// queue identity is private to its sole subscription, even when another
+/// request has byte-identical compilation inputs and the same action key.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum FlightKey {
+    Dependency(TypedDigest),
+    RequestOwned(u64),
+}
+
+#[derive(Debug, Default)]
+struct RequestBudget {
+    state: Mutex<RequestBudgetState>,
+}
+
+#[derive(Debug, Default)]
+struct RequestBudgetState {
+    next: u64,
+    live: usize,
+}
+
+impl RequestBudget {
+    fn reserve(self: &Arc<Self>) -> io::Result<RequestPermit> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("remote request budget lock poisoned"))?;
+        if state.live >= MAX_SHARED_SUBSCRIBERS {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "remote request offer and subscription capacity exhausted",
+            ));
+        }
+        let id = state
+            .next
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("remote request identity exhausted"))?;
+        state.next = id;
+        state.live += 1;
+        Ok(RequestPermit {
+            budget: Arc::clone(self),
+            id,
+        })
+    }
+}
+
+/// A request reserves service-wide demand before its remote offer is sent.
+/// Retain this permit through acceptance and independent result delivery;
+/// caller disappearance releases only this request's counted interest.
+#[derive(Debug)]
+struct RequestPermit {
+    budget: Arc<RequestBudget>,
+    id: u64,
+}
+
+impl RequestPermit {
+    fn flight_key(&self, action_key: &TypedDigest, request_owned: bool) -> FlightKey {
+        if request_owned {
+            FlightKey::RequestOwned(self.id)
+        } else {
+            FlightKey::Dependency(action_key.clone())
+        }
+    }
+}
+
+impl Drop for RequestPermit {
+    fn drop(&mut self) {
+        self.budget
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .live -= 1;
+    }
+}
+
+/// The canonical service's bounded owner of queued remote producer threads.
 /// Keep this separate from `RemoteDependencies`: producers retain the worker
 /// pool, and must never retain their own thread registry through that pool.
 pub struct SharedRemoteExecutions {
-    work: Arc<SharedWork<TypedDigest, SharedRemoteResult>>,
+    work: Arc<SharedWork<FlightKey, SharedRemoteResult>>,
     queue: Arc<QueueCore>,
     dispatcher: Mutex<Dispatcher>,
+    requests: Arc<RequestBudget>,
 }
 
 impl fmt::Debug for SharedRemoteExecutions {
@@ -136,6 +216,7 @@ impl SharedRemoteExecutions {
             ),
             queue,
             dispatcher: Mutex::new(Dispatcher::default()),
+            requests: Arc::new(RequestBudget::default()),
         })
     }
 
@@ -181,10 +262,14 @@ impl SharedRemoteExecutions {
         if queue.closed {
             return None;
         }
-        self.work.try_join(key)
+        self.work.try_join(&FlightKey::Dependency(key.clone()))
     }
 
-    fn enqueue(&self, pending: PendingRemote) -> Result<Subscription<SharedRemoteResult>, String> {
+    fn enqueue(
+        &self,
+        pending: PendingRemote,
+        permit: &RequestPermit,
+    ) -> Result<Subscription<SharedRemoteResult>, String> {
         if pending.reservation.is_some() {
             return Err("queued remote action already owns a worker".into());
         }
@@ -221,6 +306,8 @@ impl SharedRemoteExecutions {
         let deadline = Instant::now()
             .checked_add(QUEUE_WAIT)
             .ok_or("shared remote queue deadline overflow")?;
+        let flight_key =
+            permit.flight_key(pending.action_key(), pending.request.is_execution_only());
         pending
             .remote
             .workers
@@ -231,7 +318,7 @@ impl SharedRemoteExecutions {
         let signal = Arc::downgrade(&self.queue.signal);
         let (subscription, launch) = self
             .work
-            .defer(pending.action_key().clone(), move || {
+            .defer(flight_key, move || {
                 cancel.cancel();
                 if let Some(signal) = signal.upgrade() {
                     signal.notify();
@@ -275,7 +362,7 @@ fn failed_before_start(reason: impl Into<String>) -> SharedRemoteResult {
 /// producers remain owned by SharedWork and are joined by service shutdown.
 struct QueueOwner {
     queue: Arc<QueueCore>,
-    work: Arc<SharedWork<TypedDigest, SharedRemoteResult>>,
+    work: Arc<SharedWork<FlightKey, SharedRemoteResult>>,
 }
 
 impl Drop for QueueOwner {
@@ -300,7 +387,33 @@ impl Drop for QueueOwner {
     }
 }
 
-fn dispatch(work: Arc<SharedWork<TypedDigest, SharedRemoteResult>>, queue: Arc<QueueCore>) {
+/// Once an earlier request waits for an action key, later requests for that
+/// key must wait for the next FIFO pass too. A producer may release its claim
+/// between two probes in this pass; that release must not let a later caller
+/// overtake the earlier waiter. Unrelated keys can still use spare workers.
+fn probe_in_order(
+    waiting_keys: &mut HashSet<TypedDigest>,
+    workers: &DependencyWorkerPool,
+    key: &TypedDigest,
+    claim: &mut Option<PendingActionClaim>,
+) -> io::Result<WorkerProbe> {
+    if waiting_keys.contains(key) {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "an earlier queued request is waiting for this action key",
+        ));
+    }
+    let result = workers.probe_claimed_worker(key, claim);
+    if result
+        .as_ref()
+        .is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock)
+    {
+        waiting_keys.insert(key.clone());
+    }
+    result
+}
+
+fn dispatch(work: Arc<SharedWork<FlightKey, SharedRemoteResult>>, queue: Arc<QueueCore>) {
     let owner = QueueOwner { queue, work };
     loop {
         let observed = owner.queue.signal.version();
@@ -317,6 +430,7 @@ fn dispatch(work: Arc<SharedWork<TypedDigest, SharedRemoteResult>>, queue: Arc<Q
         };
         let mut retained = VecDeque::new();
         let mut blocked = false;
+        let mut waiting_keys = HashSet::new();
         let mut deadline: Option<Instant> = None;
         for mut queued in pending {
             if owner
@@ -349,6 +463,7 @@ fn dispatch(work: Arc<SharedWork<TypedDigest, SharedRemoteResult>>, queue: Arc<Q
             let remote = Arc::clone(&queued.pending.as_ref().expect("queued input owner").remote);
             let mut pool_error = None;
             let mut worker_deadline = None;
+            let mut claim_waiting = false;
             let result = owner.work.try_launch(&mut queued.launch, || {
                 if owner
                     .queue
@@ -359,7 +474,16 @@ fn dispatch(work: Arc<SharedWork<TypedDigest, SharedRemoteResult>>, queue: Arc<Q
                 {
                     return None;
                 }
-                match remote.workers.probe_worker() {
+                // Acquire no worker while an earlier same-key producer still
+                // owns its attempt. Claim release has its own availability
+                // wake, including the gap after worker reservation release.
+                let pending = queued.pending.as_mut().expect("queued input owner");
+                match probe_in_order(
+                    &mut waiting_keys,
+                    &remote.workers,
+                    &pending.request.key.action_key,
+                    &mut pending.action_claim,
+                ) {
                     Ok(WorkerProbe::Reserved(reservation)) => {
                         let mut pending = queued.pending.take().expect("queued input owner");
                         pending.reservation = Some(reservation);
@@ -368,6 +492,10 @@ fn dispatch(work: Arc<SharedWork<TypedDigest, SharedRemoteResult>>, queue: Arc<Q
                     }
                     Ok(WorkerProbe::Waiting(deadline)) => {
                         worker_deadline = deadline;
+                        None
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        claim_waiting = true;
                         None
                     }
                     Err(error) => {
@@ -388,7 +516,10 @@ fn dispatch(work: Arc<SharedWork<TypedDigest, SharedRemoteResult>>, queue: Arc<Q
                         if let Some(ready) = worker_deadline {
                             deadline = Some(deadline.map_or(ready, |at| at.min(ready)));
                         }
-                        blocked = true;
+                        // A prior same-key producer can occupy only one
+                        // worker. Keep that key's FIFO order without forcing
+                        // unrelated ready actions to leave other workers idle.
+                        blocked = !claim_waiting;
                         retained.push_back(queued);
                     }
                 }
@@ -418,12 +549,44 @@ fn dispatch(work: Arc<SharedWork<TypedDigest, SharedRemoteResult>>, queue: Arc<Q
     }
 }
 
-/// This capability can only be constructed from the current producer's
-/// successful H011 publication. It contains no arbitrary-key lookup path and
-/// cannot contain an affine workspace result. Terminal flights reject joins.
+/// Immutable bytes may have several dependency subscribers only after H011
+/// publication. An unpublished workspace capture instead retains a single
+/// affine owner behind a one-shot take; its private flight cannot be joined.
+#[derive(Debug)]
+pub(super) struct RequestOwnedOutput {
+    output: Arc<RemoteOutput>,
+    result: Mutex<Option<Box<RequestOwnedResult>>>,
+}
+
+impl RequestOwnedOutput {
+    fn new(output: Arc<RemoteOutput>, result: Box<RequestOwnedResult>) -> Result<Self, String> {
+        result.verify_binding(&output.manifest.action_key, &output.manifest_key)?;
+        if result.manifest() != &output.manifest {
+            return Err("request-owned queued result differs from its captured manifest".into());
+        }
+        Ok(Self {
+            output,
+            result: Mutex::new(Some(result)),
+        })
+    }
+
+    fn take(&self) -> Result<Box<RequestOwnedResult>, String> {
+        self.result
+            .lock()
+            .map_err(|_| "request-owned remote result lock poisoned")?
+            .take()
+            .ok_or_else(|| "request-owned remote result already consumed".into())
+    }
+}
+
+/// A current producer's result, never an arbitrary-key cache lookup. Shared
+/// publication and one-shot workspace custody remain separate alternatives.
+/// Terminal flights reject joins, and private workspace flights never admit
+/// followers even while queued or executing.
 #[derive(Debug)]
 pub(super) enum SharedRemoteResult {
     Published(Arc<RemoteOutput>),
+    RequestOwned(RequestOwnedOutput),
     Failed {
         reason: String,
         execution_finished: bool,
@@ -441,17 +604,21 @@ impl SharedRemoteResult {
                 execution_finished,
             },
             RemoteResult::Ready(ready) => {
-                if ready.request.is_execution_only() {
-                    return Self::Failed {
-                        reason: "fresh workspace execution cannot enter a shared result flight"
-                            .into(),
-                        execution_finished: true,
-                    };
-                }
                 if let Err(reason) = ready.output.verify_binding(&ready.request) {
                     return Self::Failed {
                         reason,
                         execution_finished: true,
+                    };
+                }
+                if ready.request.is_execution_only() {
+                    let RemoteInstallAuthority::RequestOwned(result) = ready.result else {
+                        return failed_before_start(
+                            "queued workspace execution lacks its request-owned result",
+                        );
+                    };
+                    return match RequestOwnedOutput::new(ready.output, result) {
+                        Ok(owned) => Self::RequestOwned(owned),
+                        Err(reason) => failed_before_start(reason),
                     };
                 }
                 match ready.result.into_shared_output(ready.output) {
@@ -498,6 +665,39 @@ impl SubscriberRequest {
             result: RemoteInstallAuthority::Published,
         })
     }
+
+    fn ready_owned(self, owned: &RequestOwnedOutput) -> RemoteResult {
+        if !self.request.is_execution_only() {
+            return failed_owned_result(
+                "dependency subscribers cannot consume a request-owned workspace result",
+            );
+        }
+        if let Err(reason) = owned.output.verify_binding(&self.request) {
+            return failed_owned_result(reason);
+        }
+        let result = match owned.take() {
+            Ok(result) => result,
+            Err(reason) => return failed_owned_result(reason),
+        };
+        // This sole subscriber retains its original request, witnesses and
+        // destination. Taking affine custody does not install, publish, index
+        // a transcript or add verification evidence. Its independent writer
+        // ACK must still pass through the ordinary request-owned installer.
+        RemoteResult::Ready(PendingRemoteInstall {
+            coord: self.coord,
+            request: self.request,
+            output: Arc::clone(&owned.output),
+            validation: self.validation,
+            result: RemoteInstallAuthority::RequestOwned(result),
+        })
+    }
+}
+
+fn failed_owned_result(reason: impl Into<String>) -> RemoteResult {
+    RemoteResult::Failed {
+        reason: reason.into(),
+        execution_finished: true,
+    }
 }
 
 enum Offer {
@@ -508,12 +708,14 @@ enum Offer {
     Joined(Subscription<SharedRemoteResult>),
 }
 
-/// An unaccepted private-execution offer. Dropping a starter releases its key
-/// claim without reserving a worker or starting a flight; dropping a follower
-/// removes only its enrolled interest. Neither authorizes output writes.
+/// An unaccepted private-execution offer. Dropping a dependency starter
+/// releases its key claim; a workspace starter owns no key claim yet. Neither
+/// has reserved a worker or started a flight. Dropping a dependency follower
+/// removes only its enrolled interest. No alternative authorizes output writes.
 pub struct PendingSharedRemote {
     subscriber: SubscriberRequest,
     offer: Offer,
+    permit: RequestPermit,
 }
 
 impl fmt::Debug for PendingSharedRemote {
@@ -526,19 +728,24 @@ impl fmt::Debug for PendingSharedRemote {
 }
 
 impl PendingSharedRemote {
-    pub(super) fn starter(executions: Arc<SharedRemoteExecutions>, pending: PendingRemote) -> Self {
+    pub(super) fn starter(
+        executions: Arc<SharedRemoteExecutions>,
+        pending: PendingRemote,
+    ) -> io::Result<Self> {
+        let permit = executions.requests.reserve()?;
         let subscriber = SubscriberRequest {
             coord: Arc::clone(&pending.lane.coord),
             request: pending.request.clone(),
             validation: pending.invocation.validation.clone(),
         };
-        Self {
+        Ok(Self {
             subscriber,
             offer: Offer::Start {
                 executions,
                 pending: Box::new(pending),
             },
-        }
+            permit,
+        })
     }
 
     pub(super) fn joined(
@@ -546,15 +753,18 @@ impl PendingSharedRemote {
         request: LiveDependencyRequest,
         validation: RemoteValidation,
         subscription: Subscription<SharedRemoteResult>,
-    ) -> Self {
-        Self {
+        executions: &SharedRemoteExecutions,
+    ) -> io::Result<Self> {
+        let permit = executions.requests.reserve()?;
+        Ok(Self {
             subscriber: SubscriberRequest {
                 coord,
                 request,
                 validation,
             },
             offer: Offer::Joined(subscription),
-        }
+            permit,
+        })
     }
 
     #[must_use]
@@ -567,25 +777,44 @@ impl PendingSharedRemote {
     /// completed between the offer and this acknowledgment. No new member can
     /// join a terminal flight or reuse its current-producer privilege later.
     pub fn accept(self) -> Result<SharedRemoteSubscription, String> {
-        let Self { subscriber, offer } = self;
-        if subscriber.request.is_execution_only() {
-            return Err("workspace execution cannot accept a shared remote offer".into());
-        }
+        let Self {
+            subscriber,
+            offer,
+            permit,
+        } = self;
         let (work, disposition) = match offer {
-            Offer::Joined(subscription) => (subscription, "joined"),
+            Offer::Joined(subscription) => {
+                if subscriber.request.is_execution_only() {
+                    return Err("workspace execution cannot join a shared remote offer".into());
+                }
+                (subscription, "joined")
+            }
             Offer::Start {
                 executions,
                 pending,
-            } => (executions.enqueue(*pending)?, "queued"),
+            } => (
+                executions.enqueue(*pending, &permit)?,
+                if subscriber.request.is_execution_only() {
+                    "queued-request-owned"
+                } else {
+                    "queued"
+                },
+            ),
         };
         let key = rabs_cas::metadata_store::digest_key(&subscriber.request.key.action_key);
+        let queue_request = permit.id.to_string();
         crate::edge::server::log_line(
             "rabsd-shared-remote-subscribed",
-            &[("key", &key), ("disposition", disposition)],
+            &[
+                ("key", &key),
+                ("disposition", disposition),
+                ("queue_request_id", &queue_request),
+            ],
         );
         Ok(SharedRemoteSubscription {
             subscriber: Some(subscriber),
             work,
+            _permit: permit,
         })
     }
 }
@@ -596,6 +825,7 @@ impl PendingSharedRemote {
 pub struct SharedRemoteSubscription {
     subscriber: Option<SubscriberRequest>,
     work: Subscription<SharedRemoteResult>,
+    _permit: RequestPermit,
 }
 
 impl fmt::Debug for SharedRemoteSubscription {
@@ -630,6 +860,7 @@ impl SharedRemoteSubscription {
         match outcome {
             Ok(result) => match result.as_ref() {
                 SharedRemoteResult::Published(output) => subscriber.ready(Arc::clone(output)),
+                SharedRemoteResult::RequestOwned(owned) => subscriber.ready_owned(owned),
                 SharedRemoteResult::Failed {
                     reason,
                     execution_finished,
@@ -700,6 +931,272 @@ mod tests {
     }
 
     #[test]
+    fn claim_release_mid_pass_cannot_let_a_later_same_key_request_overtake() {
+        let workers = super::super::worker_pool_tests::pool(
+            std::path::Path::new("/private/fifo-workspace-pool"),
+            2,
+        );
+        let key = rabs_key::typed_digest::compute("rabs.test.private-fifo.v1", b"shared-key");
+        let other = rabs_key::typed_digest::compute("rabs.test.private-fifo.v1", b"unrelated");
+        let running = workers.try_reserve(&key).unwrap();
+        let mut waiting_keys = HashSet::new();
+        let mut earlier = None;
+        assert_eq!(
+            probe_in_order(&mut waiting_keys, &workers, &key, &mut earlier)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let mut unrelated = None;
+        let WorkerProbe::Reserved(unrelated_worker) =
+            probe_in_order(&mut waiting_keys, &workers, &other, &mut unrelated).unwrap()
+        else {
+            panic!("an unrelated ready action must use the spare worker");
+        };
+        // Complete the old producer after the first queued request failed its
+        // probe, but before a later same-key request is visited in this pass.
+        drop(running);
+        let mut later = None;
+        assert_eq!(
+            probe_in_order(&mut waiting_keys, &workers, &key, &mut later)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(earlier.is_none() && later.is_none());
+        let mut next_pass = HashSet::new();
+        let WorkerProbe::Reserved(earlier_worker) =
+            probe_in_order(&mut next_pass, &workers, &key, &mut earlier).unwrap()
+        else {
+            panic!("the earlier waiter must acquire the newly freed worker first");
+        };
+        assert_eq!(
+            probe_in_order(&mut next_pass, &workers, &key, &mut later)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(later.is_none());
+        drop((earlier_worker, earlier, unrelated_worker, unrelated));
+        assert!(workers.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unacknowledged_requests_are_bounded_individually_even_for_one_action_key() {
+        let executions = SharedRemoteExecutions::new(1);
+        let key = rabs_key::typed_digest::compute("rabs.test.private-queue.v1", b"same-action");
+        // These are exactly the permits a starter/follower must reserve before
+        // returning its offer. No ACK, deferred flight or worker is present.
+        let mut offers = (0..MAX_SHARED_SUBSCRIBERS)
+            .map(|_| executions.requests.reserve().unwrap())
+            .collect::<Vec<_>>();
+        let keys = offers
+            .iter()
+            .map(|permit| permit.flight_key(&key, true))
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(keys.len(), MAX_SHARED_SUBSCRIBERS);
+        assert_eq!(
+            executions.requests.reserve().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(executions.queue.state.lock().unwrap().pending.is_empty());
+        assert!(executions.dispatcher.lock().unwrap().worker.is_none());
+        assert!(executions.try_join(&key).is_none());
+
+        drop(offers.pop());
+        let replacement = executions.requests.reserve().unwrap();
+        assert!(!keys.contains(&replacement.flight_key(&key, true)));
+        // Dependency callers spend the same request budget. Their join key
+        // differs from every private request, regardless of matching content.
+        assert!(!keys.contains(&replacement.flight_key(&key, false)));
+        assert_eq!(
+            executions.requests.reserve().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(offers);
+        drop(replacement);
+        assert_eq!(executions.requests.state.lock().unwrap().live, 0);
+        executions.shutdown().unwrap();
+    }
+
+    #[test]
+    fn request_identity_exhaustion_never_wraps_or_reuses_a_live_private_flight() {
+        let budget = Arc::new(RequestBudget::default());
+        budget.state.lock().unwrap().next = u64::MAX - 1;
+        let last = budget.reserve().unwrap();
+        assert_eq!(last.id, u64::MAX);
+        assert!(
+            budget
+                .reserve()
+                .unwrap_err()
+                .to_string()
+                .contains("identity exhausted")
+        );
+        drop(last);
+        assert_eq!(budget.state.lock().unwrap().live, 0);
+        assert!(
+            budget.reserve().is_err(),
+            "release must not recycle identity"
+        );
+    }
+
+    #[test]
+    fn cancelling_one_same_key_workspace_waiter_cannot_cancel_or_join_another() {
+        let executions = SharedRemoteExecutions::new(1);
+        let key = rabs_key::typed_digest::compute("rabs.test.private-cancel.v1", b"same-action");
+        let first = executions.requests.reserve().unwrap();
+        let second = executions.requests.reserve().unwrap();
+        let first_cancel = OperationCancellation::new();
+        let second_cancel = OperationCancellation::new();
+        let cancel = first_cancel.clone();
+        let (first_member, mut first_launch) = executions
+            .work
+            .defer(first.flight_key(&key, true), move || cancel.cancel())
+            .unwrap();
+        let cancel = second_cancel.clone();
+        let (mut second_member, mut second_launch) = executions
+            .work
+            .defer(second.flight_key(&key, true), move || cancel.cancel())
+            .unwrap();
+        assert!(executions.try_join(&key).is_none());
+        drop(first_member);
+        drop(first);
+        assert!(first_cancel.is_cancelled());
+        assert!(!second_cancel.is_cancelled());
+        assert_eq!(
+            executions
+                .work
+                .try_launch(
+                    &mut first_launch,
+                    || -> Option<fn() -> SharedRemoteResult> {
+                        panic!("a cancelled workspace waiter must not even probe a worker");
+                    }
+                )
+                .unwrap(),
+            LaunchStatus::CancelledBeforeStart
+        );
+        assert!(second_launch.is_pending());
+        executions
+            .work
+            .finish_deferred(&mut second_launch, failed_before_start("test refusal"))
+            .unwrap();
+        assert!(matches!(
+            wait(second_member.wait()).unwrap().as_ref(),
+            SharedRemoteResult::Failed { reason, execution_finished: true }
+                if reason == "test refusal"
+        ));
+        assert!(!second_cancel.is_cancelled());
+        drop(second_member);
+        drop(second);
+        executions.shutdown().unwrap();
+    }
+
+    #[test]
+    fn same_key_workspace_results_keep_distinct_one_shot_custody_without_publication() {
+        // Exercise real CAS pins and independent filesystem installation with
+        // explicit capture fixtures. This is not compiler or TLS evidence.
+        let fixture = Fixture::new();
+        let first_capture = fixture.capture();
+        let second_capture = fixture.capture();
+        let key = first_capture.manifest().action_key.clone();
+        let first_attempt = first_capture.authority().attempt_id;
+        let second_attempt = second_capture.authority().attempt_id;
+        assert_ne!(first_attempt, second_attempt);
+        let output = |capture: &RequestOwnedResult| {
+            Arc::new(RemoteOutput {
+                manifest: capture.manifest().clone(),
+                manifest_key: capture.captured.manifest_key.clone(),
+                canonical_transcript: Vec::new(),
+            })
+        };
+        let first_result =
+            RequestOwnedOutput::new(output(&first_capture), Box::new(first_capture)).unwrap();
+        let second_result =
+            RequestOwnedOutput::new(output(&second_capture), Box::new(second_capture)).unwrap();
+        let executions = SharedRemoteExecutions::new(1);
+        let first = executions.requests.reserve().unwrap();
+        let second = executions.requests.reserve().unwrap();
+        let (mut first_member, mut first_launch) = executions
+            .work
+            .defer(first.flight_key(&key, true), || {})
+            .unwrap();
+        let (mut second_member, mut second_launch) = executions
+            .work
+            .defer(second.flight_key(&key, true), || {})
+            .unwrap();
+        let (release, released) = mpsc::sync_channel(1);
+        assert_eq!(
+            executions
+                .work
+                .try_launch(&mut first_launch, || Some(move || {
+                    released.recv().unwrap();
+                    SharedRemoteResult::RequestOwned(first_result)
+                }))
+                .unwrap(),
+            LaunchStatus::Started
+        );
+        assert!(executions.try_join(&key).is_none());
+        assert_eq!(
+            executions
+                .work
+                .try_launch(
+                    &mut second_launch,
+                    || -> Option<fn() -> SharedRemoteResult> {
+                        panic!("the first private worker still owns capacity");
+                    }
+                )
+                .unwrap(),
+            LaunchStatus::Blocked
+        );
+        release.send(()).unwrap();
+        let first_result = wait(first_member.wait()).unwrap();
+        assert_eq!(
+            executions
+                .work
+                .try_launch(&mut second_launch, || Some(move || {
+                    SharedRemoteResult::RequestOwned(second_result)
+                }))
+                .unwrap(),
+            LaunchStatus::Started
+        );
+        let second_result = wait(second_member.wait()).unwrap();
+        let SharedRemoteResult::RequestOwned(first_result) = first_result.as_ref() else {
+            panic!("first workspace request lost affine custody");
+        };
+        let SharedRemoteResult::RequestOwned(second_result) = second_result.as_ref() else {
+            panic!("second workspace request lost affine custody");
+        };
+        let first_capture = first_result.take().unwrap();
+        let second_capture = second_result.take().unwrap();
+        assert_eq!(first_capture.authority().attempt_id, first_attempt);
+        assert_eq!(second_capture.authority().attempt_id, second_attempt);
+        assert!(first_result.take().is_err());
+        assert!(second_result.take().is_err());
+        let first_files = fixture
+            .install(
+                *first_capture,
+                &fixture.root.path().join("first"),
+                || Ok(()),
+            )
+            .unwrap();
+        let second_files = fixture
+            .install(*second_capture, &fixture.root.path().join("second"), || {
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(first_files.len(), 1);
+        assert_eq!(second_files.len(), 1);
+        assert_ne!(first_files, second_files);
+        assert_eq!(
+            std::fs::read(&first_files[0]).unwrap(),
+            std::fs::read(&second_files[0]).unwrap()
+        );
+        fixture.assert_unpublished();
+        assert!(executions.try_join(&key).is_none());
+        executions.shutdown().unwrap();
+    }
+
+    #[test]
     fn queued_deadline_settles_surviving_members_without_starting_a_producer() {
         let executions = SharedRemoteExecutions::new(1);
         let key = rabs_key::typed_digest::compute("rabs.test.queued-deadline.v1", b"action");
@@ -707,7 +1204,7 @@ mod tests {
         let cancel = cancellation.clone();
         let (origin, launch) = executions
             .work
-            .defer(key.clone(), move || cancel.cancel())
+            .defer(FlightKey::Dependency(key.clone()), move || cancel.cancel())
             .unwrap();
         let mut follower = executions.try_join(&key).unwrap();
         drop(origin);
@@ -747,7 +1244,10 @@ mod tests {
         let executions = SharedRemoteExecutions::new(1);
         let key = rabs_key::typed_digest::compute("rabs.test.queued-shutdown.v1", b"action");
         let cancellation = OperationCancellation::new();
-        let (mut member, launch) = executions.work.defer(key.clone(), || {}).unwrap();
+        let (mut member, launch) = executions
+            .work
+            .defer(FlightKey::Dependency(key.clone()), || {})
+            .unwrap();
         executions
             .queue
             .state
@@ -801,7 +1301,7 @@ mod tests {
         let origin = executions
             .work
             .start(
-                key.clone(),
+                FlightKey::Dependency(key.clone()),
                 move || {
                     cancel.fetch_add(1, Ordering::AcqRel);
                 },
