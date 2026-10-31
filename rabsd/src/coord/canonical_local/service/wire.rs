@@ -78,6 +78,35 @@ pub(super) fn configure(stream: &UnixStream) -> io::Result<()> {
     stream.set_write_timeout(Some(POLL))
 }
 
+/// A submitted client has no further valid messages. Check readiness without
+/// delaying output or admission behind the socket's ordinary read timeout.
+pub(super) fn check_client(stream: &mut UnixStream) -> io::Result<()> {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    let mut descriptors = [PollFd::new(&*stream, PollFlags::IN)];
+    let timeout = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    match poll(&mut descriptors, Some(&timeout)) {
+        Ok(0) | Err(rustix::io::Errno::INTR) => return Ok(()),
+        Ok(_) => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut extra = [0];
+    match stream.read(&mut extra) {
+        Ok(0) => Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "canonical client disconnected; its operation was cancelled",
+        )),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "canonical client sent another request on an active connection",
+        )),
+        Err(error) if retryable(&error) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 fn checkpoint(deadline: Instant, stopped: &AtomicBool) -> io::Result<()> {
     if stopped.load(Ordering::Acquire) {
         return Err(io::Error::new(

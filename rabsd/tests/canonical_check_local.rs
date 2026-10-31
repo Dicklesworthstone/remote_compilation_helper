@@ -400,7 +400,7 @@ fn run_with_stdin(
 }
 
 #[test]
-fn cli_rejects_profile_environment_instead_of_granting_an_ambient_mount_capability() {
+fn cli_rejects_profile_environment_that_replaces_driver_control() {
     let root = tempfile::tempdir().unwrap();
     fs::write(root.path().join("config.toml"), "[rabs]\n").unwrap();
     let profile = json!({"version":"canonical-compile-local-v1", "source_root":"/source",
@@ -408,7 +408,10 @@ fn cli_rejects_profile_environment_instead_of_granting_an_ambient_mount_capabili
         "wrapper":"/rabs-wrap", "env":{"RABS_SOCKET_PATH":"/ordinary-daemon.sock"}});
     let (code, _, output) = run(root.path(), 0, &profile);
     assert_eq!(code, 2, "{output}");
-    assert!(output.contains("unknown field `env`"), "{output}");
+    assert!(
+        output.contains("canonical env cannot replace worker, compiler or preparation controls"),
+        "{output}"
+    );
     assert!(!output.contains("canonical-compilation-started"));
 }
 
@@ -746,6 +749,45 @@ fn wait_for_shared_service_marker(
             "actual Cargo build script never reached its synchronization point: {}\n{}",
             client.diagnostics(),
             service.diagnostics()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Cargo has already compiled this build script, but the script is held at its
+/// marker. Its artifact event and progress line must reach the caller while
+/// the operation is still running; a driver-start event alone is insufficient.
+fn wait_for_shared_service_cargo_output(
+    service: &mut SharedServiceChild,
+    client: &mut SharedServiceChild,
+) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        service.assert_running();
+        client.assert_running();
+        let stdout = read_bounded(&client.stdout);
+        let stderr = read_bounded(&client.stderr);
+        let stdout = String::from_utf8(stdout).unwrap();
+        let stderr = String::from_utf8(stderr).unwrap();
+        let artifact = stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|event| {
+                event["reason"] == "compiler-artifact"
+                    && event["target"]["kind"] == json!(["custom-build"])
+                    && event["manifest_path"] == "/__rabs/workspace/Cargo.toml"
+            });
+        if let Some(artifact) = artifact
+            && stderr.contains("Compiling canonical_app ")
+        {
+            assert!(!stdout.contains("\"reason\":\"build-finished\""));
+            assert!(!stderr.contains("\"kind\":\"canonical-build-completed\""));
+            return artifact;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "actual Cargo output was buffered until completion: {}",
+            client.diagnostics()
         );
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -1618,9 +1660,11 @@ fn canonical_shared_service_overlaps_builds_scopes_cancellation_and_reuses_priva
     let mut first = shared_service_client(root, 5000, &first_profile);
     let first_marker =
         wait_for_shared_service_marker(&root.join("ops"), "A", &mut service, &mut first);
+    wait_for_shared_service_cargo_output(&mut service, &mut first);
     let mut second = shared_service_client(root, 5001, &second_profile);
     let second_marker =
         wait_for_shared_service_marker(&root.join("ops"), "B", &mut service, &mut second);
+    let streamed_artifact = wait_for_shared_service_cargo_output(&mut service, &mut second);
     // Both native build scripts are simultaneously paused inside independent
     // Cargo roots. This is overlap evidence, not an elapsed-time speedup claim.
     first.assert_running();
@@ -1708,6 +1752,20 @@ fn canonical_shared_service_overlaps_builds_scopes_cancellation_and_reuses_priva
     .unwrap();
     let (code, events, output) = second.finish(Duration::from_secs(180), false);
     assert_eq!(code, 0, "{output}\n{}", service.diagnostics());
+    assert_eq!(
+        output
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|event| event == &streamed_artifact)
+            .count(),
+        1,
+        "a streamed Cargo artifact must not be replayed at completion: {output}"
+    );
+    assert_eq!(
+        output.matches("Compiling canonical_app ").count(),
+        1,
+        "streamed Cargo progress must not be replayed at completion: {output}"
+    );
     assert!(output.contains("SERVICE_DIAGNOSTIC_B_ONLY"), "{output}");
     assert!(!output.contains("SERVICE_DIAGNOSTIC_A_ONLY"), "{output}");
     let second_target =
@@ -1791,6 +1849,143 @@ fn canonical_shared_service_overlaps_builds_scopes_cancellation_and_reuses_priva
         "{output}"
     );
     assert_eq!(fs::read_dir(root.join("ops")).unwrap().count(), retained);
+}
+
+#[test]
+#[ignore = "requires full canonical bubblewrap namespaces, native toolchain and matching RABS_CANONICAL_TEST_WRAPPER; actual queued Cargo roots, cancellation and private-target reuse"]
+fn canonical_shared_service_queues_before_capture_and_cancels_only_waiting_interest() {
+    let (owner, mut first_profile) = native_fixture();
+    let root = owner.path();
+    let socket = root.join("queued-service.sock");
+    let path = root.join("queued-service.json");
+    fs::write(
+        &path,
+        serde_json::to_vec(&json!({
+            "version":"canonical-compile-service-v1", "state_root":root.join("state"),
+            "socket":socket, "max_roots":1, "max_queued_roots":1, "jobs_per_root":1,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    shared_service_source(&root.join("source-a"), "A", 101);
+    shared_service_source(&root.join("source-b"), "B", 202);
+    first_profile["command"] = json!("build");
+    first_profile["service_socket"] = json!(socket);
+    first_profile["target_cache"] =
+        json!({"runtime_epoch":"queued-service-native-v1", "max_bytes":268435456});
+    let mut second_profile = first_profile.clone();
+    second_profile["source_root"] = json!(root.join("source-b"));
+    let mut command = shared_service_command(root);
+    command.arg("--canonical-compile-service").arg(path);
+    let mut service = SharedServiceChild::spawn(root, "queued-service", command);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        service.assert_running();
+        if socket.exists()
+            && service
+                .events()
+                .iter()
+                .any(|event| event["kind"] == "canonical-service-listening")
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{}", service.diagnostics());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let mut first = shared_service_client(root, 7000, &first_profile);
+    let first_marker =
+        wait_for_shared_service_marker(&root.join("ops"), "A", &mut service, &mut first);
+    let captured = fs::read_dir(root.join("ops")).unwrap().count();
+    let wait_queued = |service: &mut SharedServiceChild,
+                       active: &mut SharedServiceChild,
+                       queued: &mut SharedServiceChild,
+                       count: usize| {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            service.assert_running();
+            active.assert_running();
+            queued.assert_running();
+            let events = service
+                .events()
+                .into_iter()
+                .filter(|event| event["kind"] == "canonical-service-queued")
+                .collect::<Vec<_>>();
+            assert!(
+                events.len() <= count,
+                "unexpected extra queue entries: {events:?}"
+            );
+            if events.len() == count {
+                assert_eq!(fs::read_dir(root.join("ops")).unwrap().count(), captured);
+                assert!(shared_service_markers(&root.join("ops"), "B").is_empty());
+                assert!(queued.events().is_empty(), "{}", queued.diagnostics());
+                return events.last().unwrap()["ticket"].as_u64().unwrap();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "client was not admitted to the bounded waiting queue: {}\n{}",
+                queued.diagnostics(),
+                service.diagnostics()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+
+    let mut cancelled = shared_service_client(root, 7001, &second_profile);
+    let cancelled_ticket = wait_queued(&mut service, &mut first, &mut cancelled, 1);
+    let (code, events, output) = cancelled.finish(Duration::from_secs(15), true);
+    assert_ne!(code, 0, "{output}");
+    assert!(
+        events.is_empty(),
+        "a cancelled queue entry started work: {output}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        service.assert_running();
+        first.assert_running();
+        if service.events().iter().any(|event| {
+            event["kind"] == "canonical-service-session-error"
+                && event["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("client disconnected"))
+        }) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{}", service.diagnostics());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(fs::read_dir(root.join("ops")).unwrap().count(), captured);
+
+    let mut survivor = shared_service_client(root, 7002, &second_profile);
+    let survivor_ticket = wait_queued(&mut service, &mut first, &mut survivor, 2);
+    assert!(survivor_ticket > cancelled_ticket);
+    fs::write(
+        first_marker
+            .parent()
+            .unwrap()
+            .join("shared-service-release"),
+        b"released",
+    )
+    .unwrap();
+    let (code, events, output) = first.finish(Duration::from_secs(180), false);
+    assert_eq!(code, 0, "{output}");
+    assert_shared_service_build(root, 7000, &events, &output, "A:143\n", "cold");
+
+    let marker =
+        wait_for_shared_service_marker(&root.join("ops"), "B", &mut service, &mut survivor);
+    fs::write(
+        marker.parent().unwrap().join("shared-service-release"),
+        b"released",
+    )
+    .unwrap();
+    let (code, events, output) = survivor.finish(Duration::from_secs(180), false);
+    assert_eq!(code, 0, "{output}");
+    assert_shared_service_build(root, 7002, &events, &output, "B:244\n", "cold");
+
+    let warm = shared_service_client(root, 7003, &second_profile);
+    let (code, events, output) = warm.finish(Duration::from_secs(180), false);
+    assert_eq!(code, 0, "{output}");
+    assert_shared_service_build(root, 7003, &events, &output, "B:244\n", "restored");
+    service.finish(Duration::from_secs(15), true);
 }
 
 #[test]
@@ -2021,6 +2216,191 @@ fn must_not_execute() { panic!("canonical check ran a test"); }
             .is_none(),
         "completed operations retained mutable targets or live endpoints"
     );
+}
+
+fn explicit_environment_source(root: &Path) {
+    write(
+        root,
+        "build.rs",
+        r#"fn main() {
+    assert!(std::env::var_os("AMBIENT_PROFILE_INPUT").is_none());
+    assert_eq!(std::env::var("APPLICATION_EMPTY").unwrap(), "");
+    assert_eq!(std::env::var("APPLICATION_LITERAL").unwrap(), "literal $HOME $(false) `false`\n雪");
+    let value: u32 = std::env::var("APPLICATION_VALUE").unwrap().parse().unwrap();
+    let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    std::fs::write(out.join("explicit-env.rs"), format!("const GENERATED_VALUE: u32 = {value};\n")).unwrap();
+    println!("cargo::rerun-if-env-changed=APPLICATION_VALUE");
+    println!("cargo::rerun-if-env-changed=APPLICATION_EMPTY");
+    println!("cargo::rerun-if-env-changed=APPLICATION_LITERAL");
+}
+"#,
+    );
+    write(
+        root,
+        "src/lib.rs",
+        r#"include!(concat!(env!("OUT_DIR"), "/explicit-env.rs"));
+const COMPILED_VALUE: &str = env!("APPLICATION_VALUE");
+const COMPILED_LITERAL: &str = env!("APPLICATION_LITERAL");
+pub fn answer() -> u32 {
+    assert!(option_env!("AMBIENT_PROFILE_INPUT").is_none());
+    assert_eq!(env!("APPLICATION_EMPTY"), "");
+    assert_eq!(COMPILED_LITERAL, "literal $HOME $(false) `false`\n雪");
+    assert_eq!(COMPILED_VALUE.parse::<u32>().unwrap(), GENERATED_VALUE);
+    canonical_dep::answer() + GENERATED_VALUE
+}
+pub fn verify_runtime() -> u32 {
+    assert!(std::env::var_os("AMBIENT_PROFILE_INPUT").is_none());
+    assert_eq!(std::env::var("APPLICATION_VALUE").unwrap(), COMPILED_VALUE);
+    assert_eq!(std::env::var("APPLICATION_LITERAL").unwrap(), COMPILED_LITERAL);
+    assert_eq!(std::env::var("APPLICATION_EMPTY").unwrap(), "");
+    answer()
+}
+#[test]
+fn explicit_profile_environment_reaches_test_runtime() {
+    println!("EXPLICIT_ENV_TEST={}", verify_runtime());
+}
+"#,
+    );
+    write(
+        root,
+        "src/main.rs",
+        r#"fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--verify-runtime") {
+        println!("EXPLICIT_ENV_RUN={}", canonical_app::verify_runtime());
+    } else {
+        println!("{}", canonical_app::answer());
+    }
+}
+"#,
+    );
+}
+
+fn canonical_explicit_environment(shared: bool) {
+    let (owner, mut profile) = native_fixture();
+    let root = owner.path();
+    for source in ["source-a", "source-b"] {
+        explicit_environment_source(&root.join(source));
+    }
+    profile["command"] = json!("build");
+    profile["env"] = json!({
+        "APPLICATION_VALUE":"7",
+        "APPLICATION_EMPTY":"",
+        "APPLICATION_LITERAL":"literal $HOME $(false) `false`\n雪",
+    });
+    profile["target_cache"] = json!({
+        "runtime_epoch":"explicit-environment-native-v1",
+        "max_bytes":268435456,
+        "max_families":8,
+    });
+    let ambient = [
+        ("APPLICATION_VALUE".to_owned(), "999".to_owned()),
+        (
+            "AMBIENT_PROFILE_INPUT".to_owned(),
+            "must-not-leak".to_owned(),
+        ),
+    ];
+    let service = if shared {
+        let socket = root.join("explicit-env-service.sock");
+        let path = root.join("explicit-env-service.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "version":"canonical-compile-service-v1", "state_root":root.join("state"),
+                "socket":socket, "max_roots":1, "jobs_per_root":1,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        profile["service_socket"] = json!(socket);
+        let mut command = shared_service_command(root);
+        command
+            .envs(ambient.iter().map(|(name, value)| (name, value)))
+            .arg("--canonical-compile-service")
+            .arg(path);
+        let mut service = SharedServiceChild::spawn(root, "explicit-env-service", command);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            service.assert_running();
+            if socket.exists()
+                && service
+                    .events()
+                    .iter()
+                    .any(|event| event["kind"] == "canonical-service-listening")
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{}", service.diagnostics());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Some(service)
+    } else {
+        None
+    };
+
+    // Same sources and flags, two exact environment families. The second
+    // checkout must reuse the matching private state; an environment edit
+    // must never reuse fingerprints from the previous compiler/build script.
+    for (number, value, state) in [
+        (6000, "7", "cold"),
+        (6001, "7", "restored"),
+        (6002, "8", "cold"),
+        (6003, "7", "restored"),
+    ] {
+        if number != 6000 {
+            profile["source_root"] = json!(root.join("source-b"));
+        }
+        profile["env"]["APPLICATION_VALUE"] = json!(value);
+        let (code, events, output) = run_with_environment(root, number, &profile, &ambient);
+        assert_eq!(code, 0, "{output}");
+        let expected = format!("{}\n", 42 + value.parse::<u32>().unwrap());
+        assert_shared_service_build(root, number, &events, &output, &expected, state);
+        let workspace = output
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|event| {
+                event["reason"] == "compiler-artifact" && event["target"]["name"] == "canonical_app"
+            })
+            .collect::<Vec<_>>();
+        assert!(!workspace.is_empty(), "{output}");
+        assert!(
+            workspace
+                .iter()
+                .all(|event| event["fresh"] == (state == "restored")),
+            "wrong Cargo freshness after explicit environment selection: {output}"
+        );
+    }
+
+    profile["command"] = json!("test");
+    profile["env"]["APPLICATION_VALUE"] = json!("8");
+    profile["selection"] = json!({"lib":true,
+        "test_filter":"explicit_profile_environment_reaches_test_runtime",
+        "test_args":["--nocapture", "--test-threads=1"]});
+    let (code, events, output) = run_with_environment(root, 6004, &profile, &ambient);
+    assert_eq!(code, 0, "{output}");
+    assert_test_execution(&events, "cold", true);
+    assert!(output.contains("EXPLICIT_ENV_TEST=50"), "{output}");
+
+    if let Some(service) = service {
+        service.finish(Duration::from_secs(15), true);
+    } else {
+        profile["command"] = json!("run");
+        profile["selection"] = json!({"run_args":["--verify-runtime"]});
+        let (code, _, output) = run_with_environment(root, 6005, &profile, &ambient);
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("EXPLICIT_ENV_RUN=50"), "{output}");
+    }
+}
+
+#[test]
+#[ignore = "requires real canonical bubblewrap namespaces, native toolchain and RABS_CANONICAL_TEST_WRAPPER; compiles build scripts, executes delivered binaries and test/run bodies with explicit environment inputs"]
+fn canonical_explicit_environment_rebuilds_private_targets_and_reaches_cargo_descendants() {
+    canonical_explicit_environment(false);
+}
+
+#[test]
+#[ignore = "requires real canonical bubblewrap namespaces, native toolchain and RABS_CANONICAL_TEST_WRAPPER; exercises explicit client environment through one persistent canonical service"]
+fn canonical_shared_environment_rebuilds_private_targets_without_ambient_service_inputs() {
+    canonical_explicit_environment(true);
 }
 
 /// This exercises Cargo's private fingerprints, not shared action-cache

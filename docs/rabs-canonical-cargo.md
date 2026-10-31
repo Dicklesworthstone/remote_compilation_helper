@@ -1120,8 +1120,19 @@ credentials or unrelated expanded sources. The source, toolchain, state,
 operation and optional Cargo-cache roots must be disjoint ordinary absolute
 directories. The wrapper must be an ordinary executable outside the captured
 source and mutable state/operation roots. Commands other than `check`, `build`,
-`clippy`, `test`, `run` and `bench`, mount declarations
-and environment overrides are not profile fields.
+`clippy`, `test`, `run` and `bench` and arbitrary mount declarations are not
+profile fields.
+
+An optional `env` object supplies literal application inputs, for example
+`"env": {"APP_VERSION": "2026.10", "SQLX_OFFLINE": "true"}`. The driver gives
+canonical Cargo planning and execution the same values, including build scripts,
+`env!`, tests and launched programs. It never imports the submitting client's or
+service's ambient application environment. The exact values also participate in
+private target-state and compiler-action identities, so a changed value cannot
+reuse the old environment's result. Cargo retains its usual `[env]` default and
+`force = true` precedence. Namespace, toolchain, jobserver and
+coordinator controls remain reserved. See [environment inputs](rabs-canonical-environment.md)
+for names, byte bounds and the direct/shared-service contract.
 
 Preparation captures the selected toolchain before its Cargo metadata planning
 and uses those captured Cargo/rustc binaries with a controlled environment.
@@ -1462,6 +1473,7 @@ this service configuration with your actual paths:
   "state_root": "/home/builder/rabs-compile-state",
   "socket": "/home/builder/rabs-compile-state/compile.sock",
   "max_roots": 4,
+  "max_queued_roots": 16,
   "jobs_per_root": 2
 }
 ```
@@ -1493,8 +1505,16 @@ It must be outside captured source, toolchain, optional Cargo-cache and operatio
 roots. A socket inside the private state root is supported and never enters a
 build namespace.
 
-`max_roots` bounds simultaneous admitted operations. An additional client receives
-a busy refusal before capture; the service does not accumulate an unbounded queue.
+`max_roots` bounds simultaneous admitted operations. Set `max_queued_roots` to
+0–128 to retain a bounded number of additional callers; its default is zero,
+which preserves immediate busy refusal. Validated waiting requests enter a FIFO
+queue before any source/toolchain capture or Cargo process begins. Each waits
+at most its profile's `timeout_seconds`. Disconnect, cancellation, service
+shutdown and expiry remove only that caller, including the queue's head, so
+later callers can advance. The service reports `canonical-service-queued` with
+an admission ticket on its diagnostic stream. Once active and waiting slots
+are full, further clients receive a busy refusal before capture. Handshakes and
+result delivery also count against the bounded connection capacity.
 Each profile's `jobs` must be at most `jobs_per_root`, and a root retains its
 admission through process and stream drain. Independent roots can compile
 concurrently while sharing the same coordinator generation. Eligible identical
@@ -1602,8 +1622,11 @@ this protocol. The restriction is checked again after command-line selection
 replaces a saved profile's command and options. Test bodies still run on each
 invocation and retain their actual failure status.
 
-Compiler stdout and stderr are retained and replayed after completion, preserving
-each stream's exact bytes without inventing their original interleaving. Combined
+Compiler stdout and stderr stream to the client while Cargo is running. Private
+bounded files separate process-pipe drainage from a slow socket consumer, and
+independent read cursors preserve each stream's exact bytes without changing the
+writer's offset or inventing cross-stream ordering. Completion drains the last
+tail once; already visible prefixes are not replayed. Combined
 Cargo output is bounded at 64 MiB, with a separate 128 MiB protocol limit including
 planning and driver diagnostics. Disconnecting the client or exceeding an output
 bound cancels and drains that operation; this interface does not create a detached
