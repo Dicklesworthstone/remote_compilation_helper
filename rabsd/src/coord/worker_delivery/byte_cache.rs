@@ -141,6 +141,12 @@ impl<P: WorkerPeer + ?Sized> WorkerPeer for ArtifactCachePeer<'_, P> {
     fn artifact_byte_cache(&self) -> Option<&ArtifactByteCache> {
         Some(self.cache)
     }
+    fn transfer_deadline(&self) -> Option<std::time::Instant> {
+        self.inner.transfer_deadline()
+    }
+    fn live_continuation(&self) -> Option<&super::SealedResult> {
+        self.inner.live_continuation()
+    }
     fn checkpoint(&mut self) -> io::Result<()> {
         self.inner.checkpoint()
     }

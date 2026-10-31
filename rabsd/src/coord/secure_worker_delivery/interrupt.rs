@@ -453,7 +453,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> OperatorPeer<'_, S, I> {
                             preview.stop();
                         }
                         self.inner.phase = Phase::Transfer;
-                        self.inner.until = Instant::now() + TRANSFER_BUDGET;
+                        self.inner.set_phase_deadline(TRANSFER_BUDGET);
                     }
                     return Ok(value);
                 }
@@ -482,6 +482,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> WorkerPeer for OperatorPe
 
     fn artifact_byte_cache(&self) -> Option<&super::ArtifactByteCache> {
         self.inner.artifact_byte_cache()
+    }
+
+    fn transfer_deadline(&self) -> Option<Instant> {
+        self.inner.transfer_deadline()
     }
 
     fn send(&mut self, frame: &Value) -> io::Result<()> {
@@ -1144,6 +1148,32 @@ mod tests {
             assert_eq!(peer.inner.stream.sent(), before);
             assert!(!peer.cancel_sent);
         }
+    }
+
+    #[test]
+    fn cancelled_live_result_continuation_never_acquires_execution_controls() {
+        let runtime = runtime();
+        let trigger = Trigger::default();
+        let token = super::super::OperationCancellation::default();
+        let original = Instant::now() + Duration::from_secs(5);
+        let mut peer = OperatorPeer::with_interrupts(
+            RecordPeer::new(&runtime, Wire::new(&trigger, &[]), &request()).before(original),
+            OperationInterrupts::new(token.clone()),
+        );
+        let resume = json!({"kind":"result-resume", "request_id":7, "request":request()});
+        peer.send(&resume).unwrap();
+        assert_eq!(peer.transfer_deadline(), Some(original));
+        assert!(peer.execution.is_none());
+        assert!(peer.lease.is_none());
+        assert!(peer.preview.is_none());
+        token.cancel();
+        let error = peer
+            .send(&json!({"kind":"output-read", "request_id":7, "stream":"stdout", "offset":0}))
+            .unwrap_err();
+        assert!(!super::super::transport_interrupted(&error));
+        assert!(peer.inner.failed);
+        assert!(!peer.cancel_sent);
+        assert_eq!(peer.inner.stream.sent(), vec![resume]);
     }
 
     #[test]

@@ -483,6 +483,7 @@ impl PreparedBuild<'_> {
                     directory: self.directory.to_path_buf(),
                     execution_may_have_run: true,
                     transport_interrupted: false,
+                    sealed_result: None,
                     detail,
                 })?;
         Ok((delivery, Some(installed)))
@@ -496,6 +497,7 @@ impl PreparedBuild<'_> {
                 directory: self.directory.to_path_buf(),
                 execution_may_have_run: true,
                 transport_interrupted: false,
+                sealed_result: None,
                 detail: format!(
                     "build completed but its console output could not be delivered: {error}"
                 ),

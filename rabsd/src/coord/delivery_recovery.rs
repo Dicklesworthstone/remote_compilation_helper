@@ -606,6 +606,7 @@ pub fn recover_existing_delivery(
         directory: destination.to_path_buf(),
         execution_may_have_run: true,
         transport_interrupted: false,
+        sealed_result: None,
         detail: format!("retained delivery cannot be replayed; do not reexecute: {error}"),
     })
 }

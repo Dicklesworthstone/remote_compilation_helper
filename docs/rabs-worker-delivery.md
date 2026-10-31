@@ -428,6 +428,40 @@ execution retain their existing local path. `--rabs-require-daemon` guarantees
 matching daemon setup, not remote execution of every Cargo action. The original
 three-variable singleton configuration and its status fields remain supported.
 
+### Continue a completed dependency result after a disconnect
+
+The live dependency lane can reconnect once to the same worker when the result
+download is interrupted after it has observed an authenticated, successfully
+drained compilation, durable result retention and the complete declared output
+manifest. This also applies to an eligible fresh workspace execution. The
+original action owner and worker reservation stay held, and the reconnect sends
+only `result-resume` for the same request ID. It uploads no inputs, allocates no
+new execution attempt and never dispatches a second compiler.
+
+The new authenticated connection must identify the same pinned worker, boot
+generation and process incarnation, with the original request still at its
+durable high-water mark. The receiver compares the retained result digest,
+complete diagnostics, artifact names, modes and byte identities before any
+range request or release acknowledgment. It downloads and hashes the full result
+into a separate private directory. The original transfer deadline also bounds
+reconnection, authentication, download and acknowledgment; reconnecting does
+not extend it. A successful recovery reports
+`rabsd-remote-dependency-result-continued` with the action, worker and request ID.
+
+Cancellation, a changed input generation, a restarted worker, protocol or
+integrity failures, and a disconnect before the sealed result was observed do
+not enter this path. If continuation fails, both private recovery directories
+remain available to the existing operator recovery commands. The old partial
+directory retires only after every resumed byte and its original live binding
+have been verified. A lost final acknowledgment still returns verified local
+bytes and preserves the completed delivery for acknowledgment-only recovery.
+
+The continuation evidence exists only in the still-running live owner. Saved
+JSON or a generic operator resume cannot recreate it or acquire publication
+rights. Recovered outputs pass through the same original input checks, result
+capture and publication rules as an uninterrupted delivery. Workspace results
+retain their existing request-owned scope and do not become action-cache hits.
+
 ### Reuse uploaded sources and dependency archives
 
 Workers retain digest-verified source bytes across sessions and restarts.

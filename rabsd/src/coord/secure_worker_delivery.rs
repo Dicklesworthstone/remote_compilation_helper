@@ -18,8 +18,9 @@ use super::source_delivery::SourceUpload;
 use super::worker_delivery::{
     ArtifactByteCache, DEFAULT_ARTIFACT_CACHE_BYTES, DEFAULT_ARTIFACT_CACHE_ENTRIES, Delivery,
     DeliveryFailure, DeliveryMode, MAX_ARTIFACT_CACHE_BYTES, MAX_ARTIFACT_CACHE_ENTRIES,
-    ResumePeer, ResumeSource, WorkerAuthentication, WorkerPeer, negotiated_dependency_context,
-    receive_operation, transport_interrupted, validate_request, worker_transport_error,
+    ResumePeer, ResumeSource, SealedResult, WorkerAuthentication, WorkerPeer,
+    negotiated_dependency_context, receive_operation, transport_interrupted, validate_request,
+    worker_transport_error,
 };
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use asupersync::runtime::Runtime;
@@ -265,6 +266,7 @@ struct AdmittedPeer<P> {
     operation_sent: bool,
     source: Option<SourceUpload>,
     on_admitted: Option<WorkerAdmissionHook>,
+    live_continuation: Option<SealedResult>,
 }
 
 impl<P: WorkerPeer> AdmittedPeer<P> {
@@ -316,6 +318,7 @@ impl<P: WorkerPeer> AdmittedPeer<P> {
             operation_sent: false,
             source: None,
             on_admitted: None,
+            live_continuation: None,
         })
     }
 
@@ -338,6 +341,11 @@ impl<P: WorkerPeer> AdmittedPeer<P> {
         self.on_admitted = hook;
         self
     }
+
+    fn with_live_continuation(mut self, continuation: Option<SealedResult>) -> Self {
+        self.live_continuation = continuation;
+        self
+    }
 }
 
 impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
@@ -347,6 +355,14 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
 
     fn artifact_byte_cache(&self) -> Option<&ArtifactByteCache> {
         self.inner.artifact_byte_cache()
+    }
+
+    fn transfer_deadline(&self) -> Option<Instant> {
+        self.inner.transfer_deadline()
+    }
+
+    fn live_continuation(&self) -> Option<&SealedResult> {
+        self.live_continuation.as_ref()
     }
 
     fn negotiate(&mut self, hello: &Value, grant: &Value) -> io::Result<()> {
@@ -708,6 +724,7 @@ struct RecordPeer<'a, S> {
     stream: S,
     buffered: Vec<u8>,
     until: Instant,
+    absolute_deadline: Option<Instant>,
     execution_budget: Duration,
     phase: Phase,
     failed: bool,
@@ -726,6 +743,7 @@ impl<'a, S> RecordPeer<'a, S> {
             stream,
             buffered: Vec::new(),
             until: Instant::now() + ADMISSION_BUDGET,
+            absolute_deadline: None,
             execution_budget: Duration::from_millis(millis) + Duration::from_secs(60),
             phase: Phase::Admission,
             failed: false,
@@ -738,11 +756,29 @@ impl<'a, S> RecordPeer<'a, S> {
         self
     }
 
+    /// A live continuation borrows the original execution's transfer budget.
+    /// Every later phase, including release ACKs, stays below that ceiling.
+    fn before(mut self, deadline: Instant) -> Self {
+        self.absolute_deadline = Some(deadline);
+        self.until = self.until.min(deadline);
+        self
+    }
+
+    fn deadline(&self) -> Instant {
+        self.absolute_deadline
+            .map_or(self.until, |deadline| self.until.min(deadline))
+    }
+
+    fn set_phase_deadline(&mut self, budget: Duration) {
+        self.until = Instant::now() + budget;
+        self.until = self.deadline();
+    }
+
     fn remaining(&self) -> io::Result<Duration> {
         if self.failed {
             return Err(invalid("worker connection failed; no retry"));
         }
-        self.until
+        self.deadline()
             .checked_duration_since(Instant::now())
             .filter(|left| !left.is_zero())
             .ok_or_else(|| {
@@ -757,7 +793,7 @@ impl<'a, S> RecordPeer<'a, S> {
             Some("source-begin") => {
                 require(self.phase == Phase::Admission, "duplicate source upload")?;
                 self.phase = Phase::SourceUpload;
-                self.until = Instant::now() + TRANSFER_BUDGET;
+                self.set_phase_deadline(TRANSFER_BUDGET);
             }
             Some("source-chunk" | "source-seal") => {
                 require(
@@ -772,7 +808,7 @@ impl<'a, S> RecordPeer<'a, S> {
                     "toolchain transfer requires prior source upload",
                 )?;
                 self.phase = Phase::ToolchainUpload;
-                self.until = Instant::now() + TOOLCHAIN_UPLOAD_BUDGET;
+                self.set_phase_deadline(TOOLCHAIN_UPLOAD_BUDGET);
             }
             Some("toolchain-entry" | "toolchain-chunk" | "toolchain-seal") => {
                 require(
@@ -791,7 +827,7 @@ impl<'a, S> RecordPeer<'a, S> {
                     "duplicate execution dispatch",
                 )?;
                 self.phase = Phase::Execution;
-                self.until = Instant::now() + self.execution_budget;
+                self.set_phase_deadline(self.execution_budget);
             }
             Some("result-resume") => {
                 require(
@@ -801,11 +837,11 @@ impl<'a, S> RecordPeer<'a, S> {
                 // Restoring the spool and downloading it share one finite
                 // budget. Receiving exec-result must NOT restart that budget.
                 self.phase = Phase::Transfer;
-                self.until = Instant::now() + TRANSFER_BUDGET;
+                self.set_phase_deadline(TRANSFER_BUDGET);
             }
             Some("output-ack" | "artifact-ack") if self.phase == Phase::Transfer => {
                 self.phase = Phase::Acknowledgment;
-                self.until = Instant::now() + ACK_BUDGET;
+                self.set_phase_deadline(ACK_BUDGET);
             }
             _ => {}
         }
@@ -834,6 +870,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WorkerPeer for RecordPeer<'_, S> {
 
     fn artifact_byte_cache(&self) -> Option<&ArtifactByteCache> {
         self.artifact_byte_cache.as_deref()
+    }
+
+    fn transfer_deadline(&self) -> Option<Instant> {
+        (self.phase == Phase::Transfer).then(|| self.deadline())
     }
 
     fn send(&mut self, frame: &Value) -> io::Result<()> {
@@ -892,7 +932,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WorkerPeer for RecordPeer<'_, S> {
             && value["kind"] == "exec-result"
         {
             self.phase = Phase::Transfer;
-            self.until = Instant::now() + TRANSFER_BUDGET;
+            self.set_phase_deadline(TRANSFER_BUDGET);
         }
         result
     }
@@ -939,6 +979,7 @@ pub fn receive_authenticated_operation(
         directory: destination.to_path_buf(),
         execution_may_have_run: mode == DeliveryMode::Resume,
         transport_interrupted: transport_interrupted(&error),
+        sealed_result: None,
         detail: error.to_string(),
     };
     if asupersync::cx::Cx::current().is_some() {
@@ -1000,6 +1041,7 @@ pub fn acknowledge_authenticated(
         directory: directory.clone(),
         execution_may_have_run: true,
         transport_interrupted: transport_interrupted(&error),
+        sealed_result: None,
         detail: error.to_string(),
     };
     if asupersync::cx::Cx::current().is_some() {
@@ -1039,6 +1081,7 @@ pub fn acknowledge_authenticated_controlled(
         directory: directory.clone(),
         execution_may_have_run: true,
         transport_interrupted: transport_interrupted(&error),
+        sealed_result: None,
         detail: error.to_string(),
     };
     if asupersync::cx::Cx::current().is_some() {
@@ -1080,6 +1123,7 @@ pub fn receive_authenticated_source(
         directory: destination.to_path_buf(),
         execution_may_have_run: false,
         transport_interrupted: transport_interrupted(&error),
+        sealed_result: None,
         detail: error.to_string(),
     };
     if asupersync::cx::Cx::current().is_some() {
@@ -1193,10 +1237,74 @@ pub fn receive_authenticated_with_admission(
     observer: Option<crate::coord::prepared_operation::PreviewObserver>,
     on_admitted: Option<WorkerAdmissionHook>,
 ) -> Result<Delivery, DeliveryFailure> {
+    receive_authenticated_inner(
+        runtime,
+        peer,
+        admission,
+        request,
+        destination,
+        mode,
+        upload,
+        resume_source,
+        cancellation,
+        observer,
+        on_admitted,
+        None,
+    )
+}
+
+/// Continue delivery of the successful sealed result already observed by this
+/// live execution. This can only retrieve that exact result, from the same
+/// authenticated worker incarnation, within the original transfer deadline.
+/// It cannot admit another live attempt, upload inputs, or dispatch a compiler.
+/// Local prefix reuse stays in the explicit operator recovery path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn receive_authenticated_continuation(
+    runtime: &Runtime,
+    peer: AuthenticatedPeer,
+    admission: PinnedWorkerAdmission,
+    request: &Value,
+    destination: &Path,
+    resume_source: Option<&ResumeSource>,
+    cancellation: OperationCancellation,
+    sealed_result: SealedResult,
+) -> Result<Delivery, DeliveryFailure> {
+    receive_authenticated_inner(
+        runtime,
+        peer,
+        admission,
+        request,
+        destination,
+        DeliveryMode::Resume,
+        None,
+        resume_source,
+        cancellation,
+        None,
+        None,
+        Some(sealed_result),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn receive_authenticated_inner(
+    runtime: &Runtime,
+    peer: AuthenticatedPeer,
+    admission: PinnedWorkerAdmission,
+    request: &Value,
+    destination: &Path,
+    mode: DeliveryMode,
+    upload: Option<&SourceUpload>,
+    resume_source: Option<&ResumeSource>,
+    cancellation: OperationCancellation,
+    observer: Option<crate::coord::prepared_operation::PreviewObserver>,
+    on_admitted: Option<WorkerAdmissionHook>,
+    live_continuation: Option<SealedResult>,
+) -> Result<Delivery, DeliveryFailure> {
     let failure = |error: io::Error| DeliveryFailure {
         directory: destination.to_path_buf(),
         execution_may_have_run: mode == DeliveryMode::Resume,
         transport_interrupted: transport_interrupted(&error),
+        sealed_result: None,
         detail: error.to_string(),
     };
     if asupersync::cx::Cx::current().is_some() {
@@ -1214,6 +1322,24 @@ pub fn receive_authenticated_with_admission(
         "source upload cannot accompany result recovery",
     )
     .map_err(&failure)?;
+    if let Some(continuation) = &live_continuation {
+        require(
+            mode == DeliveryMode::Resume
+                && upload.is_none()
+                && resume_source.is_none()
+                && on_admitted.is_none()
+                && observer.is_none(),
+            "live result continuation requires an isolated result-only transfer",
+        )
+        .map_err(&failure)?;
+        continuation.verify_request(request).map_err(&failure)?;
+        if Instant::now() >= continuation.deadline() {
+            return Err(failure(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "original live result transfer deadline exceeded",
+            )));
+        }
+    }
     if let Some(upload) = upload {
         upload.validate_request(request).map_err(&failure)?;
     }
@@ -1228,8 +1354,13 @@ pub fn receive_authenticated_with_admission(
     let admission = Arc::new(admission);
     let expected_worker = admission.worker().to_owned();
     let cache = configured_artifact_byte_cache().map_err(&failure)?;
+    let mut records =
+        RecordPeer::new(runtime, peer.stream, request).with_artifact_byte_cache(cache);
+    if let Some(continuation) = &live_continuation {
+        records = records.before(continuation.deadline());
+    }
     let raw = interrupt::OperatorPeer::with_interrupts(
-        RecordPeer::new(runtime, peer.stream, request).with_artifact_byte_cache(cache),
+        records,
         interrupt::OperationInterrupts::new(cancellation),
     )
     .with_preview_observer(if mode == DeliveryMode::Execute {
@@ -1247,7 +1378,8 @@ pub fn receive_authenticated_with_admission(
         Arc::clone(&admission),
     )
     .map_err(&failure)?
-    .with_admission_hook(on_admitted);
+    .with_admission_hook(on_admitted)
+    .with_live_continuation(live_continuation);
     if let Some(upload) = upload {
         admitted = admitted.with_source(upload).map_err(&failure)?;
     }
@@ -3295,6 +3427,63 @@ mod tests {
         assert_eq!(peer.until, ack_until);
         assert!(peer.phase == Phase::Acknowledgment);
         assert_eq!(peer.stream.reads, 1);
+    }
+
+    #[test]
+    fn live_continuation_cannot_refresh_the_original_transfer_deadline() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let bytes =
+            b"{\"kind\":\"exec-result\",\"resumed\":true}\n{\"kind\":\"output-acknowledged\"}\n"
+                .to_vec();
+        let original = Instant::now() + Duration::from_secs(5);
+        let mut peer = RecordPeer::new(
+            &runtime,
+            RecordWire::new(bytes, RECORD_READ_BYTES),
+            &request(),
+        )
+        .before(original);
+        assert_eq!(peer.until, original);
+        assert!(peer.transfer_deadline().is_none());
+        peer.begin_frame(Some("result-resume")).unwrap();
+        assert_eq!(peer.transfer_deadline(), Some(original));
+        assert_eq!(peer.receive().unwrap()["kind"], "exec-result");
+        assert_eq!(peer.until, original);
+        peer.begin_frame(Some("output-ack")).unwrap();
+        assert_eq!(peer.until, original);
+        assert_eq!(peer.receive().unwrap()["kind"], "output-acknowledged");
+        peer.begin_frame(Some("artifact-ack")).unwrap();
+        assert_eq!(peer.until, original);
+        assert_eq!(peer.stream.reads, 1);
+    }
+
+    #[test]
+    fn expired_live_continuation_refuses_buffered_results_and_release_frames() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let bytes =
+            b"{\"kind\":\"heartbeat\"}\n{\"kind\":\"exec-result\",\"resumed\":true}\n".to_vec();
+        let mut peer = RecordPeer::new(
+            &runtime,
+            RecordWire::new(bytes, RECORD_READ_BYTES),
+            &request(),
+        )
+        .before(Instant::now() + Duration::from_secs(30));
+        peer.begin_frame(Some("result-resume")).unwrap();
+        assert_eq!(peer.receive().unwrap()["kind"], "heartbeat");
+        assert!(!peer.buffered.is_empty());
+        let reads = peer.stream.reads;
+        // Advancing the phase budget cannot outlive the original execution's
+        // independent ceiling. The coalesced result is already in memory.
+        peer.until = Instant::now() + TRANSFER_BUDGET;
+        peer.absolute_deadline = Some(Instant::now() - Duration::from_secs(1));
+        assert_eq!(peer.receive().unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(peer.stream.reads, reads);
+        assert!(peer.begin_frame(Some("output-ack")).is_err());
+        assert!(peer.phase == Phase::Transfer);
+        assert!(peer.stream.written.is_empty());
     }
 
     #[cfg(unix)]

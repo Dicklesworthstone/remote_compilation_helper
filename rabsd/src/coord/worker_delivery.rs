@@ -12,12 +12,14 @@
 mod byte_cache;
 mod ranges;
 mod reuse;
+mod sealed_result;
 pub use byte_cache::{
     ArtifactByteCache, ArtifactCachePeer, DEFAULT_ARTIFACT_CACHE_BYTES,
     DEFAULT_ARTIFACT_CACHE_ENTRIES, MAX_ARTIFACT_CACHE_BYTES, MAX_ARTIFACT_CACHE_ENTRIES,
 };
 use ranges::download;
 pub use reuse::{ResumePeer, ResumeSource};
+pub use sealed_result::SealedResult;
 
 use rabs_sandbox::artifact_tree::{
     MAX_TREE_ENTRIES, MAX_TREE_FILES, MAX_TREE_MANIFEST_BYTES, TREE_FILES_VERSION,
@@ -227,6 +229,19 @@ pub trait WorkerPeer {
         None
     }
 
+    /// The trusted transport's original absolute result-transfer deadline.
+    /// A peer without this bound cannot create live continuation evidence.
+    fn transfer_deadline(&self) -> Option<Instant> {
+        None
+    }
+
+    /// A still-owned execution's already observed sealed result. Only the
+    /// bounded live continuation path supplies this; ordinary operator resume
+    /// remains result delivery without live execution authority.
+    fn live_continuation(&self) -> Option<&SealedResult> {
+        None
+    }
+
     /// Honor absolute transfer deadlines and operator cancellation during local
     /// work too. Cache copies must not bypass a transport's send/receive checks.
     fn checkpoint(&mut self) -> io::Result<()> {
@@ -265,6 +280,11 @@ pub struct DeliveryFailure {
     /// from the error kind of a mixed filesystem/protocol operation.
     pub transport_interrupted: bool,
     pub detail: String,
+    /// Authenticated successful terminal metadata observed before transfer
+    /// failed. This is not verified output or permission to reexecute. Only a
+    /// typed transport interruption with the original live owner may use it to
+    /// request the exact same sealed result before its original deadline.
+    pub sealed_result: Option<Box<SealedResult>>,
 }
 
 #[derive(Debug)]
@@ -524,7 +544,7 @@ pub fn validate_request(request: &Value) -> io::Result<()> {
     // The worker owns the backing directory for a transferred projection.
     // Validate its canonical manifest here, including the mutually exclusive
     // workspace_backing rule. Recovery validates identity without source bytes.
-    if super::source_delivery::request_manifest(request)?.is_none() {
+    if super::source_manifest::request_manifest(request)?.is_none() {
         let backing = text(request, "workspace_backing")?;
         require(
             !backing.is_empty() && !backing.contains('\0'),
@@ -911,8 +931,17 @@ pub fn receive_operation(
     mode: DeliveryMode,
 ) -> Result<Delivery, DeliveryFailure> {
     let mut execution_may_have_run = mode == DeliveryMode::Resume;
+    let mut sealed_result = None;
+    let continuation = peer.live_continuation().cloned();
     let outcome = (|| -> io::Result<Delivery> {
         validate_request(request)?;
+        if let Some(continuation) = &continuation {
+            require(
+                mode == DeliveryMode::Resume,
+                "live result continuation cannot dispatch execution",
+            )?;
+            continuation.verify_request(request)?;
+        }
         if let Some(source) = peer.resume_source() {
             require(
                 mode == DeliveryMode::Resume,
@@ -1034,6 +1063,14 @@ pub fn receive_operation(
         }
         peer.negotiate(&hello, &ack)?;
         let authentication = peer.authentication();
+        if let Some(continuation) = &continuation {
+            continuation.verify_peer(
+                &hello,
+                authentication.ok_or_else(|| {
+                    invalid("live result continuation requires authenticated delivery")
+                })?,
+            )?;
+        }
         require(
             mode != DeliveryMode::Execute
                 || !toolchain_transfer(request)?
@@ -1144,6 +1181,22 @@ pub fn receive_operation(
             total <= MAX_DELIVERY_BYTES,
             "aggregate delivery budget exceeded",
         )?;
+        if let Some(continuation) = &continuation {
+            // Check the complete sealed-result identity before requesting any
+            // range, creating output bytes or acknowledging remote custody.
+            continuation.verify_result(&result)?;
+        } else if mode == DeliveryMode::Execute && retention {
+            sealed_result = SealedResult::observe(
+                request,
+                expected_worker,
+                &hello,
+                authentication,
+                &result,
+                total,
+                peer.transfer_deadline(),
+            )?
+            .map(Box::new);
+        }
         download(
             peer,
             expected_worker,
@@ -1258,6 +1311,7 @@ pub fn receive_operation(
         execution_may_have_run,
         transport_interrupted: transport_interrupted(&error),
         detail: error.to_string(),
+        sealed_result,
     })
 }
 

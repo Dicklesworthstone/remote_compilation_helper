@@ -93,6 +93,7 @@ impl PendingAcknowledgment {
             directory: directory.to_path_buf(),
             execution_may_have_run: true,
             transport_interrupted: false,
+            sealed_result: None,
             detail: detail.to_owned(),
         };
         let delivery = recover_existing_delivery(request, worker, directory, trust)?
@@ -135,6 +136,7 @@ impl PendingAcknowledgment {
             directory: self.delivery.directory.clone(),
             execution_may_have_run: true,
             transport_interrupted: transport_interrupted(&error),
+            sealed_result: None,
             detail: format!(
                 "worker acknowledgment unconfirmed; local delivery retained; do not reexecute: {error}"
             ),

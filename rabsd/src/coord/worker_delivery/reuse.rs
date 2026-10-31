@@ -262,6 +262,12 @@ impl<P: WorkerPeer + ?Sized> WorkerPeer for ResumePeer<'_, P> {
     fn artifact_byte_cache(&self) -> Option<&ArtifactByteCache> {
         self.inner.artifact_byte_cache()
     }
+    fn transfer_deadline(&self) -> Option<std::time::Instant> {
+        self.inner.transfer_deadline()
+    }
+    fn live_continuation(&self) -> Option<&super::SealedResult> {
+        self.inner.live_continuation()
+    }
     fn checkpoint(&mut self) -> io::Result<()> {
         self.inner.checkpoint()
     }

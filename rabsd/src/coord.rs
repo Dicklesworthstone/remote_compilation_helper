@@ -32,4 +32,5 @@ pub mod prepared_operation;
 pub mod remote_dependency_transport;
 pub mod secure_worker_delivery;
 pub mod source_delivery;
+pub mod source_manifest;
 pub mod worker_delivery;

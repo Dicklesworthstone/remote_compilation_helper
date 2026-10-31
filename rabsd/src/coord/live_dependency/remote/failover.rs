@@ -4,15 +4,17 @@
 //! cohort. Only the actual transport's typed interruption plus no-execution
 //! evidence permits another worker. Admitted attempts keep the same actor and
 //! generation, with the old lease/session explicitly released before a Retry.
+//! An interrupted sealed result instead keeps that exact owner and may use one
+//! result-only reconnect; this path never advances the execution frontier.
 
 use super::{
     AdmittedRemote, ExecutionAttempt, LiveDependencyLane, LiveDependencyRequest, LiveWorkerSession,
     OperationCancellation, PoolReservation, RemoteDependencies, RemoteInvocation, RemoteValidation,
     RetainedToolchain, SourceUpload, WorkerSessionOffer, dependency_execution_request, recovery,
-    verify_request,
+    verify_live_receipt, verify_request,
 };
 use crate::coord::action_actor::{AttemptPurpose, MAX_RETRIES_PER_GENERATION};
-use crate::coord::worker_delivery::{Delivery, DeliveryFailure};
+use crate::coord::worker_delivery::{Delivery, DeliveryFailure, SealedResult};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::io;
@@ -25,6 +27,7 @@ pub(super) struct Completed {
     pub(super) directory: recovery::ResultDirectory,
     pub(super) delivery: Delivery,
     pub(super) wire: Value,
+    pub(super) continuation: Option<SealedResult>,
     _reservation: PoolReservation,
 }
 
@@ -155,6 +158,7 @@ pub(super) fn deliver(
                     directory,
                     delivery,
                     wire,
+                    continuation: None,
                     _reservation: reservation,
                 });
             }
@@ -165,14 +169,17 @@ pub(super) fn deliver(
                     owned.execution_finished = !failure.execution_may_have_run;
                 }
                 if failure.execution_may_have_run {
-                    return Err((
-                        format!(
-                            "{}; retained remote recovery directory: {}",
-                            failure.detail,
-                            directory.path().display(),
-                        ),
-                        false,
-                    ));
+                    return continue_delivery(
+                        request,
+                        remote,
+                        invocation,
+                        wire,
+                        failure,
+                        owned,
+                        directory,
+                        reservation,
+                        cancellation,
+                    );
                 }
                 directory.execution_finished();
                 if !may_retry(&failure, cancellation.is_cancelled(), remaining) {
@@ -220,6 +227,113 @@ pub(super) fn deliver(
             }
         }
     }
+}
+
+/// Continue only an already sealed successful result of the still-owned live
+/// attempt. The two private directories remain independent: a failed reconnect
+/// must not consume the original prefix or erase either recovery record.
+#[allow(clippy::too_many_arguments)]
+fn continue_delivery(
+    request: &LiveDependencyRequest,
+    remote: &RemoteDependencies,
+    invocation: &RemoteInvocation,
+    wire: Value,
+    failure: DeliveryFailure,
+    owned: Option<AdmittedRemote>,
+    mut original: recovery::ResultDirectory,
+    mut reservation: PoolReservation,
+    cancellation: OperationCancellation,
+) -> Result<Completed, (String, bool)> {
+    // Locals retire before parameters on every return/unwind. Retain that
+    // ordering even when eligibility fails before the Option is unwrapped:
+    // the live session must release before physical capacity is advertised.
+    let live_owner = owned;
+    let refused = |reason: String| {
+        (
+            format!(
+                "{}; {reason}; retained remote recovery directory: {}",
+                failure.detail,
+                original.path().display(),
+            ),
+            false,
+        )
+    };
+    if !failure.transport_interrupted || cancellation.is_cancelled() {
+        return Err(refused("result continuation is not eligible".into()));
+    }
+    let sealed = failure
+        .sealed_result
+        .as_deref()
+        .ok_or_else(|| refused("no authenticated sealed result was observed".into()))?;
+    if std::time::Instant::now() >= sealed.deadline() {
+        return Err(refused(
+            "the original result transfer deadline expired".into(),
+        ));
+    }
+    let owned = live_owner.ok_or_else(|| refused("result lost its live attempt owner".into()))?;
+    if owned.retry_admission_failed || owned.execution_finished || owned.session.is_none() {
+        return Err(refused(
+            "result no longer has its original live session".into(),
+        ));
+    }
+    let authority = owned
+        .attempt
+        .as_ref()
+        .and_then(|attempt| attempt.authority.as_ref())
+        .ok_or_else(|| refused("result lost its original attempt authority".into()))?;
+    sealed
+        .verify_authority(authority)
+        .and_then(|()| {
+            sealed.verify_session(&owned.session.as_ref().expect("checked live session").offer)
+        })
+        .and_then(|()| sealed.verify_request(&wire))
+        .map_err(|error| refused(error.to_string()))?;
+    verify_request(request)
+        .and_then(|()| invocation.validation.verify(request))
+        .map_err(&refused)?;
+    let mut directory = recovery::ResultDirectory::new(&remote.state)
+        .map_err(|error| refused(format!("create result continuation custody: {error}")))?;
+    directory
+        .record_request(
+            &wire,
+            &rabs_cas::metadata_store::digest_key(&request.key.action_key),
+            &reservation.worker_configuration(invocation.context.version()),
+        )
+        .map_err(|error| refused(format!("persist result continuation custody: {error}")))?;
+    let destination = directory.path().join("delivery");
+    let delivery = reservation
+        .continue_result(&wire, &destination, cancellation)
+        .map_err(|error| {
+            refused(format!(
+                "result continuation failed: {}; retained continuation directory: {}",
+                error.detail,
+                directory.path().display(),
+            ))
+        })?;
+    verify_live_receipt(&delivery, &wire, Some(authority), Some(sealed)).map_err(&refused)?;
+    let continuation = sealed.clone();
+    // Every output byte has been reverified in separate durable custody. The
+    // old partial directory can now retire, even if final ACKs need recovery.
+    // The new owner remains armed until execute_inner validates completion.
+    original.execution_finished();
+    let key = rabs_cas::metadata_store::digest_key(&request.key.action_key);
+    let request_id = wire["request_id"].to_string();
+    crate::edge::server::log_line(
+        "rabsd-remote-dependency-result-continued",
+        &[
+            ("key", &key),
+            ("worker_id", reservation.worker()),
+            ("request_id", &request_id),
+        ],
+    );
+    Ok(Completed {
+        owned,
+        directory,
+        delivery,
+        wire,
+        continuation: Some(continuation),
+        _reservation: reservation,
+    })
 }
 
 fn admit(
@@ -359,6 +473,7 @@ mod tests {
             execution_may_have_run: false,
             transport_interrupted: transport_interrupted(&error),
             detail: error.to_string(),
+            sealed_result: None,
         };
         assert!(!may_retry(
             &failure(interrupted()),

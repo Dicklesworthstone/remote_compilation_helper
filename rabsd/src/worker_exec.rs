@@ -441,6 +441,7 @@ fn operation_failure(directory: &Path, mode: DeliveryMode, detail: String) -> De
             || !matches!(std::fs::symlink_metadata(directory),
                 Err(error) if error.kind() == io::ErrorKind::NotFound),
         transport_interrupted: false,
+        sealed_result: None,
         detail,
     }
 }
@@ -560,6 +561,7 @@ fn run_acknowledgment_once(args: &[String]) -> Result<Delivery, DeliveryFailure>
         directory: directory.clone(),
         execution_may_have_run: true,
         transport_interrupted: transport_interrupted(&error),
+        sealed_result: None,
         detail: error.to_string(),
     };
     let address = loopback_address(&args[0]).map_err(&failure)?;
@@ -943,6 +945,7 @@ fn run_tls_acknowledgment_once(args: &[String]) -> Result<Delivery, DeliveryFail
         directory: directory.clone(),
         execution_may_have_run: true,
         transport_interrupted: false,
+        sealed_result: None,
         detail: error.to_string(),
     })?;
     run_tls_acknowledgment_bound(&args[0], &args[1], &args[2], &request, &directory, None)
@@ -961,6 +964,7 @@ fn run_tls_acknowledgment_bound(
         directory: directory.to_path_buf(),
         execution_may_have_run: true,
         transport_interrupted: false,
+        sealed_result: None,
         detail,
     };
     let address: SocketAddr = address

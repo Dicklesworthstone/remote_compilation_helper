@@ -23,7 +23,7 @@ use crate::coord::remote_dependency_transport::{
 };
 use crate::coord::secure_worker_delivery::{OperationCancellation, parse_worker_pin};
 use crate::coord::source_delivery::SourceUpload;
-use crate::coord::worker_delivery::{Delivery, toolchain_identity_value};
+use crate::coord::worker_delivery::{Delivery, SealedResult, toolchain_identity_value};
 use crate::edge::live_facts::{GENERATED_ROOT, PACKAGE_ROOT, native_snapshot_root};
 use rabs_key::live_dependency::remote::{
     RemoteDependencyOutputClass, remote_dependency_isolation_policy, remote_dependency_key,
@@ -1173,20 +1173,23 @@ impl PendingRemote {
         drop(retained);
         let delivery = &execution.delivery;
         let wire = &execution.wire;
+        let continuation = execution.continuation.as_ref();
         let owned = &mut execution.owned;
         let attempt = owned
             .attempt
             .as_ref()
             .ok_or_else(|| ("delivery lost its admitted attempt".to_owned(), false))?;
-        verify_receipt(delivery, wire, attempt.authority.as_ref()).map_err(|reason| {
-            (
-                format!(
-                    "{reason}; retained remote recovery directory: {}",
-                    execution.directory.path().display(),
-                ),
-                false,
-            )
-        })?;
+        verify_live_receipt(delivery, wire, attempt.authority.as_ref(), continuation).map_err(
+            |reason| {
+                (
+                    format!(
+                        "{reason}; retained remote recovery directory: {}",
+                        execution.directory.path().display(),
+                    ),
+                    false,
+                )
+            },
+        )?;
         owned.execution_finished = true;
         // Complete execution is distinct from remote ACK confirmation. Keep a
         // verified delivery for acknowledgment-only reconciliation when needed.
@@ -1252,8 +1255,8 @@ impl PendingRemote {
             .verify(&attempt.request)
             .map_err(settled)?;
         let result = if attempt.request.is_execution_only() {
-            let result =
-                RequestOwnedResult::new(captured, attempt, delivery, wire).map_err(settled)?;
+            let result = RequestOwnedResult::new(captured, attempt, delivery, wire, continuation)
+                .map_err(settled)?;
             // No H011 offer, transcript index, winner or verification sample is
             // written. Retire the dispatch before releasing the worker, while
             // the affine capture owner keeps every result object pinned.
@@ -1650,6 +1653,36 @@ fn verify_receipt(
     wire: &Value,
     authority: Option<&AttemptAuthority>,
 ) -> Result<(), String> {
+    if delivery.receipt["resumed"] == true {
+        return Err("verified delivery does not bind the live authenticated attempt".into());
+    }
+    verify_attempt_receipt(delivery, wire, authority)
+}
+
+/// A generic operator resume never acquires live publication authority. Only
+/// private evidence captured by this still-owned attempt's interrupted receive
+/// can bridge the original execution to its exact result-only continuation.
+fn verify_live_receipt(
+    delivery: &Delivery,
+    wire: &Value,
+    authority: Option<&AttemptAuthority>,
+    continuation: Option<&SealedResult>,
+) -> Result<(), String> {
+    if let Some(sealed) = continuation {
+        sealed
+            .verify_delivery(delivery, wire)
+            .map_err(|error| format!("sealed result continuation: {error}"))?;
+        verify_attempt_receipt(delivery, wire, authority)
+    } else {
+        verify_receipt(delivery, wire, authority)
+    }
+}
+
+fn verify_attempt_receipt(
+    delivery: &Delivery,
+    wire: &Value,
+    authority: Option<&AttemptAuthority>,
+) -> Result<(), String> {
     let authority = authority.ok_or("remote delivery has no execution authority")?;
     let receipt = &delivery.receipt;
     let request_digest = hex(&Sha256::digest(
@@ -1657,7 +1690,6 @@ fn verify_receipt(
     ));
     let incarnation = format!("{:032x}", authority.worker_incarnation_id.0);
     if receipt["transport_authenticated"] != true
-        || receipt["resumed"] == true
         || receipt["request_id"] != wire["request_id"]
         || receipt["request_sha256"].as_str() != Some(request_digest.as_str())
         || receipt["worker_spki_sha256"].as_str() != Some(authority.worker_peer_id.0.as_str())
@@ -1697,6 +1729,7 @@ impl RequestOwnedResult {
         attempt: &ExecutionAttempt,
         delivery: &Delivery,
         wire: &Value,
+        continuation: Option<&SealedResult>,
     ) -> Result<Self, String> {
         if !attempt.request.is_execution_only()
             || !attempt.request.plan.canonical_cargo
@@ -1709,7 +1742,7 @@ impl RequestOwnedResult {
                 "request-owned result requires a successful canonical workspace execution".into(),
             );
         }
-        verify_receipt(delivery, wire, attempt.authority.as_ref())?;
+        verify_live_receipt(delivery, wire, attempt.authority.as_ref(), continuation)?;
         if attempt.authority.as_ref() != Some(&captured.offer.authority) {
             return Err("request-owned result differs from the admitted execution".into());
         }

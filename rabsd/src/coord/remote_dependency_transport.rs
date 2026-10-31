@@ -7,16 +7,18 @@
 //! execution request. The ordinary receiver verifies private delivery bytes.
 //! Publication, Cargo output installation and fallback remain with the caller.
 //! Typed transport failures temporarily exclude this worker from NEW placement;
-//! they never retry an execution or resolve its durable uncertainty.
+//! they never retry an execution or resolve its durable uncertainty. A still
+//! reserved attempt may reconnect once to fetch its already observed sealed
+//! result, with the original transfer deadline and authenticated incarnation.
 
 use super::secure_worker_delivery::{
     OperationCancellation, PinnedWorkerAdmission, WorkerAdmissionHook, parse_worker_pin,
-    receive_authenticated_with_admission,
+    receive_authenticated_continuation, receive_authenticated_with_admission,
 };
 use super::source_delivery::SourceUpload;
 use super::worker_delivery::{
-    Delivery, DeliveryFailure, DeliveryMode, toolchain_transfer, transport_interrupted,
-    validate_request, worker_transport_error,
+    Delivery, DeliveryFailure, DeliveryMode, SealedResult, toolchain_transfer,
+    transport_interrupted, validate_request, worker_transport_error,
 };
 use asupersync::runtime::RuntimeBuilder;
 use rabs_asupersync::worker_transport::{TlsFiles, accept_peer};
@@ -93,7 +95,16 @@ fn failure(destination: &Path, error: io::Error) -> DeliveryFailure {
         execution_may_have_run: false,
         transport_interrupted: transport_interrupted(&error),
         detail: error.to_string(),
+        sealed_result: None,
     }
+}
+
+enum ReservedOperation<'a> {
+    Execute {
+        upload: &'a SourceUpload,
+        on_admitted: WorkerAdmissionHook,
+    },
+    Continue(SealedResult),
 }
 
 /// Explicit worker selection, with no worker-supplied name or learned key pin.
@@ -238,6 +249,7 @@ impl RemoteDependencyTransport {
             admission: None,
             request_id: None,
             dispatch_attempted: false,
+            continuation: None,
         };
         let cooldown = self.cooldown.try_lock().map_err(|_| {
             // Contended or poisoned local hints exclude only THIS candidate,
@@ -300,17 +312,26 @@ impl RemoteDependencyTransport {
             .execute(request, upload, destination, cancellation, on_admitted)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn execute_reserved(
         &self,
         admission: Option<PinnedWorkerAdmission>,
         request: &Value,
-        upload: &SourceUpload,
         destination: &Path,
         cancellation: OperationCancellation,
-        on_admitted: WorkerAdmissionHook,
+        operation: ReservedOperation<'_>,
     ) -> Result<Delivery, DeliveryFailure> {
-        let before_dispatch = |error| failure(destination, error);
+        let continuing = matches!(&operation, ReservedOperation::Continue(_));
+        let before_dispatch = |error| {
+            let mut failure = failure(destination, error);
+            // A connection failure on this path can never erase the original
+            // dispatch. In particular, it must not permit alternate execution.
+            failure.execution_may_have_run = continuing;
+            failure
+        };
+        let mut connection_deadline = Instant::now() + CONNECT_BUDGET;
+        if let ReservedOperation::Continue(sealed) = &operation {
+            connection_deadline = connection_deadline.min(sealed.deadline());
+        }
         if asupersync::cx::Cx::current().is_some() {
             return Err(before_dispatch(invalid(
                 "remote dependency delivery requires a dedicated blocking thread",
@@ -319,7 +340,19 @@ impl RemoteDependencyTransport {
         if cancellation.is_cancelled() {
             return Err(before_dispatch(cancelled()));
         }
-        preflight(request, upload, destination).map_err(&before_dispatch)?;
+        match &operation {
+            ReservedOperation::Execute { upload, .. } => {
+                preflight(request, upload, destination).map_err(&before_dispatch)?;
+            }
+            ReservedOperation::Continue(sealed) => {
+                sealed.verify_request(request).map_err(&before_dispatch)?;
+                if !absolute_without_traversal(destination) {
+                    return Err(before_dispatch(invalid(
+                        "remote dependency destination must be absolute without traversal",
+                    )));
+                }
+            }
+        }
         let acceptor = self
             .tls
             .acceptor()
@@ -355,7 +388,16 @@ impl RemoteDependencyTransport {
                     .map_err(io::Error::other)
             };
             until_cancelled(&cancellation, async {
-                asupersync::time::timeout(asupersync::time::wall_now(), CONNECT_BUDGET, exchange)
+                let budget = connection_deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|remaining| !remaining.is_zero())
+                    .ok_or_else(|| {
+                        worker_transport_error(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "remote dependency worker connection deadline exceeded",
+                        ))
+                    })?;
+                asupersync::time::timeout(asupersync::time::wall_now(), budget, exchange)
                     .await
                     .map_err(|_| {
                         worker_transport_error(io::Error::new(
@@ -368,19 +410,34 @@ impl RemoteDependencyTransport {
         })
         .map_err(&before_dispatch)?;
 
-        receive_authenticated_with_admission(
-            &runtime,
-            peer,
-            admission,
-            request,
-            destination,
-            DeliveryMode::Execute,
-            Some(upload),
-            None,
-            cancellation,
-            None,
-            Some(on_admitted),
-        )
+        match operation {
+            ReservedOperation::Execute {
+                upload,
+                on_admitted,
+            } => receive_authenticated_with_admission(
+                &runtime,
+                peer,
+                admission,
+                request,
+                destination,
+                DeliveryMode::Execute,
+                Some(upload),
+                None,
+                cancellation,
+                None,
+                Some(on_admitted),
+            ),
+            ReservedOperation::Continue(sealed) => receive_authenticated_continuation(
+                &runtime,
+                peer,
+                admission,
+                request,
+                destination,
+                None,
+                cancellation,
+                sealed,
+            ),
+        }
     }
 }
 
@@ -391,6 +448,9 @@ pub struct RemoteDependencyReservation {
     admission: Option<PinnedWorkerAdmission>,
     request_id: Option<u64>,
     dispatch_attempted: bool,
+    /// Only this reservation's own interrupted receive can grant one reconnect.
+    /// This is consumed without allocating an ID or another execution lease.
+    continuation: Option<SealedResult>,
 }
 
 impl std::fmt::Debug for RemoteDependencyReservation {
@@ -401,6 +461,7 @@ impl std::fmt::Debug for RemoteDependencyReservation {
             .field("request_id", &self.request_id)
             .field("admission_held", &self.admission.is_some())
             .field("dispatch_attempted", &self.dispatch_attempted)
+            .field("continuation_available", &self.continuation.is_some())
             .finish()
     }
 }
@@ -489,6 +550,7 @@ impl RemoteDependencyReservation {
                 execution_may_have_run: true,
                 transport_interrupted: false,
                 detail: "remote dependency reservation cannot dispatch twice".into(),
+                sealed_result: None,
             });
         }
         if self
@@ -503,10 +565,58 @@ impl RemoteDependencyReservation {
         let outcome = self.transport.execute_reserved(
             self.admission.take(),
             request,
-            upload,
             destination,
             cancellation.clone(),
-            Box::new(on_admitted),
+            ReservedOperation::Execute {
+                upload,
+                on_admitted: Box::new(on_admitted),
+            },
+        );
+        self.continuation = outcome
+            .as_ref()
+            .err()
+            .filter(|failure| failure.transport_interrupted && failure.execution_may_have_run)
+            .and_then(|failure| failure.sealed_result.as_deref().cloned());
+        self.transport
+            .observe_delivery(&outcome, cancellation.is_cancelled(), Instant::now());
+        outcome
+    }
+
+    /// Reconnect once for the exact result already observed by this reservation.
+    /// No upload, admission callback, lease renewal or compiler dispatch exists
+    /// on this path. The receiver rehashes every delivered byte; partial local
+    /// files remain private recovery custody and are not copied without bounds.
+    pub(crate) fn continue_result(
+        &mut self,
+        request: &Value,
+        destination: &Path,
+        cancellation: OperationCancellation,
+    ) -> Result<Delivery, DeliveryFailure> {
+        let refuse = |reason: &str| DeliveryFailure {
+            directory: destination.to_path_buf(),
+            execution_may_have_run: true,
+            transport_interrupted: false,
+            detail: reason.to_owned(),
+            sealed_result: None,
+        };
+        let sealed = self
+            .continuation
+            .take()
+            .ok_or_else(|| refuse("this reservation has no sealed result to continue"))?;
+        if !self.dispatch_attempted
+            || self.request_id.is_none()
+            || self.request_id != request["request_id"].as_u64()
+        {
+            return Err(refuse(
+                "result continuation differs from its original reserved request",
+            ));
+        }
+        let outcome = self.transport.execute_reserved(
+            None,
+            request,
+            destination,
+            cancellation.clone(),
+            ReservedOperation::Continue(sealed),
         );
         self.transport
             .observe_delivery(&outcome, cancellation.is_cancelled(), Instant::now());
