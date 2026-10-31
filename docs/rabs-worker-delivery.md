@@ -462,6 +462,32 @@ rights. Recovered outputs pass through the same original input checks, result
 capture and publication rules as an uninterrupted delivery. Workspace results
 retain their existing request-owned scope and do not become action-cache hits.
 
+### Prefetch metadata while the worker compiles
+
+Matching Linux workers and coordinators automatically negotiate
+`rmeta-prefetch-v1` for a new execution with one exact declared `.rmeta` file.
+After observing rustc's complete artifact notification, the existing process
+owner can capture that file and send its bytes while the compiler continues
+producing the remaining outputs. Capture uses the original private output
+directory and accepts only a stable, nonempty, nonexecutable regular file with
+one link. The candidate is limited to 8 MiB and transferred in 64 KiB chunks.
+Observing these notifications does not consume the normal diagnostic stream.
+
+The coordinator keeps the prefetched bytes private until the ordinary terminal
+result and complete manifest have passed validation. Reuse requires the exact
+final filename, length, digest and executable mode. The normal downloader still
+creates a fresh file, rehashes its contents, applies permissions, syncs it and
+completes the existing receipts and acknowledgments. A complete matching
+candidate avoids the final metadata range requests. A missed notification,
+incomplete transfer or changed final file uses ordinary artifact delivery.
+Malformed or unnegotiated wire frames refuse the delivery.
+
+Completion and readable cancellation or lease controls take priority over each
+optional chunk. A stalled hint write has a two-second deadline and enters the
+same joined process cleanup as other transport failures. Sealed-result resume
+does not negotiate this live optimization. Prefetch does not notify Cargo before
+producer completion, grant cache publication or authorize provisional consumers.
+
 ### Reuse retained compiler runtimes
 
 A Linux worker retains up to four independently captured ELF runtime images

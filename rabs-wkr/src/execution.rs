@@ -121,6 +121,7 @@ pub struct ExecutionControl {
     artifacts: Arc<Mutex<ArtifactCapture>>,
     target_seed: Arc<Mutex<Option<crate::target_cache::PendingTargetSeed>>>,
     preview: Arc<LiveOutputPreview>,
+    pub(crate) metadata_prefetch: Arc<crate::metadata_prefetch::MetadataPrefetch>,
 }
 
 impl ExecutionControl {
@@ -173,6 +174,7 @@ impl ExecutionControl {
             artifacts: Arc::new(Mutex::new(ArtifactCapture::default())),
             target_seed: Arc::new(Mutex::new(None)),
             preview: Arc::new(LiveOutputPreview::default()),
+            metadata_prefetch: Arc::new(crate::metadata_prefetch::MetadataPrefetch::default()),
         })
     }
 
@@ -259,6 +261,14 @@ impl ExecutionControl {
         let mut output = self.output.lock().unwrap_or_else(|e| e.into_inner());
         if self.state.load(Ordering::Acquire) & FINISHED == 0 {
             output.requested = true;
+        }
+    }
+
+    /// Select optional private metadata prefetch before invoking the executor.
+    /// This cannot authorize artifact publication or a Cargo notification.
+    pub fn request_metadata_prefetch(&self) {
+        if self.state.load(Ordering::Acquire) == RUNNING {
+            self.metadata_prefetch.select();
         }
     }
 
@@ -485,6 +495,18 @@ pub struct ExecutionTask {
 }
 
 impl ExecutionTask {
+    /// One bounded prefetched chunk from this still-running execution. The
+    /// session polls completion and incoming controls before this optional lane.
+    pub fn poll_metadata_prefetch(&self, cx: &mut Context<'_>) -> Poll<serde_json::Value> {
+        if self.control.reason().is_some() || self.control.state.load(Ordering::Acquire) != RUNNING
+        {
+            return Poll::Pending;
+        }
+        self.control
+            .metadata_prefetch
+            .poll_chunk(self.request_id, cx)
+    }
+
     /// Spawn a cooperating blocking executor. Thread creation failures do not
     /// admit work. Panics become typed execution errors, never successful offers.
     pub fn spawn(

@@ -20,6 +20,7 @@ pub mod artifacts;
 pub mod execution;
 pub mod host_budget;
 pub mod jobserver;
+pub mod metadata_prefetch;
 pub mod output;
 pub mod request_journal;
 pub mod result_spool;

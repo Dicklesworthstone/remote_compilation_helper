@@ -10,6 +10,7 @@
 //! Explicit resume may copy local prefixes, but verifies the complete new files.
 
 mod byte_cache;
+mod metadata_prefetch;
 mod ranges;
 mod reuse;
 mod sealed_result;
@@ -1045,6 +1046,24 @@ pub fn receive_operation(
                 "worker lacks files-v1",
             )?;
         }
+        let prefetch_name = if mode == DeliveryMode::Execute
+            && supports(
+                "metadata_prefetches",
+                rabs_protocol::metadata_prefetch::VERSION,
+            ) {
+            expected
+                .as_ref()
+                .filter(|declaration| !declaration.tree)
+                .and_then(|declaration| {
+                    rabs_protocol::metadata_prefetch::candidate(
+                        declaration.names.iter().map(String::as_str),
+                    )
+                    .map(str::to_owned)
+                })
+        } else {
+            None
+        };
+        let mut prefetched = metadata_prefetch::MetadataPrefetch::new(id, prefetch_name);
         // Atomic create, never exists-then-truncate. Everything written below is
         // in this caller-owned private tree; no peer controls a host root.
         create_directory(destination)?;
@@ -1057,6 +1076,9 @@ pub fn receive_operation(
         }
         if expected.is_some() {
             ack["artifact_transfer"] = json!("files-v1");
+        }
+        if prefetched.selected() {
+            ack["metadata_prefetch"] = json!(rabs_protocol::metadata_prefetch::VERSION);
         }
         if retention {
             ack["result_retention"] = json!(RESULT_RETENTION);
@@ -1079,7 +1101,14 @@ pub fn receive_operation(
         )?;
         execution_may_have_run = true; // before even a partially successful write
         peer.send(&dispatch)?;
-        let result = receive(peer, expected_worker)?;
+        let result = loop {
+            let frame = receive(peer, expected_worker)?;
+            if frame.get("kind").and_then(Value::as_str) != Some("metadata-prefetch") {
+                break frame;
+            }
+            peer.checkpoint()?;
+            prefetched.accept(&frame)?;
+        };
         require(
             text(&result, "kind")? == "exec-result" && number(&result, "request_id")? == id,
             "execution refused or returned an unexpected identity; do not resubmit",
@@ -1231,6 +1260,7 @@ pub fn receive_operation(
                 id,
                 manifest,
                 &destination.join("artifacts"),
+                prefetched.complete(),
             )?;
         }
         sync_tree_directories(destination)?;
@@ -1319,6 +1349,7 @@ pub fn receive_operation(
 mod tests {
     mod byte_cache_tests;
     mod cross_file_range_tests;
+    mod metadata_prefetch_tests;
     mod range_pipeline_tests;
     mod tree_tests;
 

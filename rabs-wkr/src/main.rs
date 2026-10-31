@@ -19,6 +19,7 @@ use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use rabs_protocol::lease_semantics::{
     REQUEST_EXECUTION_LEASE_VERSION, RequestExecutionLease, RequestExecutionLeaseIdentity,
 };
+use rabs_protocol::metadata_prefetch::VERSION as METADATA_PREFETCH_VERSION;
 use rabs_sandbox::dependency_context::{
     CANONICAL_DEPENDENCY_CONTEXT_VERSION, CANONICAL_NATIVE_METADATA_CAPABILITY,
     CANONICAL_NATIVE_ROOTS_CAPABILITY, CANONICAL_WORKSPACE_CONTEXT_VERSION,
@@ -920,6 +921,7 @@ enum SessionEvent {
     },
     SourceCompleted(Box<Result<SourceReply, String>>),
     ToolchainCompleted(Box<Result<ToolchainReply, String>>),
+    MetadataPrefetch(serde_json::Value),
 }
 
 /// Input I/O may defer ordered data/admission frames. Keep raw bounded
@@ -994,7 +996,18 @@ async fn next_event<R: AsyncRead + Unpin>(
         {
             return Poll::Ready(SessionEvent::Frame(Ok(Some(frame))));
         }
-        read.as_mut().poll(cx).map(SessionEvent::Frame)
+        if let Poll::Ready(frame) = read.as_mut().poll(cx) {
+            return Poll::Ready(SessionEvent::Frame(frame));
+        }
+        // Optional artifact hints never overtake completion or readable
+        // cancellation/lease controls. Only one bounded chunk is emitted per
+        // loop, and no filesystem read runs on this control reactor.
+        if let Some(task) = active.as_ref()
+            && let Poll::Ready(frame) = task.poll_metadata_prefetch(cx)
+        {
+            return Poll::Ready(SessionEvent::MetadataPrefetch(frame));
+        }
+        Poll::Pending
     })
     .await
 }
@@ -1504,6 +1517,18 @@ where
             {
                 SessionEvent::InputExpired => return Err(INPUT_DEADLINE_EXCEEDED.to_owned()),
                 SessionEvent::Cancelled => return Err("session cancelled".to_owned()),
+                SessionEvent::MetadataPrefetch(frame) => {
+                    // A stalled optional bulk write must not indefinitely
+                    // prevent the session from reading a cancellation. A
+                    // partial timed-out frame poisons this connection; joined
+                    // cleanup below remains responsible for its compiler.
+                    asupersync::time::timeout(
+                        asupersync::time::wall_now(), Duration::from_secs(2),
+                        write_session_frame(stream, &frame.to_string(),
+                            &mut input_deadline, "metadata prefetch write"),
+                    ).await.map_err(|_| "metadata prefetch write deadline exceeded".to_owned())??;
+                    continue;
+                }
                 SessionEvent::SourceCompleted(result) => {
                     let completed = (*result).map_err(|error| format!("source operation failed: {error}"))?;
                     input_deadline.source_completed(&completed);
@@ -1857,6 +1882,7 @@ fn worker_hello(report: &rabs_wkr::session::CapabilityReport, journal: &WorkerJo
         "canonical": report.canonical_namespace, "slots": report.slots, "token_id": 1,
         "output_transfers": [OUTPUT_TRANSFER], "artifact_transfers": [ARTIFACT_TRANSFER],
         "output_previews": [OUTPUT_PREVIEW_VERSION],
+        "metadata_prefetches": if cfg!(target_os = "linux") { vec![METADATA_PREFETCH_VERSION] } else { Vec::<&str>::new() },
         "source_transfers": [SOURCE_TRANSFER],
         "toolchain_transfers": [TOOLCHAIN_TRANSFER_VERSION],
         "toolchain_reuses": [TOOLCHAIN_REUSE_VERSION],
@@ -1952,6 +1978,7 @@ async fn session_loop(
         receive_toolchain,
         reuse_toolchain,
         output_preview,
+        metadata_prefetch,
         execution_lease,
         dependency_context,
     ) = asupersync::time::timeout(
@@ -2050,6 +2077,7 @@ async fn session_loop(
             let reuse =
                 toolchain_transfer::selected_reuse(&ack, local_identity.is_some(), toolchain)?;
             let preview = output_preview_requested(&ack)?;
+            let prefetch = metadata_prefetch_requested(&ack)?;
             let dependency_context = dependency_context_selection(
                 &ack,
                 &report.dependency_modes,
@@ -2076,6 +2104,7 @@ async fn session_loop(
                 toolchain,
                 reuse,
                 preview,
+                prefetch,
                 lease,
                 dependency_context,
             ))
@@ -2133,6 +2162,9 @@ async fn session_loop(
                 // Cancellation/disconnect cannot remove source before process drain.
                 if capture_output {
                     control.request_output_capture();
+                }
+                if metadata_prefetch {
+                    control.request_metadata_prefetch();
                 }
                 let _toolchain_owner = toolchain;
                 let resources = ExecutionResources {
@@ -2212,6 +2244,26 @@ fn output_preview_requested(frame: &str) -> Result<bool, String> {
         None => Ok(false),
         Some(value) if value.as_str() == Some(OUTPUT_PREVIEW_VERSION) => Ok(true),
         Some(_) => Err("unsupported output_preview selection".to_owned()),
+    }
+}
+
+fn metadata_prefetch_requested(frame: &str) -> Result<bool, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(frame).map_err(|error| format!("handshake JSON: {error}"))?;
+    match value.get("metadata_prefetch") {
+        None => Ok(false),
+        Some(value) if value.as_str() == Some(METADATA_PREFETCH_VERSION) => {
+            if !cfg!(target_os = "linux")
+                || !output_transfer_requested(frame)?
+                || !artifacts::transfer_requested(frame)?
+            {
+                return Err(
+                    "metadata prefetch requires complete Linux output/artifact delivery".into(),
+                );
+            }
+            Ok(true)
+        }
+        Some(_) => Err("unsupported metadata_prefetch selection".into()),
     }
 }
 
@@ -3339,6 +3391,32 @@ mod tests {
                 )
                 .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn metadata_prefetch_is_optional_and_requires_exact_complete_delivery_selection() {
+        assert!(!metadata_prefetch_requested(r#"{"kind":"session-ok"}"#).unwrap());
+        let selected = serde_json::json!({"kind":"session-ok", "metadata_prefetch":METADATA_PREFETCH_VERSION,
+            "output_transfer":"ranges-v1", "artifact_transfer":"files-v1"});
+        assert_eq!(
+            metadata_prefetch_requested(&selected.to_string()).is_ok(),
+            cfg!(target_os = "linux")
+        );
+        for key in ["output_transfer", "artifact_transfer"] {
+            let mut frame = selected.clone();
+            frame.as_object_mut().unwrap().remove(key);
+            assert!(metadata_prefetch_requested(&frame.to_string()).is_err());
+        }
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!(true),
+            serde_json::json!("rmeta-prefetch-v2"),
+            serde_json::json!([METADATA_PREFETCH_VERSION]),
+        ] {
+            let mut frame = selected.clone();
+            frame["metadata_prefetch"] = value;
+            assert!(metadata_prefetch_requested(&frame.to_string()).is_err());
         }
     }
 

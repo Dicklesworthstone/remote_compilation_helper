@@ -1628,13 +1628,27 @@ fn execute_canonical_inner(
         resident_bound: EXEC_STREAM_RESIDENT_BOUND,
         spill_dir: spill_root.join(format!("attempt-{}", request.request_id)),
     };
+    #[cfg(target_os = "linux")]
+    let mut metadata_prefetch = artifacts.as_ref().and_then(|artifacts| {
+        let visible = request.dependency_context.as_ref().map_or_else(
+            || artifacts.plan().virtual_root(),
+            |context| context.out_dir().to_owned(),
+        );
+        crate::metadata_prefetch::MetadataObserver::new(artifacts, &visible, control)
+    });
     // Live tails are observational only. The SAME managed wait still owns the
     // aggregate capture budget, cancellation, descendant cleanup and full spools.
     let waited = group.wait_with_bounded_drain_preview(
         &limits,
         rabs_asupersync::stream_drain::DEFAULT_MAX_CAPTURE_BYTES,
         Some(control.output_observer()),
-        || control.reason().is_some(),
+        || {
+            #[cfg(target_os = "linux")]
+            if let Some(observer) = &mut metadata_prefetch {
+                observer.poll(control);
+            }
+            control.reason().is_some()
+        },
     );
     drop(bridge);
     match waited {

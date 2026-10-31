@@ -6,6 +6,7 @@
 //! digest, mode and sync succeed. Failure never drains, retries or acknowledges.
 
 use super::byte_cache::CacheSession;
+use super::metadata_prefetch::MetadataPrefetch;
 use super::{
     CHUNK_BYTES, Item, Manifest, ResumeSource, WorkerPeer, create_file, digest, hash, is_hex,
     number, receive, require, text,
@@ -38,6 +39,7 @@ impl<'a> Download<'a> {
         path: &Path,
         source: Option<&ResumeSource>,
         cache: Option<&CacheSession>,
+        prefetch: Option<&MetadataPrefetch>,
         mut checkpoint: impl FnMut() -> io::Result<()>,
     ) -> io::Result<Self> {
         checkpoint()?;
@@ -57,7 +59,18 @@ impl<'a> Download<'a> {
             )?,
             None => 0,
         };
-        let cached = if let Some(cache) = cache {
+        let prefetched = if let Some(prefetch) = prefetch {
+            if let Some(prefetched_hash) = prefetch.copy(item, &mut file, &mut checkpoint)? {
+                hasher = prefetched_hash;
+                offset = item.len;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let cached = if let Some(cache) = cache.filter(|_| !prefetched) {
             if let Some(cached_hash) = cache.copy(item, &mut file, &mut checkpoint)? {
                 hasher = cached_hash;
                 offset = item.len;
@@ -193,6 +206,7 @@ fn download_many<'a>(
     id: u64,
     targets: impl Iterator<Item = (&'a Item, Option<&'a str>, PathBuf)>,
     mut cache: Option<CacheSession>,
+    prefetch: Option<&MetadataPrefetch>,
 ) -> io::Result<()> {
     let mut targets = targets.fuse();
     let mut active: VecDeque<Download<'a>> = VecDeque::with_capacity(RANGE_WINDOW);
@@ -208,11 +222,17 @@ fn download_many<'a>(
                 // peer checkpoint, and are disabled whenever that source exists.
                 let source = peer.resume_source();
                 let file = if source.is_some() {
-                    Download::open(item, manifest_hash, &path, source, None, || Ok(()))?
+                    Download::open(item, manifest_hash, &path, source, None, None, || Ok(()))?
                 } else {
-                    Download::open(item, manifest_hash, &path, None, cache.as_ref(), || {
-                        peer.checkpoint()
-                    })?
+                    Download::open(
+                        item,
+                        manifest_hash,
+                        &path,
+                        None,
+                        cache.as_ref(),
+                        prefetch.filter(|_| manifest_hash.is_some()),
+                        || peer.checkpoint(),
+                    )?
                 };
                 // A complete NONEMPTY local hint needs no range request, but
                 // is not trusted until its full hash, permissions and sync pass.
@@ -259,6 +279,7 @@ pub(super) fn download(
         id,
         std::iter::once((item, manifest_hash, path.to_path_buf())),
         None,
+        None,
     )
 }
 
@@ -271,6 +292,7 @@ pub(super) fn download_artifacts(
     id: u64,
     manifest: &Manifest,
     root: &Path,
+    prefetch: Option<&MetadataPrefetch>,
 ) -> io::Result<()> {
     // A claimed JSON worker identity is insufficient. Local byte hints are
     // scoped only after trusted session admission, and never override explicit
@@ -294,5 +316,6 @@ pub(super) fn download_artifacts(
             .iter()
             .map(|item| (item, Some(manifest.sha256.as_str()), root.join(&item.name))),
         cache,
+        prefetch,
     )
 }

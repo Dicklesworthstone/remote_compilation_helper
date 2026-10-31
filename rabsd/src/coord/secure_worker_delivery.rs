@@ -264,6 +264,7 @@ struct AdmittedPeer<P> {
     negotiation_started: bool,
     proof: Option<WorkerAuthentication>,
     operation_sent: bool,
+    metadata_prefetch: bool,
     source: Option<SourceUpload>,
     on_admitted: Option<WorkerAdmissionHook>,
     live_continuation: Option<SealedResult>,
@@ -316,6 +317,7 @@ impl<P: WorkerPeer> AdmittedPeer<P> {
             negotiation_started: false,
             proof: None,
             operation_sent: false,
+            metadata_prefetch: false,
             source: None,
             on_admitted: None,
             live_continuation: None,
@@ -392,6 +394,33 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
                 && grant["recovery_protocol"] == "request-journal-v1",
             "invalid delivery session selection",
         )?;
+        let metadata_prefetch = match grant.get("metadata_prefetch") {
+            None => false,
+            Some(version) => {
+                let artifacts = &self.expected_operation["artifacts"];
+                require(
+                    self.mode == DeliveryMode::Execute
+                        && version == rabs_protocol::metadata_prefetch::VERSION
+                        && grant["artifact_transfer"] == "files-v1"
+                        && hello["metadata_prefetches"]
+                            .as_array()
+                            .is_some_and(|versions| {
+                                versions.iter().any(|version| {
+                                    version == rabs_protocol::metadata_prefetch::VERSION
+                                })
+                            })
+                        && artifacts.get("tree").is_none()
+                        && artifacts["files"].as_array().is_some_and(|files| {
+                            rabs_protocol::metadata_prefetch::candidate(
+                                files.iter().filter_map(Value::as_str),
+                            )
+                            .is_some()
+                        }),
+                    "metadata prefetch was not authorized by this execution session",
+                )?;
+                true
+            }
+        };
         if self.mode == DeliveryMode::Resume {
             require(
                 grant["result_retention"] == "durable-result-v1"
@@ -568,6 +597,7 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
             session_id,
             identity_generation: admitted.grant().binding.generation,
         });
+        self.metadata_prefetch = metadata_prefetch;
         Ok(())
     }
 
@@ -628,6 +658,22 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
         }
         require(self.operation_sent, "unsolicited worker result")?;
         let frame = self.inner.receive()?;
+        if frame["kind"] == "metadata-prefetch" {
+            require(
+                self.metadata_prefetch
+                    && self.mode == DeliveryMode::Execute
+                    && frame["request_id"] == self.expected_operation["request_id"]
+                    && frame["version"] == rabs_protocol::metadata_prefetch::VERSION
+                    && frame["publication_authorized"] == false,
+                "metadata prefetch does not own this authenticated execution",
+            )?;
+            // This adapter proves only the operation boundary. The ordinary
+            // receiver still checks every bounded chunk and the final manifest.
+            return Ok(frame);
+        }
+        if frame["kind"] == "exec-result" {
+            self.metadata_prefetch = false;
+        }
         require(
             matches!(
                 frame["kind"].as_str(),
@@ -1651,6 +1697,100 @@ mod tests {
     }
     fn peer(hello: Value, response: Value) -> AdmittedPeer<Script> {
         peer_with_mode(hello, response, DeliveryMode::Execute)
+    }
+
+    #[test]
+    fn metadata_prefetch_passes_authenticated_admission_only_during_its_selected_execution() {
+        for variant in ["selected", "unselected", "wrong-request", "terminal"] {
+            let mut request = request();
+            request["artifacts"]["files"] = json!(["libdep.rmeta"]);
+            let mut offered = hello();
+            offered["metadata_prefetches"] = json!([rabs_protocol::metadata_prefetch::VERSION]);
+            let (inner, admission) = with_admission(Script {
+                replies: VecDeque::from([offered, response()]),
+                ..Script::default()
+            });
+            let mut peer = AdmittedPeer::new(
+                inner,
+                TransportIdentity {
+                    peer_id: [1; 32],
+                    fingerprint: [1; 32],
+                },
+                [1; 32],
+                &request,
+                [10, 20, 30],
+                DeliveryMode::Execute,
+                admission,
+            )
+            .unwrap();
+            let hello = peer.receive().unwrap();
+            let mut grant = grant();
+            if variant != "unselected" {
+                grant["metadata_prefetch"] = json!(rabs_protocol::metadata_prefetch::VERSION);
+            }
+            peer.negotiate(&hello, &grant).unwrap();
+            assert_eq!(
+                peer.inner.sent[1].get("metadata_prefetch"),
+                grant.get("metadata_prefetch")
+            );
+            peer.send(&request).unwrap();
+            if variant == "terminal" {
+                peer.inner
+                    .replies
+                    .push_back(json!({"kind":"exec-result", "request_id":7}));
+                assert_eq!(peer.receive().unwrap()["kind"], "exec-result");
+            }
+            peer.inner
+                .replies
+                .push_back(json!({"kind":"metadata-prefetch",
+                "version":rabs_protocol::metadata_prefetch::VERSION,
+                "request_id":if variant == "wrong-request" { 8 } else { 7 },
+                "publication_authorized":false}));
+            assert_eq!(peer.receive().is_ok(), variant == "selected", "{variant}");
+        }
+    }
+
+    #[test]
+    fn metadata_prefetch_selection_refuses_unadvertised_or_ineligible_execution_before_challenge() {
+        for variant in ["unadvertised", "wrong-version", "no-metadata", "tree"] {
+            let mut request = request();
+            if variant != "no-metadata" {
+                request["artifacts"]["files"] = json!(["libdep.rmeta"]);
+            }
+            if variant == "tree" {
+                request["artifacts"]["tree"] = json!("tree-files-v1");
+            }
+            let mut offered = hello();
+            if variant != "unadvertised" {
+                offered["metadata_prefetches"] = json!([rabs_protocol::metadata_prefetch::VERSION]);
+            }
+            let (inner, admission) = with_admission(Script {
+                replies: VecDeque::from([offered, response()]),
+                ..Script::default()
+            });
+            let mut peer = AdmittedPeer::new(
+                inner,
+                TransportIdentity {
+                    peer_id: [1; 32],
+                    fingerprint: [1; 32],
+                },
+                [1; 32],
+                &request,
+                [10, 20, 30],
+                DeliveryMode::Execute,
+                admission,
+            )
+            .unwrap();
+            let hello = peer.receive().unwrap();
+            let mut grant = grant();
+            grant["metadata_prefetch"] = json!(if variant == "wrong-version" {
+                "rmeta-prefetch-v2"
+            } else {
+                rabs_protocol::metadata_prefetch::VERSION
+            });
+            assert!(peer.negotiate(&hello, &grant).is_err(), "{variant}");
+            assert!(peer.inner.sent.is_empty(), "{variant}");
+        }
     }
 
     #[test]

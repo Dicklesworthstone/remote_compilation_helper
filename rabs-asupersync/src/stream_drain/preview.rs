@@ -137,6 +137,32 @@ impl Lane {
             None
         }
     }
+
+    fn read_since(&self, stream: PreviewStream, cursor: u64) -> Option<OutputPreview> {
+        let tail = self.tail.try_lock().ok()?;
+        let observed = self.observed.load(Ordering::Acquire);
+        if tail.end > cursor {
+            let offset = tail.start.max(cursor);
+            let skip = usize::try_from(offset - tail.start).ok()?;
+            Some(OutputPreview {
+                stream,
+                offset,
+                bytes: tail.bytes.get(skip..)?.to_vec(),
+                skipped_bytes: offset - cursor,
+                observed_bytes: observed,
+            })
+        } else if observed > cursor {
+            Some(OutputPreview {
+                stream,
+                offset: observed,
+                bytes: Vec::new(),
+                skipped_bytes: observed - cursor,
+                observed_bytes: observed,
+            })
+        } else {
+            None
+        }
+    }
 }
 
 /// One invocation's independently bounded stdout/stderr preview tails.
@@ -165,12 +191,79 @@ impl LiveOutputPreview {
             PreviewStream::Stderr => self.stderr.take(stream),
         }
     }
+
+    /// Read with an independent caller-owned cursor, without consuming the
+    /// ordinary preview stream. This remains bounded and lossy: a gap requires
+    /// a parser to discard any incomplete record, never invent missing bytes.
+    /// The caller advances to `offset + bytes.len()` only after consuming it.
+    pub fn read_since(&self, stream: PreviewStream, cursor: u64) -> Option<OutputPreview> {
+        match stream {
+            PreviewStream::Stdout => self.stdout.read_since(stream, cursor),
+            PreviewStream::Stderr => self.stderr.read_since(stream, cursor),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn independent_cursor_never_consumes_or_rewinds_the_diagnostic_preview() {
+        let preview = LiveOutputPreview::default();
+        preview.record(PreviewStream::Stderr, 0, b"first\n");
+        let observed = preview.read_since(PreviewStream::Stderr, 0).unwrap();
+        assert_eq!(observed.bytes, b"first\n");
+        assert_eq!(
+            preview.take(PreviewStream::Stderr).unwrap().bytes,
+            b"first\n"
+        );
+        assert_eq!(
+            preview.read_since(PreviewStream::Stderr, 0).unwrap(),
+            observed
+        );
+        preview.record(PreviewStream::Stderr, 6, b"second\n");
+        assert_eq!(
+            preview.take(PreviewStream::Stderr).unwrap().bytes,
+            b"second\n"
+        );
+        assert_eq!(
+            preview.read_since(PreviewStream::Stderr, 6).unwrap().bytes,
+            b"second\n"
+        );
+        assert!(preview.read_since(PreviewStream::Stderr, 13).is_none());
+        assert!(
+            preview
+                .read_since(PreviewStream::Stderr, u64::MAX)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn independent_cursor_reports_overflow_and_contention_gaps() {
+        let preview = LiveOutputPreview::default();
+        preview.record(
+            PreviewStream::Stderr,
+            0,
+            &vec![b'x'; MAX_PREVIEW_BYTES + 11],
+        );
+        let tail = preview.read_since(PreviewStream::Stderr, 0).unwrap();
+        assert_eq!(tail.skipped_bytes, 11);
+        assert_eq!(tail.bytes.len(), MAX_PREVIEW_BYTES);
+        let end = tail.offset + tail.bytes.len() as u64;
+        {
+            let _held = preview.stderr.tail.lock().unwrap();
+            preview.record(PreviewStream::Stderr, end, b"lost");
+        }
+        let gap = preview.read_since(PreviewStream::Stderr, end).unwrap();
+        assert!(gap.bytes.is_empty());
+        assert_eq!((gap.offset, gap.skipped_bytes), (end + 4, 4));
+        assert_eq!(
+            preview.take(PreviewStream::Stderr).unwrap().skipped_bytes,
+            11
+        );
+    }
 
     #[test]
     fn independent_binary_streams_are_incremental_without_repeating_prefixes() {

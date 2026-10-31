@@ -1990,8 +1990,14 @@ also requires their metadata acknowledgment before complete installation.
 Older wrappers and valid empty-metadata results retain complete-result delivery.
 
 This permits downstream Cargo work to overlap local archive materialization.
-It does not expose an unfinished remote producer, overlap worker artifact
-upload, or authorize provisional descendants. Separate real
+Separately, matching workers can prefetch up to 8 MiB of exact declared metadata
+in 64 KiB chunks while the compiler is still running. These bytes remain private
+until the independently validated terminal manifest selects them; a complete
+match avoids the final metadata range requests. Partial or changed candidates
+use ordinary delivery. This overlaps metadata transfer with code generation,
+but Cargo notification still requires producer completion and does not authorize
+provisional descendants. See the [prefetch protocol](rabs-worker-delivery.md#prefetch-metadata-while-the-worker-compiles).
+Separate real
 Unix-socket/wrapper subprocess tests in `rabs-wrap/tests/metadata_protocol.rs`
 hold back the final answer until the prefix is observed on both cached and
 produced-result delivery, check exact transcript reassembly, and exercise
