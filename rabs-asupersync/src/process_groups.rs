@@ -385,10 +385,9 @@ impl ManagedProcessGroup {
         limits: &crate::stream_drain::DrainLimits,
         maximum: u64,
         preview: Option<std::sync::Arc<crate::stream_drain::preview::LiveOutputPreview>>,
-        mut stop_requested: impl FnMut() -> bool,
+        stop_requested: impl FnMut() -> bool,
     ) -> io::Result<crate::stream_drain::DrainedOutput> {
         use crate::stream_drain::MonitoredLanes;
-        use std::time::{Duration, Instant};
 
         let lanes = match preview {
             Some(preview) => {
@@ -396,6 +395,41 @@ impl ManagedProcessGroup {
             }
             None => MonitoredLanes::spawn(&mut self.leader, limits, maximum),
         };
+        self.wait_with_lanes(lanes, stop_requested)
+    }
+
+    /// Capture both streams and copy each accepted chunk to private ordinary
+    /// files before process completion. Slow network consumers are separate
+    /// from these lanes. The same aggregate quota, cancellation and group
+    /// cleanup apply, and a failed live write cannot produce successful output.
+    /// The returned capture is still complete; callers must not replay it to
+    /// the same destinations a second time.
+    ///
+    /// # Errors
+    /// Capture/live-write, thread startup, process wait, or cleanup errors.
+    pub fn wait_with_bounded_drain_files(
+        mut self,
+        limits: &crate::stream_drain::DrainLimits,
+        maximum: u64,
+        files: crate::stream_drain::LiveOutputFiles,
+        stop_requested: impl FnMut() -> bool,
+    ) -> io::Result<crate::stream_drain::DrainedOutput> {
+        let lanes = crate::stream_drain::MonitoredLanes::spawn_live_files(
+            &mut self.leader,
+            limits,
+            maximum,
+            files,
+        );
+        self.wait_with_lanes(lanes, stop_requested)
+    }
+
+    fn wait_with_lanes(
+        mut self,
+        lanes: crate::stream_drain::MonitoredLanes,
+        mut stop_requested: impl FnMut() -> bool,
+    ) -> io::Result<crate::stream_drain::DrainedOutput> {
+        use std::time::{Duration, Instant};
+
         let mut stopping_at = None;
         let mut killed = false;
         let status = loop {
@@ -1095,6 +1129,154 @@ mod tests {
         assert_eq!(output.status.code(), Some(7));
         assert_eq!(output.stdout.resident(), b"ordinary-out");
         assert_eq!(output.stderr.resident(), b"ordinary-error");
+    }
+
+    #[test]
+    fn live_files_deliver_binary_output_before_exit_and_retain_complete_capture() {
+        use crate::stream_drain::{DrainLimits, LiveOutputFiles};
+        use std::io::{Read, Write};
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+
+        let root = tempfile::tempdir().unwrap();
+        let stdout_path = root.path().join("stdout");
+        let stderr_path = root.path().join("stderr");
+        let make = |path| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .unwrap()
+        };
+        let stdout = make(&stdout_path);
+        let mut stderr = make(&stderr_path);
+        stderr.write_all(b"driver\n").unwrap();
+        let files = LiveOutputFiles::new(stdout, stderr).unwrap();
+        let (mut release, stdin_child) = UnixStream::pair().unwrap();
+        let group = ManagedProcessGroup::spawn_with(
+            &spec(
+                "sh",
+                r"printf 'out\000\377'; printf 'err\376' >&2; read -r release; printf tail; printf end >&2; exit 7",
+            ),
+            |command| {
+                command
+                    .stdin(Stdio::from(OwnedFd::from(stdin_child)))
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+            },
+        )
+        .unwrap();
+        let limits = DrainLimits {
+            resident_bound: 2,
+            spill_dir: root.path().join("capture"),
+        };
+        let output = std::thread::scope(|scope| {
+            let wait = scope.spawn(|| {
+                let started = Instant::now();
+                group.wait_with_bounded_drain_files(&limits, 16, files, || {
+                    started.elapsed() >= Duration::from_secs(5)
+                })
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if std::fs::read(&stdout_path).unwrap() == b"out\0\xff"
+                    && std::fs::read(&stderr_path).unwrap() == b"driver\nerr\xfe"
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "live output waited for process exit"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(!wait.is_finished(), "consumer has not released the child");
+            release.write_all(b"continue\n").unwrap();
+            wait.join().unwrap().unwrap()
+        });
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(output.residual_group_members, 0);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        output
+            .stdout
+            .reader()
+            .unwrap()
+            .read_to_end(&mut stdout)
+            .unwrap();
+        output
+            .stderr
+            .reader()
+            .unwrap()
+            .read_to_end(&mut stderr)
+            .unwrap();
+        assert_eq!(stdout, b"out\0\xfftail");
+        assert_eq!(stderr, b"err\xfeend");
+        assert_eq!(std::fs::read(stdout_path).unwrap(), stdout);
+        assert_eq!(std::fs::read(stderr_path).unwrap(), b"driver\nerr\xfeend");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_file_failures_and_output_quota_stop_and_reap_the_whole_group() {
+        use crate::stream_drain::{DrainFailure, DrainLimits, LiveOutputFiles};
+
+        for readonly in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let stdout_path = root.path().join("stdout");
+            let stdout = std::fs::File::create(&stdout_path).unwrap();
+            let stdout = if readonly {
+                std::fs::File::open(&stdout_path).unwrap()
+            } else {
+                stdout
+            };
+            let stderr_path = root.path().join("stderr");
+            let stderr = std::fs::File::create(&stderr_path).unwrap();
+            let files = LiveOutputFiles::new(stdout, stderr).unwrap();
+            let group = ManagedProcessGroup::spawn_with(
+                &spec(
+                    "sh",
+                    "trap '' TERM; sleep 30 & while :; do printf '%01000d' 0; done",
+                ),
+                |command| {
+                    command
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped());
+                },
+            )
+            .unwrap();
+            let pgid = group.pgid();
+            let started = Instant::now();
+            let maximum = if readonly { 1024 * 1024 } else { 4096 };
+            let error = group
+                .wait_with_bounded_drain_files(
+                    &DrainLimits::new(root.path().join("capture")),
+                    maximum,
+                    files,
+                    || started.elapsed() >= Duration::from_secs(5),
+                )
+                .unwrap_err();
+            let failure = error
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<DrainFailure>());
+            if readonly {
+                assert!(matches!(failure, Some(DrainFailure::Io { .. })));
+            } else {
+                assert!(matches!(
+                    failure,
+                    Some(DrainFailure::OutputLimitExceeded { maximum: 4096 })
+                ));
+            }
+            assert!(started.elapsed() < Duration::from_secs(5));
+            assert!(members_from_proc(pgid).is_empty());
+            assert!(
+                std::fs::metadata(stdout_path).unwrap().len()
+                    + std::fs::metadata(stderr_path).unwrap().len()
+                    <= maximum
+            );
+        }
     }
 
     #[test]

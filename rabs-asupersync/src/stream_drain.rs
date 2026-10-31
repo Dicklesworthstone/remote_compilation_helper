@@ -64,6 +64,59 @@ const READ_CHUNK: usize = 64 * 1024;
 /// An exceeded budget fails the execution; it never produces truncated success.
 pub const DEFAULT_MAX_CAPTURE_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// Exact live copies of accepted output, written only to ordinary files.
+///
+/// The caller owns these private destinations and must not write to either
+/// while the process drains. Each stream has one writer; no network, pipe or
+/// callback can stall the drain behind a slow output consumer. The ordinary
+/// capture remains complete and independently readable. A copy failure fails
+/// the managed execution and triggers its normal process-group cleanup.
+#[derive(Debug)]
+pub struct LiveOutputFiles {
+    stdout: File,
+    stderr: File,
+}
+
+impl LiveOutputFiles {
+    /// Keep the supplied file descriptions, including their current offsets.
+    /// Existing driver diagnostics may precede the process's own bytes.
+    ///
+    /// # Errors
+    /// Non-regular destinations, aliased streams, or failed metadata reads.
+    pub fn new(stdout: File, stderr: File) -> io::Result<Self> {
+        let first = stdout.metadata()?;
+        let second = stderr.metadata()?;
+        if !first.is_file() || !second.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "live output requires ordinary file destinations",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if (first.dev(), first.ino()) == (second.dev(), second.ino()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "live output streams must have separate destinations",
+                ));
+            }
+        }
+        Ok(Self { stdout, stderr })
+    }
+
+    fn write(&self, stream: &'static str, bytes: &[u8]) -> io::Result<()> {
+        let mut file = match stream {
+            "stdout.spill" => &self.stdout,
+            "stderr.spill" => &self.stderr,
+            _ => return Err(io::Error::other("unknown live output stream")),
+        };
+        // File is intentionally unbuffered: a consumer may read this exact
+        // prefix immediately, before the process or its capture completes.
+        file.write_all(bytes)
+    }
+}
+
 /// A capture failure observed while the process may still be running.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DrainFailure {
@@ -120,6 +173,7 @@ struct DrainState {
     failed: AtomicBool,
     failure: Mutex<Option<DrainFailure>>,
     preview: Option<Arc<LiveOutputPreview>>,
+    live_files: Option<LiveOutputFiles>,
 }
 
 /// Shared by exactly one pair of lanes. Reservations happen BEFORE retention,
@@ -133,12 +187,21 @@ impl DrainControl {
     }
 
     fn with_preview(maximum: u64, preview: Option<Arc<LiveOutputPreview>>) -> Self {
+        Self::with_output(maximum, preview, None)
+    }
+
+    fn with_output(
+        maximum: u64,
+        preview: Option<Arc<LiveOutputPreview>>,
+        live_files: Option<LiveOutputFiles>,
+    ) -> Self {
         Self(Arc::new(DrainState {
             maximum,
             remaining: AtomicU64::new(maximum),
             failed: AtomicBool::new(false),
             failure: Mutex::new(None),
             preview,
+            live_files,
         }))
     }
 
@@ -390,6 +453,12 @@ fn drain_lane_inner<R: Read>(
             writer.write_all(overflow)?;
             spilled_bytes += u64::try_from(overflow.len()).unwrap_or(u64::MAX);
         }
+        // This is an exact copy, unlike the optional lossy preview below.
+        // Reserve the shared byte quota and retain the chunk before exposing
+        // it. A failed write is monitored like every other capture failure.
+        if let Some(files) = control.and_then(|control| control.0.live_files.as_ref()) {
+            files.write(spill_name, &chunk[..n])?;
+        }
         // Observation follows successful retention and never controls capture.
         // The tail uses try_lock: even a stalled observer cannot backpressure a
         // pipe. Buffered spill bytes are not promised durable by a preview.
@@ -496,6 +565,24 @@ impl MonitoredLanes {
         })
     }
 
+    pub(crate) fn spawn_live_files(
+        child: &mut Child,
+        limits: &DrainLimits,
+        maximum: u64,
+        files: LiveOutputFiles,
+    ) -> Self {
+        Self::spawn_controlled(
+            child,
+            limits,
+            DrainControl::with_output(maximum, None, Some(files)),
+            |name, job| {
+                std::thread::Builder::new()
+                    .name(format!("rabs-g007-{name}"))
+                    .spawn(job)
+            },
+        )
+    }
+
     fn spawn_with(
         child: &mut Child,
         limits: &DrainLimits,
@@ -510,12 +597,21 @@ impl MonitoredLanes {
         limits: &DrainLimits,
         maximum: u64,
         preview: Option<Arc<LiveOutputPreview>>,
-        mut spawn: impl FnMut(&'static str, LaneJob) -> io::Result<LaneHandle>,
+        spawn: impl FnMut(&'static str, LaneJob) -> io::Result<LaneHandle>,
     ) -> Self {
         let control = match preview {
             Some(preview) => DrainControl::with_preview(maximum, Some(preview)),
             None => DrainControl::new(maximum),
         };
+        Self::spawn_controlled(child, limits, control, spawn)
+    }
+
+    fn spawn_controlled(
+        child: &mut Child,
+        limits: &DrainLimits,
+        control: DrainControl,
+        mut spawn: impl FnMut(&'static str, LaneJob) -> io::Result<LaneHandle>,
+    ) -> Self {
         let mut start = |reader: Box<dyn Read + Send>, name| {
             let lane_control = control.clone();
             let limits = limits.clone();
@@ -612,6 +708,83 @@ pub fn join_lane(lane: LaneHandle) -> io::Result<LaneDrain> {
 mod tests {
     use super::*;
     use std::process::{Command, Stdio};
+
+    #[test]
+    fn live_file_destinations_are_exact_and_share_the_existing_capture_quota() {
+        let root = tempfile::tempdir().unwrap();
+        let make = |name| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(root.path().join(name))
+                .unwrap()
+        };
+        let stdout = make("stdout");
+        let mut stderr = make("stderr");
+        stderr.write_all(b"driver\n").unwrap();
+        let files = LiveOutputFiles::new(stdout, stderr).unwrap();
+        let control = DrainControl::with_output(5, None, Some(files));
+        let limits = DrainLimits {
+            resident_bound: 1,
+            spill_dir: root.path().join("capture"),
+        };
+        let out =
+            monitored_lane(&b"a\0\xff"[..], limits.clone(), "stdout.spill", &control).unwrap();
+        let err = monitored_lane(&b"\xfe\n"[..], limits.clone(), "stderr.spill", &control).unwrap();
+        assert_eq!(
+            std::fs::read(root.path().join("stdout")).unwrap(),
+            b"a\0\xff"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("stderr")).unwrap(),
+            b"driver\n\xfe\n"
+        );
+        // Exact forwarding does not replace or contaminate ordinary capture.
+        let mut captured = Vec::new();
+        out.reader().unwrap().read_to_end(&mut captured).unwrap();
+        assert_eq!(captured, b"a\0\xff");
+        captured.clear();
+        err.reader().unwrap().read_to_end(&mut captured).unwrap();
+        assert_eq!(captured, b"\xfe\n");
+        assert!(monitored_lane(&b"x"[..], limits, "stdout.spill", &control).is_err());
+        assert_eq!(
+            std::fs::read(root.path().join("stdout")).unwrap(),
+            b"a\0\xff"
+        );
+        assert!(control.failed());
+    }
+
+    #[test]
+    fn live_output_rejects_pipes_and_aliases_and_monitors_failed_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("stdout");
+        let stdout = File::create(&path).unwrap();
+        assert!(LiveOutputFiles::new(stdout.try_clone().unwrap(), stdout).is_err());
+        let stderr = File::create(root.path().join("stderr")).unwrap();
+        assert!(LiveOutputFiles::new(File::open(root.path()).unwrap(), stderr).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::net::UnixStream;
+            let (_reader, writer) = UnixStream::pair().unwrap();
+            let file = File::from(std::os::fd::OwnedFd::from(writer));
+            let stderr = File::create(root.path().join("stderr-pipe")).unwrap();
+            assert!(LiveOutputFiles::new(file, stderr).is_err());
+        }
+        let stderr = File::create(root.path().join("stderr-readonly")).unwrap();
+        let files = LiveOutputFiles::new(File::open(&path).unwrap(), stderr).unwrap();
+        let control = DrainControl::with_output(32, None, Some(files));
+        let error = monitored_lane(
+            &b"must not silently disappear"[..],
+            DrainLimits::new(root.path().join("capture")),
+            "stdout.spill",
+            &control,
+        )
+        .unwrap_err();
+        assert!(control.failed());
+        assert_eq!(control.error().unwrap().kind(), error.kind());
+        assert!(std::fs::read(path).unwrap().is_empty());
+    }
 
     #[test]
     fn managed_budget_counts_both_resident_and_spilled_bytes() {
