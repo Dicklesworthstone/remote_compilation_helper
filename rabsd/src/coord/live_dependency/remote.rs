@@ -59,6 +59,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
+mod failover;
 mod recovery;
 mod shared;
 mod toolchains;
@@ -335,7 +336,14 @@ impl DependencyWorkerPool {
     }
 
     fn try_reserve_worker(&self) -> io::Result<PoolReservation> {
-        match self.probe_worker()? {
+        self.try_reserve_worker_excluding(&HashSet::new())
+    }
+
+    fn try_reserve_worker_excluding(
+        &self,
+        attempted: &HashSet<String>,
+    ) -> io::Result<PoolReservation> {
+        match self.probe_worker_excluding(attempted)? {
             WorkerProbe::Reserved(reservation) => Ok(reservation),
             WorkerProbe::Waiting(_) => Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -345,6 +353,10 @@ impl DependencyWorkerPool {
     }
 
     fn probe_worker(&self) -> io::Result<WorkerProbe> {
+        self.probe_worker_excluding(&HashSet::new())
+    }
+
+    fn probe_worker_excluding(&self, attempted: &HashSet<String>) -> io::Result<WorkerProbe> {
         // A failed transport probe can briefly own its occupied bit before
         // discovering cooldown. Serialize only these short probes, so another
         // caller cannot mistake that unnotified temporary guard for an active
@@ -362,9 +374,14 @@ impl DependencyWorkerPool {
         let observed = Instant::now();
         let mut deadline = None;
         let mut available_state = false;
+        let mut candidate = false;
         let start = self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len();
         for offset in 0..self.workers.len() {
             let worker = &self.workers[(start + offset) % self.workers.len()];
+            if attempted.contains(worker.worker()) {
+                continue;
+            }
+            candidate = true;
             match worker.try_reserve() {
                 Ok(reservation) => {
                     return Ok(WorkerProbe::Reserved(PoolReservation {
@@ -382,6 +399,12 @@ impl DependencyWorkerPool {
                 }
                 Err(error) => return Err(error),
             }
+        }
+        if !candidate {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "remote failover exhausted distinct configured workers",
+            ));
         }
         if !available_state {
             return Err(io::Error::other(
@@ -1072,7 +1095,7 @@ impl PendingRemote {
             action_claim: _action_claim,
         } = self;
         let settled = |reason: String| (reason, true);
-        let mut reservation = reservation
+        let reservation = reservation
             .ok_or_else(|| settled("remote action has no admitted worker reservation".into()))?;
         if cancellation.is_cancelled() {
             return Err(settled(
@@ -1082,9 +1105,6 @@ impl PendingRemote {
         verify_request(&request).map_err(settled)?;
         invocation.validation.verify(&request).map_err(settled)?;
         let retained = Arc::clone(&invocation.validation.retained);
-        let mut directory = recovery::ResultDirectory::new(&remote.state)
-            .map_err(|error| settled(error.to_string()))?;
-        let destination = directory.path().join("delivery");
         let paths = request
             .package
             .files
@@ -1137,130 +1157,31 @@ impl PendingRemote {
         let upload = upload
             .with_retained_dependency_artifacts(dependency_artifacts)
             .map_err(|error| settled(error.to_string()))?;
-        verify_request(&request).map_err(settled)?;
-        // The worker persists a request-id high-water mark. The admission owner
-        // durably allocates before sending; random ids fail on ordinary reuse.
-        let request_id = reservation
-            .allocate_request_id()
-            .map_err(|error| settled(format!("allocate worker request: {error}")))?;
-        let wire = dependency_execution_request(
-            &request.plan,
-            &invocation.argv,
-            &invocation.context,
-            upload.wire_manifest(),
-            retained.image().identity(),
-            request_id,
-        )
-        .map_err(settled)?;
-        let upload = retained
-            .attach(upload, &wire)
-            .map_err(|error| settled(format!("prepare worker upload: {error}")))?;
-        let owner: Arc<Mutex<Option<AdmittedRemote>>> = Arc::new(Mutex::new(None));
-        let admitted_owner = Arc::clone(&owner);
-        let validation = invocation.validation.clone();
-        // Persist exact recovery intent BEFORE execution can leave this process.
-        // Recovery must target this reserved worker, even when the pool changes
-        // order or membership. The whole pool is not a worker identity.
-        directory
-            .record_request(
-                &wire,
-                &rabs_cas::metadata_store::digest_key(&request.key.action_key),
-                &reservation.worker_configuration(invocation.context.version()),
-            )
-            .map_err(|error| settled(format!("persist remote recovery request: {error}")))?;
-        let selected_worker = reservation.worker().to_owned();
-        // Borrow the reservation: transport completion alone does not release
-        // worker capacity. Its later drop follows the admitted session's drop
-        // after capture/publication, including every error return below.
-        let delivery = reservation.execute(
-            &wire,
-            &upload,
-            &destination,
+        let mut execution = failover::deliver(
+            &lane,
+            &request,
+            &remote,
+            &invocation,
+            &retained,
+            upload,
+            reservation,
             cancellation.clone(),
-            move |worker| {
-                let (admission, started) = lane
-                    .coord
-                    .admit_worker_session(worker)
-                    .map_err(io::Error::other)?;
-                let started = started.ok_or_else(|| {
-                    io::Error::other(format!("live worker session not admitted: {admission:?}"))
-                })?;
-                // Install the release owner before action admission: a losing
-                // dispatch claim must not leave this worker permanently busy.
-                let session = LiveWorkerSession {
-                    coord: Arc::clone(&lane.coord),
-                    offer: worker.clone(),
-                    started,
-                };
-                let attempt = lane
-                    .begin_execution_on(request, worker, Some(validation))
-                    .map_err(io::Error::other)?
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::WouldBlock,
-                            "another subscriber owns the remote action",
-                        )
-                    })?;
-                let mut slot = admitted_owner
-                    .lock()
-                    .map_err(|_| io::Error::other("remote attempt owner poisoned"))?;
-                let key = rabs_cas::metadata_store::digest_key(&attempt.request.key.action_key);
-                *slot = Some(AdmittedRemote {
-                    attempt: Some(attempt),
-                    _session: session,
-                    execution_finished: false,
-                });
-                drop(slot);
-                crate::edge::server::log_line(
-                    "rabsd-remote-dependency-admitted",
-                    &[
-                        ("key", &key),
-                        ("worker_id", &selected_worker),
-                        ("worker_spki_sha256", &worker.worker_peer_id.0),
-                    ],
-                );
-                Ok(())
-            },
-        );
-        // Keep the compiler backing and source snapshot owners until transfer,
-        // execution, drain and verified delivery have all returned.
-        drop(upload);
+        )?;
+        // Immutable inputs span every bounded placement attempt. The returned
+        // owner retains its successful reservation through capture/publication.
         drop(retained);
-        let mut owned = owner
-            .lock()
-            .map_err(|_| ("remote attempt owner poisoned".to_owned(), false))?
-            .take();
-        let delivery = match delivery {
-            Ok(delivery) => delivery,
-            Err(failure) => {
-                if let Some(owned) = owned.as_mut() {
-                    owned.execution_finished = !failure.execution_may_have_run;
-                }
-                let detail = if failure.execution_may_have_run {
-                    format!(
-                        "{}; retained remote recovery directory: {}",
-                        failure.detail,
-                        directory.path().display(),
-                    )
-                } else {
-                    directory.execution_finished();
-                    failure.detail
-                };
-                return Err((detail, !failure.execution_may_have_run));
-            }
-        };
-        let owned = owned
-            .as_mut()
-            .ok_or_else(|| ("delivery has no live admitted attempt".to_owned(), false))?;
+        let delivery = &execution.delivery;
+        let wire = &execution.wire;
+        let owned = &mut execution.owned;
         let attempt = owned
             .attempt
             .as_ref()
             .ok_or_else(|| ("delivery lost its admitted attempt".to_owned(), false))?;
-        verify_receipt(&delivery, &wire, attempt.authority.as_ref()).map_err(|reason| {
+        verify_receipt(delivery, wire, attempt.authority.as_ref()).map_err(|reason| {
             (
                 format!(
                     "{reason}; retained remote recovery directory: {}",
-                    directory.path().display(),
+                    execution.directory.path().display(),
                 ),
                 false,
             )
@@ -1268,7 +1189,9 @@ impl PendingRemote {
         owned.execution_finished = true;
         // Complete execution is distinct from remote ACK confirmation. Keep a
         // verified delivery for acknowledgment-only reconciliation when needed.
-        directory.delivery_finished(delivery.acknowledgments_confirmed);
+        execution
+            .directory
+            .delivery_finished(delivery.acknowledgments_confirmed);
         if cancellation.is_cancelled() {
             return Err(settled(
                 "remote execution interest ended after private execution".into(),
@@ -1329,7 +1252,7 @@ impl PendingRemote {
             .map_err(settled)?;
         let result = if attempt.request.is_execution_only() {
             let result =
-                RequestOwnedResult::new(captured, attempt, &delivery, &wire).map_err(settled)?;
+                RequestOwnedResult::new(captured, attempt, delivery, wire).map_err(settled)?;
             // No H011 offer, transcript index, winner or verification sample is
             // written. Retire the dispatch before releasing the worker, while
             // the affine capture owner keeps every result object pinned.
@@ -1487,15 +1410,29 @@ struct LiveWorkerSession {
     coord: Arc<CoordLive>,
     offer: WorkerSessionOffer,
     started: u64,
+    released: bool,
+}
+
+impl LiveWorkerSession {
+    fn release_checked(&mut self) -> Result<(), String> {
+        if self.released {
+            return Ok(());
+        }
+        if !self.coord.release_worker_session(
+            &self.offer.worker_peer_id,
+            self.offer.incarnation,
+            self.started,
+        )? {
+            return Err("the exact live worker session could not be released".into());
+        }
+        self.released = true;
+        Ok(())
+    }
 }
 
 impl Drop for LiveWorkerSession {
     fn drop(&mut self) {
-        let _ = self.coord.release_worker_session(
-            &self.offer.worker_peer_id,
-            self.offer.incarnation,
-            self.started,
-        );
+        let _ = self.release_checked();
     }
 }
 
@@ -1504,17 +1441,112 @@ impl Drop for LiveWorkerSession {
 #[derive(Debug)]
 struct AdmittedRemote {
     attempt: Option<ExecutionAttempt>,
-    _session: LiveWorkerSession,
+    session: Option<LiveWorkerSession>,
     execution_finished: bool,
+    retry_admission_failed: bool,
+}
+
+impl AdmittedRemote {
+    /// Only the returned transport's typed no-execution outcome authorizes
+    /// this transition. Keep the actor and its generation while retiring the
+    /// exact prior attempt/lease and session before another worker is selected.
+    fn prepare_retry(&mut self) -> Result<(), String> {
+        if !self.execution_finished || self.retry_admission_failed {
+            return Err("remote retry lacks confirmed before-execution ownership".into());
+        }
+        if let Some(session) = self.session.as_mut() {
+            self.retry_admission_failed = true;
+            self.attempt
+                .as_mut()
+                .ok_or("remote retry lost its admitted action")?
+                .prepare_retry()?;
+            session.release_checked()?;
+            self.session = None;
+            self.retry_admission_failed = false;
+        } else if !self
+            .attempt
+            .as_ref()
+            .is_some_and(ExecutionAttempt::retry_is_settleable)
+        {
+            self.retry_admission_failed = true;
+            return Err("remote retry lost its prepared action lineage".into());
+        }
+        // A subsequent connection can fail before its admission callback. In
+        // that case the retained retry-ready owner has no new session to end.
+        Ok(())
+    }
+
+    fn settle_checked(&mut self) -> Result<(), String> {
+        if !self.execution_finished || self.retry_admission_failed {
+            return Err("remote failure retains unresolved attempt ownership".into());
+        }
+        self.attempt
+            .as_mut()
+            .ok_or("remote failure lost its admitted action")?
+            .settle_checked()?;
+        if let Some(session) = self.session.as_mut() {
+            session.release_checked()?;
+            self.session = None;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for AdmittedRemote {
     fn drop(&mut self) {
-        if !self.execution_finished
+        if (!self.execution_finished || self.retry_admission_failed)
             && let Some(attempt) = self.attempt.as_mut()
         {
             attempt.abandon();
         }
+    }
+}
+
+#[cfg(test)]
+mod session_release_tests {
+    use super::*;
+    use crate::janitor::store::mount_and_reconcile;
+    use rabs_protocol::generation::{WorkerBootGeneration, WorkerIncarnationId};
+    use rabs_protocol::wire_time::PeerId;
+
+    #[test]
+    fn stale_session_cannot_supply_checked_retry_release_or_clear_replacement() {
+        let directory = crate::test_util::private_tempdir();
+        let cas = Arc::new(mount_and_reconcile(&directory.path().join("cas")).unwrap());
+        let coord = Arc::new(CoordLive::with_cas(cas));
+        coord
+            .acquire_boot_authority("remote-retry-session-tests")
+            .unwrap();
+        coord.mark_up();
+        let offer = WorkerSessionOffer {
+            worker_peer_id: PeerId("37".repeat(32)),
+            boot_generation: WorkerBootGeneration(1),
+            incarnation: WorkerIncarnationId(9),
+            reenrollment_proof: None,
+        };
+        let started = coord.admit_worker_session(&offer).unwrap().1.unwrap();
+        let mut stale = LiveWorkerSession {
+            coord: Arc::clone(&coord),
+            offer: offer.clone(),
+            started,
+            released: false,
+        };
+        assert!(
+            coord
+                .release_worker_session(&offer.worker_peer_id, offer.incarnation, started)
+                .unwrap()
+        );
+        let replacement = coord.admit_worker_session(&offer).unwrap().1.unwrap();
+        assert_ne!(replacement, started);
+        assert!(stale.release_checked().is_err());
+        drop(stale);
+        // Both the explicit retry gate and best-effort Drop name the stale
+        // exact session. The replacement remains available for its true owner.
+        assert!(
+            coord
+                .release_worker_session(&offer.worker_peer_id, offer.incarnation, replacement)
+                .unwrap()
+        );
     }
 }
 
@@ -2152,6 +2184,35 @@ mod worker_pool_tests {
         drop(claims);
         assert!(pool.pending.lock().unwrap().is_empty());
         assert!(pool.try_claim(&extra).is_ok());
+    }
+
+    #[test]
+    fn alternate_placement_never_revisits_released_workers_or_releases_action_claim() {
+        let pool = pool(Path::new("/private/failover-worker-pool"), 3);
+        let action = key(42);
+        let claim = pool.try_claim(&action).unwrap();
+        let mut attempted = HashSet::new();
+        for expected in ["worker-1", "worker-2", "worker-3"] {
+            let reservation = pool.try_reserve_worker_excluding(&attempted).unwrap();
+            assert_eq!(reservation.worker(), expected);
+            assert!(attempted.insert(reservation.worker().to_owned()));
+            // A prior worker is genuinely available again. Exclusion must
+            // follow this producer's history, not incidental occupancy/cooldown.
+            drop(reservation);
+            assert_eq!(
+                pool.try_claim(&action).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
+        assert_eq!(
+            pool.try_reserve_worker_excluding(&attempted)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound,
+        );
+        drop(claim);
+        assert!(pool.try_claim(&action).is_ok());
+        assert!(pool.try_reserve_worker().is_ok());
     }
 
     #[test]

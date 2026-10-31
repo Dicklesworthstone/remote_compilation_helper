@@ -188,6 +188,8 @@ jobs:
           cargo test --release -p rabs-asupersync --lib stream_drain --locked
           cargo test --release -p rabs-wkr --lib output::tests --locked
           cargo test --release -p rabs-wkr --lib session::tests --locked
+          cargo test --release -p rabs-wkr --lib source_transfer --locked
+          cargo test --release -p rabs-wkr --lib source_task --locked
           cargo test --release -p rabs-wkr --lib host_budget --locked
           cargo test --release -p rabs-wkr --lib root_admission --locked
       - name: Durable replay allowance and real compiler verification
@@ -214,6 +216,10 @@ jobs:
           cargo test --release -p rabsd --lib coord::live_dependency::remote::recovery --locked
           cargo test --release -p rabs-sandbox --lib toolchain_cache --locked
           cargo test --release -p rabsd --lib coord::live_dependency::remote::worker_pool_tests --locked
+          cargo test --release -p rabsd --lib coord::live::tests::retry --locked
+          cargo test --release -p rabsd --lib coord::action_actor::tests::retry_budget_and_illegal_transitions_refuse --locked
+          cargo test --release -p rabsd --lib coord::live_dependency::remote::failover --locked
+          cargo test --release -p rabsd --lib coord::live_dependency::remote::session_release_tests --locked
           cargo test --release -p rabsd --lib coord::live_dependency::remote::execution_resource_tests --locked
           cargo test --release -p rabsd --lib coord::live_dependency::shared_work --locked
           cargo test --release -p rabsd --lib coord::live_dependency::remote::shared --locked
@@ -261,6 +267,9 @@ jobs:
             -- --ignored --exact --nocapture
           cargo test --release -p rabsd --test canonical_check_local --locked \
             canonical_shared_remote_queue_coalesces_and_survives_origin_cancellation \
+            -- --ignored --exact --nocapture
+          cargo test --release -p rabsd --test canonical_check_local --locked \
+            canonical_shared_remote_failover_preserves_generation_and_surviving_subscriber \
             -- --ignored --exact --nocapture
       - name: Canonical Cargo delivers no-run tests and always executes current harnesses
         timeout-minutes: 30

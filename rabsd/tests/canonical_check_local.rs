@@ -1330,6 +1330,243 @@ fn canonical_shared_remote_queue_coalesces_and_survives_origin_cancellation() {
 }
 
 #[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual TLS upload loss retries on a second worker within one action generation"]
+fn canonical_shared_remote_failover_preserves_generation_and_surviving_subscriber() {
+    let (owner, mut origin_profile) = native_fixture();
+    let root = owner.path();
+    shared_remote_source(&root.join("source-a"), "retry-origin", 40);
+    shared_remote_source(&root.join("source-b"), "retry-survivor", 40);
+    let (coordinator, identities) = native_certificates(
+        &root.join("credentials"),
+        &["worker-first", "worker-second"],
+    );
+    let first_root = root.join("worker-first");
+    let second_root = root.join("worker-second");
+    for directory in [&first_root, &second_root] {
+        fs::DirBuilder::new().mode(0o700).create(directory).unwrap();
+    }
+    let (first_worker, first_environment) = NativeWorker::start_with_identity(
+        &first_root,
+        "failover-first",
+        &coordinator,
+        &identities[0],
+    );
+    let (mut second_worker, second_environment) = NativeWorker::start_with_identity(
+        &second_root,
+        "failover-second",
+        &coordinator,
+        &identities[1],
+    );
+    let pool = [first_environment.as_slice(), second_environment.as_slice()]
+        .into_iter()
+        .map(|environment| {
+            let value = |name| {
+                environment
+                    .iter()
+                    .find(|(key, _)| key == name)
+                    .unwrap()
+                    .1
+                    .clone()
+            };
+            json!({
+                "listen":value("RABS_DEPENDENCY_WORKER_LISTEN"),
+                "worker_id":value("RABS_DEPENDENCY_WORKER_ID"),
+                "worker_spki_sha256":value("RABS_DEPENDENCY_WORKER_SPKI_SHA256"),
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_ne!(pool[0]["worker_spki_sha256"], pool[1]["worker_spki_sha256"]);
+    let socket = root.join("canonical-service.sock");
+    let service_profile = root.join("shared-failover-service.json");
+    fs::write(
+        &service_profile,
+        serde_json::to_vec(&json!({
+            "version":"canonical-compile-service-v1", "state_root":root.join("state"),
+            "socket":socket, "max_roots":2, "jobs_per_root":1,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    origin_profile["command"] = json!("build");
+    origin_profile["service_socket"] = json!(socket);
+    origin_profile["timeout_seconds"] = json!(600);
+    let mut survivor_profile = origin_profile.clone();
+    survivor_profile["source_root"] = json!(root.join("source-b"));
+    let mut command = shared_service_command(root);
+    command
+        .envs(
+            first_environment
+                .iter()
+                .filter(|(name, _)| name.starts_with("RABS_COORD_TLS_"))
+                .map(|(name, value)| (name, value)),
+        )
+        .env(
+            "RABS_DEPENDENCY_WORKERS_JSON",
+            serde_json::to_string(&pool).unwrap(),
+        )
+        .arg("--canonical-compile-service")
+        .arg(service_profile);
+    let mut service = SharedServiceChild::spawn(root, "shared-failover-service", command);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !socket.exists()
+        || !service
+            .events()
+            .iter()
+            .any(|event| event["kind"] == "canonical-service-listening")
+    {
+        service.assert_running();
+        assert!(Instant::now() < deadline, "{}", service.diagnostics());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let mut origin = shared_service_client(root, 5300, &origin_profile);
+    let deadline = Instant::now() + Duration::from_secs(240);
+    let key = loop {
+        let events = service.events();
+        let offered = decisions(&events, "shared-remote-offer");
+        if let Some(key) = offered.get("canonical_leaf")
+            && let Some(admitted) = events.iter().find(|event| {
+                event["kind"] == "rabsd-remote-dependency-admitted" && event["key"] == *key
+            })
+        {
+            assert_eq!(admitted["worker_id"], "failover-first");
+            assert_eq!(admitted["purpose"], "primary");
+            break key.clone();
+        }
+        service.assert_running();
+        origin.assert_running();
+        assert!(Instant::now() < deadline, "{}", service.diagnostics());
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    let paused = PausedNativeWorker::pause(&first_worker);
+    let journal_path = first_worker.state.join("requests.json");
+    let journal = read_bounded(&journal_path);
+    let state: Value = serde_json::from_slice(&journal).unwrap();
+    assert!(
+        state.get("last").is_some_and(Value::is_null),
+        "the failed worker must not have accepted canonical-exec: {state}"
+    );
+    first_worker.assert_fresh_toolchain_upload_incomplete(Path::new(
+        origin_profile["toolchain_root"].as_str().unwrap(),
+    ));
+    let origin_operation = shared_remote_operation(&root.join("ops"), "retry-origin");
+    let mut survivor = shared_service_client(root, 5301, &survivor_profile);
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while !service.events().iter().any(|event| {
+        event["kind"] == "rabsd-shared-remote-subscribed"
+            && event["key"] == key
+            && event["disposition"] == "joined"
+    }) {
+        service.assert_running();
+        origin.assert_running();
+        survivor.assert_running();
+        assert!(Instant::now() < deadline, "{}", service.diagnostics());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let (code, events, output) = origin.finish(Duration::from_secs(15), true);
+    assert_ne!(code, 0, "{output}");
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["kind"] == "canonical-build-completed")
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !service.events().iter().any(|event| {
+        event["kind"] == "canonical-service-session-error"
+            && event["reason"].as_str().is_some_and(|reason| {
+                reason.contains("canonical client disconnected; its operation was drained")
+            })
+    }) {
+        service.assert_running();
+        survivor.assert_running();
+        assert!(Instant::now() < deadline, "{}", service.diagnostics());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        read_bounded(&origin_operation.join("bundle/source/shared-flight-label.txt")),
+        b"retry-origin"
+    );
+    // The stopped worker lacks a required toolchain member, so it cannot have
+    // acknowledged toolchain-ready. The coordinator therefore cannot even
+    // start writing canonical-exec. Its real TLS EOF must trigger failover;
+    // no transport result or compiler receipt is injected by this fixture.
+    rustix::process::kill_process(paused.0, rustix::process::Signal::KILL).unwrap();
+    drop(paused);
+    first_worker.finish();
+    assert_eq!(read_bounded(&journal_path), journal);
+
+    let (code, events, output) = survivor.finish(Duration::from_secs(300), false);
+    assert_eq!(code, 0, "{output}\n{}", service.diagnostics());
+    assert_shared_service_build(
+        root,
+        5301,
+        &events,
+        &output,
+        "retry-survivor:42\n",
+        "disabled",
+    );
+    second_worker.completed_receipt();
+    let events = service.events();
+    let admissions = events
+        .iter()
+        .filter(|event| event["kind"] == "rabsd-remote-dependency-admitted" && event["key"] == key)
+        .collect::<Vec<_>>();
+    assert_eq!(admissions.len(), 2, "{events:?}");
+    assert_eq!(admissions[0]["worker_id"], "failover-first");
+    assert_eq!(admissions[1]["worker_id"], "failover-second");
+    assert_eq!(admissions[0]["purpose"], "primary");
+    assert_eq!(admissions[1]["purpose"], "retry");
+    for admission in &admissions {
+        for field in ["generation_id", "attempt_id", "execution_lease_id"] {
+            let value = admission[field].as_str().unwrap();
+            assert_eq!(value.len(), 32, "missing actual {field}: {admission}");
+            assert!(value.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        }
+    }
+    assert_eq!(
+        admissions[0]["generation_id"],
+        admissions[1]["generation_id"]
+    );
+    assert_ne!(admissions[0]["attempt_id"], admissions[1]["attempt_id"]);
+    assert_ne!(
+        admissions[0]["execution_lease_id"],
+        admissions[1]["execution_lease_id"]
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(
+                |event| event["kind"] == "rabsd-remote-dependency-executed" && event["key"] == key
+            )
+            .count(),
+        1,
+        "one surviving subscriber must receive the actual retry result: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|event| {
+            event["key"] == key
+                && (matches!(
+                    event["kind"].as_str(),
+                    Some(
+                        "rabsd-remote-dependency-failed" | "rabsd-remote-dependency-install-failed"
+                    )
+                ) || (event["kind"] == "rabsd-live-dependency"
+                    && matches!(
+                        event["decision"].as_str(),
+                        Some("execute" | "hit" | "served")
+                    )))
+        }),
+        "fallback or replay cannot satisfy actual failover: {events:?}"
+    );
+    assert!(
+        !origin_operation.exists(),
+        "the retry retained its departed origin"
+    );
+    service.finish(Duration::from_secs(15), true);
+    second_worker.finish();
+}
+
+#[test]
 #[ignore = "requires full canonical bubblewrap namespaces, native toolchain and matching RABS_CANONICAL_TEST_WRAPPER; runs concurrent actual Cargo builds through one persistent service"]
 fn canonical_shared_service_overlaps_builds_scopes_cancellation_and_reuses_private_targets() {
     let (owner, mut first_profile) = native_fixture();
@@ -2521,9 +2758,9 @@ fn read_bounded(path: &Path) -> Vec<u8> {
 }
 
 // Other native integration binaries have private certificate fixtures. Keep
-// this one limited to a CA and the two identities consumed by the production
+// this one limited to a CA and the identities consumed by the production
 // outward-worker transport; every OpenSSL process has a finite group lifetime.
-fn native_certificates(root: &Path) -> (TlsFiles, TlsFiles) {
+fn native_certificates(root: &Path, workers: &[&str]) -> (TlsFiles, Vec<TlsFiles>) {
     fs::create_dir(root).unwrap();
     let openssl = |name: &str, arguments: &[&str]| {
         let mut command = Command::new("/usr/bin/openssl");
@@ -2581,10 +2818,16 @@ fn native_certificates(root: &Path) -> (TlsFiles, TlsFiles) {
             "keyUsage=critical,keyCertSign,cRLSign",
         ],
     );
-    for (name, usage, serial) in [
-        ("coordinator", "serverAuth", "2"),
-        ("worker", "clientAuth", "3"),
-    ] {
+    for (index, name) in std::iter::once("coordinator")
+        .chain(workers.iter().copied())
+        .enumerate()
+    {
+        let usage = if index == 0 {
+            "serverAuth"
+        } else {
+            "clientAuth"
+        };
+        let serial = (index + 2).to_string();
         let key = format!("{name}.key");
         let csr = format!("{name}.csr");
         let certificate = format!("{name}.pem");
@@ -2619,7 +2862,7 @@ fn native_certificates(root: &Path) -> (TlsFiles, TlsFiles) {
                 "-CAkey",
                 "ca.key",
                 "-set_serial",
-                serial,
+                &serial,
                 "-days",
                 "1",
                 "-sha256",
@@ -2635,12 +2878,16 @@ fn native_certificates(root: &Path) -> (TlsFiles, TlsFiles) {
         certificate: root.join(format!("{name}.pem")),
         private_key: root.join(format!("{name}.key")),
     };
-    (files("coordinator"), files("worker"))
+    (
+        files("coordinator"),
+        workers.iter().map(|name| files(name)).collect(),
+    )
 }
 
 struct NativeWorker {
     process: Option<ManagedProcessGroup>,
     state: PathBuf,
+    temporary: PathBuf,
     stdout: PathBuf,
     stderr: PathBuf,
     drain: PathBuf,
@@ -2649,12 +2896,21 @@ struct NativeWorker {
 impl NativeWorker {
     fn start(root: &Path) -> (Self, Vec<(String, String)>) {
         const ID: &str = "canonical-dependency-worker";
+        let (coordinator, workers) = native_certificates(&root.join("credentials"), &["worker"]);
+        Self::start_with_identity(root, ID, &coordinator, &workers[0])
+    }
+
+    fn start_with_identity(
+        root: &Path,
+        id: &str,
+        coordinator: &TlsFiles,
+        worker: &TlsFiles,
+    ) -> (Self, Vec<(String, String)>) {
         let binary = fs::canonicalize(
             std::env::var_os("RABS_TEST_WORKER_BIN")
                 .expect("set RABS_TEST_WORKER_BIN to the matching native rabs-wkr"),
         )
         .unwrap();
-        let (coordinator, worker) = native_certificates(&root.join("credentials"));
         let reserved = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = reserved.local_addr().unwrap().to_string();
         let pin: String = worker
@@ -2666,7 +2922,7 @@ impl NativeWorker {
             .collect();
         let environment = vec![
             ("RABS_DEPENDENCY_WORKER_LISTEN".into(), address.clone()),
-            ("RABS_DEPENDENCY_WORKER_ID".into(), ID.into()),
+            ("RABS_DEPENDENCY_WORKER_ID".into(), id.into()),
             ("RABS_DEPENDENCY_WORKER_SPKI_SHA256".into(), pin),
             (
                 "RABS_COORD_TLS_CA".into(),
@@ -2682,13 +2938,19 @@ impl NativeWorker {
             ),
         ];
         let state = root.join("worker-state");
+        let temporary = root.join("worker-tmp");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&temporary)
+            .unwrap();
         let stdout = root.join("worker.stdout");
         let stderr = root.join("worker.stderr");
         let mut command = Command::new(binary);
         command
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
-            .args(["--coordinator", &address, "--worker-id", ID])
+            .env("TMPDIR", &temporary)
+            .args(["--coordinator", &address, "--worker-id", id])
             .env("RABS_WORKER_STATE_DIR", &state)
             .env(
                 "RABS_WORKER_TOOLCHAIN_CACHE_BYTES",
@@ -2711,12 +2973,61 @@ impl NativeWorker {
             Self {
                 process: Some(process),
                 state,
+                temporary,
                 stdout,
                 stderr,
                 drain: root.join("worker-stop"),
             },
             environment,
         )
+    }
+
+    /// Called only after stopping a fresh worker, whose empty request journal
+    /// excludes an earlier execution and whose launch has no durable cache.
+    /// Missing bytes in its private upload tree are stronger evidence than an
+    /// empty journal: the sender cannot have received the required ready reply
+    /// and started writing an execution frame that has not been journaled yet.
+    fn assert_fresh_toolchain_upload_incomplete(&self, source: &Path) {
+        let mut pending = vec![PathBuf::new()];
+        let mut required: Option<(PathBuf, u64)> = None;
+        while let Some(relative) = pending.pop() {
+            let metadata = fs::symlink_metadata(source.join(&relative)).unwrap();
+            if metadata.is_dir() {
+                for entry in fs::read_dir(source.join(&relative)).unwrap() {
+                    pending.push(relative.join(entry.unwrap().file_name()));
+                }
+            } else if metadata.is_file()
+                && metadata.len() != 0
+                && required.as_ref().is_none_or(|(last, _)| relative > *last)
+            {
+                required = Some((relative, metadata.len()));
+            }
+        }
+        let (relative, bytes) = required.expect("the native toolchain must contain file bytes");
+        let mut uploads = 0;
+        for entry in fs::read_dir(&self.temporary).unwrap() {
+            let entry = entry.unwrap();
+            if !entry
+                .file_name()
+                .as_encoded_bytes()
+                .starts_with(b"rabs-toolchain-upload-")
+            {
+                continue;
+            }
+            uploads += 1;
+            assert!(entry.file_type().unwrap().is_dir());
+            let member = entry.path().join("dataset").join(&relative);
+            match fs::symlink_metadata(&member) {
+                Ok(metadata) => assert!(
+                    metadata.is_file() && metadata.len() < bytes,
+                    "the test missed the incomplete upload window: {}",
+                    member.display()
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("cannot inspect {}: {error}", member.display()),
+            }
+        }
+        assert!(uploads <= 1, "a fresh worker must own at most one upload");
     }
 
     fn events(&self) -> Vec<Value> {

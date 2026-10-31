@@ -1478,6 +1478,27 @@ and the service keeps the transport owner until it returns verified completion
 or an explicitly uncertain outcome with retained recovery state. Service shutdown
 cancels and joins these owners before releasing coordinator authority.
 
+An actual transport interruption before the coordinator starts writing the
+compiler execution request can now move that same producer to an available
+alternate worker. Placement permits at most two alternate attempts and never
+returns to a previously tried worker. Its immutable inputs, subscribers, action
+generation and dispatch claim stay together. An admitted retry receives a fresh
+attempt and execution lease only after the prior attempt's exact lease and
+worker session have been checked released. Late messages from that prior
+attempt cannot advance or complete its replacement. Each worker receives a
+fresh durable request ID and its own recovery directory.
+
+This failover is limited to transport failures with explicit evidence that no
+execution request may have reached the worker. Compiler failures, malformed
+inputs, authentication refusals and caller cancellation do not trigger it. If
+no untried worker is immediately available, the producer settles the confirmed
+pre-execution failure instead of holding a thread waiting for another slot.
+Once any execution-frame write may have occurred, the same failure remains
+uncertain: its recovery record is retained and it cannot authorize another
+worker execution or local fallback. The admitted and failover events report
+the participating workers; admission events also report the actual generation,
+attempt and lease identities for diagnosis.
+
 Each subscriber retains its own input observations and target mapping. Shared
 compilation never writes a target by itself: each caller must accept the exact
 completed manifest before its own bounded installer runs and revalidates its

@@ -995,6 +995,7 @@ impl LiveDependencyLane {
             authority: None,
             request,
             remote_validation,
+            retry_ready: false,
             settled: false,
         };
         let authority = self
@@ -1029,6 +1030,9 @@ struct ExecutionAttempt {
     authority: Option<AttemptAuthority>,
     request: LiveDependencyRequest,
     remote_validation: Option<remote::RemoteValidation>,
+    /// The retained authority names a finished, durably fenced attempt. Its
+    /// generation/dispatch claim survive until a Retry is admitted or settled.
+    retry_ready: bool,
     settled: bool,
 }
 
@@ -1042,6 +1046,17 @@ pub(super) fn settle_completed_dispatch(
 ) -> Result<(), SubmissionRefusal> {
     coord.advance_started_dispatch(key, serial, authority, AttemptState::Draining)?;
     coord.advance_started_dispatch(key, serial, authority, AttemptState::Finished)?;
+    settle_finished_dispatch(coord, key, serial, authority)
+}
+
+/// A retry-ready owner has already fenced and finished its prior attempt. When
+/// no alternate starts, retire that exact generation without replaying drain.
+pub(super) fn settle_finished_dispatch(
+    coord: &CoordLive,
+    key: &TypedDigest,
+    serial: u64,
+    authority: &AttemptAuthority,
+) -> Result<(), SubmissionRefusal> {
     coord.complete_started_dispatch(key, serial, authority)?;
     if !coord.retire_finished_action(key)? {
         return Err(SubmissionRefusal::StaleDispatch);
@@ -1111,6 +1126,68 @@ impl ExecutionAttempt {
             .map_err(|error| format!("attempt {state:?}: {error:?}"))
     }
 
+    /// Called only for an actual returned transport failure proving that no
+    /// execution request may have reached the worker, never for uncertain
+    /// execution, compiler failure, cancellation, or inferred diagnostic text.
+    /// The remote owner must then CHECK release of its exact worker session
+    /// before dropping that worker reservation and selecting another worker.
+    fn prepare_retry(&mut self) -> Result<(), String> {
+        if self.settled || self.retry_ready {
+            return Err("execution is not an active retry candidate".into());
+        }
+        let authority = self.authority.as_ref().ok_or("attempt not admitted")?;
+        let result = self
+            .coord
+            .prepare_retry_dispatch(&self.key, self.serial, authority);
+        if let Err(error) = result {
+            // Failed retirement is not permission to invent a new producer or
+            // let Drop silently claim that the old authority was fenced.
+            self.abandon();
+            return Err(format!("retry retirement: {error:?}"));
+        }
+        self.retry_ready = true;
+        Ok(())
+    }
+
+    /// A rejected replacement has not changed the already-fenced owner. The
+    /// remote session must also be checked released before treating it settled.
+    fn retry_is_settleable(&self) -> bool {
+        self.retry_ready && !self.settled
+    }
+
+    /// Continue this owner only after the alternate's pinned authentication and
+    /// exact session admission. Retain the original request and input witnesses;
+    /// fresh observations cannot silently substitute a different action here.
+    fn retry_on(&mut self, worker: &WorkerSessionOffer) -> Result<(), String> {
+        if self.settled || !self.retry_ready {
+            return Err("execution has no retired attempt eligible for retry".into());
+        }
+        self.request
+            .verify_enforced_read_closure(self.remote_validation.as_ref())?;
+        self.request.verify_toolchain()?;
+        self.request.verify_package()?;
+        self.request.dependencies.verify_unchanged()?;
+        if let Some(validation) = &self.remote_validation {
+            validation.verify(&self.request)?;
+        }
+        let previous = self.authority.as_ref().ok_or("attempt not admitted")?;
+        let authority = self
+            .coord
+            .begin_retry_dispatch(&self.key, self.serial, previous, worker, LOCAL_LEASE_TTL_MS)
+            .map_err(|error| format!("retry admission: {error:?}"))?;
+        self.authority = Some(authority);
+        self.retry_ready = false;
+        for state in [
+            AttemptState::LeaseAccepted,
+            AttemptState::AwaitingInputs,
+            AttemptState::Materializing,
+            AttemptState::Running,
+        ] {
+            self.advance(state)?;
+        }
+        Ok(())
+    }
+
     /// Execution may still be running remotely. Preserve the abandoned claim
     /// for reconciliation; neither Drop nor caller fallback can invent a drain.
     fn abandon(&mut self) {
@@ -1138,7 +1215,14 @@ impl ExecutionAttempt {
             self.coord.release_dispatch_claim(&self.key, self.serial);
             return Err("execution has no admitted authority to retire".into());
         };
-        let finished = settle_completed_dispatch(&self.coord, &self.key, self.serial, authority);
+        let finished = if self.retry_ready {
+            // No replacement was started (no alternate, cancellation, or a
+            // refusal). The old attempt is already Finished; retire this same
+            // generation instead of trying to transition it through drain twice.
+            settle_finished_dispatch(&self.coord, &self.key, self.serial, authority)
+        } else {
+            settle_completed_dispatch(&self.coord, &self.key, self.serial, authority)
+        };
         if finished.is_err() {
             // Leave the reconciliation-required state rather than guess.
             self.coord.release_dispatch_claim(&self.key, self.serial);

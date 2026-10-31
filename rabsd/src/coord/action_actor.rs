@@ -786,6 +786,13 @@ impl ActionActor {
         self.attempts.values()
     }
 
+    /// Remaining retry admissions in this generation. Retiring a failed
+    /// attempt does not restore budget; only opening a new generation does.
+    #[must_use]
+    pub const fn retries_remaining(&self) -> u32 {
+        MAX_RETRIES_PER_GENERATION.saturating_sub(self.retries_used)
+    }
+
     /// Selection receipts (placement decisions recorded at registration).
     #[must_use]
     pub const fn selection_receipts(&self) -> &Vec<SelectionReceipt> {
@@ -2566,18 +2573,22 @@ mod tests {
     fn retry_budget_and_illegal_transitions_refuse() {
         let mut actor = actor();
         open_with_primary(&mut actor);
+        assert_eq!(actor.retries_remaining(), MAX_RETRIES_PER_GENERATION);
         assert_eq!(
             actor.register_attempt(registration(2, 12, 22, AttemptPurpose::Retry)),
             RegisterAttemptReceipt::Registered
         );
+        assert_eq!(actor.retries_remaining(), MAX_RETRIES_PER_GENERATION - 1);
         assert_eq!(
             actor.register_attempt(registration(3, 13, 23, AttemptPurpose::Retry)),
             RegisterAttemptReceipt::Registered
         );
+        assert_eq!(actor.retries_remaining(), 0);
         assert_eq!(
             actor.register_attempt(registration(4, 14, 24, AttemptPurpose::Retry)),
             RegisterAttemptReceipt::RefusedRetryBudgetExhausted
         );
+        assert_eq!(actor.retries_remaining(), 0);
         // Denial-default machine: LeaseOffered → Running skips spine states.
         assert_eq!(
             actor.advance_attempt(AttemptId(1), AttemptState::Running),

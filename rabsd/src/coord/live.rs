@@ -1120,7 +1120,16 @@ fn source_component(value: &str) -> bool {
 enum DispatchState {
     Queued,
     Claimed(u64),
-    Started(u64),
+    Started {
+        serial: u64,
+        attempt: AttemptId,
+    },
+    /// The exact prior attempt is finished and its durable lease is released.
+    /// The same dispatcher still owns this generation's bounded retry right.
+    RetryReady {
+        serial: u64,
+        attempt: AttemptId,
+    },
     Finished,
     Abandoned,
 }
@@ -1134,6 +1143,24 @@ struct SubmittedActor {
     started_as_speculative: bool,
     promoted_from_speculation: bool,
     started_at: Option<Instant>,
+}
+
+impl SubmittedActor {
+    fn contains_authority(&self, key: &TypedDigest, authority: &AttemptAuthority) -> bool {
+        authority.action_key == *key
+            && self.actor.active_generation() == Some(&authority.action_generation)
+            && authority_digest(&authority.coordinator)
+                == authority.action_generation.created_under_authority_digest
+            && self.actor.attempts().any(|attempt| {
+                attempt.attempt == authority.attempt_id
+                    && attempt.generation == authority.action_generation.generation_id
+                    && attempt.lease == authority.execution_lease_id
+                    && attempt.worker == authority.worker_peer_id
+                    && attempt.worker_boot_generation == authority.worker_boot_generation
+                    && attempt.worker_incarnation == authority.worker_incarnation_id
+                    && attempt.lease_renewal_seq == authority.lease_renewal_seq
+            })
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1882,7 +1909,10 @@ impl CoordLive {
         {
             let mut to_tombstone: Vec<u128> = Vec::new();
             for entry in submissions.entries.values_mut() {
-                if !matches!(entry.state, DispatchState::Started(_)) {
+                if !matches!(
+                    entry.state,
+                    DispatchState::Started { .. } | DispatchState::RetryReady { .. }
+                ) {
                     continue;
                 }
                 if let Some(generation_id) = entry
@@ -3083,7 +3113,9 @@ impl CoordLive {
         if receipt == CancelReceipt::LastInterestCancelledGeneration {
             if matches!(
                 entry.state,
-                DispatchState::Claimed(_) | DispatchState::Started(_)
+                DispatchState::Claimed(_)
+                    | DispatchState::Started { .. }
+                    | DispatchState::RetryReady { .. }
             ) {
                 entry.state = DispatchState::Queued;
             }
@@ -3282,7 +3314,10 @@ impl CoordLive {
             )));
         }
         entry.actor = actor;
-        entry.state = DispatchState::Started(serial);
+        entry.state = DispatchState::Started {
+            serial,
+            attempt: authority.attempt_id,
+        };
         entry.started_at = Some(Instant::now());
         Ok(authority)
     }
@@ -3329,6 +3364,209 @@ impl CoordLive {
         self.begin_submitted_dispatch(key, serial, worker, lease_ttl_ms)
     }
 
+    /// Retire an attempt only after its transport has returned typed proof that
+    /// no execution request could have reached the worker. This is not recovery
+    /// for an uncertain compiler. Keep its generation and dispatch claim owned;
+    /// a caller must release the exact worker session before admitting a retry.
+    pub(crate) fn prepare_retry_dispatch(
+        &self,
+        key: &TypedDigest,
+        serial: u64,
+        authority: &AttemptAuthority,
+    ) -> Result<(), SubmissionRefusal> {
+        use crate::coord::action_actor::AdvanceAttemptReceipt;
+        use rabs_action::state_machines::AttemptState;
+
+        if !self.available() || self.authority().as_ref() != Some(&authority.coordinator) {
+            return Err(SubmissionRefusal::Unavailable);
+        }
+        let cas = self.cas.as_ref().ok_or(SubmissionRefusal::Unavailable)?;
+        let mut submissions = self
+            .submissions
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        let entry = submissions
+            .entries
+            .get_mut(key)
+            .ok_or(SubmissionRefusal::StaleDispatch)?;
+        if entry.state
+            != (DispatchState::Started {
+                serial,
+                attempt: authority.attempt_id,
+            })
+            || !entry.contains_authority(key, authority)
+            || !entry.actor.attempts().any(|attempt| {
+                attempt.attempt == authority.attempt_id
+                    && matches!(
+                        attempt.state,
+                        AttemptState::LeaseOffered
+                            | AttemptState::LeaseAccepted
+                            | AttemptState::AwaitingInputs
+                            | AttemptState::Materializing
+                            | AttemptState::Running
+                    )
+            })
+        {
+            return Err(SubmissionRefusal::StaleDispatch);
+        }
+        // Change a private copy first. A failed durable release cannot leave a
+        // retry-ready actor whose previous attempt still has publication rights.
+        let mut actor = entry.actor.clone();
+        for state in [AttemptState::Draining, AttemptState::Finished] {
+            if actor.advance_attempt(authority.attempt_id, state) != AdvanceAttemptReceipt::Advanced
+            {
+                return Err(SubmissionRefusal::StaleDispatch);
+            }
+        }
+        let mut store = cas
+            .store()
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        match store.validate_attempt_lease(authority, self.lease_now_ms()) {
+            Ok(_) | Err(StoreError::LeaseExpired | StoreError::LeaseReleased) => {}
+            Err(error) => {
+                return Err(SubmissionRefusal::Admission(format!(
+                    "retry retirement: {error:?}"
+                )));
+            }
+        }
+        // Expiry or prior release is sufficient for cleanup only, never for
+        // execution admission. The exact lease renewal must still be the one
+        // owned by this actor, including when validation reported expiry.
+        if !store
+            .lease_state(authority.execution_lease_id.0)
+            .map_err(|error| SubmissionRefusal::Admission(format!("retry lease: {error:?}")))?
+            .is_some_and(|lease| lease.renewal_seq == authority.lease_renewal_seq.0)
+        {
+            return Err(SubmissionRefusal::StaleDispatch);
+        }
+        store
+            .release_lease(authority.execution_lease_id.0)
+            .map_err(|error| {
+                SubmissionRefusal::Admission(format!("retry lease release: {error:?}"))
+            })?;
+        entry.actor = actor;
+        entry.state = DispatchState::RetryReady {
+            serial,
+            attempt: authority.attempt_id,
+        };
+        Ok(())
+    }
+
+    /// Admit a replacement under the SAME active generation. The prior lease
+    /// must already be released, every retry consumes the actor's existing
+    /// budget, and a previous worker cannot masquerade as an alternate.
+    pub(crate) fn begin_retry_dispatch(
+        &self,
+        key: &TypedDigest,
+        serial: u64,
+        previous: &AttemptAuthority,
+        worker: &WorkerSessionOffer,
+        lease_ttl_ms: u64,
+    ) -> Result<AttemptAuthority, SubmissionRefusal> {
+        if !self.available() || self.authority().as_ref() != Some(&previous.coordinator) {
+            return Err(SubmissionRefusal::Unavailable);
+        }
+        let cas = self.cas.as_ref().ok_or(SubmissionRefusal::Unavailable)?;
+        let mut submissions = self
+            .submissions
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        let entry = submissions
+            .entries
+            .get(key)
+            .ok_or(SubmissionRefusal::StaleDispatch)?;
+        if entry.state
+            != (DispatchState::RetryReady {
+                serial,
+                attempt: previous.attempt_id,
+            })
+            || !entry.contains_authority(key, previous)
+            || entry.actor.winner().is_some()
+        {
+            return Err(SubmissionRefusal::StaleDispatch);
+        }
+        if entry.actor.retries_remaining() == 0 {
+            return Err(SubmissionRefusal::Admission(
+                "actor retry budget exhausted".into(),
+            ));
+        }
+        if entry
+            .actor
+            .attempts()
+            .any(|attempt| attempt.worker == worker.worker_peer_id)
+        {
+            return Err(SubmissionRefusal::Admission(
+                "retry requires an untried worker identity".into(),
+            ));
+        }
+        if !entry.actor.has_foreground_interest() && !self.optional_admitted()? {
+            self.record_brownout_refusal()?;
+            return Err(SubmissionRefusal::Brownout);
+        }
+        let mut actor = entry.actor.clone();
+        let identity = |counter: u64| (u128::from(self.boot_nonce) << 64) | u128::from(counter);
+        let authority = AttemptAuthority {
+            attempt_id: AttemptId(identity(submissions.next_serial()?)),
+            execution_lease_id: ExecutionLeaseId(identity(submissions.next_serial()?)),
+            lease_renewal_seq: LeaseRenewalSeq(0),
+            worker_peer_id: worker.worker_peer_id.clone(),
+            worker_boot_generation: worker.boot_generation,
+            worker_incarnation_id: worker.incarnation,
+            ..previous.clone()
+        };
+        let mut store = cas
+            .store()
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        if !store
+            .lease_state(previous.execution_lease_id.0)
+            .map_err(|error| SubmissionRefusal::Admission(format!("prior retry lease: {error:?}")))?
+            .is_some_and(|lease| lease.released)
+        {
+            return Err(SubmissionRefusal::StaleDispatch);
+        }
+        let admitted = self.admit_dispatch_lease(&mut *store, &authority, lease_ttl_ms);
+        let entry = submissions
+            .entries
+            .get_mut(key)
+            .ok_or(SubmissionRefusal::StaleDispatch)?;
+        if let Err(error) = admitted {
+            if let Err(cleanup) = Self::discard_unreturned_lease(&mut *store, &authority) {
+                entry.state = DispatchState::Abandoned;
+                return Err(SubmissionRefusal::Admission(format!(
+                    "retry lease: {error:?}; cleanup: {cleanup:?}"
+                )));
+            }
+            return Err(SubmissionRefusal::Admission(format!(
+                "retry lease: {error:?}"
+            )));
+        }
+        let receipt = actor.register_attempt(RegisterAttempt {
+            validated: ValidatedAttemptLease {
+                authority: authority.clone(),
+            },
+            purpose: AttemptPurpose::Retry,
+        });
+        if receipt != RegisterAttemptReceipt::Registered {
+            if let Err(error) = Self::discard_unreturned_lease(&mut *store, &authority) {
+                entry.state = DispatchState::Abandoned;
+                return Err(SubmissionRefusal::Admission(format!(
+                    "retry registration: {receipt:?}; cleanup: {error:?}"
+                )));
+            }
+            return Err(SubmissionRefusal::Admission(format!(
+                "retry registration: {receipt:?}"
+            )));
+        }
+        entry.actor = actor;
+        entry.state = DispatchState::Started {
+            serial,
+            attempt: authority.attempt_id,
+        };
+        Ok(authority)
+    }
+
     /// One observed attempt transition through the actor machine, for the
     /// dispatch claim `(key, serial)` that started `authority`.
     pub(crate) fn advance_started_dispatch(
@@ -3347,7 +3585,13 @@ impl CoordLive {
             .entries
             .get_mut(key)
             .ok_or(SubmissionRefusal::StaleDispatch)?;
-        if entry.state != DispatchState::Started(serial) {
+        if entry.state
+            != (DispatchState::Started {
+                serial,
+                attempt: authority.attempt_id,
+            })
+            || !entry.contains_authority(key, authority)
+        {
             return Err(SubmissionRefusal::StaleDispatch);
         }
         match entry.actor.advance_attempt(authority.attempt_id, to) {
@@ -3373,7 +3617,12 @@ impl CoordLive {
             .entries
             .get_mut(key)
             .ok_or(SubmissionRefusal::StaleDispatch)?;
-        if entry.state != DispatchState::Started(serial)
+        if !matches!(
+            entry.state,
+            DispatchState::Started { serial: owner, attempt }
+                | DispatchState::RetryReady { serial: owner, attempt }
+                if owner == serial && attempt == authority.attempt_id
+        ) || !entry.contains_authority(key, authority)
             || !entry.actor.attempts().any(|attempt| {
                 attempt.attempt == authority.attempt_id
                     && attempt.state == rabs_action::state_machines::AttemptState::Finished
@@ -3424,7 +3673,12 @@ impl CoordLive {
                 DispatchState::Claimed(claimed) if claimed == serial => {
                     entry.state = DispatchState::Queued;
                 }
-                DispatchState::Started(started) if started == serial => {
+                DispatchState::Started {
+                    serial: started, ..
+                }
+                | DispatchState::RetryReady {
+                    serial: started, ..
+                } if started == serial => {
                     entry.state = DispatchState::Abandoned;
                 }
                 _ => {}
@@ -4224,6 +4478,29 @@ impl CoordLive {
         Ok(())
     }
 
+    fn admit_dispatch_lease(
+        &self,
+        store: &mut dyn RabsMetadataStore,
+        authority: &AttemptAuthority,
+        lease_ttl_ms: u64,
+    ) -> Result<(), StoreError> {
+        let (_, deadline) = self.lease_deadline(lease_ttl_ms)?;
+        store.admit_attempt_lease(authority, self.next_seq(), deadline)?;
+        self.confirm_live_admission(store, authority)
+    }
+
+    /// Admission has not returned to its caller, so this lease has never
+    /// authorized an execution request. Failure to fence it remains an error.
+    fn discard_unreturned_lease(
+        store: &mut dyn RabsMetadataStore,
+        authority: &AttemptAuthority,
+    ) -> Result<(), StoreError> {
+        if store.lease_state(authority.execution_lease_id.0)?.is_some() {
+            store.release_lease(authority.execution_lease_id.0)?;
+        }
+        Ok(())
+    }
+
     fn lease_deadline(&self, ttl_ms: u64) -> Result<(u64, u64), StoreError> {
         let now = self.lease_now_ms();
         let deadline = now
@@ -4508,6 +4785,8 @@ pub fn coord_work(
 
 #[cfg(test)]
 mod tests {
+    mod retry;
+
     use super::*;
     use crate::coord::action_actor::SubscriptionRequirements;
     use crate::janitor::store::mount_and_reconcile;
