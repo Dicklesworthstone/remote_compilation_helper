@@ -21,12 +21,20 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const UPLOAD_BUDGET: Duration = Duration::from_secs(5 * 60);
 
 fn invalid(message: &str) -> String {
     message.to_owned()
+}
+
+fn check_cancelled(cancelled: &AtomicBool) -> Result<(), String> {
+    if cancelled.load(Ordering::Acquire) {
+        return Err(invalid("source upload cancelled"));
+    }
+    Ok(())
 }
 
 pub fn hex(bytes: &[u8]) -> String {
@@ -1361,9 +1369,16 @@ pub struct SourceTransferState {
     pending: Option<SourceOwner>,
     input_budget: Option<Duration>,
     cache: Option<SourceCache>,
+    // Upload work observes this flag without a source-state lock. It is not
+    // retained by an execution-owned SourceOwner after the admission handoff.
+    cancelled: Arc<AtomicBool>,
 }
 
 impl SourceTransferState {
+    pub(crate) fn cancellation_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancelled)
+    }
+
     pub(crate) fn with_cache(mut self, cache: Option<SourceCache>) -> Self {
         self.cache = cache;
         self
@@ -1389,6 +1404,8 @@ impl SourceTransferState {
         if busy {
             return Err(invalid("worker-busy-or-result-pending"));
         }
+        let cancelled = Arc::clone(&self.cancelled);
+        check_cancelled(&cancelled)?;
         let id = value["request_id"]
             .as_u64()
             .ok_or("source request_id must be unsigned")?;
@@ -1412,11 +1429,17 @@ impl SourceTransferState {
                 if owner.source_failed {
                     return Err(invalid("execution source verification failed"));
                 }
-                return owner.ready();
+                let reply = owner.ready()?;
+                check_cancelled(&cancelled)?;
+                return Ok(reply);
             }
             let deadline = Instant::now() + self.input_budget.unwrap_or(UPLOAD_BUDGET);
             let cache = if allow_cached_files {
-                self.cache.clone().map(|cache| cache.before(deadline))
+                self.cache.clone().map(|cache| {
+                    cache
+                        .before(deadline)
+                        .with_cancellation(Arc::clone(&cancelled))
+                })
             } else {
                 None
             };
@@ -1434,6 +1457,7 @@ impl SourceTransferState {
             let mut missing_files = Vec::new();
             let mut reused_bytes = 0;
             for file in receiver.manifest().files().to_vec() {
+                check_cancelled(&cancelled)?;
                 if Instant::now() >= deadline {
                     return Err(invalid("source upload deadline exceeded"));
                 }
@@ -1452,6 +1476,10 @@ impl SourceTransferState {
                     missing_files.push(file.path);
                 }
             }
+            // A cache lookup deliberately treats corrupt/unavailable bytes as
+            // misses. Cancellation must not be converted into such a miss or
+            // acknowledged as a fresh upload's readiness.
+            check_cancelled(&cancelled)?;
             if Instant::now() >= deadline {
                 return Err(invalid("source upload deadline exceeded"));
             }
@@ -1471,6 +1499,7 @@ impl SourceTransferState {
                 prepared_cargo_home: None,
             };
             let reply = owner.ready()?;
+            check_cancelled(&cancelled)?;
             self.pending = Some(owner);
             return Ok(reply);
         }
@@ -1508,12 +1537,19 @@ impl SourceTransferState {
                 // Accepted filesystem writes do not make an expired transfer
                 // live again. Do not acknowledge progress after the deadline.
                 owner.within_budget()?;
+                check_cancelled(&cancelled)?;
                 Ok(json!({"kind":"source-chunk-accepted", "request_id":id,
                     "manifest_sha256":hex(&owner.receiver.manifest().digest()),
                     "path":path, "next_offset":next}))
             }
             Some("source-seal") => {
-                owner.receiver.seal().map_err(|error| error.to_string())?;
+                let deadline = owner.deadline;
+                let sealed = owner.receiver.seal_cancellable(|| {
+                    cancelled.load(Ordering::Acquire) || Instant::now() >= deadline
+                });
+                check_cancelled(&cancelled)?;
+                sealed.map_err(|error| error.to_string())?;
+                owner.within_budget()?;
                 // Seed once, before execution owns the source. Optional cache
                 // storage failure is not an execution failure; discovering a
                 // changed source is, and remains fenced on subsequent frames.
@@ -1529,6 +1565,8 @@ impl SourceTransferState {
                         }
                     }
                 }
+                check_cancelled(&cancelled)?;
+                owner.within_budget()?;
                 if let Some(projection) = &owner.cargo_home
                     && owner.prepared_cargo_home.is_none()
                 {
@@ -1536,7 +1574,7 @@ impl SourceTransferState {
                     match projection.prepare(
                         &owner.receiver,
                         &owner._directory.path().join("cargo-home-runtime"),
-                        || Instant::now() >= deadline,
+                        || cancelled.load(Ordering::Acquire) || Instant::now() >= deadline,
                     ) {
                         Ok(prepared) => owner.prepared_cargo_home = Some(prepared),
                         Err(error) => {
@@ -1545,7 +1583,9 @@ impl SourceTransferState {
                         }
                     }
                 }
-                owner.ready()
+                let reply = owner.ready()?;
+                check_cancelled(&cancelled)?;
+                Ok(reply)
             }
             _ => Err(invalid("unknown source operation")),
         }
@@ -1558,6 +1598,7 @@ impl SourceTransferState {
         let Some(manifest) = request_manifest(request)? else {
             return Ok(None);
         };
+        check_cancelled(&self.cancelled)?;
         if !enabled {
             return Err(invalid("source transfer not negotiated"));
         }
@@ -1601,6 +1642,9 @@ impl SourceTransferState {
         Ok(self.pending.take().map(|mut owner| {
             // Only the same fully verified, unexpired owner can make this
             // transition. There is no public setter or alternate host path.
+            // Upload cache controls belong to the retired transfer phase,
+            // even if a future preparation path retains one after sealing.
+            owner.cache = None;
             owner.execution_owned = true;
             owner
         }))
@@ -3522,7 +3566,17 @@ mod tests {
             std::fs::metadata(root.join(archive)).unwrap().ino()
         );
         let owner = warm.take_prepared(&request).unwrap().unwrap();
+        assert!(owner.cache.is_none());
+        let cancelled = warm.cancellation_flag();
+        cancelled.store(true, Ordering::Release);
         assert!(warm.prepared_path(&request, true).is_err());
+        drop(warm);
+        assert_eq!(
+            Arc::strong_count(&cancelled),
+            1,
+            "execution retains no upload cancellation token"
+        );
+        assert_eq!(owner.target_cache_inputs(8).unwrap().root, root);
         assert!(root.exists());
         drop(owner);
     }

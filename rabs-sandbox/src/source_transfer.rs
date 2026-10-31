@@ -236,6 +236,13 @@ fn open_root(path: &Path) -> io::Result<File> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum FileAccess {
+    Read,
+    Append,
+    Import,
+}
+
 /// Every component is opened separately: NOFOLLOW on the final pathname alone
 /// does not protect a file whose parent was replaced with a symlink. NONBLOCK
 /// prevents a substituted FIFO from wedging the execution control reactor.
@@ -244,17 +251,17 @@ fn open_member(
     parent: &Path,
     name: &OsStr,
     is_directory: bool,
-    append: bool,
+    access: FileAccess,
 ) -> io::Result<File> {
     #[cfg(target_os = "linux")]
     {
         use rustix::fs::{Mode, OFlags, openat};
         let _ = parent;
         let mut flags = OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
-        flags |= if append {
-            OFlags::WRONLY | OFlags::APPEND
-        } else {
-            OFlags::RDONLY
+        flags |= match access {
+            FileAccess::Read => OFlags::RDONLY,
+            FileAccess::Append => OFlags::WRONLY | OFlags::APPEND,
+            FileAccess::Import => OFlags::WRONLY,
         };
         if is_directory {
             flags |= OFlags::DIRECTORY;
@@ -274,8 +281,9 @@ fn open_member(
             ));
         }
         let file = OpenOptions::new()
-            .read(!append)
-            .append(append)
+            .read(matches!(access, FileAccess::Read))
+            .write(matches!(access, FileAccess::Import))
+            .append(matches!(access, FileAccess::Append))
             .open(&path)?;
         if !same_identity(&before, &file.metadata()?) {
             return Err(invalid("source member changed while opening"));
@@ -294,7 +302,12 @@ fn check_root(root: &Path, directory: &File) -> io::Result<()> {
 
 /// The relative name has already passed SourceManifest validation. At most one
 /// parent descriptor is retained while walking to the requested regular file.
-fn open_source(root: &Path, directory: &File, relative: &str, append: bool) -> io::Result<File> {
+fn open_source(
+    root: &Path,
+    directory: &File,
+    relative: &str,
+    access: FileAccess,
+) -> io::Result<File> {
     check_root(root, directory)?;
     let mut directory = directory.try_clone()?;
     let mut parent = root.to_path_buf();
@@ -306,7 +319,11 @@ fn open_source(root: &Path, directory: &File, relative: &str, append: bool) -> i
             &parent,
             OsStr::new(part),
             is_directory,
-            append && !is_directory,
+            if is_directory {
+                FileAccess::Read
+            } else {
+                access
+            },
         )?;
         if !is_directory {
             return Ok(member);
@@ -498,7 +515,11 @@ impl SourceReceiver {
                 &self.root,
                 &self.root_directory,
                 path,
-                offset == file.received,
+                if offset == file.received {
+                    FileAccess::Append
+                } else {
+                    FileAccess::Read
+                },
             )?;
             let before = target.metadata()?;
             ordinary_file(&before, file.received)?;
@@ -524,6 +545,121 @@ impl SourceReceiver {
         })();
         if result.is_err() {
             self.poisoned = true;
+        }
+        result
+    }
+
+    /// Import one complete, previously untouched manifest member from an owned
+    /// regular file. Local byte reuse needs no transport chunk hashes. Both the
+    /// ordinary copy and an optional independent CoW clone verify the complete
+    /// manifest digest; the clone path hashes the actual destination bytes.
+    ///
+    /// This does not seal the receiver or grant execution authority. The final
+    /// exact-tree seal still rereads every member. Source/destination movement,
+    /// partial I/O and cancellation poison this receiver, including a panicking
+    /// cloning callback. A failed clone is truncated before copying normally.
+    /// The callback must establish real CoW isolation, never a hardlink.
+    pub fn import_file_with_cloner(
+        &mut self,
+        path: &str,
+        input: &mut File,
+        stopped: impl Fn() -> bool,
+        cloner: impl FnOnce(&File, &File, &Path) -> bool,
+    ) -> io::Result<bool> {
+        if self.poisoned || self.sealed {
+            return Err(invalid("source staging is failed or already sealed"));
+        }
+        let pending = self
+            .files
+            .get_mut(path)
+            .ok_or_else(|| invalid("undeclared source file"))?;
+        if pending.received != 0 {
+            return Err(invalid("source import requires an untouched member"));
+        }
+        // Set the failure fence before invoking external code or touching the
+        // destination. A panic cannot leave a partly imported reusable receiver.
+        self.poisoned = true;
+        let result = (|| {
+            checkpoint(&stopped)?;
+            let source_before = input.metadata()?;
+            if !source_before.is_file() || source_before.len() != pending.expected.len {
+                return Err(invalid(
+                    "source import input type or length differs from manifest",
+                ));
+            }
+            input.seek(SeekFrom::Start(0))?;
+            let mut target =
+                open_source(&self.root, &self.root_directory, path, FileAccess::Import)?;
+            let target_before = target.metadata()?;
+            ordinary_file(&target_before, 0)?;
+            if same_identity(&source_before, &target_before) {
+                return Err(invalid("source import input aliases its destination"));
+            }
+            // Both descriptors use the same anchored acquisition. A whole-file
+            // clone needs a normal writer: Linux FICLONE refuses O_APPEND.
+            // A separate anchored reader verifies actual cloned bytes and binds
+            // both descriptors to the same initially empty private inode.
+            let mut reader = open_source(&self.root, &self.root_directory, path, FileAccess::Read)?;
+            if !same_state(&target_before, &reader.metadata()?) {
+                return Err(invalid("source import destination changed while opening"));
+            }
+            let parent = self.root.join(path);
+            let parent = parent
+                .parent()
+                .ok_or_else(|| invalid("source import parent"))?;
+            let cloned = cloner(input, &target, parent);
+            checkpoint(&stopped)?;
+            if cloned {
+                ordinary_file(&target.metadata()?, pending.expected.len)?;
+            } else {
+                target.set_len(0)?;
+                target.rewind()?;
+                ordinary_file(&target.metadata()?, 0)?;
+            }
+            let mut hash = Sha256::new();
+            let mut buffer = [0_u8; MAX_SOURCE_CHUNK];
+            let mut remaining = pending.expected.len;
+            let verify = if cloned { &mut reader } else { &mut *input };
+            let observed = verify.metadata()?;
+            verify.seek(SeekFrom::Start(0))?;
+            while remaining != 0 {
+                checkpoint(&stopped)?;
+                let count = remaining.min(buffer.len() as u64) as usize;
+                verify.read_exact(&mut buffer[..count])?;
+                hash.update(&buffer[..count]);
+                if !cloned {
+                    target.write_all(&buffer[..count])?;
+                }
+                remaining -= count as u64;
+            }
+            checkpoint(&stopped)?;
+            if verify.read(&mut buffer[..1])? != 0
+                || !same_state(&observed, &verify.metadata()?)
+                || <[u8; 32]>::from(hash.clone().finalize()) != pending.expected.sha256
+            {
+                return Err(invalid("source import bytes differ from manifest"));
+            }
+            if !same_state(&source_before, &input.metadata()?) {
+                return Err(invalid("source import input changed while reading"));
+            }
+            let completed = target.metadata()?;
+            ordinary_file(&completed, pending.expected.len)?;
+            let named = open_source(&self.root, &self.root_directory, path, FileAccess::Read)?;
+            if !same_state(&completed, &reader.metadata()?)
+                || !same_state(&completed, &named.metadata()?)
+                || same_identity(&source_before, &completed)
+            {
+                return Err(invalid(
+                    "source import destination changed while populating",
+                ));
+            }
+            checkpoint(&stopped)?;
+            pending.hash = hash;
+            pending.received = pending.expected.len;
+            Ok(cloned)
+        })();
+        if result.is_ok() {
+            self.poisoned = false;
         }
         result
     }
@@ -623,7 +759,7 @@ impl SourceReceiver {
                 return Err(invalid("undeclared or duplicate source member before seal"));
             }
             let is_directory = directories.contains(relative.as_str());
-            let mut member = open_member(directory, path, name, is_directory, false)?;
+            let mut member = open_member(directory, path, name, is_directory, FileAccess::Read)?;
             if is_directory {
                 self.verify_directory(
                     &member,
@@ -805,6 +941,215 @@ mod tests {
                 .write_chunk("src/lib.rs", 0, b"A", Sha256::digest(b"A").into())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn whole_file_import_owns_exact_bytes_and_recovers_a_partial_clone_fallback() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let owner = private();
+        let bytes = vec![0x9b; MAX_SOURCE_CHUNK * 3 + 19];
+        let mut expected = entry("src/lib.rs", &bytes);
+        expected.executable = true;
+        let root = owner.path().join("source");
+        let mut receiver =
+            SourceReceiver::create(&root, SourceManifest::new(vec![expected]).unwrap()).unwrap();
+        let mut input = tempfile::tempfile_in(owner.path()).unwrap();
+        input.write_all(&bytes).unwrap();
+        assert!(
+            !receiver
+                .import_file_with_cloner(
+                    "src/lib.rs",
+                    &mut input,
+                    || false,
+                    |_, mut output, _| {
+                        #[cfg(target_os = "linux")]
+                        assert!(
+                            !rustix::fs::fcntl_getfl(output)
+                                .unwrap()
+                                .contains(rustix::fs::OFlags::APPEND)
+                        );
+                        output.write_all(b"failed clone debris").unwrap();
+                        false
+                    }
+                )
+                .unwrap()
+        );
+        assert!(receiver.sealed_root().is_none());
+        let target = root.join("src/lib.rs");
+        assert_ne!(
+            input.metadata().unwrap().ino(),
+            fs::metadata(&target).unwrap().ino()
+        );
+        // The receiver owns its bytes even if the caller changes or drops the
+        // anonymous spool before the mandatory final exact-tree verification.
+        input.rewind().unwrap();
+        input.write_all(b"changed").unwrap();
+        drop(input);
+        receiver.seal().unwrap();
+        assert_eq!(fs::read(&target).unwrap(), bytes);
+        assert_eq!(
+            fs::metadata(target).unwrap().permissions().mode() & 0o777,
+            0o555
+        );
+    }
+
+    #[test]
+    fn whole_file_import_verifies_a_clone_candidates_actual_destination() {
+        for corrupt in [false, true] {
+            let owner = private();
+            let bytes = vec![0x71; MAX_SOURCE_CHUNK * 2 + 3];
+            let root = owner.path().join("source");
+            let mut receiver = SourceReceiver::create(
+                &root,
+                SourceManifest::new(vec![entry("src/lib.rs", &bytes)]).unwrap(),
+            )
+            .unwrap();
+            let mut input = tempfile::tempfile_in(owner.path()).unwrap();
+            input.write_all(&bytes).unwrap();
+            let result = receiver.import_file_with_cloner(
+                "src/lib.rs",
+                &mut input,
+                || false,
+                |input, mut output, _| {
+                    // Exercise the candidate-verification branch with real
+                    // independent bytes; this is not a filesystem CoW claim.
+                    if corrupt {
+                        output.write_all(&vec![0x72; bytes.len()]).unwrap();
+                    } else {
+                        io::copy(&mut input.try_clone().unwrap(), &mut output).unwrap();
+                    }
+                    true
+                },
+            );
+            if corrupt {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+                assert_poisoned(&mut receiver);
+            } else {
+                assert!(result.unwrap());
+                receiver.seal().unwrap();
+                assert_eq!(fs::read(root.join("src/lib.rs")).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn whole_file_import_rejects_length_digest_and_post_read_source_mutation() {
+        use std::cell::Cell;
+        use std::io::Seek;
+        for change in 0..3 {
+            let owner = private();
+            let bytes = vec![0x63; MAX_SOURCE_CHUNK * 3 + 11];
+            let mut receiver = SourceReceiver::create(
+                &owner.path().join("source"),
+                SourceManifest::new(vec![entry("src/lib.rs", &bytes)]).unwrap(),
+            )
+            .unwrap();
+            let mut input = tempfile::tempfile_in(owner.path()).unwrap();
+            match change {
+                0 => input.write_all(&bytes[..bytes.len() - 1]).unwrap(),
+                1 => input.write_all(&vec![0x64; bytes.len()]).unwrap(),
+                _ => input.write_all(&bytes).unwrap(),
+            }
+            input.rewind().unwrap();
+            let observer = std::cell::RefCell::new(input.try_clone().unwrap());
+            let changed = Cell::new(false);
+            let result = receiver.import_file_with_cloner(
+                "src/lib.rs",
+                &mut input,
+                || {
+                    if change == 2 && !changed.get() {
+                        let mut observer = observer.borrow_mut();
+                        let position = observer.stream_position().unwrap();
+                        if position >= MAX_SOURCE_CHUNK as u64 {
+                            observer.rewind().unwrap();
+                            observer.write_all(b"X").unwrap();
+                            observer.seek(SeekFrom::Start(position)).unwrap();
+                            changed.set(true);
+                        }
+                    }
+                    false
+                },
+                |_, _, _| false,
+            );
+            assert!(result.is_err(), "accepted changed source case {change}");
+            if change == 2 {
+                assert!(changed.get(), "source mutation followed a real read");
+            }
+            assert_poisoned(&mut receiver);
+        }
+    }
+
+    #[test]
+    fn cancelling_whole_file_import_after_real_read_poisoned_partial_receiver() {
+        use std::cell::RefCell;
+        let owner = private();
+        let bytes = vec![0x31; MAX_SOURCE_CHUNK * 3 + 17];
+        let root = owner.path().join("source");
+        let mut receiver = SourceReceiver::create(
+            &root,
+            SourceManifest::new(vec![entry("src/lib.rs", &bytes)]).unwrap(),
+        )
+        .unwrap();
+        let mut input = tempfile::tempfile_in(owner.path()).unwrap();
+        input.write_all(&bytes).unwrap();
+        input.rewind().unwrap();
+        let observer = RefCell::new(input.try_clone().unwrap());
+        let error = receiver
+            .import_file_with_cloner(
+                "src/lib.rs",
+                &mut input,
+                || observer.borrow_mut().stream_position().unwrap() >= MAX_SOURCE_CHUNK as u64,
+                |_, _, _| false,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(input.stream_position().unwrap(), MAX_SOURCE_CHUNK as u64);
+        assert_eq!(
+            fs::read(root.join("src/lib.rs")).unwrap(),
+            bytes[..MAX_SOURCE_CHUNK]
+        );
+        assert_poisoned(&mut receiver);
+    }
+
+    #[test]
+    fn whole_file_import_refuses_destination_links_replacements_and_callback_unwind() {
+        for change in 0..4 {
+            let owner = private();
+            let root = owner.path().join("source");
+            let mut receiver = SourceReceiver::create(
+                &root,
+                SourceManifest::new(vec![entry("src/lib.rs", b"AB")]).unwrap(),
+            )
+            .unwrap();
+            let mut input = tempfile::tempfile_in(owner.path()).unwrap();
+            input.write_all(b"AB").unwrap();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                receiver.import_file_with_cloner(
+                    "src/lib.rs",
+                    &mut input,
+                    || false,
+                    |_, _, _| {
+                        match change {
+                            0 => fs::hard_link(root.join("src/lib.rs"), owner.path().join("alias"))
+                                .unwrap(),
+                            1 => {
+                                fs::rename(root.join("src/lib.rs"), owner.path().join("old-file"))
+                                    .unwrap();
+                                fs::write(root.join("src/lib.rs"), b"").unwrap();
+                            }
+                            2 => {
+                                fs::rename(&root, owner.path().join("old-root")).unwrap();
+                                fs::create_dir(&root).unwrap();
+                            }
+                            _ => panic!("injected clone callback unwind"),
+                        }
+                        false
+                    },
+                )
+            }));
+            assert!(result.is_err() || result.unwrap().is_err());
+            assert_poisoned(&mut receiver);
+        }
     }
 
     #[test]

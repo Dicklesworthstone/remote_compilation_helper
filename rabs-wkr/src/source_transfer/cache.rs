@@ -13,6 +13,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime};
 
 /// Retain one maximum-size source/dependency projection by default.
@@ -91,14 +93,39 @@ fn same_state(a: &Metadata, b: &Metadata) -> bool {
     }
 }
 
-fn within_budget(deadline: Option<Instant>) -> io::Result<()> {
-    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-        return Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "source upload deadline exceeded during cache I/O",
-        ));
+#[derive(Debug, Clone, Default)]
+struct CacheControl {
+    deadline: Option<Instant>,
+    cancelled: Option<Arc<AtomicBool>>,
+}
+
+impl CacheControl {
+    fn check(&self) -> io::Result<()> {
+        if self
+            .cancelled
+            .as_ref()
+            .is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "source upload cancelled during cache I/O",
+            ));
+        }
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "source upload deadline exceeded during cache I/O",
+            ));
+        }
+        Ok(())
     }
-    Ok(())
+
+    fn stopped(&self) -> bool {
+        self.check().is_err()
+    }
 }
 
 fn object_name(digest: &[u8; 32]) -> String {
@@ -119,10 +146,10 @@ fn owned_name(name: &str) -> bool {
 fn copy_verified(
     path: &Path,
     expected: &SourceFile,
-    deadline: Option<Instant>,
+    control: &CacheControl,
     output: &mut impl Write,
 ) -> Result<File, RememberError> {
-    within_budget(deadline)?;
+    control.check()?;
     if expected.len > MAX_FILE_BYTES {
         return Err(RememberError::Source(invalid(
             "source object exceeds the per-file reuse bound",
@@ -158,7 +185,7 @@ fn copy_verified(
     let mut buffer = [0_u8; MAX_SOURCE_CHUNK];
     let mut remaining = expected.len;
     while remaining != 0 {
-        within_budget(deadline)?;
+        control.check()?;
         let count = remaining.min(buffer.len() as u64) as usize;
         input
             .read_exact(&mut buffer[..count])
@@ -167,7 +194,7 @@ fn copy_verified(
         output.write_all(&buffer[..count])?;
         remaining -= count as u64;
     }
-    within_budget(deadline)?;
+    control.check()?;
     if input
         .read(&mut buffer[..1])
         .map_err(RememberError::Source)?
@@ -193,26 +220,22 @@ fn copy_verified(
 pub(super) struct VerifiedSource {
     file: File,
     expected: SourceFile,
-    deadline: Option<Instant>,
+    control: CacheControl,
 }
 
 impl VerifiedSource {
     pub(super) fn install(mut self, receiver: &mut SourceReceiver) -> io::Result<()> {
-        let mut buffer = [0_u8; MAX_SOURCE_CHUNK];
-        let mut offset = 0_u64;
-        while offset < self.expected.len {
-            within_budget(self.deadline)?;
-            let count = (self.expected.len - offset).min(buffer.len() as u64) as usize;
-            self.file.read_exact(&mut buffer[..count])?;
-            receiver.write_chunk(
-                &self.expected.path,
-                offset,
-                &buffer[..count],
-                Sha256::digest(&buffer[..count]).into(),
-            )?;
-            offset += count as u64;
-        }
-        within_budget(self.deadline)
+        self.control.check()?;
+        let result = receiver.import_file_with_cloner(
+            &self.expected.path,
+            &mut self.file,
+            || self.control.stopped(),
+            rabs_cas::materialization::try_verified_reflink,
+        );
+        // Preserve the fixed upload timeout separately from cancellation;
+        // either condition has already poisoned a partially imported receiver.
+        self.control.check()?;
+        result.map(|_| ())
     }
 
     #[cfg(test)]
@@ -236,7 +259,7 @@ pub struct SourceCache {
     root: PathBuf,
     max_bytes: u64,
     max_files: usize,
-    deadline: Option<Instant>,
+    control: CacheControl,
 }
 
 #[derive(Debug)]
@@ -282,12 +305,17 @@ impl SourceCache {
             root,
             max_bytes,
             max_files: MAX_FILES,
-            deadline: None,
+            control: CacheControl::default(),
         })
     }
 
     pub(super) fn before(mut self, deadline: Instant) -> Self {
-        self.deadline = Some(deadline);
+        self.control.deadline = Some(deadline);
+        self
+    }
+
+    pub(super) fn with_cancellation(mut self, cancelled: Arc<AtomicBool>) -> Self {
+        self.control.cancelled = Some(cancelled);
         self
     }
 
@@ -297,23 +325,23 @@ impl SourceCache {
         if expected.len > self.max_bytes || expected.len > MAX_FILE_BYTES {
             return None;
         }
-        within_budget(self.deadline).ok()?;
+        self.control.check().ok()?;
         private_directory(&self.root).ok()?;
         let mut snapshot = tempfile::tempfile_in(&self.root).ok()?;
         let file = copy_verified(
             &self.root.join(object_name(&expected.sha256)),
             expected,
-            self.deadline,
+            &self.control,
             &mut snapshot,
         )
         .ok()?;
         snapshot.rewind().ok()?;
-        within_budget(self.deadline).ok()?;
+        self.control.check().ok()?;
         let _ = file.set_modified(SystemTime::now());
         Some(VerifiedSource {
             file: snapshot,
             expected: expected.clone(),
-            deadline: self.deadline,
+            control: self.control.clone(),
         })
     }
 
@@ -321,7 +349,7 @@ impl SourceCache {
         let Ok(file) = copy_verified(
             &self.root.join(object_name(&expected.sha256)),
             expected,
-            self.deadline,
+            &self.control,
             &mut io::sink(),
         ) else {
             return false;
@@ -331,7 +359,7 @@ impl SourceCache {
     }
 
     fn writer(&self) -> io::Result<Option<File>> {
-        within_budget(self.deadline)?;
+        self.control.check()?;
         private_directory(&self.root)?;
         let path = self.root.join("lock");
         match fs::symlink_metadata(&path) {
@@ -373,7 +401,7 @@ impl SourceCache {
         }
         let mut entries = Vec::new();
         for item in fs::read_dir(&self.root)? {
-            within_budget(self.deadline)?;
+            self.control.check()?;
             let item = item?;
             let name = item.file_name();
             if name == "lock" {
@@ -425,7 +453,7 @@ impl SourceCache {
         // that limit before protecting this projection's hits, including when
         // every requested object was already present in the older cache.
         while total > self.max_bytes || entries.len() > self.max_files {
-            within_budget(self.deadline)?;
+            self.control.check()?;
             let entry = entries
                 .pop_front()
                 .ok_or_else(|| invalid("source cache capacity accounting is inconsistent"))?;
@@ -439,7 +467,7 @@ impl SourceCache {
         // paths sort that way. A filename alone is never protection evidence:
         // corrupt objects must remain evictable/repairable, not occupy credit.
         for expected in receiver.manifest().files() {
-            within_budget(self.deadline)?;
+            self.control.check()?;
             if expected.len == 0 || expected.len > MAX_FILE_BYTES || expected.len > self.max_bytes {
                 continue;
             }
@@ -455,7 +483,7 @@ impl SourceCache {
         })?;
         let mut stored = 0;
         for expected in missing {
-            within_budget(self.deadline)?;
+            self.control.check()?;
             let destination = self.root.join(object_name(&expected.sha256));
             if let Some(bytes) = protected.get(&destination) {
                 if *bytes != expected.len {
@@ -476,7 +504,7 @@ impl SourceCache {
                 copy_verified(
                     &root.join(&expected.path),
                     expected,
-                    self.deadline,
+                    &self.control,
                     &mut io::sink(),
                 )?;
                 continue;
@@ -496,7 +524,7 @@ impl SourceCache {
             copy_verified(
                 &root.join(&expected.path),
                 expected,
-                self.deadline,
+                &self.control,
                 &mut file,
             )?;
             let mut permissions = file.metadata()?.permissions();
@@ -520,7 +548,7 @@ impl SourceCache {
                     .checked_add(expected.len)
                     .is_none_or(|sum| sum > self.max_bytes)
             {
-                within_budget(self.deadline)?;
+                self.control.check()?;
                 let index = entries
                     .iter()
                     .position(|entry| !protected.contains_key(&entry.path))
@@ -531,7 +559,7 @@ impl SourceCache {
                 fs::remove_file(&entry.path)?;
                 total -= entry.bytes;
             }
-            within_budget(self.deadline)?;
+            self.control.check()?;
             fs::rename(&scratch, &destination)?;
             total += expected.len;
             protected_bytes = next_protected_bytes;
@@ -1113,10 +1141,156 @@ mod tests {
             changed: false,
         };
         assert!(matches!(
-            copy_verified(&path, &source.manifest().files()[0], None, &mut sink),
+            copy_verified(
+                &path,
+                &source.manifest().files()[0],
+                &CacheControl::default(),
+                &mut sink,
+            ),
             Err(RememberError::Source(_))
         ));
         assert!(sink.changed);
+    }
+
+    #[test]
+    fn cache_verification_stops_after_a_real_copy_chunk_when_session_is_cancelled() {
+        struct CancellingOutput {
+            file: File,
+            cancelled: Arc<AtomicBool>,
+        }
+        impl Write for CancellingOutput {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.file.write_all(bytes)?;
+                self.cancelled.store(true, Ordering::Release);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.file.flush()
+            }
+        }
+        let input = private();
+        let bytes = vec![b'A'; MAX_SOURCE_CHUNK * 3 + 7];
+        let source = staged(input.path(), &[("lib.rlib", &bytes)]);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let control = CacheControl {
+            cancelled: Some(Arc::clone(&cancelled)),
+            ..CacheControl::default()
+        };
+        let mut output = CancellingOutput {
+            file: tempfile::tempfile_in(input.path()).unwrap(),
+            cancelled,
+        };
+        let result = copy_verified(
+            &source.sealed_root().unwrap().join("lib.rlib"),
+            &source.manifest().files()[0],
+            &control,
+            &mut output,
+        );
+        assert!(matches!(result,
+            Err(RememberError::Cache(error)) if error.kind() == io::ErrorKind::Interrupted));
+        assert_eq!(
+            output.file.metadata().unwrap().len(),
+            MAX_SOURCE_CHUNK as u64
+        );
+        output.file.rewind().unwrap();
+        let mut copied = Vec::new();
+        output.file.read_to_end(&mut copied).unwrap();
+        assert_eq!(copied, bytes[..MAX_SOURCE_CHUNK]);
+    }
+
+    #[test]
+    fn cancelled_cache_session_does_not_modify_receiver_or_revoke_other_sessions() {
+        let parent = private();
+        let input = private();
+        let bytes = vec![0x81; MAX_SOURCE_CHUNK * 2 + 1];
+        let source = staged(input.path(), &[("lib.rlib", &bytes)]);
+        let expected = &source.manifest().files()[0];
+        let cache = SourceCache::open(parent.path(), DEFAULT_SOURCE_CACHE_BYTES).unwrap();
+        cache.remember(&source).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let session = cache.clone().with_cancellation(Arc::clone(&cancelled));
+        let snapshot = session.load(expected).unwrap();
+        let original = cache_inodes(&cache);
+        cancelled.store(true, Ordering::Release);
+        assert!(session.load(expected).is_none());
+        assert!(matches!(session.remember(&source),
+            Err(RememberError::Cache(error)) if error.kind() == io::ErrorKind::Interrupted));
+        let next = private();
+        let mut receiver =
+            SourceReceiver::create(&next.path().join("workspace"), source.manifest().clone())
+                .unwrap();
+        assert_eq!(
+            snapshot.install(&mut receiver).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(
+            fs::metadata(next.path().join("workspace/lib.rlib"))
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(receiver.sealed_root().is_none());
+        assert_eq!(cache_inodes(&cache), original);
+        // A new session keeps the same reusable bytes but has independent
+        // cancellation custody; cancelled consumers cannot poison the cache.
+        cache
+            .load(expected)
+            .unwrap()
+            .install(&mut receiver)
+            .unwrap();
+        let installed = receiver.seal().unwrap().join("lib.rlib");
+        assert_eq!(fs::read(&installed).unwrap(), bytes);
+        assert_ne!(
+            fs::metadata(installed).unwrap().ino(),
+            fs::metadata(cache.root.join(object_name(&expected.sha256)))
+                .unwrap()
+                .ino()
+        );
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        not(any(target_arch = "sparc", target_arch = "sparc64"))
+    ))]
+    #[test]
+    #[ignore = "requires RABS_REFLINK_TEST_ROOT on a real reflink-capable filesystem"]
+    fn cached_snapshot_import_requires_real_verified_reflink_and_independent_seal() {
+        let root = std::env::var_os("RABS_REFLINK_TEST_ROOT").expect("explicit capable filesystem");
+        let parent = tempfile::tempdir_in(root).unwrap();
+        let input = tempfile::tempdir_in(parent.path()).unwrap();
+        let bytes = vec![0x29; MAX_SOURCE_CHUNK * 4 + 3];
+        let source = staged(input.path(), &[("lib.rlib", &bytes)]);
+        let cache = SourceCache::open(parent.path(), DEFAULT_SOURCE_CACHE_BYTES).unwrap();
+        cache.remember(&source).unwrap();
+        let expected = &source.manifest().files()[0];
+        let mut snapshot = cache.load(expected).unwrap();
+        let next = tempfile::tempdir_in(parent.path()).unwrap();
+        let mut receiver =
+            SourceReceiver::create(&next.path().join("workspace"), source.manifest().clone())
+                .unwrap();
+        assert!(
+            receiver
+                .import_file_with_cloner(
+                    &expected.path,
+                    &mut snapshot.file,
+                    || snapshot.control.stopped(),
+                    rabs_cas::materialization::try_verified_reflink,
+                )
+                .unwrap(),
+            "a private-copy fallback does not satisfy this real CoW fixture"
+        );
+        assert!(receiver.sealed_root().is_none());
+        snapshot.file.rewind().unwrap();
+        snapshot.file.write_all(b"changed private spool").unwrap();
+        let installed = receiver.seal().unwrap().join("lib.rlib");
+        assert_eq!(fs::read(&installed).unwrap(), bytes);
+        assert_ne!(
+            snapshot.file.metadata().unwrap().ino(),
+            fs::metadata(&installed).unwrap().ino()
+        );
+        fs::set_permissions(&installed, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&installed, b"changed private receiver").unwrap();
+        assert_eq!(cache.load(expected).unwrap().bytes(), bytes);
     }
 
     #[test]
@@ -1137,7 +1311,7 @@ mod tests {
         assert!(!cache.root.join(INCOMING).exists());
 
         let mut snapshot = cache.load(expected).unwrap();
-        snapshot.deadline = Some(Instant::now());
+        snapshot.control.deadline = Some(Instant::now());
         let next = private();
         let mut receiver =
             SourceReceiver::create(&next.path().join("workspace"), source.manifest().clone())

@@ -6,13 +6,15 @@
 //! The reactor never holds a source-state lock across filesystem work, and
 //! cannot obtain an execution source while a frame is being processed.
 //!
-//! Cancellation revokes readiness immediately. It is not interruption of a
-//! blocking kernel filesystem call: cleanup joins the worker rather than
+//! Cancellation revokes readiness immediately and stops source cache reads,
+//! copies and sealing between bounded chunks. A blocking kernel filesystem call
+//! still has to settle: cleanup signals and joins the worker rather than
 //! detaching it or exposing a late successful seal after cancellation.
 
 use crate::source_transfer::{SourceCache, SourceOwner, SourceTransferState};
 use serde_json::Value;
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::task::{Context, Poll, Waker};
 use std::thread::JoinHandle;
@@ -52,6 +54,7 @@ pub struct SourceTransferTask {
     pending_id: Option<u64>,
     upload_id: Option<u64>,
     cancelled: bool,
+    stop: Arc<AtomicBool>,
     failed: bool,
 }
 
@@ -76,6 +79,7 @@ impl SourceTransferTask {
     }
 
     fn with_source(source: SourceTransferState) -> Self {
+        let stop = source.cancellation_flag();
         Self {
             source: Some(source),
             shared: Arc::new(Mutex::new(CompletionState::default())),
@@ -84,6 +88,7 @@ impl SourceTransferTask {
             pending_id: None,
             upload_id: None,
             cancelled: false,
+            stop,
             failed: false,
         }
     }
@@ -260,6 +265,7 @@ impl SourceTransferTask {
         }
         let accepted = !self.cancelled;
         self.cancelled = true;
+        self.stop.store(true, Ordering::Release);
         Some(accepted)
     }
 
@@ -294,8 +300,11 @@ impl SourceTransferTask {
 
 impl Drop for SourceTransferTask {
     fn drop(&mut self) {
-        // Close the command channel FIRST. The worker completes the one
-        // accepted job, then exits; no join while an idle recv stays open.
+        // Stop in-flight bounded source I/O, then close the command channel.
+        // The worker settles the accepted job before exiting; no detached
+        // writer and no join while an idle recv stays open. Execution custody
+        // already transferred by take_prepared does not retain this flag.
+        self.stop.store(true, Ordering::Release);
         drop(self.sender.take());
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -412,6 +421,7 @@ mod tests {
             path.exists(),
             "execution, not the I/O thread, owns the sealed tree"
         );
+        assert_eq!(owner.target_cache_inputs(7).unwrap().root, path);
         drop(owner);
         assert!(!path.exists());
     }
@@ -491,6 +501,53 @@ mod tests {
         assert!(task.prepared_path(&request, true).is_err());
         assert!(task.take_prepared(&request).is_err());
         assert!(task.submit(&begin(&request), true, false).is_err());
+    }
+
+    #[test]
+    fn cancelling_or_dropping_task_signals_its_active_source_state_before_join() {
+        for cancel in [false, true] {
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (observed_tx, observed_rx) = mpsc::channel();
+            let mut task = SourceTransferTask::default();
+            task.start_worker(move |source, frame| {
+                // Start a real receiver on the worker thread before waiting
+                // for its cancellation flag. No fake successful seal is used.
+                source.handle(frame, true, false)?;
+                entered_tx.send(()).unwrap();
+                let flag = source.cancellation_flag();
+                let until = Instant::now() + Duration::from_secs(5);
+                while !flag.load(Ordering::Acquire) {
+                    assert!(
+                        Instant::now() < until,
+                        "active source work was not signalled"
+                    );
+                    std::thread::park_timeout(Duration::from_millis(1));
+                }
+                let result = source.handle(frame, true, false);
+                observed_tx.send(result.clone()).unwrap();
+                result
+            })
+            .unwrap();
+            task.submit(&begin(&request()), true, false).unwrap();
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            if cancel {
+                assert_eq!(task.cancel(8), None);
+                assert!(!task.stop.load(Ordering::Acquire));
+                assert_eq!(task.cancel(7), Some(true));
+                assert_eq!(
+                    finish(&mut task).unwrap().response.unwrap_err(),
+                    "source upload cancelled"
+                );
+            }
+            drop(task);
+            assert_eq!(
+                observed_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap_err(),
+                "source upload cancelled"
+            );
+        }
     }
 
     #[test]

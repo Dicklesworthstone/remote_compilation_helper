@@ -1505,6 +1505,18 @@ is full, ordinary verified capture proceeds within the existing per-upload
 bounds. Cancellation releases unfinished captures; worker-side verification of
 received bytes remains mandatory.
 
+Workers reuse verified source and dependency objects when negotiating the exact
+missing-file list. A warm object is first captured into an independent verified
+file, then imported as a whole manifest member. The import tries the existing
+filesystem-tested copy-on-write clone and otherwise copies with bounded buffers;
+it does not repeat transport chunk encoding and hashing for bytes already on
+the worker. Both paths check the complete file digest and keep a distinct private
+inode. The final source-tree seal still verifies every declared member before
+execution. Upload cancellation reaches cache reads, imports, final sealing and
+Cargo-home preparation between bounded chunks; the worker joins its input task
+before releasing that task's custody. Once verified source custody passes to
+execution, dropping the upload task cannot revoke the executing source.
+
 Preparation's Cargo metadata, package selection, rustup and Git subprocesses use
 the same root broker, so preliminary work cannot exceed the configured process
 root limit. Source capture, cache expansion, hashing, materialization and final
