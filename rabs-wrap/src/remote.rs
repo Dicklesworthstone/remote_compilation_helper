@@ -63,6 +63,7 @@ fn completed_failure(reply: &reply_json::Value, key: &str) -> bool {
             .get("compiler_skip_authorized")
             .and_then(reply_json::Value::as_bool)
             == Some(false)
+        && metadata::exposure_flag(reply) == Some(false)
 }
 
 /// Handle a complete typed failure in either consent phase. The daemon may
@@ -166,28 +167,12 @@ pub(super) fn outcome(
             "RABS remote install deadline is not representable".into(),
         ));
     };
-    let accepted = format!(
-        "{{\"kind\":\"rustc-accept\",\"capture\":{}}}\n",
-        json_string(capture),
-    );
-    if singleflight::write_owned(&mut reader, accepted.as_bytes(), deadline, owned).is_err() {
-        return Ok(Live::FailClosed(
-            "RABS remote installation acceptance is uncertain".into(),
-        ));
-    }
-    let line =
-        match singleflight::read_owned_reply(&mut reader, MAX_LIVE_REPLY_BYTES, deadline, owned) {
-            Ok(line) => line,
-            Err(error) => {
-                return Ok(Live::FailClosed(format!(
-                    "RABS remote installation outcome is unknown: {error}"
-                )));
-            }
-        };
-    Ok(completion(&line, key))
+    Ok(metadata::remote_install(
+        &ready, key, capture, reader, deadline, owned,
+    ))
 }
 
-fn completion(line: &str, key: &str) -> Live {
+pub(super) fn completion(line: &str, key: &str) -> Live {
     let Some(reply) = reply_json::parse(line) else {
         return Live::FailClosed("malformed remote installation answer".into());
     };
@@ -274,6 +259,27 @@ mod tests {
             completion(&valid.replace("6f6b0a", "zz"), "this-action"),
             Live::FailClosed(_)
         ));
+    }
+
+    #[test]
+    fn remote_exposure_cannot_be_cleared_by_returning_the_install_writer() {
+        let settled = r#"{"kind":"rustc-decision","decision":"remote-failed","remote_protocol":1,"action_key":"this-action","execution_finished":true,"writer_returned":true,"compiler_skip_authorized":false}"#;
+        for exposure in [
+            r#""metadata_exposed":true"#,
+            r#""metadata_exposed":"false""#,
+            r#""metadata_exposed":false,"metadata_exposed":false"#,
+        ] {
+            let frame = format!("{},{exposure}}}", settled.strip_suffix('}').unwrap());
+            for after_install_consent in [false, true] {
+                let (result, acknowledgments) =
+                    failure_exchange(format!("{frame}\n"), after_install_consent);
+                assert!(matches!(result, Live::FailClosed(_)), "{exposure}");
+                assert_eq!(
+                    acknowledgments.len(),
+                    if after_install_consent { 2 } else { 1 }
+                );
+            }
+        }
     }
 
     #[test]

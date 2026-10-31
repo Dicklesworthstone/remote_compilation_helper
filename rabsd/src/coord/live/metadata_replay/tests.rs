@@ -54,6 +54,10 @@ fn put(cas: &LiveCas, bytes: &[u8]) -> ObjectId {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_comparisons(2)
+    }
+
+    fn with_comparisons(comparisons: u128) -> Self {
         let root = crate::test_util::private_tempdir();
         let cas = Arc::new(mount_and_reconcile(&root.path().join("cas")).unwrap());
         let coord = Arc::new(CoordLive::with_cas(Arc::clone(&cas)));
@@ -125,9 +129,9 @@ impl Fixture {
                 .unwrap(),
             PublicationOutcome::Committed(_)
         ));
-        // Two separately fenced, admitted matching attempts establish the live
-        // minimum and a durable replay allowance through the production path.
-        for number in 1..=2 {
+        // Cache fixtures establish the live minimum through separately fenced
+        // matching attempts. Producer fixtures deliberately have no comparisons.
+        for number in 1..=comparisons {
             let ids = FixtureAttemptIds {
                 generation: 11 + number,
                 attempt: 20 + number,
@@ -163,20 +167,39 @@ impl Fixture {
             &self.offer.manifest.action_key,
             &digest_key(&self.offer.manifest_id.0),
             destination,
-            &ExpectedOutputs::WithDepInfo {
-                paths: BTreeSet::from([
-                    "fixture.d".into(),
-                    "libfixture.rmeta".into(),
-                    "libfixture.rlib".into(),
-                ]),
-                mappings: vec![(
-                    b"/__rabs/out".to_vec(),
-                    destination.as_os_str().as_bytes().to_vec(),
-                )],
-            },
+            &Self::expected(destination),
             now_micros(),
             callback,
         )
+    }
+
+    fn produce(
+        &self,
+        destination: &Path,
+        callback: Option<&mut dyn FnMut(&[PathBuf]) -> Result<(), String>>,
+    ) -> Result<ServeOutcome, ServeError> {
+        self.coord.serve_produced_result_with_metadata(
+            &self.offer.manifest.action_key,
+            &digest_key(&self.offer.manifest_id.0),
+            destination,
+            &Self::expected(destination),
+            now_micros(),
+            callback,
+        )
+    }
+
+    fn expected(destination: &Path) -> ExpectedOutputs {
+        ExpectedOutputs::WithDepInfo {
+            paths: BTreeSet::from([
+                "fixture.d".into(),
+                "libfixture.rmeta".into(),
+                "libfixture.rlib".into(),
+            ]),
+            mappings: vec![(
+                b"/__rabs/out".to_vec(),
+                destination.as_os_str().as_bytes().to_vec(),
+            )],
+        }
     }
 
     fn installs(&self) -> i64 {
@@ -279,8 +302,17 @@ fn metadata_and_tail_complete_on_the_final_replay_allowance() {
 
 #[test]
 fn metadata_delivery_is_sticky_across_receiver_authority_manifest_evidence_and_tail_failures() {
+    assert_delivery_faults(false);
+}
+
+#[test]
+fn published_producer_metadata_rechecks_gates_and_keeps_all_post_head_failures_sticky() {
+    assert_delivery_faults(true);
+}
+
+fn assert_delivery_faults(producer: bool) {
     for fault in ["receiver", "authority", "manifest", "evidence", "tail"] {
-        let fixture = Fixture::new();
+        let fixture = Fixture::with_comparisons(if producer { 0 } else { 2 });
         let destination = fixture.root.path().join(fault);
         let mut ready = |_: &[PathBuf]| {
             match fault {
@@ -332,8 +364,13 @@ fn metadata_delivery_is_sticky_across_receiver_authority_manifest_evidence_and_t
             }
             Ok(())
         };
+        let result = if producer {
+            fixture.produce(&destination, Some(&mut ready))
+        } else {
+            fixture.install(&destination, Some(&mut ready))
+        };
         assert!(
-            matches!(fixture.install(&destination, Some(&mut ready)), Err(ServeError::MetadataExposed { installed, .. }) if installed == vec![destination.join("libfixture.rmeta"), destination.join("fixture.d")]),
+            matches!(result, Err(ServeError::MetadataExposed { installed, .. }) if installed == vec![destination.join("libfixture.rmeta"), destination.join("fixture.d")]),
             "{fault}"
         );
         assert_eq!(
@@ -342,8 +379,70 @@ fn metadata_delivery_is_sticky_across_receiver_authority_manifest_evidence_and_t
             "{fault}"
         );
         assert!(!destination.join("libfixture.rlib").exists(), "{fault}");
-        assert_eq!(fixture.installs(), 1, "{fault}");
+        assert_eq!(fixture.installs(), i64::from(!producer), "{fault}");
     }
+}
+
+#[test]
+fn published_producer_pipelines_without_spending_or_creating_cache_replay_authority() {
+    let fixture = Fixture::with_comparisons(0);
+    let destination = fixture.root.path().join("producer");
+    let replay_refusal = ServeOutcome::ExecutePrivately(ReplayRefusal::Sampling(
+        PrivateExecutionReason::InsufficientVerificationSamples {
+            observed: 0,
+            required: 2,
+        },
+    ));
+    assert_eq!(fixture.install(&destination, None).unwrap(), replay_refusal);
+    let mut calls = 0;
+    let mut ready = |files: &[PathBuf]| {
+        calls += 1;
+        assert_eq!(
+            files,
+            &[
+                destination.join("libfixture.rmeta"),
+                destination.join("fixture.d")
+            ]
+        );
+        assert_eq!(std::fs::read(&files[0]).unwrap(), HEAD);
+        assert_eq!(
+            std::fs::read(&files[1]).unwrap(),
+            format!("{}/libfixture.rmeta:\n", destination.display()).as_bytes()
+        );
+        assert!(!destination.join("libfixture.rlib").exists());
+        assert!(fixture.cas.store().try_lock().is_ok());
+        assert!(matches!(
+            fixture.produce(&destination, None),
+            Err(ServeError::DestinationConflict { .. })
+        ));
+        assert_eq!(fixture.installs(), 0);
+        Ok(())
+    };
+    assert!(
+        matches!(fixture.produce(&destination, Some(&mut ready)).unwrap(), ServeOutcome::Served { files } if files.len() == 3)
+    );
+    assert_eq!(calls, 1);
+    assert_eq!(
+        std::fs::read(destination.join("libfixture.rlib")).unwrap(),
+        TAIL
+    );
+    assert_eq!(fixture.installs(), 0);
+    assert!(
+        fixture
+            .cas
+            .store()
+            .lock()
+            .unwrap()
+            .list_verification_samples(&fixture.offer.manifest.action_key)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        fixture
+            .install(&fixture.root.path().join("later-cache-read"), None)
+            .unwrap(),
+        replay_refusal
+    );
 }
 
 #[test]
@@ -356,6 +455,22 @@ fn a_changed_preview_manifest_refuses_before_metadata_or_any_destination_write()
         fixture
             .coord
             .serve_cached_result(
+                &fixture.offer.manifest.action_key,
+                "not-the-accepted-manifest",
+                &destination,
+                &ExpectedOutputs::WhateverWasCommitted,
+                now_micros(),
+                Some(&mut ready),
+            )
+            .unwrap(),
+        ServeOutcome::ManifestUnavailable { .. }
+    ));
+    assert!(!destination.exists());
+    assert_eq!(fixture.installs(), 0);
+    assert!(matches!(
+        fixture
+            .coord
+            .serve_produced_result_with_metadata(
                 &fixture.offer.manifest.action_key,
                 "not-the-accepted-manifest",
                 &destination,

@@ -12,9 +12,10 @@ use super::{
     CanonicalActionResultManifest, CapturedLocalResult, CompletionOutcome, CompletionReport,
     CoordLive, DependencyActionPlan, ExecutionAttempt, InstallResult, LiveDecision,
     LiveDependencyKey, LiveDependencyLane, LiveDependencyRequest, MAX_TRANSCRIPT_BYTES, Path,
-    PathBuf, ServeOutcome, ToolchainGuard, TypedDigest, WorkerSessionOffer,
-    canonicalize_compiler_transcript, known_installed_output, now_micros, read_stable,
-    render_compiler_transcript,
+    PathBuf, ServeError, ServeOutcome, ToolchainGuard, TypedDigest, WorkerSessionOffer,
+    canonicalize_compiler_transcript, committed_output, install_fault, known_installed_output,
+    metadata_replay_prefix_len, now_micros, read_stable, render_compiler_transcript,
+    verify_metadata_head,
 };
 use crate::coord::live::RequestOwnedInstallError;
 use crate::coord::remote_dependency_transport::{
@@ -1814,11 +1815,38 @@ impl PendingRemoteInstall {
         &self.output.manifest_key
     }
 
+    /// Early notification is available only after an actual dependency result
+    /// has completed and published. Affine workspace results keep their existing
+    /// complete-delivery protocol; no unfinished producer gains this capability.
+    #[must_use]
+    pub fn supports_metadata(&self) -> bool {
+        matches!(self.result, RemoteInstallAuthority::Published)
+            && !self.request.is_execution_only()
+    }
+
     /// Called only after the wrapper acknowledges this exact captured result.
     /// Dependency publication gates remain active. An execution-only workspace
     /// result uses its consumed request owner and never enters cache serving.
     #[must_use]
     pub fn install(self) -> InstallResult {
+        self.install_inner(None)
+    }
+
+    /// Forward one exact metadata/dep-info transcript prefix after its files are
+    /// verified in place, then return only the suffix on successful completion.
+    /// Callback failure and all later faults permanently prohibit local fallback.
+    #[must_use]
+    pub fn install_with_metadata(
+        self,
+        mut metadata_ready: impl FnMut(&[u8]) -> Result<(), String>,
+    ) -> InstallResult {
+        self.install_inner(Some(&mut metadata_ready))
+    }
+
+    fn install_inner(
+        self,
+        mut metadata_ready: Option<&mut dyn FnMut(&[u8]) -> Result<(), String>>,
+    ) -> InstallResult {
         let request = &self.request;
         if let Err(reason) = self
             .output
@@ -1837,14 +1865,49 @@ impl PendingRemoteInstall {
             Ok(expected) => expected,
             Err(reason) => return InstallResult::Declined(reason),
         };
+        let transcript = render_compiler_transcript(&self.output.canonical_transcript, plan);
+        let prefix_len = if metadata_ready.is_some() && self.supports_metadata() {
+            match metadata_replay_prefix_len(&transcript, plan) {
+                Ok(prefix) => prefix,
+                Err(reason) => return InstallResult::Declined(reason.into()),
+            }
+        } else {
+            None
+        };
+        let mut metadata_exposed = false;
         let installed_result = match self.result {
-            RemoteInstallAuthority::Published => self.coord.serve_produced_result(
-                &request.key.action_key,
-                &self.output.manifest_key,
-                Path::new(&physical.out_dir),
-                &expected,
-                now_micros(),
-            ),
+            RemoteInstallAuthority::Published => {
+                if prefix_len.is_some() {
+                    let mut notify = |files: &[PathBuf]| -> Result<(), String> {
+                        // The complete reserved head is already visible, even
+                        // if a subsequent input check or receiver write fails.
+                        metadata_exposed = true;
+                        verify_request(request)?;
+                        verify_metadata_head(plan, &self.output.manifest, files)?;
+                        self.validation.verify(request)?;
+                        verify_request(request)?;
+                        let callback =
+                            metadata_ready.as_mut().ok_or("missing metadata receiver")?;
+                        callback(&transcript[..prefix_len.ok_or("missing metadata prefix")?])
+                    };
+                    self.coord.serve_produced_result_with_metadata(
+                        &request.key.action_key,
+                        &self.output.manifest_key,
+                        Path::new(&physical.out_dir),
+                        &expected,
+                        now_micros(),
+                        Some(&mut notify),
+                    )
+                } else {
+                    self.coord.serve_produced_result(
+                        &request.key.action_key,
+                        &self.output.manifest_key,
+                        Path::new(&physical.out_dir),
+                        &expected,
+                        now_micros(),
+                    )
+                }
+            }
             RemoteInstallAuthority::RequestOwned(captured) => {
                 match self.coord.install_request_owned_result(
                     *captured,
@@ -1867,45 +1930,52 @@ impl PendingRemoteInstall {
         match installed_result {
             Ok(ServeOutcome::Served { files }) => {
                 if files.len() != self.output.manifest.logical_outputs.len() {
-                    return InstallResult::Fault(
+                    return install_fault(
                         "remote installed output set is incomplete".into(),
+                        metadata_exposed,
                     );
                 }
                 let mut installed = Vec::new();
                 for path in files {
-                    let Some(output) =
-                        path.file_name()
-                            .and_then(|name| name.to_str())
-                            .and_then(|name| {
-                                self.output.manifest.logical_outputs.iter().find(|output| {
-                                    output.virtual_path.as_bytes() == name.as_bytes()
-                                })
-                            })
-                    else {
-                        return InstallResult::Fault(
-                            "remote installed output is undeclared".into(),
-                        );
+                    let output = match committed_output(&self.output.manifest, &path) {
+                        Ok(output) => output,
+                        Err(reason) => return install_fault(reason, metadata_exposed),
                     };
                     if output.role != OutputRole::DepInfo {
                         match known_installed_output(&path, &output.object.0) {
                             Ok(output) => installed.push(output),
-                            Err(reason) => return InstallResult::Fault(reason),
+                            Err(reason) => return install_fault(reason, metadata_exposed),
                         }
                     }
                 }
                 if let Err(reason) = self.validation.verify(request) {
-                    return InstallResult::Fault(reason);
+                    return install_fault(reason, metadata_exposed);
                 }
-                super::finish_installation(
+                let result = super::finish_installation(
                     &request.dependencies,
                     &request.package,
                     &physical,
-                    render_compiler_transcript(&self.output.canonical_transcript, plan),
+                    transcript[if metadata_exposed {
+                        prefix_len.unwrap_or(0)
+                    } else {
+                        0
+                    }..]
+                        .to_vec(),
                     installed,
-                )
+                );
+                match result {
+                    InstallResult::Fault(reason) => install_fault(reason, metadata_exposed),
+                    result => result,
+                }
+            }
+            Ok(other) if metadata_exposed => {
+                InstallResult::ExposedFault(format!("remote install: {other:?}"))
             }
             Ok(other) => InstallResult::Declined(format!("remote install: {other:?}")),
-            Err(error) => InstallResult::Fault(format!("remote install: {error}")),
+            Err(error) => {
+                metadata_exposed |= matches!(error, ServeError::MetadataExposed { .. });
+                install_fault(format!("remote install: {error}"), metadata_exposed)
+            }
         }
     }
 }

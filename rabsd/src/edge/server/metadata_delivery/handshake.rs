@@ -1,4 +1,4 @@
-//! One bounded, acknowledged transcript prefix for an already committed hit.
+//! One bounded, acknowledged transcript prefix for an already committed result.
 //!
 //! This handshake grants no installation or execution authority. The caller
 //! may offer a prefix only after the corresponding metadata is installed and
@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 pub(crate) struct Identity {
     pub(crate) action_key: String,
     pub(crate) manifest_key: String,
+    remote: bool,
 }
 
 #[derive(Deserialize)]
@@ -36,8 +37,75 @@ struct Acknowledgment {
     sequence: u64,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteConsent {
+    kind: String,
+    capture: String,
+    remote_protocol: u32,
+    metadata_protocol: u32,
+    action_key: String,
+    manifest_key: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteAcknowledgment {
+    kind: String,
+    capture: String,
+    remote_protocol: u32,
+    metadata_protocol: u32,
+    action_key: String,
+    manifest_key: String,
+    sequence: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaptureConsent {
+    kind: String,
+    capture: String,
+}
+
+/// Only an unextended legacy consent can decline metadata negotiation. A
+/// partial, duplicate or mismatched metadata identity must never downgrade.
+pub(crate) fn accepts_capture(bytes: &[u8], capture: &str) -> bool {
+    serde_json::from_slice::<CaptureConsent>(bytes)
+        .is_ok_and(|value| value.kind == "rustc-accept" && value.capture == capture)
+}
+
 impl Identity {
+    pub(crate) fn cached(action_key: String, manifest_key: String) -> Self {
+        Self {
+            action_key,
+            manifest_key,
+            remote: false,
+        }
+    }
+
+    pub(crate) fn produced(action_key: String, capture: String) -> Self {
+        Self {
+            action_key,
+            manifest_key: capture,
+            remote: true,
+        }
+    }
+
+    pub(super) fn is_remote(&self) -> bool {
+        self.remote
+    }
+
     pub(crate) fn accepts(&self, bytes: &[u8]) -> bool {
+        if self.remote {
+            return serde_json::from_slice::<RemoteConsent>(bytes).is_ok_and(|value| {
+                value.kind == "rustc-accept"
+                    && value.remote_protocol == 1
+                    && value.metadata_protocol == 1
+                    && value.action_key == self.action_key
+                    && value.manifest_key == self.manifest_key
+                    && value.capture == self.manifest_key
+            });
+        }
         serde_json::from_slice::<Consent>(bytes).is_ok_and(|value| {
             value.kind == "rustc-accept"
                 && value.metadata_protocol == 1
@@ -47,6 +115,17 @@ impl Identity {
     }
 
     pub(super) fn acknowledges(&self, bytes: &[u8]) -> bool {
+        if self.remote {
+            return serde_json::from_slice::<RemoteAcknowledgment>(bytes).is_ok_and(|value| {
+                value.kind == "rustc-metadata-ack"
+                    && value.remote_protocol == 1
+                    && value.metadata_protocol == 1
+                    && value.action_key == self.action_key
+                    && value.manifest_key == self.manifest_key
+                    && value.capture == self.manifest_key
+                    && value.sequence == 1
+            });
+        }
         serde_json::from_slice::<Acknowledgment>(bytes).is_ok_and(|value| {
             value.kind == "rustc-metadata-ack"
                 && value.metadata_protocol == 1
@@ -58,12 +137,16 @@ impl Identity {
 
     pub(super) fn notice(&self, prefix: &[u8]) -> String {
         let bytes: String = prefix.iter().map(|byte| format!("{byte:02x}")).collect();
-        json!({
+        let mut value = json!({
             "kind":"rustc-metadata", "metadata_protocol":1,
             "action_key":self.action_key, "manifest_key":self.manifest_key,
             "sequence":1, "stderr_hex":bytes,
-        })
-        .to_string()
+        });
+        if self.remote {
+            value["remote_protocol"] = json!(1);
+            value["capture"] = json!(self.manifest_key);
+        }
+        value.to_string()
     }
 }
 
@@ -267,10 +350,7 @@ mod tests {
 
     #[test]
     fn consent_and_ack_bind_version_action_manifest_sequence_and_unique_fields() {
-        let identity = Identity {
-            action_key: "action-a".into(),
-            manifest_key: "manifest-a".into(),
-        };
+        let identity = Identity::cached("action-a".into(), "manifest-a".into());
         let consent = json!({"kind":"rustc-accept","metadata_protocol":1,
             "action_key":"action-a","manifest_key":"manifest-a"});
         assert!(identity.accepts(consent.to_string().as_bytes()));
@@ -298,5 +378,66 @@ mod tests {
             serde_json::from_str(&identity.notice(b"a\0\xff\n")).unwrap();
         assert_eq!(notice["stderr_hex"], "6100ff0a");
         assert_eq!(notice["manifest_key"], "manifest-a");
+    }
+
+    #[test]
+    fn produced_consent_ack_and_notice_bind_the_exact_remote_capture() {
+        let identity = Identity::produced("action-a".into(), "manifest-a".into());
+        assert!(identity.is_remote());
+        let consent = json!({"kind":"rustc-accept","capture":"manifest-a",
+            "remote_protocol":1,"metadata_protocol":1,
+            "action_key":"action-a","manifest_key":"manifest-a"});
+        assert!(identity.accepts(consent.to_string().as_bytes()));
+        let mut ack = consent.clone();
+        ack["kind"] = json!("rustc-metadata-ack");
+        ack["sequence"] = json!(1);
+        assert!(identity.acknowledges(ack.to_string().as_bytes()));
+        for (field, value) in [
+            ("kind", json!("other")),
+            ("capture", json!("other")),
+            ("remote_protocol", json!(2)),
+            ("metadata_protocol", json!(2)),
+            ("action_key", json!("other")),
+            ("manifest_key", json!("other")),
+        ] {
+            let mut changed = consent.clone();
+            changed[field] = value.clone();
+            assert!(!identity.accepts(changed.to_string().as_bytes()));
+            let mut changed = ack.clone();
+            changed[field] = value;
+            assert!(!identity.acknowledges(changed.to_string().as_bytes()));
+        }
+        ack["sequence"] = json!(2);
+        assert!(!identity.acknowledges(ack.to_string().as_bytes()));
+        let duplicate = br#"{"kind":"rustc-metadata-ack","capture":"wrong","capture":"manifest-a","remote_protocol":1,"metadata_protocol":1,"action_key":"action-a","manifest_key":"manifest-a","sequence":1}"#;
+        assert!(!identity.acknowledges(duplicate));
+        let mut extra = consent.clone();
+        extra["writer_returned"] = json!(true);
+        assert!(!identity.accepts(extra.to_string().as_bytes()));
+        let cached = Identity::cached("action-a".into(), "manifest-a".into());
+        assert!(!cached.accepts(consent.to_string().as_bytes()));
+        let notice: serde_json::Value =
+            serde_json::from_str(&identity.notice(b"metadata\n")).unwrap();
+        assert_eq!(notice.as_object().unwrap().len(), 8);
+        assert_eq!(notice["remote_protocol"], 1);
+        assert_eq!(notice["capture"], "manifest-a");
+        assert_eq!(notice["manifest_key"], "manifest-a");
+        assert_eq!(notice["stderr_hex"], "6d657461646174610a");
+    }
+
+    #[test]
+    fn legacy_capture_consent_cannot_downgrade_a_partial_metadata_handshake() {
+        let legacy = br#"{"kind":"rustc-accept","capture":"manifest-a"}"#;
+        assert!(accepts_capture(legacy, "manifest-a"));
+        assert!(!accepts_capture(legacy, "other"));
+        let remote = Identity::produced("action-a".into(), "manifest-a".into());
+        assert!(!remote.accepts(legacy));
+        for invalid in [
+            br#"{"kind":"rustc-accept","capture":"manifest-a","metadata_protocol":1}"#.as_slice(),
+            br#"{"kind":"rustc-accept","capture":"wrong","capture":"manifest-a"}"#,
+            br#"{"kind":"rustc-accept","capture":"manifest-a","action_key":"action-a"}"#,
+        ] {
+            assert!(!accepts_capture(invalid, "manifest-a"));
+        }
     }
 }

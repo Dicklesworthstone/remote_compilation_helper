@@ -1,6 +1,7 @@
 //! Two-phase delivery of an already committed result. One full destination
-//! reservation and one durable replay admission cover both phases. The metadata
-//! callback runs without the store lock, before bulk outputs are even staged.
+//! reservation covers both phases. Cached delivery spends one durable replay
+//! admission; a current published producer spends none. The metadata callback
+//! runs without the store lock, before bulk outputs are even staged.
 
 use super::{
     CoordLive, ReplayInstallPermit, ServeError, ServeOutcome, declare_coordinator_domains,
@@ -23,7 +24,7 @@ mod tests;
 
 pub(super) type MetadataCallback<'a> = dyn FnMut(&[PathBuf]) -> Result<(), String> + 'a;
 
-pub(super) struct CachedResult<'manifest, 'callback, 'env> {
+pub(super) struct CommittedResult<'manifest, 'callback, 'env> {
     pub(super) manifest_key: &'manifest str,
     pub(super) metadata_ready: Option<&'callback mut MetadataCallback<'env>>,
 }

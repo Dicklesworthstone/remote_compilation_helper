@@ -1952,11 +1952,24 @@ dependencies, then verifies a relocated warm build without additional worker
 executions. It compares delivered `.rlib` bytes and executes the final linked
 binary, edits a dependency and requires new keys and changed outputs, and checks
 that the failing build script cannot create a completed build delivery. The
-warm archive checks also require one exact metadata-prefix acknowledgment per
-dependency before the daemon records complete installation. Separate real
+archive checks require one exact metadata-prefix acknowledgment per dependency
+before the daemon records complete installation, both for the first three
+published remote productions and for later warm replay. The producer path
+requires completed worker execution and H011 publication; it spends no cache
+replay receipt and does not manufacture a passing verification sample. Only
+the dep-info and nonempty metadata head is installed before acknowledgment,
+under the same complete destination reservation used by the archive tail.
+Every negotiated frame binds the action, manifest and exact remote capture.
+Failures after exposing the head prevent local fallback. Older wrappers and
+request-owned workspace results retain complete-result delivery.
+
+This permits downstream Cargo work to overlap local archive materialization.
+It does not expose an unfinished remote producer, overlap worker artifact
+upload, or authorize provisional descendants. Separate real
 Unix-socket/wrapper subprocess tests in `rabs-wrap/tests/metadata_protocol.rs`
-hold back the final answer until the prefix is observed, check exact transcript
-reassembly, and exercise failure after exposure and blocked stderr. Those
+hold back the final answer until the prefix is observed on both cached and
+produced-result delivery, check exact transcript reassembly, and exercise
+failure after exposure and blocked stderr. Those
 protocol fixtures do not substitute for this actual Cargo/worker acceptance.
 The sandbox fixture separately compiles an actual `.incbin` payload whose bytes appear
 in the archive but not rustc's dep-info, then verifies that unkeyed host/process/

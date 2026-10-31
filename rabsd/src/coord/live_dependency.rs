@@ -274,6 +274,62 @@ fn known_installed_output(path: &Path, expected: &TypedDigest) -> Result<KnownOu
     })
 }
 
+fn committed_output<'a>(
+    manifest: &'a CanonicalActionResultManifest,
+    path: &Path,
+) -> Result<&'a LogicalOutput, String> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| {
+            manifest
+                .logical_outputs
+                .iter()
+                .find(|output| output.virtual_path.as_bytes() == name.as_bytes())
+        })
+        .ok_or_else(|| "installed output is not in the manifest".into())
+}
+
+/// Exact notification readiness shared by cached and freshly published results.
+/// The coordinator's adapter has already re-read each dep-info file against its
+/// subscriber derivation (or canonical Cargo identity) under the full destination
+/// reservation. Metadata also needs its exact committed, nonempty bytes here.
+fn verify_metadata_head(
+    plan: &DependencyActionPlan,
+    manifest: &CanonicalActionResultManifest,
+    files: &[PathBuf],
+) -> Result<(), String> {
+    let expected_head: std::collections::BTreeMap<_, _> = plan
+        .outputs
+        .declarations
+        .iter()
+        .filter(|output| {
+            matches!(
+                output.class,
+                OutputClass::ProvisionalMetadata | OutputClass::DepInfo
+            )
+        })
+        .map(|output| (output.virtual_path.as_bytes(), output_role(output.class)))
+        .collect();
+    let mut installed_head = std::collections::BTreeMap::new();
+    for path in files {
+        let committed = committed_output(manifest, path)?;
+        if expected_head.get(committed.virtual_path.as_bytes()) != Some(&committed.role) {
+            return Err("metadata phase installed an undeclared head role".into());
+        }
+        if committed.role == OutputRole::ProvisionalMetadata {
+            let installed = known_installed_output(path, &committed.object.0)?;
+            if installed.sig.size() == 0 {
+                return Err("zero-length metadata cannot authorize compiler notification".into());
+            }
+        }
+        installed_head.insert(committed.virtual_path.as_bytes(), committed.role);
+    }
+    if installed_head != expected_head || files.len() != expected_head.len() {
+        return Err("metadata notification head outputs are not all installed".into());
+    }
+    Ok(())
+}
+
 /// The lane's answer to one request.
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -396,18 +452,6 @@ impl PendingServe {
         self.request.dependencies.verify_unchanged()
     }
 
-    fn committed_output(&self, path: &Path) -> Result<&LogicalOutput, String> {
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .and_then(|name| {
-                self.manifest
-                    .logical_outputs
-                    .iter()
-                    .find(|output| output.virtual_path.as_bytes() == name.as_bytes())
-            })
-            .ok_or_else(|| "installed output is not in the manifest".into())
-    }
-
     /// Install the complete result before replaying any stderr.
     #[must_use]
     pub fn install(self) -> InstallResult {
@@ -457,45 +501,7 @@ impl PendingServe {
                 // has already made metadata visible in the target namespace.
                 metadata_exposed = true;
                 self.verify_inputs()?;
-                let expected_head: std::collections::BTreeMap<_, _> = self
-                    .request
-                    .plan
-                    .outputs
-                    .declarations
-                    .iter()
-                    .filter(|output| {
-                        matches!(
-                            output.class,
-                            OutputClass::ProvisionalMetadata | OutputClass::DepInfo
-                        )
-                    })
-                    .map(|output| (output.virtual_path.as_bytes(), output_role(output.class)))
-                    .collect();
-                let mut installed_head = std::collections::BTreeMap::new();
-                for path in files {
-                    let committed = self.committed_output(path)?;
-                    if expected_head.get(committed.virtual_path.as_bytes()) != Some(&committed.role)
-                    {
-                        return Err("metadata phase installed an undeclared head role".into());
-                    }
-                    if committed.role == OutputRole::ProvisionalMetadata {
-                        let installed = known_installed_output(path, &committed.object.0)?;
-                        if installed.sig.size() == 0 {
-                            return Err(
-                                "zero-length metadata cannot authorize compiler notification"
-                                    .into(),
-                            );
-                        }
-                    }
-                    // The adapter separately re-read dep-info against the exact
-                    // subscriber derivation (or canonical Cargo object) before
-                    // entering this callback. Its canonical CAS digest cannot
-                    // identify an ordinary subscriber's rewritten .d bytes.
-                    installed_head.insert(committed.virtual_path.as_bytes(), committed.role);
-                }
-                if installed_head != expected_head || files.len() != expected_head.len() {
-                    return Err("metadata notification head outputs are not all installed".into());
-                }
+                verify_metadata_head(&self.request.plan, &self.manifest, files)?;
                 // Recheck the original observations after reading every head
                 // file; no refreshed memo can bless a changed package/input.
                 self.verify_inputs()?;
@@ -519,7 +525,7 @@ impl PendingServe {
             Ok(ServeOutcome::Served { files }) => {
                 let mut installed = Vec::with_capacity(files.len());
                 for path in &files {
-                    let committed = match self.committed_output(path) {
+                    let committed = match committed_output(&self.manifest, path) {
                         Ok(output) => output,
                         Err(reason) => return install_fault(reason, metadata_exposed),
                     };

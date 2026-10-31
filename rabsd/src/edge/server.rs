@@ -868,9 +868,11 @@ async fn handle_connection(
                         // Nothing is written unless the subscriber commits to
                         // waiting for the install. A subscriber that already
                         // gave up (timeout, crash) never sees a late writer.
-                        let metadata = metadata.then(|| metadata_delivery::Identity {
-                            action_key: rabs_cas::metadata_store::digest_key(pending.action_key()),
-                            manifest_key: pending.manifest_key().to_owned(),
+                        let metadata = metadata.then(|| {
+                            metadata_delivery::Identity::cached(
+                                rabs_cas::metadata_store::digest_key(pending.action_key()),
+                                pending.manifest_key().to_owned(),
+                            )
                         });
                         let accepted = write_frame(&mut stream, &reply).await
                             && read_frame(&mut stream).await.is_some_and(|frame| {

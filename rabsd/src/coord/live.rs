@@ -3783,7 +3783,7 @@ impl CoordLive {
             Some(LIVE_SAMPLING_POLICY),
             ServeMode::Install,
             None,
-            Some(metadata_replay::CachedResult {
+            Some(metadata_replay::CommittedResult {
                 manifest_key,
                 metadata_ready,
             }),
@@ -4221,6 +4221,28 @@ impl CoordLive {
         expected: &ExpectedOutputs,
         now_unix_micros: i64,
     ) -> Result<ServeOutcome, ServeError> {
+        self.serve_produced_result_with_metadata(
+            action_key,
+            manifest_key,
+            destination_root,
+            expected,
+            now_unix_micros,
+            None,
+        )
+    }
+
+    /// Deliver a freshly published producer's metadata head before its archive
+    /// tail, under the same exact publication and current-producer gates. This
+    /// spends no cache-replay allowance and cannot accept an unfinished result.
+    pub(super) fn serve_produced_result_with_metadata(
+        &self,
+        action_key: &TypedDigest,
+        manifest_key: &str,
+        destination_root: &Path,
+        expected: &ExpectedOutputs,
+        now_unix_micros: i64,
+        metadata_ready: Option<&mut metadata_replay::MetadataCallback<'_>>,
+    ) -> Result<ServeOutcome, ServeError> {
         self.serve_action_bound(
             action_key,
             destination_root,
@@ -4230,7 +4252,10 @@ impl CoordLive {
             None,
             ServeMode::Install,
             Some(manifest_key),
-            None,
+            Some(metadata_replay::CommittedResult {
+                manifest_key,
+                metadata_ready,
+            }),
         )
     }
 
@@ -4269,7 +4294,7 @@ impl CoordLive {
         sampling: Option<SamplingPolicy>,
         mode: ServeMode,
         produced_manifest: Option<&str>,
-        mut cached_result: Option<metadata_replay::CachedResult<'_, '_, '_>>,
+        mut committed_result: Option<metadata_replay::CommittedResult<'_, '_, '_>>,
     ) -> Result<ServeOutcome, ServeError> {
         let started = Instant::now();
         // Take the authority snapshot BEFORE the store lock, preserving the
@@ -4352,7 +4377,7 @@ impl CoordLive {
             return Ok(ServeOutcome::NoCommit);
         };
         if produced_manifest
-            .or(cached_result.as_ref().map(|cached| cached.manifest_key))
+            .or(committed_result.as_ref().map(|result| result.manifest_key))
             .is_some_and(|expected| expected != manifest_key)
         {
             return Ok(ServeOutcome::ManifestUnavailable { key: manifest_key });
@@ -4431,9 +4456,9 @@ impl CoordLive {
         // The staged owner exposes no final destination and carries no serving
         // authority. A corrupt replica is settled only after reacquiring metadata.
         let selected = output_install::select_for_install(&mut *store, &plan)?;
-        let (selected, metadata_tail) = if cached_result
+        let (selected, metadata_tail) = if committed_result
             .as_ref()
-            .is_some_and(|cached| cached.metadata_ready.is_some())
+            .is_some_and(|result| result.metadata_ready.is_some())
         {
             let (metadata, tail) = selected.split_metadata();
             match metadata {
@@ -4511,9 +4536,9 @@ impl CoordLive {
             })?;
         drop(store);
         if let Some(tail) = metadata_tail {
-            let callback = cached_result
+            let callback = committed_result
                 .as_mut()
-                .and_then(|cached| cached.metadata_ready.as_deref_mut())
+                .and_then(|result| result.metadata_ready.as_deref_mut())
                 .ok_or_else(|| {
                     metadata_replay::exposed_failure(
                         &files,

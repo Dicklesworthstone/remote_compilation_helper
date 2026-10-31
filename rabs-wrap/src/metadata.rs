@@ -1,10 +1,12 @@
-//! Committed-hit metadata delivery for Cargo's pipelined compilation.
+//! Committed-result metadata delivery for Cargo's pipelined compilation.
 //!
 //! Both sides explicitly negotiate protocol 1 and bind the accepted action
 //! and committed manifest. The only intermediate frame exposes one exact,
 //! continuous stderr prefix; the wrapper flushes it before acknowledging it.
 //! That exposure is irreversible even if the install writer later returns.
 //! All socket phases AND prefix delivery use the original install deadline.
+//! Freshly published remote results additionally retain their execution
+//! protocol and exact captured-result identity throughout installation.
 
 use super::reply_json::{self, Value};
 use super::{
@@ -21,6 +23,7 @@ const OWNER_POLL: Duration = Duration::from_millis(100);
 struct Identity<'a> {
     action_key: &'a str,
     manifest_key: &'a str,
+    remote_capture: Option<&'a str>,
 }
 
 fn contains(reply: &Value, field: &str) -> bool {
@@ -31,16 +34,16 @@ fn one(value: Option<&Value>) -> bool {
     matches!(value, Some(Value::Number(raw)) if raw == "1")
 }
 
-fn key<'a>(reply: &'a Value, field: &str) -> Option<&'a str> {
+fn key<'a>(reply: &'a Value, field: &str, maximum: usize) -> Option<&'a str> {
     reply
         .get(field)
         .and_then(Value::as_str)
-        .filter(|value| !value.is_empty() && value.len() <= 256)
+        .filter(|value| !value.is_empty() && value.len() <= maximum)
 }
 
 /// Absence means legacy. An explicitly malformed or duplicated opt-in must
 /// never be silently downgraded into a different acceptance contract.
-fn negotiate(reply: &Value) -> Result<Option<Identity<'_>>, ()> {
+fn negotiate(reply: &Value, maximum: usize) -> Result<Option<Identity<'_>>, ()> {
     if !contains(reply, "metadata_protocol") {
         return Ok(None);
     }
@@ -48,8 +51,9 @@ fn negotiate(reply: &Value) -> Result<Option<Identity<'_>>, ()> {
         return Err(());
     }
     Ok(Some(Identity {
-        action_key: key(reply, "action_key").ok_or(())?,
-        manifest_key: key(reply, "manifest_key").ok_or(())?,
+        action_key: key(reply, "action_key", maximum).ok_or(())?,
+        manifest_key: key(reply, "manifest_key", maximum).ok_or(())?,
+        remote_capture: None,
     }))
 }
 
@@ -58,14 +62,25 @@ impl Identity<'_> {
         one(reply.get("metadata_protocol"))
             && reply.get("action_key").and_then(Value::as_str) == Some(self.action_key)
             && reply.get("manifest_key").and_then(Value::as_str) == Some(self.manifest_key)
+            && self.remote_capture.is_none_or(|capture| {
+                one(reply.get("remote_protocol"))
+                    && reply.get("capture").and_then(Value::as_str) == Some(capture)
+            })
     }
 
     fn frame(&self, kind: &str, sequence: bool) -> String {
+        let remote = self.remote_capture.map_or_else(String::new, |capture| {
+            format!(
+                ",\"remote_protocol\":1,\"capture\":{}",
+                json_string(capture)
+            )
+        });
         format!(
-            "{{\"kind\":{},\"metadata_protocol\":1,\"action_key\":{},\"manifest_key\":{}{}}}\n",
+            "{{\"kind\":{},\"metadata_protocol\":1,\"action_key\":{},\"manifest_key\":{}{}{}}}\n",
             json_string(kind),
             json_string(self.action_key),
             json_string(self.manifest_key),
+            remote,
             if sequence { ",\"sequence\":1" } else { "" },
         )
     }
@@ -74,9 +89,9 @@ impl Identity<'_> {
         let Value::Object(fields) = reply else {
             return None;
         };
-        // A versioned control frame has exactly these six unique fields.
-        // get() also rejects duplicates, including equal duplicates.
-        if fields.len() != 6
+        // A remote prefix also binds its distinct execution protocol and
+        // capture. Every required field is unique, including equal duplicates.
+        if fields.len() != if self.remote_capture.is_some() { 8 } else { 6 }
             || reply.get("kind").and_then(Value::as_str) != Some("rustc-metadata")
             || !self.matches(reply)
             || !one(reply.get("sequence"))
@@ -161,10 +176,10 @@ fn failure(exposed: bool, reason: impl Into<String>) -> Live {
 /// unless a typed writer-return receipt proves a still-unexposed install safe.
 pub(super) fn outcome(
     offer: &Value,
-    mut reader: BufReader<ConsultStream>,
+    reader: BufReader<ConsultStream>,
     owned: &impl Fn() -> bool,
 ) -> Result<Live, ()> {
-    let identity = negotiate(offer)?;
+    let identity = negotiate(offer, 256)?;
     let Some(deadline) = Instant::now().checked_add(install_wait()) else {
         return Ok(Live::FailClosed(
             "RABS install deadline is not representable".into(),
@@ -174,13 +189,80 @@ pub(super) fn outcome(
         || "{\"kind\":\"rustc-accept\"}\n".to_owned(),
         |identity| identity.frame("rustc-accept", false),
     );
-    Ok(catch_unwind(AssertUnwindSafe(|| {
-        if singleflight::write_owned(&mut reader, accepted.as_bytes(), deadline, owned).is_err() {
-            return Live::FailClosed("the RABS cache-hit acceptance could not be confirmed".into());
+    Ok(accept_and_receive(
+        reader,
+        identity.as_ref(),
+        &accepted,
+        deadline,
+        owned,
+        accepted_install_reply,
+        "cache-hit",
+    ))
+}
+
+/// Remote execution was already accepted and produced private verified output.
+/// Negotiate early delivery only for this exact ready capture; malformed new
+/// fields fail closed before installation consent rather than authorizing a
+/// second compiler. Workspace request-owned results keep their legacy path.
+pub(super) fn remote_install(
+    ready: &Value,
+    key: &str,
+    capture: &str,
+    reader: BufReader<ConsultStream>,
+    deadline: Instant,
+    owned: &impl Fn() -> bool,
+) -> Live {
+    if contains(ready, "manifest_key") && !contains(ready, "metadata_protocol") {
+        return Live::FailClosed("incomplete remote metadata negotiation".into());
+    }
+    let mut identity = match negotiate(ready, 512) {
+        Ok(identity) => identity,
+        Err(()) => return Live::FailClosed("invalid remote metadata negotiation".into()),
+    };
+    if let Some(identity) = &mut identity {
+        if identity.action_key != key || identity.manifest_key != capture {
+            return Live::FailClosed("remote metadata offer changed its captured result".into());
         }
-        receive(&mut reader, identity.as_ref(), deadline, owned)
+        identity.remote_capture = Some(capture);
+    }
+    let accepted = identity.as_ref().map_or_else(
+        || {
+            format!(
+                "{{\"kind\":\"rustc-accept\",\"capture\":{}}}\n",
+                json_string(capture)
+            )
+        },
+        |identity| identity.frame("rustc-accept", false),
+    );
+    accept_and_receive(
+        reader,
+        identity.as_ref(),
+        &accepted,
+        deadline,
+        owned,
+        |line| super::remote::completion(line, key),
+        "remote",
+    )
+}
+
+fn accept_and_receive(
+    mut reader: BufReader<ConsultStream>,
+    identity: Option<&Identity<'_>>,
+    accepted: &str,
+    deadline: Instant,
+    owned: &impl Fn() -> bool,
+    complete: impl Fn(&str) -> Live,
+    description: &str,
+) -> Live {
+    catch_unwind(AssertUnwindSafe(|| {
+        if singleflight::write_owned(&mut reader, accepted.as_bytes(), deadline, owned).is_err() {
+            return Live::FailClosed(format!(
+                "RABS {description} installation acceptance is uncertain"
+            ));
+        }
+        receive(&mut reader, identity, deadline, owned, complete)
     }))
-    .unwrap_or(Live::FailClosedSilently))
+    .unwrap_or(Live::FailClosedSilently)
 }
 
 fn receive(
@@ -188,6 +270,7 @@ fn receive(
     identity: Option<&Identity<'_>>,
     deadline: Instant,
     owned: &impl Fn() -> bool,
+    complete: impl Fn(&str) -> Live,
 ) -> Live {
     let mut exposed = false;
     loop {
@@ -197,7 +280,7 @@ fn receive(
                 Err(error) => {
                     return failure(
                         exposed,
-                        format!("the RABS cache-hit install outcome is unknown: {error}"),
+                        format!("the RABS installation outcome is unknown: {error}"),
                     );
                 }
             };
@@ -233,8 +316,10 @@ fn receive(
             let Some(reported_exposed) = exposure_flag(&answer) else {
                 return failure(exposed, "ambiguous metadata exposure receipt");
             };
-            if answer.get("decision").and_then(Value::as_str) == Some("served")
-                && contains(&answer, "metadata_exposed")
+            if matches!(
+                answer.get("decision").and_then(Value::as_str),
+                Some("served" | "remote-complete")
+            ) && contains(&answer, "metadata_exposed")
                 && reported_exposed != exposed
             {
                 return failure(
@@ -242,8 +327,10 @@ fn receive(
                     "served transcript disagrees with metadata exposure",
                 );
             }
+        } else if contains(&answer, "metadata_protocol") || exposure_flag(&answer) != Some(false) {
+            return failure(exposed, "unnegotiated metadata installation answer");
         }
-        let terminal = accepted_install_reply(&line);
+        let terminal = complete(&line);
         return match terminal {
             Live::PassThrough | Live::FailClosed(_) if exposed => Live::FailClosedSilently,
             other => other,

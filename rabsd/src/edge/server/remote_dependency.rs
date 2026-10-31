@@ -3,7 +3,7 @@
 //! delayed writer targeting Cargo's directory.
 use super::liveness::{Limit, OwnedWork, Permit};
 use super::rustc_request::LiveEdge;
-use super::{EdgeStream, backpressure, read_frame, write_frame};
+use super::{EdgeStream, backpressure, metadata_delivery, read_frame, write_frame};
 use crate::coord::live_dependency::remote::{
     PendingRemote, PendingRemoteInstall, PendingSharedRemote, RemoteResult,
 };
@@ -224,24 +224,31 @@ async fn complete_result(
         }
     };
     let capture = pending.capture().to_owned();
-    let ready = json!({
+    let metadata = pending
+        .supports_metadata()
+        .then(|| metadata_delivery::Identity::produced(key.to_owned(), capture.clone()));
+    let mut ready = json!({
         "kind":"rustc-decision", "decision":"remote-ready", "remote_protocol":1,
         "action_key":key, "capture":capture, "capture_protocol":1,
         "compiler_skip_authorized":false,
-    })
-    .to_string();
+    });
+    if metadata.is_some() {
+        ready["metadata_protocol"] = json!(1);
+        ready["manifest_key"] = json!(capture);
+    }
     // The first ACK authorized private computation only. Check the exact
     // capture here so no early/foreign ACK grants a subscriber write.
-    let accepted = write_frame(stream, &ready).await
-        && read_frame(stream).await.is_some_and(|frame| {
-            serde_json::from_slice::<Value>(&frame).is_ok_and(|value| {
-                value["kind"] == "rustc-accept"
-                    && value["capture"].as_str() == Some(capture.as_str())
-            })
-        });
-    if !accepted {
-        drop(pending);
+    if !write_frame(stream, &ready.to_string()).await {
         return None;
+    }
+    let frame = read_frame(stream).await?;
+    let negotiated = metadata.filter(|identity| identity.accepts(&frame));
+    if negotiated.is_none() && !metadata_delivery::accepts_capture(&frame, &capture) {
+        return None;
+    }
+    if let Some(identity) = negotiated {
+        return metadata_delivery::install_remote(installation, live, pending, identity, stream)
+            .await;
     }
     match installation.finish(move || install(live, pending)) {
         Ok(mut work) => Some(
@@ -255,18 +262,31 @@ async fn complete_result(
 
 fn install(live: Arc<LiveEdge>, pending: PendingRemoteInstall) -> String {
     let key = digest_key(pending.action_key());
-    match pending.install() {
+    installed_reply(live, &key, pending.install())
+}
+
+pub(super) fn install_with_metadata(
+    live: Arc<LiveEdge>,
+    pending: PendingRemoteInstall,
+    callback: &mut dyn FnMut(&[u8]) -> Result<(), String>,
+) -> String {
+    let key = digest_key(pending.action_key());
+    installed_reply(live, &key, pending.install_with_metadata(callback))
+}
+
+fn installed_reply(live: Arc<LiveEdge>, key: &str, result: InstallResult) -> String {
+    match result {
         InstallResult::Served {
             transcript,
             installed,
         } => {
             if transcript.len() > MAX_TRANSCRIPT_BYTES {
-                return failure(&key, "remote transcript exceeds its declared bound", true);
+                return failure(key, "remote transcript exceeds its declared bound", true);
             }
             for output in installed {
                 live.facts.remember(&output.path, output.sig, output.digest);
             }
-            super::log_line("rabsd-remote-dependency-executed", &[("key", &key)]);
+            super::log_line("rabsd-remote-dependency-executed", &[("key", key)]);
             let stderr: String = transcript
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
@@ -281,11 +301,17 @@ fn install(live: Arc<LiveEdge>, pending: PendingRemoteInstall) -> String {
         InstallResult::Declined(reason) | InstallResult::Fault(reason) => {
             super::log_line(
                 "rabsd-remote-dependency-install-failed",
-                &[("key", &key), ("reason", &reason)],
+                &[("key", key), ("reason", &reason)],
             );
-            failure(&key, reason, true)
+            failure(key, reason, true)
         }
-        InstallResult::ExposedFault(reason) => failure(&key, reason, false),
+        InstallResult::ExposedFault(reason) => json!({
+            "kind":"rustc-decision", "decision":"remote-failed", "remote_protocol":1,
+            "action_key":key, "reason":reason, "execution_finished":true,
+            "writer_returned":true, "compiler_skip_authorized":false,
+            "metadata_exposed":true,
+        })
+        .to_string(),
     }
 }
 

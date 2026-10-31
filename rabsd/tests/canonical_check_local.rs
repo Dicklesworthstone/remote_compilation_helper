@@ -4354,6 +4354,63 @@ impl GeneratedDependency {
     }
 }
 
+fn assert_metadata_delivery(
+    events: &[Value],
+    expected: &BTreeMap<String, String>,
+    remote: bool,
+    output: &str,
+) {
+    let acknowledged = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event["kind"] == "rabsd-metadata-prefix-acknowledged")
+        .map(|(index, event)| {
+            assert_eq!(event["sequence"], 1, "{output}");
+            assert_eq!(event["remote"], remote, "{output}");
+            assert!(
+                event["bytes"].as_u64().is_some_and(|bytes| bytes > 0),
+                "{output}"
+            );
+            assert!(
+                event["manifest_key"]
+                    .as_str()
+                    .is_some_and(|key| !key.is_empty()),
+                "{output}"
+            );
+            let key = event["key"].as_str().unwrap();
+            let terminal = events
+                .iter()
+                .position(|candidate| {
+                    candidate["key"] == key
+                        && if remote {
+                            candidate["kind"] == "rabsd-remote-dependency-executed"
+                        } else {
+                            candidate["decision"] == "served"
+                        }
+                })
+                .expect("acknowledged metadata must finish the exact result installation");
+            assert!(
+                index < terminal,
+                "metadata ACK followed complete installation: {output}"
+            );
+            key
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        acknowledged.len(),
+        expected.len(),
+        "each dependency archive must deliver one metadata prefix: {output}"
+    );
+    assert_eq!(
+        acknowledged.into_iter().collect::<BTreeSet<_>>(),
+        expected
+            .values()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        "metadata delivery did not cover the actual dependency results: {output}"
+    );
+}
+
 /// Exercise the production native CLI, wrapper, remote executor, CAS sampling,
 /// exact delivery and invalidation using the same dependency graph in each mode.
 fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
@@ -4363,7 +4420,8 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
     let build = command == "build";
     if build {
         // Permit Cargo to start a downstream compiler while its dependency's
-        // acknowledged metadata hit is still installing the archive tail.
+        // acknowledged metadata result is still installing the archive tail,
+        // both during producer qualification and subsequent cache replay.
         profile["jobs"] = json!(2);
     }
     // Native fixtures require Cargo's propagated search roots to survive every
@@ -4480,6 +4538,9 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
             .into_iter()
             .filter(|(name, _)| !workspace_units.contains(&name.as_str()))
             .collect::<BTreeMap<_, _>>();
+        if build {
+            assert_metadata_delivery(&events, &dependency_keys, true, &output);
+        }
         if let Some(expected) = &first_keys {
             assert_eq!(
                 &dependency_keys, expected,
@@ -4541,51 +4602,7 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
             "{output}"
         );
         if build {
-            let acknowledged = events
-                .iter()
-                .enumerate()
-                .filter(|(_, event)| event["kind"] == "rabsd-metadata-prefix-acknowledged")
-                .map(|(index, event)| {
-                    assert_eq!(event["sequence"], 1, "{output}");
-                    assert!(
-                        event["bytes"].as_u64().is_some_and(|bytes| bytes > 0),
-                        "{output}"
-                    );
-                    assert!(
-                        event["manifest_key"]
-                            .as_str()
-                            .is_some_and(|key| !key.is_empty()),
-                        "{output}"
-                    );
-                    let key = event["key"].as_str().unwrap();
-                    let terminal = events
-                        .iter()
-                        .position(|candidate| {
-                            candidate["decision"] == "served" && candidate["key"] == key
-                        })
-                        .expect("acknowledged metadata must finish the exact cache replay");
-                    assert!(
-                        index < terminal,
-                        "metadata ACK followed complete installation: {output}"
-                    );
-                    key
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(
-                acknowledged.len(),
-                2,
-                "each archive cache hit must deliver one metadata prefix: {output}"
-            );
-            assert_eq!(
-                acknowledged.into_iter().collect::<BTreeSet<_>>(),
-                first_keys
-                    .as_ref()
-                    .unwrap()
-                    .values()
-                    .map(String::as_str)
-                    .collect::<BTreeSet<_>>(),
-                "metadata delivery did not cover the actual remotely compiled archive hits: {output}"
-            );
+            assert_metadata_delivery(&events, first_keys.as_ref().unwrap(), false, &output);
         }
         let workspace_keys = assert_fresh_workspace_units(
             owner.path(),
