@@ -16,7 +16,7 @@ use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-use tokio::sync::{RwLock, mpsc, watch};
+use tokio::sync::{Mutex, RwLock, mpsc, watch};
 use tokio::time::Instant;
 use tracing::{debug, error, warn};
 
@@ -46,6 +46,79 @@ const POOL_LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const SSH_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 const SSH_READY_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+#[derive(Clone, Copy)]
+struct PoolWorkerPolicy {
+    enabled: bool,
+    generation: u64,
+}
+
+struct PoolWorkerControl {
+    policy: watch::Sender<PoolWorkerPolicy>,
+    // Serialize disable/enable while removing the old entry, without holding
+    // the pool-wide map lock across a per-worker transition.
+    transition: Mutex<()>,
+}
+
+impl PoolWorkerControl {
+    fn new() -> Self {
+        let (policy, _) = watch::channel(PoolWorkerPolicy {
+            enabled: true,
+            generation: 0,
+        });
+        Self {
+            policy,
+            transition: Mutex::new(()),
+        }
+    }
+
+    fn admission(&self) -> PoolWorkerAdmission {
+        let policy = self.policy.subscribe();
+        let generation = policy.borrow().generation;
+        PoolWorkerAdmission { policy, generation }
+    }
+}
+
+/// A borrow belongs to one administrative generation. A disable followed
+/// immediately by enable must still revoke old queued/in-flight borrowers.
+#[derive(Clone)]
+struct PoolWorkerAdmission {
+    policy: watch::Receiver<PoolWorkerPolicy>,
+    generation: u64,
+}
+
+impl PoolWorkerAdmission {
+    fn is_current(&self) -> bool {
+        let current = self.policy.borrow();
+        current.enabled && current.generation == self.generation
+    }
+
+    async fn revoked(mut self) {
+        loop {
+            if !self.is_current() || self.policy.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+async fn pool_admission_revoked(admission: Option<PoolWorkerAdmission>) {
+    match admission {
+        Some(admission) => admission.revoked().await,
+        None => std::future::pending().await,
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+struct SshConnectError(#[from] anyhow::Error);
+
+/// Whether this failure occurred while establishing a connection, before a
+/// command could run. In particular, an authentication/VPN timeout must not
+/// be misclassified as an established worker failing to execute a command.
+pub fn is_connection_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<SshConnectError>())
+}
+
 #[derive(Clone)]
 struct SshProcessState {
     active_commands: usize,
@@ -69,6 +142,21 @@ impl OwnedSshProcess {
         control_dir: Option<Arc<tempfile::TempDir>>,
         idle_timeout: Option<Duration>,
     ) -> Result<Self> {
+        Self::spawn_with_admission(command, control_dir, idle_timeout, None)
+    }
+
+    fn spawn_with_admission(
+        command: &mut tokio::process::Command,
+        control_dir: Option<Arc<tempfile::TempDir>>,
+        idle_timeout: Option<Duration>,
+        admission: Option<PoolWorkerAdmission>,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            admission
+                .as_ref()
+                .is_none_or(PoolWorkerAdmission::is_current),
+            "SSH worker pool admission was revoked"
+        );
         let mut child = command.kill_on_drop(true).spawn()?;
         let (state, mut changes) = watch::channel(SshProcessState {
             active_commands: 0,
@@ -82,6 +170,8 @@ impl OwnedSshProcess {
             // In particular, do not unlink a control socket while its master
             // is still alive following cancellation of the caller.
             let _control_dir = control_dir;
+            let revoked = pool_admission_revoked(admission);
+            tokio::pin!(revoked);
             let outcome = loop {
                 let current = changes.borrow_and_update().clone();
                 if current.stopping {
@@ -94,6 +184,9 @@ impl OwnedSshProcess {
                     .filter(|_| current.active_commands == 0)
                     .and_then(|idle| current.idle_since.checked_add(idle));
                 tokio::select! {
+                    () = &mut revoked => {
+                        updates.send_modify(|state| state.stopping = true);
+                    },
                     outcome = child.wait() => break outcome,
                     _ = changes.changed() => {},
                     _ = async {
@@ -244,7 +337,7 @@ fn is_health_check_sentinel(line: &str) -> bool {
 #[derive(Debug, Clone)]
 pub struct SshOptions {
     /// Wall-clock deadline for connection setup, including authentication and
-    /// ControlMaster readiness. A mux fallback shares the same deadline.
+    /// ControlMaster readiness. Each call makes one connection attempt.
     pub connect_timeout: Duration,
     /// Command execution timeout.
     pub command_timeout: Duration,
@@ -338,6 +431,9 @@ pub struct SshClient {
     options: SshOptions,
     /// Active SSH session (if connected).
     session: Option<OwnedSshSession>,
+    /// Pool-owned administrative admission. Standalone clients have no pool
+    /// policy; callers of those clients remain responsible for admission.
+    pool_admission: Option<PoolWorkerAdmission>,
 }
 
 impl SshClient {
@@ -347,6 +443,7 @@ impl SshClient {
             config,
             options,
             session: None,
+            pool_admission: None,
         }
     }
 
@@ -357,9 +454,13 @@ impl SshClient {
 
     /// Check if connected to the worker.
     pub fn is_connected(&self) -> bool {
-        self.session
+        self.pool_admission
             .as_ref()
-            .is_some_and(|session| session.process.is_running())
+            .is_none_or(PoolWorkerAdmission::is_current)
+            && self
+                .session
+                .as_ref()
+                .is_some_and(|session| session.process.is_running())
     }
 
     #[cfg(test)]
@@ -377,6 +478,22 @@ impl SshClient {
         ssh_program: &Path,
         control_directory: Option<&Path>,
     ) -> Result<()> {
+        let admission = self.pool_admission.clone();
+        let result = tokio::select! {
+            biased;
+            () = pool_admission_revoked(admission) => {
+                Err(anyhow::anyhow!("SSH worker pool admission was revoked"))
+            }
+            result = self.connect_admitted(ssh_program, control_directory) => result,
+        };
+        result.map_err(|error| anyhow::Error::new(SshConnectError(error)))
+    }
+
+    async fn connect_admitted(
+        &mut self,
+        ssh_program: &Path,
+        control_directory: Option<&Path>,
+    ) -> Result<()> {
         if self.is_connected() {
             debug!("Already connected to {}", self.config.id);
             return Ok(());
@@ -390,7 +507,11 @@ impl SshClient {
         let destination = format!("{}@{}", self.config.user, self.config.host);
         debug!("Connecting to {} via SSH...", destination);
 
-        let session = match self
+        // A second "non-mux" attempt used the same owned foreground master
+        // and merely changed its idle lifetime. Retrying an offline host,
+        // failed VPN, or rejected key doubled dials without fixing anything.
+        // Retry cadence belongs to the caller's health/recovery policy.
+        let session = self
             .connect_with_mode(
                 &destination,
                 self.options.control_master,
@@ -399,33 +520,7 @@ impl SshClient {
                 deadline,
             )
             .await
-        {
-            Ok(session) => session,
-            Err(primary_error) if self.options.control_master && Instant::now() < deadline => {
-                warn!(
-                    "SSH ControlMaster connection to {} failed ({}). Retrying without ControlMaster.",
-                    destination, primary_error
-                );
-                self.connect_with_mode(
-                    &destination,
-                    false,
-                    ssh_program,
-                    control_directory,
-                    deadline,
-                )
-                .await
-                .with_context(|| {
-                    format!(
-                        "Failed to connect to {} after retrying without ControlMaster",
-                        destination
-                    )
-                })?
-            }
-            Err(primary_error) => {
-                return Err(primary_error)
-                    .with_context(|| format!("Failed to connect to {}", destination));
-            }
-        };
+            .with_context(|| format!("Failed to connect to {}", destination))?;
 
         // debug, not info: the telemetry pool connects to every worker each poll
         // cycle, so at info this floods the daemon log (8M+ lines / multi-GB).
@@ -493,9 +588,13 @@ impl SshClient {
             &log,
             can_disable_background,
         );
-        let mut process =
-            OwnedSshProcess::spawn(&mut command, Some(control_dir.clone()), idle_timeout)
-                .with_context(|| format!("Failed to spawn SSH connection to {destination}"))?;
+        let mut process = OwnedSshProcess::spawn_with_admission(
+            &mut command,
+            Some(control_dir.clone()),
+            idle_timeout,
+            self.pool_admission.clone(),
+        )
+        .with_context(|| format!("Failed to spawn SSH connection to {destination}"))?;
         // Authentication is activity too; a short idle policy must not cut it
         // off before the connection deadline.
         let connecting = process.begin_use()?;
@@ -533,6 +632,9 @@ impl SshClient {
             .arg("-S")
             .arg(socket)
             .args(["-M", "-N", "-T", "-o", "BatchMode=yes"])
+            // An inherited ConnectionAttempts setting must not multiply a
+            // single bounded recovery probe into a reconnect loop.
+            .args(["-o", "ConnectionAttempts=1"])
             // ControlPersist forks after authentication even without `-f`.
             // Keep the master in this owned foreground child instead.
             .args(["-o", "ControlPersist=no"])
@@ -607,6 +709,20 @@ impl SshClient {
     /// pooled client can serve calls with different timeouts (a fast health
     /// probe vs. a slower cleanup) without mutating the shared client options.
     pub async fn execute_with_timeout(
+        &self,
+        command: &str,
+        command_timeout: Duration,
+    ) -> Result<CommandResult> {
+        tokio::select! {
+            biased;
+            () = pool_admission_revoked(self.pool_admission.clone()) => {
+                anyhow::bail!("SSH worker pool admission was revoked")
+            }
+            result = self.execute_admitted(command, command_timeout) => result,
+        }
+    }
+
+    async fn execute_admitted(
         &self,
         command: &str,
         command_timeout: Duration,
@@ -740,6 +856,25 @@ impl SshClient {
 
     /// Execute a command and stream output in real-time.
     pub async fn execute_streaming<F, G>(
+        &self,
+        command: &str,
+        on_stdout: F,
+        on_stderr: G,
+    ) -> Result<CommandResult>
+    where
+        F: FnMut(&str),
+        G: FnMut(&str),
+    {
+        tokio::select! {
+            biased;
+            () = pool_admission_revoked(self.pool_admission.clone()) => {
+                anyhow::bail!("SSH worker pool admission was revoked")
+            }
+            result = self.execute_streaming_admitted(command, on_stdout, on_stderr) => result,
+        }
+    }
+
+    async fn execute_streaming_admitted<F, G>(
         &self,
         command: &str,
         mut on_stdout: F,
@@ -1030,8 +1165,8 @@ fn ssh_connect_diagnostic(log: &Path) -> String {
 /// health check). Applying the override HERE — the single place pooled
 /// clients are constructed from the pool's global options — fixes every pool
 /// consumer (daemon shared build/telemetry pool, dedicated health pool) at
-/// once. [`SshClient::connect`]'s ControlMaster-failure retry cannot catch
-/// this class: the mux connect does not fail, the commands do.
+/// once. A successful connection alone cannot catch this class: the mux
+/// connect does not fail, the commands do.
 ///
 /// `control_persist_idle` needs no separate neutralization: it is consulted
 /// only when `control_master` is true (see [`control_persist_mode`]), so it
@@ -1327,6 +1462,7 @@ struct PooledSshClient {
     // An old caller can hold that lock across authentication while a new
     // endpoint is admitted independently into the pool.
     config: WorkerConfig,
+    generation: u64,
     client: Arc<RwLock<SshClient>>,
 }
 
@@ -1334,6 +1470,9 @@ struct PooledSshClient {
 pub struct SshPool {
     /// Pool of active connections.
     connections: Arc<RwLock<HashMap<WorkerId, PooledSshClient>>>,
+    /// Administrative tombstones outlive cached connections, close(), and
+    /// endpoint replacement. Removing a connection must not re-enable it.
+    controls: RwLock<HashMap<WorkerId, Arc<PoolWorkerControl>>>,
     /// Default SSH options.
     options: SshOptions,
 }
@@ -1343,7 +1482,48 @@ impl SshPool {
     pub fn new(options: SshOptions) -> Self {
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
+            controls: RwLock::new(HashMap::new()),
             options,
+        }
+    }
+
+    async fn worker_control(&self, worker_id: &WorkerId) -> Arc<PoolWorkerControl> {
+        if let Some(control) = self.controls.read().await.get(worker_id) {
+            return control.clone();
+        }
+        self.controls
+            .write()
+            .await
+            .entry(worker_id.clone())
+            .or_insert_with(|| Arc::new(PoolWorkerControl::new()))
+            .clone()
+    }
+
+    /// Permit or suspend this worker's transport activity. Suspension cancels
+    /// authentication, commands, and queued borrows; the owned SSH supervisor
+    /// also terminates idle masters without waiting for the client's lock.
+    ///
+    /// A suspended worker stays suspended across close(), close_all(), and
+    /// endpoint changes until explicitly enabled. Daemon restart persistence
+    /// belongs to the caller's administrative state store, which must restore
+    /// this policy before starting background work. Re-enabling issues fresh
+    /// admission; it never revives an old borrowed client or queued operation.
+    pub async fn set_worker_enabled(&self, worker_id: &WorkerId, enabled: bool) {
+        let control = self.worker_control(worker_id).await;
+        let _transition = control.transition.lock().await;
+        control.policy.send_if_modified(|policy| {
+            if policy.enabled == enabled {
+                return false;
+            }
+            policy.enabled = enabled;
+            policy.generation = policy.generation.wrapping_add(1);
+            true
+        });
+        if !enabled {
+            // Do not wait for a client write lock held by authentication or a
+            // command. Revocation reaches both that future and the supervisor
+            // directly; keeping an Arc elsewhere cannot keep the master alive.
+            self.connections.write().await.remove(worker_id);
         }
     }
 
@@ -1368,6 +1548,21 @@ impl SshPool {
     /// probe, toolchain preflight during selection) for ~10 minutes, and the
     /// sequential health loop stalled the whole fleet's state behind it.
     async fn get_or_connect_probing_within(
+        &self,
+        config: &WorkerConfig,
+        probe_timeout: Duration,
+    ) -> Result<Arc<RwLock<SshClient>>> {
+        let admission = self.worker_control(&config.id).await.admission();
+        tokio::select! {
+            biased;
+            () = admission.revoked() => {
+                anyhow::bail!("SSH worker {} is disabled or its pool admission was revoked", config.id)
+            }
+            result = self.get_or_connect_admitted(config, probe_timeout) => result,
+        }
+    }
+
+    async fn get_or_connect_admitted(
         &self,
         config: &WorkerConfig,
         probe_timeout: Duration,
@@ -1416,32 +1611,47 @@ impl SshPool {
 
     async fn get_or_create_client_entry(&self, config: &WorkerConfig) -> Arc<RwLock<SshClient>> {
         let worker_id = config.id.clone();
+        let admission = self.worker_control(&worker_id).await.admission();
+
+        let new_client = || {
+            let mut client =
+                SshClient::new(config.clone(), pooled_client_options(&self.options, config));
+            client.pool_admission = Some(admission.clone());
+            Arc::new(RwLock::new(client))
+        };
 
         loop {
+            if !admission.is_current() {
+                // A disable/enable may have raced an entry-map lock. Never
+                // replace a newer generation's entry with a revoked client.
+                // Public callers' admission guards reject this detached one.
+                return new_client();
+            }
             let existing_entry = {
                 let connections = self.connections.read().await;
                 connections.get(&worker_id).cloned()
             };
 
             if let Some(entry) = existing_entry {
-                if same_ssh_endpoint(&entry.config, config) {
+                if same_ssh_endpoint(&entry.config, config)
+                    && entry.generation == admission.generation
+                {
                     return entry.client;
                 }
 
-                let replacement = Arc::new(RwLock::new(SshClient::new(
-                    config.clone(),
-                    pooled_client_options(&self.options, config),
-                )));
+                let replacement = new_client();
                 let replaced = {
                     let mut connections = self.connections.write().await;
-                    if connections
-                        .get(&worker_id)
-                        .is_some_and(|current| Arc::ptr_eq(&current.client, &entry.client))
+                    if admission.is_current()
+                        && connections
+                            .get(&worker_id)
+                            .is_some_and(|current| Arc::ptr_eq(&current.client, &entry.client))
                     {
                         connections.insert(
                             worker_id.clone(),
                             PooledSshClient {
                                 config: config.clone(),
+                                generation: admission.generation,
                                 client: replacement.clone(),
                             },
                         );
@@ -1462,19 +1672,17 @@ impl SshPool {
                 continue;
             }
 
-            let new_client = Arc::new(RwLock::new(SshClient::new(
-                config.clone(),
-                pooled_client_options(&self.options, config),
-            )));
+            let new_client = new_client();
             let inserted = {
                 let mut connections = self.connections.write().await;
-                if connections.contains_key(&worker_id) {
+                if !admission.is_current() || connections.contains_key(&worker_id) {
                     false
                 } else {
                     connections.insert(
                         worker_id.clone(),
                         PooledSshClient {
                             config: config.clone(),
+                            generation: admission.generation,
                             client: new_client.clone(),
                         },
                     );
@@ -1550,14 +1758,25 @@ impl SshPool {
         command: &str,
         command_timeout: Duration,
     ) -> Result<CommandResult> {
-        let client = self
-            .get_or_connect_probing_within(config, command_timeout.min(POOL_LIVENESS_PROBE_TIMEOUT))
-            .await?;
-        // Execute under a shared read lock: execute() needs only `&self`, so
-        // concurrent callers for the same worker can multiplex over the one
-        // master without serializing on a write lock.
-        let guard = client.read().await;
-        guard.execute_with_timeout(command, command_timeout).await
+        let admission = self.worker_control(&config.id).await.admission();
+        tokio::select! {
+            biased;
+            () = admission.revoked() => {
+                anyhow::bail!("SSH worker {} is disabled or its pool admission was revoked", config.id)
+            }
+            result = async {
+                let client = self
+                    .get_or_connect_probing_within(
+                        config,
+                        command_timeout.min(POOL_LIVENESS_PROBE_TIMEOUT),
+                    )
+                    .await?;
+                // The admission above also covers waiting for this lock, so
+                // a queued command cannot survive disable followed by enable.
+                let guard = client.read().await;
+                guard.execute_with_timeout(command, command_timeout).await
+            } => result,
+        }
     }
 }
 
@@ -2697,6 +2916,8 @@ printf '%s\n' "$$" >> "$root/master-pids"
 case "$mode" in
     ready|old-client|probe-stall|probe-reject) : > "$socket" ;;
     fail) printf 'Permission denied (publickey).\n' > "$log"; exit 255 ;;
+    refused) printf 'ssh: connect to host worker port 22: Connection refused\n' > "$log"; exit 255 ;;
+    vpn-down) printf 'ssh: connect to host worker port 22: Network is unreachable\n' > "$log"; exit 255 ;;
 esac
 exec sleep 30
 "#,
@@ -2822,6 +3043,7 @@ exec sleep 30
             for expected in [
                 expected,
                 "BatchMode=yes",
+                "ConnectionAttempts=1",
                 "ConnectTimeout=7",
                 "ServerAliveInterval=13",
                 "IdentitiesOnly=yes",
@@ -2947,6 +3169,7 @@ exec sleep 30
         let start = Instant::now();
         let error = fake.connect(&mut client).await.unwrap_err();
         assert!(format!("{error:#}").contains("timed out"), "{error:#}");
+        assert!(is_connection_error(&error));
         assert!(start.elapsed() < Duration::from_secs(2));
         assert!(!client.is_connected());
         assert_eq!(fake.pids("master-pids").len(), 1);
@@ -3006,16 +3229,157 @@ exec sleep 30
     }
 
     #[tokio::test]
-    async fn failed_primary_retries_and_preserves_authentication_diagnostic() {
-        let fake = FakeSsh::new("fail");
-        let mut client = fake.client(Duration::from_secs(3), true);
-        let error = fake.connect(&mut client).await.unwrap_err();
-        assert!(
-            format!("{error:#}").contains("Permission denied (publickey)."),
-            "{error:#}"
-        );
-        assert_eq!(fake.pids("master-pids").len(), 2);
+    async fn failed_connect_makes_one_attempt_and_preserves_diagnostic() {
+        for (mode, expected) in [
+            ("fail", "Permission denied (publickey)."),
+            ("refused", "Connection refused"),
+            ("vpn-down", "Network is unreachable"),
+        ] {
+            let fake = FakeSsh::new(mode);
+            let mut client = fake.client(Duration::from_secs(3), true);
+            let error = fake.connect(&mut client).await.unwrap_err();
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            assert!(is_connection_error(&error));
+            assert_eq!(
+                fake.pids("master-pids").len(),
+                1,
+                "one scheduled probe must make only one connection attempt"
+            );
+            fake.assert_reaped().await;
+        }
+        assert!(!is_connection_error(&anyhow::anyhow!(
+            "Command timed out after 10s"
+        )));
+    }
+
+    #[tokio::test]
+    async fn pool_disable_cancels_authentication_and_queued_borrows() {
+        let fake = FakeSsh::new("auth-stall");
+        let config = fake.client(Duration::from_secs(30), true).config;
+        let pool = Arc::new(SshPool::new(SshOptions {
+            connect_timeout: Duration::from_secs(30),
+            control_master: true,
+            ..SshOptions::default()
+        }));
+        let entry = pool.get_or_create_client_entry(&config).await;
+        let connecting_entry = entry.clone();
+        let program = fake.program.clone();
+        let directory = fake.directory.path().to_owned();
+        let connecting = tokio::spawn(async move {
+            connecting_entry
+                .write()
+                .await
+                .connect_using(&program, Some(&directory))
+                .await
+        });
+        fake.wait_for_pid("master-pids").await;
+
+        let mut queued = tokio::task::JoinSet::new();
+        for _ in 0..16 {
+            let pool = pool.clone();
+            let config = config.clone();
+            queued.spawn(async move {
+                pool.run_with_timeout(&config, "echo ok", Duration::from_secs(30))
+                    .await
+            });
+        }
+        // Let the callers reach the per-worker client lock held by the
+        // stalled authentication, then revoke all their generation permits.
+        tokio::task::yield_now().await;
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            pool.set_worker_enabled(&config.id, false),
+        )
+        .await
+        .expect("disable must not wait on authentication's client lock");
+        // Re-enable before collecting task outcomes: a watch receiver may
+        // coalesce false/true, but the generation still revokes old work.
+        pool.set_worker_enabled(&config.id, true).await;
+        let error = tokio::time::timeout(Duration::from_secs(1), connecting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("revoked"), "{error:#}");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while let Some(result) = queued.join_next().await {
+                assert!(result.unwrap().is_err());
+            }
+        })
+        .await
+        .expect("queued callers must be cancelled without waiting their timeout");
+        assert_eq!(fake.pids("master-pids").len(), 1);
         fake.assert_reaped().await;
+
+        let ready = FakeSsh::new("ready");
+        let fresh = pool.get_or_create_client_entry(&config).await;
+        assert!(!Arc::ptr_eq(&entry, &fresh));
+        // Previously returned handles stay revoked after explicit re-enable.
+        assert!(ready.connect(&mut *entry.write().await).await.is_err());
+        ready.connect(&mut *fresh.write().await).await.unwrap();
+        assert!(fresh.read().await.is_connected());
+        assert_eq!(ready.pids("master-pids").len(), 1);
+        pool.close(&config.id).await.unwrap();
+        ready.assert_reaped().await;
+    }
+
+    #[tokio::test]
+    async fn disabled_pool_policy_survives_close_retarget_and_explicit_reenable() {
+        let fake = FakeSsh::new("ready");
+        let mut config = fake.client(Duration::from_secs(3), true).config;
+        let pool = SshPool::default();
+        pool.set_worker_enabled(&config.id, false).await;
+        for _ in 0..3 {
+            assert!(pool.get_or_connect(&config).await.is_err());
+            assert!(
+                pool.run_with_timeout(&config, "echo ok", Duration::from_secs(1))
+                    .await
+                    .is_err()
+            );
+            pool.close(&config.id).await.unwrap();
+            pool.close_all().await.unwrap();
+            config.host.push_str("-retargeted");
+        }
+        assert_eq!(pool.active_connections().await, 0);
+        assert!(fake.pids("master-pids").is_empty());
+
+        pool.set_worker_enabled(&config.id, true).await;
+        let entry = pool.get_or_create_client_entry(&config).await;
+        fake.connect(&mut *entry.write().await).await.unwrap();
+        assert!(entry.read().await.is_connected());
+        pool.close(&config.id).await.unwrap();
+        fake.assert_reaped().await;
+    }
+
+    #[tokio::test]
+    async fn pool_disable_reaps_idle_and_active_masters_without_client_lock() {
+        for active in [false, true] {
+            let fake = FakeSsh::new("ready");
+            let config = fake.client(Duration::from_secs(3), true).config;
+            let pool = SshPool::new(SshOptions {
+                control_master: true,
+                control_persist_idle: Some(Duration::from_secs(60)),
+                ..SshOptions::default()
+            });
+            let entry = pool.get_or_create_client_entry(&config).await;
+            fake.connect(&mut *entry.write().await).await.unwrap();
+            let borrowed = entry.read().await;
+            let process = &borrowed.session.as_ref().unwrap().process;
+            let activity = active.then(|| process.begin_use().unwrap());
+
+            pool.set_worker_enabled(&config.id, false).await;
+            let status = process
+                .wait_until(Instant::now() + Duration::from_secs(3))
+                .await
+                .unwrap();
+            assert!(!status.success());
+            assert!(!borrowed.is_connected());
+            assert!(borrowed.execute("echo must-not-run").await.is_err());
+            drop(activity);
+            drop(borrowed);
+            drop(entry);
+            fake.assert_reaped().await;
+        }
     }
 
     #[tokio::test]

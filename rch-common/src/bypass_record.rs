@@ -647,10 +647,9 @@ pub fn default_admin_disable_path() -> PathBuf {
 }
 
 /// A single-document, atomically-persisted store of current
-/// [`AdminDisableRecord`]s keyed by worker id. Same corruption tolerance as
-/// [`BypassRecordStore`]: a missing or unreadable file yields an empty store
-/// and never blocks daemon startup (the failure mode is "worker rejoins until
-/// re-disabled", the pre-existing behavior).
+/// [`AdminDisableRecord`]s keyed by worker id. Administrative intent cannot be
+/// reconstructed by probing a worker, so unreadable/corrupt state must fail
+/// closed instead of silently enabling the fleet. Only a missing file is empty.
 #[derive(Debug)]
 pub struct AdminDisableStore {
     path: PathBuf,
@@ -667,19 +666,62 @@ impl AdminDisableStore {
         }
     }
 
-    /// Load the store from `path`; missing/corrupt files yield an empty store.
+    /// Load trusted state, failing closed if it cannot be read. Production
+    /// callers should use [`Self::try_load`] to report an actionable error.
+    ///
+    /// # Panics
+    /// Panics on an unreadable, corrupt, or unsupported state document.
     #[must_use]
     pub fn load(path: impl Into<PathBuf>) -> Self {
+        Self::try_load(path).expect("cannot safely load administrative worker disablement")
+    }
+
+    /// Load administrative intent before any worker activity starts. Missing
+    /// files represent first startup; every other error must reach the caller.
+    pub fn try_load(path: impl Into<PathBuf>) -> std::io::Result<Self> {
         let path = path.into();
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::with_path(path));
+            }
+            Err(error) => return Err(error),
+        };
+        let file: AdminDisableFile = serde_json::from_slice(&bytes).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "invalid administrative disable state {}: {error}",
+                    path.display()
+                ),
+            )
+        })?;
+        if file.schema_version != ADMIN_DISABLE_SCHEMA_VERSION {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported administrative disable schema {} in {} (expected {})",
+                    file.schema_version,
+                    path.display(),
+                    ADMIN_DISABLE_SCHEMA_VERSION,
+                ),
+            ));
+        }
         let mut records = BTreeMap::new();
-        if let Ok(bytes) = fs::read(&path)
-            && let Ok(file) = serde_json::from_slice::<AdminDisableFile>(&bytes)
-        {
-            for record in file.records {
-                records.insert(record.worker_id.clone(), record);
+        for record in file.records {
+            if record.worker_id.trim().is_empty()
+                || records.insert(record.worker_id.clone(), record).is_some()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "empty or duplicate worker id in administrative disable state {}",
+                        path.display()
+                    ),
+                ));
             }
         }
-        Self { path, records }
+        Ok(Self { path, records })
     }
 
     /// The store file path.
@@ -702,52 +744,61 @@ impl AdminDisableStore {
 
     /// Record a worker disable and persist the store.
     pub fn upsert(&mut self, record: AdminDisableRecord) -> std::io::Result<()> {
-        self.records.insert(record.worker_id.clone(), record);
-        self.persist()
+        if record.worker_id.trim().is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "administrative disable worker id cannot be empty",
+            ));
+        }
+        let mut proposed = self.records.clone();
+        proposed.insert(record.worker_id.clone(), record);
+        self.persist(&proposed)?;
+        self.records = proposed;
+        Ok(())
     }
 
     /// Remove a worker's record (operator enable) and persist. Returns the
     /// removed record, if any.
     pub fn remove(&mut self, worker_id: &str) -> std::io::Result<Option<AdminDisableRecord>> {
-        let removed = self.records.remove(worker_id);
+        let removed = self.records.get(worker_id).cloned();
         if removed.is_some() {
-            self.persist()?;
+            let mut proposed = self.records.clone();
+            proposed.remove(worker_id);
+            self.persist(&proposed)?;
+            self.records = proposed;
         }
         Ok(removed)
     }
 
-    /// Atomically write the current records to disk (temp-file + rename).
-    fn persist(&self) -> std::io::Result<()> {
-        if let Some(parent) = self.path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent)?;
-        }
+    /// Persist a proposed state before publishing it in memory. A failed
+    /// enable must retain the record so a repeated request cannot skip I/O and
+    /// accidentally authorize the worker after an earlier failed write.
+    fn persist(&self, records: &BTreeMap<String, AdminDisableRecord>) -> std::io::Result<()> {
+        let parent = self
+            .path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
         let doc = AdminDisableFile {
             schema_version: ADMIN_DISABLE_SCHEMA_VERSION,
-            records: self.records.values().cloned().collect(),
+            records: records.values().cloned().collect(),
         };
         let body = serde_json::to_vec_pretty(&doc)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
-        let tmp = parent.join(format!(".admin_disables.{}.tmp", std::process::id()));
-        {
-            let mut tmp_file = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&tmp)?;
-            tmp_file.write_all(&body)?;
-            tmp_file.flush()?;
-        }
-        match fs::rename(&tmp, &self.path) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                let _ = fs::remove_file(&tmp);
-                Err(e)
-            }
-        }
+        // Open the directory before changing the durable document, so a
+        // permission error here cannot occur after the rename.
+        #[cfg(unix)]
+        let directory = fs::File::open(parent)?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        temporary.write_all(&body)?;
+        temporary.flush()?;
+        temporary.as_file().sync_all()?;
+        temporary.persist(&self.path).map_err(|error| error.error)?;
+        #[cfg(unix)]
+        directory.sync_all()?;
+        Ok(())
     }
 }
 
@@ -1273,15 +1324,110 @@ mod tests {
     }
 
     #[test]
-    fn admin_disable_store_tolerates_missing_and_corrupt_files() {
+    fn admin_disable_store_accepts_only_missing_file_as_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let missing = AdminDisableStore::load(dir.path().join("nope.json"));
+        let missing = AdminDisableStore::try_load(dir.path().join("nope.json")).unwrap();
         assert!(missing.all().is_empty());
 
-        let corrupt_path = dir.path().join("corrupt.json");
-        std::fs::write(&corrupt_path, b"{ not json").unwrap();
-        let corrupt = AdminDisableStore::load(&corrupt_path);
-        assert!(corrupt.all().is_empty());
+        for (name, bytes) in [
+            ("corrupt", "{ not json"),
+            ("empty", ""),
+            ("old-schema", r#"{"schema_version":0,"records":[]}"#),
+            ("new-schema", r#"{"schema_version":2,"records":[]}"#),
+            (
+                "empty-id",
+                r#"{"schema_version":1,"records":[{"worker_id":" ","disabled_unix_ms":1}]}"#,
+            ),
+            (
+                "duplicate-id",
+                r#"{"schema_version":1,"records":[{"worker_id":"w1","disabled_unix_ms":1},{"worker_id":"w1","disabled_unix_ms":2}]}"#,
+            ),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            let error = AdminDisableStore::try_load(&path).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::InvalidData,
+                "{name}: {error}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);
+        }
+
+        // Reading a directory fails even when tests run as root (unlike a
+        // mode-000 file), exercising the unreadable-state branch reliably.
+        assert!(AdminDisableStore::try_load(dir.path()).is_err());
+        let non_directory = dir.path().join("not-a-directory");
+        std::fs::write(&non_directory, "file").unwrap();
+        assert!(AdminDisableStore::try_load(non_directory.join("state.json")).is_err());
+    }
+
+    #[test]
+    fn admin_disable_failed_enable_stays_disabled_on_retry_and_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let saved = dir.path().join("saved-state.json");
+        let mut store = AdminDisableStore::with_path(&path);
+        let record = AdminDisableRecord {
+            worker_id: "w1".into(),
+            reason: Some("operator: powered off".into()),
+            disabled_unix_ms: 123,
+        };
+        store.upsert(record.clone()).unwrap();
+        std::fs::rename(&path, &saved).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        for _ in 0..3 {
+            assert!(store.remove("w1").is_err());
+            assert_eq!(store.get("w1"), Some(&record));
+            assert_eq!(
+                AdminDisableStore::try_load(&saved).unwrap().get("w1"),
+                Some(&record)
+            );
+        }
+        // Remove the obstruction by moving it, then restore and reload the
+        // durable pre-operation state exactly as a daemon restart would.
+        std::fs::rename(&path, dir.path().join("obstruction")).unwrap();
+        std::fs::rename(&saved, &path).unwrap();
+        let mut restarted = AdminDisableStore::try_load(&path).unwrap();
+        assert_eq!(restarted.get("w1"), Some(&record));
+        assert_eq!(restarted.remove("w1").unwrap(), Some(record));
+        assert!(
+            AdminDisableStore::try_load(&path)
+                .unwrap()
+                .get("w1")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn admin_disable_failed_write_preserves_existing_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let saved = dir.path().join("saved-state.json");
+        let mut store = AdminDisableStore::with_path(&path);
+        let original = AdminDisableRecord {
+            worker_id: "w1".into(),
+            reason: Some("operator: keep out".into()),
+            disabled_unix_ms: 123,
+        };
+        store.upsert(original.clone()).unwrap();
+        std::fs::rename(&path, &saved).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        for worker_id in ["w1", "w2"] {
+            assert!(
+                store
+                    .upsert(AdminDisableRecord {
+                        worker_id: worker_id.into(),
+                        reason: Some("replacement intent".into()),
+                        disabled_unix_ms: 456,
+                    })
+                    .is_err()
+            );
+            assert_eq!(store.get("w1"), Some(&original));
+            assert!(store.get("w2").is_none());
+            let restarted = AdminDisableStore::try_load(&saved).unwrap();
+            assert_eq!(restarted.all(), store.all());
+        }
     }
 
     #[test]
