@@ -51,9 +51,9 @@ use super::source_fidelity::{
     build_source_commit_env, capture_build_source_stamp, coalesce_source_content_plan,
     finalize_owned_source_content_receipt, finalize_source_content_receipt,
     guard_owned_source_content_cargo_config, owned_source_content_freshness_identity,
-    prepare_source_content_root, reconcile_build_source_stamps,
-    validate_owned_source_content_closure, verify_coalesced_source_plan,
-    verify_owned_source_content_roots, verify_source_content_roots,
+    prepare_clean_overlay_source_content_root, prepare_source_content_root,
+    reconcile_build_source_stamps, validate_owned_source_content_closure,
+    verify_coalesced_source_plan, verify_owned_source_content_roots, verify_source_content_roots,
 };
 use super::ssh::{
     acquire_clean_overlay_source_pair, ensure_worker_projects_topology,
@@ -1066,19 +1066,20 @@ async fn execute_remote_compilation_inner(
     // Bind receipt provenance to this invocation. The legacy receipt route
     // also uses it for its isolated path; the owned pair instead preserves
     // compiler paths under a durable exclusive source/target lease.
-    let project_hash = if let Some(proof_build_id) = source_content_build_id {
-        blake3::hash(
-            format!(
-                "rch.source_content_remote_root.v1\0{}\0{}\0{}",
-                project_hash, proof_build_id, worker_config.id
+    let project_hash =
+        if let Some(proof_build_id) = source_content_build_id.filter(|_| clean_overlay.is_none()) {
+            blake3::hash(
+                format!(
+                    "rch.source_content_remote_root.v1\0{}\0{}\0{}",
+                    project_hash, proof_build_id, worker_config.id
+                )
+                .as_bytes(),
             )
-            .as_bytes(),
-        )
-        .to_hex()
-        .to_string()
-    } else {
-        project_hash
-    };
+            .to_hex()
+            .to_string()
+        } else {
+            project_hash
+        };
     let mut sync_plan = if clean_overlay.is_some() {
         // Explicit committed roots are the whole authority. The ordinary
         // planner reads ambient ancestor manifests and must not widen this set.
@@ -1133,7 +1134,8 @@ async fn execute_remote_compilation_inner(
         source_pair_pool = Some(layout.pooled_target_name);
         overlay_remote_root = Some(layout.source_root);
         sync_plan = layout.plan;
-    } else if let Some(proof_build_id) = source_content_build_id {
+    } else if let Some(proof_build_id) = source_content_build_id.filter(|_| clean_overlay.is_none())
+    {
         let proof_base = format!(
             "{}/source-content-{}-{}",
             transfer_config.remote_base.trim_end_matches('/'),
@@ -1764,9 +1766,18 @@ async fn execute_remote_compilation_inner(
         );
 
         let prepared_source_root = if source_content_receipt {
-            let mut prepared =
+            let mut prepared = if let Some(spec) = root_overlay {
+                prepare_clean_overlay_source_content_root(
+                    prepared_source_roots.len(),
+                    entry,
+                    &root_pipeline,
+                    spec,
+                )
+                .await?
+            } else {
                 prepare_source_content_root(prepared_source_roots.len(), entry, &root_pipeline)
-                    .await?;
+                    .await?
+            };
             attach_coalesced_source_roots(
                 &mut prepared,
                 coalesced_source_roots.remove(&entry.local_root),
@@ -2642,7 +2653,11 @@ async fn execute_remote_compilation_inner(
             finalize_source_content_receipt(
                 &worker_config,
                 proof_build_id,
-                command,
+                if clean_overlay.is_some() {
+                    caller_command
+                } else {
+                    command
+                },
                 result.exit_code,
                 &prepared_source_roots,
                 source_identity,

@@ -1932,7 +1932,7 @@ mod managed_build_dir_tests {
             self.run_from(prefix, &self.project)
         }
 
-        fn run_from(&self, prefix: &str, directory: &Path) -> std::process::Output {
+        fn run_from(&self, prefix: &str, directory: &std::path::Path) -> std::process::Output {
             let command = format!(
                 "{prefix} {} test -- 'literal $value; with spaces'",
                 shell_words::quote(self.cargo.to_str().unwrap())

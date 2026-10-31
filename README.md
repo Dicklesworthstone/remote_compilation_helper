@@ -1196,8 +1196,25 @@ command digest and exit code, transfer filter policy, per-root file paths,
 lengths, executable bits, SHA-256 digests, and content roots. Any unproved
 dependency closure, transfer delta, worker verification error, local lasting
 change, retry, or local fallback refuses the invocation instead of emitting a
-receipt. Receipt mode currently requires the Unix rsync transport and cannot be
-combined with clean-overlay mode.
+receipt. Receipt mode requires the Unix rsync transport.
+
+Clean-overlay builds can request the same byte-level proof:
+
+```bash
+rch exec --base HEAD --clean-overlay --overlay-path src/lib.rs \
+  --source-content-receipt -- cargo test --locked
+```
+
+The manifest covers the complete selected Git archive plus the exact files
+transferred by the explicit overlay filters. Unselected working-tree edits
+never become receipt inputs. `--no-overlay` proves the committed tree and its
+pinned submodules; each `--dependency-base PATH=REV` adds its own selected root.
+The filter policy records the commit, tree, invocation directory, pinned
+submodules, overlay paths, and fingerprint separately from the rsync rules,
+because those rules select only the live overlay. Every selected
+file is checked on the worker before and after execution, including committed
+files that are absent or dirty in the local checkout. Receipt mode preserves
+the clean-overlay source/target pair's stable paths and warm compiler cache.
 
 On Linux with target reuse enabled, supported Cargo commands use an owned
 source/target pair. The source layout preserves sibling dependencies, selected

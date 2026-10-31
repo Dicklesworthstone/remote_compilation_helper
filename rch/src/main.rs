@@ -638,7 +638,7 @@ USAGE:
         #[arg(long, requires = "clean_overlay", conflicts_with = "overlay_path")]
         no_overlay: bool,
         /// Emit a worker-verified per-root manifest for the exact transferred source bytes
-        #[arg(long, conflicts_with = "clean_overlay")]
+        #[arg(long)]
         source_content_receipt: bool,
         /// Admit an arbitrary NON-compilation job (sharded tests, fuzzing,
         /// benchmarks, mutation testing). Bypasses ONLY the compilation
@@ -7599,21 +7599,44 @@ mod tests {
     }
 
     #[test]
-    fn cli_rejects_source_content_receipt_with_clean_overlay() {
+    fn cli_parses_source_content_receipt_with_clean_overlay() {
         let _guard = test_guard!();
-        let result = Cli::try_parse_from([
-            "rch",
-            "exec",
-            "--base",
-            "HEAD",
-            "--clean-overlay",
-            "--no-overlay",
-            "--source-content-receipt",
-            "--",
-            "cargo",
-            "check",
-        ]);
-        assert!(result.is_err());
+        for (selection, expected_overlay, expected_dependencies) in [
+            (vec!["--no-overlay"], None, Vec::<String>::new()),
+            (vec!["--overlay-path", "src/lib.rs"], Some("src/lib.rs"), vec![]),
+            (
+                vec!["--no-overlay", "--dependency-base", "../dep=HEAD"],
+                None,
+                vec!["../dep=HEAD".to_owned()],
+            ),
+        ] {
+            let mut args = vec!["rch", "exec", "--base", "HEAD", "--clean-overlay"];
+            args.extend(selection);
+            args.extend(["--source-content-receipt", "--", "cargo", "check"]);
+            match Cli::try_parse_from(args).unwrap().command {
+                Some(Commands::Exec {
+                    base,
+                    clean_overlay,
+                    no_overlay,
+                    overlay_path,
+                    dependency_base,
+                    source_content_receipt,
+                    command,
+                    ..
+                }) => {
+                    assert_eq!(base.as_deref(), Some("HEAD"));
+                    assert!(clean_overlay && source_content_receipt);
+                    assert_eq!(no_overlay, expected_overlay.is_none());
+                    assert_eq!(
+                        overlay_path,
+                        expected_overlay.map(PathBuf::from).into_iter().collect::<Vec<_>>()
+                    );
+                    assert_eq!(dependency_base, expected_dependencies);
+                    assert_eq!(command, ["cargo", "check"]);
+                }
+                _ => fail_expected("Expected clean-overlay source-content receipt command"),
+            }
+        }
     }
 
     #[test]

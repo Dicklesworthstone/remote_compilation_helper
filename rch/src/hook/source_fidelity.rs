@@ -1,9 +1,10 @@
 //! Exact source-content manifests and worker-side verification for proof runs.
 //!
-//! This is deliberately a transfer-boundary proof. The file universe comes
-//! from the configured `TransferPipeline`'s own rsync filters, uploads use
-//! checksum mode, a no-delta rsync barrier reopens the synchronized tree, and a
-//! worker-side verifier re-hashes every selected regular file before Cargo.
+//! This is deliberately a transfer-boundary proof. Ordinary source selection
+//! uses the configured `TransferPipeline`'s rsync filters; clean overlays combine
+//! the immutable Git archive with exactly the selected live overlay. Uploads
+//! use checksum mode, the matching rsync barrier checks transferred bytes, and
+//! worker-side verification re-hashes selected entries before and after execution.
 
 use super::dependency_closure::{
     SyncClosureMode, SyncClosurePlanEntry, source_content_coalescing_candidates,
@@ -37,6 +38,27 @@ pub(super) struct SourceContentFilterPolicy {
     exclude_patterns: Vec<String>,
     delete_extraneous: bool,
     checksum_transfer: bool,
+    /// This policy's rsync filters apply only to the overlay. The complete
+    /// immutable Git archive is selected independently of those filters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    clean_overlay: Option<SourceContentCleanOverlay>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct SourceContentCleanOverlay {
+    base_commit: String,
+    tree_object: String,
+    working_directory: PathBuf,
+    overlay_fingerprint: String,
+    overlay_paths: Vec<PathBuf>,
+    submodules: Vec<SourceContentSubmodule>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct SourceContentSubmodule {
+    path: PathBuf,
+    base_commit: String,
+    tree_object: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
@@ -103,6 +125,7 @@ pub(super) struct PreparedSourceContentRoot {
     pipeline: TransferPipeline,
     manifest: SourceContentRootManifest,
     directories: Vec<PathBuf>,
+    clean_overlay: Option<CleanOverlaySpec>,
     // Absorbed selections remain live proof obligations, not extra transfers.
     coalesced: Vec<PreparedSourceContentRoot>,
 }
@@ -419,7 +442,20 @@ async fn capture_manifest(
         exclude_patterns,
         delete_extraneous,
         checksum_transfer,
+        clean_overlay: None,
     };
+    let manifest = assemble_manifest(ordinal, entry, local_root, filter_policy, files, byte_count)?;
+    Ok((manifest, directories))
+}
+
+fn assemble_manifest(
+    ordinal: usize,
+    entry: &SyncClosurePlanEntry,
+    local_root: String,
+    filter_policy: SourceContentFilterPolicy,
+    files: Vec<SourceContentFile>,
+    byte_count: u64,
+) -> anyhow::Result<SourceContentRootManifest> {
     let preimage = SourceContentRootPreimage {
         schema: ROOT_SCHEMA,
         ordinal,
@@ -435,24 +471,21 @@ async fn capture_manifest(
         files: &files,
     };
     let content_root = sha256_hex(&serde_json::to_vec(&preimage)?);
-    Ok((
-        SourceContentRootManifest {
-            schema: ROOT_SCHEMA,
-            ordinal,
-            project_id: entry.project_id.clone(),
-            local_root,
-            remote_root: entry.remote_root.clone(),
-            root_hash: entry.root_hash.clone(),
-            is_primary: entry.is_primary,
-            mode: entry.mode,
-            filter_policy,
-            file_count: files.len(),
-            byte_count,
-            files,
-            content_root,
-        },
-        directories,
-    ))
+    Ok(SourceContentRootManifest {
+        schema: ROOT_SCHEMA,
+        ordinal,
+        project_id: entry.project_id.clone(),
+        local_root,
+        remote_root: entry.remote_root.clone(),
+        root_hash: entry.root_hash.clone(),
+        is_primary: entry.is_primary,
+        mode: entry.mode,
+        filter_policy,
+        file_count: files.len(),
+        byte_count,
+        files,
+        content_root,
+    })
 }
 
 pub(super) async fn prepare_source_content_root(
@@ -465,6 +498,349 @@ pub(super) async fn prepare_source_content_root(
         pipeline: pipeline.clone(),
         manifest,
         directories,
+        clean_overlay: None,
+        coalesced: Vec::new(),
+    })
+}
+
+fn selected_source_path(path: &str) -> anyhow::Result<&Path> {
+    anyhow::ensure!(
+        !path.is_empty()
+            && !path.contains('\\')
+            && !path.chars().any(char::is_control)
+            && path.split('/').all(|part| !matches!(part, "" | "." | "..")),
+        "source-content path must be a literal relative path: {path:?}"
+    );
+    Ok(Path::new(path))
+}
+
+fn selected_source_ancestors(path: &Path, directories: &mut std::collections::BTreeSet<PathBuf>) {
+    for parent in path.ancestors().skip(1) {
+        if !parent.as_os_str().is_empty() {
+            directories.insert(parent.to_path_buf());
+        }
+    }
+}
+
+/// Resolve symlinks using only selected archive/overlay entries. The checkout
+/// can contain unrelated dirty symlinks and is not this materialization's view.
+fn validate_selected_source_symlinks(
+    files: &std::collections::BTreeMap<String, SourceContentFile>,
+    directories: &std::collections::BTreeSet<PathBuf>,
+) -> anyhow::Result<()> {
+    for directory in directories {
+        anyhow::ensure!(
+            !files.contains_key(directory.to_str().context("non-UTF-8 selected directory")?),
+            "source-content file aliases a selected directory: {}",
+            directory.display()
+        );
+    }
+    for (path, file) in files {
+        let Some(target) = &file.symlink_target else {
+            continue;
+        };
+        let relative = Path::new(path);
+        validate_symlink_lexical(relative, target)?;
+        let mut resolved = relative
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .to_path_buf();
+        let mut pending: std::collections::VecDeque<String> =
+            target.split('/').map(ToOwned::to_owned).collect();
+        let mut hops = 0;
+        while let Some(segment) = pending.pop_front() {
+            match segment.as_str() {
+                "" | "." => {}
+                ".." => {
+                    anyhow::ensure!(
+                        resolved.pop(),
+                        "selected source symlink escapes root: {path}"
+                    );
+                }
+                _ => {
+                    resolved.push(segment);
+                    let key = resolved.to_str().context("non-UTF-8 selected symlink")?;
+                    if let Some(next) = files
+                        .get(key)
+                        .and_then(|entry| entry.symlink_target.as_ref())
+                    {
+                        hops += 1;
+                        anyhow::ensure!(
+                            hops <= 64,
+                            "selected source symlink cycle or hop limit: {path}"
+                        );
+                        validate_symlink_lexical(&resolved, next)?;
+                        let mut continuation: std::collections::VecDeque<String> =
+                            next.split('/').map(ToOwned::to_owned).collect();
+                        continuation.append(&mut pending);
+                        pending = continuation;
+                        resolved.pop();
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn hash_clean_overlay_selection(
+    archive_file: tempfile::NamedTempFile,
+    local_root: &Path,
+    overlay_files: &[PathBuf],
+    overlay_directories: &[PathBuf],
+) -> anyhow::Result<(Vec<SourceContentFile>, Vec<PathBuf>, u64)> {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::io::Read as _;
+
+    let mut archive = tar::Archive::new(archive_file.reopen()?);
+    let mut files = BTreeMap::new();
+    let mut directories = BTreeSet::new();
+    let mut archive_bytes = 0_u64;
+    // Overlay hashing also uses a large read buffer; keep this one off the
+    // blocking worker's stack while the two hashing frames overlap.
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    for entry in archive.entries()? {
+        let mut entry = entry.context("read immutable source archive entry")?;
+        let kind = entry.header().entry_type();
+        // Git's global PAX header records the commit, not a filesystem entry.
+        if kind.as_byte() == b'g' {
+            anyhow::ensure!(entry.size() <= 64 * 1024, "oversized Git archive metadata");
+            continue;
+        }
+        let raw_path = entry.path()?.into_owned();
+        let raw_path = raw_path.to_str().context("Git archive path is not UTF-8")?;
+        let path = if kind.is_dir() {
+            raw_path.strip_suffix('/').unwrap_or(raw_path)
+        } else {
+            raw_path
+        };
+        let relative = selected_source_path(path)?;
+        selected_source_ancestors(relative, &mut directories);
+        if kind.is_dir() {
+            anyhow::ensure!(
+                directories.len() < MAX_SOURCE_CONTENT_FILES,
+                "source-content directory cap exceeded"
+            );
+            directories.insert(relative.to_path_buf());
+            continue;
+        }
+        anyhow::ensure!(
+            files.len() < MAX_SOURCE_CONTENT_FILES,
+            "source-content file cap exceeded"
+        );
+        let file = if kind.is_file() {
+            let expected = entry.size();
+            anyhow::ensure!(
+                expected <= MAX_SOURCE_CONTENT_BYTES.saturating_sub(archive_bytes),
+                "source-content byte cap exceeded"
+            );
+            let mut hasher = Sha256::new();
+            let mut bytes = 0_u64;
+            loop {
+                let read = entry.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                bytes = bytes
+                    .checked_add(read as u64)
+                    .context("source-content byte count overflow")?;
+                anyhow::ensure!(
+                    bytes <= expected,
+                    "Git archive entry exceeded its declared size"
+                );
+                hasher.update(&buffer[..read]);
+            }
+            anyhow::ensure!(bytes == expected, "Git archive entry was truncated: {path}");
+            SourceContentFile {
+                path: path.to_owned(),
+                kind: SourceContentEntryKind::Regular,
+                symlink_target: None,
+                sha256: hex_lower(&hasher.finalize()),
+                byte_count: bytes,
+                executable: entry.header().mode()? & 0o111 != 0,
+            }
+        } else if kind.is_symlink() {
+            let target = entry
+                .link_name()?
+                .context("Git archive symlink has no target")?;
+            let target = target
+                .to_str()
+                .context("Git archive symlink target is not UTF-8")?;
+            validate_symlink_lexical(relative, target)?;
+            SourceContentFile {
+                path: path.to_owned(),
+                kind: SourceContentEntryKind::Symlink,
+                symlink_target: Some(target.to_owned()),
+                sha256: sha256_hex(target.as_bytes()),
+                byte_count: target.len() as u64,
+                executable: false,
+            }
+        } else {
+            anyhow::bail!("unsupported source-content Git archive entry: {path}");
+        };
+        archive_bytes = archive_bytes
+            .checked_add(file.byte_count)
+            .context("source-content byte count overflow")?;
+        anyhow::ensure!(
+            archive_bytes <= MAX_SOURCE_CONTENT_BYTES,
+            "source-content byte cap exceeded"
+        );
+        anyhow::ensure!(
+            files.insert(path.to_owned(), file).is_none(),
+            "duplicate Git archive path: {path}"
+        );
+    }
+    for path in overlay_files {
+        let text = path.to_str().context("overlay path is not UTF-8")?;
+        selected_source_path(text)?;
+        let file = hash_source_entry(local_root, path, text)?;
+        anyhow::ensure!(
+            file.kind == SourceContentEntryKind::Regular,
+            "selected clean-overlay entry became a symlink: {text}"
+        );
+        if let Some(base) = files.get(text) {
+            anyhow::ensure!(
+                base.kind == file.kind,
+                "overlay changes selected base entry type: {text}"
+            );
+        }
+        files.insert(text.to_owned(), file);
+        anyhow::ensure!(
+            files.len() <= MAX_SOURCE_CONTENT_FILES,
+            "source-content file cap exceeded"
+        );
+        selected_source_ancestors(path, &mut directories);
+    }
+    for directory in overlay_directories {
+        let text = directory
+            .to_str()
+            .context("overlay directory is not UTF-8")?;
+        let path = selected_source_path(text.trim_end_matches('/'))?;
+        directories.insert(path.to_path_buf());
+        selected_source_ancestors(path, &mut directories);
+    }
+    anyhow::ensure!(
+        !files.is_empty(),
+        "source-content clean-overlay universe is empty"
+    );
+    anyhow::ensure!(
+        directories.len() <= MAX_SOURCE_CONTENT_FILES,
+        "source-content directory cap exceeded"
+    );
+    validate_selected_source_symlinks(&files, &directories)?;
+    let byte_count = files
+        .values()
+        .try_fold(0_u64, |total, file| total.checked_add(file.byte_count))
+        .context("source-content byte count overflow")?;
+    anyhow::ensure!(
+        byte_count <= MAX_SOURCE_CONTENT_BYTES,
+        "source-content byte cap exceeded"
+    );
+    Ok((
+        files.into_values().collect(),
+        directories.into_iter().collect(),
+        byte_count,
+    ))
+}
+
+async fn capture_clean_overlay_manifest(
+    ordinal: usize,
+    entry: &SyncClosurePlanEntry,
+    pipeline: &TransferPipeline,
+    spec: &CleanOverlaySpec,
+) -> anyhow::Result<(SourceContentRootManifest, Vec<PathBuf>)> {
+    let local_root = canonical_root_path(&entry.local_root)?;
+    anyhow::ensure!(
+        Path::new(&local_root) == spec.repository_root,
+        "clean-overlay receipt root differs from its selected Git root"
+    );
+    spec.verify_overlay_unchanged(Path::new(&local_root))?;
+    spec.verify_archive_attributes(Path::new(&local_root))
+        .await?;
+    let (include_patterns, exclude_patterns, delete_extraneous, checksum_transfer) =
+        pipeline.source_content_filter_policy();
+    anyhow::ensure!(
+        checksum_transfer && !delete_extraneous,
+        "clean-overlay proof requires checksum transfer without deletion"
+    );
+    let (paths, overlay_directories) = if spec.is_base_only() {
+        (Vec::new(), Vec::new())
+    } else {
+        anyhow::ensure!(
+            include_patterns.is_some(),
+            "clean-overlay receipt requires explicit overlay transfer filters"
+        );
+        pipeline.enumerate_source_content_selection().await?
+    };
+    for path in &paths {
+        anyhow::ensure!(
+            spec.overlay_paths()
+                .iter()
+                .any(|overlay| path.starts_with(overlay)),
+            "rsync selected an unrequested clean-overlay path: {}",
+            path.display()
+        );
+    }
+    let selected_submodules = spec
+        .submodules
+        .iter()
+        .map(|submodule| (submodule.path.clone(), submodule.base_commit.clone()))
+        .collect::<Vec<_>>();
+    let archive = TransferPipeline::create_selected_git_archive(
+        Path::new(&local_root),
+        spec.base_commit(),
+        &selected_submodules,
+    )
+    .await?;
+    let hash_root = PathBuf::from(&local_root);
+    let (files, directories, byte_count) = tokio::task::spawn_blocking(move || {
+        hash_clean_overlay_selection(archive, &hash_root, &paths, &overlay_directories)
+    })
+    .await
+    .context("join clean-overlay source-content hashing")??;
+    spec.verify_overlay_unchanged(Path::new(&local_root))?;
+    spec.verify_archive_attributes(Path::new(&local_root))
+        .await?;
+    let filter_policy = SourceContentFilterPolicy {
+        schema: "rch.source_content_clean_overlay_filter.v1",
+        include_patterns,
+        exclude_patterns,
+        delete_extraneous,
+        checksum_transfer,
+        clean_overlay: Some(SourceContentCleanOverlay {
+            base_commit: spec.base_commit.clone(),
+            tree_object: spec.tree_object.clone(),
+            working_directory: spec.invocation_directory.clone(),
+            overlay_fingerprint: spec.overlay_fingerprint.clone(),
+            overlay_paths: spec.overlay_paths.clone(),
+            submodules: spec
+                .submodules
+                .iter()
+                .map(|submodule| SourceContentSubmodule {
+                    path: submodule.path.clone(),
+                    base_commit: submodule.base_commit.clone(),
+                    tree_object: submodule.tree_object.clone(),
+                })
+                .collect(),
+        }),
+    };
+    let manifest = assemble_manifest(ordinal, entry, local_root, filter_policy, files, byte_count)?;
+    Ok((manifest, directories))
+}
+
+pub(super) async fn prepare_clean_overlay_source_content_root(
+    ordinal: usize,
+    entry: &SyncClosurePlanEntry,
+    pipeline: &TransferPipeline,
+    spec: &CleanOverlaySpec,
+) -> anyhow::Result<PreparedSourceContentRoot> {
+    let (manifest, directories) =
+        capture_clean_overlay_manifest(ordinal, entry, pipeline, spec).await?;
+    Ok(PreparedSourceContentRoot {
+        pipeline: pipeline.clone(),
+        manifest,
+        directories,
+        clean_overlay: Some(spec.clone()),
         coalesced: Vec::new(),
     })
 }
@@ -657,19 +1033,21 @@ pub(super) async fn attach_coalesced_source_roots(
 async fn verify_local_source_content_manifest(
     root: &PreparedSourceContentRoot,
 ) -> anyhow::Result<()> {
-    let (recaptured, directories) = capture_manifest(
-        root.manifest.ordinal,
-        &SyncClosurePlanEntry {
-            local_root: PathBuf::from(&root.manifest.local_root),
-            remote_root: root.manifest.remote_root.clone(),
-            project_id: root.manifest.project_id.clone(),
-            root_hash: root.manifest.root_hash.clone(),
-            is_primary: root.manifest.is_primary,
-            mode: root.manifest.mode,
-        },
-        &root.pipeline,
-    )
-    .await?;
+    let entry = SyncClosurePlanEntry {
+        local_root: PathBuf::from(&root.manifest.local_root),
+        remote_root: root.manifest.remote_root.clone(),
+        project_id: root.manifest.project_id.clone(),
+        root_hash: root.manifest.root_hash.clone(),
+        is_primary: root.manifest.is_primary,
+        mode: root.manifest.mode,
+    };
+    let (recaptured, directories) = match &root.clean_overlay {
+        Some(spec) => {
+            capture_clean_overlay_manifest(root.manifest.ordinal, &entry, &root.pipeline, spec)
+                .await?
+        }
+        None => capture_manifest(root.manifest.ordinal, &entry, &root.pipeline).await?,
+    };
     anyhow::ensure!(
         recaptured == root.manifest && directories == root.directories,
         "local source-content changed during transfer proof for {}",
@@ -1173,6 +1551,7 @@ exec "$@""#
 fn remote_manifest_payload(manifest: &SourceContentRootManifest) -> anyhow::Result<Vec<u8>> {
     let mut payload = Vec::new();
     for file in &manifest.files {
+        selected_source_path(&file.path)?;
         if file.path.chars().any(|ch| matches!(ch, '\t' | '\n' | '\r')) {
             anyhow::bail!("unsafe source-content manifest path: {:?}", file.path);
         }
@@ -1433,7 +1812,16 @@ async fn verify_remote_root(
     source_identity: Option<&str>,
     owned_timestamps: Option<bool>,
 ) -> anyhow::Result<()> {
-    if let Some(managed_timestamps) = owned_timestamps {
+    if let Some(spec) = &root.clean_overlay {
+        // The archive baseline has no ambient working-tree comparison. The
+        // overlay barrier checks only the uploaded patch, and cannot delete
+        // or complain about baseline files excluded by its include policy.
+        if !spec.is_base_only() {
+            root.pipeline
+                .verify_clean_overlay_source_content_rsync_barrier(worker)
+                .await?;
+        }
+    } else if let Some(managed_timestamps) = owned_timestamps {
         root.pipeline
             .verify_owned_source_content_rsync_barrier(worker, managed_timestamps)
             .await?;
@@ -2577,6 +2965,7 @@ mod tests {
             exclude_patterns: vec!["target/".to_string()],
             delete_extraneous: true,
             checksum_transfer: true,
+            clean_overlay: None,
         };
         let file = SourceContentFile {
             path: "src/lib.rs".to_string(),
@@ -2658,6 +3047,7 @@ mod tests {
                 exclude_patterns: vec![],
                 delete_extraneous: true,
                 checksum_transfer: true,
+                clean_overlay: None,
             },
             file_count: 1,
             byte_count: 3,
@@ -2872,6 +3262,7 @@ mod tests {
                 exclude_patterns: vec![],
                 delete_extraneous: true,
                 checksum_transfer: true,
+                clean_overlay: None,
             },
             file_count: files.len(),
             byte_count: files.iter().map(|file| file.byte_count).sum(),
@@ -3262,6 +3653,431 @@ mod tests {
         let head = build_source_stamp_git(&root, &["rev-parse", "HEAD"]);
         assert!(stamp_commit_hash(&head));
         (root, head)
+    }
+
+    #[cfg(unix)]
+    fn clean_overlay_receipt_pipeline(
+        spec: &CleanOverlaySpec,
+        remote: &Path,
+    ) -> (SyncClosurePlanEntry, TransferPipeline) {
+        let entry = SyncClosurePlanEntry {
+            local_root: spec.repository_root.clone(),
+            remote_root: remote.to_str().unwrap().to_owned(),
+            project_id: "selected-clean-overlay".into(),
+            root_hash: spec.tree_object.clone(),
+            is_primary: true,
+            mode: SyncClosureMode::Full,
+        };
+        let pipeline = TransferPipeline::new(
+            entry.local_root.clone(),
+            entry.project_id.clone(),
+            entry.root_hash.clone(),
+            TransferConfig::default(),
+        )
+        .with_remote_path_override(entry.remote_root.clone())
+        .with_sync_include_patterns(
+            clean_overlay_include_patterns(&spec.repository_root, spec.overlay_paths()).unwrap(),
+        )
+        .with_sync_delete(false)
+        .with_sync_checksum(true);
+        (entry, pipeline)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clean_overlay_receipt_binds_archive_and_filtered_overlay_not_ambient_checkout() {
+        let (root, _) = build_source_stamp_fixture_repo();
+        for (name, bytes) in [
+            ("README.md", "immutable readme\n"),
+            ("overlay-dir/changed.txt", "base version\n"),
+            (
+                "overlay-dir/.rch-tmp/retained.txt",
+                "excluded overlay keeps base\n",
+            ),
+            ("run.sh", "#!/bin/sh\nexit 0\n"),
+        ] {
+            let path = root.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        std::fs::set_permissions(root.join("run.sh"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        std::os::unix::fs::symlink("README.md", root.join("README_LINK")).unwrap();
+        build_source_stamp_git(&root, &["add", "-f", "."]);
+        build_source_stamp_git_commit(&root, "receipt base");
+        let head = build_source_stamp_git(&root, &["rev-parse", "HEAD"]);
+        std::fs::write(root.join("README.md"), "unselected dirty readme\n").unwrap();
+        std::fs::rename(root.join("README_LINK"), root.join("unselected-old-link")).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", root.join("README_LINK")).unwrap();
+        std::fs::write(root.join("unselected.txt"), "not selected\n").unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn selected_overlay() {}\n").unwrap();
+        std::fs::write(
+            root.join("overlay-dir/changed.txt"),
+            "selected directory bytes\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("overlay-dir/added.txt"), "new selected file\n").unwrap();
+        std::fs::write(
+            root.join("overlay-dir/.rch-tmp/retained.txt"),
+            "excluded ambient change\n",
+        )
+        .unwrap();
+        let spec = prepare_clean_overlay_spec(
+            &root,
+            Some(head.clone()),
+            true,
+            vec![PathBuf::from("src/lib.rs"), PathBuf::from("overlay-dir")],
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let remote = tempfile::tempdir().unwrap().keep();
+        let (entry, pipeline) = clean_overlay_receipt_pipeline(&spec, &remote);
+        let prepared = prepare_clean_overlay_source_content_root(0, &entry, &pipeline, &spec)
+            .await
+            .unwrap();
+        let files: std::collections::BTreeMap<_, _> = prepared
+            .manifest
+            .files
+            .iter()
+            .map(|file| (file.path.as_str(), file))
+            .collect();
+        assert_eq!(files["README.md"].sha256, sha256_hex(b"immutable readme\n"));
+        assert_eq!(
+            files["src/lib.rs"].sha256,
+            sha256_hex(b"pub fn selected_overlay() {}\n")
+        );
+        assert_eq!(
+            files["overlay-dir/changed.txt"].sha256,
+            sha256_hex(b"selected directory bytes\n")
+        );
+        assert_eq!(
+            files["overlay-dir/added.txt"].sha256,
+            sha256_hex(b"new selected file\n")
+        );
+        assert_eq!(
+            files["overlay-dir/.rch-tmp/retained.txt"].sha256,
+            sha256_hex(b"excluded overlay keeps base\n")
+        );
+        assert_eq!(
+            files["README_LINK"].symlink_target.as_deref(),
+            Some("README.md")
+        );
+        assert!(files["run.sh"].executable);
+        assert!(!files.contains_key("unselected.txt"));
+        assert!(!files.contains_key("unselected-old-link"));
+        let policy = prepared
+            .manifest
+            .filter_policy
+            .clean_overlay
+            .as_ref()
+            .unwrap();
+        assert_eq!(policy.base_commit, head);
+        assert_eq!(policy.tree_object, spec.tree_object);
+        assert_eq!(policy.overlay_fingerprint, spec.overlay_fingerprint);
+        assert!(!prepared.manifest.filter_policy.delete_extraneous);
+        assert_eq!(prepared.manifest.file_count, files.len());
+
+        let archive = TransferPipeline::create_selected_git_archive(
+            &spec.repository_root,
+            spec.base_commit(),
+            &[],
+        )
+        .await
+        .unwrap();
+        tar::Archive::new(archive.reopen().unwrap())
+            .unpack(&remote)
+            .unwrap();
+        for path in pipeline
+            .enumerate_source_content_selection()
+            .await
+            .unwrap()
+            .0
+        {
+            let target = remote.join(&path);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::copy(spec.repository_root.join(&path), target).unwrap();
+        }
+        let payload = remote_manifest_payload(&prepared.manifest).unwrap();
+        let verified = run_source_verifier(&prepared.manifest, &payload, None, true);
+        assert!(verified.status.success(), "{verified:?}");
+        assert!(verified.stderr.is_empty());
+        verify_local_source_content_manifest(&prepared)
+            .await
+            .unwrap();
+        // Changing an unselected working-tree file does not change this proof.
+        std::fs::write(root.join("README.md"), "another unselected edit\n").unwrap();
+        verify_local_source_content_manifest(&prepared)
+            .await
+            .unwrap();
+        // Real worker bytes, rather than the declared base ID, decide success.
+        std::fs::write(remote.join("src/lib.rs"), "pub fn corrupted_worker() {}\n").unwrap();
+        let refused = run_source_verifier(&prepared.manifest, &payload, None, true);
+        assert!(!refused.status.success());
+        assert!(refused.stdout.is_empty());
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn changed_after_admission() {}\n",
+        )
+        .unwrap();
+        assert!(
+            verify_local_source_content_manifest(&prepared)
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clean_overlay_receipt_binds_recursive_submodule_pins_not_live_checkouts() {
+        let (root, _) = build_source_stamp_fixture_repo();
+        let (module_source, _) = build_source_stamp_fixture_repo();
+        let (leaf_source, _) = build_source_stamp_fixture_repo();
+        std::fs::write(leaf_source.join("src/lib.rs"), "pub fn leaf_pin() {}\n").unwrap();
+        build_source_stamp_git(&leaf_source, &["add", "src/lib.rs"]);
+        build_source_stamp_git_commit(&leaf_source, "leaf pin");
+        let leaf_pin = build_source_stamp_git(&leaf_source, &["rev-parse", "HEAD"]);
+        build_source_stamp_git(
+            &module_source,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                leaf_source.to_str().unwrap(),
+                "nested/leaf",
+            ],
+        );
+        std::fs::write(module_source.join("src/lib.rs"), "pub fn module_pin() {}\n").unwrap();
+        build_source_stamp_git(&module_source, &["add", "."]);
+        build_source_stamp_git_commit(&module_source, "module pin with nested leaf");
+        let module_pin = build_source_stamp_git(&module_source, &["rev-parse", "HEAD"]);
+        build_source_stamp_git(
+            &root,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                module_source.to_str().unwrap(),
+                "vendor/dep",
+            ],
+        );
+        build_source_stamp_git(
+            &root,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "update",
+                "--init",
+                "--recursive",
+            ],
+        );
+        build_source_stamp_git(&root, &["add", "."]);
+        build_source_stamp_git_commit(&root, "superproject pin");
+        let head = build_source_stamp_git(&root, &["rev-parse", "HEAD"]);
+        let module = root.join("vendor/dep");
+        let leaf = module.join("nested/leaf");
+        for checkout in [&module, &leaf] {
+            std::fs::write(checkout.join("src/lib.rs"), "pub fn newer_checkout() {}\n").unwrap();
+            std::fs::write(checkout.join("newer.txt"), "newer committed bytes\n").unwrap();
+            build_source_stamp_git(checkout, &["add", "src/lib.rs", "newer.txt"]);
+            build_source_stamp_git_commit(checkout, "unselected newer checkout");
+            std::fs::write(checkout.join("src/lib.rs"), "dirty ambient bytes\n").unwrap();
+            std::fs::write(checkout.join("untracked.txt"), "unselected new file\n").unwrap();
+        }
+        let spec =
+            prepare_clean_overlay_spec(&root.join("src"), Some(head), true, Vec::new(), true)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(spec.submodules.len(), 2);
+        let remote = tempfile::tempdir().unwrap().keep();
+        let (entry, pipeline) = clean_overlay_receipt_pipeline(&spec, &remote);
+        let prepared = prepare_clean_overlay_source_content_root(0, &entry, &pipeline, &spec)
+            .await
+            .unwrap();
+        let files: std::collections::BTreeMap<_, _> = prepared
+            .manifest
+            .files
+            .iter()
+            .map(|file| (file.path.as_str(), file))
+            .collect();
+        assert_eq!(
+            files["vendor/dep/src/lib.rs"].sha256,
+            sha256_hex(b"pub fn module_pin() {}\n")
+        );
+        assert_eq!(
+            files["vendor/dep/nested/leaf/src/lib.rs"].sha256,
+            sha256_hex(b"pub fn leaf_pin() {}\n")
+        );
+        for prefix in ["vendor/dep", "vendor/dep/nested/leaf"] {
+            for excluded in ["newer.txt", "untracked.txt", ".git"] {
+                assert!(!files.contains_key(format!("{prefix}/{excluded}").as_str()));
+            }
+        }
+        let policy = prepared
+            .manifest
+            .filter_policy
+            .clean_overlay
+            .as_ref()
+            .unwrap();
+        assert_eq!(policy.working_directory, Path::new("src"));
+        let pins = &policy.submodules;
+        assert_eq!(pins.len(), 2);
+        for (selected, (path, pin, checkout)) in pins.iter().zip([
+            ("vendor/dep", &module_pin, &module),
+            ("vendor/dep/nested/leaf", &leaf_pin, &leaf),
+        ]) {
+            assert_eq!(selected.path, Path::new(path));
+            assert_eq!(&selected.base_commit, pin);
+            assert_eq!(
+                selected.tree_object,
+                build_source_stamp_git(checkout, &["rev-parse", &format!("{pin}^{{tree}}")])
+            );
+            assert_ne!(
+                selected.base_commit,
+                build_source_stamp_git(checkout, &["rev-parse", "HEAD"])
+            );
+        }
+        let selected = spec
+            .submodules
+            .iter()
+            .map(|submodule| (submodule.path.clone(), submodule.base_commit.clone()))
+            .collect::<Vec<_>>();
+        let archive = TransferPipeline::create_selected_git_archive(
+            &spec.repository_root,
+            spec.base_commit(),
+            &selected,
+        )
+        .await
+        .unwrap();
+        tar::Archive::new(archive.reopen().unwrap())
+            .unpack(&remote)
+            .unwrap();
+        let payload = remote_manifest_payload(&prepared.manifest).unwrap();
+        let verified = run_source_verifier(&prepared.manifest, &payload, None, true);
+        assert!(verified.status.success(), "{verified:?}");
+        verify_local_source_content_manifest(&prepared)
+            .await
+            .unwrap();
+        std::fs::write(leaf.join("src/lib.rs"), "another unselected edit\n").unwrap();
+        verify_local_source_content_manifest(&prepared)
+            .await
+            .unwrap();
+        std::fs::write(
+            remote.join("vendor/dep/nested/leaf/src/lib.rs"),
+            "pub fn leaf_bad() {}\n",
+        )
+        .unwrap();
+        let refused = run_source_verifier(&prepared.manifest, &payload, None, true);
+        assert!(!refused.status.success());
+        assert!(refused.stdout.is_empty());
+
+        // Mutable archive attributes in any selected repository are still a
+        // live proof obligation, even though its checkout bytes are ignored.
+        let attributes = PathBuf::from(build_source_stamp_git(
+            &leaf,
+            &["rev-parse", "--git-path", "info/attributes"],
+        ));
+        let attributes = if attributes.is_absolute() {
+            attributes
+        } else {
+            leaf.join(attributes)
+        };
+        std::fs::create_dir_all(attributes.parent().unwrap()).unwrap();
+        std::fs::write(attributes, "* export-subst\n").unwrap();
+        assert!(
+            verify_local_source_content_manifest(&prepared)
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clean_overlay_receipt_base_only_preserves_git_bytes_and_refuses_policy_drift() {
+        let (root, head) = build_source_stamp_fixture_repo();
+        std::fs::write(root.join("src/lib.rs"), "pub fn unselected_dirty() {}\n").unwrap();
+        let spec = prepare_clean_overlay_spec(&root, Some(head), true, Vec::new(), true)
+            .await
+            .unwrap()
+            .unwrap();
+        let remote = tempfile::tempdir().unwrap().keep();
+        let (entry, pipeline) = clean_overlay_receipt_pipeline(&spec, &remote);
+        let prepared = prepare_clean_overlay_source_content_root(0, &entry, &pipeline, &spec)
+            .await
+            .unwrap();
+        assert_eq!(
+            prepared
+                .manifest
+                .files
+                .iter()
+                .find(|file| file.path == "src/lib.rs")
+                .unwrap()
+                .sha256,
+            sha256_hex(b"pub fn baseline() {}\n")
+        );
+        assert!(
+            prepared
+                .manifest
+                .filter_policy
+                .clean_overlay
+                .as_ref()
+                .unwrap()
+                .overlay_paths
+                .is_empty()
+        );
+        verify_local_source_content_manifest(&prepared)
+            .await
+            .unwrap();
+        std::fs::write(root.join(".rchignore"), "changed-filter-policy/\n").unwrap();
+        assert!(
+            verify_local_source_content_manifest(&prepared)
+                .await
+                .is_err()
+        );
+        std::fs::write(root.join(".git/info/attributes"), "* export-subst\n").unwrap();
+        assert!(
+            prepare_clean_overlay_source_content_root(0, &entry, &pipeline, &spec)
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clean_overlay_receipt_rejects_chained_archive_symlink_escape() {
+        let (root, _) = build_source_stamp_fixture_repo();
+        std::fs::create_dir_all(root.join("dir")).unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::write(root.join("target/inside"), "inside\n").unwrap();
+        std::os::unix::fs::symlink("../target", root.join("dir/link")).unwrap();
+        // Each target is lexically inside the root, but resolving the first
+        // symlink changes the depth before the following parent traversals.
+        std::os::unix::fs::symlink("dir/link/../../outside", root.join("escape")).unwrap();
+        build_source_stamp_git(&root, &["add", "-f", "."]);
+        build_source_stamp_git_commit(&root, "chained escape");
+        let head = build_source_stamp_git(&root, &["rev-parse", "HEAD"]);
+        let spec = prepare_clean_overlay_spec(&root, Some(head), true, Vec::new(), true)
+            .await
+            .unwrap()
+            .unwrap();
+        let remote = tempfile::tempdir().unwrap().keep();
+        let (entry, pipeline) = clean_overlay_receipt_pipeline(&spec, &remote);
+        let error =
+            match prepare_clean_overlay_source_content_root(0, &entry, &pipeline, &spec).await {
+                Ok(_) => panic!("selected archive symlink escape was admitted"),
+                Err(error) => error,
+            };
+        assert!(
+            error.to_string().contains("symlink escapes root"),
+            "{error:#}"
+        );
     }
 
     fn build_source_stamp_overlay_spec(

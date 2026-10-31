@@ -2815,6 +2815,16 @@ pub(crate) fn configure_clean_git_command(command: &mut Command) {
         .arg("tar.umask=0022");
 }
 
+/// Source verification has distinct timestamp and surplus-file policies.
+/// Clean overlays compare only the selected live overlay through rsync; their
+/// immutable baseline is checked by the complete source-content manifest.
+#[derive(Clone, Copy)]
+enum SourceContentBarrier {
+    Ordinary,
+    Owned { managed_timestamps: bool },
+    CleanOverlay,
+}
+
 /// Transfer pipeline for remote compilation.
 #[derive(Clone)]
 pub struct TransferPipeline {
@@ -4744,7 +4754,7 @@ impl TransferPipeline {
         &self,
         worker: &WorkerConfig,
         effective_excludes: &[String],
-        owned_managed_timestamps: Option<bool>,
+        policy: SourceContentBarrier,
     ) -> Command {
         let remote_path = self.remote_path();
         let escaped_remote_path = escape(Cow::from(&remote_path));
@@ -4755,10 +4765,13 @@ impl TransferPipeline {
         );
 
         let (mut cmd, capabilities) = self.rsync_command();
-        let receiver = if owned_managed_timestamps.is_some() {
-            self.source_rsync_path("rsync".to_owned())
-        } else {
-            self.source_rsync_path(format!("mkdir -p {} && rsync", escaped_remote_path))
+        let receiver = match policy {
+            SourceContentBarrier::Ordinary => {
+                self.source_rsync_path(format!("mkdir -p {} && rsync", escaped_remote_path))
+            }
+            SourceContentBarrier::Owned { .. } | SourceContentBarrier::CleanOverlay => {
+                self.source_rsync_path("rsync".to_owned())
+            }
         };
         self.append_source_rsync_io_timeout(&mut cmd);
         cmd.arg("-azn")
@@ -4771,10 +4784,17 @@ impl TransferPipeline {
             .arg("--rsync-path")
             .arg(receiver);
         add_portable_rsync_archive_args(&mut cmd);
-        if self.sync_delete || owned_managed_timestamps.is_some() {
+        if matches!(policy, SourceContentBarrier::Owned { .. })
+            || (matches!(policy, SourceContentBarrier::Ordinary) && self.sync_delete)
+        {
             cmd.arg("--delete");
         }
-        if owned_managed_timestamps == Some(true) {
+        if matches!(
+            policy,
+            SourceContentBarrier::Owned {
+                managed_timestamps: true
+            } | SourceContentBarrier::CleanOverlay
+        ) {
             cmd.arg("--no-times");
         }
         self.append_sync_filter_args(&mut cmd, effective_excludes);
@@ -4796,8 +4816,11 @@ impl TransferPipeline {
             anyhow::bail!("source-content receipts require the rsync transport");
         }
         let effective_excludes = self.get_effective_excludes();
-        let cmd =
-            self.build_source_content_rsync_barrier_command(worker, &effective_excludes, None);
+        let cmd = self.build_source_content_rsync_barrier_command(
+            worker,
+            &effective_excludes,
+            SourceContentBarrier::Ordinary,
+        );
 
         let output = run_source_content_rsync_capture(
             cmd,
@@ -4826,11 +4849,43 @@ impl TransferPipeline {
         let cmd = self.build_source_content_rsync_barrier_command(
             worker,
             &effective_excludes,
-            Some(managed_timestamps),
+            SourceContentBarrier::Owned { managed_timestamps },
         );
         let output = run_source_content_rsync_capture(
             cmd,
             "owned source-content rsync no-delta barrier",
+            self.source_sync_attempt_timeout(&effective_excludes),
+            None,
+        )
+        .await?;
+        source_content_barrier::verify_output(&output).map_err(anyhow::Error::msg)
+    }
+
+    /// Check selected overlay bytes after the clean source/target pair has
+    /// refreshed source timestamps. The immutable Git baseline can contain
+    /// paths absent from the live overlay, so this barrier never treats those
+    /// baseline files as surplus. The complete manifest verifies them too.
+    pub(crate) async fn verify_clean_overlay_source_content_rsync_barrier(
+        &self,
+        worker: &WorkerConfig,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !self.worker_platform.is_windows()
+                && self.source_authority_prefix.is_some()
+                && self.sync_include_patterns.is_some()
+                && !self.sync_delete
+                && self.sync_checksum,
+            "clean-overlay source verification requires a granted checksum overlay pipeline"
+        );
+        let effective_excludes = self.get_effective_excludes();
+        let cmd = self.build_source_content_rsync_barrier_command(
+            worker,
+            &effective_excludes,
+            SourceContentBarrier::CleanOverlay,
+        );
+        let output = run_source_content_rsync_capture(
+            cmd,
+            "clean-overlay source-content rsync no-delta barrier",
             self.source_sync_attempt_timeout(&effective_excludes),
             None,
         )
@@ -13403,8 +13458,23 @@ Number of files transferred: 42
             for command in [
                 pipeline.build_sync_command(&worker, "worker:/source", "/source", &[]),
                 pipeline.build_sync_streaming_command(&worker, "worker:/source", "/source", &[]),
-                pipeline.build_source_content_rsync_barrier_command(&worker, &[], None),
-                pipeline.build_source_content_rsync_barrier_command(&worker, &[], Some(true)),
+                pipeline.build_source_content_rsync_barrier_command(
+                    &worker,
+                    &[],
+                    SourceContentBarrier::Ordinary,
+                ),
+                pipeline.build_source_content_rsync_barrier_command(
+                    &worker,
+                    &[],
+                    SourceContentBarrier::Owned {
+                        managed_timestamps: true,
+                    },
+                ),
+                pipeline.build_source_content_rsync_barrier_command(
+                    &worker,
+                    &[],
+                    SourceContentBarrier::CleanOverlay,
+                ),
             ] {
                 assert_eq!(timeout_args(command), expected_source);
             }
@@ -14140,7 +14210,11 @@ Number of files transferred: 42
             pipeline.build_result_dir_retrieve_command(&worker, "/src", Path::new("results")),
             flavour_test_pipeline(RsyncFlavor::Unknown, 0)
                 .with_owned_source_materialization()
-                .build_source_content_rsync_barrier_command(&flavour_test_worker(), &[], None),
+                .build_source_content_rsync_barrier_command(
+                    &flavour_test_worker(),
+                    &[],
+                    SourceContentBarrier::Ordinary,
+                ),
         ] {
             assert!(!has_flag(&other), "{:?}", other.as_std());
         }
@@ -15128,7 +15202,9 @@ Number of files transferred: 42
             let args = command_args(&pipeline.build_source_content_rsync_barrier_command(
                 &worker,
                 &[],
-                Some(managed_times),
+                SourceContentBarrier::Owned {
+                    managed_timestamps: managed_times,
+                },
             ));
             for required in ["-azn", "--checksum", "--itemize-changes", "--delete"] {
                 assert!(args.iter().any(|arg| arg == required), "{args:?}");
@@ -15147,6 +15223,95 @@ Number of files transferred: 42
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn clean_overlay_source_barrier_checks_selected_bytes_with_managed_timestamps() {
+        let _guard = test_guard!();
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let remote = directory.path().join("worker");
+        for root in [&source, &remote] {
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            std::fs::write(root.join("src/selected.rs"), b"selected\n").unwrap();
+        }
+        std::fs::write(source.join("src/base.rs"), b"unselected local edit\n").unwrap();
+        std::fs::write(remote.join("src/base.rs"), b"committed baseline\n").unwrap();
+        std::fs::write(remote.join("base-only.rs"), b"committed source\n").unwrap();
+        let selected = PathBuf::from("src/selected.rs");
+        let remote_selected = remote.join(&selected);
+        std::fs::File::options()
+            .write(true)
+            .open(&remote_selected)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1234))
+            .unwrap();
+        let pipeline = TransferPipeline::new(
+            source.clone(),
+            "overlay-barrier".into(),
+            "abcdef".into(),
+            TransferConfig::default(),
+        )
+        .with_sync_include_patterns(clean_overlay_include_patterns(&source, &[selected]).unwrap())
+        .with_sync_delete(false)
+        .with_sync_checksum(true)
+        .with_remote_path_override(remote.to_str().unwrap());
+        let worker = flavour_test_worker();
+        // Exercise the production selection/checksum argv with real rsync on
+        // two local directories. Only SSH transport and its receiver launcher
+        // are replaced; this does not claim a remote-worker execution.
+        let verify = || {
+            let command = pipeline.build_source_content_rsync_barrier_command(
+                &worker,
+                &pipeline.get_effective_excludes(),
+                SourceContentBarrier::CleanOverlay,
+            );
+            let args = command_args(&command);
+            assert!(!args.iter().any(|arg| arg.starts_with("--delete")));
+            let receiver = &args
+                .windows(2)
+                .find(|pair| pair[0] == "--rsync-path")
+                .unwrap()[1];
+            assert!(!receiver.contains("mkdir"));
+            let mut local = std::process::Command::new("rsync");
+            local.env("LC_ALL", "C");
+            let mut index = 0;
+            while index + 1 < args.len() {
+                if matches!(args[index].as_str(), "-e" | "--rsync-path") {
+                    index += 2;
+                } else {
+                    local.arg(&args[index]);
+                    index += 1;
+                }
+            }
+            local.arg(format!("{}/", remote.display()));
+            let output = local.output().expect("real rsync must execute");
+            assert!(output.status.success(), "{output:?}");
+            assert!(output.stderr.is_empty(), "{output:?}");
+            output
+        };
+        source_content_barrier::verify_output(&verify()).unwrap();
+        // A checksum mismatch must refuse even when size and timestamp match.
+        std::fs::write(&remote_selected, b"modified\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&remote_selected)
+            .unwrap()
+            .set_modified(
+                std::fs::metadata(source.join("src/selected.rs"))
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(source_content_barrier::verify_output(&verify()).is_err());
+        assert_eq!(std::fs::read(&remote_selected).unwrap(), b"modified\n");
+        assert_eq!(
+            std::fs::read(remote.join("src/base.rs")).unwrap(),
+            b"committed baseline\n"
+        );
+        assert!(remote.join("base-only.rs").is_file());
+    }
+
     #[test]
     fn source_content_barrier_changes_only_ssh_log_verbosity() {
         let _guard = test_guard!();
@@ -15157,8 +15322,11 @@ Number of files transferred: 42
         let escaped = escape(Cow::from(remote.as_str()));
         let upload =
             command_args(&pipeline.build_sync_command(&worker, &destination, &escaped, &[]));
-        let barrier =
-            command_args(&pipeline.build_source_content_rsync_barrier_command(&worker, &[], None));
+        let barrier = command_args(&pipeline.build_source_content_rsync_barrier_command(
+            &worker,
+            &[],
+            SourceContentBarrier::Ordinary,
+        ));
         let ssh = |args: &[String]| {
             args.windows(2)
                 .find(|pair| pair[0] == "-e")
@@ -15224,7 +15392,11 @@ Number of files transferred: 42
                     pipeline.build_sync_command(&worker, &destination, &escaped, &[]),
                     pipeline.build_sync_streaming_command(&worker, &destination, &escaped, &[]),
                     pipeline.build_estimate_command(&worker),
-                    pipeline.build_source_content_rsync_barrier_command(&worker, &[], None),
+                    pipeline.build_source_content_rsync_barrier_command(
+                        &worker,
+                        &[],
+                        SourceContentBarrier::Ordinary,
+                    ),
                     pipeline.build_retrieve_command(&worker, &remote, &patterns),
                     pipeline.build_retrieve_streaming_command(&worker, &remote, &patterns),
                 ];
