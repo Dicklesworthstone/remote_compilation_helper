@@ -1822,6 +1822,21 @@ impl RemoteOutput {
         }
         Ok(())
     }
+
+    fn has_nonempty_metadata(&self) -> bool {
+        let Ok(empty) = super::object_id(b"") else {
+            return false;
+        };
+        let mut metadata = self
+            .manifest
+            .logical_outputs
+            .iter()
+            .filter(|output| output.role == OutputRole::ProvisionalMetadata);
+        metadata
+            .next()
+            .is_some_and(|output| output.object.0 != empty)
+            && metadata.all(|output| output.object.0 != empty)
+    }
 }
 
 /// A successful current producer, not an arbitrary cache-read capability.
@@ -1848,13 +1863,20 @@ impl PendingRemoteInstall {
         &self.output.manifest_key
     }
 
-    /// Early notification is available only after an actual dependency result
-    /// has completed and published. Affine workspace results keep their existing
-    /// complete-delivery protocol; no unfinished producer gains this capability.
+    /// Notification is available only after the actual compiler has completed:
+    /// a dependency result has published, while a workspace result retains its
+    /// affine execution custody. Neither grants unfinished-producer authority.
     #[must_use]
     pub fn supports_metadata(&self) -> bool {
-        matches!(self.result, RemoteInstallAuthority::Published)
-            && !self.request.is_execution_only()
+        let owns_result = match &self.result {
+            RemoteInstallAuthority::Published => !self.request.is_execution_only(),
+            RemoteInstallAuthority::RequestOwned(_) => self.request.is_execution_only(),
+        };
+        // Successful workspace binary/test checks can declare and announce an
+        // intentionally empty .rmeta. Preserve those exact outputs through the
+        // whole-result protocol: they cannot pass the nonempty readiness gate.
+        // Use the captured content identity, never a crate-name/path heuristic.
+        owns_result && self.output.has_nonempty_metadata()
     }
 
     /// Called only after the wrapper acknowledges this exact captured result.
@@ -1908,21 +1930,20 @@ impl PendingRemoteInstall {
             None
         };
         let mut metadata_exposed = false;
+        let mut notify = |files: &[PathBuf]| -> Result<(), String> {
+            // The complete reserved head is already visible, even if an
+            // input check or the exact wrapper acknowledgment subsequently fails.
+            metadata_exposed = true;
+            verify_request(request)?;
+            verify_metadata_head(plan, &self.output.manifest, files)?;
+            self.validation.verify(request)?;
+            verify_request(request)?;
+            let callback = metadata_ready.as_mut().ok_or("missing metadata receiver")?;
+            callback(&transcript[..prefix_len.ok_or("missing metadata prefix")?])
+        };
         let installed_result = match self.result {
             RemoteInstallAuthority::Published => {
                 if prefix_len.is_some() {
-                    let mut notify = |files: &[PathBuf]| -> Result<(), String> {
-                        // The complete reserved head is already visible, even
-                        // if a subsequent input check or receiver write fails.
-                        metadata_exposed = true;
-                        verify_request(request)?;
-                        verify_metadata_head(plan, &self.output.manifest, files)?;
-                        self.validation.verify(request)?;
-                        verify_request(request)?;
-                        let callback =
-                            metadata_ready.as_mut().ok_or("missing metadata receiver")?;
-                        callback(&transcript[..prefix_len.ok_or("missing metadata prefix")?])
-                    };
                     self.coord.serve_produced_result_with_metadata(
                         &request.key.action_key,
                         &self.output.manifest_key,
@@ -1949,13 +1970,21 @@ impl PendingRemoteInstall {
                     Path::new(&physical.out_dir),
                     &expected,
                     || verify_request(request).and_then(|()| self.validation.verify(request)),
+                    if prefix_len.is_some() {
+                        Some(&mut notify)
+                    } else {
+                        None
+                    },
                 ) {
                     Ok(files) => Ok(ServeOutcome::Served { files }),
                     Err(RequestOwnedInstallError::Declined(reason)) => {
                         return InstallResult::Declined(reason);
                     }
                     Err(RequestOwnedInstallError::Fault(reason)) => {
-                        return InstallResult::Fault(reason);
+                        return install_fault(reason, metadata_exposed);
+                    }
+                    Err(RequestOwnedInstallError::MetadataExposed(reason)) => {
+                        return InstallResult::ExposedFault(reason);
                     }
                 }
             }

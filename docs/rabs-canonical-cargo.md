@@ -1366,6 +1366,21 @@ retained backing mappings. Source, dependency, toolchain or coordinator changes
 refuse installation. A repeated request needs another fresh execution, and
 uncertain execution cannot authorize concurrent local fallback.
 
+For a completed workspace result with nonempty declared metadata and a valid
+compiler notification prefix, the matching wrapper receives metadata before
+the archive tail. The coordinator installs and verifies the metadata and
+dep-info, sends the original compiler prefix, and waits for its exact
+acknowledgment before staging the remaining outputs. One reservation covers
+every destination, and the original result pins and input guards remain owned
+through both phases. Input or coordinator changes during the acknowledgment
+prevent tail installation. Any failure after head exposure prevents local
+fallback. Successful checks whose metadata is intentionally empty retain
+complete-result delivery.
+
+This permits downstream Cargo work to overlap archive installation after the
+workspace compiler has completed. It does not grant cache authority or expose
+an unfinished producer's metadata.
+
 Workspace results do not create an action-cache publication, serving entry,
 differential sample or replayable transcript index. This adds remote execution
 for eligible workspace compilations without granting workspace action-cache reuse.
@@ -1960,8 +1975,11 @@ replay receipt and does not manufacture a passing verification sample. Only
 the dep-info and nonempty metadata head is installed before acknowledgment,
 under the same complete destination reservation used by the archive tail.
 Every negotiated frame binds the action, manifest and exact remote capture.
-Failures after exposing the head prevent local fallback. Older wrappers and
-request-owned workspace results retain complete-result delivery.
+Failures after exposing the head prevent local fallback. Completed request-owned
+workspace results use the same metadata acknowledgment with their original
+private result custody instead of publication or replay authority. The fixture
+also requires their metadata acknowledgment before complete installation.
+Older wrappers and valid empty-metadata results retain complete-result delivery.
 
 This permits downstream Cargo work to overlap local archive materialization.
 It does not expose an unfinished remote producer, overlap worker artifact

@@ -3968,6 +3968,12 @@ fn remote_native_workspace(command: &str) {
         previous_workspace = Some(workspace.clone());
         previous_archive = archive;
         let offered = decisions(&events, "remote-offer");
+        if build {
+            // These are real fresh workspace/dependency compilations. The
+            // delivered binary above consumes their archives, while the exact
+            // metadata ACK must precede each complete result installation.
+            assert_metadata_delivery(&events, &offered, true, &output);
+        }
         if cold {
             assert_eq!(offered.len(), 3, "{output}");
             assert!(
@@ -3998,6 +4004,14 @@ fn remote_native_workspace(command: &str) {
                 dependency_keys.as_ref(),
                 "unchanged dependencies must replay while own native inputs compile afresh: {output}"
             );
+            if build {
+                assert_metadata_delivery(
+                    &events,
+                    dependency_keys.as_ref().unwrap(),
+                    false,
+                    &output,
+                );
+            }
             assert_eq!(
                 events
                     .iter()
@@ -4364,6 +4378,12 @@ fn assert_metadata_delivery(
         .iter()
         .enumerate()
         .filter(|(_, event)| event["kind"] == "rabsd-metadata-prefix-acknowledged")
+        .filter(|(_, event)| {
+            event["remote"]
+                .as_bool()
+                .expect("metadata delivery must identify its actual origin")
+                == remote
+        })
         .map(|(index, event)| {
             assert_eq!(event["sequence"], 1, "{output}");
             assert_eq!(event["remote"], remote, "{output}");
@@ -4399,7 +4419,7 @@ fn assert_metadata_delivery(
     assert_eq!(
         acknowledged.len(),
         expected.len(),
-        "each dependency archive must deliver one metadata prefix: {output}"
+        "each selected archive must deliver one metadata prefix: {output}"
     );
     assert_eq!(
         acknowledged.into_iter().collect::<BTreeSet<_>>(),
@@ -4407,7 +4427,7 @@ fn assert_metadata_delivery(
             .values()
             .map(String::as_str)
             .collect::<BTreeSet<_>>(),
-        "metadata delivery did not cover the actual dependency results: {output}"
+        "metadata delivery did not cover the actual selected results: {output}"
     );
 }
 
@@ -4534,13 +4554,16 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
             workspace_units,
             &mut workspace_attempts,
         );
+        if build {
+            // Include the request-owned workspace library: its metadata must
+            // be acknowledged before final installation, and delivered_build
+            // above links and executes the exact completed archive output.
+            assert_metadata_delivery(&events, &offered, true, &output);
+        }
         let dependency_keys = offered
             .into_iter()
             .filter(|(name, _)| !workspace_units.contains(&name.as_str()))
             .collect::<BTreeMap<_, _>>();
-        if build {
-            assert_metadata_delivery(&events, &dependency_keys, true, &output);
-        }
         if let Some(expected) = &first_keys {
             assert_eq!(
                 &dependency_keys, expected,
@@ -4611,6 +4634,9 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
             workspace_units,
             &mut workspace_attempts,
         );
+        if build {
+            assert_metadata_delivery(&events, &workspace_keys, true, &output);
+        }
         assert_eq!(
             decisions(&events, "remote-offer"),
             workspace_keys,
