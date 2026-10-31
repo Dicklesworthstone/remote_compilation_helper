@@ -430,32 +430,59 @@ three-variable singleton configuration and its status fields remain supported.
 
 ### Reuse uploaded sources and dependency archives
 
-Workers retain a digest-verified input cache across sessions and restarts by
-default. Its objects live in `source-files-v1` below the worker's existing
-private journal directory and have a 512 MiB aggregate allowance. Source files,
-generated inputs and Rust dependency archives share this cache; objects larger
-than 4 MiB are reusable too, up to the existing 512 MiB source-projection limit.
-Every hit is fully hashed into a private snapshot before populating a fresh
-execution receiver. Hashing and copying use 64 KiB buffers, and the final source
-seal remains required even when no file bytes need uploading.
+Workers retain digest-verified source bytes across sessions and restarts.
+Objects live in `source-files-v1` below the worker's private journal directory.
+The default retained-input allowance is 512 MiB. Source files, generated inputs
+and Rust dependency archives share its byte cache. Every hit is fully hashed
+into a private snapshot before populating a fresh execution receiver; the final
+source seal remains required even when nothing needs uploading.
+
+Workers also retain complete, read-only execution projections of package,
+workspace, generated and native trees within one process. Their keys bind the
+selected filenames, SHA-256 digests, lengths, executable modes and complete
+directory topology, including empty directories. Unrelated dependency artifacts
+in the surrounding transfer do not split an unchanged package projection. Cold
+preparation verifies an independent copy; warm acquisition checks the original
+filesystem generation and membership witnesses without rereading file contents.
+Execution leases keep those trees alive through process drain and output checks.
+Cargo home, output trees and dependency mountpoint placeholders remain private.
 
 For a directly launched worker, `--source-cache-bytes N` overrides
 `RABS_WORKER_SOURCE_CACHE_BYTES`. Both accept 0–8589934592 bytes; `0` disables
-input reuse. For example:
+input reuse. At capacities of at least 4 MiB, one quarter is reserved for
+execution projections and three quarters for byte objects. Smaller caches use
+only the byte cache. The projection pool additionally permits at most 64 images
+and 16,384 filesystem members. Pending captures, active leases and retired
+generations remain charged until their owned storage is reclaimed. For example:
 
 ```sh
 rabs-wkr --coordinator 192.0.2.10:7092 --worker-id leaf-worker --source-cache-bytes 1073741824
 ```
 
 `RABS_SOURCE_CACHE_DIR` optionally selects another existing absolute private
-directory instead of the journal directory. Reducing the allowance trims older
-retained objects when the next source upload seals. Cache corruption or eviction costs
-another upload; retained readers have independent snapshots, and execution
-never shares writable inodes with cached objects. Capacity bounds retained
-objects; transfer staging and one in-flight verification snapshot require
-additional temporary space. Lookup, copy and cache population use the original
-input deadline. This cache saves input transport; compilation, result
-publication and Cargo target-state policies retain their existing checks.
+directory instead of the journal directory. A retained process-shared writer
+lock makes the byte/projection partition exclusive across cache owners; other
+openers can read verified byte snapshots without growing the domain. If a
+previous process leaves projection storage behind, the domain stays read-only
+until that residue is resolved and its cache owners restart. Lowering the
+configured limit does not reclaim preserved orphaned storage. Uncertain
+ownership is never permission to delete it.
+
+Pool capacity pressure or a different source filesystem uses private execution
+projection preparation. Cache opt-out prevents acquisition. Every final writable
+namespace mount is checked against the cache domain, including legacy requests
+without an uploaded source owner. Corrupt generations require a fresh verified
+copy; another execution's live lease cannot be evicted. Upload operations retain
+their original deadline and cancellation owner, while execution preparation uses
+the current execution control.
+
+Retained capacity excludes request-private transfer staging and verification
+snapshots. Input objects must fit their byte-cache partition as well as the
+existing 512 MiB per-source limit. Projection reuse removes repeated execution
+tree copies and byte hashing; transport snapshot/import and the final receiver
+seal still run. Compilation, result publication and Cargo target-state policies
+retain their existing checks. This is input materialization reuse and grants no
+additional action-cache eligibility.
 
 ### Share a CPU budget between workers on the same host
 

@@ -2072,6 +2072,11 @@ async fn session_loop(
     let home = std::env::temp_dir().join(format!("rabs-wkr-home-{}", std::process::id()));
     let spills = std::env::temp_dir().join(format!("rabs-wkr-spill-{}", std::process::id()));
     for path in [&cargo_home, &home, &spills] {
+        if let Some(cache) = &resources.source_cache {
+            cache
+                .validate_runtime_root(path)
+                .map_err(|error| error.to_string())?;
+        }
         prepare_runtime_directory(path).map_err(|e| format!("prepare {}: {e}", path.display()))?;
     }
     let journal_root = journal.storage_root().to_path_buf();
@@ -2101,6 +2106,7 @@ async fn session_loop(
             let spills = spills.clone();
             let slots = report.slots;
             let host_budget = resources.host_budget.clone();
+            let source_cache = resources.source_cache.clone();
             let target_cache = resources.target_cache.clone();
             let id = request.request_id;
             let retention = retain_result
@@ -2116,6 +2122,7 @@ async fn session_loop(
                 let resources = ExecutionResources {
                     slots,
                     host_budget: host_budget.as_deref(),
+                    source_cache: source_cache.as_ref(),
                     target_cache: target_cache.as_ref().map(|cache| (cache, target_scope)),
                 };
                 match source.as_ref() {

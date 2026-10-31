@@ -630,7 +630,8 @@ mod pool_tests {
 
     #[test]
     fn source_mutations_replace_only_the_checked_generation_and_preserve_readers() {
-        let mutations: [(&str, fn(&Path), bool); 6] = [
+        type Mutation = (&'static str, fn(&Path), bool);
+        let mutations: [Mutation; 6] = [
             ("bytes", rewrite_compiler, true),
             ("inode", replace_compiler, false),
             ("membership", add_member, true),

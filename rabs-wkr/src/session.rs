@@ -850,6 +850,7 @@ const EXEC_STREAM_RESIDENT_BOUND: usize = 1024 * 1024;
 pub struct ExecutionResources<'a> {
     pub slots: u32,
     pub host_budget: Option<&'a crate::host_budget::HostBudget>,
+    pub source_cache: Option<&'a crate::source_transfer::SourceCache>,
     pub target_cache: Option<(
         &'a std::sync::Arc<crate::target_cache::TargetCache>,
         crate::target_cache::TargetCacheScope,
@@ -862,6 +863,7 @@ impl ExecutionResources<'_> {
         Self {
             slots,
             host_budget: None,
+            source_cache: None,
             target_cache: None,
         }
     }
@@ -1251,14 +1253,29 @@ fn execute_canonical_inner(
                 )
                 .map_err(|error| error.to_string())?;
             workspace_inputs = source
-                .prepare_dependency_source(request.request_id, context, &mut spec)
+                .prepare_dependency_source_cancellable(
+                    request.request_id,
+                    context,
+                    &mut spec,
+                    || control.reason().is_some(),
+                )
                 .map_err(|error| format!("workspace input preparation: {error}"))?;
             retained_package = Some(source_root);
             generated_inputs = source
-                .prepare_dependency_generated(request.request_id, context, &mut spec)
+                .prepare_dependency_generated_cancellable(
+                    request.request_id,
+                    context,
+                    &mut spec,
+                    || control.reason().is_some(),
+                )
                 .map_err(|error| format!("generated input preparation: {error}"))?;
             native_inputs = source
-                .prepare_dependency_native(request.request_id, context, &mut spec)
+                .prepare_dependency_native_cancellable(
+                    request.request_id,
+                    context,
+                    &mut spec,
+                    || control.reason().is_some(),
+                )
                 .map_err(|error| format!("native input preparation: {error}"))?;
             let inputs = source
                 .prepare_dependency_output(request.request_id, context, &mut spec)
@@ -1399,6 +1416,15 @@ fn execute_canonical_inner(
                     "{}",
                     serde_json::json!({"kind":"worker-target-state-refused", "request_id":request.request_id, "error":error.to_string()})
                 );
+            }
+        }
+    }
+    if let Some(cache) = resources.source_cache {
+        for bind in &spec.rw_binds {
+            if let Err(error) = cache.validate_runtime_root(&bind.backing) {
+                let _ =
+                    control.retain_outputs(Err(format!("source cache mount isolation: {error}")));
+                return exec_error(request.request_id);
             }
         }
     }

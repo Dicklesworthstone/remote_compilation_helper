@@ -6,15 +6,16 @@
 //! The directory is scoped to one trusted worker administrative domain.
 
 use rabs_sandbox::source_transfer::{
-    MAX_SOURCE_BYTES, MAX_SOURCE_CHUNK, SourceFile, SourceReceiver,
+    MAX_SOURCE_BYTES, MAX_SOURCE_CHUNK, SOURCE_PROJECTION_PREFIX, SourceFile, SourceProjectionPool,
+    SourceReceiver,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Instant, SystemTime};
 
 /// Retain one maximum-size source/dependency projection by default.
@@ -24,6 +25,9 @@ pub const MAX_SOURCE_CACHE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_FILES: usize = 4096;
 const MAX_FILE_BYTES: u64 = MAX_SOURCE_BYTES;
 const INCOMING: &str = "incoming";
+const MIN_PROJECTION_CACHE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_PROJECTION_IMAGES: usize = 64;
+const MAX_PROJECTION_MEMBERS: usize = 4 * MAX_FILES;
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -91,6 +95,29 @@ fn same_state(a: &Metadata, b: &Metadata) -> bool {
         let _ = (a, b);
         false
     }
+}
+
+/// Only a complete, unchanged bounded inventory can rule out retained images.
+/// Names suffice to refuse reuse; uncertain storage is never traversed/deleted.
+fn projection_residue(parent: &Path) -> io::Result<bool> {
+    private_directory(parent)?;
+    let before = fs::symlink_metadata(parent)?;
+    for (index, entry) in fs::read_dir(parent)?.enumerate() {
+        if index >= MAX_FILES {
+            return Err(invalid("source cache parent inventory exceeds its bound"));
+        }
+        if entry?
+            .file_name()
+            .as_encoded_bytes()
+            .starts_with(SOURCE_PROJECTION_PREFIX.as_bytes())
+        {
+            return Ok(true);
+        }
+    }
+    if !same_state(&before, &fs::symlink_metadata(parent)?) {
+        return Err(invalid("source cache parent changed during inspection"));
+    }
+    Ok(false)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -252,6 +279,17 @@ struct Entry {
     used: SystemTime,
 }
 
+#[derive(Debug)]
+struct ProjectionWriter {
+    file: Arc<File>,
+    local: Mutex<()>,
+}
+
+enum CacheWriter<'a> {
+    Process { file: File },
+    Local { _guard: MutexGuard<'a, ()> },
+}
+
 /// A path is only configuration, never an input capability. The cache owns a
 /// dedicated namespace below an explicitly configured private directory.
 #[derive(Debug, Clone)]
@@ -260,6 +298,9 @@ pub struct SourceCache {
     max_bytes: u64,
     max_files: usize,
     control: CacheControl,
+    projections: Option<Arc<SourceProjectionPool>>,
+    projection_writer: Option<Arc<ProjectionWriter>>,
+    quarantine: Arc<Mutex<Option<File>>>,
 }
 
 #[derive(Debug)]
@@ -301,12 +342,103 @@ impl SourceCache {
             Err(error) => return Err(error),
         }
         private_directory(&root)?;
-        Ok(Self {
+        // Keep the existing configured retained-byte budget: larger caches
+        // reserve one quarter for complete read-only execution projections.
+        // Tiny caches remain byte-only, and zero still omits SourceCache.
+        let projection_bytes = if max_bytes >= MIN_PROJECTION_CACHE_BYTES {
+            max_bytes / 4
+        } else {
+            0
+        };
+        let mut cache = Self {
             root,
-            max_bytes,
+            max_bytes: max_bytes - projection_bytes,
             max_files: MAX_FILES,
             control: CacheControl::default(),
-        })
+            projections: None,
+            projection_writer: None,
+            quarantine: Arc::new(Mutex::new(None)),
+        };
+        let retained_writer = cache.reserve_projection_budget(projection_bytes != 0)?;
+        if let Some(file) = retained_writer {
+            // Hold the existing process-shared writer lock through the final
+            // retained image lease. Independent cache opens can still read
+            // snapshots, but cannot grow raw storage or create a second pool.
+            // Clones of this owner serialize their own writes locally.
+            let pool = SourceProjectionPool::new(
+                parent,
+                projection_bytes,
+                MAX_PROJECTION_IMAGES,
+                MAX_PROJECTION_MEMBERS,
+            )?
+            .with_retention_lock(Arc::clone(&file))?;
+            cache.projections = Some(Arc::new(pool));
+            cache.projection_writer = Some(Arc::new(ProjectionWriter {
+                file,
+                local: Mutex::new(()),
+            }));
+        } else {
+            // An existing writer may still be using the old raw-file budget.
+            // Skip the optional pool instead of oversubscribing that budget.
+            cache.max_bytes = max_bytes;
+        }
+        Ok(cache)
+    }
+
+    pub(super) fn projections(&self) -> Option<Arc<SourceProjectionPool>> {
+        self.projections.as_ref().map(Arc::clone)
+    }
+
+    /// Refuse writable runtime aliases, including legacy commands without uploads.
+    pub fn validate_runtime_root(&self, path: &Path) -> io::Result<()> {
+        let path = fs::canonicalize(path).or_else(|error| {
+            if error.kind() != io::ErrorKind::NotFound {
+                return Err(error);
+            }
+            let (parent, name) = path
+                .parent()
+                .zip(path.file_name())
+                .ok_or_else(|| invalid("invalid runtime root"))?;
+            Ok(fs::canonicalize(parent)?.join(name))
+        })?;
+        let parent = self
+            .root
+            .parent()
+            .ok_or_else(|| invalid("source cache parent missing"))?;
+        if let Some(pool) = &self.projections {
+            pool.protected_parent()?;
+        }
+        if parent.starts_with(&path) || path.starts_with(parent) {
+            return Err(invalid("runtime root aliases retained source storage"));
+        }
+        Ok(())
+    }
+
+    fn reserve_projection_budget(&self, enabled: bool) -> io::Result<Option<Arc<File>>> {
+        let Some(_writer) = self.writer()? else {
+            return Ok(None);
+        };
+        if !enabled {
+            return Ok(None);
+        }
+        let mut entries = self.inventory()?;
+        let mut total = entries.iter().try_fold(0_u64, |sum, entry| {
+            sum.checked_add(entry.bytes)
+                .ok_or_else(|| invalid("source cache size overflow"))
+        })?;
+        while total > self.max_bytes || entries.len() > self.max_files {
+            let entry = entries
+                .pop_front()
+                .ok_or_else(|| invalid("source cache capacity accounting is inconsistent"))?;
+            fs::remove_file(&entry.path)?;
+            total -= entry.bytes;
+        }
+        match _writer {
+            CacheWriter::Process { file } => Ok(Some(Arc::new(file))),
+            CacheWriter::Local { .. } => {
+                Err(invalid("source cache projection budget already owned"))
+            }
+        }
     }
 
     pub(super) fn before(mut self, deadline: Instant) -> Self {
@@ -358,10 +490,33 @@ impl SourceCache {
         true
     }
 
-    fn writer(&self) -> io::Result<Option<File>> {
+    fn writer(&self) -> io::Result<Option<CacheWriter<'_>>> {
         self.control.check()?;
         private_directory(&self.root)?;
         let path = self.root.join("lock");
+        if let Some(owner) = &self.projection_writer {
+            let metadata = owner.file.metadata()?;
+            if !ordinary(&metadata) || !same_inode(&metadata, &fs::symlink_metadata(&path)?) {
+                return Err(invalid("retained source cache writer identity changed"));
+            }
+            return match owner.local.try_lock() {
+                Ok(guard) => Ok(Some(CacheWriter::Local { _guard: guard })),
+                Err(std::sync::TryLockError::WouldBlock) => Ok(None),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    Err(invalid("source cache writer poisoned"))
+                }
+            };
+        }
+        let mut quarantine = match self.quarantine.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid("source cache quarantine poisoned"));
+            }
+        };
+        if quarantine.is_some() {
+            return Ok(None);
+        }
         match fs::symlink_metadata(&path) {
             Ok(meta) if !ordinary(&meta) => return Err(invalid("invalid source cache lock")),
             Ok(_) => {}
@@ -381,7 +536,30 @@ impl SourceCache {
             return Err(invalid("source cache lock identity changed"));
         }
         match file.try_lock() {
-            Ok(()) => Ok(Some(file)),
+            Ok(()) => {
+                let parent = self
+                    .root
+                    .parent()
+                    .ok_or_else(|| invalid("source cache parent missing"))?;
+                let residue = projection_residue(parent);
+                self.control.check()?;
+                if !matches!(residue, Ok(false)) {
+                    // A crashed predecessor released flock without freeing its
+                    // images. Retain this lock even for tiny/lowered budgets;
+                    // old passive handles must pass the same check on writing.
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "kind": "worker-source-cache-read-only",
+                            "reason": "retained projection residue or incomplete parent inspection",
+                            "preserved_bytes": null,
+                        })
+                    );
+                    *quarantine = Some(file);
+                    return Ok(None);
+                }
+                Ok(Some(CacheWriter::Process { file }))
+            }
             Err(fs::TryLockError::WouldBlock) => Ok(None),
             Err(fs::TryLockError::Error(error)) => Err(error),
         }
@@ -622,6 +800,26 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_parent_inventory_retains_a_read_only_domain_lock() {
+        let parent = private();
+        for index in 0..=MAX_FILES {
+            File::create(parent.path().join(format!("entry-{index}"))).unwrap();
+        }
+        let cache = SourceCache::open(parent.path(), 1).unwrap();
+        let input = private();
+        let source = staged(input.path(), &[("new", b"x")]);
+        assert!(cache.projections().is_none());
+        assert!(cache.quarantine.try_lock().unwrap().is_some());
+        assert_eq!(cache.remember(&source).unwrap(), 0);
+        let other = File::open(cache.root.join("lock")).unwrap();
+        assert!(matches!(
+            other.try_lock(),
+            Err(fs::TryLockError::WouldBlock)
+        ));
+        assert_eq!(fs::read_dir(&cache.root).unwrap().count(), 1);
+    }
+
+    #[test]
     fn reuse_survives_reopen_and_never_aliases_a_staging_inode() {
         let parent = private();
         let input = private();
@@ -765,7 +963,7 @@ mod tests {
     }
 
     fn bounded_cache(parent: &Path, bytes: u64, files: usize) -> SourceCache {
-        let mut cache = SourceCache::open(parent, DEFAULT_SOURCE_CACHE_BYTES).unwrap();
+        let mut cache = SourceCache::open(parent, bytes.max(1)).unwrap();
         cache.max_bytes = bytes;
         cache.max_files = files;
         cache
@@ -1073,7 +1271,9 @@ mod tests {
         let first = vec![b'A'; 5 * 1024 * 1024 + 17];
         let second = vec![b'B'; first.len()];
         let source = staged(input.path(), &[("a.rlib", &first), ("b.rlib", &second)]);
-        let capacity = 6 * 1024 * 1024;
+        // Three quarters remain available to byte objects after the retained
+        // projection reservation; enough for one of these actual large files.
+        let capacity = 8 * 1024 * 1024;
         let cache = SourceCache::open(parent.path(), capacity).unwrap();
         assert_eq!(cache.remember(&source).unwrap(), 1);
         let inodes = cache_inodes(&cache);
@@ -1098,6 +1298,8 @@ mod tests {
         );
         assert!(reopened.load(&source.manifest().files()[1]).is_none());
 
+        drop(reopened);
+        drop(cache);
         let smaller = SourceCache::open(parent.path(), 4 * 1024 * 1024).unwrap();
         assert!(smaller.load(&source.manifest().files()[0]).is_none());
         assert_eq!(smaller.remember(&source).unwrap(), 0);

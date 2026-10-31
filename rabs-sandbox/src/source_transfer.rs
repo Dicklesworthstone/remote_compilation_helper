@@ -10,6 +10,10 @@
 //! usable root before every declared byte is verified. Filesystem work is
 //! synchronous; orchestration must keep the owner alive through process cleanup.
 
+mod projection;
+
+pub use projection::{SourceProjectionLease, SourceProjectionPool};
+
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -19,6 +23,8 @@ use std::path::{Path, PathBuf};
 
 /// Version negotiated independently of output/artifact transfer.
 pub const SOURCE_TRANSFER: &str = "source-files-v1";
+/// Retained image parents. A leftover name must not be credited as free cache space.
+pub const SOURCE_PROJECTION_PREFIX: &str = "source-projections-";
 /// Bounded decoded bytes in one chunk, before hexadecimal wire expansion.
 pub const MAX_SOURCE_CHUNK: usize = 64 * 1024;
 /// Maximum number of regular files in one projected source tree.

@@ -183,6 +183,7 @@ fn canonical_action_observes_only_worker_authored_jobserver_env() {
             ExecutionResources {
                 slots: 6,
                 host_budget: Some(&host_budget),
+                source_cache: None,
                 target_cache: None,
             },
             &workspace.path().join("spills"),
@@ -267,6 +268,7 @@ fn canonical_action_observes_only_worker_authored_jobserver_env() {
     let resources = ExecutionResources {
         slots: 6,
         host_budget: Some(&host_budget),
+        source_cache: None,
         target_cache: None,
     };
     let result = std::thread::scope(|scope| {
