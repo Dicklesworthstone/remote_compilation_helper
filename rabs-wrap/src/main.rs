@@ -16,18 +16,21 @@
 //! 5. on pass-through, `exec` the real rustc — the wrapper process
 //!    BECOMES the compiler, preserving exit codes, signals, and stdio.
 //!    An accepted hit instead awaits installation and replays the
-//!    transcript only after explicit compiler-skip authorization.
+//!    transcript after explicit compiler-skip authorization. A negotiated
+//!    metadata prefix can unblock Cargo before the remaining outputs finish.
 //!
 //! Failure philosophy: before hit acceptance, wrapper-side problems —
 //! no daemon, timeout, malformed reply, unreadable state file — degrade
 //! to local exec. After acceptance, the daemon may own output writes:
 //! uncertain delivery fails closed. Local exec resumes only after a
 //! complete, typed reply on the install connection explicitly
-//! confirms that the install writer has returned. A lost original caller
+//! confirms that the install writer has returned, and only before any
+//! metadata transcript exposure. A lost original caller
 //! is cancellation, not a cache failure: it never authorizes local fallback,
 //! a new compiler attempt, or acceptance of a cache installation.
 
 mod capture;
+mod metadata;
 mod remote;
 mod singleflight;
 mod supervision;
@@ -553,6 +556,9 @@ enum Live {
     },
     /// An accepted hit with an unknown outcome, or a cancelled caller.
     FailClosed(String),
+    /// Metadata may have reached Cargo, or its stderr writer may still be
+    /// blocked. Exit without another stderr write or any compiler fallback.
+    FailClosedSilently,
 }
 
 fn live_decision_timeout_ms(breaker_budget_ms: u32) -> u32 {
@@ -590,7 +596,7 @@ fn live_request_frame(args: &[String], cwd: &str) -> Option<String> {
     }
     let argv_json: Vec<String> = args.iter().map(|a| json_string(a)).collect();
     let frame = format!(
-        "{{\"kind\":\"rustc-request\",\"argv\":[{}],\"cwd\":{},\"env\":[{}],\"wait_for_inflight\":true,\"remote_protocol\":1}}",
+        "{{\"kind\":\"rustc-request\",\"argv\":[{}],\"cwd\":{},\"env\":[{}],\"wait_for_inflight\":true,\"remote_protocol\":1,\"metadata_protocol\":1}}",
         argv_json.join(","),
         json_string(cwd),
         env.join(","),
@@ -601,7 +607,7 @@ fn live_request_frame(args: &[String], cwd: &str) -> Option<String> {
 /// Interpret a live decision. `Err(())` = the daemon failed us (breaker).
 fn live_outcome(
     reply: &reply_json::Value,
-    mut reader: BufReader<ConsultStream>,
+    reader: BufReader<ConsultStream>,
     owned: &impl Fn() -> bool,
 ) -> Result<Live, ()> {
     if !owned() {
@@ -643,51 +649,7 @@ fn live_outcome(
             if !capture::supported(reply) {
                 return Ok(Live::PassThrough);
             }
-            // Commit to waiting: from here on the daemon may write outputs,
-            // so this process must not run the compiler unless a complete,
-            // typed answer confirms that the install writer returned. Losing
-            // a connection does not prove that its daemon or writer died.
-            let Some(deadline) = Instant::now().checked_add(install_wait()) else {
-                return Ok(Live::FailClosed(
-                    "RABS install deadline is not representable".into(),
-                ));
-            };
-            if singleflight::write_owned(
-                &mut reader,
-                b"{\"kind\":\"rustc-accept\"}\n",
-                deadline,
-                owned,
-            )
-            .is_err()
-            {
-                return Ok(Live::FailClosed(
-                    "the RABS cache-hit acceptance could not be confirmed".into(),
-                ));
-            }
-            match singleflight::read_owned_reply(&mut reader, MAX_LIVE_REPLY_BYTES, deadline, owned)
-            {
-                Ok(line) => Ok(accepted_install_reply(&line)),
-                // A socket read timeout surfaces as WouldBlock (EAGAIN) on
-                // Linux and TimedOut elsewhere; both mean "still alive, no
-                // answer", which is never evidence that the writer returned.
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                    ) =>
-                {
-                    Ok(Live::FailClosed(
-                        "the RABS daemon accepted a cache hit but did not finish installing it"
-                            .into(),
-                    ))
-                }
-                // Caller loss, EOF/reset, invalid UTF-8, oversized or truncated
-                // frames all fail closed. Closing our connection does not stop
-                // an independently owned daemon writer or authorize fallback.
-                Err(error) => Ok(Live::FailClosed(format!(
-                    "the RABS cache-hit install outcome is unknown: {error}"
-                ))),
-            }
+            metadata::outcome(reply, reader, owned)
         }
         _ => Err(()),
     }
@@ -723,7 +685,8 @@ fn accepted_install_reply(line: &str) -> Live {
             if answer
                 .get("writer_returned")
                 .and_then(reply_json::Value::as_bool)
-                == Some(true) =>
+                == Some(true)
+                && metadata::exposure_flag(&answer) == Some(false) =>
         {
             Live::PassThrough
         }
@@ -918,6 +881,12 @@ fn observe_with_breaker(
         args,
         &owned,
     );
+    // A metadata writer can still be blocked on Cargo's stderr pipe. Neither
+    // cancellation reporting nor breaker bookkeeping may turn this into a
+    // fresh stderr write or a compiler retry.
+    if matches!(outcome, Ok(Live::FailClosedSilently)) {
+        return Live::FailClosedSilently;
+    }
     if !owned() {
         // Cancellation is neither daemon failure nor evidence of its health.
         // An abandoned probe keeps its already published cooldown reservation;
@@ -925,7 +894,7 @@ fn observe_with_breaker(
         return Live::FailClosed("original compiler caller disappeared".into());
     }
     let attempt = match &outcome {
-        Ok(Live::FailClosed(_)) | Err(()) => AttemptOutcome::Failed,
+        Ok(Live::FailClosed(_) | Live::FailClosedSilently) | Err(()) => AttemptOutcome::Failed,
         Ok(_) => AttemptOutcome::Succeeded,
     };
     match (probe_guard, probing_state) {
@@ -1258,6 +1227,9 @@ fn main() {
         // leave the daemon statting `--crate-name` and mislabeling
         // receipts.
         let decision = observe_with_breaker(&socket_path(), &breaker_path(), &consult_argv, owner);
+        if matches!(decision, Live::FailClosedSilently) {
+            std::process::exit(1);
+        }
         // Every return path, including errors, an open/contended breaker,
         // legacy decisions and writer-returned fallback, keeps this fence.
         stop_if_caller_lost(owner);
@@ -1289,6 +1261,7 @@ fn main() {
                 );
                 std::process::exit(1);
             }
+            Live::FailClosedSilently => std::process::exit(1),
         }
         stop_if_caller_lost(owner);
     }

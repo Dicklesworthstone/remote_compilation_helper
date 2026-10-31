@@ -24,6 +24,7 @@
 //! split itself, and the shutdown receipt shows the coord region
 //! abandoned so nothing hides.
 
+mod metadata_replay;
 mod output_install;
 mod request_owned_install;
 pub(super) use request_owned_install::RequestOwnedInstallError;
@@ -52,7 +53,7 @@ use rabs_cas::publication::{
 };
 use rabs_cas::serving_sample_gate::{
     ActionClassRisk, PrivateExecutionReason, SampleGateDecision, SamplingPolicy,
-    class_safety_refusal, serving_sample_decision,
+    class_safety_refusal, serving_sample_continuation_decision, serving_sample_decision,
 };
 use rabs_cas::serving_state::{ServeDecision, serving_gate};
 use rabs_cas::trust_evidence::{DISPOSITION_SERVABLE, evidence_set_digest};
@@ -389,6 +390,15 @@ pub enum ServeError {
     /// The existing materializer's full failure, including any already
     /// installed, verified prefix. Never erase this delivery-frontier evidence.
     Materialize(ActionMaterializeFailure),
+    /// Metadata has been installed for early compiler notification. The
+    /// subscriber must fail closed, even if the remaining writer has returned:
+    /// Cargo may already have started consumers of this exact result.
+    MetadataExposed {
+        /// Verified destinations installed before the failure.
+        installed: Vec<PathBuf>,
+        /// The gate, transport or materialization failure that stopped delivery.
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for ServeError {
@@ -410,6 +420,11 @@ impl std::fmt::Display for ServeError {
                 "materialization interrupted after {} installed outputs: {}",
                 failure.installed.len(),
                 failure.error,
+            ),
+            Self::MetadataExposed { installed, reason } => write!(
+                f,
+                "metadata delivery failed after {} installed outputs: {reason}",
+                installed.len(),
             ),
         }
     }
@@ -606,6 +621,17 @@ fn live_replay_permit(
     action: &TypedDigest,
     manifest_key: &str,
 ) -> Result<Option<ReplayInstallPermit>, StoreError> {
+    live_replay_permit_or_continuation(store, action, manifest_key, None)
+}
+
+/// A metadata/tail delivery is one installation. Its continuation verifies the
+/// exact spent receipt instead of requiring (or spending) another free slot.
+fn live_replay_permit_or_continuation(
+    store: &mut dyn RabsMetadataStore,
+    action: &TypedDigest,
+    manifest_key: &str,
+    continuing: Option<&ReplayInstallPermit>,
+) -> Result<Option<ReplayInstallPermit>, StoreError> {
     let action_key = digest_key(action);
     let rows = store.query(
         "SELECT seq, decision, reason FROM decision_receipts \
@@ -667,10 +693,20 @@ fn live_replay_permit(
     // None means the opt-in is off, not that evidence failed. Some(0) is a
     // hard verification requirement and must never inherit the fixed budget.
     // Policy changes reuse these same receipts, so they cannot replenish it.
-    let limit = LIVE_SAMPLING_POLICY
-        .replay_install_limit(store, action)?
-        .unwrap_or(LIVE_REPLAY_INSTALL_LIMIT);
-    Ok((used < limit).then_some(ReplayInstallPermit { subject, seq: used }))
+    let limit = match continuing {
+        Some(held) => LIVE_SAMPLING_POLICY.replay_continuation_limit(store, action, held.seq)?,
+        None => LIVE_SAMPLING_POLICY.replay_install_limit(store, action)?,
+    }
+    .unwrap_or(LIVE_REPLAY_INSTALL_LIMIT);
+    let install_seq = match continuing {
+        Some(held) if held.subject == subject && held.seq < used => held.seq,
+        Some(_) => return Ok(None),
+        None => used,
+    };
+    Ok((install_seq < limit).then_some(ReplayInstallPermit {
+        subject,
+        seq: install_seq,
+    }))
 }
 
 /// Final live replay admission, called with the SAME store lock subsequently
@@ -680,6 +716,15 @@ fn live_replay_gate(
     store: &mut dyn RabsMetadataStore,
     action: &TypedDigest,
     policy: &SamplingPolicy,
+) -> Result<Option<ReplayRefusal>, StoreError> {
+    live_replay_gate_for_install(store, action, policy, None)
+}
+
+fn live_replay_gate_for_install(
+    store: &mut dyn RabsMetadataStore,
+    action: &TypedDigest,
+    policy: &SamplingPolicy,
+    continuing: Option<&ReplayInstallPermit>,
 ) -> Result<Option<ReplayRefusal>, StoreError> {
     let risk = recorded_action_risk(store, action)?;
     let adverse = store
@@ -692,7 +737,11 @@ fn live_replay_gate(
             observations: u64::try_from(adverse).unwrap_or(u64::MAX),
         }));
     }
-    match serving_sample_decision(store, action, risk, policy)? {
+    let decision = match continuing {
+        Some(held) => serving_sample_continuation_decision(store, action, risk, policy, held.seq)?,
+        None => serving_sample_decision(store, action, risk, policy)?,
+    };
+    match decision {
         SampleGateDecision::ServeFromCache => Ok(None),
         SampleGateDecision::ExecutePrivately(reason) => Ok(Some(ReplayRefusal::Sampling(reason))),
     }
@@ -3713,6 +3762,34 @@ impl CoordLive {
         )
     }
 
+    /// Install the exact result previewed by this subscriber. Optional metadata
+    /// notification runs after its verified metadata writes, outside the store
+    /// lock and under the same complete destination reservation as the tail.
+    pub(super) fn serve_cached_result(
+        &self,
+        action_key: &TypedDigest,
+        manifest_key: &str,
+        destination_root: &Path,
+        expected: &ExpectedOutputs,
+        now_unix_micros: i64,
+        metadata_ready: Option<&mut metadata_replay::MetadataCallback<'_>>,
+    ) -> Result<ServeOutcome, ServeError> {
+        self.serve_action_bound(
+            action_key,
+            destination_root,
+            expected,
+            now_unix_micros,
+            0,
+            Some(LIVE_SAMPLING_POLICY),
+            ServeMode::Install,
+            None,
+            Some(metadata_replay::CachedResult {
+                manifest_key,
+                metadata_ready,
+            }),
+        )
+    }
+
     /// Read-only actor observation for subscriber delivery/diagnostics. Mutating
     /// this copy cannot mutate the coordinator or grant another dispatch.
     pub fn submitted_actor(
@@ -4153,6 +4230,7 @@ impl CoordLive {
             None,
             ServeMode::Install,
             Some(manifest_key),
+            None,
         )
     }
 
@@ -4176,6 +4254,7 @@ impl CoordLive {
             sampling,
             mode,
             None,
+            None,
         )
     }
 
@@ -4190,7 +4269,9 @@ impl CoordLive {
         sampling: Option<SamplingPolicy>,
         mode: ServeMode,
         produced_manifest: Option<&str>,
+        mut cached_result: Option<metadata_replay::CachedResult<'_, '_, '_>>,
     ) -> Result<ServeOutcome, ServeError> {
+        let started = Instant::now();
         // Take the authority snapshot BEFORE the store lock, preserving the
         // existing authority -> store lock order during coordinator startup.
         let replay_authority = if sampling.is_some() || produced_manifest.is_some() {
@@ -4270,7 +4351,10 @@ impl CoordLive {
             // store, not a hit.
             return Ok(ServeOutcome::NoCommit);
         };
-        if produced_manifest.is_some_and(|expected| expected != manifest_key) {
+        if produced_manifest
+            .or(cached_result.as_ref().map(|cached| cached.manifest_key))
+            .is_some_and(|expected| expected != manifest_key)
+        {
             return Ok(ServeOutcome::ManifestUnavailable { key: manifest_key });
         }
         let Some(manifest) = load_manifest(&mut *store, &manifest_key) else {
@@ -4347,6 +4431,18 @@ impl CoordLive {
         // The staged owner exposes no final destination and carries no serving
         // authority. A corrupt replica is settled only after reacquiring metadata.
         let selected = output_install::select_for_install(&mut *store, &plan)?;
+        let (selected, metadata_tail) = if cached_result
+            .as_ref()
+            .is_some_and(|cached| cached.metadata_ready.is_some())
+        {
+            let (metadata, tail) = selected.split_metadata();
+            match metadata {
+                Some(metadata) => (metadata, Some(tail)),
+                None => (tail, None),
+            }
+        } else {
+            (selected, None)
+        };
         drop(store);
         let prepared = match output_install::stage_for_install(selected, &plan) {
             Ok(prepared) => prepared,
@@ -4363,62 +4459,24 @@ impl CoordLive {
         // authority/gating boundary before the FIRST rename. The prepared CAS
         // owner independently rechecks object quarantine, selected locations and
         // private file generations during install.
+        let context = metadata_replay::InstallContext {
+            action: action_key,
+            manifest_key: &manifest_key,
+            authority: replay_authority.as_ref(),
+            now_unix_micros,
+            now_epoch,
+            started,
+            sampling,
+            producer: produced_manifest.is_some(),
+        };
         let mut store = cas
             .store()
             .lock()
             .map_err(|_| ServeError::StoreUnavailable)?;
-        declare_coordinator_domains(&mut *store);
-        if let Some(ref held) = replay_authority {
-            if !self.available() {
-                return Err(ServeError::CoordinatorUnavailable);
-            }
-            match store
-                .active_authority()
-                .map_err(|error| ServeError::Store(format!("{error:?}")))?
-            {
-                Some(active) if active.digest == authority_digest(held) => {}
-                _ => return Err(ServeError::CoordinatorUnavailable),
-            }
+        if let Some(refusal) = context.recheck(self, &mut *store, None)? {
+            return Ok(refusal);
         }
-        let standing = release_standing(
-            store
-                .release_verdict(&self.build_identity)
-                .map_err(|error| ServeError::Store(format!("{error:?}")))?
-                .as_ref(),
-            &self.build_identity,
-            now_unix_micros,
-            now_epoch,
-        );
-        if !standing.permits_serving(self.release_mode) {
-            return Ok(ServeOutcome::ReleaseUnauthorized { standing });
-        }
-        match serving_gate(&mut *store, &key, now_unix_micros, now_epoch)
-            .map_err(|error| ServeError::Store(format!("{error:?}")))?
-        {
-            ServeDecision::Servable => {}
-            decision => return Ok(ServeOutcome::NotServable(decision)),
-        }
-        if let Some(policy) = sampling
-            && let Some(refusal) = live_replay_gate(&mut *store, action_key, &policy)
-                .map_err(|error| ServeError::Store(format!("{error:?}")))?
-        {
-            return Ok(ServeOutcome::ExecutePrivately(refusal));
-        }
-        if produced_manifest.is_some()
-            && let Some(refusal) = live_producer_gate(&mut *store, action_key)
-                .map_err(|error| ServeError::Store(format!("{error:?}")))?
-        {
-            return Ok(ServeOutcome::ExecutePrivately(refusal));
-        }
-        match store
-            .published_manifest_key(action_key)
-            .map_err(|error| ServeError::Store(format!("{error:?}")))?
-        {
-            Some(current) if current == manifest_key => {}
-            Some(current) => return Ok(ServeOutcome::ManifestUnavailable { key: current }),
-            None => return Ok(ServeOutcome::NoCommit),
-        }
-        if sampling.is_some() {
+        let permit = if sampling.is_some() {
             let Some(permit) = live_replay_permit(&mut *store, action_key, &manifest_key)
                 .map_err(|error| ServeError::Store(format!("{error:?}")))?
             else {
@@ -4437,8 +4495,41 @@ impl CoordLive {
                     &manifest_key,
                 )
                 .map_err(|error| ServeError::Store(format!("{error:?}")))?;
+            Some(permit)
+        } else {
+            None
+        };
+        let files = output_install::install_prepared(&mut *store, &plan, prepared)
+            .map_err(|error| {
+                if metadata_tail.is_some()
+                    && matches!(&error, ServeError::Materialize(failure) if !failure.installed.is_empty())
+                {
+                    metadata_replay::exposed_failure(&[], error)
+                } else {
+                    error
+                }
+            })?;
+        drop(store);
+        if let Some(tail) = metadata_tail {
+            let callback = cached_result
+                .as_mut()
+                .and_then(|cached| cached.metadata_ready.as_deref_mut())
+                .ok_or_else(|| {
+                    metadata_replay::exposed_failure(
+                        &files,
+                        ServeError::Store("metadata callback ownership lost".into()),
+                    )
+                })?;
+            return metadata_replay::finish(
+                self,
+                &context,
+                &plan,
+                tail,
+                permit.as_ref(),
+                files,
+                callback,
+            );
         }
-        let files = output_install::install_prepared(&mut *store, &plan, prepared)?;
         Ok(ServeOutcome::Served { files })
     }
 

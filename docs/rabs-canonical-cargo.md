@@ -986,6 +986,39 @@ admission; this change does not claim complete per-unit acceleration for every
 macro-heavy graph. Build-script failure and generated-source errors preserve
 Cargo's failure status. No script, macro, test or program result cache is added.
 
+### Pipelined metadata delivery for committed dependency hits
+
+Matching `rabsd` and `rabs-wrap` binaries negotiate metadata delivery on an
+accepted dependency cache hit. For results containing separately emitted
+`.rmeta` and its recorded compiler artifact notification, the coordinator
+validates the complete output selection and reserves every destination, then
+stages and installs the metadata and derived dep-info before staging the
+remaining `.rlib` outputs. Cargo can receive its original metadata-ready notification
+while those larger outputs are still being prepared.
+
+The wrapper forwards and flushes the exact continuous stderr prefix through
+the metadata notification, including preceding dep-info notifications and diagnostics, before
+acknowledging the action and committed manifest. Final success replays only
+the remaining suffix. Notification order, diagnostic bytes and line endings
+are preserved. A result without an eligible notification uses complete-result
+delivery. Existing peers without the negotiated protocol keep that behavior.
+
+Both phases retain one destination reservation and spend one durable replay
+allowance. The coordinator checks original input observations before exposing
+metadata, and rechecks the current authority, manifest, serving/release gates,
+selected replicas and the exact spent receipt before installing the tail.
+The last permitted replay can finish its tail without obtaining a second
+allowance. A disconnect, expired deadline, corrupt tail or revoked authority
+after metadata exposure fails the build; it cannot start a second local rustc
+over the partially delivered outputs. The socket exchange and stderr-prefix
+delivery use bounded waits, including when Cargo stops reading its pipe.
+
+This delivery path uses already committed, qualified dependency results.
+Unfinished worker output does not gain publication or replay authority, and
+workspace compilation retains its existing execution-only policy. Native
+Cargo qualification and build-time measurements remain necessary to establish
+the effect on a particular workload.
+
 ### Create and run the local profile
 
 Install matching native `rabsd` and `rabs-wrap` binaries. The explicit nightly toolchain
@@ -1896,7 +1929,13 @@ dependencies, then verifies a relocated warm build without additional worker
 executions. It compares delivered `.rlib` bytes and executes the final linked
 binary, edits a dependency and requires new keys and changed outputs, and checks
 that the failing build script cannot create a completed build delivery. The
-sandbox fixture separately compiles an actual `.incbin` payload whose bytes appear
+warm archive checks also require one exact metadata-prefix acknowledgment per
+dependency before the daemon records complete installation. Separate real
+Unix-socket/wrapper subprocess tests in `rabs-wrap/tests/metadata_protocol.rs`
+hold back the final answer until the prefix is observed, check exact transcript
+reassembly, and exercise failure after exposure and blocked stderr. Those
+protocol fixtures do not substitute for this actual Cargo/worker acceptance.
+The sandbox fixture separately compiles an actual `.incbin` payload whose bytes appear
 in the archive but not rustc's dep-info, then verifies that unkeyed host/process/
 entropy inputs are inaccessible. The native-archive fixtures compile and link real
 C objects through both an own generated tree and two propagated native trees,

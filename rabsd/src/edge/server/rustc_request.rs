@@ -12,7 +12,11 @@
 //!   answer is `{"decision":"served","stderr_hex":…,
 //!   "compiler_skip_authorized":true}` (replay and exit 0) or
 //!   `{"decision":"serve-failed",…}` (the synchronous install returned; no
-//!   writer remains, so the compiler may run);
+//!   writer remains, so the compiler may run if metadata was never exposed).
+//!   Protocol-1 peers may receive an identity-bound `rustc-metadata` prefix
+//!   after the committed metadata is installed and before bulk staging. They
+//!   flush it before `rustc-metadata-ack`; the final `served` carries only the
+//!   remaining stderr. Any subsequent failure prohibits local compilation;
 //! - `{"kind":"rustc-decision","decision":"execute","attempt":…,"env":[…]}`
 //!   — run the compiler with EXACTLY `env` as an admitted attempt, then send
 //!   `{"kind":"rustc-complete","capture_protocol":1,…}` while retaining the
@@ -213,6 +217,7 @@ pub(super) enum Decided {
     Hit {
         reply: String,
         pending: Box<PendingServe>,
+        metadata: bool,
     },
     /// Offer private worker execution, then obtain fresh install consent.
     Remote {
@@ -780,7 +785,13 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
         }
         None => live.lane.decide(admitted),
     };
-    decision_reply(decision, &key_text, unit, may_wait)
+    decision_reply(
+        decision,
+        &key_text,
+        unit,
+        may_wait,
+        request.get("metadata_protocol").and_then(Value::as_u64) == Some(1),
+    )
 }
 
 fn decision_reply(
@@ -788,18 +799,24 @@ fn decision_reply(
     key_text: &str,
     unit: &str,
     wait_for_inflight: bool,
+    metadata: bool,
 ) -> Decided {
     match decision {
         LiveDecision::Hit(pending) => {
             log("hit", &[("crate", unit), ("key", key_text)]);
+            let mut reply = json!({
+                "kind": "rustc-decision", "decision": "hit",
+                "action_key": key_text, "capture_protocol": 1,
+                "compiler_skip_authorized": false,
+            });
+            if metadata {
+                reply["metadata_protocol"] = json!(1);
+                reply["manifest_key"] = json!(pending.manifest_key());
+            }
             Decided::Hit {
-                reply: json!({
-                    "kind": "rustc-decision", "decision": "hit",
-                    "action_key": key_text, "capture_protocol": 1,
-                    "compiler_skip_authorized": false,
-                })
-                .to_string(),
+                reply: reply.to_string(),
                 pending: Box::new(pending),
+                metadata,
             }
         }
         LiveDecision::Remote(pending) => {
@@ -880,10 +897,24 @@ fn decision_reply(
 
 /// Install an accepted hit (blocking). Only `served` authorizes skipping
 /// the compiler; every other answer is given after the synchronous install
-/// returned, so no writer remains behind it.
+/// returned, so no writer remains behind it. Metadata exposure additionally
+/// prohibits fallback even when the writer has returned.
 pub(super) fn install(live: &LiveEdge, pending: Box<PendingServe>) -> String {
     let key_text = digest_key(pending.action_key());
-    match pending.install() {
+    installed_reply(live, &key_text, pending.install())
+}
+
+pub(super) fn install_with_metadata(
+    live: &LiveEdge,
+    pending: Box<PendingServe>,
+    callback: impl FnMut(&[u8]) -> Result<(), String>,
+) -> String {
+    let key_text = digest_key(pending.action_key());
+    installed_reply(live, &key_text, pending.install_with_metadata(callback))
+}
+
+fn installed_reply(live: &LiveEdge, key_text: &str, result: InstallResult) -> String {
+    match result {
         InstallResult::Served {
             transcript,
             installed,
@@ -891,7 +922,7 @@ pub(super) fn install(live: &LiveEdge, pending: Box<PendingServe>) -> String {
             for output in installed {
                 live.facts.remember(&output.path, output.sig, output.digest);
             }
-            log("served", &[("key", &key_text)]);
+            log("served", &[("key", key_text)]);
             json!({
                 "kind": "rustc-decision", "decision": "served",
                 "action_key": key_text, "stderr_hex": hex(&transcript),
@@ -900,11 +931,21 @@ pub(super) fn install(live: &LiveEdge, pending: Box<PendingServe>) -> String {
             .to_string()
         }
         InstallResult::Declined(reason) | InstallResult::Fault(reason) => {
-            log("serve-failed", &[("key", &key_text), ("reason", &reason)]);
+            log("serve-failed", &[("key", key_text), ("reason", &reason)]);
             json!({
                 "kind": "rustc-decision", "decision": "serve-failed",
                 "action_key": key_text, "reason": reason,
                 "compiler_skip_authorized": false, "writer_returned": true,
+            })
+            .to_string()
+        }
+        InstallResult::ExposedFault(reason) => {
+            log("serve-failed", &[("key", key_text), ("reason", &reason)]);
+            json!({
+                "kind":"rustc-decision", "decision":"serve-failed",
+                "action_key":key_text, "reason":reason,
+                "compiler_skip_authorized":false, "writer_returned":true,
+                "metadata_exposed":true,
             })
             .to_string()
         }
@@ -1512,7 +1553,8 @@ mod tests {
 
     #[test]
     fn in_flight_is_a_non_owning_retry_not_a_hit_or_execution() {
-        let Decided::Reply(reply) = decision_reply(LiveDecision::InFlight, "key", "leaf", true)
+        let Decided::Reply(reply) =
+            decision_reply(LiveDecision::InFlight, "key", "leaf", true, false)
         else {
             panic!("a follower must not retain an attempt or install capability");
         };
@@ -1532,7 +1574,8 @@ mod tests {
             (LiveDecision::InFlight, false),
             (LiveDecision::PassThrough("store unavailable".into()), true),
         ] {
-            let Decided::Reply(reply) = decision_reply(decision, "key", "leaf", opted_in) else {
+            let Decided::Reply(reply) = decision_reply(decision, "key", "leaf", opted_in, false)
+            else {
                 panic!("no execution or output ownership on refusal");
             };
             let reply: Value = serde_json::from_str(&reply).unwrap();

@@ -32,8 +32,8 @@
 
 use crate::coord::action_actor::{JoinRequest, SubscriptionRequirements};
 use crate::coord::live::{
-    ActionSubmission, CoordLive, ExpectedOutputs, ServeMode, ServeOutcome, SubmissionRefusal,
-    load_manifest,
+    ActionSubmission, CoordLive, ExpectedOutputs, ServeError, ServeMode, ServeOutcome,
+    SubmissionRefusal, load_manifest,
 };
 use crate::edge::live_facts::{
     DependencyFacts, FileSig, GENERATED_ROOT, PACKAGE_ROOT, PackageFacts, ToolchainGuard,
@@ -50,7 +50,7 @@ use rabs_cas::publication::{
 use rabs_key::live_dependency::{
     DependencyActionPlan, DependencySourceKind, LiveDependencyKey,
     canonicalize_compiler_transcript, canonicalize_placements, check_dependency_cache_read_closure,
-    dep_info_closure_violation, render_compiler_transcript,
+    dep_info_closure_violation, metadata_replay_prefix_len, render_compiler_transcript,
 };
 use rabs_key::output_declarations::OutputClass;
 use rabs_key::typed_digest::compute;
@@ -304,6 +304,7 @@ pub struct PendingServe {
     coord: Arc<CoordLive>,
     request: LiveDependencyRequest,
     manifest: CanonicalActionResultManifest,
+    manifest_key: String,
     canonical_transcript: Vec<u8>,
     remote_validation: Option<remote::RemoteValidation>,
 }
@@ -324,6 +325,17 @@ pub enum InstallResult {
     /// The synchronous install failed. It has returned, so no writer
     /// remains; the caller may run the compiler over the target tree.
     Fault(String),
+    /// Metadata was installed for early notification. Cargo may have started
+    /// consumers, so even a settled writer must never authorize local fallback.
+    ExposedFault(String),
+}
+
+fn install_fault(reason: String, metadata_exposed: bool) -> InstallResult {
+    if metadata_exposed {
+        InstallResult::ExposedFault(reason)
+    } else {
+        InstallResult::Fault(reason)
+    }
 }
 
 /// Finish only after the synchronous materializer and output verification have
@@ -367,27 +379,58 @@ impl PendingServe {
         &self.request.key.action_key
     }
 
-    /// Install under every gate again (one store lock through install).
+    /// Exact committed result captured with the preview's bound transcript.
+    #[must_use]
+    pub fn manifest_key(&self) -> &str {
+        &self.manifest_key
+    }
+
+    fn verify_inputs(&self) -> Result<(), String> {
+        self.request
+            .verify_enforced_read_closure(self.remote_validation.as_ref())?;
+        if let Some(validation) = &self.remote_validation {
+            validation.verify(&self.request)?;
+        }
+        self.request.verify_toolchain()?;
+        self.request.verify_package()?;
+        self.request.dependencies.verify_unchanged()
+    }
+
+    fn committed_output(&self, path: &Path) -> Result<&LogicalOutput, String> {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| {
+                self.manifest
+                    .logical_outputs
+                    .iter()
+                    .find(|output| output.virtual_path.as_bytes() == name.as_bytes())
+            })
+            .ok_or_else(|| "installed output is not in the manifest".into())
+    }
+
+    /// Install the complete result before replaying any stderr.
     #[must_use]
     pub fn install(self) -> InstallResult {
-        let plan = &self.request.plan;
-        if let Err(reason) = self
-            .request
-            .verify_enforced_read_closure(self.remote_validation.as_ref())
-        {
-            return InstallResult::Declined(reason);
-        }
-        if let Some(validation) = &self.remote_validation
-            && let Err(reason) = validation.verify(&self.request)
-        {
-            return InstallResult::Declined(reason);
-        }
-        if let Err(reason) = self
-            .request
-            .verify_toolchain()
-            .and_then(|()| self.request.verify_package())
-            .and_then(|()| self.request.dependencies.verify_unchanged())
-        {
+        self.install_inner(None)
+    }
+
+    /// Deliver the exact metadata transcript prefix once its committed files
+    /// are verified in place. The callback must acknowledge forwarding those
+    /// bytes before returning; the terminal transcript contains only the suffix.
+    /// A callback error or any later failure permanently prohibits fallback.
+    #[must_use]
+    pub fn install_with_metadata(
+        self,
+        mut metadata_ready: impl FnMut(&[u8]) -> Result<(), String>,
+    ) -> InstallResult {
+        self.install_inner(Some(&mut metadata_ready))
+    }
+
+    fn install_inner(
+        self,
+        mut metadata_ready: Option<&mut dyn FnMut(&[u8]) -> Result<(), String>>,
+    ) -> InstallResult {
+        if let Err(reason) = self.verify_inputs() {
             return InstallResult::Declined(reason);
         }
         let expected = match self.request.installation_outputs() {
@@ -398,58 +441,130 @@ impl PendingServe {
             Ok(physical) => physical,
             Err(reason) => return InstallResult::Declined(reason),
         };
-        match self.coord.serve_for_subscriber(
-            &self.request.key.action_key,
-            Path::new(&physical.out_dir),
-            &expected,
-            now_micros(),
-            ServeMode::Install,
-        ) {
+        let transcript = render_compiler_transcript(&self.canonical_transcript, &self.request.plan);
+        let prefix_len = if metadata_ready.is_some() {
+            match metadata_replay_prefix_len(&transcript, &self.request.plan) {
+                Ok(prefix) => prefix,
+                Err(reason) => return InstallResult::Declined(reason.into()),
+            }
+        } else {
+            None
+        };
+        let mut metadata_exposed = false;
+        let outcome = {
+            let mut notify = |files: &[PathBuf]| -> Result<(), String> {
+                // Sticky before any verification or callback: the coordinator
+                // has already made metadata visible in the target namespace.
+                metadata_exposed = true;
+                self.verify_inputs()?;
+                let expected_head: std::collections::BTreeMap<_, _> = self
+                    .request
+                    .plan
+                    .outputs
+                    .declarations
+                    .iter()
+                    .filter(|output| {
+                        matches!(
+                            output.class,
+                            OutputClass::ProvisionalMetadata | OutputClass::DepInfo
+                        )
+                    })
+                    .map(|output| (output.virtual_path.as_bytes(), output_role(output.class)))
+                    .collect();
+                let mut installed_head = std::collections::BTreeMap::new();
+                for path in files {
+                    let committed = self.committed_output(path)?;
+                    if expected_head.get(committed.virtual_path.as_bytes()) != Some(&committed.role)
+                    {
+                        return Err("metadata phase installed an undeclared head role".into());
+                    }
+                    if committed.role == OutputRole::ProvisionalMetadata {
+                        let installed = known_installed_output(path, &committed.object.0)?;
+                        if installed.sig.size() == 0 {
+                            return Err(
+                                "zero-length metadata cannot authorize compiler notification"
+                                    .into(),
+                            );
+                        }
+                    }
+                    // The adapter separately re-read dep-info against the exact
+                    // subscriber derivation (or canonical Cargo object) before
+                    // entering this callback. Its canonical CAS digest cannot
+                    // identify an ordinary subscriber's rewritten .d bytes.
+                    installed_head.insert(committed.virtual_path.as_bytes(), committed.role);
+                }
+                if installed_head != expected_head || files.len() != expected_head.len() {
+                    return Err("metadata notification head outputs are not all installed".into());
+                }
+                // Recheck the original observations after reading every head
+                // file; no refreshed memo can bless a changed package/input.
+                self.verify_inputs()?;
+                let callback = metadata_ready.as_mut().ok_or("missing metadata receiver")?;
+                callback(&transcript[..prefix_len.ok_or("missing metadata prefix")?])
+            };
+            self.coord.serve_cached_result(
+                &self.request.key.action_key,
+                &self.manifest_key,
+                Path::new(&physical.out_dir),
+                &expected,
+                now_micros(),
+                if prefix_len.is_some() {
+                    Some(&mut notify)
+                } else {
+                    None
+                },
+            )
+        };
+        match outcome {
             Ok(ServeOutcome::Served { files }) => {
                 let mut installed = Vec::with_capacity(files.len());
                 for path in &files {
-                    let Some(committed) =
-                        path.file_name()
-                            .and_then(|name| name.to_str())
-                            .and_then(|name| {
-                                self.manifest.logical_outputs.iter().find(|output| {
-                                    output.virtual_path.as_bytes() == name.as_bytes()
-                                })
-                            })
-                    else {
-                        return InstallResult::Fault(
-                            "installed output is not in the manifest".into(),
-                        );
+                    let committed = match self.committed_output(path) {
+                        Ok(output) => output,
+                        Err(reason) => return install_fault(reason, metadata_exposed),
                     };
                     if committed.role == OutputRole::DepInfo {
                         continue;
                     };
                     match known_installed_output(path, &committed.object.0) {
                         Ok(output) => installed.push(output),
-                        Err(reason) => return InstallResult::Fault(reason),
+                        Err(reason) => return install_fault(reason, metadata_exposed),
                     }
                 }
                 // The synchronous writer has returned. A toolchain update
                 // during installation cannot authorize a skip under the old
                 // key; report a settled failure, never uncertain fallback.
                 if let Err(reason) = self.request.verify_toolchain() {
-                    return InstallResult::Fault(reason);
+                    return install_fault(reason, metadata_exposed);
                 }
                 if let Some(validation) = &self.remote_validation
                     && let Err(reason) = validation.verify(&self.request)
                 {
-                    return InstallResult::Fault(reason);
+                    return install_fault(reason, metadata_exposed);
                 }
-                finish_installation(
+                let result = finish_installation(
                     &self.request.dependencies,
                     &self.request.package,
                     &physical,
-                    render_compiler_transcript(&self.canonical_transcript, plan),
+                    transcript[if metadata_exposed {
+                        prefix_len.unwrap_or(0)
+                    } else {
+                        0
+                    }..]
+                        .to_vec(),
                     installed,
-                )
+                );
+                match result {
+                    InstallResult::Fault(reason) => install_fault(reason, metadata_exposed),
+                    result => result,
+                }
             }
+            Ok(other) if metadata_exposed => InstallResult::ExposedFault(format!("{other:?}")),
             Ok(other) => InstallResult::Declined(format!("{other:?}")),
-            Err(error) => InstallResult::Fault(error.to_string()),
+            Err(error) => {
+                metadata_exposed |= matches!(error, ServeError::MetadataExposed { .. });
+                install_fault(error.to_string(), metadata_exposed)
+            }
         }
     }
 }
@@ -879,12 +994,12 @@ impl LiveDependencyLane {
                 Some(manifest_key) => {
                     load_manifest(&mut *store, &manifest_key).and_then(|manifest| {
                         load_bound_transcript(&mut *store, &manifest)
-                            .map(|transcript| (manifest, transcript))
+                            .map(|transcript| (manifest_key, manifest, transcript))
                     })
                 }
             }
         };
-        let Some((manifest, canonical_transcript)) = loaded else {
+        let Some((manifest_key, manifest, canonical_transcript)) = loaded else {
             return Ok(Err(request));
         };
         let expected = request.installation_outputs()?;
@@ -900,6 +1015,7 @@ impl LiveDependencyLane {
                 coord: Arc::clone(&self.coord),
                 request,
                 manifest,
+                manifest_key,
                 canonical_transcript,
                 remote_validation: remote_validation.cloned(),
             })),

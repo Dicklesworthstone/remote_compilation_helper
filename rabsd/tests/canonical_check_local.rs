@@ -3981,6 +3981,11 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
     profile["command"] = json!(command);
     profile["selection"] = json!({"features":["remote_workspace"]});
     let build = command == "build";
+    if build {
+        // Permit Cargo to start a downstream compiler while its dependency's
+        // acknowledged metadata hit is still installing the archive tail.
+        profile["jobs"] = json!(2);
+    }
     // Native fixtures require Cargo's propagated search roots to survive every
     // eligible consumer: the ordinary workspace library and metadata binary
     // have no OUT_DIR or direct native-library directive of their own.
@@ -4155,6 +4160,53 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
             2,
             "{output}"
         );
+        if build {
+            let acknowledged = events
+                .iter()
+                .enumerate()
+                .filter(|(_, event)| event["kind"] == "rabsd-metadata-prefix-acknowledged")
+                .map(|(index, event)| {
+                    assert_eq!(event["sequence"], 1, "{output}");
+                    assert!(
+                        event["bytes"].as_u64().is_some_and(|bytes| bytes > 0),
+                        "{output}"
+                    );
+                    assert!(
+                        event["manifest_key"]
+                            .as_str()
+                            .is_some_and(|key| !key.is_empty()),
+                        "{output}"
+                    );
+                    let key = event["key"].as_str().unwrap();
+                    let terminal = events
+                        .iter()
+                        .position(|candidate| {
+                            candidate["decision"] == "served" && candidate["key"] == key
+                        })
+                        .expect("acknowledged metadata must finish the exact cache replay");
+                    assert!(
+                        index < terminal,
+                        "metadata ACK followed complete installation: {output}"
+                    );
+                    key
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                acknowledged.len(),
+                2,
+                "each archive cache hit must deliver one metadata prefix: {output}"
+            );
+            assert_eq!(
+                acknowledged.into_iter().collect::<BTreeSet<_>>(),
+                first_keys
+                    .as_ref()
+                    .unwrap()
+                    .values()
+                    .map(String::as_str)
+                    .collect::<BTreeSet<_>>(),
+                "metadata delivery did not cover the actual remotely compiled archive hits: {output}"
+            );
+        }
         let workspace_keys = assert_fresh_workspace_units(
             owner.path(),
             &events,

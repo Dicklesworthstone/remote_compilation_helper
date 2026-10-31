@@ -22,6 +22,7 @@ mod backpressure;
 mod endpoint;
 mod frame_read;
 mod liveness;
+mod metadata_delivery;
 mod remote_dependency;
 mod rustc_outputs;
 mod rustc_request;
@@ -56,7 +57,9 @@ const CONTROL_WORKERS: usize = 2;
 const SHADOW_WORKERS: usize = 4;
 /// Artifact installs, including accepted live hits. Reserve before asking a
 /// subscriber to wait, so fresh decisions cannot steal its installation slot.
-/// A bounded acknowledgment wait retains capacity, never a blocking thread.
+/// Initial consent retains capacity without a thread. A negotiated metadata
+/// prefix uses one finite ACK on the already-owned installer thread; control
+/// work and all metadata-store locks remain independent of that wait.
 const MATERIALIZATION_WORKERS: usize = 2;
 const PREPARED_ADMISSION_WORKERS: usize = 2;
 /// Live dependency decisions: a compiler is waiting on each. Saturation
@@ -840,7 +843,11 @@ async fn handle_connection(
                             None => break,
                         }
                     }
-                    Ok(rustc_request::Decided::Hit { reply, pending }) => {
+                    Ok(rustc_request::Decided::Hit {
+                        reply,
+                        pending,
+                        metadata,
+                    }) => {
                         // Reserve the independent installation lane BEFORE
                         // offering a hit. Once Cargo accepts, a fresh decision
                         // burst cannot force a verified hit back to compilation.
@@ -861,8 +868,15 @@ async fn handle_connection(
                         // Nothing is written unless the subscriber commits to
                         // waiting for the install. A subscriber that already
                         // gave up (timeout, crash) never sees a late writer.
+                        let metadata = metadata.then(|| metadata_delivery::Identity {
+                            action_key: rabs_cas::metadata_store::digest_key(pending.action_key()),
+                            manifest_key: pending.manifest_key().to_owned(),
+                        });
                         let accepted = write_frame(&mut stream, &reply).await
                             && read_frame(&mut stream).await.is_some_and(|frame| {
+                                if let Some(identity) = &metadata {
+                                    return identity.accepts(&frame);
+                                }
                                 serde_json::from_slice::<serde_json::Value>(&frame)
                                     .ok()
                                     .and_then(|value| {
@@ -877,28 +891,20 @@ async fn handle_connection(
                             drop(pending);
                             break;
                         }
-                        let live = live.clone();
-                        let installed = match live {
-                            Some(live) => {
-                                installation.finish(move || rustc_request::install(&live, pending))
-                            }
-                            None => break,
+                        let Some(live) = live.clone() else {
+                            break;
                         };
-                        match installed {
-                            Ok(mut work) => work.wait().await.unwrap_or_else(|error| {
-                                // A panic may have interrupted a rename; the
-                                // thread has been joined, so no writer remains.
-                                format!(
-                                    "{{\"kind\":\"rustc-decision\",\"decision\":\"serve-failed\",\
-                                     \"reason\":\"{}\",\"writer_returned\":true}}",
-                                    error.to_string().replace('"', "'")
-                                )
-                            }),
-                            Err(error) => format!(
-                                "{{\"kind\":\"rustc-decision\",\"decision\":\"serve-failed\",\
-                                 \"reason\":\"{}\",\"writer_returned\":true}}",
-                                error.to_string().replace('"', "'")
-                            ),
+                        match metadata_delivery::install(
+                            installation,
+                            live,
+                            pending,
+                            metadata,
+                            &mut stream,
+                        )
+                        .await
+                        {
+                            Some(reply) => reply,
+                            None => break,
                         }
                     }
                     Ok(rustc_request::Decided::Execute { reply, attempt }) => {
@@ -1454,6 +1460,10 @@ fn serve_error_reply(error: &crate::coord::live::ServeError) -> String {
                 .iter()
                 .map(|output| output.destination.as_path())
                 .collect::<Vec<_>>(),
+        ),
+        ServeError::MetadataExposed { installed, .. } => (
+            true,
+            installed.iter().map(std::path::PathBuf::as_path).collect(),
         ),
         _ => (false, Vec::new()),
     };

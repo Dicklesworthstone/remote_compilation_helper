@@ -392,6 +392,7 @@ fn used_since_comparison(
 pub(super) fn refusal(
     store: &mut dyn RabsMetadataStore,
     action: &str,
+    continuing_install: Option<u64>,
 ) -> Result<Option<PrivateExecutionReason>, StoreError> {
     if mode() == Mode::Invalid {
         return Err(corrupt("invalid RABS_SPRT_SAMPLING setting"));
@@ -407,7 +408,17 @@ pub(super) fn refusal(
     let checkpoint = advance(store)?;
     record_crossings(store, checkpoint)?;
     let used = used_since_comparison(store, action)?;
-    if checkpoint.replay_limit() == 0 || used.is_none_or(|used| used >= checkpoint.replay_limit()) {
+    // A continuation consumes no fresh slot: the existing receipt already
+    // counts in `used`. The coordinator separately validates its exact binding.
+    // Never let an absent/unspent sequence or a newly stricter ceiling pass.
+    let allowed = match (used, continuing_install) {
+        (Some(used), Some(install_seq)) => {
+            install_seq < used && install_seq < checkpoint.replay_limit()
+        }
+        (Some(used), None) => used < checkpoint.replay_limit(),
+        (None, _) => false,
+    };
+    if !allowed {
         return Ok(Some(PrivateExecutionReason::ClassVerificationRequired {
             class: CLASS.into(),
             credited_comparisons: checkpoint.passes,
@@ -441,6 +452,27 @@ impl super::SamplingPolicy {
     ) -> Result<Option<u64>, StoreError> {
         replay_limit_with_mode(store, action, self, mode())
     }
+
+    /// Current replay ceiling for an already receipted installation. All
+    /// evidence and class gates still run; the spent sequence must remain below
+    /// the current ceiling even when the last available slot has been spent.
+    ///
+    /// The caller must validate the exact retained comparison/manifest/install
+    /// receipt under this same exclusive metadata lock. This grants no new
+    /// installation and spends nothing. `None` preserves fixed-policy behavior;
+    /// `Some(0)` refuses continuation and must never inherit the fixed allowance.
+    ///
+    /// # Errors
+    /// [`StoreError`] for invalid configuration, unreadable evidence, malformed
+    /// state or failed durable checkpoint/promotion writes.
+    pub fn replay_continuation_limit(
+        &self,
+        store: &mut dyn RabsMetadataStore,
+        action: &rabs_protocol::result_identity::TypedDigest,
+        install_seq: u64,
+    ) -> Result<Option<u64>, StoreError> {
+        replay_limit_for_install(store, action, self, mode(), Some(install_seq))
+    }
 }
 
 fn replay_limit_with_mode(
@@ -448,6 +480,16 @@ fn replay_limit_with_mode(
     action: &rabs_protocol::result_identity::TypedDigest,
     policy: &super::SamplingPolicy,
     selected: Mode,
+) -> Result<Option<u64>, StoreError> {
+    replay_limit_for_install(store, action, policy, selected, None)
+}
+
+fn replay_limit_for_install(
+    store: &mut dyn RabsMetadataStore,
+    action: &rabs_protocol::result_identity::TypedDigest,
+    policy: &super::SamplingPolicy,
+    selected: Mode,
+    continuing_install: Option<u64>,
 ) -> Result<Option<u64>, StoreError> {
     match selected {
         Mode::Fixed => return Ok(None),
@@ -463,12 +505,13 @@ fn replay_limit_with_mode(
     // Reuse the actual policy gate, never a second interpretation of its
     // evidence. In particular a checkpoint cannot overrule sibling divergence
     // or reset the spent receipts of the latest independent comparison.
-    match super::decide(
+    match super::decide_with_continuation(
         store,
         action,
         super::ActionClassRisk::LowRiskRegistry,
         policy,
         true,
+        continuing_install,
     )? {
         super::SampleGateDecision::ExecutePrivately(_) => Ok(Some(0)),
         super::SampleGateDecision::ServeFromCache => {
@@ -514,6 +557,197 @@ mod replay_budget_tests {
             &SamplingPolicy::sample_all(2, 10_000),
             selected,
         )
+    }
+
+    fn continuation_ceiling(
+        store: &mut dyn RabsMetadataStore,
+        selected: Mode,
+        install_seq: u64,
+    ) -> Result<Option<u64>, StoreError> {
+        replay_limit_for_install(
+            store,
+            &action(1),
+            &SamplingPolicy::sample_all(2, 10_000),
+            selected,
+            Some(install_seq),
+        )
+    }
+
+    fn spend_installations(store: &mut dyn RabsMetadataStore, key: &str, count: u64) {
+        let manifest = store.published_manifest_key_str(key).unwrap().unwrap();
+        for seq in 0..count {
+            store
+                .record_decision_receipt(INSTALL, &format!("{key}:100"), seq, "install", &manifest)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn last_spent_slot_can_continue_but_cannot_admit_or_spend_another_installation() {
+        for (stage, limit) in [(1, 3), (2, 19), (3, 99)] {
+            let mut store =
+                SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+            let key = fixture(&mut store);
+            // As in the existing ceiling tests, this synthetic checkpoint
+            // isolates policy consumption; it does not claim earned trials.
+            Checkpoint {
+                cursor: FINAL_PASSES as i64,
+                passes: stage * PASSES_PER_STEP,
+            }
+            .persist(&mut store)
+            .unwrap();
+            assert_eq!(
+                continuation_ceiling(&mut store, Mode::Sprt, 0).unwrap(),
+                Some(0),
+                "an unspent sequence is never a continuation"
+            );
+            spend_installations(&mut store, &key, limit);
+            assert_eq!(ceiling(&mut store, Mode::Sprt).unwrap(), Some(0));
+            let before = store.differential_snapshot().unwrap();
+            assert_eq!(
+                continuation_ceiling(&mut store, Mode::Sprt, limit - 1).unwrap(),
+                Some(limit)
+            );
+            assert_eq!(
+                super::super::decide_with_continuation(
+                    &mut store,
+                    &action(1),
+                    super::super::ActionClassRisk::LowRiskRegistry,
+                    &SamplingPolicy::sample_all(2, 10_000),
+                    true,
+                    Some(limit - 1),
+                )
+                .unwrap(),
+                super::super::SampleGateDecision::ServeFromCache
+            );
+            for unspent in [limit, u64::MAX] {
+                assert_eq!(
+                    continuation_ceiling(&mut store, Mode::Sprt, unspent).unwrap(),
+                    Some(0)
+                );
+            }
+            assert_eq!(ceiling(&mut store, Mode::Sprt).unwrap(), Some(0));
+            assert_eq!(
+                used_since_comparison(&mut store, &key).unwrap(),
+                Some(limit)
+            );
+            assert_eq!(store.differential_snapshot().unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn continuation_preserves_fixed_invalid_unbound_and_zero_floor_semantics() {
+        let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+        let before = store.differential_snapshot().unwrap();
+        assert_eq!(
+            continuation_ceiling(&mut store, Mode::Fixed, 0).unwrap(),
+            None
+        );
+        assert!(continuation_ceiling(&mut store, Mode::Invalid, 0).is_err());
+        assert_eq!(
+            continuation_ceiling(&mut store, Mode::Sprt, 0).unwrap(),
+            None
+        );
+        assert_eq!(store.differential_snapshot().unwrap(), before);
+
+        let key = fixture(&mut store);
+        Checkpoint {
+            cursor: FINAL_PASSES as i64,
+            passes: PASSES_PER_STEP,
+        }
+        .persist(&mut store)
+        .unwrap();
+        spend_installations(&mut store, &key, 1);
+        assert_eq!(
+            continuation_ceiling(&mut store, Mode::Sprt, 0).unwrap(),
+            Some(3)
+        );
+        // A conservative checkpoint downgrade must revoke the retained slot.
+        // Append a new generation; never overwrite or delete the old evidence.
+        Checkpoint {
+            cursor: FINAL_PASSES as i64,
+            passes: 0,
+        }
+        .persist(&mut store)
+        .unwrap();
+        assert_eq!(
+            continuation_ceiling(&mut store, Mode::Sprt, 0).unwrap(),
+            Some(0)
+        );
+        assert_eq!(used_since_comparison(&mut store, &key).unwrap(), Some(1));
+    }
+
+    #[test]
+    fn continuation_cannot_override_current_policy_or_new_negative_evidence() {
+        for veto in ["action-sample", "class-sample", "quarantine"] {
+            let mut store =
+                SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+            let key = fixture(&mut store);
+            Checkpoint {
+                cursor: FINAL_PASSES as i64,
+                passes: PASSES_PER_STEP,
+            }
+            .persist(&mut store)
+            .unwrap();
+            spend_installations(&mut store, &key, 3);
+            assert_eq!(
+                continuation_ceiling(&mut store, Mode::Sprt, 2).unwrap(),
+                Some(3)
+            );
+            for policy in [
+                SamplingPolicy::sample_all(100, 10_000),
+                SamplingPolicy::sample_all(2, 10_001),
+                SamplingPolicy {
+                    sample_rate_basis_points: 0,
+                    ..SamplingPolicy::sample_all(2, 10_000)
+                },
+            ] {
+                assert_eq!(
+                    replay_limit_for_install(&mut store, &action(1), &policy, Mode::Sprt, Some(2),)
+                        .unwrap(),
+                    Some(0)
+                );
+            }
+            match veto {
+                "action-sample" => {
+                    store
+                        .record_verification_sample(&action(1), 999_999, false, 101)
+                        .unwrap();
+                }
+                "class-sample" => {
+                    let sibling = published(&mut store, 2, 11);
+                    store
+                        .record_decision_receipt(
+                            CLASS_KIND,
+                            &sibling,
+                            0,
+                            CLASS,
+                            "synthetic sibling",
+                        )
+                        .unwrap();
+                    store
+                        .record_verification_sample(&action(2), 999_999, false, 1)
+                        .unwrap();
+                }
+                "quarantine" => {
+                    store
+                        .add_quarantine(
+                            crate::metadata_store::QuarantineScope::ActionEntry,
+                            &key,
+                            "revoked between metadata and tail",
+                        )
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let before = store.differential_snapshot().unwrap();
+            assert_eq!(
+                continuation_ceiling(&mut store, Mode::Sprt, 2).unwrap(),
+                Some(0)
+            );
+            assert_eq!(used_since_comparison(&mut store, &key).unwrap(), Some(3));
+            assert_eq!(store.differential_snapshot().unwrap(), before);
+        }
     }
 
     #[test]

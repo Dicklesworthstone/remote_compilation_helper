@@ -202,6 +202,36 @@ pub fn serving_sample_decision(
     decide(store, action, risk, policy, sprt_ladder::enabled())
 }
 
+/// Recheck one installation whose durable replay receipt was already spent.
+/// Every ordinary action, class, evidence and sampling veto still applies. Only
+/// the SPRT cadence considers the retained installation sequence instead of
+/// asking whether another installation may start.
+///
+/// This is not an installation permit. Under the same exclusive metadata lock,
+/// the caller must validate the exact retained comparison, action, manifest and
+/// installation receipt before continuing any output writes. This function does
+/// not spend a receipt or authorize a new installation.
+///
+/// # Errors
+/// [`StoreError`] for unreadable or malformed evidence and failed durable
+/// checkpoint/promotion writes.
+pub fn serving_sample_continuation_decision(
+    store: &mut dyn RabsMetadataStore,
+    action: &TypedDigest,
+    risk: ActionClassRisk,
+    policy: &SamplingPolicy,
+    install_seq: u64,
+) -> Result<SampleGateDecision, StoreError> {
+    decide_with_continuation(
+        store,
+        action,
+        risk,
+        policy,
+        sprt_ladder::enabled(),
+        Some(install_seq),
+    )
+}
+
 /// Existing durable class-wide negative-evidence veto without replay cadence.
 ///
 /// A coordinator installing the freshly executed current producer still must
@@ -227,6 +257,17 @@ fn decide(
     risk: ActionClassRisk,
     policy: &SamplingPolicy,
     use_sprt: bool,
+) -> Result<SampleGateDecision, StoreError> {
+    decide_with_continuation(store, action, risk, policy, use_sprt, None)
+}
+
+fn decide_with_continuation(
+    store: &mut dyn RabsMetadataStore,
+    action: &TypedDigest,
+    risk: ActionClassRisk,
+    policy: &SamplingPolicy,
+    use_sprt: bool,
+    continuing_install: Option<u64>,
 ) -> Result<SampleGateDecision, StoreError> {
     if risk == ActionClassRisk::Elevated {
         return Ok(SampleGateDecision::ExecutePrivately(
@@ -311,7 +352,8 @@ fn decide(
             },
         ));
     }
-    if use_sprt && let Some(reason) = sprt_ladder::refusal(store, &action_key)? {
+    if use_sprt && let Some(reason) = sprt_ladder::refusal(store, &action_key, continuing_install)?
+    {
         return Ok(SampleGateDecision::ExecutePrivately(reason));
     }
     Ok(SampleGateDecision::ServeFromCache)

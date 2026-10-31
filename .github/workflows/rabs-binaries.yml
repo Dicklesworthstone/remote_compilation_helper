@@ -122,16 +122,16 @@ jobs:
           cargo test -p rabs-sandbox --lib snapshot_capture --locked
           cargo test -p rabs-sandbox --lib source_transfer --locked
       - name: Check changed wrapper formatting
-        run: rustfmt --edition 2024 --check rabs-wrap/src/main.rs rabs-wrap/tests/live_protocol.rs
+        run: rustfmt --edition 2024 --check rabs-wrap/src/main.rs rabs-wrap/tests/live_protocol.rs rabs-wrap/tests/metadata_protocol.rs
       - name: Run wrapper unit and real socket delivery regressions
-        run: cargo test -p rabs-wrap --bin rabs-wrap --test live_protocol --locked
+        run: cargo test -p rabs-wrap --bin rabs-wrap --test live_protocol --test metadata_protocol --locked
       - name: Selected Cargo check and build planning with real compiler outputs
         run: |
           cargo test -p rabs-sandbox --lib cargo_check --locked
           cargo test -p rabs-sandbox --test cargo_check --locked -- --nocapture
           cargo clippy -p rabs-sandbox --lib --test cargo_check --locked -- -D warnings
       - name: Lint the tested wrapper targets
-        run: cargo clippy -p rabs-wrap --bin rabs-wrap --test live_protocol --locked -- -D warnings
+        run: cargo clippy -p rabs-wrap --bin rabs-wrap --test live_protocol --test metadata_protocol --locked -- -D warnings
 
   build:
     name: release build + gates
@@ -200,6 +200,8 @@ jobs:
           cargo test --release -p rabs-cas --lib trust_evidence --locked
           cargo test --release -p rabsd --test live_replay --test live_class_safety --test live_sprt_budget --locked
           cargo test --release -p rabsd --test publication_lineage --locked
+          cargo test --release -p rabsd --lib coord::live::metadata_replay --locked
+          cargo test --release -p rabsd --lib coord::live::output_install --locked
           cargo test --release -p rabsd --lib edge::server --locked
           cargo test --release -p rabs-wrap --test live_dependency_e2e --locked
       - name: Shared endpoint ownership and restart fences

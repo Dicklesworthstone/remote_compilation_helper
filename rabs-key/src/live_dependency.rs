@@ -115,10 +115,12 @@ use crate::typed_digest::compute;
 pub mod remote;
 
 mod canonical_cargo;
+mod metadata_replay;
 pub use canonical_cargo::{
     canonical_cargo_dependency_key, plan_canonical_cargo_dependency_action,
     plan_canonical_remote_dependency_action,
 };
+pub use metadata_replay::metadata_replay_prefix_len;
 mod workspace_execution;
 pub use workspace_execution::{
     plan_canonical_workspace_execution, remote_workspace_execution_isolation_policy,
@@ -3885,6 +3887,175 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn real_rustc_dep_info_then_metadata_is_an_early_replay_prefix() {
+        use std::path::Path;
+        use std::process::{Command, Output, Stdio};
+
+        fn successful(command: &mut Command) -> Output {
+            let output = command.stdin(Stdio::inherit()).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{command:?}: {}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr),
+            );
+            output
+        }
+        let sysroot = successful(Command::new("rustc").args(["--print", "sysroot"]));
+        let compiler =
+            Path::new(std::str::from_utf8(&sysroot.stdout).unwrap().trim()).join("bin/rustc");
+        let version = successful(Command::new(&compiler).arg("-vV"));
+        let version = std::str::from_utf8(&version.stdout).unwrap();
+        let host = version
+            .lines()
+            .find_map(|line| line.strip_prefix("host: "))
+            .unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let cargo_home = temporary.path().join("cargo-home");
+        let package =
+            cargo_home.join("registry/src/index.example-0123456789abcdef/metadata_fixture-1.0.0");
+        let out = temporary.path().join("target/deps");
+        std::fs::create_dir_all(package.join("src")).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(
+            package.join("Cargo.toml"),
+            "[package]\nname='metadata_fixture'\nversion='1.0.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        let source = package.join("src/lib.rs");
+        std::fs::write(&source, "pub fn answer() -> u32 { 42 }\n").unwrap();
+        let environment = vec![
+            ("CARGO_HOME".into(), cargo_home.display().to_string()),
+            ("CARGO_MANIFEST_DIR".into(), package.display().to_string()),
+            ("CARGO_PKG_NAME".into(), "metadata_fixture".into()),
+            ("CARGO_PKG_VERSION".into(), "1.0.0".into()),
+        ];
+        let argv = vec![
+            compiler.display().to_string(),
+            "--crate-name=metadata_fixture".into(),
+            "--edition=2021".into(),
+            source.display().to_string(),
+            "--crate-type=lib".into(),
+            "--emit=dep-info,metadata,link".into(),
+            "--error-format=json".into(),
+            "--json=artifacts".into(),
+            "--cap-lints=allow".into(),
+            "--out-dir".into(),
+            out.display().to_string(),
+        ];
+        let plan = plan_dependency_action(
+            LiveRustcRequest {
+                argv: &argv,
+                cwd: package.to_str().unwrap(),
+                env: &environment,
+            },
+            host,
+        )
+        .unwrap();
+        let output = successful(
+            Command::new(&compiler)
+                .args(&argv[1..])
+                .current_dir(&package)
+                .env_clear()
+                .envs(plan.execution_env.iter().cloned()),
+        );
+        assert!(output.stdout.is_empty());
+        let boundary = metadata_replay_prefix_len(&output.stderr, &plan)
+            .unwrap()
+            .expect("real dep-info before metadata must permit early replay");
+        let events = |bytes: &[u8]| -> Vec<String> {
+            std::str::from_utf8(bytes)
+                .unwrap()
+                .lines()
+                .filter_map(|line| {
+                    let event: serde_json::Value = serde_json::from_str(line).unwrap();
+                    (event["$message_type"] == "artifact")
+                        .then(|| event["emit"].as_str().unwrap().to_owned())
+                })
+                .collect()
+        };
+        assert_eq!(events(&output.stderr[..boundary]), ["dep-info", "metadata"]);
+        assert_eq!(events(&output.stderr[boundary..]), ["link"]);
+        for name in plan.output_names() {
+            assert!(std::fs::metadata(out.join(name)).unwrap().len() > 0);
+        }
+        let canonical = canonicalize_compiler_transcript(&output.stderr, &plan).unwrap();
+        assert_eq!(render_compiler_transcript(&canonical, &plan), output.stderr);
+    }
+
+    #[test]
+    fn metadata_replay_preserves_exact_prefix_and_terminal_suffix() {
+        let plan = plan_for(OUT_A, &[], &[]).unwrap();
+        let metadata = plan
+            .outputs
+            .declarations
+            .iter()
+            .find(|output| {
+                output.class == crate::output_declarations::OutputClass::ProvisionalMetadata
+            })
+            .unwrap();
+        let archive = plan
+            .outputs
+            .declarations
+            .iter()
+            .find(|output| output.class == crate::output_declarations::OutputClass::File)
+            .unwrap();
+        let dep_info = plan
+            .outputs
+            .declarations
+            .iter()
+            .find(|output| output.class == crate::output_declarations::OutputClass::DepInfo)
+            .unwrap();
+        let prefix = format!(
+            "{{\"$message_type\":\"diagnostic\",\"message\":\"retain whitespace\"}}\r\n{{\"$message_type\":\"artifact\",\"artifact\":\"{OUT_A}/{}\",\"emit\":\"dep-info\"}}\n  {{ \"emit\" : \"metadata\", \"artifact\" : \"{OUT_A}/{}\", \"$message_type\" : \"artifact\" }}\r\n",
+            dep_info.virtual_path, metadata.virtual_path
+        );
+        let suffix = format!(
+            "{{\"$message_type\":\"diagnostic\",\"message\":\"later warning\"}}\n{{\"$message_type\":\"artifact\",\"artifact\":\"{OUT_A}/{}\",\"emit\":\"link\"}}\n",
+            archive.virtual_path
+        );
+        let transcript = [prefix.as_bytes(), suffix.as_bytes()].concat();
+        let boundary = metadata_replay_prefix_len(&transcript, &plan)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&transcript[..boundary], prefix.as_bytes());
+        assert_eq!(&transcript[boundary..], suffix.as_bytes());
+        assert_eq!(
+            [&transcript[..boundary], &transcript[boundary..]].concat(),
+            transcript
+        );
+    }
+
+    #[test]
+    fn metadata_replay_never_passes_unready_or_ambiguous_artifact_events() {
+        let plan = plan_for(OUT_A, &[], &[]).unwrap();
+        let metadata = format!(
+            "{{\"$message_type\":\"artifact\",\"artifact\":\"{OUT_A}/libitoa-c2b2f4e1a6d0b3c9.rmeta\",\"emit\":\"metadata\"}}\n"
+        );
+        let archive = format!(
+            "{{\"$message_type\":\"artifact\",\"artifact\":\"{OUT_A}/libitoa-c2b2f4e1a6d0b3c9.rlib\",\"emit\":\"link\"}}\n"
+        );
+        for transcript in [
+            Vec::new(),
+            archive.as_bytes().to_vec(),
+            [archive.as_bytes(), metadata.as_bytes()].concat(),
+            [metadata.as_bytes(), metadata.as_bytes()].concat(),
+            [metadata.as_bytes(), archive.as_bytes(), metadata.as_bytes()].concat(),
+        ] {
+            assert_eq!(metadata_replay_prefix_len(&transcript, &plan), Ok(None));
+        }
+        for transcript in [
+            metadata.replace("libitoa-", "libforeign-"),
+            metadata.replace("\"metadata\"", "\"link\""),
+            metadata.replace("\"$message_type\"", "\"\\u0024message_type\""),
+            metadata.replace("/libitoa", "\\/libitoa"),
+        ] {
+            assert!(metadata_replay_prefix_len(transcript.as_bytes(), &plan).is_err());
+        }
     }
 
     #[test]

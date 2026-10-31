@@ -552,18 +552,78 @@ pub(super) fn settle_stage_failure(
     ServeError::Materialize(failure.settle(store))
 }
 
+/// Recheck every installed dep-info file before early artifact notification.
+/// Ordinary subscribers receive derived bytes, whose identity deliberately
+/// differs from the canonical CAS object. Canonical Cargo keeps the original.
+/// The coordinator calls this without its store lock and retains the complete
+/// destination reservation; no receipt or serving authority is created here.
+pub(super) fn verify_installed_dep_info(
+    plan: &PreparedOutputs,
+    installed: &[PathBuf],
+) -> Result<(), ServeError> {
+    use crate::edge::live_facts::read_stable;
+    use rabs_cas::digest_set::{DigestRequest, digest_set};
+
+    for output in plan
+        .outputs
+        .iter()
+        .filter(|output| output.role == OutputRole::DepInfo)
+    {
+        let path = &output.destination;
+        if !installed.contains(path) {
+            return Err(preparation(
+                path,
+                "dep-info is absent from the installed metadata head",
+            ));
+        }
+        let derived = plan.dep_info.get(path);
+        let limit = derived.map_or(MAX_DEP_INFO_BYTES, |derived| derived.bytes.len());
+        let (_, bytes) =
+            read_stable(path, limit as u64).map_err(|error| preparation(path, error))?;
+        let matches = match derived {
+            Some(derived) => bytes == derived.bytes,
+            None => {
+                digest_set(&bytes, DigestRequest::default(), None)
+                    .map_err(|error| preparation(path, format!("{error:?}")))?
+                    .atp_content_id
+                    == output.object
+            }
+        };
+        if !matches {
+            return Err(preparation(
+                path,
+                "installed dep-info differs from its prepared bytes",
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn install_prepared(
     store: &mut dyn RabsMetadataStore,
     plan: &PreparedOutputs,
     prepared: PreparedActionOutputs,
 ) -> Result<Vec<PathBuf>, ServeError> {
+    install_prepared_logged(store, plan, prepared, &mut std::io::stderr().lock())
+}
+
+fn install_prepared_logged(
+    store: &mut dyn RabsMetadataStore,
+    plan: &PreparedOutputs,
+    prepared: PreparedActionOutputs,
+    log: &mut impl Write,
+) -> Result<Vec<PathBuf>, ServeError> {
     let receipt = prepared.install(store).map_err(ServeError::Materialize)?;
-    for (destination, derived) in &plan.dep_info {
+    for output in &receipt.installed {
+        let destination = &output.destination;
+        let Some(derived) = plan.dep_info.get(destination) else {
+            continue;
+        };
         // Digests distinguish canonical identity from subscriber derivation.
         // Never log raw dep-info or source/environment contents.
         // A diagnostic sink failure must not hide a completed installation.
         let _ = writeln!(
-            std::io::stderr().lock(),
+            log,
             "{}",
             serde_json::json!({
                 "kind": "rabs-dep-info-installed", "action_key": plan.action_key,
@@ -1029,8 +1089,166 @@ mod tests {
             std::fs::read(destination.join("libunit.rmeta")).unwrap(),
             metadata
         );
+        verify_installed_dep_info(&plan, &files).unwrap();
+        for file in &files {
+            assert!(std::fs::metadata(file).unwrap().modified().unwrap() >= future);
+        }
+        std::fs::write(destination.join("unit.d"), b"changed canonical dep-info\n").unwrap();
+        assert!(verify_installed_dep_info(&plan, &files).is_err());
+    }
+
+    #[test]
+    fn phased_install_derives_and_verifies_dep_info_before_metadata_notification() {
+        use rabs_cas::blob_store::{DurabilityPolicy, PutLimits, put_if_absent};
+        use rabs_cas::digest_set::{DigestRequest, digest_set};
+        use rabs_protocol::raw_bytes::RawBytes;
+        use rabs_protocol::result_identity::{LogicalOutput, ObjectId};
+
+        let directory = crate::test_util::private_tempdir();
+        let cas =
+            crate::janitor::store::mount_and_reconcile(&directory.path().join("cas")).unwrap();
+        let source = directory.path().join("source");
+        let destination = directory.path().join("target");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("lib.rs"), b"pub fn unit() {}\n").unwrap();
+        let future = SystemTime::now() + std::time::Duration::from_secs(3600);
+        std::fs::File::open(source.join("lib.rs"))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(future))
+            .unwrap();
+        let canonical = b"/__rabs/out/libunit.rmeta: /__rabs/source/lib.rs\n";
+        let put = |bytes: &[u8]| {
+            let id = digest_set(bytes, DigestRequest::default(), None)
+                .unwrap()
+                .atp_content_id;
+            put_if_absent(
+                cas.layout(),
+                &mut *cas.store().lock().unwrap(),
+                &id,
+                &mut &bytes[..],
+                PutLimits::default(),
+                DurabilityPolicy::FULL,
+            )
+            .unwrap();
+            ObjectId(id)
+        };
+        let mut manifest = rabs_cas::test_support::sample_manifest();
+        manifest.result_kind = ResultKind::Success;
+        manifest.artifact_bundle_root = None;
+        manifest.logical_outputs = vec![
+            LogicalOutput {
+                role: OutputRole::ProvisionalMetadata,
+                virtual_path: RawBytes::from("libunit.rmeta"),
+                object: put(b"metadata"),
+            },
+            LogicalOutput {
+                role: OutputRole::Materializable,
+                virtual_path: RawBytes::from("libunit.rlib"),
+                object: put(b"archive"),
+            },
+            LogicalOutput {
+                role: OutputRole::DepInfo,
+                virtual_path: RawBytes::from("unit.d"),
+                object: put(canonical),
+            },
+        ];
+        let contract = ExpectedOutputs::WithDepInfo {
+            paths: BTreeSet::from([
+                "libunit.rmeta".into(),
+                "libunit.rlib".into(),
+                "unit.d".into(),
+            ]),
+            mappings: vec![
+                (
+                    b"/__rabs/source".to_vec(),
+                    source.as_os_str().as_bytes().to_vec(),
+                ),
+                (
+                    b"/__rabs/out".to_vec(),
+                    destination.as_os_str().as_bytes().to_vec(),
+                ),
+            ],
+        };
+        let plan = match prepare(
+            &mut *cas.store().lock().unwrap(),
+            &manifest,
+            &destination,
+            &contract,
+        )
+        .unwrap()
+        {
+            Ok(plan) => plan,
+            Err(refusal) => panic!("output plan refused: {refusal:?}"),
+        };
+        assert_eq!(plan.dep_info.len(), 1);
+        let expected_dep_info = plan.dep_info[&destination.join("unit.d")].bytes.clone();
+        let (head, tail) = select_for_install(&mut *cas.store().lock().unwrap(), &plan)
+            .unwrap()
+            .split_metadata();
+        let mut log = Vec::new();
+        let prepared_head = stage_for_install(head.unwrap(), &plan).unwrap();
+        let files = install_prepared_logged(
+            &mut *cas.store().lock().unwrap(),
+            &plan,
+            prepared_head,
+            &mut log,
+        )
+        .unwrap();
+        assert_eq!(
+            files,
+            vec![
+                destination.join("libunit.rmeta"),
+                destination.join("unit.d")
+            ]
+        );
+        assert_eq!(std::fs::read(&files[0]).unwrap(), b"metadata");
+        for file in &files {
+            assert!(std::fs::metadata(file).unwrap().modified().unwrap() >= future);
+        }
+        assert_ne!(expected_dep_info, canonical);
+        assert_eq!(
+            std::fs::read(destination.join("unit.d")).unwrap(),
+            expected_dep_info
+        );
+        verify_installed_dep_info(&plan, &files).unwrap();
+        assert!(verify_installed_dep_info(&plan, &files[..1]).is_err());
+        assert_eq!(String::from_utf8(log.clone()).unwrap().lines().count(), 1);
+        assert!(!destination.join("libunit.rlib").exists());
+        let head_files = files;
+        let prepared_tail = stage_for_install(tail, &plan).unwrap();
+        let files = install_prepared_logged(
+            &mut *cas.store().lock().unwrap(),
+            &plan,
+            prepared_tail,
+            &mut log,
+        )
+        .unwrap();
+        assert_eq!(files, vec![destination.join("libunit.rlib")]);
+        assert_eq!(
+            std::fs::read(destination.join("libunit.rlib")).unwrap(),
+            b"archive"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("unit.d")).unwrap(),
+            expected_dep_info
+        );
         for file in files {
             assert!(std::fs::metadata(file).unwrap().modified().unwrap() >= future);
         }
+        let text = String::from_utf8(log).unwrap();
+        let events: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["kind"], "rabs-dep-info-installed");
+        assert_eq!(
+            events[0]["destination_bytes"],
+            serde_json::json!(destination.join("unit.d").as_os_str().as_bytes())
+        );
+        // Canonical bytes are valid CAS content but not valid subscriber bytes.
+        // A post-install replacement must be refused before forwarding events.
+        std::fs::write(destination.join("unit.d"), canonical).unwrap();
+        assert!(verify_installed_dep_info(&plan, &head_files).is_err());
     }
 }

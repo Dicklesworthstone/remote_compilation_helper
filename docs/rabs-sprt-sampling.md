@@ -65,6 +65,14 @@ at most 83 more. Restarting with fixed policy after those installations permits
 none until a new admitted comparison. Previews do not spend; failed or partial
 installations conservatively spend once, before any output write.
 
+A metadata-first replay is also one installation. Its `.rmeta` head and archive
+tail retain the same exact manifest and spent receipt. The tail rechecks current
+class safety, evidence, quarantine and policy, using the original installation's
+sequence against the current ceiling. Spending the final allowed slot therefore
+does not invalidate that same delivery, while a new replay still requires a
+fresh comparison. This continuation cannot allocate another receipt, reset the
+allowance or survive a stricter policy that excludes its original sequence.
+
 These are boundaries of the configured Bernoulli model, not evidence that
 actual build outcomes are independent or identically distributed, not a measured
 1e-6 divergence rate, and not an overall repeated-testing error guarantee.

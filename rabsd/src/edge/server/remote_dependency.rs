@@ -285,6 +285,7 @@ fn install(live: Arc<LiveEdge>, pending: PendingRemoteInstall) -> String {
             );
             failure(&key, reason, true)
         }
+        InstallResult::ExposedFault(reason) => failure(&key, reason, false),
     }
 }
 

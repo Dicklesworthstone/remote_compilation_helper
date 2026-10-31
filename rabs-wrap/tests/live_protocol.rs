@@ -202,6 +202,7 @@ fn a_served_hit_replays_the_transcript_and_never_runs_the_compiler() {
     // environment VALUES — what the daemon needs to key the action exactly.
     let request = &received[0];
     assert_eq!(request["kind"], "rustc-request");
+    assert_eq!(request["metadata_protocol"], 1);
     assert_eq!(
         request["argv"][0].as_str().unwrap(),
         fixture.compiler.to_str().unwrap()
@@ -214,6 +215,7 @@ fn a_served_hit_replays_the_transcript_and_never_runs_the_compiler() {
             .any(|pair| pair[0] == "CARGO_PKG_NAME" && pair[1] == "demo")
     );
     assert_eq!(received[1]["kind"], "rustc-accept");
+    assert!(received[1].get("metadata_protocol").is_none());
 }
 
 #[test]

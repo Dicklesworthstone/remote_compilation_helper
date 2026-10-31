@@ -327,6 +327,53 @@ impl SelectedActionOutputs {
         })
     }
 
+    /// Partition a completely selected action before any payload staging.
+    /// When declared metadata exists, it and every declared dep-info output
+    /// enter the head: rustc can announce dep-info before metadata. All selected
+    /// outputs retain their exact locations, ordering, copy mode and freshness.
+    /// Without metadata, the original complete selection remains unchanged.
+    ///
+    /// This grants no early exposure authority. The caller must retain its
+    /// reservation for the COMPLETE destination set across both phases, recheck
+    /// the committed action and serving gates before each installation, and
+    /// treat any failure after exposing metadata as a terminal delivery failure.
+    /// The tail has been namespace/location-validated, but its bytes have not
+    /// been read or copied and may still fail verification when staged.
+    #[must_use]
+    pub fn split_metadata(self) -> (Option<Self>, Self) {
+        if !self
+            .selected
+            .iter()
+            .any(|output| output.output.role == OutputRole::ProvisionalMetadata)
+        {
+            return (None, self);
+        }
+        let (metadata, remainder) = self.selected.into_iter().partition(|output| {
+            matches!(
+                output.output.role,
+                OutputRole::ProvisionalMetadata | OutputRole::DepInfo
+            )
+        });
+        (
+            Some(Self {
+                selected: metadata,
+                mode: self.mode,
+                freshness: self.freshness,
+            }),
+            Self {
+                selected: remainder,
+                mode: self.mode,
+                freshness: self.freshness,
+            },
+        )
+    }
+
+    /// Whether this selection owns no outputs, including an empty phase tail.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.selected.is_empty()
+    }
+
     /// Copy, hash, derive and freshness-stamp private files WITHOUT metadata
     /// access. The existing materializer is the sole byte-verification/CoW path.
     /// Retain the returned owner until the caller rechecks action authority.
@@ -493,3 +540,6 @@ impl PreparedActionOutputs {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod metadata_pipeline_tests;
