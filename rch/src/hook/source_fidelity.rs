@@ -1276,6 +1276,18 @@ try:
         relative_str = relative.decode("utf-8")
         if not relative:
             refuse(62, "empty_path")
+        components = relative.split(b"/")
+        if any(part in (b"", b".", b"..") for part in components) or b"\\" in relative:
+            refuse(62, "unsafe_path", relative)
+        parent = root
+        for component in components[:-1]:
+            parent += b"/" + component
+            try:
+                parent_metadata = os.lstat(parent)
+            except OSError:
+                refuse(63, "not_directory", relative)
+            if not stat.S_ISDIR(parent_metadata.st_mode):
+                refuse(63, "not_directory", relative)
         file = root + b"/" + relative
         if expected_exec == b"L":
             try:
@@ -1357,6 +1369,15 @@ fn remote_verify_command(manifest: &SourceContentRootManifest) -> String {
          else printf 'RCH_SOURCE_CONTENT_ERROR:sha256_tool_missing\\n' >&2; exit 61; fi; \
          while IFS=\"$tab\" read -r expected_hash expected_bytes expected_exec relative; do \
            [ -n \"$relative\" ] || {{ printf 'RCH_SOURCE_CONTENT_ERROR:empty_path\\n' >&2; exit 62; }}; \
+           ancestor=\"$root\"; remaining=\"$relative/\"; \
+           while [ -n \"$remaining\" ]; do \
+             component=${{remaining%%/*}}; remaining=${{remaining#*/}}; \
+             case \"$component\" in \"\"|.|..|*\\\\*) printf 'RCH_SOURCE_CONTENT_ERROR:unsafe_path:%s\\n' \"$relative\" >&2; exit 62 ;; esac; \
+             if [ -n \"$remaining\" ]; then \
+               ancestor=\"$ancestor/$component\"; \
+               [ -d \"$ancestor\" ] && [ ! -L \"$ancestor\" ] || {{ printf 'RCH_SOURCE_CONTENT_ERROR:not_directory:%s\\n' \"$relative\" >&2; exit 63; }}; \
+             fi; \
+           done; \
            file=\"$root/$relative\"; \
            if [ \"$expected_exec\" = L ]; then \
              [ -L \"$file\" ] || {{ printf 'RCH_SOURCE_CONTENT_ERROR:not_symlink:%s\\n' \"$relative\" >&2; exit 63; }}; \
@@ -2966,6 +2987,38 @@ mod tests {
             assert_eq!(output.status.code(), Some(67), "{:?}", output);
             assert!(output.stdout.is_empty(), "{:?}", output);
         }
+        // Byte-identical content outside the grant is still not the selected
+        // source. Check this with BOTH verifier implementations and framings.
+        let parent = root.join("nested");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::write(parent.join("input.rs"), b"selected bytes\n").unwrap();
+        let nested_file = hash_source_entry(
+            &root.canonicalize().unwrap(),
+            Path::new("nested/input.rs"),
+            "nested/input.rs",
+        )
+        .unwrap();
+        let mut nested = manifest.clone();
+        nested.byte_count = nested_file.byte_count;
+        nested.file_count = 1;
+        nested.files = vec![nested_file];
+        let nested_payload = remote_manifest_payload(&nested).unwrap();
+        assert!(
+            run_source_verifier(&nested, &nested_payload, path_override, finite_input)
+                .status
+                .success()
+        );
+        let displaced = temp.path().join("displaced-source-parent");
+        std::fs::rename(&parent, &displaced).unwrap();
+        std::os::unix::fs::symlink(&displaced, &parent).unwrap();
+        let redirected = run_source_verifier(&nested, &nested_payload, path_override, finite_input);
+        assert_eq!(redirected.status.code(), Some(63), "{redirected:?}");
+        assert!(redirected.stdout.is_empty());
+        assert!(
+            redirected
+                .stderr
+                .starts_with(b"RCH_SOURCE_CONTENT_ERROR:not_directory:")
+        );
         if path_override.is_none() {
             // This deliberately failing interpreter is a must-reject control.
             // Its exit must survive; a failed Python run cannot be retried as
