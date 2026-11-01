@@ -474,6 +474,10 @@ const LIVE_COMMITTED_WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-committed-rli
 const LIVE_COMMITTED_WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-committed-metadata-v1";
 const LIVE_MIXED_WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-committed-mixed-rlib-v1";
 const LIVE_MIXED_WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-committed-mixed-metadata-v1";
+const LIVE_IMMUTABLE_DAG_RLIB_CLASS: &str = "rustc-immutable-committed-dag-rlib-v1";
+const LIVE_IMMUTABLE_DAG_METADATA_CLASS: &str = "rustc-immutable-committed-dag-metadata-v1";
+const LIVE_WORKSPACE_DAG_RLIB_CLASS: &str = "rustc-workspace-committed-dag-rlib-v1";
+const LIVE_WORKSPACE_DAG_METADATA_CLASS: &str = "rustc-workspace-committed-dag-metadata-v1";
 const LIVE_PRIVATE_CLASS: &str = "private-only";
 
 // This is an additional floor, not a replacement for the stored serving policy.
@@ -496,27 +500,33 @@ fn record_descriptor_class(
     use rabs_key::live_dependency::workspace_cache::{
         ClosedWorkspaceLibraryClass, closed_workspace_library_descriptor_class,
     };
+    use rabs_key::live_dependency::workspace_dependency_cache::{
+        CommittedDependencyPolicy, committed_dependency_descriptor_policy,
+        uses_committed_dependency_namespace,
+    };
 
-    let class = if descriptor.action_class
+    // Immutable DAG actions keep their dependency source origin and action
+    // family. Their exact policy must be recognized before the generic family
+    // fallback so historical dependency evidence cannot qualify the new class.
+    let class = if let Some(policy) = committed_dependency_descriptor_policy(descriptor) {
+        match policy {
+            CommittedDependencyPolicy::WorkspaceRlib => LIVE_COMMITTED_WORKSPACE_RLIB_CLASS,
+            CommittedDependencyPolicy::WorkspaceMetadata => LIVE_COMMITTED_WORKSPACE_METADATA_CLASS,
+            CommittedDependencyPolicy::MixedWorkspaceRlib => LIVE_MIXED_WORKSPACE_RLIB_CLASS,
+            CommittedDependencyPolicy::MixedWorkspaceMetadata => {
+                LIVE_MIXED_WORKSPACE_METADATA_CLASS
+            }
+            CommittedDependencyPolicy::ImmutableDagRlib => LIVE_IMMUTABLE_DAG_RLIB_CLASS,
+            CommittedDependencyPolicy::ImmutableDagMetadata => LIVE_IMMUTABLE_DAG_METADATA_CLASS,
+            CommittedDependencyPolicy::WorkspaceDagRlib => LIVE_WORKSPACE_DAG_RLIB_CLASS,
+            CommittedDependencyPolicy::WorkspaceDagMetadata => LIVE_WORKSPACE_DAG_METADATA_CLASS,
+        }
+    } else if uses_committed_dependency_namespace(descriptor) {
+        LIVE_PRIVATE_CLASS
+    } else if descriptor.action_class
         == rabs_protocol::descriptor::ActionClass::RustcDependencyCompile
     {
         LIVE_DEPENDENCY_CLASS
-    } else if rabs_key::live_dependency::workspace_dependency_cache::is_committed_workspace_rlib_descriptor(
-        descriptor,
-    ) {
-        LIVE_COMMITTED_WORKSPACE_RLIB_CLASS
-    } else if rabs_key::live_dependency::workspace_dependency_cache::is_committed_workspace_metadata_descriptor(
-        descriptor,
-    ) {
-        LIVE_COMMITTED_WORKSPACE_METADATA_CLASS
-    } else if rabs_key::live_dependency::workspace_dependency_cache::is_mixed_workspace_rlib_descriptor(
-        descriptor,
-    ) {
-        LIVE_MIXED_WORKSPACE_RLIB_CLASS
-    } else if rabs_key::live_dependency::workspace_dependency_cache::is_mixed_workspace_metadata_descriptor(
-        descriptor,
-    ) {
-        LIVE_MIXED_WORKSPACE_METADATA_CLASS
     } else {
         match closed_workspace_library_descriptor_class(descriptor) {
             Some(ClosedWorkspaceLibraryClass::Rlib) => LIVE_WORKSPACE_RLIB_CLASS,
@@ -570,6 +580,18 @@ fn recorded_action_risk(
             }
             [SqlValue::Text(class)] if class == LIVE_MIXED_WORKSPACE_METADATA_CLASS => {
                 Ok(ActionClassRisk::MixedWorkspaceMetadata)
+            }
+            [SqlValue::Text(class)] if class == LIVE_IMMUTABLE_DAG_RLIB_CLASS => {
+                Ok(ActionClassRisk::ImmutableDagRlib)
+            }
+            [SqlValue::Text(class)] if class == LIVE_IMMUTABLE_DAG_METADATA_CLASS => {
+                Ok(ActionClassRisk::ImmutableDagMetadata)
+            }
+            [SqlValue::Text(class)] if class == LIVE_WORKSPACE_DAG_RLIB_CLASS => {
+                Ok(ActionClassRisk::WorkspaceDagRlib)
+            }
+            [SqlValue::Text(class)] if class == LIVE_WORKSPACE_DAG_METADATA_CLASS => {
+                Ok(ActionClassRisk::WorkspaceDagMetadata)
             }
             [SqlValue::Text(_)] => Ok(ActionClassRisk::Elevated),
             _ => Err(StoreError::Backend(
@@ -5331,19 +5353,33 @@ mod tests {
             plan_closed_workspace_library, remote_closed_workspace_library_key,
         };
         use rabs_key::live_dependency::workspace_dependency_cache::{
-            CommittedWorkspaceDependency, plan_committed_workspace_metadata,
-            plan_committed_workspace_rlib, remote_committed_workspace_metadata_key,
-            remote_committed_workspace_rlib_key,
+            CommittedDependencyPolicy, CommittedWorkspaceDependency,
+            plan_committed_workspace_metadata, plan_committed_workspace_rlib,
+            plan_mixed_workspace_library, remote_committed_dependency_key,
+            remote_committed_workspace_metadata_key, remote_committed_workspace_rlib_key,
         };
         use rabs_key::live_dependency::{
             DependencyDirectoryFact, DependencySourceKind, ExternFact, LiveRustcRequest,
-            ToolchainFacts, plan_canonical_workspace_execution,
+            ToolchainFacts, plan_canonical_remote_dependency_action,
+            plan_canonical_workspace_execution,
         };
         use rabs_protocol::result_identity::OutputRole;
 
         // Exercise the real pure key builder and the production durable receipt
         // writer. Compiler execution is covered by the canonical Cargo fixture.
-        let descriptor = |emit: &str, committed: bool| {
+        let descriptor = |emit: &str, policy: Option<CommittedDependencyPolicy>| {
+            let immutable = matches!(
+                policy,
+                Some(
+                    CommittedDependencyPolicy::ImmutableDagRlib
+                        | CommittedDependencyPolicy::ImmutableDagMetadata
+                )
+            );
+            let source_root = if immutable {
+                "/__rabs/cargo-home/registry/src/index/leaf-1.0.0"
+            } else {
+                "/__rabs/workspace"
+            };
             let mut argv = [
                 "/__rabs/toolchain/bin/rustc",
                 "--crate-name=leaf",
@@ -5356,35 +5392,56 @@ mod tests {
             ]
             .map(str::to_owned)
             .to_vec();
-            if committed {
+            if immutable {
+                argv[3] = format!("{source_root}/src.rs");
+                argv.push("--cap-lints=allow".into());
+            }
+            if policy.is_some() {
                 argv.push("-Ldependency=/__rabs/out/cargo/debug/deps".into());
                 argv.push(
                     "--extern=upstream=/__rabs/out/cargo/debug/deps/libupstream.rmeta".into(),
                 );
             }
             let env = [
-                ("CARGO_MANIFEST_DIR", "/__rabs/workspace"),
+                ("CARGO_MANIFEST_DIR", source_root),
                 ("CARGO_PKG_NAME", "leaf"),
                 ("CARGO_PRIMARY_PACKAGE", "1"),
                 ("CARGO_HOME", "/__rabs/cargo-home"),
                 ("HOME", "/__rabs/home"),
             ]
-            .map(|(name, value)| (name.to_owned(), value.to_owned()));
-            let execution = plan_canonical_workspace_execution(
-                LiveRustcRequest {
-                    argv: &argv,
-                    env: &env,
-                    cwd: "/__rabs/workspace",
-                },
-                "x86_64-unknown-linux-gnu",
-            )
-            .unwrap();
-            let plan = if !committed {
-                plan_closed_workspace_library(&execution)
-            } else if execution.invocation.emit.iter().any(|kind| kind == "link") {
-                plan_committed_workspace_rlib(&execution)
+            .into_iter()
+            .filter(|(name, _)| !immutable || *name != "CARGO_PRIMARY_PACKAGE")
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+            .collect::<Vec<_>>();
+            let request = LiveRustcRequest {
+                argv: &argv,
+                env: &env,
+                cwd: source_root,
+            };
+            let execution = if immutable {
+                plan_canonical_remote_dependency_action(request, "x86_64-unknown-linux-gnu", None)
             } else {
-                plan_committed_workspace_metadata(&execution)
+                plan_canonical_workspace_execution(request, "x86_64-unknown-linux-gnu")
+            }
+            .unwrap();
+            let plan = match policy {
+                None => plan_closed_workspace_library(&execution),
+                Some(CommittedDependencyPolicy::WorkspaceRlib) => {
+                    plan_committed_workspace_rlib(&execution)
+                }
+                Some(CommittedDependencyPolicy::WorkspaceMetadata) => {
+                    plan_committed_workspace_metadata(&execution)
+                }
+                Some(
+                    CommittedDependencyPolicy::MixedWorkspaceRlib
+                    | CommittedDependencyPolicy::MixedWorkspaceMetadata
+                    | CommittedDependencyPolicy::WorkspaceDagRlib
+                    | CommittedDependencyPolicy::WorkspaceDagMetadata,
+                ) => plan_mixed_workspace_library(&execution),
+                Some(
+                    CommittedDependencyPolicy::ImmutableDagRlib
+                    | CommittedDependencyPolicy::ImmutableDagMetadata,
+                ) => Ok(execution),
             }
             .unwrap();
             let identity =
@@ -5398,10 +5455,14 @@ mod tests {
                     executable: false,
                     symlink_resolution: vec![],
                 }],
-                directory_enumerations: vec![DirectoryEnumeration {
-                    virtual_path: RawBytes::new(plan.source_virtual_root().into_bytes()),
-                    entries: vec![RawBytes::from("src.rs")],
-                }],
+                directory_enumerations: if immutable {
+                    Vec::new()
+                } else {
+                    vec![DirectoryEnumeration {
+                        virtual_path: RawBytes::new(plan.source_virtual_root().into_bytes()),
+                        entries: vec![RawBytes::from("src.rs")],
+                    }]
+                },
                 ..ActionInputManifest::default()
             };
             let toolchain = ToolchainFacts {
@@ -5446,8 +5507,8 @@ mod tests {
                 }],
             }];
             let dependencies = [binding];
-            match plan.source_kind {
-                DependencySourceKind::WorkspaceCommittedMetadata => {
+            match (plan.source_kind, policy) {
+                (DependencySourceKind::WorkspaceCommittedMetadata, _) => {
                     remote_committed_workspace_metadata_key(
                         &plan,
                         &toolchain,
@@ -5460,7 +5521,7 @@ mod tests {
                         &runtime,
                     )
                 }
-                DependencySourceKind::WorkspaceCommittedRlib => {
+                (DependencySourceKind::WorkspaceCommittedRlib, _) => {
                     remote_committed_workspace_rlib_key(
                         &plan,
                         &toolchain,
@@ -5473,7 +5534,19 @@ mod tests {
                         &runtime,
                     )
                 }
-                _ => remote_closed_workspace_library_key(
+                (_, Some(policy)) => remote_committed_dependency_key(
+                    &plan,
+                    policy,
+                    &toolchain,
+                    &directories,
+                    &dependencies,
+                    &inputs,
+                    None,
+                    "/__rabs/toolchain",
+                    &[39; 32],
+                    &runtime,
+                ),
+                (_, None) => remote_closed_workspace_library_key(
                     &plan,
                     &toolchain,
                     &[],
@@ -5489,24 +5562,77 @@ mod tests {
         };
         let descriptors = [
             (
-                descriptor("--emit=dep-info,metadata,link", false),
+                descriptor("--emit=dep-info,metadata,link", None),
                 ActionClassRisk::ClosedWorkspaceRlib,
             ),
             (
-                descriptor("--emit=dep-info,metadata", false),
+                descriptor("--emit=dep-info,metadata", None),
                 ActionClassRisk::ClosedWorkspaceMetadata,
             ),
             (
-                descriptor("--emit=dep-info,metadata,link", true),
+                descriptor(
+                    "--emit=dep-info,metadata,link",
+                    Some(CommittedDependencyPolicy::WorkspaceRlib),
+                ),
                 ActionClassRisk::CommittedWorkspaceRlib,
             ),
             (
-                descriptor("--emit=dep-info,metadata", true),
+                descriptor(
+                    "--emit=dep-info,metadata",
+                    Some(CommittedDependencyPolicy::WorkspaceMetadata),
+                ),
                 ActionClassRisk::CommittedWorkspaceMetadata,
+            ),
+            (
+                descriptor(
+                    "--emit=dep-info,metadata,link",
+                    Some(CommittedDependencyPolicy::MixedWorkspaceRlib),
+                ),
+                ActionClassRisk::MixedWorkspaceRlib,
+            ),
+            (
+                descriptor(
+                    "--emit=dep-info,metadata",
+                    Some(CommittedDependencyPolicy::MixedWorkspaceMetadata),
+                ),
+                ActionClassRisk::MixedWorkspaceMetadata,
+            ),
+            (
+                descriptor(
+                    "--emit=dep-info,metadata,link",
+                    Some(CommittedDependencyPolicy::ImmutableDagRlib),
+                ),
+                ActionClassRisk::ImmutableDagRlib,
+            ),
+            (
+                descriptor(
+                    "--emit=dep-info,metadata",
+                    Some(CommittedDependencyPolicy::ImmutableDagMetadata),
+                ),
+                ActionClassRisk::ImmutableDagMetadata,
+            ),
+            (
+                descriptor(
+                    "--emit=dep-info,metadata,link",
+                    Some(CommittedDependencyPolicy::WorkspaceDagRlib),
+                ),
+                ActionClassRisk::WorkspaceDagRlib,
+            ),
+            (
+                descriptor(
+                    "--emit=dep-info,metadata",
+                    Some(CommittedDependencyPolicy::WorkspaceDagMetadata),
+                ),
+                ActionClassRisk::WorkspaceDagMetadata,
             ),
         ];
         assert_eq!(descriptors[2].0.key_epoch, 6);
         assert_eq!(descriptors[3].0.key_epoch, 7);
+        assert_eq!(descriptors[4].0.key_epoch, 8);
+        assert_eq!(descriptors[5].0.key_epoch, 9);
+        for (index, (descriptor, _)) in descriptors[6..].iter().enumerate() {
+            assert_eq!(descriptor.key_epoch, 10 + u32::try_from(index).unwrap());
+        }
         for (index, (descriptor, _)) in descriptors.iter().enumerate() {
             for (other, _) in &descriptors[index + 1..] {
                 assert_ne!(
@@ -5521,13 +5647,28 @@ mod tests {
             let mut store = coord.live_cas().unwrap().store().lock().unwrap();
             for (descriptor, _) in &descriptors {
                 record_descriptor_class(&mut *store, descriptor).unwrap();
-                for mutation in 0..4 {
+                let dag = (10..=13).contains(&descriptor.key_epoch);
+                for mutation in 0..if dag { 6 } else { 4 } {
                     let mut changed = descriptor.clone();
                     match mutation {
-                        0 => changed.key_epoch += 1,
+                        0 => changed.key_epoch = if dag { 1 } else { changed.key_epoch + 1 },
                         1 => changed.projection_epoch += 1,
                         2 => changed.sandbox_semantic_policy.bytes[0] ^= 1,
-                        _ => changed.execution_semantics.bytes[0] ^= 1,
+                        3 => changed.execution_semantics.bytes[0] ^= 1,
+                        4 => {
+                            changed.dependency_inputs = rabs_key::typed_digest::compute(
+                                "rabs.closed-workspace-class-test.v1",
+                                b"unqualified dependency domain",
+                            )
+                        }
+                        _ => {
+                            changed.action_class = match descriptor.action_class {
+                                ActionClass::RustcDependencyCompile => {
+                                    ActionClass::RustcWorkspaceCompile
+                                }
+                                _ => ActionClass::RustcDependencyCompile,
+                            }
+                        }
                     }
                     record_descriptor_class(&mut *store, &changed).unwrap();
                     private.push(compute_action_key(&changed).final_key);

@@ -1,4 +1,4 @@
-//! Current safety of the committed producers used by workspace library caches.
+//! Current safety of committed immutable and workspace library producers.
 //!
 //! Physical file-generation witnesses belong to one canonical Cargo operation.
 //! They are not durable serving authority. This module reuses H028's publication
@@ -13,9 +13,10 @@ use super::{
 };
 use rabs_cas::metadata_store::ProvisionalAncestorRow;
 use rabs_cas::publication::ProvisionalAncestorRef;
-use rabs_key::live_dependency::DependencySourceKind;
 use rabs_key::live_dependency::remote::RemoteDependencyOutputClass;
-use rabs_key::live_dependency::workspace_dependency_cache::CommittedWorkspaceDependency;
+use rabs_key::live_dependency::workspace_dependency_cache::{
+    CommittedDependencyPolicy, CommittedWorkspaceDependency,
+};
 use rabs_protocol::generation::AttemptAuthority;
 use rabs_protocol::result_identity::{CanonicalActionResultManifest, OutputRole, ResultKind};
 use std::collections::BTreeSet;
@@ -29,45 +30,90 @@ const IMMUTABLE_LEAF_RECEIPT: &str = "rabs-committed-immutable-leaf-v1";
 #[derive(Clone, Copy)]
 struct ProducerPolicy {
     metadata_allowed: bool,
-    mixed_allowed: bool,
+    domain: ProducerDomain,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProducerDomain {
+    Workspace,
+    MixedWorkspace,
+    ImmutableDag,
+    WorkspaceDag,
 }
 
 impl ProducerPolicy {
-    fn for_consumer(kind: DependencySourceKind) -> Result<Self, String> {
-        let (metadata_allowed, mixed_allowed) = match kind {
-            DependencySourceKind::WorkspaceCommittedRlib => (false, false),
-            DependencySourceKind::WorkspaceCommittedMetadata => (true, false),
-            DependencySourceKind::WorkspaceMixedRlib => (false, true),
-            DependencySourceKind::WorkspaceMixedMetadata => (true, true),
-            _ => return Err("unsupported committed workspace consumer class".into()),
+    const fn for_consumer(policy: CommittedDependencyPolicy) -> Self {
+        let (metadata_allowed, domain) = match policy {
+            CommittedDependencyPolicy::WorkspaceRlib => (false, ProducerDomain::Workspace),
+            CommittedDependencyPolicy::WorkspaceMetadata => (true, ProducerDomain::Workspace),
+            CommittedDependencyPolicy::MixedWorkspaceRlib => {
+                (false, ProducerDomain::MixedWorkspace)
+            }
+            CommittedDependencyPolicy::MixedWorkspaceMetadata => {
+                (true, ProducerDomain::MixedWorkspace)
+            }
+            CommittedDependencyPolicy::ImmutableDagRlib => (false, ProducerDomain::ImmutableDag),
+            CommittedDependencyPolicy::ImmutableDagMetadata => (true, ProducerDomain::ImmutableDag),
+            CommittedDependencyPolicy::WorkspaceDagRlib => (false, ProducerDomain::WorkspaceDag),
+            CommittedDependencyPolicy::WorkspaceDagMetadata => (true, ProducerDomain::WorkspaceDag),
         };
-        Ok(Self {
+        Self {
             metadata_allowed,
-            mixed_allowed,
-        })
+            domain,
+        }
     }
 
     const fn for_risk(risk: ActionClassRisk) -> Option<Self> {
-        let (metadata_allowed, mixed_allowed) = match risk {
-            ActionClassRisk::CommittedWorkspaceRlib => (false, false),
-            ActionClassRisk::CommittedWorkspaceMetadata => (true, false),
-            ActionClassRisk::MixedWorkspaceRlib => (false, true),
-            ActionClassRisk::MixedWorkspaceMetadata => (true, true),
+        let policy = match risk {
+            ActionClassRisk::CommittedWorkspaceRlib => CommittedDependencyPolicy::WorkspaceRlib,
+            ActionClassRisk::CommittedWorkspaceMetadata => {
+                CommittedDependencyPolicy::WorkspaceMetadata
+            }
+            ActionClassRisk::MixedWorkspaceRlib => CommittedDependencyPolicy::MixedWorkspaceRlib,
+            ActionClassRisk::MixedWorkspaceMetadata => {
+                CommittedDependencyPolicy::MixedWorkspaceMetadata
+            }
+            ActionClassRisk::ImmutableDagRlib => CommittedDependencyPolicy::ImmutableDagRlib,
+            ActionClassRisk::ImmutableDagMetadata => {
+                CommittedDependencyPolicy::ImmutableDagMetadata
+            }
+            ActionClassRisk::WorkspaceDagRlib => CommittedDependencyPolicy::WorkspaceDagRlib,
+            ActionClassRisk::WorkspaceDagMetadata => {
+                CommittedDependencyPolicy::WorkspaceDagMetadata
+            }
             _ => return None,
         };
-        Some(Self {
-            metadata_allowed,
-            mixed_allowed,
-        })
+        Some(Self::for_consumer(policy))
     }
 
-    const fn admits_workspace(self, risk: ActionClassRisk) -> bool {
+    fn admits_immutable_leaves(self) -> bool {
+        self.domain != ProducerDomain::Workspace
+    }
+
+    fn admits_class(self, risk: ActionClassRisk) -> bool {
+        let workspace = self.domain != ProducerDomain::ImmutableDag;
+        let mixed = matches!(
+            self.domain,
+            ProducerDomain::MixedWorkspace | ProducerDomain::WorkspaceDag
+        );
+        let immutable_dag = matches!(
+            self.domain,
+            ProducerDomain::ImmutableDag | ProducerDomain::WorkspaceDag
+        );
         match risk {
-            ActionClassRisk::ClosedWorkspaceRlib | ActionClassRisk::CommittedWorkspaceRlib => true,
+            ActionClassRisk::ClosedWorkspaceRlib | ActionClassRisk::CommittedWorkspaceRlib => {
+                workspace
+            }
             ActionClassRisk::ClosedWorkspaceMetadata
-            | ActionClassRisk::CommittedWorkspaceMetadata => self.metadata_allowed,
-            ActionClassRisk::MixedWorkspaceRlib => self.mixed_allowed,
-            ActionClassRisk::MixedWorkspaceMetadata => self.mixed_allowed && self.metadata_allowed,
+            | ActionClassRisk::CommittedWorkspaceMetadata => workspace && self.metadata_allowed,
+            ActionClassRisk::MixedWorkspaceRlib => mixed,
+            ActionClassRisk::MixedWorkspaceMetadata => mixed && self.metadata_allowed,
+            ActionClassRisk::ImmutableDagRlib => immutable_dag,
+            ActionClassRisk::ImmutableDagMetadata => immutable_dag && self.metadata_allowed,
+            ActionClassRisk::WorkspaceDagRlib => self.domain == ProducerDomain::WorkspaceDag,
+            ActionClassRisk::WorkspaceDagMetadata => {
+                self.domain == ProducerDomain::WorkspaceDag && self.metadata_allowed
+            }
             _ => false,
         }
     }
@@ -132,7 +178,7 @@ impl CoordLive {
         {
             return Err("immutable leaf differs from its retained remote action".into());
         }
-        validate_immutable_leaf_manifest(&manifest, proof.output_class())?;
+        validate_immutable_library_manifest(&manifest, proof.output_class())?;
         if !store
             .list_provisional_ancestors(&action_key)
             .map_err(store_error)?
@@ -173,12 +219,12 @@ impl CoordLive {
     /// Check operation-owned installation witnesses against current durable
     /// producer authority. Callers still have to verify the exact physical
     /// candidate generation before and after this check.
-    pub(crate) fn verify_committed_workspace_dependencies(
+    pub(crate) fn verify_committed_dependencies(
         &self,
         dependencies: &[CommittedWorkspaceDependency],
-        consumer_kind: DependencySourceKind,
+        consumer_policy: CommittedDependencyPolicy,
     ) -> Result<(), String> {
-        let policy = ProducerPolicy::for_consumer(consumer_kind)?;
+        let policy = ProducerPolicy::for_consumer(consumer_policy);
         if dependencies.is_empty() || dependencies.len() > MAX_LINEAGE_EDGES {
             return Err("committed workspace candidate count is outside its bound".into());
         }
@@ -270,7 +316,7 @@ fn recorded_immutable_leaf(
     }
 }
 
-fn validate_immutable_leaf_manifest(
+fn validate_immutable_library_manifest(
     manifest: &CanonicalActionResultManifest,
     class: RemoteDependencyOutputClass,
 ) -> Result<(), String> {
@@ -503,26 +549,29 @@ fn verify_graph(
             ));
         }
         let risk = recorded_action_risk(store, &manifest.action_key).map_err(store_error)?;
-        let immutable_leaf = if risk == ActionClassRisk::LowRiskRegistry && policy.mixed_allowed {
-            let class =
-                recorded_immutable_leaf(store, &manifest, &manifest_key)?.ok_or_else(|| {
-                    format!(
-                        "immutable producer {} has no qualified leaf publication",
-                        check.producer
-                    )
-                })?;
-            validate_immutable_leaf_manifest(&manifest, class)?;
-            Some(class)
-        } else {
-            None
-        };
+        let immutable_leaf =
+            if risk == ActionClassRisk::LowRiskRegistry && policy.admits_immutable_leaves() {
+                let class =
+                    recorded_immutable_leaf(store, &manifest, &manifest_key)?.ok_or_else(|| {
+                        format!(
+                            "immutable producer {} has no qualified leaf publication",
+                            check.producer
+                        )
+                    })?;
+                validate_immutable_library_manifest(&manifest, class)?;
+                Some(class)
+            } else {
+                None
+            };
         let metadata_producer = matches!(
             risk,
             ActionClassRisk::ClosedWorkspaceMetadata
                 | ActionClassRisk::CommittedWorkspaceMetadata
                 | ActionClassRisk::MixedWorkspaceMetadata
+                | ActionClassRisk::ImmutableDagMetadata
+                | ActionClassRisk::WorkspaceDagMetadata
         ) || immutable_leaf == Some(RemoteDependencyOutputClass::Metadata);
-        if !(policy.admits_workspace(risk)
+        if !(policy.admits_class(risk)
             || immutable_leaf.is_some_and(|class| {
                 class == RemoteDependencyOutputClass::Rlib || policy.metadata_allowed
             }))
@@ -532,6 +581,18 @@ fn verify_graph(
                 "workspace producer {} lacks a closed class allowed by its consumer",
                 check.producer
             ));
+        }
+        match risk {
+            ActionClassRisk::ImmutableDagRlib => {
+                validate_immutable_library_manifest(&manifest, RemoteDependencyOutputClass::Rlib)?;
+            }
+            ActionClassRisk::ImmutableDagMetadata => {
+                validate_immutable_library_manifest(
+                    &manifest,
+                    RemoteDependencyOutputClass::Metadata,
+                )?;
+            }
+            _ => {}
         }
         let current_now =
             now.saturating_add(i64::try_from(started.elapsed().as_micros()).unwrap_or(i64::MAX));
@@ -575,6 +636,10 @@ fn verify_graph(
                     | ActionClassRisk::CommittedWorkspaceMetadata
                     | ActionClassRisk::MixedWorkspaceRlib
                     | ActionClassRisk::MixedWorkspaceMetadata
+                    | ActionClassRisk::ImmutableDagRlib
+                    | ActionClassRisk::ImmutableDagMetadata
+                    | ActionClassRisk::WorkspaceDagRlib
+                    | ActionClassRisk::WorkspaceDagMetadata
             ) && ancestors.is_empty())
         {
             return Err(format!(
@@ -634,8 +699,9 @@ pub(crate) mod tests {
         install_offer_closure, offer_serving_object, sample_evidence, sample_expected_descriptor,
         tagged_digest,
     };
-    use rabs_key::live_dependency::DependencySourceKind;
-    use rabs_key::live_dependency::workspace_dependency_cache::CommittedWorkspaceDependency;
+    use rabs_key::live_dependency::workspace_dependency_cache::{
+        CommittedDependencyPolicy, CommittedWorkspaceDependency,
+    };
     use rabs_protocol::generation::{ActionGenerationId, WorkerBootGeneration};
     use rabs_protocol::raw_bytes::RawBytes;
     use rabs_protocol::result_identity::{LogicalOutput, OutputRole};
@@ -772,6 +838,28 @@ pub(crate) mod tests {
             )
         }
 
+        pub(crate) fn prepare_dag(
+            &self,
+            tag: u8,
+            parents: Vec<ProvisionalAncestorRef>,
+            outputs: &[(&str, OutputRole, &[u8])],
+            policy: CommittedDependencyPolicy,
+        ) -> OfferPreparedActionResult {
+            assert!(!parents.is_empty());
+            let class = match policy {
+                CommittedDependencyPolicy::ImmutableDagRlib => LIVE_IMMUTABLE_DAG_RLIB_CLASS,
+                CommittedDependencyPolicy::ImmutableDagMetadata => {
+                    LIVE_IMMUTABLE_DAG_METADATA_CLASS
+                }
+                CommittedDependencyPolicy::WorkspaceDagRlib => LIVE_WORKSPACE_DAG_RLIB_CLASS,
+                CommittedDependencyPolicy::WorkspaceDagMetadata => {
+                    LIVE_WORKSPACE_DAG_METADATA_CLASS
+                }
+                _ => panic!("DAG fixture requires an independently keyed DAG policy"),
+            };
+            self.prepare_class(tag, parents, outputs, class)
+        }
+
         fn prepare_class(
             &self,
             tag: u8,
@@ -877,7 +965,7 @@ pub(crate) mod tests {
             } else {
                 rabs_key::live_dependency::remote::RemoteDependencyOutputClass::Rlib
             };
-            super::validate_immutable_leaf_manifest(&offer.manifest, class).unwrap();
+            super::validate_immutable_library_manifest(&offer.manifest, class).unwrap();
             self.commit(&offer);
             // The input/execution qualification is explicitly synthetic here,
             // like descriptor enrollment above. Publication, exact CAS bytes,
@@ -1086,17 +1174,17 @@ pub(crate) mod tests {
         for offer in [&a, &b, &c] {
             fixture
                 .coord
-                .verify_committed_workspace_dependencies(
+                .verify_committed_dependencies(
                     &[witness(offer)],
-                    DependencySourceKind::WorkspaceCommittedMetadata,
+                    CommittedDependencyPolicy::WorkspaceMetadata,
                 )
                 .unwrap();
             assert!(
                 fixture
                     .coord
-                    .verify_committed_workspace_dependencies(
+                    .verify_committed_dependencies(
                         &[witness(offer)],
-                        DependencySourceKind::WorkspaceCommittedRlib,
+                        CommittedDependencyPolicy::WorkspaceRlib,
                     )
                     .is_err()
             );
@@ -1121,9 +1209,9 @@ pub(crate) mod tests {
         fixture.quarantine(&a.manifest.action_key);
         let reason = fixture
             .coord
-            .verify_committed_workspace_dependencies(
+            .verify_committed_dependencies(
                 &[witness(&c)],
-                DependencySourceKind::WorkspaceCommittedMetadata,
+                CommittedDependencyPolicy::WorkspaceMetadata,
             )
             .unwrap_err();
         assert!(
@@ -1195,23 +1283,23 @@ pub(crate) mod tests {
             let fixture = WorkspaceLineageFixture::new();
             let [a, b, c] = mixed_chain(&fixture, metadata);
             let consumer = if metadata {
-                DependencySourceKind::WorkspaceMixedMetadata
+                CommittedDependencyPolicy::MixedWorkspaceMetadata
             } else {
-                DependencySourceKind::WorkspaceMixedRlib
+                CommittedDependencyPolicy::MixedWorkspaceRlib
             };
             fixture
                 .coord
-                .verify_committed_workspace_dependencies(&[witness(&c)], consumer)
+                .verify_committed_dependencies(&[witness(&c)], consumer)
                 .unwrap();
             for legacy in [
-                DependencySourceKind::WorkspaceCommittedRlib,
-                DependencySourceKind::WorkspaceCommittedMetadata,
+                CommittedDependencyPolicy::WorkspaceRlib,
+                CommittedDependencyPolicy::WorkspaceMetadata,
             ] {
                 for offer in [&a, &b, &c] {
                     assert!(
                         fixture
                             .coord
-                            .verify_committed_workspace_dependencies(&[witness(offer)], legacy)
+                            .verify_committed_dependencies(&[witness(offer)], legacy)
                             .is_err()
                     );
                 }
@@ -1281,9 +1369,9 @@ pub(crate) mod tests {
         assert!(
             fixture
                 .coord
-                .verify_committed_workspace_dependencies(
+                .verify_committed_dependencies(
                     &[witness(&unqualified)],
-                    DependencySourceKind::WorkspaceMixedMetadata,
+                    CommittedDependencyPolicy::MixedWorkspaceMetadata,
                 )
                 .unwrap_err()
                 .contains("no qualified leaf publication")
@@ -1292,17 +1380,17 @@ pub(crate) mod tests {
         let metadata = fixture.commit_immutable_leaf(82, outputs, true);
         fixture
             .coord
-            .verify_committed_workspace_dependencies(
+            .verify_committed_dependencies(
                 &[witness(&metadata)],
-                DependencySourceKind::WorkspaceMixedMetadata,
+                CommittedDependencyPolicy::MixedWorkspaceMetadata,
             )
             .unwrap();
         assert!(
             fixture
                 .coord
-                .verify_committed_workspace_dependencies(
+                .verify_committed_dependencies(
                     &[witness(&metadata)],
-                    DependencySourceKind::WorkspaceMixedRlib,
+                    CommittedDependencyPolicy::MixedWorkspaceRlib,
                 )
                 .unwrap_err()
                 .contains("closed class allowed")
@@ -1328,12 +1416,12 @@ pub(crate) mod tests {
             consumes(&archive).consumed_object
         );
         for consumer in [
-            DependencySourceKind::WorkspaceMixedMetadata,
-            DependencySourceKind::WorkspaceMixedRlib,
+            CommittedDependencyPolicy::MixedWorkspaceMetadata,
+            CommittedDependencyPolicy::MixedWorkspaceRlib,
         ] {
             fixture
                 .coord
-                .verify_committed_workspace_dependencies(&[witness(&archive)], consumer)
+                .verify_committed_dependencies(&[witness(&archive)], consumer)
                 .unwrap();
         }
 
@@ -1351,9 +1439,9 @@ pub(crate) mod tests {
         assert!(
             fixture
                 .coord
-                .verify_committed_workspace_dependencies(
+                .verify_committed_dependencies(
                     &[witness(&metadata)],
-                    DependencySourceKind::WorkspaceMixedMetadata,
+                    CommittedDependencyPolicy::MixedWorkspaceMetadata,
                 )
                 .unwrap_err()
                 .contains("qualification differs")
@@ -1380,13 +1468,13 @@ pub(crate) mod tests {
             drop(engine);
             drop(held);
             let consumer = if metadata {
-                DependencySourceKind::WorkspaceMixedMetadata
+                CommittedDependencyPolicy::MixedWorkspaceMetadata
             } else {
-                DependencySourceKind::WorkspaceMixedRlib
+                CommittedDependencyPolicy::MixedWorkspaceRlib
             };
             let reason = fixture
                 .coord
-                .verify_committed_workspace_dependencies(&[witness(&c)], consumer)
+                .verify_committed_dependencies(&[witness(&c)], consumer)
                 .unwrap_err();
             assert!(reason.contains("allowed by its consumer"), "{reason}");
             assert!(
@@ -1423,9 +1511,9 @@ pub(crate) mod tests {
         drop(held);
         let reason = fixture
             .coord
-            .verify_committed_workspace_dependencies(
+            .verify_committed_dependencies(
                 &[witness(&a)],
-                DependencySourceKind::WorkspaceMixedMetadata,
+                CommittedDependencyPolicy::MixedWorkspaceMetadata,
             )
             .unwrap_err();
         assert!(reason.contains("inconsistent class ancestry"), "{reason}");
@@ -1434,6 +1522,246 @@ pub(crate) mod tests {
             ServeOutcome::ExecutePrivately(ReplayRefusal::CommittedDependency(reason))
                 if reason.contains("inconsistent class ancestry")));
         assert!(!destination.exists());
+    }
+
+    fn immutable_dag_chain(
+        fixture: &WorkspaceLineageFixture,
+        metadata: bool,
+    ) -> [OfferPreparedActionResult; 4] {
+        let outputs =
+            |metadata_name: &'static str, archive_name: &'static str, bytes: &'static [u8]| {
+                let mut result = vec![(metadata_name, OutputRole::ProvisionalMetadata, bytes)];
+                if !metadata {
+                    result.push((archive_name, OutputRole::Materializable, bytes));
+                }
+                result
+            };
+        let immutable_policy = if metadata {
+            CommittedDependencyPolicy::ImmutableDagMetadata
+        } else {
+            CommittedDependencyPolicy::ImmutableDagRlib
+        };
+        let workspace_policy = if metadata {
+            CommittedDependencyPolicy::WorkspaceDagMetadata
+        } else {
+            CommittedDependencyPolicy::WorkspaceDagRlib
+        };
+        let a = fixture.commit_immutable_leaf(
+            101,
+            &outputs("liba.rmeta", "liba.rlib", b"immutable root A"),
+            metadata,
+        );
+        let b = fixture.prepare_dag(
+            102,
+            vec![consumes(&a)],
+            &outputs("libb.rmeta", "libb.rlib", b"immutable middle B"),
+            immutable_policy,
+        );
+        fixture.commit(&b);
+        let c = fixture.prepare_dag(
+            103,
+            vec![consumes(&b), consumes(&a)],
+            &outputs("libc.rmeta", "libc.rlib", b"workspace middle C"),
+            workspace_policy,
+        );
+        fixture.commit(&c);
+        let d = fixture.prepare_dag(
+            104,
+            vec![consumes(&c), consumes(&b), consumes(&a)],
+            &outputs("libd.rmeta", "libd.rlib", b"metadata D"),
+            workspace_policy,
+        );
+        fixture.commit(&d);
+        [a, b, c, d]
+    }
+
+    #[test]
+    fn immutable_dag_replay_requires_own_samples_and_current_transitive_producers() {
+        for metadata in [false, true] {
+            let fixture = WorkspaceLineageFixture::new();
+            let [a, b, c, d] = immutable_dag_chain(&fixture, metadata);
+            let immutable_policy = if metadata {
+                CommittedDependencyPolicy::ImmutableDagMetadata
+            } else {
+                CommittedDependencyPolicy::ImmutableDagRlib
+            };
+            let workspace_policy = if metadata {
+                CommittedDependencyPolicy::WorkspaceDagMetadata
+            } else {
+                CommittedDependencyPolicy::WorkspaceDagRlib
+            };
+            for offer in [&a, &b] {
+                fixture
+                    .coord
+                    .verify_committed_dependencies(&[witness(offer)], immutable_policy)
+                    .unwrap();
+            }
+            for offer in [&a, &b, &c, &d] {
+                fixture
+                    .coord
+                    .verify_committed_dependencies(&[witness(offer)], workspace_policy)
+                    .unwrap();
+            }
+            for offer in [&b, &c, &d] {
+                for legacy in [
+                    CommittedDependencyPolicy::MixedWorkspaceRlib,
+                    CommittedDependencyPolicy::MixedWorkspaceMetadata,
+                ] {
+                    assert!(
+                        fixture
+                            .coord
+                            .verify_committed_dependencies(&[witness(offer)], legacy)
+                            .is_err()
+                    );
+                }
+            }
+            for offer in [&c, &d] {
+                assert!(
+                    fixture
+                        .coord
+                        .verify_committed_dependencies(&[witness(offer)], immutable_policy)
+                        .is_err()
+                );
+            }
+            let unsampled = fixture.root.path().join("dag-unsampled");
+            assert!(matches!(
+                fixture.replay(&d, &unsampled, None).unwrap(),
+                ServeOutcome::ExecutePrivately(ReplayRefusal::Sampling(
+                    PrivateExecutionReason::InsufficientVerificationSamples {
+                        observed: 0,
+                        required: 2
+                    }
+                ))
+            ));
+            assert!(!unsampled.exists());
+            fixture.compare_twice(&d);
+            let destination = fixture.root.path().join("dag-served");
+            assert!(matches!(fixture.replay(&d, &destination, None).unwrap(),
+                ServeOutcome::Served { files } if files.len() == if metadata { 1 } else { 2 }));
+            assert_eq!(
+                std::fs::read(destination.join("libd.rmeta")).unwrap(),
+                b"metadata D"
+            );
+            if !metadata {
+                assert_eq!(
+                    std::fs::read(destination.join("libd.rlib")).unwrap(),
+                    b"metadata D"
+                );
+            }
+            for producer in [&a, &b, &c] {
+                fixture.assert_unsampled(producer);
+            }
+
+            fixture.quarantine(&a.manifest.action_key);
+            let refused = fixture.root.path().join("dag-revoked");
+            assert!(matches!(fixture.replay(&d, &refused, None).unwrap(),
+                ServeOutcome::ExecutePrivately(ReplayRefusal::CommittedDependency(reason))
+                    if reason.contains(&digest_key(&a.manifest.action_key))));
+            assert!(!refused.exists());
+            let later = fixture.prepare_dag(
+                105,
+                vec![consumes(&d)],
+                &[("liblater.rmeta", OutputRole::ProvisionalMetadata, b"later")],
+                workspace_policy,
+            );
+            assert!(
+                matches!(fixture.coord.commit_offer(&later, &sample_expected_descriptor()),
+                Err(CommitRefusal::CommittedDependency(reason))
+                    if reason.contains(&digest_key(&a.manifest.action_key)))
+            );
+            fixture.assert_unpublished(&later);
+        }
+    }
+
+    #[test]
+    fn workspace_dag_consumers_cannot_lend_workspace_authority_to_immutable_ancestors() {
+        let fixture = WorkspaceLineageFixture::new();
+        let [a, b, c, d] = immutable_dag_chain(&fixture, true);
+        fixture.compare_twice(&d);
+        let workspace = fixture.commit_metadata_leaf(
+            106,
+            &[(
+                "liba.rmeta",
+                OutputRole::ProvisionalMetadata,
+                b"immutable root A",
+            )],
+        );
+        // First visit the same producer under the broader root policy. It must
+        // still be rejected later when traversed as immutable B's input.
+        let held = fixture.cas.store().lock().unwrap();
+        let mut engine = RusqliteEngine::open(&fixture.cas.cas_root().join("meta.sqlite")).unwrap();
+        assert_eq!(engine.execute(
+            "UPDATE provisional_ancestry SET producer_action_key = ?1 WHERE producer_action_key = ?2",
+            &[
+                SqlValue::Text(digest_key(&workspace.manifest.action_key)),
+                SqlValue::Text(digest_key(&a.manifest.action_key)),
+            ],
+        ).unwrap(), 3);
+        drop(engine);
+        drop(held);
+        let reason = fixture
+            .coord
+            .verify_committed_dependencies(
+                &[witness(&d)],
+                CommittedDependencyPolicy::WorkspaceDagMetadata,
+            )
+            .unwrap_err();
+        assert!(reason.contains("allowed by its consumer"), "{reason}");
+        assert!(
+            reason.contains(&digest_key(&workspace.manifest.action_key)),
+            "{reason}"
+        );
+        let refused = fixture.root.path().join("immutable-parent-is-workspace");
+        assert!(matches!(fixture.replay(&d, &refused, None).unwrap(),
+            ServeOutcome::ExecutePrivately(ReplayRefusal::CommittedDependency(reason))
+                if reason.contains("allowed by its consumer")));
+        assert!(!refused.exists());
+        fixture.assert_unsampled(&b);
+        fixture.assert_unsampled(&c);
+    }
+
+    #[test]
+    fn immutable_dag_metadata_cannot_authorize_archive_ancestry_or_omit_its_parents() {
+        let fixture = WorkspaceLineageFixture::new();
+        let [_a, b, _c, d] = immutable_dag_chain(&fixture, true);
+        for policy in [
+            CommittedDependencyPolicy::ImmutableDagRlib,
+            CommittedDependencyPolicy::WorkspaceDagRlib,
+        ] {
+            assert!(
+                fixture
+                    .coord
+                    .verify_committed_dependencies(&[witness(&b)], policy)
+                    .is_err()
+            );
+        }
+        fixture.compare_twice(&d);
+        // A corrupted committed-class receipt cannot conceal the absence of
+        // its required producer graph, even though exact output bytes survive.
+        let held = fixture.cas.store().lock().unwrap();
+        let mut engine = RusqliteEngine::open(&fixture.cas.cas_root().join("meta.sqlite")).unwrap();
+        assert_eq!(engine.execute(
+            "UPDATE provisional_ancestry SET consumer_action_key = ?1 WHERE consumer_action_key = ?2",
+            &[
+                SqlValue::Text("explicit-test-orphan".into()),
+                SqlValue::Text(digest_key(&b.manifest.action_key)),
+            ],
+        ).unwrap(), 1);
+        drop(engine);
+        drop(held);
+        let reason = fixture
+            .coord
+            .verify_committed_dependencies(
+                &[witness(&b)],
+                CommittedDependencyPolicy::ImmutableDagMetadata,
+            )
+            .unwrap_err();
+        assert!(reason.contains("inconsistent class ancestry"), "{reason}");
+        let refused = fixture.root.path().join("immutable-dag-without-ancestry");
+        assert!(matches!(fixture.replay(&d, &refused, None).unwrap(),
+            ServeOutcome::ExecutePrivately(ReplayRefusal::CommittedDependency(reason))
+                if reason.contains("inconsistent class ancestry")));
+        assert!(!refused.exists());
     }
 
     fn metadata_chain(fixture: &WorkspaceLineageFixture) -> [OfferPreparedActionResult; 3] {
@@ -1458,12 +1786,28 @@ pub(crate) mod tests {
 
     #[test]
     fn metadata_only_revocation_after_delivery_is_terminal_with_an_empty_archive_tail() {
-        for (producer, mixed) in [(false, false), (true, false), (false, true), (true, true)] {
+        for (producer, graph) in [
+            (false, 0),
+            (true, 0),
+            (false, 1),
+            (true, 1),
+            (false, 2),
+            (true, 2),
+        ] {
             let fixture = WorkspaceLineageFixture::new();
-            let [a, b, c] = if mixed {
-                mixed_chain(&fixture, true)
+            let [a, b, c] = match graph {
+                0 => metadata_chain(&fixture),
+                1 => mixed_chain(&fixture, true),
+                _ => {
+                    let [a, b, c, d] = immutable_dag_chain(&fixture, true);
+                    fixture.assert_unsampled(&c);
+                    [a, b, d]
+                }
+            };
+            let (name, bytes): (&str, &[u8]) = if graph == 2 {
+                ("libd.rmeta", b"metadata D")
             } else {
-                metadata_chain(&fixture)
+                ("libc.rmeta", b"metadata C")
             };
             if !producer {
                 fixture.compare_twice(&c);
@@ -1472,8 +1816,8 @@ pub(crate) mod tests {
             let mut calls = 0;
             let mut ready = |files: &[PathBuf]| {
                 calls += 1;
-                assert_eq!(files, &[destination.join("libc.rmeta")]);
-                assert_eq!(std::fs::read(&files[0]).unwrap(), b"metadata C");
+                assert_eq!(files, &[destination.join(name)]);
+                assert_eq!(std::fs::read(&files[0]).unwrap(), bytes);
                 assert!(fixture.cas.store().try_lock().is_ok());
                 // A was safe when this head was installed. Revocation here
                 // must still be observed after notification, even though C
@@ -1496,14 +1840,11 @@ pub(crate) mod tests {
             assert_eq!(calls, 1, "producer={producer}");
             assert!(
                 matches!(result, Err(ServeError::MetadataExposed { installed, reason })
-                if installed == vec![destination.join("libc.rmeta")]
+                if installed == vec![destination.join(name)]
                     && reason.contains(&digest_key(&a.manifest.action_key))),
                 "producer={producer}"
             );
-            assert_eq!(
-                std::fs::read(destination.join("libc.rmeta")).unwrap(),
-                b"metadata C"
-            );
+            assert_eq!(std::fs::read(destination.join(name)).unwrap(), bytes);
             fixture.assert_unsampled(&a);
             fixture.assert_unsampled(&b);
         }
@@ -1534,9 +1875,9 @@ pub(crate) mod tests {
         drop(held);
         let reason = fixture
             .coord
-            .verify_committed_workspace_dependencies(
+            .verify_committed_dependencies(
                 &[witness(&c)],
-                DependencySourceKind::WorkspaceCommittedMetadata,
+                CommittedDependencyPolicy::WorkspaceMetadata,
             )
             .unwrap_err();
         assert!(reason.contains("allowed by its consumer"), "{reason}");
@@ -1561,9 +1902,9 @@ pub(crate) mod tests {
             fixture.assert_unsampled(offer);
             fixture
                 .coord
-                .verify_committed_workspace_dependencies(
+                .verify_committed_dependencies(
                     &[witness(offer)],
-                    DependencySourceKind::WorkspaceCommittedRlib,
+                    CommittedDependencyPolicy::WorkspaceRlib,
                 )
                 .unwrap();
         }
@@ -1647,9 +1988,9 @@ pub(crate) mod tests {
         assert!(
             fixture
                 .coord
-                .verify_committed_workspace_dependencies(
+                .verify_committed_dependencies(
                     &[witness(&c)],
-                    DependencySourceKind::WorkspaceCommittedRlib,
+                    CommittedDependencyPolicy::WorkspaceRlib,
                 )
                 .is_err()
         );
@@ -1689,9 +2030,9 @@ pub(crate) mod tests {
         let exact = witness(&a);
         fixture
             .coord
-            .verify_committed_workspace_dependencies(
+            .verify_committed_dependencies(
                 std::slice::from_ref(&exact),
-                DependencySourceKind::WorkspaceCommittedRlib,
+                CommittedDependencyPolicy::WorkspaceRlib,
             )
             .unwrap();
         for change in ["object", "manifest", "descriptor"] {
@@ -1706,9 +2047,9 @@ pub(crate) mod tests {
             }
             let reason = fixture
                 .coord
-                .verify_committed_workspace_dependencies(
+                .verify_committed_dependencies(
                     &[different],
-                    DependencySourceKind::WorkspaceCommittedRlib,
+                    CommittedDependencyPolicy::WorkspaceRlib,
                 )
                 .unwrap_err();
             assert!(
@@ -1741,10 +2082,7 @@ pub(crate) mod tests {
         fixture.compare_twice(&c);
         fixture
             .coord
-            .verify_committed_workspace_dependencies(
-                &[witness(&c)],
-                DependencySourceKind::WorkspaceCommittedRlib,
-            )
+            .verify_committed_dependencies(&[witness(&c)], CommittedDependencyPolicy::WorkspaceRlib)
             .unwrap();
         let d = fixture.prepare(
             4,
@@ -1778,10 +2116,7 @@ pub(crate) mod tests {
         drop(store);
         let reason = fixture
             .coord
-            .verify_committed_workspace_dependencies(
-                &[witness(&c)],
-                DependencySourceKind::WorkspaceCommittedRlib,
-            )
+            .verify_committed_dependencies(&[witness(&c)], CommittedDependencyPolicy::WorkspaceRlib)
             .unwrap_err();
         assert!(reason.contains("provisional adoption"), "{reason}");
         assert!(
