@@ -1006,16 +1006,23 @@ mod tests {
     fn capability_wait_keeps_its_action_claim_without_stranding_another_compatible_request() {
         use super::super::worker_pool_tests::{pool, scheduling_hello, scheduling_request};
 
-        let workers = pool(std::path::Path::new("/private/capability-queue"), 1);
+        let workers = pool(std::path::Path::new("/private/capability-queue"), 2);
         let mut hello = scheduling_hello();
         hello["dependency_execution_modes"] = serde_json::json!(["closed-metadata"]);
         let advertisement = workers.workers[0].advertise_for_test(&hello);
+        let compatible = workers.workers[1].advertise_for_test(&scheduling_hello());
         let archive = scheduling_request(false);
         let metadata = scheduling_request(true);
         let blocked_key =
             rabs_key::typed_digest::compute("rabs.test.capability-queue.v1", b"archive");
         let ready_key =
             rabs_key::typed_digest::compute("rabs.test.capability-queue.v1", b"metadata");
+        let running_key =
+            rabs_key::typed_digest::compute("rabs.test.capability-queue.v1", b"running");
+        let busy = workers
+            .try_reserve_for(&running_key, Some(&archive))
+            .unwrap();
+        assert_eq!(busy.0.worker(), "worker-2");
         let mut waiting_keys = HashSet::new();
         let mut earlier = None;
         assert!(matches!(
@@ -1055,9 +1062,72 @@ mod tests {
             panic!("an incompatible queue head must not hide usable worker capacity");
         };
         assert_eq!(reserved.worker(), "worker-1");
-        drop((reserved, ready_claim, earlier, advertisement));
+        drop((
+            reserved,
+            ready_claim,
+            earlier,
+            busy,
+            advertisement,
+            compatible,
+        ));
         assert!(workers.pending.lock().unwrap().is_empty());
         assert!(workers.try_claim(&blocked_key).is_ok());
+    }
+
+    #[test]
+    fn incompatible_request_settles_before_start_and_releases_its_real_action_claim() {
+        use super::super::worker_pool_tests::{pool, scheduling_hello, scheduling_request};
+
+        let state = crate::test_util::private_tempdir();
+        let workers = pool(state.path(), 1);
+        let mut hello = scheduling_hello();
+        hello["dependency_execution_modes"] = serde_json::json!(["closed-metadata"]);
+        let advertisement = workers.workers[0].advertise_for_test(&hello);
+        let request = scheduling_request(false);
+        let key = rabs_key::typed_digest::compute("rabs.test.incompatible-queue.v1", b"archive");
+        let executions = SharedRemoteExecutions::new(1);
+        let (mut origin, mut launch) = executions
+            .work
+            .defer(FlightKey::Dependency(key.clone()), || {})
+            .unwrap();
+        let mut follower = executions.try_join(&key).unwrap();
+        let mut waiting_keys = HashSet::new();
+        let mut action_claim = None;
+        let refusal = probe_in_order_for(
+            &mut waiting_keys,
+            &workers,
+            &key,
+            &mut action_claim,
+            Some(&request),
+        )
+        .unwrap_err();
+        assert_eq!(refusal.kind(), io::ErrorKind::Unsupported);
+        assert!(action_claim.is_some());
+        assert!(waiting_keys.is_empty());
+        assert!(workers.try_claim(&key).is_err());
+
+        // Exercise the real deferred-flight completion and claim destructor
+        // used by dispatch's pool-error branch. No worker or producer thread
+        // was admitted, and no five-minute deadline needs to elapse.
+        executions
+            .work
+            .finish_deferred(&mut launch, failed_before_start(refusal.to_string()))
+            .unwrap();
+        drop(action_claim.take());
+        for result in [wait(origin.wait()).unwrap(), wait(follower.wait()).unwrap()] {
+            assert!(matches!(result.as_ref(), SharedRemoteResult::Failed {
+                reason,
+                execution_finished: true,
+            } if reason.contains("no currently authenticated remote worker")));
+        }
+        assert!(!launch.is_pending());
+        assert!(executions.try_join(&key).is_none());
+        assert!(workers.pending.lock().unwrap().is_empty());
+        assert!(workers.try_claim(&key).is_ok());
+        assert_eq!(std::fs::read_dir(state.path()).unwrap().count(), 0);
+        assert!(executions.dispatcher.lock().unwrap().worker.is_none());
+        drop(advertisement);
+        executions.shutdown().unwrap();
     }
 
     #[test]

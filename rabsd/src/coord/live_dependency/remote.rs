@@ -480,6 +480,7 @@ impl DependencyWorkerPool {
         let mut available_state = false;
         let mut candidate = false;
         let mut request_excluded = false;
+        let mut request_candidate = false;
         let start = self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len();
         // Readiness is a preference, not execution authority. First try every
         // compatible live peer before assigning a job to an absent worker's
@@ -501,6 +502,11 @@ impl DependencyWorkerPool {
                     PlacementReadiness::Unknown if ready_only => continue,
                     PlacementReadiness::Unknown => None,
                 };
+                // A compatible busy/cooling worker or an unknown connection
+                // can still become usable within the ordinary queue budget.
+                // Preserve that possibility even if its hint changes during
+                // this probe; a later pass can make a fresh observation.
+                request_candidate = true;
                 match worker.try_reserve_for(request, generation) {
                     Ok(reservation) => {
                         return Ok(WorkerProbe::Reserved(PoolReservation {
@@ -527,6 +533,17 @@ impl DependencyWorkerPool {
             ));
         }
         if request_excluded {
+            if !request_candidate {
+                // Every candidate currently advertises an incompatible
+                // authenticated connection. No execution was admitted, so
+                // this request can fall back immediately instead of waiting
+                // five minutes for capabilities that may never change. This
+                // is not persistent fleet state: the next request probes anew.
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "no currently authenticated remote worker supports this request",
+                ));
+            }
             return Ok(WorkerProbe::RequestWaiting(deadline));
         }
         if !available_state {
@@ -2898,11 +2915,12 @@ mod worker_pool_tests {
         let archive = scheduling_request(false);
         let metadata = scheduling_request(true);
         let mut archive_claim = None;
-        assert!(matches!(
+        assert_eq!(
             pool.probe_claimed_worker_for(&key(1), &mut archive_claim, Some(&archive))
-                .unwrap(),
-            WorkerProbe::RequestWaiting(None)
-        ));
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
         let (reserved, metadata_claim) = pool.try_reserve_for(&key(2), Some(&metadata)).unwrap();
         assert_eq!(reserved.worker(), "worker-1");
         assert!(pool.try_claim(&key(1)).is_err());
@@ -2919,6 +2937,88 @@ mod worker_pool_tests {
         };
         drop((reconnected, archive_claim));
         assert!(pool.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn incompatible_fleet_refuses_only_this_request_without_allocating_worker_history() {
+        let state = crate::test_util::private_tempdir();
+        let pool = pool(state.path(), 2);
+        let mut metadata_only = scheduling_hello();
+        metadata_only["dependency_execution_modes"] = json!(["closed-metadata"]);
+        let first = pool.workers[0].advertise_for_test(&metadata_only);
+        let second = pool.workers[1].advertise_for_test(&metadata_only);
+        let archive = scheduling_request(false);
+        assert_eq!(
+            pool.try_reserve_for(&key(1), Some(&archive))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert!(pool.pending.lock().unwrap().is_empty());
+        assert_eq!(std::fs::read_dir(state.path()).unwrap().count(), 0);
+
+        // The refusal must neither blacklist a worker nor retain the action
+        // claim. A new compatible connection may serve the same action.
+        drop(second);
+        let replacement = pool.workers[1].advertise_for_test(&scheduling_hello());
+        let (reserved, claim) = pool.try_reserve_for(&key(1), Some(&archive)).unwrap();
+        assert_eq!(reserved.worker(), "worker-2");
+        assert_eq!(std::fs::read_dir(state.path()).unwrap().count(), 0);
+        drop((reserved, claim, first, replacement));
+        assert!(pool.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn incompatible_peer_does_not_refuse_busy_compatible_or_unknown_alternatives() {
+        for advertised in [false, true] {
+            let pool = pool(Path::new("/private/eligible-worker-wait"), 2);
+            let mut metadata_only = scheduling_hello();
+            metadata_only["dependency_execution_modes"] = json!(["closed-metadata"]);
+            let first = pool.workers[0].advertise_for_test(&metadata_only);
+            let second =
+                advertised.then(|| pool.workers[1].advertise_for_test(&scheduling_hello()));
+            let archive = scheduling_request(false);
+            let (busy, busy_claim) = pool.try_reserve_for(&key(1), Some(&archive)).unwrap();
+            assert_eq!(busy.worker(), "worker-2");
+            let mut queued_claim = None;
+            assert!(matches!(
+                pool.probe_claimed_worker_for(&key(2), &mut queued_claim, Some(&archive))
+                    .unwrap(),
+                WorkerProbe::RequestWaiting(None)
+            ));
+            assert!(queued_claim.is_some());
+            drop((busy, busy_claim));
+            let WorkerProbe::Reserved(reserved) = pool
+                .probe_claimed_worker_for(&key(2), &mut queued_claim, Some(&archive))
+                .unwrap()
+            else {
+                panic!("the queued request must use the released eligible endpoint");
+            };
+            assert_eq!(reserved.worker(), "worker-2");
+            drop((reserved, queued_claim, first, second));
+            assert!(pool.pending.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn incompatible_alternates_do_not_wait_for_an_already_attempted_compatible_worker() {
+        let pool = pool(Path::new("/private/incompatible-alternate-workers"), 2);
+        let first = pool.workers[0].advertise_for_test(&scheduling_hello());
+        let mut metadata_only = scheduling_hello();
+        metadata_only["dependency_execution_modes"] = json!(["closed-metadata"]);
+        let second = pool.workers[1].advertise_for_test(&metadata_only);
+        let archive = scheduling_request(false);
+        assert_eq!(
+            pool.try_reserve_worker_excluding_for(
+                &HashSet::from(["worker-1".to_owned()]),
+                Some(&archive),
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert!(pool.pending.lock().unwrap().is_empty());
+        drop((first, second));
     }
 
     #[test]
