@@ -6,7 +6,7 @@
 **CI/release policy, explicitly confirmed by the user November 1:** DSR only.
 Never enable or dispatch GitHub Actions. Historical workflow receipts below
 remain unqualified history; the earlier optional enablement question is closed.
-**Current status, November 1 at 14:25 UTC:** controlled native RABS is working
+**Current status, November 1 at 20:20 UTC:** controlled native RABS is working
 for real Cargo archive execution/delivery and five shared-service consumers.
 Production source 6a79d453 passes six of seven original canonical cases and
 all five overhead/support tests; the overlap case fails final SDK cleanup
@@ -20,9 +20,25 @@ fails earlier during capture at 121s, so optimized consumer verification
 remains pending. DSR/native QA passes 304 checks, cache 94/94 including both
 real Rust consumers, relocated roots 16/16, actual diagnostic build and syntax.
 Its default full suite stays UNRUN behind the unchanged root-volume guard.
-The optimized overlap + 32-case canonical + five-test overhead DSR build is
-now active with the verified corrected builder. Four verified runtime-file
-repairs are applied to the shared checkout; merged-source checks are queued.
+The optimized overlap + 32-case canonical + five-test overhead DSR invocation
+is terminal: native timeout five / frontend six after 21,628s, at its original
+six-hour limit. Production tool and wrapper graphs finish zero; the canonical
+harness graph does not finish, and every runtime case stays UNRUN. All 1,729
+source files and all four completed production executable hashes are verified;
+the executables are retained separately. This is not a runtime test verdict.
+Four verified runtime-file repairs and the reconciled shutdown helper/controls
+are applied to the shared checkout. Its complete 1,755-file working cut is
+captured and audited on the dispatcher; merged-source checks are submitted
+through strict RCH and queued first behind a different project's TRJ build.
+No peer is cancelled or slot limit increased. Its changed lockfile requires fresh
+compiler proof, even though the four runtime repair files match the tested cut.
+An actual complete native diagnostic bundle also installs and upgrades. Its
+current installer exposed a real umask-0002 defect: newly written manifest
+0664 was rejected by its unchanged verifier. The writer now sets 0600;
+before/after real-tool probes and all 100 installer tests pass at the fixed
+source. The installed 6a daemon boots, answers actual socket status, shuts down
+cleanly, then advances term 1 to 2 with a fresh incarnation on the same state.
+These are native component checks, not portable release or distinct-host proof.
 Shared Beads now contains the complete execution history and M6 is in_progress.
 M6 remains open;
 fleet/QUIC, full package, dependency budgets and broader failures below remain
@@ -1667,12 +1683,26 @@ only the stated step, never closure of the surrounding milestone.
   - [ ] Pool occupancy/bypass, both worker slots and independent delivery ownership.
   - [ ] Wrong capability/pin, corrupt/partial output, lost ACK, cancellation and result-only recovery.
 - [ ] Qualify shared canonical service and cross-edge authority (M6).
+  The inspected live routes are host-local: main.rs constructs one CoordLive
+  shared with its edge in-process; canonical service profiles expose a Unix
+  socket and same-host input paths. Durable boot authority is already wired
+  through coord_work/acquire_boot_authority and the mounted CAS; do not replace
+  it with another authority mechanism. Passing local concurrent Cargo and real
+  loopback TLS-worker tests does not establish remote edge attachment.
   - [ ] Compile the new persistent service and run its real concurrent Cargo fixture.
   - [ ] Two overlapping roots, third-root refusal, independent caller cancellation.
+  - [ ] Wire authenticated remote edges to the existing configured authority,
+    preserving source/SDK identity and independent subscriber ownership. A
+    forwarded socket or a matching remote path alone cannot bind caller inputs.
   - [ ] One authority with independent edges; root permits and C-1 jobserver accounting.
   - [ ] Delivered binary, Cargo Fresh state, source invalidation and stopped-service refusal.
   - [ ] Two distinct edge hosts join one action lineage; coordinator restart/stale-offer fencing.
   - [ ] Final-subscriber drain and no leaked process, token, lease, pin or partial destination.
+  - [ ] Run M6's original fifteen-agent multi-host storm with stock/current-RCH
+    incumbents live in the same invocation and an A/A control. Preserve the
+    >=2x stage threshold, useful-completion/tail and memory/pressure/transfer
+    countermetrics. The >=3x final storm remains bd-hjhe3; local component or
+    same-host throughput does not satisfy either distinct-host requirement.
 
 ### Current integration repair and execution TODO
 
@@ -2548,9 +2578,47 @@ only the stated step, never closure of the surrounding milestone.
       no policy is lowered or global host configuration changed. Fresh source,
       builder, config and recipe preflight SHA
       2a2da6738e8c3141b624f068852c8e9723774471b38ecadcc3e1660517382b64.
-      New DSR attempt starts 13:45:49 UTC, retaining the first logs; all
-      optimized runtime outcomes remain pending. Both earlier builder cuts,
-      all raw failures and the unchanged original-checkout work remain preserved.
+      New DSR attempt starts 13:45:49 UTC, retaining the first logs. It ends
+      19:47:49 UTC at the unchanged six-hour deadline: native status timeout /
+      exit five, frontend six, 21,628s including supervision. Production graph
+      finishes zero in 209m54s; wrapper graph zero in 2m26s. Canonical harness
+      compilation stops without build-finished; overlap/full32/overhead runtime
+      are all UNRUN. Preserve this loss rather than raising the bound.
+      Fresh source audit verifies all 1,729 files; the four production outputs
+      still match their pre-harness map and are retained under
+      dsr-timeout404-production-20261101. Custody SHA
+      bf0eb98b8cbd2def59abdbb7b286ab2a82645dc07c47653816723eceb42ba324;
+      four genuine JSON/JSONL receipts are copied and SHA-verified locally in
+      rabs-dsr-all-404f98a5-20261101/timeout-evidence. No old-run compiler remains.
+      Both earlier builder cuts, all raw failures and peer work remain preserved.
+    - [x] Prepare a minimal fixture-only daemon selector on the private cut.
+      Canonical tests hard-code Cargo's companion daemon while already allowing
+      explicit wrapper/worker selections. RABS_CANONICAL_TEST_DAEMON now selects
+      an explicit absolute executable, or retains Cargo's original default;
+      both ordinary and shared-service calls use it. Add one default/explicit/
+      unusable-path control. No original acceptance assertion, namespace, SDK,
+      timing bound or cancellation policy changes. Rustfmt/diff checks zero.
+      Production code is unchanged from 404; this is an uncompiled test enabler,
+      not a new product capability or a passing consumer. It is not yet applied
+      to the evolving shared test file. The one-file fixture source capsule has
+      all 1,729 inputs, overlay
+      19d46b2692735f0d4ce6675f02640b4bacf9e8f354c243707d5de513f6caeb21,
+      manifest SHA
+      3d2525148a0e4be8f4285b2ffe7372b2e12c001de1d5bc75c2bea32c10d4420e,
+      archive SHA
+      3871363a1f0de8d292478bb5d20c583b0b1a5060d1359f341f37d9680c2eb472.
+      This derives from the verified 404 archive plus the documented test file;
+      it is not a clean Git commit or RCH-generated stamp. Extraction verifies
+      every dispatcher file. A first archive attempt assumed directory entries
+      were files and stopped before population; its empty artifact is retained.
+    - [ ] After the queued shared-source job's terminal ACK, compile and test
+      this fixture, then run required workspace check/strict Clippy/fmt. Bind
+      its actual harness path/hash and profile separately from the four
+      DSR-built production runtime tools. Execute the original overlap consumer
+      before the full original suite with the new control (33 total), through
+      DSR only, preserving all original product assertions and per-case bounds.
+      A dev harness driving optimized production tools is explicitly that;
+      never relabel the timed-out optimized-harness invocation as passing.
   - [ ] Complete shared-checkout integration and qualify its captured source;
     private-cut evidence alone does not qualify evolving canonical main.
     - [x] Inspect the live checkout at observed HEAD
@@ -2567,15 +2635,48 @@ only the stated step, never closure of the surrounding milestone.
       superseding earlier historical statements that it remained untouched.
       All four source leases are released after this integration; report and
       Beads leases remain active. No shared index entries are staged or committed.
-    - [ ] After the optimized overlap prerequisite passes, manually reconcile
-      orderly service teardown and its real-process controls into the original
-      canonical test file. Preserve every concurrent new leaf/selection case;
-      the original test file is much larger than the frozen private copy.
-    - [ ] Capture the merged shared source, preserve its actual working-cut
-      identity, and run native pipe/service/daemon checks plus required
-      workspace/all-target check, strict Clippy and fmt after the sole active
-      DSR job retires. These combined-source commands are currently UNRUN;
-      equality of four runtime files does not supply whole-workspace proof.
+    - [x] Manually reconcile the independently proven orderly-service helper
+      and its real-process controls into the original canonical test file.
+      The unchanged full-SDK diagnostic and private native controls establish
+      the correction independently; optimized original-consumer qualification
+      remains pending. Only seven normal service teardown calls change; fast
+      client cancellation and both peer-added 30s service cases stay unchanged.
+      Helper/control bodies are byte-identical to tested 404. Inverting only
+      these owned edits in memory reproduces the complete 319,349-byte peer
+      preimage exactly; no leaf/selection case is lost. Source SHA before
+      22cb8f8672023bb5a8d4f94d5bedc10c2ca836a032aad2e385fbadb997e10269,
+      after 4633bc5f328661896c2cffc1f6a28d4f2c8ac5d04c922c68af02ed53fb9aaacb;
+      322,565 bytes. Rustfmt/diff checks zero; source lease released.
+    - [ ] Complete optimized overlap and combined-source native qualification
+      of this shared helper; code integration is not a passing consumer receipt.
+    - [x] Capture the merged shared source with two stable full-file passes,
+      fixed HEAD/membership and held-file byte/mode/hash checks. Observed base
+      94be863e1415888eddacc0eb618808efc88fc80b; 1,755 files. This is a shared
+      working tree containing peer changes, not a clean Git revision or an
+      RCH-generated overlay. Its explicit content-map SHA256 overlay is
+      a38a908eeaecc9e47e4b44c4bc38f343674fb53016e6eaae896bf3dd9548369f.
+      Archive SHA
+      95696add71109f430dfe97596ec303873f12aae70dcf529384932db97e086f28;
+      manifest SHA
+      337e1dfa089591b8501dc6ea59aabd8bbb00d0b795418d7a534d29be43ddbc0c.
+      All 1,755 extracted dispatcher files match. Cargo.toml/toolchain match
+      the private source; Cargo.lock differs. Original checkout/index untouched
+      by capture. Ordinary transfer configuration is copied verbatim from the
+      preceding acknowledged run; exact 46 existing exclusions remain declared.
+    - [ ] Execute the prepared native batch after the sole active DSR job
+      retires: storage guards, preservation of the old dev harness/daemon,
+      Cargo-built combined-source daemon/canonical harnesses, real OS shutdown
+      controls, pipe and Unix socket checks, complete daemon library including
+      physical reflink, workspace/all-target check, strict Clippy and fmt.
+      Enumerate each selected test set before executing it and require the
+      complete count with zero ignored; preserve every raw failure. Driver
+      SHA 4705e5b7bf2424cc7b65924ea44f00615962a02b088d3edc5d3de0b6c46860d9,
+      7,844 bytes, held-file identity and read-only source manifest prepared
+      on TRJ. Submitted at 20:05:34 UTC after the DSR timeout and observed old
+      compiler exit; strict one-slot RCH job is first in queue behind a peer.
+      Queued request id 9253452172182422125; no active own compiler yet.
+      These combined-source commands are UNRUN; equality of four files does
+      not qualify the whole workspace.
     - [x] Reconcile the execution history into the shared Beads tracker. Its
       JSONL/DB had remained at the initial reopened snapshot; private comments
       alone did not mark the shared task in progress. Supported import then
@@ -2761,6 +2862,58 @@ Passes below are scoped to e8083f9d and do not qualify later merged changes.
     under the same private install root. This is a short 2432 component probe,
     not current-shipping qualification, elapsed soak or fleet deployment.
   - [ ] Build correct wrapper/daemon release profiles; validate actual complete archives.
+    - [x] Assemble a private native diagnostic archive from the four genuine
+      6a DSR production tools: wrapper-release rabs-wrap, daemon-release rabsd,
+      rabs-wkr and rabs-cargo-root, plus the matching cargo-rabs and installer.
+      Archive SHA
+      6efe560a28ea7e9a376c84424afa3e18e3f40568e680653ea1dbef839f66adff.
+      Actual install, all five entry points and upgrade pass. Initial raw two
+      is retained: I incorrectly requested the newer --verify option from
+      the old installer. The captured current verifier then independently
+      refuses its group-writable manifest. An unchanged-current installer
+      reproducer with explicit umask 0002 confirms install zero / verification
+      one, manifest 0664. This is a writer defect, not a defective refusal gate.
+    - [x] Fix the original shared installer in place: fchmod the newly written
+      manifest to 0600 before fsync/activation. Leave the verifier unchanged.
+      Add one native filesystem regression: collaborative-umask install must
+      verify without mutation/execution, then a deliberately group-writable
+      manifest must still refuse. Fixed script SHA
+      64ad8fda43c946cf8419fed8821eb1ba0e48886485408a6a006df46168fa4949;
+      test SHA
+      13e0f9f6638cc8513e8c8d7909c296a24defd28dbbe2f837685ac70a29f13875.
+      The same genuine archive now installs/verifies/upgrades/verifies at
+      explicit umask 0002: all four commands zero, manifest 0600, old generation
+      retained. Do not repair or relabel the old losing generations.
+    - [x] Run the complete native Linux installer selection: 36 + 22 + 21 + 21
+      tests, all 100 pass / zero skipped, all four module commands zero,
+      174.00s total command time at explicit umask 0002. The initial copied
+      capsule omitted launcher/main-installer support files and retained raw
+      one with 14 setup errors; all seven complete inputs are then frozen and
+      checked before the full rerun. Existing SSH/platform/tool doubles remain
+      labeled as such; these are installation/process tests, not fleet proof.
+    - [x] Boot the installed production daemon with new private state, perform
+      real Unix-socket hello/status, and auto-shutdown after five seconds:
+      exit zero / 5.18s, socket retired, all four subsystem obligations clean.
+      Boot it again against the same state: zero / 5.10s, term 1 to 2, different
+      incarnation, socket retired, obligations clean. Serving stays off;
+      release standing is honestly unknown/advisory. This does not exercise
+      stale offers, manual fencing, cross-edge sharing, Cargo or elapsed soak.
+      Fresh post-run audit confirms all 12 preceding DSR executables unchanged.
+      Forty genuine indexed receipts plus index are copied and SHA-verified
+      under /Volumes/trj-data/rabs-installer-mode-results-20261101;
+      receipt tar SHA
+      6b11f9ecb9e51ce69102c53a1a5ba02b16c6a5e16a28d008965ab62cf1590d3d,
+      full unit run SHA
+      4e1d32230d9c75b7495c8ae3c5eb79648b75d2577e04044a2619b419140e71eb,
+      post-run SHA
+      e10dea3644fca441dd786a0902def90ede0efce149501450effc245d7a6861d3.
+      S7 remains in progress: the archive is a private native diagnostic,
+      not the signed published portable package or two-host deployment.
+      All 1,755 shared captured paths are reread afterward: only this Python
+      installer/test and the requested plan/Beads changed; no missing/unstable
+      file, no Rust/Cargo input drift. The queued Rust qualification still
+      targets the earlier explicit working cut; this Python repair has the
+      separate complete native proof above.
   - [ ] Clean private install/upgrade on capable Linux hosts; version/hash/doctor checks.
   - [ ] Real-repository Cargo canary compared with stock/current RCH in the same invocation.
     Initial actual `rabs-key` canary is red: stock plus four wrapped checks exit
