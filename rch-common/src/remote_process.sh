@@ -199,8 +199,11 @@ rch_group_state() {
     # One deadline covers both exchanges and descendants holding stdout open;
     # timeout kills the helper group and means unknown, never absence. Inspect
     # all leaders, then group/observer LWPs (including zombie-leader siblings).
-    # Unrelated LWPs previously exhausted this same 1s bound on busy workers.
-    rch_task_snapshot=$(LC_ALL=C rch_control_capture 1s \
+    # Even the leader-only pass can exceed one second on a loaded worker. Give
+    # the whole exchange five seconds, retaining the selected-thread census
+    # and the same unknown result on timeout. Cancellation separately bounds
+    # its total retry time; this must not become twenty five-second waits.
+    rch_task_snapshot=$(LC_ALL=C rch_control_capture 5s \
         /bin/sh -c '
             leaders=$(ps -e -o pid= -o lwp= -o pgid= -o s= -o nlwp=) || exit 2
             selection=$(printf "%s\n" "$leaders" | awk -v group="$1" -v observer="$2" '\''
@@ -425,6 +428,20 @@ rch_remote_cancel() {
     rch_remote_cancel_loaded "$3"
 }
 
+# Linux's monotonic uptime bounds the WHOLE recovery attempt, including the
+# initial census, graceful stop and witness collection. Builtin read avoids
+# spawning another all-process observer on the already loaded worker. The
+# hundredths keep a deadline from expiring early at a second boundary.
+rch_cancel_clock() {
+    read -r rch_cancel_uptime rch_cancel_idle < /proc/uptime || return 1
+    case "$rch_cancel_uptime" in *.*) ;; *) return 1;; esac
+    rch_cancel_secs=${rch_cancel_uptime%%.*}
+    rch_cancel_frac=${rch_cancel_uptime#*.}
+    rch_scope_uint "$rch_cancel_secs" && [ "${#rch_cancel_secs}" -le 12 ] || return 1
+    case "$rch_cancel_frac" in [0-9][0-9]) ;; *) return 1;; esac
+    rch_cancel_now=$((rch_cancel_secs * 100 + 1$rch_cancel_frac - 100))
+}
+
 # Operate on the already validated identity. The in-session supervisor has
 # additionally bound it to its direct child; rereading a mutable receipt here
 # could replace that authority between its check and the first scope operation.
@@ -433,6 +450,12 @@ rch_remote_cancel_loaded() {
     rch_witness_identity=
     rch_term_sent=0
     rch_mode=$1
+    rch_cancel_deadline=
+    if [ "$(uname -s)" = Linux ]; then
+        rch_cancel_clock || return 44
+        rch_cancel_last_clock=$rch_cancel_now
+        rch_cancel_deadline=$((rch_cancel_now + 3000))
+    fi
     rch_group_state
     case $? in
         0) return 0;;
@@ -478,11 +501,22 @@ rch_remote_cancel_loaded() {
     rch_signal_group KILL || rch_kill_status=$?
     case "$rch_kill_status" in 0|43) ;; *) return "$rch_kill_status";; esac
     rch_attempt=0
-    # Each scope observation uses two individually bounded manager reads.
-    # Keep fresh-channel cleanup within the existing 45-second SSH budget.
+    # Retain the quick-poll caps for ordinary exits, but stop starting Linux
+    # observations after 30 seconds since entry. A final census takes at most
+    # five seconds, plus V2's two one-second manager reads: 37 seconds leaves
+    # room inside the existing 45-second SSH budget. The pre-loop TERM path is
+    # bounded by 26 seconds (censuses, witnesses and grace), or 19 for V2.
+    # Darwin keeps its existing one-second census and retry caps.
     rch_attempt_limit=20
     [ "${rch_scope_bound:-0}" != 1 ] || rch_attempt_limit=8
+    rch_last_state=2
     while [ "$rch_attempt" -lt "$rch_attempt_limit" ]; do
+        if [ -n "$rch_cancel_deadline" ]; then
+            rch_cancel_clock || return 44
+            [ "$rch_cancel_now" -ge "$rch_cancel_last_clock" ] || return 44
+            rch_cancel_last_clock=$rch_cancel_now
+            [ "$rch_cancel_now" -lt "$rch_cancel_deadline" ] || break
+        fi
         rch_group_state
         rch_last_state=$?
         # Without stop authority, an unavailable census keeps the refusal.

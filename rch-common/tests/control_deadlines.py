@@ -133,7 +133,7 @@ time.sleep(20)
         self.stalled_helper("ps", "client")
         result = self.run_shell(
             "rch_pgid=424242; rch_scope_bound=0; rch_group_state",
-            stalled=True,
+            stalled=True, budget=8,
         )
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertEqual(result.stdout, b"")
@@ -142,7 +142,7 @@ time.sleep(20)
         self.stalled_helper("ps", "stdout")
         result = self.run_shell(
             "rch_pgid=424242; rch_scope_bound=0; rch_group_state",
-            stalled=True,
+            stalled=True, budget=8,
         )
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertEqual(result.stdout, b"")
@@ -239,7 +239,7 @@ class ProcessCensusRecovery(unittest.TestCase):
         self.count.write_text("0")
         ps = self.root / "ps"
         ps.write_text(f"#!{sys.executable}\n" + '''
-import os, sys
+import os, sys, time
 from pathlib import Path
 root = Path(os.environ["RCH_CENSUS_ROOT"])
 counter = root / "count"
@@ -247,6 +247,10 @@ number = int(counter.read_text()) + int("-e" in sys.argv)
 counter.write_text(str(number))
 # Count logical censuses, not their selected-thread second exchange.
 fault = os.environ.get("RCH_CENSUS_FAULT", "none")
+if fault == "slow" and "-e" in sys.argv:
+    # A real process table, delayed beyond the old one-second budget. Never
+    # manufacture an empty census or replace the selected-thread exchange.
+    time.sleep(1.25)
 bad = (fault in ("failed", "malformed") and number == 1
        or fault == "persistent"
        or fault == "thread-pass" and "-q" in sys.argv
@@ -377,6 +381,62 @@ exec "$@"
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assert_stopped(group)
                 self.assertEqual(self.signals()[-1], f"-KILL -{group[0].pid}")
+
+    def test_slow_real_census_observes_live_work_and_confirms_owned_cleanup(self):
+        group = self.group()
+        live = self.recover(group, "slow", body='rch_read_record "$1" 41 || exit $?\nrch_group_state')
+        self.assertEqual(live.returncode, 1, live.stderr)
+        self.assert_alive(group)
+        self.assertEqual(self.signals(), [])
+        self.count.write_text("0")
+        stopped = self.recover(group, "slow")
+        self.assertEqual(stopped.returncode, 0, stopped.stderr)
+        self.assert_stopped(group)
+        self.assertGreaterEqual(int(self.count.read_text()), 2)
+        self.assertEqual(self.signals(), [f"-KILL -{group[0].pid}"])
+
+    def test_elapsed_recovery_budget_stops_retries_without_claiming_absence(self):
+        group = self.group()
+        # Advance only the monotonic budget after the genuine authenticated
+        # KILL. The process, receipt and failed census remain native. No time
+        # limit may turn missing death evidence into a completion receipt.
+        clock = '''
+rch_cancel_clock() {
+    if [ -f "$RCH_CENSUS_ROOT/signals" ]; then
+        rch_cancel_now=3100
+    else
+        rch_cancel_now=100
+    fi
+}
+'''
+        result = self.recover(group, "persistent", extra=clock)
+        self.assertEqual(result.returncode, 44, result.stderr)
+        self.assertEqual(int(self.count.read_text()), 1)
+        self.assertEqual(self.signals(), [f"-KILL -{group[0].pid}"])
+        self.assert_stopped(group)
+        self.assertEqual(self.recover(group).returncode, 0)
+
+    def test_missing_or_backwards_recovery_clock_cannot_confirm_cleanup(self):
+        for clock_failure in ("return 1", "rch_cancel_now=99"):
+            with self.subTest(clock_failure=clock_failure):
+                group = self.group()
+                self.count.write_text("0")
+                self.trace.write_text("")
+                clock = '''
+rch_cancel_clock() {
+    if [ -s "$RCH_CENSUS_ROOT/signals" ]; then
+        ''' + clock_failure + '''
+    else
+        rch_cancel_now=100
+    fi
+}
+'''
+                result = self.recover(group, "persistent", extra=clock)
+                self.assertEqual(result.returncode, 44, result.stderr)
+                self.assertEqual(int(self.count.read_text()), 1)
+                self.assertEqual(self.signals(), [f"-KILL -{group[0].pid}"])
+                self.assert_stopped(group)
+                self.assertEqual(self.recover(group).returncode, 0)
 
     def test_malformed_successful_census_does_not_strand_an_owned_group(self):
         group = self.group()

@@ -333,9 +333,15 @@ impl Default for CancellationConfig {
         Self {
             grace_period: Duration::from_secs(5),
             kill_timeout: Duration::from_secs(3),
-            remote_kill_timeout: Duration::from_secs(10),
+            // Match the fresh-channel recovery budget in the transfer path.
+            // A loaded worker's bounded census and authenticated escalation
+            // can legitimately outlast ten seconds; cutting off its receipt
+            // retains a reservation even after the owned workload has stopped.
+            remote_kill_timeout: Duration::from_secs(45),
             max_escalations: 3,
-            cleanup_timeout: Duration::from_secs(15),
+            // Include local TERM grace, the complete remote attempt, and local
+            // KILL settlement. The overall deadline still bounds every stage.
+            cleanup_timeout: Duration::from_secs(60),
         }
     }
 }
@@ -2319,9 +2325,9 @@ wait
         let config = CancellationConfig::default();
         assert_eq!(config.grace_period, Duration::from_secs(5));
         assert_eq!(config.kill_timeout, Duration::from_secs(3));
-        assert_eq!(config.remote_kill_timeout, Duration::from_secs(10));
+        assert_eq!(config.remote_kill_timeout, Duration::from_secs(45));
         assert_eq!(config.max_escalations, 3);
-        assert_eq!(config.cleanup_timeout, Duration::from_secs(15));
+        assert_eq!(config.cleanup_timeout, Duration::from_secs(60));
     }
 
     // 7. Cancel all with no active builds
@@ -3534,14 +3540,11 @@ exec /bin/sh -c "$payload"
             .await;
             std::fs::write(root.join("build-id"), active.id.to_string()).unwrap();
             let ctx = make_test_context(pool, history.clone());
-            // A loaded Mac took over 1 s to run the fake ssh for "confirmed".
-            let orch = CancellationOrchestrator::new(
-                CancellationConfig {
-                    remote_kill_timeout: Duration::from_secs(10),
-                    ..test_config()
-                },
-                test_events(),
-            );
+            // Exercise the production budgets: the valid receipt below is
+            // deliberately later than the old ten-second remote cutoff.
+            // Transport status alone, malformed receipts, and hard hangs must
+            // still retain the original reservation.
+            let orch = CancellationOrchestrator::new(CancellationConfig::default(), test_events());
             for mode in [
                 "empty",
                 "truncated",
@@ -3641,7 +3644,7 @@ case "$mode" in
   duplicate) printf 'RCH_REMOTE_CANCELLED_V1:%s\n' "$id" "$id";;
   failed) printf 'RCH_REMOTE_CANCELLED_V1:%s\n' "$id"; exit 255;;
   hang) exec /bin/sleep 60;;
-  confirmed) printf 'RCH_REMOTE_CANCELLED_V1:%s\n' "$id";;
+  confirmed) /bin/sleep 11; printf 'RCH_REMOTE_CANCELLED_V1:%s\n' "$id";;
   *) exit 99;;
 esac
 "#,
@@ -3649,7 +3652,7 @@ esac
         .unwrap();
         std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
         let output = tokio::time::timeout(
-            Duration::from_secs(15),
+            CancellationConfig::default().cleanup_timeout + Duration::from_secs(5),
             tokio::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "cancellation::tests::remote_cancel_transport_requires_receipt_before_releasing_reservations", "--nocapture"])
                 .env(CHILD_ROOT, &root)

@@ -431,6 +431,33 @@ if rch_remote_witness_matches; then exit 88; fi
         self.assertTrue(self.ready.exists())
         self.assert_empty()
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux process census budget")
+    def test_slow_real_process_census_preserves_completion_and_stops_background_work(self):
+        real_ps = shutil.which("ps", path=self.env.get("PATH"))
+        self.assertIsNotNone(real_ps)
+        binaries = self.root / "slow-ps"
+        binaries.mkdir()
+        trace = self.root / "census-trace"
+        ps = binaries / "ps"
+        ps.write_text(f"#!{sys.executable}\n" + f'''
+import os, sys, time
+if "-e" in sys.argv:
+    with open({str(trace)!r}, "a") as output:
+        output.write("leader census\\n")
+    time.sleep(1.25)
+os.execv({real_ps!r}, ["ps", *sys.argv[1:]])
+''')
+        ps.chmod(0o700)
+        self.env["PATH"] = f"{binaries}:{self.env.get('PATH', os.defpath)}"
+        late = self.root / "late-write"
+        payload = (f"(sleep 5; printf leaked > {shlex.quote(str(late))}) & "
+                   "printf result; printf diagnostic >&2; exit 7")
+        out, err = self.finish(self.start(payload), 7)
+        self.assertEqual((out, err), (b"result", b"diagnostic"))
+        self.assertGreaterEqual(len(trace.read_text().splitlines()), 2)
+        self.assertFalse(late.exists())
+        self.assert_empty()
+
     def test_post_kill_incomplete_census_requires_later_complete_observation(self):
         killed = self.root / "owned-kill"
         retried = self.root / "census-retried"
