@@ -1,4 +1,4 @@
-//! Complete-workspace libraries with exact, already committed Rust producers.
+//! Rust libraries with exact, already committed artifact producers.
 //!
 //! Every visible retained crate candidate, including candidates not named by an
 //! explicit extern, requires a driver-owned committed-install witness. These
@@ -152,6 +152,172 @@ pub struct CommittedWorkspaceDependency {
     pub virtual_path: RawBytes,
     /// Entire retained artifact's object identity.
     pub object: ObjectId,
+}
+
+/// The producer contract retained by an operation-owned committed-input proof.
+/// Source origin is independent: immutable DAG policies retain the original
+/// registry, Git or directory-package kind; workspace DAG policies retain the
+/// existing mixed workspace source scope and use new descriptor identities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommittedDependencyPolicy {
+    /// Existing workspace-only archive producer contract, epoch 6.
+    WorkspaceRlib,
+    /// Existing workspace-only metadata producer contract, epoch 7.
+    WorkspaceMetadata,
+    /// Existing workspace/archive and qualified immutable-leaf contract, epoch 8.
+    MixedWorkspaceRlib,
+    /// Existing workspace/metadata and qualified immutable-leaf contract, epoch 9.
+    MixedWorkspaceMetadata,
+    /// Immutable archive with a complete committed producer inventory, epoch 10.
+    ImmutableDagRlib,
+    /// Immutable metadata with a complete committed producer inventory, epoch 11.
+    ImmutableDagMetadata,
+    /// Workspace archive admitting committed immutable dependency DAGs, epoch 12.
+    WorkspaceDagRlib,
+    /// Workspace metadata admitting committed immutable dependency DAGs, epoch 13.
+    WorkspaceDagMetadata,
+}
+
+impl CommittedDependencyPolicy {
+    /// Original policy for existing committed workspace source classes. New
+    /// DAG policies require an explicit retained capability; a source kind
+    /// alone never selects them.
+    #[must_use]
+    pub const fn from_source_kind(kind: DependencySourceKind) -> Option<Self> {
+        match kind {
+            DependencySourceKind::WorkspaceCommittedRlib => Some(Self::WorkspaceRlib),
+            DependencySourceKind::WorkspaceCommittedMetadata => Some(Self::WorkspaceMetadata),
+            DependencySourceKind::WorkspaceMixedRlib => Some(Self::MixedWorkspaceRlib),
+            DependencySourceKind::WorkspaceMixedMetadata => Some(Self::MixedWorkspaceMetadata),
+            _ => None,
+        }
+    }
+
+    /// Exact compiler output class; workspace metadata additionally requires
+    /// the separately negotiated ClosedMetadata worker namespace.
+    #[must_use]
+    pub const fn output_class(self) -> RemoteDependencyOutputClass {
+        match self {
+            Self::WorkspaceRlib
+            | Self::MixedWorkspaceRlib
+            | Self::ImmutableDagRlib
+            | Self::WorkspaceDagRlib => RemoteDependencyOutputClass::Rlib,
+            Self::WorkspaceMetadata
+            | Self::MixedWorkspaceMetadata
+            | Self::ImmutableDagMetadata
+            | Self::WorkspaceDagMetadata => RemoteDependencyOutputClass::Metadata,
+        }
+    }
+
+    /// Check source origin and invocation compatibility, independently of any
+    /// installed producer, current publication or runtime authority.
+    ///
+    /// # Errors
+    /// A different source/mode, noncanonical layout, or unsupported inputs.
+    pub fn validate_plan(self, plan: &DependencyActionPlan) -> Result<(), LiveRefusal> {
+        match self {
+            Self::WorkspaceRlib => validate_committed_workspace_rlib_plan(plan),
+            Self::WorkspaceMetadata => validate_committed_workspace_metadata_plan(plan),
+            Self::MixedWorkspaceRlib
+            | Self::MixedWorkspaceMetadata
+            | Self::WorkspaceDagRlib
+            | Self::WorkspaceDagMetadata => {
+                if validate_mixed_workspace_library_plan(plan)? != self.output_class() {
+                    return Err(LiveRefusal::Facts(
+                        "committed policy differs from workspace output class".into(),
+                    ));
+                }
+                Ok(())
+            }
+            Self::ImmutableDagRlib | Self::ImmutableDagMetadata => {
+                super::canonical_cargo::canonical_layout(plan)?;
+                let source_is_immutable = match plan.source_kind {
+                    DependencySourceKind::RegistryPackage | DependencySourceKind::GitCheckout => {
+                        plan.directory_source_manifest.is_none()
+                    }
+                    DependencySourceKind::DirectoryPackage => {
+                        plan.directory_source_manifest.is_some()
+                    }
+                    _ => false,
+                };
+                if !source_is_immutable
+                    || !matches!(plan.invocation.crate_types.as_slice(), [kind] if matches!(kind.as_str(), "lib" | "rlib"))
+                    || plan.generated_root.is_some()
+                    || !plan.native_roots.is_empty()
+                    || !plan.invocation.native_libs.is_empty()
+                    || remote::remote_dependency_output_class(&plan.invocation)
+                        != Ok(self.output_class())
+                {
+                    return Err(LiveRefusal::Facts("committed immutable DAG requires a pure canonical immutable library without generated or native inputs".into()));
+                }
+                let outputs = crate::output_derivation::derive_dependency_output_declarations(
+                    &plan.invocation,
+                    &plan.host_triple,
+                )
+                .map_err(|error| {
+                    LiveRefusal::Facts(format!("immutable DAG output contract: {error:?}"))
+                })?;
+                if outputs.canonical_bytes() != plan.outputs.canonical_bytes() {
+                    return Err(LiveRefusal::Facts(
+                        "immutable DAG output declarations differ from its invocation".into(),
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+struct DagContract {
+    epoch: u32,
+    class: ActionClass,
+    isolation_domain: &'static str,
+    semantics_domain: &'static str,
+    dependencies_domain: &'static str,
+    profile: &'static str,
+}
+
+const IMMUTABLE_DAG_RLIB: DagContract = DagContract {
+    epoch: 10,
+    class: ActionClass::RustcDependencyCompile,
+    isolation_domain: "rabs.canonical-immutable-committed-dag-rlib.isolation.v1",
+    semantics_domain: "rabs.canonical-immutable-committed-dag-rlib.semantics.v1",
+    dependencies_domain: "rabs.canonical-immutable-committed-dag-rlib.dependencies.v1",
+    profile: "canonical-immutable-committed-dag-rlib-v1: complete immutable canonical registry, Git or checksum-witnessed directory package; existing canonical-dependency-exec-v4 Rlib namespace with no procfs or entropy devices; exact argv, semantic environment, complete retained toolchain and matched ELF runtime; exact ordered read-only Rust candidate inventory, whole explicit archives and unchanged metadata-shadow projection; every retained candidate bound to an operation-owned installed generation and exact committed archive producer action, descriptor, manifest, role and object; qualified immutable archive leaves or committed immutable archive DAGs, no unresolved ancestors; H028 carries all exact retained candidates and current transitive serving, class and quarantine gates apply at commit and delivery; no local completion, request-owned or unregistered inputs, generated/native inputs, proc macros, incremental state or final links; authenticated drained capture, exact diagnostics, dep-info and tracked-control veto; separate class samples and existing release and installation gates",
+};
+const IMMUTABLE_DAG_METADATA: DagContract = DagContract {
+    epoch: 11,
+    class: ActionClass::RustcDependencyCompile,
+    isolation_domain: "rabs.canonical-immutable-committed-dag-metadata.isolation.v1",
+    semantics_domain: "rabs.canonical-immutable-committed-dag-metadata.semantics.v1",
+    dependencies_domain: "rabs.canonical-immutable-committed-dag-metadata.dependencies.v1",
+    profile: "canonical-immutable-committed-dag-metadata-v1: complete immutable canonical registry, Git or checksum-witnessed directory package; existing canonical-dependency-exec-v4 Metadata namespace and established dep-info read-closure contract; exact canonical argv and semantic environment, complete retained toolchain and matched ELF runtime; exact ordered read-only Rust candidate inventory and whole explicit archives; every retained candidate bound to an operation-owned installed generation and exact committed immutable producer action, descriptor, manifest, role and object; qualified immutable leaves or committed immutable DAGs; metadata producers authorize only ProvisionalMetadata rmeta, archive producers may authorize rmeta or whole Materializable rlib; H028 carries every retained candidate and current transitive serving, class and quarantine gates apply at commit and delivery; no unregistered, unresolved, adopted, local fallback or request-owned authority; no generated/native inputs, proc macros, incremental state or codegen output; authenticated drained capture, exact diagnostics and tracked-control veto, independent class samples and existing release and installation gates",
+};
+const WORKSPACE_DAG_RLIB: DagContract = DagContract {
+    epoch: 12,
+    class: ActionClass::RustcWorkspaceCompile,
+    isolation_domain: "rabs.canonical-workspace-committed-dag-rlib.isolation.v1",
+    semantics_domain: "rabs.canonical-workspace-committed-dag-rlib.semantics.v1",
+    dependencies_domain: "rabs.canonical-workspace-committed-dag-rlib.dependencies.v1",
+    profile: "canonical-workspace-committed-dag-rlib-v1: selected ordinary library in an executor-free canonical Cargo graph; complete immutable workspace files and directory topology, exact argv and environment, complete retained toolchain and matched ELF runtime; existing canonical-workspace-exec-v3 Rlib namespace with no procfs or entropy devices; complete ordered retained candidate inventory and whole explicit archive bytes; every candidate has its original operation-owned installation generation and exact committed producer action, descriptor, manifest, role and object; closed, mixed or DAG workspace archive producers plus qualified immutable archive leaves and committed immutable archive DAGs; every intermediate retains its own producer policy, metadata-only producer authority is excluded; exact H028 ancestry and current transitive serving/class safety at commit and every delivery phase; no generated/native inputs, proc macros, incremental state, final links, local or request-owned completion, unresolved or adopted lineage; authenticated drained capture, exact diagnostics and dep-info, separate class samples and existing release and installation gates",
+};
+const WORKSPACE_DAG_METADATA: DagContract = DagContract {
+    epoch: 13,
+    class: ActionClass::RustcWorkspaceCompile,
+    isolation_domain: "rabs.canonical-workspace-committed-dag-metadata.isolation.v1",
+    semantics_domain: "rabs.canonical-workspace-committed-dag-metadata.semantics.v1",
+    dependencies_domain: "rabs.canonical-workspace-committed-dag-metadata.dependencies.v1",
+    profile: "canonical-workspace-committed-dag-metadata-v1: selected ordinary check in an executor-free canonical Cargo graph; complete immutable workspace files and directory topology, exact argv and environment, complete retained toolchain and matched ELF runtime; explicitly negotiated canonical-workspace-closed-metadata-v1 ClosedMetadata namespace without procfs or entropy devices; every ordered retained Rust candidate has its original operation-owned installation generation and exact committed producer action, descriptor, manifest, role and object; closed, mixed or DAG workspace producers plus qualified immutable leaves and committed immutable DAGs; metadata producers authorize only ProvisionalMetadata rmeta, archive producers may authorize rmeta or whole Materializable rlib; every intermediate retains its own narrower producer policy; complete H028 ancestry and current transitive serving/class safety at commit and every delivery phase; no generated/native inputs, proc macros, incremental state, archive or harness outputs, local or request-owned completion, unresolved or adopted lineage; authenticated drained capture, exact diagnostics and dep-info, separate class samples and existing release and installation gates",
+};
+
+fn dag_contract(policy: CommittedDependencyPolicy) -> Option<&'static DagContract> {
+    match policy {
+        CommittedDependencyPolicy::ImmutableDagRlib => Some(&IMMUTABLE_DAG_RLIB),
+        CommittedDependencyPolicy::ImmutableDagMetadata => Some(&IMMUTABLE_DAG_METADATA),
+        CommittedDependencyPolicy::WorkspaceDagRlib => Some(&WORKSPACE_DAG_RLIB),
+        CommittedDependencyPolicy::WorkspaceDagMetadata => Some(&WORKSPACE_DAG_METADATA),
+        _ => None,
+    }
 }
 
 /// Refine the original fresh plan; actual driver selection and every candidate
@@ -399,6 +565,47 @@ pub fn remote_mixed_workspace_library_shape(
     Ok(())
 }
 
+/// Validate the exact namespace and every ordered committed candidate under
+/// the capability's explicit producer policy. These pure facts cannot mint a
+/// physical installation witness or assert a producer's current standing.
+///
+/// # Errors
+/// Unsupported source/mode, namespace, externs or incomplete provenance.
+pub fn remote_committed_dependency_shape(
+    plan: &DependencyActionPlan,
+    policy: CommittedDependencyPolicy,
+    directories: &[DependencyDirectoryFact],
+    dependencies: &[CommittedWorkspaceDependency],
+    toolchain_root: &str,
+) -> Result<(), RemoteDependencyRefusal> {
+    policy.validate_plan(plan)?;
+    match policy {
+        CommittedDependencyPolicy::WorkspaceRlib => {
+            remote_committed_workspace_rlib_shape(plan, directories, dependencies, toolchain_root)
+        }
+        CommittedDependencyPolicy::WorkspaceMetadata => remote_committed_workspace_metadata_shape(
+            plan,
+            directories,
+            dependencies,
+            toolchain_root,
+        ),
+        CommittedDependencyPolicy::MixedWorkspaceRlib
+        | CommittedDependencyPolicy::MixedWorkspaceMetadata
+        | CommittedDependencyPolicy::WorkspaceDagRlib
+        | CommittedDependencyPolicy::WorkspaceDagMetadata => {
+            remote_mixed_workspace_library_shape(plan, directories, dependencies, toolchain_root)
+        }
+        CommittedDependencyPolicy::ImmutableDagRlib
+        | CommittedDependencyPolicy::ImmutableDagMetadata => {
+            remote::remote_dependency_shape(plan, directories, toolchain_root)?;
+            validate_committed_workspace_dependencies(directories, dependencies)?;
+            let externs = remote::remote_extern_facts(plan, directories)?;
+            artifacts_component(plan, &externs, directories)?;
+            Ok(())
+        }
+    }
+}
+
 fn isolation_policy() -> TypedDigest {
     compute(POLICY_DOMAIN, ISOLATION_PROFILE.as_bytes())
 }
@@ -476,6 +683,37 @@ pub fn remote_mixed_workspace_library_isolation_policy(
     ))
 }
 
+/// Isolation identity selected by the retained producer capability, never by
+/// mutable source kind alone. The four existing identities remain unchanged.
+///
+/// # Errors
+/// Source origin or invocation mode does not match the exact policy.
+pub fn remote_committed_dependency_isolation_policy(
+    plan: &DependencyActionPlan,
+    policy: CommittedDependencyPolicy,
+) -> Result<TypedDigest, RemoteDependencyRefusal> {
+    policy.validate_plan(plan)?;
+    if let Some(contract) = dag_contract(policy) {
+        return Ok(compute(
+            contract.isolation_domain,
+            contract.profile.as_bytes(),
+        ));
+    }
+    match policy {
+        CommittedDependencyPolicy::WorkspaceRlib => {
+            remote_committed_workspace_rlib_isolation_policy(plan)
+        }
+        CommittedDependencyPolicy::WorkspaceMetadata => {
+            remote_committed_workspace_metadata_isolation_policy(plan)
+        }
+        CommittedDependencyPolicy::MixedWorkspaceRlib
+        | CommittedDependencyPolicy::MixedWorkspaceMetadata => {
+            remote_mixed_workspace_library_isolation_policy(plan)
+        }
+        _ => unreachable!("DAG policies returned their distinct contract"),
+    }
+}
+
 /// Descriptor classification only; never a replacement for live witnesses.
 #[must_use]
 pub fn is_committed_workspace_rlib_descriptor(descriptor: &ActionDescriptor) -> bool {
@@ -519,6 +757,76 @@ pub fn is_mixed_workspace_metadata_descriptor(descriptor: &ActionDescriptor) -> 
             == mixed_isolation_policy(RemoteDependencyOutputClass::Metadata)
         && descriptor.execution_semantics
             == mixed_execution_semantics(RemoteDependencyOutputClass::Metadata)
+}
+
+/// Exact policy identity only, not proof of installation, retained inputs,
+/// publication, current ancestry, or independent verification samples.
+#[must_use]
+pub fn committed_dependency_descriptor_policy(
+    descriptor: &ActionDescriptor,
+) -> Option<CommittedDependencyPolicy> {
+    for (policy, matches) in [
+        (
+            CommittedDependencyPolicy::WorkspaceRlib,
+            is_committed_workspace_rlib_descriptor(descriptor),
+        ),
+        (
+            CommittedDependencyPolicy::WorkspaceMetadata,
+            is_committed_workspace_metadata_descriptor(descriptor),
+        ),
+        (
+            CommittedDependencyPolicy::MixedWorkspaceRlib,
+            is_mixed_workspace_rlib_descriptor(descriptor),
+        ),
+        (
+            CommittedDependencyPolicy::MixedWorkspaceMetadata,
+            is_mixed_workspace_metadata_descriptor(descriptor),
+        ),
+    ] {
+        if matches {
+            return Some(policy);
+        }
+    }
+    for policy in [
+        CommittedDependencyPolicy::ImmutableDagRlib,
+        CommittedDependencyPolicy::ImmutableDagMetadata,
+        CommittedDependencyPolicy::WorkspaceDagRlib,
+        CommittedDependencyPolicy::WorkspaceDagMetadata,
+    ] {
+        let contract = dag_contract(policy).expect("DAG policy has a contract");
+        if descriptor.action_class == contract.class
+            && descriptor.key_epoch == contract.epoch
+            && descriptor.projection_epoch == PROJECTION_EPOCH
+            && descriptor.dependency_inputs.domain == contract.dependencies_domain
+            && descriptor.sandbox_semantic_policy
+                == compute(contract.isolation_domain, contract.profile.as_bytes())
+            && descriptor.execution_semantics
+                == compute(contract.semantics_domain, contract.profile.as_bytes())
+        {
+            return Some(policy);
+        }
+    }
+    None
+}
+
+/// Identify a claimed DAG namespace even when its exact descriptor is invalid.
+/// Coordinators use this after exact classification to prevent an altered DAG
+/// descriptor falling through to generic dependency-class authority.
+#[must_use]
+pub fn uses_committed_dependency_namespace(descriptor: &ActionDescriptor) -> bool {
+    (10..=13).contains(&descriptor.key_epoch)
+        || [
+            &IMMUTABLE_DAG_RLIB,
+            &IMMUTABLE_DAG_METADATA,
+            &WORKSPACE_DAG_RLIB,
+            &WORKSPACE_DAG_METADATA,
+        ]
+        .into_iter()
+        .any(|contract| {
+            descriptor.sandbox_semantic_policy.domain == contract.isolation_domain
+                || descriptor.execution_semantics.domain == contract.semantics_domain
+                || descriptor.dependency_inputs.domain == contract.dependencies_domain
+        })
 }
 
 fn encode_digest(encoder: &mut CanonicalEncoder, digest: &TypedDigest) {
@@ -629,6 +937,142 @@ pub fn remote_mixed_workspace_library_key(
         output,
         true,
     )
+}
+
+/// Build the exact descriptor selected by an operation-owned committed-input
+/// policy. New immutable DAG keys retain their immutable source origin and the
+/// existing worker mode. New workspace DAG keys retain the complete workspace
+/// closure and their separately negotiated archive/closed-metadata context.
+/// Every retained candidate's exact bytes and producer identities are bound;
+/// the four existing workspace key encodings remain byte-for-byte unchanged.
+///
+/// # Errors
+/// Unsupported inputs, source/mode mismatch, incomplete provenance or runtime.
+#[allow(clippy::too_many_arguments)]
+pub fn remote_committed_dependency_key(
+    plan: &DependencyActionPlan,
+    policy: CommittedDependencyPolicy,
+    toolchain: &ToolchainFacts,
+    directories: &[DependencyDirectoryFact],
+    dependencies: &[CommittedWorkspaceDependency],
+    inputs: &ActionInputManifest,
+    build_script_output: Option<&[u8]>,
+    toolchain_root: &str,
+    retained_toolchain_sha256: &[u8; 32],
+    runtime: &TypedDigest,
+) -> Result<LiveDependencyKey, RemoteDependencyRefusal> {
+    remote_committed_dependency_shape(plan, policy, directories, dependencies, toolchain_root)?;
+    match policy {
+        CommittedDependencyPolicy::WorkspaceRlib => {
+            return remote_committed_workspace_rlib_key(
+                plan,
+                toolchain,
+                directories,
+                dependencies,
+                inputs,
+                build_script_output,
+                toolchain_root,
+                retained_toolchain_sha256,
+                runtime,
+            );
+        }
+        CommittedDependencyPolicy::WorkspaceMetadata => {
+            return remote_committed_workspace_metadata_key(
+                plan,
+                toolchain,
+                directories,
+                dependencies,
+                inputs,
+                build_script_output,
+                toolchain_root,
+                retained_toolchain_sha256,
+                runtime,
+            );
+        }
+        CommittedDependencyPolicy::MixedWorkspaceRlib
+        | CommittedDependencyPolicy::MixedWorkspaceMetadata => {
+            return remote_mixed_workspace_library_key(
+                plan,
+                toolchain,
+                directories,
+                dependencies,
+                inputs,
+                build_script_output,
+                toolchain_root,
+                retained_toolchain_sha256,
+                runtime,
+            );
+        }
+        _ => {}
+    }
+    if build_script_output.is_some() {
+        return Err(LiveRefusal::Facts(
+            "committed dependency DAG cannot consume a build-script run record".into(),
+        )
+        .into());
+    }
+    let immutable = matches!(
+        policy,
+        CommittedDependencyPolicy::ImmutableDagRlib
+            | CommittedDependencyPolicy::ImmutableDagMetadata
+    );
+    let mut key = if immutable {
+        remote::remote_dependency_key(
+            plan,
+            toolchain,
+            directories,
+            inputs,
+            None,
+            toolchain_root,
+            retained_toolchain_sha256,
+            runtime,
+        )?
+    } else {
+        remote_mixed_workspace_library_key(
+            plan,
+            toolchain,
+            directories,
+            dependencies,
+            inputs,
+            None,
+            toolchain_root,
+            retained_toolchain_sha256,
+            runtime,
+        )?
+    };
+    let contract = dag_contract(policy).expect("nonlegacy policy has a DAG contract");
+    let mut provenance = CanonicalEncoder::new();
+    encode_digest(&mut provenance, &key.descriptor.dependency_inputs);
+    if immutable {
+        provenance.seq(dependencies, |encoder, dependency| {
+            encoder.str(&dependency.path);
+            encode_digest(encoder, &dependency.producer_action);
+            encode_digest(encoder, &dependency.producer_descriptor);
+            encode_digest(encoder, &dependency.producer_manifest);
+            encoder.str(match dependency.role {
+                OutputRole::Materializable => "materializable",
+                OutputRole::ProvisionalMetadata => "provisional-metadata",
+                OutputRole::DepInfo => "dep-info",
+                OutputRole::BuildScriptMetadata => "build-script-metadata",
+                OutputRole::TestSideEffect => "test-side-effect",
+            });
+            encoder.bytes(dependency.virtual_path.as_bytes());
+            encode_digest(encoder, &dependency.object.0);
+        });
+    }
+    // Workspace base components already bind the same complete ordered
+    // producer tuple; rebind that encoding without changing its source scope.
+    key.descriptor.dependency_inputs = compute(contract.dependencies_domain, &provenance.finish());
+    key.descriptor.key_epoch = contract.epoch;
+    key.descriptor.projection_epoch = PROJECTION_EPOCH;
+    key.descriptor.action_class = contract.class;
+    key.descriptor.sandbox_semantic_policy =
+        compute(contract.isolation_domain, contract.profile.as_bytes());
+    key.descriptor.execution_semantics =
+        compute(contract.semantics_domain, contract.profile.as_bytes());
+    key.action_key = compute_action_key(&key.descriptor).final_key;
+    key.descriptor_digest = descriptor_digest(&descriptor_canonical_bytes(&key.descriptor));
+    Ok(key)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -790,8 +1234,8 @@ fn remote_committed_workspace_key(
 mod tests {
     use super::*;
     use crate::live_dependency::{
-        ExternFact, LiveRustcRequest, plan_canonical_workspace_execution,
-        remote_workspace_execution_key,
+        ExternFact, LiveRustcRequest, plan_canonical_remote_dependency_action,
+        plan_canonical_workspace_execution, remote_workspace_execution_key,
     };
     use rabs_protocol::input_evidence::{
         DirectoryEnumeration, INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType, PositiveInput,
@@ -996,6 +1440,410 @@ mod tests {
             &[39; 32],
             &compute(remote::RUNTIME_COHORT_DOMAIN, b"runtime"),
         )
+    }
+
+    fn policy_key(
+        plan: &DependencyActionPlan,
+        policy: CommittedDependencyPolicy,
+        dependencies: &[CommittedWorkspaceDependency],
+        inputs: &ActionInputManifest,
+    ) -> Result<LiveDependencyKey, RemoteDependencyRefusal> {
+        remote_committed_dependency_key(
+            plan,
+            policy,
+            &toolchain(),
+            &directories(dependencies),
+            dependencies,
+            inputs,
+            None,
+            TOOLCHAIN,
+            &[39; 32],
+            &compute(remote::RUNTIME_COHORT_DOMAIN, b"runtime"),
+        )
+    }
+
+    fn immutable_plan(package: &str, metadata: bool) -> DependencyActionPlan {
+        let argv = [
+            "/__rabs/toolchain/bin/rustc".into(),
+            "--crate-name=consumer".into(),
+            "--crate-type=lib".into(),
+            "--edition=2021".into(),
+            format!("{package}/src/lib.rs"),
+            "--error-format=json".into(),
+            "--json=artifacts".into(),
+            if metadata {
+                "--emit=dep-info,metadata"
+            } else {
+                "--emit=dep-info,metadata,link"
+            }
+            .into(),
+            "--cap-lints=allow".into(),
+            format!("--out-dir={OUTPUT}"),
+            "-L".into(),
+            format!("dependency={OUTPUT}"),
+            format!("--extern=upstream={OUTPUT}/libupstream.rmeta"),
+        ];
+        let env = [
+            ("HOME".into(), "/__rabs/home".into()),
+            ("CARGO_HOME".into(), "/__rabs/cargo-home".into()),
+            ("CARGO_MANIFEST_DIR".into(), package.into()),
+            ("CARGO_PKG_NAME".into(), "consumer".into()),
+            ("CARGO_INCREMENTAL".into(), "0".into()),
+        ];
+        let checksum = package
+            .starts_with("/__rabs/workspace/vendor/")
+            .then(|| digest(b"checked directory package manifest"));
+        plan_canonical_remote_dependency_action(
+            LiveRustcRequest {
+                argv: &argv,
+                env: &env,
+                cwd: package,
+            },
+            HOST,
+            checksum,
+        )
+        .unwrap()
+    }
+
+    fn immutable_inputs(plan: &DependencyActionPlan) -> ActionInputManifest {
+        let crate::invocation::SourceInput::Path(source) = plan.invocation.source.as_ref().unwrap()
+        else {
+            panic!("fixture source must be a real path");
+        };
+        let source = source
+            .strip_prefix(&format!("{}/", plan.source_root))
+            .unwrap();
+        let mut files = vec![
+            ("Cargo.toml", digest(b"manifest")),
+            (source, digest(b"crate source")),
+        ];
+        if let Some(checksum) = &plan.directory_source_manifest {
+            files.push((".cargo-checksum.json", checksum.clone()));
+        }
+        ActionInputManifest {
+            schema_version: INPUT_EVIDENCE_SCHEMA_VERSION,
+            inputs: files
+                .into_iter()
+                .map(|(path, digest)| PositiveInput {
+                    virtual_path: RawBytes::new(plan.input_virtual_path(path).into_bytes()),
+                    object: ObjectId(digest),
+                    file_type: InputFileType::Regular,
+                    executable: false,
+                    symlink_resolution: Vec::new(),
+                })
+                .collect(),
+            ..ActionInputManifest::default()
+        }
+    }
+
+    #[test]
+    fn typed_committed_policy_preserves_all_four_published_workspace_identities() {
+        let dependencies = vec![candidate("libupstream.rmeta")];
+        for metadata in [false, true] {
+            let fresh = execution_with_output(false, "one", metadata);
+            let workspace = if metadata {
+                plan_committed_workspace_metadata(&fresh).unwrap()
+            } else {
+                plan_committed_workspace_rlib(&fresh).unwrap()
+            };
+            let mixed = plan_mixed_workspace_library(&fresh).unwrap();
+            for plan in [workspace, mixed] {
+                let policy = CommittedDependencyPolicy::from_source_kind(plan.source_kind).unwrap();
+                let captured = inputs(&plan);
+                let original = match policy {
+                    CommittedDependencyPolicy::WorkspaceRlib => {
+                        key(&plan, &dependencies, &captured)
+                    }
+                    CommittedDependencyPolicy::WorkspaceMetadata => {
+                        metadata_key(&plan, &dependencies, &captured)
+                    }
+                    _ => mixed_key(&plan, &dependencies, &captured),
+                }
+                .unwrap();
+                let typed = policy_key(&plan, policy, &dependencies, &captured).unwrap();
+                assert_eq!(typed, original);
+                assert_eq!(
+                    committed_dependency_descriptor_policy(&typed.descriptor),
+                    Some(policy)
+                );
+                assert!(!uses_committed_dependency_namespace(&typed.descriptor));
+            }
+        }
+        assert_eq!(
+            CommittedDependencyPolicy::from_source_kind(DependencySourceKind::RegistryPackage),
+            None
+        );
+    }
+
+    #[test]
+    fn immutable_dag_keys_keep_all_canonical_origins_and_separate_each_output_policy() {
+        let dependencies = vec![candidate("libupstream.rmeta")];
+        for (package, kind) in [
+            (
+                "/__rabs/cargo-home/registry/src/index/consumer-1.0.0",
+                DependencySourceKind::RegistryPackage,
+            ),
+            (
+                "/__rabs/cargo-home/git/checkouts/fixture-cafe1234/0123456789ab/crates/member",
+                DependencySourceKind::GitCheckout,
+            ),
+            (
+                "/__rabs/workspace/vendor/consumer-1.0.0",
+                DependencySourceKind::DirectoryPackage,
+            ),
+        ] {
+            for metadata in [false, true] {
+                let plan = immutable_plan(package, metadata);
+                assert_eq!(plan.source_kind, kind);
+                let policy = if metadata {
+                    CommittedDependencyPolicy::ImmutableDagMetadata
+                } else {
+                    CommittedDependencyPolicy::ImmutableDagRlib
+                };
+                let captured = immutable_inputs(&plan);
+                let dag = policy_key(&plan, policy, &dependencies, &captured).unwrap();
+                assert_eq!(dag.descriptor.key_epoch, if metadata { 11 } else { 10 });
+                assert_eq!(
+                    dag.descriptor.action_class,
+                    ActionClass::RustcDependencyCompile
+                );
+                assert_eq!(
+                    committed_dependency_descriptor_policy(&dag.descriptor),
+                    Some(policy)
+                );
+                let ordinary = remote::remote_dependency_key(
+                    &plan,
+                    &toolchain(),
+                    &directories(&dependencies),
+                    &captured,
+                    None,
+                    TOOLCHAIN,
+                    &[39; 32],
+                    &compute(remote::RUNTIME_COHORT_DOMAIN, b"runtime"),
+                )
+                .unwrap();
+                assert_ne!(dag.action_key, ordinary.action_key);
+                assert_eq!(
+                    committed_dependency_descriptor_policy(&ordinary.descriptor),
+                    None
+                );
+                assert!(
+                    policy_key(
+                        &plan,
+                        if metadata {
+                            CommittedDependencyPolicy::ImmutableDagRlib
+                        } else {
+                            CommittedDependencyPolicy::ImmutableDagMetadata
+                        },
+                        &dependencies,
+                        &captured
+                    )
+                    .is_err()
+                );
+                assert!(
+                    policy_key(
+                        &plan,
+                        CommittedDependencyPolicy::WorkspaceDagMetadata,
+                        &dependencies,
+                        &captured
+                    )
+                    .is_err()
+                );
+                let mut changed = captured.clone();
+                changed.inputs[1].object = ObjectId(digest(b"changed immutable source"));
+                assert_ne!(
+                    dag.action_key,
+                    policy_key(&plan, policy, &dependencies, &changed)
+                        .unwrap()
+                        .action_key
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dag_policies_bind_every_candidate_byte_and_exact_committed_producer() {
+        let immutable = immutable_plan(
+            "/__rabs/cargo-home/registry/src/index/consumer-1.0.0",
+            false,
+        );
+        let workspace = plan_mixed_workspace_library(&execution(false)).unwrap();
+        let dependencies = vec![
+            candidate("libupstream.rmeta"),
+            candidate("libzztransitive.rlib"),
+        ];
+        for (plan, policy, captured) in [
+            (
+                &immutable,
+                CommittedDependencyPolicy::ImmutableDagRlib,
+                immutable_inputs(&immutable),
+            ),
+            (
+                &workspace,
+                CommittedDependencyPolicy::WorkspaceDagRlib,
+                inputs(&workspace),
+            ),
+        ] {
+            let original = policy_key(plan, policy, &dependencies, &captured).unwrap();
+            for field in 0..4 {
+                let mut changed = dependencies.clone();
+                let dependency = &mut changed[1];
+                match field {
+                    0 => dependency.producer_action = digest(b"different producer action"),
+                    1 => dependency.producer_descriptor = digest(b"different producer descriptor"),
+                    2 => dependency.producer_manifest = digest(b"different producer manifest"),
+                    _ => {
+                        dependency.object = ObjectId(digest(b"different entire transitive archive"))
+                    }
+                }
+                assert_ne!(
+                    original.action_key,
+                    policy_key(plan, policy, &changed, &captured)
+                        .unwrap()
+                        .action_key
+                );
+            }
+            for evidence in [
+                Vec::new(),
+                dependencies[..1].to_vec(),
+                dependencies.iter().rev().cloned().collect(),
+            ] {
+                assert!(
+                    remote_committed_dependency_shape(
+                        plan,
+                        policy,
+                        &directories(&dependencies),
+                        &evidence,
+                        TOOLCHAIN
+                    )
+                    .is_err()
+                );
+            }
+            let mut wrong = dependencies.clone();
+            wrong[1].role = OutputRole::ProvisionalMetadata;
+            assert!(policy_key(plan, policy, &wrong, &captured).is_err());
+            let mut proc_macro = dependencies.clone();
+            proc_macro.push(candidate("libhidden_proc_macro.so"));
+            assert!(policy_key(plan, policy, &proc_macro, &captured).is_err());
+        }
+    }
+
+    #[test]
+    fn workspace_dag_keeps_full_source_topology_and_legacy_scope_separate() {
+        let dependencies = vec![candidate("libupstream.rmeta")];
+        for metadata in [false, true] {
+            let plan = plan_mixed_workspace_library(&execution_with_output(false, "one", metadata))
+                .unwrap();
+            let policy = if metadata {
+                CommittedDependencyPolicy::WorkspaceDagMetadata
+            } else {
+                CommittedDependencyPolicy::WorkspaceDagRlib
+            };
+            let captured = inputs(&plan);
+            let dag = policy_key(&plan, policy, &dependencies, &captured).unwrap();
+            assert_eq!(dag.descriptor.key_epoch, if metadata { 13 } else { 12 });
+            assert_eq!(
+                committed_dependency_descriptor_policy(&dag.descriptor),
+                Some(policy)
+            );
+            assert_ne!(
+                dag.action_key,
+                mixed_key(&plan, &dependencies, &captured)
+                    .unwrap()
+                    .action_key
+            );
+            let mut sibling = captured.clone();
+            sibling.inputs[3].object = ObjectId(digest(b"changed complete workspace sibling"));
+            assert_ne!(
+                dag.action_key,
+                policy_key(&plan, policy, &dependencies, &sibling)
+                    .unwrap()
+                    .action_key
+            );
+            let mut topology = captured.clone();
+            topology.directory_enumerations[0]
+                .entries
+                .push(RawBytes::from("new-empty"));
+            topology.directory_enumerations[0].entries.sort();
+            topology.directory_enumerations.push(DirectoryEnumeration {
+                virtual_path: RawBytes::new(plan.input_virtual_path("new-empty").into_bytes()),
+                entries: Vec::new(),
+            });
+            assert_ne!(
+                dag.action_key,
+                policy_key(&plan, policy, &dependencies, &topology)
+                    .unwrap()
+                    .action_key
+            );
+            let changed_env =
+                plan_mixed_workspace_library(&execution_with_output(false, "two", metadata))
+                    .unwrap();
+            assert_ne!(
+                dag.action_key,
+                policy_key(&changed_env, policy, &dependencies, &captured)
+                    .unwrap()
+                    .action_key
+            );
+            assert!(
+                policy_key(
+                    &plan,
+                    CommittedDependencyPolicy::ImmutableDagRlib,
+                    &dependencies,
+                    &captured
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn dag_namespace_claims_fail_closed_and_purity_cannot_be_inferred_from_bytes() {
+        let plan = immutable_plan(
+            "/__rabs/cargo-home/registry/src/index/consumer-1.0.0",
+            false,
+        );
+        let policy = CommittedDependencyPolicy::ImmutableDagRlib;
+        let dependencies = vec![candidate("libupstream.rmeta")];
+        let captured = immutable_inputs(&plan);
+        let key = policy_key(&plan, policy, &dependencies, &captured).unwrap();
+        for field in 0..6 {
+            let mut descriptor = key.descriptor.clone();
+            match field {
+                0 => descriptor.key_epoch = 1,
+                1 => descriptor.projection_epoch = 2,
+                2 => descriptor.action_class = ActionClass::RustcWorkspaceCompile,
+                3 => descriptor.sandbox_semantic_policy = digest(b"wrong policy"),
+                4 => descriptor.execution_semantics = digest(b"wrong semantics"),
+                _ => descriptor.dependency_inputs = digest(b"unbound dependencies"),
+            }
+            assert_eq!(committed_dependency_descriptor_policy(&descriptor), None);
+            assert!(uses_committed_dependency_namespace(&descriptor));
+        }
+        let mut generated = plan.clone();
+        generated.generated_root = Some("/__rabs/out/cargo/debug/build/consumer/out".into());
+        assert!(policy_key(&generated, policy, &dependencies, &captured).is_err());
+        let mut native = plan.clone();
+        native.native_roots.push("/__rabs/workspace/native".into());
+        assert!(policy_key(&native, policy, &dependencies, &captured).is_err());
+        let mut unchecked = plan.clone();
+        unchecked.source_kind = DependencySourceKind::DirectoryPackage;
+        assert!(policy_key(&unchecked, policy, &dependencies, &captured).is_err());
+        assert!(
+            remote_committed_dependency_key(
+                &plan,
+                policy,
+                &toolchain(),
+                &directories(&dependencies),
+                &dependencies,
+                &captured,
+                Some(b"build-script run"),
+                TOOLCHAIN,
+                &[39; 32],
+                &compute(remote::RUNTIME_COHORT_DOMAIN, b"runtime")
+            )
+            .is_err()
+        );
+        assert!(policy_key(&plan, policy, &[], &captured).is_err());
     }
 
     #[test]
