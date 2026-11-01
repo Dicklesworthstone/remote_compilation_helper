@@ -903,6 +903,55 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn metadata_only_revocation_after_delivery_is_terminal_with_an_empty_archive_tail() {
+        for producer in [false, true] {
+            let fixture = WorkspaceLineageFixture::new();
+            let [a, b, c] = metadata_chain(&fixture);
+            if !producer {
+                fixture.compare_twice(&c);
+            }
+            let destination = fixture.root.path().join("metadata-only-frontier");
+            let mut calls = 0;
+            let mut ready = |files: &[PathBuf]| {
+                calls += 1;
+                assert_eq!(files, &[destination.join("libc.rmeta")]);
+                assert_eq!(std::fs::read(&files[0]).unwrap(), b"metadata C");
+                assert!(fixture.cas.store().try_lock().is_ok());
+                // A was safe when this head was installed. Revocation here
+                // must still be observed after notification, even though C
+                // has no archive tail to install before returning success.
+                fixture.quarantine(&a.manifest.action_key);
+                Ok(())
+            };
+            let result = if producer {
+                fixture.coord.serve_produced_result_with_metadata(
+                    &c.manifest.action_key,
+                    &digest_key(&c.manifest_id.0),
+                    &destination,
+                    &expected(&c, &destination),
+                    now_micros(),
+                    Some(&mut ready),
+                )
+            } else {
+                fixture.replay(&c, &destination, Some(&mut ready))
+            };
+            assert_eq!(calls, 1, "producer={producer}");
+            assert!(
+                matches!(result, Err(ServeError::MetadataExposed { installed, reason })
+                if installed == vec![destination.join("libc.rmeta")]
+                    && reason.contains(&digest_key(&a.manifest.action_key))),
+                "producer={producer}"
+            );
+            assert_eq!(
+                std::fs::read(destination.join("libc.rmeta")).unwrap(),
+                b"metadata C"
+            );
+            fixture.assert_unsampled(&a);
+            fixture.assert_unsampled(&b);
+        }
+    }
+
+    #[test]
     fn metadata_consumer_cannot_broaden_an_archive_ancestors_producer_class() {
         let fixture = WorkspaceLineageFixture::new();
         let [a, b, c] = metadata_chain(&fixture);

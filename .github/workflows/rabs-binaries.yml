@@ -317,6 +317,12 @@ jobs:
           cargo test --release -p rabsd --test canonical_check_local --locked \
             canonical_workspace_leaf_metadata_denied_input_falls_back_only_after_worker_settlement \
             -- --ignored --exact --nocapture
+          cargo test --release -p rabsd --test canonical_check_local --locked \
+            canonical_workspace_committed_metadata_dag_earns_transitive_replay_across_worktrees \
+            -- --ignored --exact --nocapture
+          cargo test --release -p rabsd --test canonical_check_local --locked \
+            canonical_workspace_metadata_dag_refuses_cache_authority_from_a_local_fallback_producer \
+            -- --ignored --exact --nocapture
       - name: Canonical Cargo offloads archives, replays them and delivers a working binary
         timeout-minutes: 30
         env:
