@@ -19,7 +19,7 @@ use super::{
 };
 use crate::coord::live::RequestOwnedInstallError;
 use crate::coord::remote_dependency_transport::{
-    RemoteDependencyReservation, RemoteDependencyTransport,
+    PlacementReadiness, RemoteDependencyReservation, RemoteDependencyTransport,
 };
 use crate::coord::secure_worker_delivery::{OperationCancellation, parse_worker_pin};
 use crate::coord::source_delivery::SourceUpload;
@@ -298,6 +298,10 @@ enum WorkerProbe {
     /// No actual worker or persistent admission is held. An absolute expiry
     /// from this probe remains useful even if it passes before the queue waits.
     Waiting(Option<Instant>),
+    /// Some current authenticated peers cannot execute this exact request.
+    /// Another queued action may use those peers, so this wait must not stop
+    /// the queue's scan. Revocation/new readiness wakes the ordinary deadline.
+    RequestWaiting(Option<Instant>),
 }
 
 impl Deref for PoolReservation {
@@ -379,48 +383,81 @@ impl DependencyWorkerPool {
         })
     }
 
+    #[cfg(test)]
     fn try_reserve(&self, key: &TypedDigest) -> io::Result<(PoolReservation, PendingActionClaim)> {
+        self.try_reserve_for(key, None)
+    }
+
+    fn try_reserve_for(
+        &self,
+        key: &TypedDigest,
+        request: Option<&Value>,
+    ) -> io::Result<(PoolReservation, PendingActionClaim)> {
         let claim = self.try_claim(key)?;
-        self.try_reserve_worker()
+        self.try_reserve_worker_excluding_for(&HashSet::new(), request)
             .map(|reservation| (reservation, claim))
     }
 
+    #[cfg(test)]
     fn try_reserve_worker(&self) -> io::Result<PoolReservation> {
         self.try_reserve_worker_excluding(&HashSet::new())
     }
 
+    #[cfg(test)]
     fn try_reserve_worker_excluding(
         &self,
         attempted: &HashSet<String>,
     ) -> io::Result<PoolReservation> {
-        match self.probe_worker_excluding(attempted)? {
+        self.try_reserve_worker_excluding_for(attempted, None)
+    }
+
+    fn try_reserve_worker_excluding_for(
+        &self,
+        attempted: &HashSet<String>,
+        request: Option<&Value>,
+    ) -> io::Result<PoolReservation> {
+        match self.probe_worker_excluding(attempted, request)? {
             WorkerProbe::Reserved(reservation) => Ok(reservation),
             WorkerProbe::Waiting(_) => Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "all remote dependency workers are busy or cooling down",
             )),
+            WorkerProbe::RequestWaiting(_) => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "no currently ready remote worker supports this request",
+            )),
         }
-    }
-
-    fn probe_worker(&self) -> io::Result<WorkerProbe> {
-        self.probe_worker_excluding(&HashSet::new())
     }
 
     /// Claim the action before taking a worker. A key-conflict WouldBlock is
     /// distinct from Waiting for physical capacity: another key may still run.
     /// Retain an acquired claim while queued, releasing it on caller loss.
+    #[cfg(test)]
     fn probe_claimed_worker(
         &self,
         key: &TypedDigest,
         claim: &mut Option<PendingActionClaim>,
     ) -> io::Result<WorkerProbe> {
+        self.probe_claimed_worker_for(key, claim, None)
+    }
+
+    fn probe_claimed_worker_for(
+        &self,
+        key: &TypedDigest,
+        claim: &mut Option<PendingActionClaim>,
+        request: Option<&Value>,
+    ) -> io::Result<WorkerProbe> {
         if claim.is_none() {
             *claim = Some(self.try_claim(key)?);
         }
-        self.probe_worker()
+        self.probe_worker_excluding(&HashSet::new(), request)
     }
 
-    fn probe_worker_excluding(&self, attempted: &HashSet<String>) -> io::Result<WorkerProbe> {
+    fn probe_worker_excluding(
+        &self,
+        attempted: &HashSet<String>,
+        request: Option<&Value>,
+    ) -> io::Result<WorkerProbe> {
         // A failed transport probe can briefly own its occupied bit before
         // discovering cooldown. Serialize only these short probes, so another
         // caller cannot mistake that unnotified temporary guard for an active
@@ -439,29 +476,45 @@ impl DependencyWorkerPool {
         let mut deadline = None;
         let mut available_state = false;
         let mut candidate = false;
+        let mut request_excluded = false;
         let start = self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len();
-        for offset in 0..self.workers.len() {
-            let worker = &self.workers[(start + offset) % self.workers.len()];
-            if attempted.contains(worker.worker()) {
-                continue;
-            }
-            candidate = true;
-            match worker.try_reserve() {
-                Ok(reservation) => {
-                    return Ok(WorkerProbe::Reserved(PoolReservation {
-                        reservation: Box::new(reservation),
-                        _release: CapacityRelease(Arc::clone(&self.availability)),
-                    }));
+        // Readiness is a preference, not execution authority. First try every
+        // compatible live peer before assigning a job to an absent worker's
+        // connection deadline. The second pass reobserves hints, preserving
+        // the existing connection path when readiness is unknown or revoked.
+        for ready_only in [true, false] {
+            for offset in 0..self.workers.len() {
+                let worker = &self.workers[(start + offset) % self.workers.len()];
+                if attempted.contains(worker.worker()) {
+                    continue;
                 }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    if let Ok(next) = worker.cooldown_deadline_at(observed) {
-                        available_state = true;
-                        if let Some(next) = next {
-                            deadline = Some(deadline.map_or(next, |at: Instant| at.min(next)));
+                candidate = true;
+                let generation = match worker.placement_readiness(request) {
+                    PlacementReadiness::Incompatible => {
+                        request_excluded = true;
+                        continue;
+                    }
+                    PlacementReadiness::Ready(generation) => Some(generation),
+                    PlacementReadiness::Unknown if ready_only => continue,
+                    PlacementReadiness::Unknown => None,
+                };
+                match worker.try_reserve_for(request, generation) {
+                    Ok(reservation) => {
+                        return Ok(WorkerProbe::Reserved(PoolReservation {
+                            reservation: Box::new(reservation),
+                            _release: CapacityRelease(Arc::clone(&self.availability)),
+                        }));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if let Ok(next) = worker.cooldown_deadline_at(observed) {
+                            available_state = true;
+                            if let Some(next) = next {
+                                deadline = Some(deadline.map_or(next, |at: Instant| at.min(next)));
+                            }
                         }
                     }
+                    Err(error) => return Err(error),
                 }
-                Err(error) => return Err(error),
             }
         }
         if !candidate {
@@ -469,6 +522,9 @@ impl DependencyWorkerPool {
                 io::ErrorKind::NotFound,
                 "remote failover exhausted distinct configured workers",
             ));
+        }
+        if request_excluded {
+            return Ok(WorkerProbe::RequestWaiting(deadline));
         }
         if !available_state {
             return Err(io::Error::other(
@@ -562,6 +618,7 @@ fn toolchain_staging_directory(state: &Path) -> io::Result<tempfile::TempDir> {
 pub struct RemoteInvocation {
     argv: Vec<String>,
     context: DependencyExecContext,
+    requirements: Value,
     validation: RemoteValidation,
 }
 
@@ -1152,6 +1209,8 @@ impl RemoteDependencies {
         retained
             .verify_source(root)
             .map_err(|error| format!("original toolchain changed during keying: {error}"))?;
+        let requirements =
+            dependency_execution_requirements(plan, argv, &context, retained.image().identity())?;
         let validation = RemoteValidation {
             retained,
             runtime,
@@ -1166,6 +1225,7 @@ impl RemoteDependencies {
             RemoteInvocation {
                 argv: argv.to_vec(),
                 context,
+                requirements,
                 validation,
             },
         )))
@@ -1340,7 +1400,7 @@ impl LiveDependencyLane {
         } else {
             remote
                 .workers
-                .try_reserve(&request.key.action_key)
+                .try_reserve_for(&request.key.action_key, Some(&invocation.requirements))
                 .map(|(reservation, claim)| (Some(reservation), claim))
         };
         match admitted {
@@ -1672,6 +1732,23 @@ fn dependency_execution_request(
     toolchain: &ToolchainIdentity,
     request_id: u64,
 ) -> Result<Value, String> {
+    let mut request = dependency_execution_requirements(plan, argv, context, toolchain)?;
+    request["kind"] = json!("canonical-exec");
+    request["request_id"] = json!(request_id);
+    request["source_manifest"] = source_manifest;
+    request["artifacts"]["unit"] = json!(format!("dependency-{request_id:016x}"));
+    Ok(request)
+}
+
+/// The same immutable capability fields drive placement and the eventual
+/// wire request. This value deliberately has no request ID, artifact unit,
+/// source authority, session grant or execution lease; it cannot be dispatched.
+fn dependency_execution_requirements(
+    plan: &DependencyActionPlan,
+    argv: &[String],
+    context: &DependencyExecContext,
+    toolchain: &ToolchainIdentity,
+) -> Result<Value, String> {
     let grant = dependency_execution_grant(plan, argv)?;
     if context.execution_mode() != execution_mode(plan)?
         || context.canonical_cargo() != plan.canonical_cargo
@@ -1689,14 +1766,12 @@ fn dependency_execution_request(
         );
     }
     Ok(json!({
-        "kind":"canonical-exec", "request_id":request_id,
         "program":plan.compiler, "args":argv[1..],
         "jobserver_grant":grant,
-        "source_manifest":source_manifest,
+        "source_manifest":null,
         "toolchain_transfer":TOOLCHAIN_TRANSFER_VERSION,
         "toolchain_identity":toolchain_identity_value(toolchain),
-        "artifacts":{"unit":format!("dependency-{request_id:016x}"),
-            "files":plan.output_names()},
+        "artifacts":{"files":plan.output_names()},
         "dependency_context":context_value(context),
     }))
 }
@@ -2496,6 +2571,150 @@ mod worker_pool_tests {
 
     fn key(index: u8) -> TypedDigest {
         compute("rabs.test.worker-pool.v1", &[index])
+    }
+
+    /// Selection tests inject evidence at the already-authenticated owner
+    /// boundary. Native transport acceptance independently proves that only a
+    /// pinned peer can publish it; these fixtures grant no durable admission.
+    pub(super) fn scheduling_hello() -> Value {
+        json!({
+            "canonical":true, "slots":4, "boot_generation":1,
+            "incarnation":"00000000000000000000000000000001",
+            "recovery_protocols":["request-journal-v1"],
+            "output_transfers":["ranges-v1"], "artifact_transfers":["files-v1"],
+            "source_transfers":["source-files-v1"],
+            "toolchain_datasets":["toolchain-dataset-v1"],
+            "toolchain_transfers":[TOOLCHAIN_TRANSFER_VERSION],
+            "execution_leases":[rabs_protocol::lease_semantics::REQUEST_EXECUTION_LEASE_VERSION],
+            "dependency_contexts":[CANONICAL_DEPENDENCY_CONTEXT_VERSION,
+                rabs_sandbox::dependency_context::CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION],
+            "dependency_execution_modes":["rlib", "closed-metadata"],
+        })
+    }
+
+    pub(super) fn scheduling_request(closed_metadata: bool) -> Value {
+        let (version, mode) = if closed_metadata {
+            (
+                rabs_sandbox::dependency_context::CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION,
+                "closed-metadata",
+            )
+        } else {
+            (CANONICAL_DEPENDENCY_CONTEXT_VERSION, "rlib")
+        };
+        json!({
+            "program":"/__rabs/toolchain/bin/rustc", "args":["src/lib.rs"],
+            "source_manifest":null, "toolchain_identity":null,
+            "toolchain_transfer":TOOLCHAIN_TRANSFER_VERSION,
+            "artifacts":{"files":["libunit.rmeta"]},
+            "dependency_context":{"version":version,"execution_mode":mode},
+        })
+    }
+
+    #[test]
+    fn authenticated_ready_worker_precedes_an_absent_endpoint_without_durable_admission() {
+        let state = crate::test_util::private_tempdir();
+        let pool = pool(state.path(), 2);
+        let advertisement = pool.workers[1].advertise_for_test(&scheduling_hello());
+        let request = scheduling_request(true);
+        let (reserved, claim) = pool.try_reserve_for(&key(1), Some(&request)).unwrap();
+        assert_eq!(reserved.worker(), "worker-2");
+        assert_eq!(std::fs::read_dir(state.path()).unwrap().count(), 0);
+        // Preference must not manufacture a second physical slot, and an
+        // absent endpoint still retains the ordinary bounded connection path.
+        let (unknown, other_claim) = pool.try_reserve_for(&key(2), Some(&request)).unwrap();
+        assert_eq!(unknown.worker(), "worker-1");
+        assert_eq!(
+            pool.try_reserve_for(&key(3), Some(&request))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop((reserved, claim, unknown, other_claim, advertisement));
+        assert!(pool.pending.lock().unwrap().is_empty());
+        assert_eq!(std::fs::read_dir(state.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn incompatible_authenticated_peers_do_not_hide_a_compatible_ready_worker() {
+        let request = scheduling_request(false);
+        for (field, incompatible) in [
+            ("dependency_contexts", json!([])),
+            ("dependency_execution_modes", json!(["closed-metadata"])),
+            ("toolchain_datasets", json!([])),
+            ("toolchain_transfers", json!([])),
+            ("source_transfers", json!([])),
+            ("execution_leases", json!([])),
+            ("artifact_transfers", json!([])),
+            ("slots", json!(0)),
+        ] {
+            let pool = pool(Path::new("/private/compatible-worker-pool"), 2);
+            let mut hello = scheduling_hello();
+            hello[field] = incompatible;
+            let unsuitable = pool.workers[0].advertise_for_test(&hello);
+            let suitable = pool.workers[1].advertise_for_test(&scheduling_hello());
+            assert_eq!(
+                pool.workers[0].placement_readiness(Some(&request)),
+                PlacementReadiness::Incompatible,
+                "{field}"
+            );
+            let (reserved, claim) = pool.try_reserve_for(&key(1), Some(&request)).unwrap();
+            assert_eq!(reserved.worker(), "worker-2", "{field}");
+            drop((reserved, claim, unsuitable, suitable));
+        }
+    }
+
+    #[test]
+    fn placement_uses_the_exact_mode_and_revocation_restores_unknown_connectivity() {
+        let pool = pool(Path::new("/private/exact-mode-worker-pool"), 1);
+        let mut metadata_only = scheduling_hello();
+        metadata_only["canonical"] = json!(false);
+        metadata_only["dependency_execution_modes"] = json!(["closed-metadata"]);
+        let advertisement = pool.workers[0].advertise_for_test(&metadata_only);
+        let archive = scheduling_request(false);
+        let metadata = scheduling_request(true);
+        let mut archive_claim = None;
+        assert!(matches!(
+            pool.probe_claimed_worker_for(&key(1), &mut archive_claim, Some(&archive))
+                .unwrap(),
+            WorkerProbe::RequestWaiting(None)
+        ));
+        let (reserved, metadata_claim) = pool.try_reserve_for(&key(2), Some(&metadata)).unwrap();
+        assert_eq!(reserved.worker(), "worker-1");
+        assert!(pool.try_claim(&key(1)).is_err());
+        drop((reserved, metadata_claim, advertisement));
+        assert_eq!(
+            pool.workers[0].placement_readiness(Some(&archive)),
+            PlacementReadiness::Unknown
+        );
+        let WorkerProbe::Reserved(reconnected) = pool
+            .probe_claimed_worker_for(&key(1), &mut archive_claim, Some(&archive))
+            .unwrap()
+        else {
+            panic!("revoked capability evidence must not exclude the next connection");
+        };
+        drop((reconnected, archive_claim));
+        assert!(pool.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failover_prefers_a_ready_compatible_peer_without_revisiting_attempted_workers() {
+        let pool = pool(Path::new("/private/ready-failover-pool"), 3);
+        let first = pool.workers[0].advertise_for_test(&scheduling_hello());
+        let third = pool.workers[2].advertise_for_test(&scheduling_hello());
+        let request = scheduling_request(true);
+        let mut attempted = HashSet::from(["worker-1".to_owned()]);
+        let selected = pool
+            .try_reserve_worker_excluding_for(&attempted, Some(&request))
+            .unwrap();
+        assert_eq!(selected.worker(), "worker-3");
+        attempted.extend(["worker-2".to_owned(), "worker-3".to_owned()]);
+        assert_eq!(
+            pool.try_reserve_worker_excluding_for(&attempted, Some(&request))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        drop((selected, first, third));
     }
 
     #[test]

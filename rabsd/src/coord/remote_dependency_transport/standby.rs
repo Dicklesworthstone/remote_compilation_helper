@@ -29,6 +29,148 @@ use std::task::{Context, Poll, Waker};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
+/// Advisory evidence from the exact authenticated connection currently parked
+/// on this owner. A generation is never reused, including across a disconnect.
+/// It grants no request, execution lease, or durable worker admission.
+#[derive(Debug)]
+pub(super) struct Advertisement {
+    pub generation: u64,
+    pub hello: Value,
+}
+
+#[derive(Debug, Default)]
+struct ReadinessState {
+    next_generation: u64,
+    current: Option<Arc<Advertisement>>,
+    closed: bool,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct Readiness(Mutex<ReadinessState>);
+
+impl Readiness {
+    pub(super) fn snapshot(&self) -> Option<Arc<Advertisement>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .current
+            .clone()
+    }
+
+    pub(super) fn is_current(&self, generation: u64) -> bool {
+        self.snapshot()
+            .is_some_and(|current| current.generation == generation)
+    }
+
+    fn publish(
+        self: &Arc<Self>,
+        hello: &Value,
+        changed: Arc<dyn Fn() + Send + Sync>,
+    ) -> io::Result<AdvertisementOwner> {
+        let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        if state.closed {
+            return Err(cancelled());
+        }
+        let generation = state
+            .next_generation
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("standby readiness generation exhausted"))?;
+        state.next_generation = generation;
+        state.current = Some(Arc::new(Advertisement {
+            generation,
+            hello: hello.clone(),
+        }));
+        Ok(AdvertisementOwner {
+            readiness: Arc::clone(self),
+            generation,
+            changed,
+        })
+    }
+
+    pub(super) fn close(&self) {
+        let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        state.closed = true;
+        state.current = None;
+    }
+
+    fn is_closed(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .closed
+    }
+
+    #[cfg(test)]
+    pub(super) fn publish_for_test(self: &Arc<Self>, hello: &Value) -> AdvertisementOwner {
+        self.publish(hello, Arc::new(|| {})).unwrap()
+    }
+}
+
+/// The socket owner alone retains this registration. Revocation precedes
+/// dispatch and every peer drop; an old destructor cannot clear a newer peer.
+pub(super) struct AdvertisementOwner {
+    readiness: Arc<Readiness>,
+    generation: u64,
+    changed: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl Drop for AdvertisementOwner {
+    fn drop(&mut self) {
+        let revoked = {
+            let mut state = self
+                .readiness
+                .0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if state
+                .current
+                .as_ref()
+                .is_some_and(|current| current.generation == self.generation)
+            {
+                state.current = None;
+                true
+            } else {
+                false
+            }
+        };
+        if revoked {
+            (self.changed)();
+        }
+    }
+}
+
+struct ParkedPeer {
+    // Field order revokes the hint before closing the authenticated transport.
+    advertisement: Option<AdvertisementOwner>,
+    peer: StandbyPeer,
+}
+
+impl ParkedPeer {
+    fn new(
+        peer: StandbyPeer,
+        readiness: &Arc<Readiness>,
+        changed: &Arc<dyn Fn() + Send + Sync>,
+    ) -> io::Result<Self> {
+        let advertisement = peer
+            .supported()
+            .then(|| readiness.publish(peer.scheduling_hello(), Arc::clone(changed)))
+            .transpose()?;
+        Ok(Self {
+            advertisement,
+            peer,
+        })
+    }
+
+    fn into_peer(self) -> StandbyPeer {
+        let Self {
+            advertisement,
+            peer,
+        } = self;
+        drop(advertisement);
+        peer
+    }
+}
+
 pub(super) enum Operation {
     Execute {
         upload: Box<SourceUpload>,
@@ -232,16 +374,23 @@ impl Drop for WorkReady<'_> {
 
 /// Seals pending senders even if the thread unwinds before returning a result.
 /// An active sender then disconnects; its caller must retain run uncertainty.
-struct OwnerExit(Arc<Mailbox>);
+struct OwnerExit {
+    mailbox: Arc<Mailbox>,
+    readiness: Arc<Readiness>,
+    changed: Arc<dyn Fn() + Send + Sync>,
+}
 
 impl Drop for OwnerExit {
     fn drop(&mut self) {
-        self.0.close();
+        self.readiness.close();
+        self.mailbox.close();
+        (self.changed)();
     }
 }
 
 pub(super) struct Listener {
     mailbox: Arc<Mailbox>,
+    readiness: Arc<Readiness>,
     owner: Mutex<Option<JoinHandle<io::Result<()>>>>,
 }
 
@@ -261,14 +410,16 @@ impl Listener {
         pin: [u8; 32],
         tls: TlsFiles,
         ready: Arc<dyn Fn() + Send + Sync>,
+        readiness: Arc<Readiness>,
+        changed: Arc<dyn Fn() + Send + Sync>,
     ) -> io::Result<Self> {
         let mailbox = Arc::new(Mailbox::default());
         let owned_mailbox = Arc::clone(&mailbox);
+        let owned_readiness = Arc::clone(&readiness);
         let (started, startup) = mpsc::sync_channel(1);
         let owner = std::thread::Builder::new()
             .name("rabs-worker-listener".into())
             .spawn(move || {
-                let _exit = OwnerExit(Arc::clone(&owned_mailbox));
                 let setup = (|| {
                     let runtime = RuntimeBuilder::current_thread().build().map_err(|error| {
                         io::Error::other(format!("remote dependency runtime: {error:?}"))
@@ -286,9 +437,18 @@ impl Listener {
                 let (runtime, acceptor, listener) = match setup {
                     Ok(setup) => setup,
                     Err(error) => {
+                        // No listener was published and no assignment could
+                        // reach this mailbox. A corrected TLS/bind setup may
+                        // retry with the same transport and readiness owner.
+                        owned_mailbox.close();
                         let _ = started.send(Err(error));
                         return Ok(());
                     }
+                };
+                let _exit = OwnerExit {
+                    mailbox: Arc::clone(&owned_mailbox),
+                    readiness: Arc::clone(&owned_readiness),
+                    changed: Arc::clone(&changed),
                 };
                 if started.send(Ok(())).is_err() {
                     return Ok(());
@@ -301,11 +461,14 @@ impl Listener {
                     pin,
                     &owned_mailbox,
                     &*ready,
+                    &owned_readiness,
+                    &changed,
                 )
             })?;
         match startup.recv() {
             Ok(Ok(())) => Ok(Self {
                 mailbox,
+                readiness,
                 owner: Mutex::new(Some(owner)),
             }),
             result => {
@@ -343,6 +506,7 @@ impl Listener {
     }
 
     pub(super) fn shutdown(&self) -> io::Result<()> {
+        self.readiness.close();
         self.mailbox.close();
         // Hold the join lock through completion. Concurrent shutdown callers
         // must never observe success while another caller still drains it.
@@ -546,29 +710,26 @@ fn deliver_assigned(
     pin: [u8; 32],
     assignment: Assignment,
     shutdown: &OperationCancellation,
-    parked: &mut Option<StandbyPeer>,
-    ready: &dyn Fn(),
+    parked: &mut Option<ParkedPeer>,
 ) -> Result<Delivery, DeliveryFailure> {
     assignment
         .check_pending()
         .map_err(|error| assignment.before_dispatch(error))?;
-    if parked.is_none() {
-        let peer = block_on_top_level(
+    let peer = if let Some(parked) = parked.take() {
+        // Revocation happens before this connection leaves idle custody. A
+        // reservation may race disconnect, but cannot retain readiness for a
+        // handed-off connection or silently reuse it for another operation.
+        parked.into_peer()
+    } else {
+        block_on_top_level(
             runtime,
             connect_assigned(listener, acceptor, worker, pin, &assignment, shutdown),
         )
-        .map_err(|error| assignment.before_dispatch(error))?;
-        if peer.supported() {
-            ready();
-        }
-        *parked = Some(peer);
-    }
+        .map_err(|error| assignment.before_dispatch(error))?
+    };
     assignment
         .check_pending()
         .map_err(|error| assignment.before_dispatch(error))?;
-    let peer = parked.take().ok_or_else(|| {
-        assignment.before_dispatch(io::Error::other("authenticated worker disappeared"))
-    })?;
     if peer.supported() {
         eprintln!(
             "{}",
@@ -599,6 +760,7 @@ fn deliver_assigned(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_owner(
     runtime: &Runtime,
     listener: &TcpListener,
@@ -607,8 +769,10 @@ fn run_owner(
     pin: [u8; 32],
     mailbox: &Mailbox,
     ready: &dyn Fn(),
+    readiness: &Arc<Readiness>,
+    changed: &Arc<dyn Fn() + Send + Sync>,
 ) -> io::Result<()> {
-    let mut parked: Option<StandbyPeer> = None;
+    let mut parked: Option<ParkedPeer> = None;
     while !mailbox.is_closed() {
         if let Some(Job { assignment, result }) = mailbox.take() {
             let delivery = deliver_assigned(
@@ -620,13 +784,13 @@ fn run_owner(
                 assignment,
                 &mailbox.shutdown,
                 &mut parked,
-                ready,
             );
             mailbox.finished();
             let _ = result.send(delivery);
             continue;
         }
-        if let Some(peer) = parked.as_mut() {
+        if let Some(parked_peer) = parked.as_mut() {
+            let peer = &mut parked_peer.peer;
             // Old workers can be used for an already waiting request, but an
             // absent optional protocol cannot justify keeping them idle.
             if !peer.supported()
@@ -648,10 +812,29 @@ fn run_owner(
             idle_arrival(listener, acceptor, worker, pin, mailbox),
         ) {
             Ok(Arrival::Peer(peer)) => {
-                if peer.supported() {
+                let peer = match ParkedPeer::new(*peer, readiness, changed) {
+                    Ok(peer) => peer,
+                    // Shutdown revokes readiness before closing the mailbox.
+                    // An already-completed handshake in that narrow window
+                    // must drain normally, not turn shutdown into an error.
+                    Err(error)
+                        if error.kind() == io::ErrorKind::Interrupted && readiness.is_closed() =>
+                    {
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                };
+                if let Some(advertisement) = &peer.advertisement {
                     ready();
+                    eprintln!(
+                        "{}",
+                        json!({
+                            "kind":"rabsd-worker-standby-ready", "worker":worker,
+                            "connection_generation":advertisement.generation,
+                        })
+                    );
                 }
-                parked = Some(*peer);
+                parked = Some(peer);
             }
             Ok(Arrival::Work | Arrival::Rejected) => {}
             Err(_) if mailbox.is_closed() => break,
@@ -665,9 +848,83 @@ fn run_owner(
 mod tests {
     use super::*;
     use rabs_sandbox::snapshot_capture::capture_sealed_source;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::Wake;
     use std::time::Duration;
+
+    #[test]
+    fn readiness_revocation_is_connection_specific_and_notifies_after_releasing_its_lock() {
+        let readiness = Arc::new(Readiness::default());
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&readiness);
+        let counted = Arc::clone(&notifications);
+        let changed: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            assert!(observed.snapshot().is_none());
+            counted.fetch_add(1, Ordering::Relaxed);
+        });
+        let earlier = readiness
+            .publish(&json!({"incarnation":"earlier"}), Arc::clone(&changed))
+            .unwrap();
+        let old_snapshot = readiness.snapshot().unwrap();
+        let current = readiness
+            .publish(&json!({"incarnation":"current"}), changed)
+            .unwrap();
+        let generation = readiness.snapshot().unwrap().generation;
+        assert!(generation > old_snapshot.generation);
+        drop(earlier);
+        assert!(readiness.is_current(generation));
+        assert!(!readiness.is_current(old_snapshot.generation));
+        assert_eq!(notifications.load(Ordering::Relaxed), 0);
+        drop(current);
+        assert!(readiness.snapshot().is_none());
+        assert_eq!(notifications.load(Ordering::Relaxed), 1);
+        // A cloned observation survives as data only, never as current
+        // readiness or a way to resurrect the ended authenticated transport.
+        assert!(!readiness.is_current(old_snapshot.generation));
+    }
+
+    #[test]
+    fn closing_readiness_revokes_the_peer_and_refuses_republication() {
+        let readiness = Arc::new(Readiness::default());
+        let owner = readiness.publish_for_test(&json!({"incarnation":"worker"}));
+        let snapshot = readiness.snapshot().unwrap();
+        readiness.close();
+        assert!(!readiness.is_current(snapshot.generation));
+        assert!(readiness.snapshot().is_none());
+        assert_eq!(
+            readiness
+                .publish(&json!({}), Arc::new(|| {}))
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
+        drop(owner);
+        assert!(readiness.snapshot().is_none());
+    }
+
+    #[test]
+    fn owner_exit_revokes_readiness_before_announcing_shutdown() {
+        let readiness = Arc::new(Readiness::default());
+        let advertisement = readiness.publish_for_test(&json!({"incarnation":"worker"}));
+        let mailbox = Arc::new(Mailbox::default());
+        let observed_readiness = Arc::clone(&readiness);
+        let observed_mailbox = Arc::clone(&mailbox);
+        let notified = Arc::new(AtomicBool::new(false));
+        let notification = Arc::clone(&notified);
+        let owner = OwnerExit {
+            mailbox,
+            readiness,
+            changed: Arc::new(move || {
+                assert!(observed_readiness.snapshot().is_none());
+                assert!(observed_mailbox.is_closed());
+                notification.store(true, Ordering::Release);
+            }),
+        };
+        drop(owner);
+        assert!(notified.load(Ordering::Acquire));
+        drop(advertisement);
+    }
 
     fn assignment() -> (tempfile::TempDir, Assignment) {
         let state = crate::test_util::private_tempdir();
@@ -814,6 +1071,7 @@ mod tests {
         let mailbox = Arc::new(Mailbox::default());
         let listener = Arc::new(Listener {
             mailbox: Arc::clone(&mailbox),
+            readiness: Arc::new(Readiness::default()),
             owner: Mutex::new(None),
         });
         let (waker, notified) = wake_channel(&mailbox);

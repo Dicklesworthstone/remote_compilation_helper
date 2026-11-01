@@ -1148,6 +1148,232 @@ fn canonical_shared_service_keeps_worker_ready_between_real_cargo_requests() {
 }
 
 #[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; real authenticated two-endpoint placement and fresh remote Cargo check"]
+fn canonical_shared_service_selects_ready_worker_before_disconnected_first_endpoint() {
+    const ABSENT: &str = "placement-disconnected-first";
+    const READY: &str = "placement-ready-second";
+    const CRATE: &str = "ready_worker_app";
+
+    let (owner, mut profile) = native_fixture();
+    let root = owner.path();
+    let source = root.join("ready-worker-source");
+    write(
+        &source,
+        "Cargo.toml",
+        "[package]\nname='ready_worker_app'\nversion='0.1.0'\nedition='2021'\n",
+    );
+    write(
+        &source,
+        "Cargo.lock",
+        "version=4\n\n[[package]]\nname='ready_worker_app'\nversion='0.1.0'\n",
+    );
+    write(&source, "src/value.rs", "42\n");
+    write(
+        &source,
+        "src/main.rs",
+        "const VALUE: usize = include!(\"value.rs\");\nconst _: [(); 42] = [(); VALUE];\nfn main() { println!(\"{VALUE}\"); }\n",
+    );
+    profile["source_root"] = json!(source);
+    profile["vendor"] = Value::Null;
+    profile["command"] = json!("check");
+    profile["selection"] = json!({"bins":true});
+    let socket = root.join("canonical-service.sock");
+    profile["service_socket"] = json!(socket);
+    let service_profile = root.join("ready-worker-service.json");
+    fs::write(
+        &service_profile,
+        serde_json::to_vec(&json!({
+            "version":"canonical-compile-service-v1", "state_root":root.join("state"),
+            "socket":socket, "max_roots":1, "jobs_per_root":1,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let (coordinator, identities) = native_certificates(
+        &root.join("credentials"),
+        &["worker-absent", "worker-ready"],
+    );
+    let absent_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let absent_address = absent_listener.local_addr().unwrap().to_string();
+    let worker_root = root.join("worker-ready");
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&worker_root)
+        .unwrap();
+    let (mut worker, environment) =
+        NativeWorker::start_with_identity(&worker_root, READY, &coordinator, &identities[1]);
+    let configured = |name| {
+        environment
+            .iter()
+            .find(|(key, _)| key == name)
+            .unwrap()
+            .1
+            .clone()
+    };
+    let absent_pin = identities[0]
+        .local_identity()
+        .unwrap()
+        .fingerprint
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let pool = json!([
+        {"listen":absent_address, "worker_id":ABSENT, "worker_spki_sha256":absent_pin},
+        {"listen":configured("RABS_DEPENDENCY_WORKER_LISTEN"), "worker_id":READY,
+            "worker_spki_sha256":configured("RABS_DEPENDENCY_WORKER_SPKI_SHA256")},
+    ]);
+    assert_ne!(pool[0]["listen"], pool[1]["listen"]);
+    assert_ne!(pool[0]["worker_spki_sha256"], pool[1]["worker_spki_sha256"]);
+    let mut command = shared_service_command(root);
+    command
+        .envs(
+            environment
+                .iter()
+                .filter(|(name, _)| name.starts_with("RABS_COORD_TLS_"))
+                .map(|(name, value)| (name, value)),
+        )
+        .env("RABS_DEPENDENCY_WORKERS_JSON", pool.to_string())
+        .arg("--canonical-compile-service")
+        .arg(service_profile);
+    // Only the second configured worker is ever started. Both listener ports
+    // belong to the production service; the first can never receive its peer.
+    drop(absent_listener);
+    let mut service = SharedServiceChild::spawn(root, "ready-worker-service", command);
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let events = service.events();
+        if events
+            .iter()
+            .any(|event| event["kind"] == "canonical-service-listening")
+            && events.iter().any(|event| {
+                event["kind"] == "rabsd-worker-standby-ready" && event["worker"] == READY
+            })
+        {
+            break;
+        }
+        service.assert_running();
+        assert!(
+            worker
+                .process
+                .as_mut()
+                .unwrap()
+                .leader_try_wait()
+                .unwrap()
+                .is_none(),
+            "ready worker exited: {:?}",
+            worker.events()
+        );
+        assert!(Instant::now() < deadline, "{}", service.diagnostics());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // This event follows authenticated capability publication, rather than
+    // socket acceptance or the worker merely sending its hello.
+    let initial: Value =
+        serde_json::from_slice(&read_bounded(&worker.state.join("requests.json"))).unwrap();
+    assert!(initial.get("last").is_some_and(Value::is_null));
+    let admissions =
+        root.join("state/canonical-compile-v1/shadow/dependency-workers/worker-admission");
+    let absent_history = admissions.join(sha(ABSENT.as_bytes()));
+    let ready_history = admissions.join(sha(READY.as_bytes()));
+    assert!(!absent_history.exists());
+    assert!(!ready_history.exists());
+    let previous_events = service.events().len();
+    let mut client = shared_service_client(root, 5400, &profile);
+    let deadline = Instant::now() + Duration::from_secs(240);
+    let key = loop {
+        // The old order-first placement opens this durable store before its
+        // 60-second connection wait. Fail at that concrete allocation, leaving
+        // toolchain capture and Cargo startup a generous independent budget.
+        assert!(
+            !absent_history.exists(),
+            "the disconnected first endpoint consumed durable admission:\n{}",
+            service.diagnostics()
+        );
+        let events = service.events();
+        if let Some(admitted) = events[previous_events..]
+            .iter()
+            .find(|event| event["kind"] == "rabsd-remote-dependency-admitted")
+        {
+            assert_eq!(admitted["worker_id"], READY, "{events:?}");
+            assert_eq!(admitted["purpose"], "primary", "{events:?}");
+            break admitted["key"].as_str().unwrap().to_owned();
+        }
+        service.assert_running();
+        client.assert_running();
+        assert!(Instant::now() < deadline, "{}", service.diagnostics());
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let (code, client_events, output) = client.finish(Duration::from_secs(300), false);
+    assert_eq!(code, 0, "{output}\n{}", service.diagnostics());
+    assert!(
+        !client_events
+            .iter()
+            .any(|event| event["kind"] == "canonical-build-completed"),
+        "cargo check must not claim a retained build target: {output}"
+    );
+    let artifacts = output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| event["reason"] == "compiler-artifact" && event["target"]["name"] == CRATE)
+        .collect::<Vec<_>>();
+    assert_eq!(artifacts.len(), 1, "{output}");
+    assert_eq!(artifacts[0]["fresh"], false, "{output}");
+    let receipt = worker.completed_receipt();
+    let events = service.events();
+    let current = &events[previous_events..];
+    let handoffs = current
+        .iter()
+        .filter(|event| event["kind"] == "rabsd-worker-standby-dispatch")
+        .collect::<Vec<_>>();
+    assert_eq!(handoffs.len(), 1, "{current:?}");
+    assert_eq!(handoffs[0]["worker"], READY);
+    assert_eq!(handoffs[0]["request_id"], receipt["request_id"]);
+    for kind in [
+        "rabsd-remote-dependency-admitted",
+        "rabsd-remote-dependency-executed",
+    ] {
+        let matching = current
+            .iter()
+            .filter(|event| event["kind"] == kind)
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1, "{current:?}");
+        assert_eq!(matching[0]["key"], key, "{current:?}");
+    }
+    assert!(
+        current.iter().any(|event| {
+            event["kind"] == "rabsd-live-dependency"
+                && event["crate"] == CRATE
+                && event["key"] == key
+                && matches!(
+                    event["decision"].as_str(),
+                    Some("remote-offer" | "shared-remote-offer")
+                )
+        }),
+        "the real workspace unit was not offered remotely: {current:?}"
+    );
+    assert!(!decisions(current, "hit").contains_key(CRATE));
+    assert!(!decisions(current, "execute").contains_key(CRATE));
+    assert!(!absent_history.exists());
+    assert_eq!(
+        fs::read_dir(&admissions)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>(),
+        vec![ready_history],
+        "only the selected worker may own a request allocation"
+    );
+
+    let pid = service.process.as_ref().unwrap().pgid();
+    let pid = rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap();
+    rustix::process::kill_process(pid, rustix::process::Signal::TERM).unwrap();
+    let (code, _, output) = service.finish(Duration::from_secs(30), false);
+    assert_eq!(code, 0, "{output}");
+    worker.finish();
+    assert!(fs::read_dir(root.join("ops")).unwrap().next().is_none());
+}
+
+#[test]
 #[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual concurrent canonical Cargo clients, shared TLS compiler execution and origin cancellation"]
 fn canonical_shared_remote_flight_survives_origin_cancellation() {
     let (owner, mut first_profile) = native_fixture();

@@ -204,7 +204,7 @@ pub(super) fn deliver(
                 }
                 let next = remote
                     .workers
-                    .try_reserve_worker_excluding(&attempted)
+                    .try_reserve_worker_excluding_for(&attempted, Some(&invocation.requirements))
                     .map_err(|error| {
                         settled_failure(
                             &mut owned,

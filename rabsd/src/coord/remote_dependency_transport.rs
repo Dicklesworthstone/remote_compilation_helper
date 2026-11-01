@@ -14,6 +14,7 @@
 
 use super::secure_worker_delivery::{
     OperationCancellation, PinnedWorkerAdmission, WorkerAdmissionHook, parse_worker_pin,
+    validate_authenticated_worker_execution_capabilities,
 };
 use super::source_delivery::SourceUpload;
 #[cfg(test)]
@@ -111,6 +112,15 @@ enum ReservedOperation<'a> {
     Continue(Box<SealedResult>),
 }
 
+/// A connection-local placement hint. These generations are unrelated to
+/// durable worker boots or action generations and authorize no execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlacementReadiness {
+    Unknown,
+    Ready(u64),
+    Incompatible,
+}
+
 /// Explicit worker selection, with no worker-supplied name or learned key pin.
 /// Keep one instance in an `Arc` for the lifetime of the live dependency lane.
 /// The durable admission store also fences separate processes using this name.
@@ -124,6 +134,7 @@ pub struct RemoteDependencyTransport {
     occupied: AtomicBool,
     stopped: AtomicBool,
     cooldown: Arc<Mutex<ConnectionCooldown>>,
+    readiness: Arc<standby::Readiness>,
     listener: Mutex<Option<Arc<standby::Listener>>>,
 }
 
@@ -170,6 +181,7 @@ impl RemoteDependencyTransport {
             occupied: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             cooldown: Arc::new(Mutex::new(ConnectionCooldown::default())),
+            readiness: Arc::new(standby::Readiness::default()),
             listener: Mutex::new(None),
         })
     }
@@ -211,6 +223,55 @@ impl RemoteDependencyTransport {
         &self.worker
     }
 
+    /// Inspect only the currently parked, TLS-pinned hello. Missing evidence
+    /// retains the ordinary bounded connection path; incompatible evidence
+    /// excludes this request only until that exact connection is revoked.
+    pub(crate) fn placement_readiness(&self, request: Option<&Value>) -> PlacementReadiness {
+        let Some(snapshot) = self.readiness.snapshot() else {
+            return PlacementReadiness::Unknown;
+        };
+        if request.is_some_and(|request| {
+            validate_authenticated_worker_execution_capabilities(&snapshot.hello, request).is_err()
+        }) {
+            PlacementReadiness::Incompatible
+        } else {
+            PlacementReadiness::Ready(snapshot.generation)
+        }
+    }
+
+    /// Recheck after taking physical capacity so a revoked snapshot cannot
+    /// make the ready pass claim a disconnected or replaced connection. The
+    /// complete ordinary capability/challenge checks still run at dispatch.
+    pub(crate) fn try_reserve_for(
+        self: &Arc<Self>,
+        request: Option<&Value>,
+        ready_generation: Option<u64>,
+    ) -> io::Result<RemoteDependencyReservation> {
+        let reservation = self.try_reserve()?;
+        match self.placement_readiness(request) {
+            PlacementReadiness::Incompatible => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "current authenticated worker cannot execute this request",
+            )),
+            PlacementReadiness::Ready(generation)
+                if ready_generation.is_none_or(|expected| expected == generation)
+                    && self.readiness.is_current(generation) =>
+            {
+                Ok(reservation)
+            }
+            PlacementReadiness::Unknown if ready_generation.is_none() => Ok(reservation),
+            _ => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "authenticated worker readiness changed during placement",
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn advertise_for_test(&self, hello: &Value) -> impl Drop {
+        self.readiness.publish_for_test(hello)
+    }
+
     /// Bind once for the lifetime of the configured pool. The owner keeps its
     /// native reactor and authenticated idle peer on one thread; no socket is
     /// transferred between runtimes. A second start cannot replace that owner.
@@ -228,14 +289,14 @@ impl RemoteDependencyTransport {
         if owner.is_some() {
             return Ok(());
         }
+        let changed: Arc<dyn Fn() + Send + Sync> = available.unwrap_or_else(|| Arc::new(|| {}));
+        let ready_changed = Arc::clone(&changed);
         let cooldown = Arc::clone(&self.cooldown);
         let ready = Arc::new(move || {
             if let Ok(mut cooldown) = cooldown.lock() {
                 cooldown.completed();
             }
-            if let Some(available) = &available {
-                available();
-            }
+            ready_changed();
         });
         let listener = Arc::new(standby::Listener::start(
             self.address,
@@ -243,6 +304,8 @@ impl RemoteDependencyTransport {
             self.pin,
             self.tls.clone(),
             ready,
+            Arc::clone(&self.readiness),
+            changed,
         )?);
         if self.stopped.load(Ordering::Acquire) {
             listener.shutdown()?;
@@ -257,6 +320,7 @@ impl RemoteDependencyTransport {
     /// This is idempotent, but a stopped endpoint can never be started again.
     pub(crate) fn shutdown(&self) -> io::Result<()> {
         self.stopped.store(true, Ordering::Release);
+        self.readiness.close();
         let owner = self
             .listener
             .lock()
@@ -732,6 +796,123 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    #[test]
+    fn ready_reservation_rejects_a_revoked_or_replaced_connection_without_leaking_capacity() {
+        let state = crate::test_util::private_tempdir();
+        let transport = transport_at(state.path());
+        let first = transport.advertise_for_test(&serde_json::json!({"incarnation":"first"}));
+        let PlacementReadiness::Ready(generation) = transport.placement_readiness(None) else {
+            panic!("the injected authenticated connection should be ready");
+        };
+        drop(first);
+        assert_eq!(
+            transport
+                .try_reserve_for(None, Some(generation))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(!transport.occupied.load(Ordering::Acquire));
+        let second = transport.advertise_for_test(&serde_json::json!({"incarnation":"second"}));
+        assert_eq!(
+            transport
+                .try_reserve_for(None, Some(generation))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(!transport.occupied.load(Ordering::Acquire));
+        let PlacementReadiness::Ready(current) = transport.placement_readiness(None) else {
+            panic!("the replacement connection should have its own readiness");
+        };
+        assert_ne!(current, generation);
+        let reserved = transport.try_reserve_for(None, Some(current)).unwrap();
+        assert!(reserved.request_id.is_none());
+        assert!(reserved.admission.is_none());
+        assert!(!reserved.dispatch_attempted);
+        assert_eq!(std::fs::read_dir(state.path()).unwrap().count(), 0);
+        drop((reserved, second));
+        assert!(!transport.occupied.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn ready_hint_does_not_override_cooldown_occupancy_or_shutdown() {
+        let transport = transport();
+        let advertisement = transport.advertise_for_test(&serde_json::json!({}));
+        let PlacementReadiness::Ready(generation) = transport.placement_readiness(None) else {
+            panic!("test connection should be ready");
+        };
+        transport
+            .cooldown
+            .lock()
+            .unwrap()
+            .interrupted(Instant::now());
+        assert_eq!(
+            transport
+                .try_reserve_for(None, Some(generation))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(!transport.occupied.load(Ordering::Acquire));
+        transport.cooldown.lock().unwrap().completed();
+        let owner = transport.try_reserve_for(None, Some(generation)).unwrap();
+        assert_eq!(
+            transport
+                .try_reserve_for(None, Some(generation))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        transport.shutdown().unwrap();
+        assert_eq!(
+            transport.placement_readiness(None),
+            PlacementReadiness::Unknown
+        );
+        drop(owner);
+        assert_eq!(
+            transport
+                .try_reserve_for(None, Some(generation))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert!(!transport.occupied.load(Ordering::Acquire));
+        drop(advertisement);
+    }
+
+    #[test]
+    fn failed_listener_setup_does_not_permanently_close_future_readiness() {
+        let state = crate::test_util::private_tempdir();
+        let transport = Arc::new(
+            RemoteDependencyTransport::new(
+                "127.0.0.1:9123".parse().unwrap(),
+                "worker".into(),
+                [1; 32],
+                state.path().to_path_buf(),
+                TlsFiles {
+                    ca: state.path().join("missing-ca.pem"),
+                    certificate: state.path().join("missing-server.pem"),
+                    private_key: state.path().join("missing-server.key"),
+                },
+            )
+            .unwrap(),
+        );
+        assert!(transport.start_listener(None).is_err());
+        assert!(transport.listener.lock().unwrap().is_none());
+        assert!(!transport.stopped.load(Ordering::Acquire));
+        // The normal successful-start owner must remain able to publish.
+        // This deliberately tests startup custody, not a simulated TLS match.
+        let advertisement = transport.advertise_for_test(&serde_json::json!({}));
+        assert!(matches!(
+            transport.placement_readiness(None),
+            PlacementReadiness::Ready(_)
+        ));
+        drop(advertisement);
+        transport.shutdown().unwrap();
+        assert!(transport.readiness.snapshot().is_none());
     }
 
     #[test]
