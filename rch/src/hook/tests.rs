@@ -2006,6 +2006,337 @@ async fn clean_overlay_submodule_recursion_preserves_nested_pins_and_rejects_rep
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
+async fn clean_overlay_nested_pins_invalidate_warm_archives_and_cargo_artifacts() {
+    use sha2::{Digest as _, Sha256};
+    use std::io::Read as _;
+
+    let _guard = test_guard!();
+    let (app, module, _) = retained_clean_overlay_submodule_fixture().await;
+    let upstream = init_clean_overlay_test_repo().keep();
+    std::fs::write(
+        upstream.join("Cargo.toml"),
+        "[package]\nname='leaf'\nversion='0.1.0'\nedition='2024'\n",
+    )
+    .unwrap();
+    std::fs::write(upstream.join("src/lib.rs"), "pub fn value() -> u32 { 1 }\n").unwrap();
+    std::fs::write(upstream.join("data.txt"), "one\n").unwrap();
+    commit_clean_overlay_submodule_fixture(&upstream).await;
+    git_output(
+        &module,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            upstream.to_str().unwrap(),
+            "nested/leaf",
+        ],
+    )
+    .await
+    .unwrap();
+    let leaf = module.join("nested/leaf");
+    for (key, value) in [
+        ("user.name", "RCH Test"),
+        ("user.email", "rch-test@example.invalid"),
+        ("core.hooksPath", "/dev/null"),
+    ] {
+        git_output(&leaf, &["config", key, value]).await.unwrap();
+    }
+    std::fs::write(module.join("Cargo.toml"), "[package]\nname='dep'\nversion='0.1.0'\nedition='2024'\n[dependencies]\nleaf={path='nested/leaf'}\n").unwrap();
+    std::fs::write(
+        module.join("src/lib.rs"),
+        "pub fn value() -> u32 { leaf::value() }\n",
+    )
+    .unwrap();
+    std::fs::write(app.join("Cargo.toml"), "[package]\nname='app'\nversion='0.1.0'\nedition='2024'\n[workspace]\n[dependencies]\ndep={path='vendor/dep'}\n").unwrap();
+    std::fs::write(app.join("src/main.rs"), r#"fn main() {
+    let data = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/dep/nested/leaf/data.txt")).unwrap();
+    print!("{}:{}", dep::value(), data);
+}
+"#).unwrap();
+    std::fs::write(app.join("Cargo.lock"), "version = 4\n[[package]]\nname = 'app'\nversion = '0.1.0'\ndependencies = ['dep']\n[[package]]\nname = 'dep'\nversion = '0.1.0'\ndependencies = ['leaf']\n[[package]]\nname = 'leaf'\nversion = '0.1.0'\n").unwrap();
+    commit_clean_overlay_submodule_fixture(&module).await;
+    let base_a = commit_clean_overlay_submodule_fixture(&app).await;
+    std::fs::write(leaf.join("src/lib.rs"), "pub fn value() -> u32 { 2 }\n").unwrap();
+    std::fs::write(leaf.join("data.txt"), "two\n").unwrap();
+    commit_clean_overlay_submodule_fixture(&leaf).await;
+    commit_clean_overlay_submodule_fixture(&module).await;
+    let base_b = commit_clean_overlay_submodule_fixture(&app).await;
+    // Both a newer nested HEAD and uncommitted bytes must remain unselected.
+    std::fs::write(leaf.join("src/lib.rs"), "pub fn value() -> u32 { 9 }\n").unwrap();
+    let newer_leaf = commit_clean_overlay_submodule_fixture(&leaf).await;
+    std::fs::write(
+        leaf.join("src/lib.rs"),
+        "compile_error!(\"unselected dirt\");\n",
+    )
+    .unwrap();
+    std::fs::write(leaf.join("data.txt"), "dirty checkout\n").unwrap();
+    let first = prepare_clean_overlay_spec(&app, Some(base_a), true, vec![], true)
+        .await
+        .unwrap()
+        .unwrap();
+    let second = prepare_clean_overlay_spec(&app, Some(base_b), true, vec![], true)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.submodules.len(), 2);
+    assert_ne!(
+        first.submodules[1].base_commit,
+        second.submodules[1].base_commit
+    );
+    assert_ne!(first.overlay_fingerprint(), second.overlay_fingerprint());
+    assert_ne!(first.execution_receipt(), second.execution_receipt());
+
+    let retained = tempfile::tempdir().unwrap().keep();
+    let cargo_home = retained.join("cargo-home");
+    std::fs::create_dir(&cargo_home).unwrap();
+    let mut cargo = PathBuf::from(env!("CARGO"));
+    if std::fs::metadata(&cargo).unwrap().len() <= 8 * 1024
+        && std::fs::read_to_string(&cargo)
+            .unwrap()
+            .lines()
+            .any(|line| line.starts_with("# rch-toolchain-wrap-version:"))
+    {
+        cargo.set_file_name("cargo-rch-real");
+    }
+    let mut magic = [0; 4];
+    std::fs::File::open(&cargo)
+        .unwrap()
+        .read_exact(&mut magic)
+        .unwrap();
+    assert_eq!(&magic, b"\x7fELF", "fixture requires native Cargo");
+    let cargo_bin = cargo.parent().unwrap();
+    let path = std::env::join_paths([cargo_bin, Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+    let slot = "a".repeat(64);
+    let steps = [
+        (&first, 1, "one"),
+        (&first, 1, "one"),
+        (&second, 2, "two"),
+        (&second, 2, "two"),
+        (&first, 1, "one"),
+    ];
+    // Without source freshness, a valid archive-cache miss still leaves Cargo
+    // reusing the old same-size leaf artifact. The positive lane must fix that.
+    for refresh in [false, true] {
+        let root = retained.join(format!("source-{refresh}"));
+        let pool = retained.join(format!("pool-{refresh}"));
+        let pipeline = TransferPipeline::new(
+            root.clone(),
+            "pin-fixture".into(),
+            "pair".into(),
+            TransferConfig::default(),
+        )
+        .with_remote_path_override(root.to_string_lossy().into_owned())
+        .with_remote_cargo_target_dir_override(pool.to_string_lossy().into_owned());
+        let selected_steps = if refresh {
+            steps.to_vec()
+        } else {
+            vec![steps[0], steps[2]]
+        };
+        for (run, (spec, value, word)) in selected_steps.into_iter().enumerate() {
+            spec.verify_archive_attributes(&app).await.unwrap();
+            validate_clean_overlay_cargo_sources(&app, spec, "cargo build --bin app")
+                .await
+                .unwrap();
+            let selected = spec
+                .submodules
+                .iter()
+                .map(|module| (module.path.clone(), module.base_commit.clone()))
+                .collect::<Vec<_>>();
+            let archive =
+                TransferPipeline::create_selected_git_archive(&app, spec.base_commit(), &selected)
+                    .await
+                    .unwrap();
+            let bytes = std::fs::read(archive.path()).unwrap();
+            let digest = Sha256::digest(&bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            std::fs::create_dir(&root).unwrap();
+            let transport = root.join(".rch-clean-overlay-base.tar");
+            let cache = |operation: &str| {
+                let output = std::process::Command::new("/usr/bin/timeout")
+                    .args([
+                        "--kill-after=5",
+                        "120",
+                        "/usr/bin/python3",
+                        "-I",
+                        "-c",
+                        include_str!("../transfer/git_archive_cache.py"),
+                        operation,
+                    ])
+                    .arg(&root)
+                    .arg(&pool)
+                    .arg(&slot)
+                    .arg(&digest)
+                    .arg(bytes.len().to_string())
+                    .arg("0")
+                    .env_clear()
+                    .env("PATH", &path)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{output:?}");
+                assert!(output.stderr.is_empty(), "{output:?}");
+                String::from_utf8(output.stdout).unwrap()
+            };
+            let unchanged = refresh && (run == 1 || run == 3);
+            assert_eq!(
+                cache("restore"),
+                format!(
+                    "RCH_GIT_ARCHIVE_CACHE_V1 {}\n",
+                    if unchanged { "HIT" } else { "MISS" }
+                )
+            );
+            if !unchanged {
+                std::fs::copy(archive.path(), &transport).unwrap();
+            }
+            tar::Archive::new(std::fs::File::open(&transport).unwrap())
+                .unpack(&root)
+                .unwrap();
+            if !unchanged {
+                assert_eq!(cache("publish"), "RCH_GIT_ARCHIVE_CACHE_V1 PUBLISHED\n");
+            }
+            assert!(!root.join("vendor/dep/nested/leaf/.git").exists());
+            assert_eq!(
+                std::fs::read_to_string(root.join("vendor/dep/nested/leaf/src/lib.rs")).unwrap(),
+                format!("pub fn value() -> u32 {{ {value} }}\n")
+            );
+            for name in [
+                "Cargo.toml",
+                "Cargo.lock",
+                "src/main.rs",
+                "src/lib.rs",
+                "vendor/dep/Cargo.toml",
+                "vendor/dep/src/lib.rs",
+                "vendor/dep/nested/leaf/Cargo.toml",
+                "vendor/dep/nested/leaf/src/lib.rs",
+                "vendor/dep/nested/leaf/data.txt",
+            ] {
+                std::fs::File::open(root.join(name))
+                    .unwrap()
+                    .set_times(
+                        std::fs::FileTimes::new()
+                            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_000_000)),
+                    )
+                    .unwrap();
+            }
+            if refresh {
+                let identity = transfer_orchestration::clean_overlay_freshness_identity(spec);
+                let output = std::process::Command::new("/usr/bin/timeout")
+                    .args([
+                        "--kill-after=5",
+                        "120",
+                        "/bin/sh",
+                        "-c",
+                        &pipeline
+                            .clean_overlay_source_refresh_command(&identity)
+                            .unwrap(),
+                    ])
+                    .env_clear()
+                    .env("PATH", &path)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{output:?}");
+                assert!(
+                    String::from_utf8_lossy(&output.stdout).contains("RCH_SOURCE_FRESHNESS_V2")
+                );
+            }
+            let output = std::process::Command::new("/usr/bin/timeout")
+                .args(["--kill-after=5", "120"])
+                .arg(&cargo)
+                .args([
+                    "build",
+                    "--offline",
+                    "--locked",
+                    "--jobs",
+                    "1",
+                    "--bin",
+                    "app",
+                    "--message-format=json",
+                ])
+                .current_dir(&root)
+                .env_clear()
+                .env("PATH", &path)
+                .env("HOME", &retained)
+                .env("CARGO_HOME", &cargo_home)
+                .env("CARGO_TARGET_DIR", &pool)
+                .env("RUSTC", cargo_bin.join("rustc"))
+                .env("RUSTUP_AUTO_INSTALL", "0")
+                .env("RCH_CARGO_WRAPPER_BYPASS", "1")
+                .env("RCH_CARGO_WRAPPER_ORIGIN", "rch")
+                .output()
+                .unwrap();
+            std::fs::write(
+                retained.join(format!("cargo-{refresh}-{run}.jsonl")),
+                &output.stdout,
+            )
+            .unwrap();
+            std::fs::write(
+                retained.join(format!("cargo-{refresh}-{run}.stderr")),
+                &output.stderr,
+            )
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "{output:?}; retained {}",
+                retained.display()
+            );
+            for name in ["leaf", "dep", "app"] {
+                let artifacts = String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .filter(|message| {
+                        message["reason"] == "compiler-artifact"
+                            && message["target"]["name"] == name
+                    })
+                    .collect::<Vec<_>>();
+                assert!(!artifacts.is_empty(), "missing {name} artifact");
+                assert!(
+                    artifacts
+                        .iter()
+                        .all(|message| message["fresh"] == (unchanged || (!refresh && run == 1))),
+                    "refresh={refresh} run={run}: {artifacts:?}"
+                );
+            }
+            let actual = std::process::Command::new("/usr/bin/timeout")
+                .args(["--kill-after=5", "120"])
+                .arg(pool.join("debug/app"))
+                .env_clear()
+                .output()
+                .unwrap();
+            assert!(actual.status.success(), "{actual:?}");
+            assert_eq!(
+                actual.stdout,
+                format!("{}:{word}\n", if refresh { value } else { 1 }).as_bytes()
+            );
+            std::fs::rename(&root, retained.join(format!("retired-{refresh}-{run}"))).unwrap();
+            assert!(
+                !root.exists(),
+                "the next build must rematerialize its source path"
+            );
+        }
+    }
+    assert_eq!(
+        git_output(&leaf, &["rev-parse", "HEAD"]).await.unwrap(),
+        newer_leaf
+    );
+    assert_eq!(
+        std::fs::read_to_string(leaf.join("data.txt")).unwrap(),
+        "dirty checkout\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(leaf.join("src/lib.rs")).unwrap(),
+        "compile_error!(\"unselected dirt\");\n"
+    );
+    eprintln!(
+        "nested-pin warm Cargo fixtures retained at {}",
+        retained.display()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
 async fn clean_overlay_submodule_archive_refuses_case_aliased_parent_directories() {
     let _guard = test_guard!();
     let (app, _, _) = retained_clean_overlay_submodule_fixture().await;
