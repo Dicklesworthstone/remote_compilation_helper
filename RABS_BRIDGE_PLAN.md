@@ -6,7 +6,7 @@
 **CI/release policy, explicitly confirmed by the user November 1:** DSR only.
 Never enable or dispatch GitHub Actions. Historical workflow receipts below
 remain unqualified history; the earlier optional enablement question is closed.
-**Current status, November 1 at 20:20 UTC:** controlled native RABS is working
+**Current status, November 1 at 21:48 UTC:** controlled native RABS is working
 for real Cargo archive execution/delivery and five shared-service consumers.
 Production source 6a79d453 passes six of seven original canonical cases and
 all five overhead/support tests; the overlap case fails final SDK cleanup
@@ -28,10 +28,15 @@ source files and all four completed production executable hashes are verified;
 the executables are retained separately. This is not a runtime test verdict.
 Four verified runtime-file repairs and the reconciled shutdown helper/controls
 are applied to the shared checkout. Its complete 1,755-file working cut is
-captured and audited on the dispatcher; merged-source checks are submitted
-through strict RCH and queued first behind a different project's TRJ build.
-No peer is cancelled or slot limit increased. Its changed lockfile requires fresh
-compiler proof, even though the four runtime repair files match the tested cut.
+captured and audited on the dispatcher. That shared attempt is stopped with
+terminal 137/ACK true after a runner error forced unnecessary full-debug
+dependency rebuilding; it produced no new harness or runtime result. The
+runner is corrected, and the explicit-daemon fixture now compiles through
+strict one-slot RCH against ordinary debug settings. Its controls/checks, then
+the retained-production DSR consumer, are pending. Shared source has since
+advanced; CAS's test-only dependency demotion and the already tested TOML
+dependency guards are integrated there too. A fresh combined-source native
+pass remains required. No peer is cancelled or slot limit increased.
 An actual complete native diagnostic bundle also installs and upgrades. Its
 current installer exposed a real umask-0002 defect: newly written manifest
 0664 was rejected by its unchanged verifier. The writer now sets 0600;
@@ -1468,6 +1473,30 @@ only the stated step, never closure of the surrounding milestone.
       101 and ACK true; no overall green status is manufactured.
     - [x] Finish mandatory workspace/all-target check, strict Clippy and fmt;
       retain source/binary/receipt custody and exact owner terminal ACK.
+    - [x] Integrate that already verified manifest-only correction into the
+      original shared checkout at 21:20 UTC. Its preimage is byte-identical
+      to the private 8e parent; its resulting manifest is byte-identical to
+      validated 8e/6a (SHA 13b8284e above). Fresh source inspection confirms
+      filetime import/use only under cfg(test), with production held-file
+      set_modified unchanged. No budget, production Rust code, lockfile,
+      peer staging or existing timestamp fixture is changed. Lease released.
+    - [x] At 21:46 UTC, close the second shared integration gap: manually port
+      the already native-validated TOML budget/direction parsers and their two
+      adversarial cases from the private cut. All three source files match
+      that tested cut byte for byte. Every numeric budget, runtime dependency,
+      allowlist and original product assertion remains unchanged. TOML stays
+      protocol-dev-only; Cargo.lock gains only that existing locked package
+      reference. Inverting the three-line lock entry reproduces the entire
+      peer preimage exactly. Formatting/diff checks zero. This strengthens
+      target/alias/inherited-edge detection; it is not dependency removal or a
+      passing budget gate. Fresh combined-source execution remains pending.
+    - [ ] Qualify the newly combined shared source after this manifest edit:
+      full CAS tests including physical reflink, actual Cargo normal/dev edge
+      metadata, corrected budget/direction guards and their original unchanged
+      budgets/allowlists, workspace/all-target check,
+      strict Clippy and fmt. The currently running A38 snapshot predates this
+      shared manifest edit and cannot stand in for that qualification. Preserve
+      all four other overages and keep A012 in progress.
     - [ ] Resolve the remaining sandbox/adapter/worker/daemon runtime edges and
       complete A012's transitive-cone/license/reproducibility acceptance before
       closing the parent. A012 is in progress, not complete.
@@ -2591,6 +2620,31 @@ only the stated step, never closure of the surrounding milestone.
       four genuine JSON/JSONL receipts are copied and SHA-verified locally in
       rabs-dsr-all-404f98a5-20261101/timeout-evidence. No old-run compiler remains.
       Both earlier builder cuts, all raw failures and peer work remain preserved.
+    - [x] Execute the retained DSR-built production404 daemon directly for a
+      short native CLI smoke while the independent compiler remains active.
+      Check-config, socket status and doctor on each of two boots all exit zero
+      (five CLI commands). Each doctor reports all five checks OK, including
+      actual canonical-namespace support. Both original 5s timed runs exit zero
+      without forced cleanup, in 5.217s and 5.102s; all four subsystem obligations
+      are clean and both sockets retire. Same-state authority advances term
+      1 to 2 with a different incarnation; build identity binds exact source404.
+      Status remains advisory/release-standing unknown/live_dependency false;
+      this is bootstrap, doctor and local durable restart proof, not Cargo,
+      serving, stale-offer/manual fencing, distinct-host, soak or release proof.
+      Fresh before/after audits verify all eight original/retained DSR tools.
+      The first smoke runner fails one after its three actual CLI commands pass:
+      it wrongly parses doctor's six NDJSON frames as one object. Preserve that
+      parser failure and explicitly terminated partial cycle; correct only the
+      runner's framing parse and rerun both complete cycles on fresh state.
+      Original 10s startup / 5s run / 15s total bounds and all product assertions
+      stay unchanged. Thirty-one genuine receipt/state/source files are copied
+      and hashed under rabs-retained404-cli-smoke-results-20261101. Archive SHA
+      1ceb7617c8f4c76feb0d08e7d557155352edd87cdd9000137277edd47dd03445;
+      successful report SHA
+      ce41c4347ddc54d1515240adbb007e03d89e15da7d3a6ff254c7eb0a629a2c55.
+      This does not turn the old six-hour compile timeout or pending original
+      canonical consumer into a pass. No global service, source or fleet setting
+      changes. Private fixture workspace checking is still active.
     - [x] Prepare a minimal fixture-only daemon selector on the private cut.
       Canonical tests hard-code Cargo's companion daemon while already allowing
       explicit wrapper/worker selections. RABS_CANONICAL_TEST_DAEMON now selects
@@ -2619,6 +2673,31 @@ only the stated step, never closure of the surrounding milestone.
       DSR only, preserving all original product assertions and per-case bounds.
       A dev harness driving optimized production tools is explicitly that;
       never relabel the timed-out optimized-harness invocation as passing.
+      November 1, 21:40 UTC: the preceding shared attempt is now terminal and
+      acknowledged (137), so submit the fixture-only native batch through RCH.
+      Correct the runner's accidental removal of RCH's ordinary
+      line-tables-only compilation settings; only executed fixture environments
+      discard those settings. Dev optimization/assertions and every test bound
+      are unchanged. The replacement immutable runner is 7,734 bytes, SHA
+      607f14fac240fdd0a5676bc1ced912d99609ecb4cea9f785b7b697eab83fd402;
+      the original prepared runner remains retained. Same one slot, same
+      storage guards, same source capsule. Native controls/checks remain pending.
+      At 21:49 UTC, its Cargo build finishes zero (497.84s); selector control
+      1/1 passes in 0.02s and shutdown control 1/1 in 4.54s. Actual artifact
+      profile is opt-level zero, line-tables-only, debug assertions and
+      overflow checks enabled. Retained harness is 249,855,296 bytes, SHA
+      829ecb1c7fe5cb0be614b827d9c8f3ca006d171c4084bfd2d5df44afffbcda92.
+      Workspace check/Clippy/fmt and source-after/terminal ACK remain pending;
+      no production overlap has run yet. RCH wrapper
+      rchw-c4c3b4ff-e3b7-4efe-a190-2cded3f363f5, build 30080135327648050.
+      Manually port the exact passing helper/control and two spawn substitutions
+      into the expanded shared test file. Source changes from 356,217 bytes /
+      SHA f800b6bf5bf8aff767748979aa6b8cfe462bda87089b6b6f47f006b3c7540253
+      to 357,599 bytes /
+      SHA 4cb8b0ee7e9fe06d2c1de0f97993072b257a87d6864c5804ce307d619ac61ea3.
+      Exact inverse restores every byte of that peer preimage; no existing
+      case, assertion or timing bound changes. Formatting/diff zero, lease
+      released. Fresh combined-source native qualification remains required.
   - [ ] Complete shared-checkout integration and qualify its captured source;
     private-cut evidence alone does not qualify evolving canonical main.
     - [x] Inspect the live checkout at observed HEAD
@@ -2693,8 +2772,80 @@ only the stated step, never closure of the surrounding milestone.
       52bd694590cfba261dea7cc194a4dc799fc9ad5d6bbbcaa0b8b41cb70af73bb6,
       7,917 bytes. New request 9253452172182422126 submitted 20:24:58 UTC,
       first queued behind a peer, same source bytes and one-slot policy.
-      Combined-source compiler/runtime commands remain UNRUN; equality of four
-      files does not qualify the whole workspace.
+      It is admitted 20:48:49 UTC as build 30080135327648045. Exact source
+      audit verifies 1,694/1,755 with the declared 61 exclusions, zero differences;
+      all three storage guards zero. Old dev executables are preserved before
+      cache reuse. Daemon library/canonical-harness compilation is active;
+      runtime tests and remaining checks have no terminal verdict yet.
+      At 21:38 UTC, identify an avoidable runner error: it removed RCH's normal
+      line-tables-only overrides before compilation, forcing a full-debug
+      Asupersync rebuild. Stop only this owned job through supported RCH
+      cancellation. The first request reports cancellation unconfirmed; retain
+      that failure. Supported recovery then returns zero, terminal exit 137,
+      ACK true, sources released/retired true. Exact wrapper
+      rchw-137b973f-df07-4e5c-bfde-1156d8b30b5c, command fingerprint
+      blake3:64d68936f105b532ed19f8e6d2564d7b34ffddb295af2ae8e218d85e46aaaea3.
+      No new harness, compiler pass or runtime result was produced. Preserve
+      partial logs and old binaries; no peer job, slot or storage floor changes.
+      This captured cut also predates the CAS manifest port, so it cannot
+      qualify the latest combined checkout. First execute the small private
+      fixture and retained DSR production consumer; then capture/qualify the
+      combined source including CAS and the validated selector. Normal Cargo
+      owns cache reuse; this is runner maintenance, with no speedup claim.
+    - [ ] On the latest integrated cut below, preserve its actual Cargo-produced
+      shared-cut daemon by hash, then run its real private startup, doctor,
+      Unix-socket status, clean shutdown and same-state restart. Bind the
+      reported build identity to the captured working cut. A dev daemon
+      lifecycle probe is not optimized Cargo, serving or fleet qualification.
+      The cancelled A38 attempt produced no executable; its original proposed
+      lifecycle probe is UNRUN. The latest driver retains its daemon before
+      further cache reuse and runs the complete existing doctor-live suite;
+      explicit status and same-state restart remain separate pending checks.
+    - [x] Capture the latest combined shared working tree after the dependency
+      guard and daemon-selector ports, at observed HEAD
+      5ab9bd16901c144b57e3ae194bca01a400132878. Two complete held-file passes
+      match with HEAD, Git-visible membership and the full index unchanged;
+      1,755 files, no absent members. Explicit content-map overlay
+      306203c1d60ed3ed1d41572fff724f3f9364e407bff796e15c730e0855dfe567;
+      archive SHA
+      70093778384bd76e92bfc1508f885e5f9294b08433721d5022c50f4f69502095;
+      manifest SHA
+      59f5a0175cb700e444d3f453c88d108fc30e0b30c5d314d21380d1d0dd6320db.
+      All 1,755 dispatcher inputs verify; the same configured 61 exclusions
+      remain explicit and no build input is waived. Transfer config is copied
+      verbatim. This is a captured working tree, not clean Git or an
+      RCH-generated overlay. The first capture command is blocked before any
+      execution because its dynamic Git helper obscures subprocess arguments;
+      replacing that helper with explicit read-only argument arrays passes.
+      A later read-only bridge verifies all seven installer/launcher/support
+      input sizes and hashes against the genuine 100/100 native run (report
+      SHA 4e1d32230d9c75b7495c8ae3c5eb79648b75d2577e04044a2619b419140e71eb).
+      This carries that component evidence to identical Python/shell inputs
+      with the same controlled 6a bundle; it is not a new test run, fresh Rust
+      qualification, actual SSH fleet, portable package or release proof.
+    - [x] Prepare the corrected latest-cut native driver, 12,033 bytes, SHA
+      4b22e18af7ba81802c0b12ead95bf2cee4f886f32d344cd1fe44c2a306fa12ab.
+      Preserve the preceding fixture outside the target cache; retain the new
+      Cargo-produced dev daemon with its actual artifact/profile/hash. Original
+      runners and cancelled/failed logs remain unchanged. The new batch is
+      prepared, not submitted; first finish the private fixture and DSR consumer.
+    - [ ] Execute that latest-cut batch with the existing one-slot policy and
+      all three unchanged storage guards. Keep normal compile debug settings;
+      clear them only for executed fixtures. Do not overlap our DSR runtime.
+      - [ ] Compile daemon library, canonical and doctor-live harnesses; retain
+        the actual source-bound dev daemon before later cache reuse.
+      - [ ] List then run shutdown, selector, framing, service socket, complete
+        daemon library and complete doctor-live sets; require full counts and
+        zero ignored, preserving every raw exit.
+      - [ ] Compile/list/run the complete CAS library with actual physical CoW;
+        verify all enumerated cases with zero ignored.
+      - [ ] Compile/list/run both dependency guards; preserve the expected
+        budget failure and all actual violations, with every budget unchanged.
+      - [ ] Run actual offline locked Cargo metadata; assert CAS seven normal
+        edges, filetime dev-only, protocol zero runtime edges.
+      - [ ] Finish workspace/all-target check, strict Clippy and formatting;
+        audit source and executable hashes after all commands; retain genuine
+        results and exact RCH terminal acknowledgement even on nonzero exit.
     - [x] Reconcile the execution history into the shared Beads tracker. Its
       JSONL/DB had remained at the initial reopened snapshot; private comments
       alone did not mark the shared task in progress. Supported import then
