@@ -4951,10 +4951,8 @@ impl TransferPipeline {
         let remote_path = self.remote_path();
         let escaped_remote_path = escape(Cow::from(&remote_path));
         let destination = self.rsync_remote_spec(worker, &remote_path);
-        let identity_file = shellexpand::tilde(&worker.identity_file);
-        let ssh_command = source_content_barrier::ssh_command(
-            &self.build_rsync_ssh_command(identity_file.as_ref()),
-        );
+        let ssh_command =
+            source_content_barrier::ssh_command(&self.build_rsync_ssh_command(worker));
 
         let (mut cmd, capabilities) = self.rsync_command();
         let receiver = match policy {
@@ -5983,10 +5981,9 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         // disables silence detection for actual source uploads.
         cmd.arg(rsync_io_timeout_arg(self.transfer_estimate_timeout()));
 
-        let identity_file = shellexpand::tilde(&worker.identity_file);
         let ssh_command = format!(
             "{} -o ConnectTimeout=5",
-            self.build_rsync_ssh_command(identity_file.as_ref())
+            self.build_rsync_ssh_command(worker)
         );
 
         cmd.arg("-az");
@@ -6144,8 +6141,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         let (mut cmd, capabilities) = self.rsync_command();
         self.append_source_rsync_io_timeout(&mut cmd);
 
-        let identity_file = shellexpand::tilde(&worker.identity_file);
-        let ssh_command = self.build_rsync_ssh_command(identity_file.as_ref());
+        let ssh_command = self.build_rsync_ssh_command(worker);
 
         cmd.arg("-az"); // Archive mode + compression
         add_portable_rsync_archive_args(&mut cmd);
@@ -6206,8 +6202,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         let (mut cmd, capabilities) = self.rsync_command();
         self.append_source_rsync_io_timeout(&mut cmd);
 
-        let identity_file = shellexpand::tilde(&worker.identity_file);
-        let ssh_command = self.build_rsync_ssh_command(identity_file.as_ref());
+        let ssh_command = self.build_rsync_ssh_command(worker);
 
         cmd.arg("-az"); // Archive mode + compression
         add_portable_rsync_archive_args(&mut cmd);
@@ -6480,8 +6475,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         let remote_archive_path = format!("{remote_path}/.rch-clean-overlay-base.tar");
         let escaped_remote_archive = escape(Cow::from(remote_archive_path.as_str()));
         let destination = self.rsync_remote_spec(worker, &remote_archive_path);
-        let identity_file = shellexpand::tilde(&worker.identity_file);
-        let ssh_command = self.build_rsync_ssh_command(identity_file.as_ref());
+        let ssh_command = self.build_rsync_ssh_command(worker);
         let extraction_script = format!(
             "set -eu\n{guard} || exit 73\numask 0022\nmkdir -p {path}\nTAR_OPTIONS='' tar -xf {archive} -C {path}",
             guard = live_checkout_sync_guard(&remote_path),
@@ -6672,6 +6666,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         let identity_file = shellexpand::tilde(&worker.identity_file);
         let mut cmd = Command::new("ssh");
         crate::commands::jobs::configure_automatic_recovery_ssh(&mut cmd);
+        crate::hook::ssh::configure_offload_ssh_transport(cmd.as_std_mut(), worker);
         cmd.arg("-o").arg("BatchMode=yes");
         cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
         cmd.arg("-o").arg(format!(
@@ -7563,6 +7558,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         let identity_file = shellexpand::tilde(&worker.identity_file);
 
         let mut cmd = Command::new("ssh");
+        crate::hook::ssh::configure_offload_ssh_transport(cmd.as_std_mut(), worker);
         cmd.arg("-o").arg("BatchMode=yes");
         cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
         cmd.arg("-o").arg(format!(
@@ -7911,8 +7907,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
     ) -> Command {
         let (mut cmd, capabilities) = self.rsync_command();
 
-        let identity_file = shellexpand::tilde(&worker.identity_file);
-        let ssh_command = self.build_rsync_ssh_command(identity_file.as_ref());
+        let ssh_command = self.build_rsync_ssh_command(worker);
 
         // Use --safe-links to prevent symlink traversal attacks from malicious workers.
         // --stats is required so parse_rsync_bytes/parse_rsync_files can read transfer
@@ -8030,9 +8025,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
     ) -> Command {
         let (mut cmd, capabilities) = self.rsync_command();
 
-        let identity_file = shellexpand::tilde(&worker.identity_file);
-
-        let ssh_command = self.build_rsync_ssh_command(identity_file.as_ref());
+        let ssh_command = self.build_rsync_ssh_command(worker);
 
         // Match the integrity policy of the non-streaming planner/collector.
         cmd.arg("-az")
@@ -8115,16 +8108,21 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         cmd
     }
 
-    fn build_rsync_ssh_command(&self, identity_file: &str) -> String {
+    fn build_rsync_ssh_command(&self, worker: &WorkerConfig) -> String {
         let automatic_options = crate::commands::jobs::automatic_recovery_ssh_options();
+        let owned_arguments = crate::hook::ssh::offload_ssh_transport_shell_arguments(worker);
         let automatic_prefix = if automatic_options.is_empty() {
             String::new()
         } else {
             format!("{automatic_options} ")
         };
+        let owned_prefix = owned_arguments
+            .as_ref()
+            .map(|arguments| format!("{arguments} "))
+            .unwrap_or_default();
         let mut command = format!(
-            "ssh {automatic_prefix}{} -o StrictHostKeyChecking=accept-new -o BatchMode=yes",
-            rch_common::ssh_utils::identity_shell_args(identity_file)
+            "ssh {automatic_prefix}{owned_prefix}{} -o StrictHostKeyChecking=accept-new -o BatchMode=yes",
+            rch_common::ssh_utils::identity_shell_args(&worker.identity_file)
         );
 
         #[cfg(unix)]
@@ -8137,6 +8135,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             }
 
             if automatic_options.is_empty()
+                && owned_arguments.is_none()
                 && self.ssh_options.control_master
                 && let Some(idle) = self.ssh_options.control_persist_idle
             {
@@ -8397,8 +8396,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
     ) -> Command {
         let (mut cmd, capabilities) = self.rsync_command();
 
-        let identity_file = shellexpand::tilde(&worker.identity_file);
-        let ssh_command = self.build_rsync_ssh_command(identity_file.as_ref());
+        let ssh_command = self.build_rsync_ssh_command(worker);
 
         // Same transport hardening as artifact retrieval: --safe-links blocks
         // symlink traversal out of the declared tree.
@@ -16039,7 +16037,7 @@ Number of files transferred: 42
         let _guard = test_guard!();
         let worker = flavour_test_worker();
         let mut pipeline = flavour_test_pipeline(RsyncFlavor::Unknown, 0);
-        let manual = pipeline.build_rsync_ssh_command(&worker.identity_file);
+        let manual = pipeline.build_rsync_ssh_command(&worker);
         assert!(!manual.contains("ConnectionAttempts=1"));
         pipeline.ssh_options.control_master = true;
         pipeline.ssh_options.control_persist_idle = Some(Duration::from_secs(600));
@@ -16053,7 +16051,7 @@ Number of files transferred: 42
                         .iter()
                         .position(|arg| arg == "ubuntu@worker.example")
                         .unwrap();
-                    let nested = pipeline.build_rsync_ssh_command(&worker.identity_file);
+                    let nested = pipeline.build_rsync_ssh_command(&worker);
                     for expected in [
                         "ConnectionAttempts=1",
                         "ControlMaster=no",
@@ -16080,16 +16078,181 @@ Number of files transferred: 42
             .unwrap();
         }
         pipeline.ssh_options.control_master = false;
-        assert_eq!(
-            pipeline.build_rsync_ssh_command(&worker.identity_file),
-            manual
-        );
+        assert_eq!(pipeline.build_rsync_ssh_command(&worker), manual);
         let manual_direct = command_args(&pipeline.worker_ssh_command(&worker, &["sh", "-s"]));
         assert!(
             !manual_direct
                 .iter()
                 .any(|arg| arg == "ConnectionAttempts=1")
         );
+    }
+
+    #[tokio::test]
+    async fn owned_offload_direct_and_rsync_share_exact_socket() {
+        let _guard = test_guard!();
+        let worker = flavour_test_worker();
+        let mut pipeline = flavour_test_pipeline(RsyncFlavor::Unknown, 0);
+        pipeline.ssh_options.control_master = true;
+        pipeline.ssh_options.control_persist_idle = Some(Duration::from_secs(600));
+        let socket = "/tmp/rch-owned socket's control";
+        let owned_arguments = [
+            "-S",
+            socket,
+            "-o",
+            "ControlMaster=no",
+            "-o",
+            "ControlPersist=no",
+            "-o",
+            "ProxyCommand=false",
+        ]
+        .map(std::ffi::OsString::from)
+        .to_vec();
+        crate::hook::ssh::with_offload_ssh_arguments_for_test(
+            worker.clone(),
+            owned_arguments,
+            async {
+                let direct = command_args(&pipeline.worker_ssh_command(&worker, &["sh", "-s"]));
+                let remote = "/data/tmp/rch/selected";
+                let destination = pipeline.rsync_remote_spec(&worker, remote);
+                let sync = pipeline.build_sync_command(&worker, &destination, remote, &[]);
+                let retrieve = pipeline.build_retrieve_command(&worker, remote, &[]);
+                let mut transports = vec![direct];
+                for command in [&sync, &retrieve] {
+                    let arguments = command_args(command);
+                    let ssh = arguments
+                        .windows(2)
+                        .find(|pair| pair[0] == "-e")
+                        .expect("rsync must name its SSH transport");
+                    let parsed = shell_words::split(&ssh[1]).unwrap();
+                    assert_eq!(parsed[0], "ssh");
+                    transports.push(parsed[1..].to_vec());
+                }
+                for arguments in transports {
+                    assert_eq!(
+                        arguments
+                            .windows(2)
+                            .filter(|pair| pair[0] == "-S")
+                            .map(|pair| pair[1].as_str())
+                            .collect::<Vec<_>>(),
+                        [socket],
+                        "{arguments:?}"
+                    );
+                    for required in [
+                        "ControlMaster=no",
+                        "ControlPersist=no",
+                        "ProxyCommand=false",
+                    ] {
+                        let position = arguments.iter().position(|arg| arg == required).unwrap();
+                        let identity = arguments.iter().position(|arg| arg == "-i").unwrap();
+                        assert!(position < identity, "{arguments:?}");
+                    }
+                    assert!(!arguments.iter().any(|arg| arg == "ControlMaster=auto"));
+                    assert!(!arguments.iter().any(|arg| arg == "ControlPersist=600s"));
+                    assert!(!arguments.iter().any(|arg| arg.contains("rch-rsync-%C")));
+                }
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn owned_offload_transport_is_not_lent_to_another_worker() {
+        let _guard = test_guard!();
+        let worker = flavour_test_worker();
+        let pipeline = flavour_test_pipeline(RsyncFlavor::Unknown, 0);
+        let socket = "/tmp/rch-selected-control";
+        crate::hook::ssh::with_offload_ssh_arguments_for_test(
+            worker.clone(),
+            ["-S", socket, "-o", "ProxyCommand=false"]
+                .map(std::ffi::OsString::from)
+                .to_vec(),
+            async {
+                for field in ["id", "host", "user", "identity", "platform"] {
+                    let mut other = worker.clone();
+                    match field {
+                        "id" => other.id = WorkerId::new("other-worker"),
+                        "host" => other.host = "other.example".into(),
+                        "user" => other.user = "other-user".into(),
+                        "identity" => other.identity_file = "/other/key".into(),
+                        "platform" => other.tags = vec!["os:windows".into()],
+                        _ => unreachable!(),
+                    }
+                    for arguments in [
+                        command_args(&pipeline.worker_ssh_command(&other, &["sh", "-s"])),
+                        shell_words::split(&pipeline.build_rsync_ssh_command(&other)).unwrap(),
+                    ] {
+                        assert!(!arguments.iter().any(|arg| arg == "-S"), "{field}");
+                        assert!(!arguments.iter().any(|arg| arg == socket), "{field}");
+                        assert!(
+                            !arguments.iter().any(|arg| arg == "ProxyCommand=false"),
+                            "{field}"
+                        );
+                    }
+                }
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn owned_offload_transport_cannot_override_recovery_ssh() {
+        let _guard = test_guard!();
+        let worker = flavour_test_worker();
+        let mut pipeline = flavour_test_pipeline(RsyncFlavor::Unknown, 0);
+        pipeline.ssh_options.control_master = true;
+        pipeline.ssh_options.control_persist_idle = Some(Duration::from_secs(600));
+        let socket = "/tmp/rch-selected-control";
+        crate::hook::ssh::with_offload_ssh_arguments_for_test(
+            worker.clone(),
+            [
+                "-S",
+                socket,
+                "-o",
+                "ProxyCommand=false",
+                "-o",
+                "ForkAfterAuthentication=no",
+            ]
+            .map(std::ffi::OsString::from)
+            .to_vec(),
+            async {
+                for can_disable_background in [false, true] {
+                    crate::commands::jobs::run_automatic_recovery(
+                        can_disable_background,
+                        std::future::pending::<()>(),
+                        async {
+                            for arguments in [
+                                command_args(&pipeline.worker_ssh_command(&worker, &["sh", "-s"])),
+                                shell_words::split(&pipeline.build_rsync_ssh_command(&worker))
+                                    .unwrap(),
+                            ] {
+                                assert!(!arguments.iter().any(|arg| arg == "-S"));
+                                assert!(!arguments.iter().any(|arg| arg == socket));
+                                assert!(!arguments.iter().any(|arg| arg == "ProxyCommand=false"));
+                                for required in [
+                                    "ConnectionAttempts=1",
+                                    "ControlMaster=no",
+                                    "ControlPersist=no",
+                                    "ControlPath=none",
+                                ] {
+                                    assert!(arguments.iter().any(|arg| arg == required));
+                                }
+                                assert_eq!(
+                                    arguments
+                                        .iter()
+                                        .any(|arg| arg == "ForkAfterAuthentication=no"),
+                                    can_disable_background
+                                );
+                                assert!(!arguments.iter().any(|arg| arg == "ControlMaster=auto"));
+                                assert!(!arguments.iter().any(|arg| arg == "ControlPersist=600s"));
+                            }
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+            },
+        )
+        .await;
     }
 
     #[test]

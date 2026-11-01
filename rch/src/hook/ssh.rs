@@ -35,6 +35,155 @@
 use super::*;
 use crate::transfer::WorkerPlatform;
 
+/// A socket selects its already authenticated endpoint, regardless of the host
+/// later supplied to `ssh`. Never lend it to a different worker configuration.
+struct OffloadSshTransport {
+    worker: WorkerConfig,
+    arguments: Vec<std::ffi::OsString>,
+    shell_arguments: String,
+}
+
+impl OffloadSshTransport {
+    fn matches(&self, worker: &WorkerConfig) -> bool {
+        self.worker.id == worker.id
+            && self.worker.host == worker.host
+            && self.worker.user == worker.user
+            && self.worker.identity_file == worker.identity_file
+            && !WorkerPlatform::from_worker(worker).is_windows()
+    }
+}
+
+tokio::task_local! {
+    /// Scoped to one complete dispatch, including its preparation cleanup.
+    /// Spawned tasks drain existing pipes; they do not inherit this capability.
+    static OFFLOAD_SSH_TRANSPORT: Option<OffloadSshTransport>;
+}
+
+/// Reuse one supervised foreground connection for an explicitly opted-in Unix
+/// dispatch. The client and active-use guard outlive every control/transfer/build
+/// channel and the dispatch's cancellation cleanup. No persistent background
+/// master is created, and a lost socket cannot silently redial or replay work.
+pub(super) async fn with_owned_offload_ssh<T>(
+    worker: WorkerConfig,
+    transfer: &TransferConfig,
+    operation: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    if !transfer
+        .ssh_control_persist_secs
+        .is_some_and(|secs| secs > 0)
+        || WorkerPlatform::from_worker(&worker).is_windows()
+        || crate::transfer::use_mock_transport(&worker)
+        || !crate::commands::jobs::automatic_recovery_ssh_options().is_empty()
+    {
+        return OFFLOAD_SSH_TRANSPORT.scope(None, operation).await;
+    }
+    let options = rch_common::ssh::SshOptions {
+        control_master: true,
+        control_persist_idle: transfer.ssh_control_persist_secs.map(Duration::from_secs),
+        server_alive_interval: Some(Duration::from_secs(
+            transfer.ssh_server_alive_interval_secs.unwrap_or(15),
+        )),
+        ..Default::default()
+    };
+    let mut client = rch_common::ssh::SshClient::new(worker.clone(), options);
+    client
+        .connect()
+        .await
+        .context("connect owned offload SSH transport")?;
+    let transport = client.external_transport()?;
+    let context = OffloadSshTransport {
+        worker,
+        arguments: transport.arguments()?,
+        shell_arguments: transport.shell_args()?,
+    };
+    let outcome = OFFLOAD_SSH_TRANSPORT.scope(Some(context), operation).await;
+    if outcome.is_ok() {
+        transport.complete();
+    } else {
+        drop(transport);
+    }
+    // A cleanup problem cannot erase an already verified remote result. The
+    // client's supervisor still owns, signals, and reaps its foreground child.
+    if let Err(error) = client.disconnect().await {
+        warn!("Failed to finish owned offload SSH cleanup: {error:#}");
+    }
+    outcome
+}
+
+pub(crate) fn offload_ssh_transport_arguments(
+    worker: &WorkerConfig,
+) -> Option<Vec<std::ffi::OsString>> {
+    // `-S` overrides even an earlier `-o ControlPath=none`, so automatic
+    // recovery must bypass socket attachment rather than rely on option order.
+    if !crate::commands::jobs::automatic_recovery_ssh_options().is_empty() {
+        return None;
+    }
+    OFFLOAD_SSH_TRANSPORT
+        .try_with(|context| {
+            context
+                .as_ref()
+                .filter(|context| context.matches(worker))
+                .map(|context| context.arguments.clone())
+        })
+        .ok()
+        .flatten()
+}
+
+pub(crate) fn configure_offload_ssh_transport(
+    command: &mut std::process::Command,
+    worker: &WorkerConfig,
+) {
+    if let Some(arguments) = offload_ssh_transport_arguments(worker) {
+        command.args(arguments);
+    }
+}
+
+pub(crate) fn offload_ssh_transport_shell_arguments(worker: &WorkerConfig) -> Option<String> {
+    if !crate::commands::jobs::automatic_recovery_ssh_options().is_empty() {
+        return None;
+    }
+    OFFLOAD_SSH_TRANSPORT
+        .try_with(|context| {
+            context
+                .as_ref()
+                .filter(|context| context.matches(worker))
+                .map(|context| context.shell_arguments.clone())
+        })
+        .ok()
+        .flatten()
+}
+
+#[cfg(test)]
+pub(crate) async fn with_offload_ssh_arguments_for_test<F: std::future::Future>(
+    worker: WorkerConfig,
+    arguments: Vec<std::ffi::OsString>,
+    operation: F,
+) -> F::Output {
+    let shell_arguments = arguments
+        .iter()
+        .map(|argument| {
+            shell_escape::escape(
+                argument
+                    .to_str()
+                    .expect("UTF-8 SSH fixture argument")
+                    .into(),
+            )
+            .into_owned()
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    OFFLOAD_SSH_TRANSPORT
+        .scope(
+            Some(OffloadSshTransport {
+                worker,
+                arguments,
+                shell_arguments,
+            }),
+            operation,
+        )
+        .await
+}
+
 const MAX_OFFLOAD_SSH_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SOURCE_LOCK_READY_BYTES: usize = 4096;
 const MAX_SOURCE_LOCK_OUTPUT_BYTES: usize = 64 * 1024;
@@ -1820,6 +1969,7 @@ async fn spawn_source_authority_lock(
     let destination = format!("{}@{}", worker.user, worker.host);
     let mut cmd = Command::new("ssh");
     crate::commands::jobs::configure_automatic_recovery_ssh(&mut cmd);
+    configure_offload_ssh_transport(cmd.as_std_mut(), worker);
     cmd.arg("-o").arg("BatchMode=yes");
     cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
     cmd.arg("-o").arg("ConnectTimeout=10");
@@ -2090,6 +2240,7 @@ async fn run_offload_ssh_command_with_optional_stdin(
 
     let mut cmd = Command::new("ssh");
     crate::commands::jobs::configure_automatic_recovery_ssh(&mut cmd);
+    configure_offload_ssh_transport(cmd.as_std_mut(), worker);
     cmd.arg("-o").arg("BatchMode=yes");
     cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
     // The per-file verifier after the rsync barrier also requires clean stderr.
@@ -2665,6 +2816,115 @@ async fn repair_worker_mirror_ownership(
 mod tests {
     use super::*;
     use rch_common::test_guard;
+
+    #[tokio::test]
+    async fn owned_offload_socket_is_bound_to_endpoint_and_task() {
+        let worker = WorkerConfig {
+            id: WorkerId::new("selected-worker"),
+            host: "selected.invalid".into(),
+            user: "builder".into(),
+            identity_file: "/selected/key".into(),
+            ..WorkerConfig::default()
+        };
+        let arguments = ["-S", "/selected/control socket", "-o", "ProxyCommand=false"]
+            .map(std::ffi::OsString::from)
+            .to_vec();
+        assert!(offload_ssh_transport_arguments(&worker).is_none());
+        with_offload_ssh_arguments_for_test(worker.clone(), arguments.clone(), async {
+            assert_eq!(
+                offload_ssh_transport_arguments(&worker),
+                Some(arguments.clone())
+            );
+            for changed in ["id", "host", "user", "identity", "platform"] {
+                let mut other = worker.clone();
+                match changed {
+                    "id" => other.id = WorkerId::new("different-worker"),
+                    "host" => other.host = "other.invalid".into(),
+                    "user" => other.user = "other-user".into(),
+                    "identity" => other.identity_file = "/other/key".into(),
+                    "platform" => other.tags = vec!["os:windows".into()],
+                    _ => unreachable!(),
+                }
+                assert!(
+                    offload_ssh_transport_arguments(&other).is_none(),
+                    "{changed}"
+                );
+            }
+            let child_worker = worker.clone();
+            assert!(
+                tokio::spawn(
+                    async move { offload_ssh_transport_arguments(&child_worker).is_none() }
+                )
+                .await
+                .unwrap()
+            );
+            assert_eq!(
+                offload_ssh_transport_arguments(&worker),
+                Some(arguments.clone())
+            );
+        })
+        .await;
+        assert!(offload_ssh_transport_arguments(&worker).is_none());
+    }
+
+    #[tokio::test]
+    async fn owned_offload_socket_never_overrides_automatic_recovery() {
+        let worker = WorkerConfig::default();
+        let arguments = ["-S", "/selected/control", "-o", "ProxyCommand=false"]
+            .map(std::ffi::OsString::from)
+            .to_vec();
+        with_offload_ssh_arguments_for_test(worker.clone(), arguments.clone(), async {
+            for can_disable_background in [false, true] {
+                crate::commands::jobs::run_automatic_recovery(
+                    can_disable_background,
+                    std::future::pending::<()>(),
+                    async {
+                        assert!(offload_ssh_transport_arguments(&worker).is_none());
+                        let mut command = std::process::Command::new("ssh");
+                        configure_offload_ssh_transport(&mut command, &worker);
+                        assert_eq!(command.get_args().count(), 0);
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            assert_eq!(offload_ssh_transport_arguments(&worker), Some(arguments));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn owned_offload_reuse_requires_positive_opt_in_and_unix_worker() {
+        let worker = WorkerConfig {
+            host: "must-not-connect.invalid".into(),
+            ..WorkerConfig::default()
+        };
+        for setting in [None, Some(0)] {
+            let transfer = TransferConfig {
+                ssh_control_persist_secs: setting,
+                ..TransferConfig::default()
+            };
+            let value = with_owned_offload_ssh(worker.clone(), &transfer, async {
+                assert!(offload_ssh_transport_arguments(&worker).is_none());
+                Ok(42)
+            })
+            .await
+            .unwrap();
+            assert_eq!(value, 42);
+        }
+        let mut windows = worker;
+        windows.tags = vec!["os:windows".into()];
+        let transfer = TransferConfig {
+            ssh_control_persist_secs: Some(60),
+            ..TransferConfig::default()
+        };
+        with_owned_offload_ssh(windows.clone(), &transfer, async {
+            assert!(offload_ssh_transport_arguments(&windows).is_none());
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
 
     #[test]
     fn claim_write_failure_is_a_storage_fault_on_the_registry_filesystem() {

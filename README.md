@@ -775,6 +775,13 @@ remote_base = "/data/tmp/rch"
 # Explicit rsync binary. Unset lets RCH prefer a modern (3.x) rsync over the
 # stock macOS openrsync automatically; RCH_RSYNC_BIN overrides this.
 # rsync_bin = "/opt/homebrew/bin/rsync"
+# Opt in to one supervised SSH connection throughout a Unix dispatch, shared
+# by preflight, source locks, rsync, verification, execution, and retrieval.
+# The foreground master is reaped when the dispatch and its cleanup finish;
+# it does not leave a background ControlPersist process between invocations.
+# Unset or zero keeps the existing one-shot exec paths. Windows workers and
+# automatic recovery do not use this dispatch connection.
+# ssh_control_persist_secs = 60
 adaptive_compression = true
 verify_artifacts = false
 max_transfer_mb = 2048

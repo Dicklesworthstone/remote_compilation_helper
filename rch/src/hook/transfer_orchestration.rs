@@ -690,60 +690,71 @@ pub(super) async fn execute_remote_compilation(
     // `None` keeps pooled stores inside the project mirror.
     pooled_target_store_base: Option<&str>,
 ) -> anyhow::Result<RemoteExecutionResult> {
-    // The pipeline's state machine is large; held inline, debug builds moved
-    // it across a 2 MiB thread stack and overflowed (bd-uz82c). Keep it on
-    // the heap so every caller's future stays small.
-    let outcome = Box::pin(execute_remote_compilation_inner(
-        worker,
-        command,
-        transfer_config,
-        env_allowlist,
-        forward_cargo_profile_settings,
-        forwarded_cargo_target_dir,
-        compilation_config,
-        toolchain,
-        kind,
-        reporter,
-        socket_path,
-        color_mode,
-        build_id,
-        local_wrapper_id,
-        durable_lease,
-        topology_policy,
-        clean_overlay,
-        source_content_receipt,
-        result_dirs,
-        layer0_env,
-        pooled_target_prune_idle_hours,
-        pooled_target_store_base,
-    ))
-    .await;
-    // The inner future has dropped every local holder before cleanup tries to
-    // reattach it. Cancellation drains remote mutation descriptors first; once
-    // execution may have started, its exact completion must resolve ownership.
-    if outcome.is_err()
-        && let Some(writer) = durable_lease.filter(|writer| writer.snapshot().recovery.is_some())
-    {
-        match recovery::cancel_preparation(writer).await {
-            Ok(true) => {}
-            Ok(false) => {
-                return outcome
-                    .map_err(|error| error.context(crate::transfer::RemoteExecutionUnconfirmed));
-            }
-            Err(cleanup) => {
-                let detail = format!(
-                    "source ownership remains recoverable with rch jobs recover {}: {cleanup:#}",
-                    writer.snapshot().identity.local_wrapper_id
-                );
-                return outcome.map_err(|error| {
-                    error
-                        .context(detail)
-                        .context(crate::transfer::RemoteExecutionUnconfirmed)
-                });
+    let connection_config = transfer_config.clone();
+    let operation = async {
+        // The pipeline's state machine is large; held inline, debug builds moved
+        // it across a 2 MiB thread stack and overflowed (bd-uz82c). Keep it on
+        // the heap so every caller's future stays small.
+        let outcome = Box::pin(execute_remote_compilation_inner(
+            worker,
+            command,
+            transfer_config,
+            env_allowlist,
+            forward_cargo_profile_settings,
+            forwarded_cargo_target_dir,
+            compilation_config,
+            toolchain,
+            kind,
+            reporter,
+            socket_path,
+            color_mode,
+            build_id,
+            local_wrapper_id,
+            durable_lease,
+            topology_policy,
+            clean_overlay,
+            source_content_receipt,
+            result_dirs,
+            layer0_env,
+            pooled_target_prune_idle_hours,
+            pooled_target_store_base,
+        ))
+        .await;
+        // The inner future has dropped every local holder before cleanup tries to
+        // reattach it. Cancellation drains remote mutation descriptors first; once
+        // execution may have started, its exact completion must resolve ownership.
+        if outcome.is_err()
+            && let Some(writer) =
+                durable_lease.filter(|writer| writer.snapshot().recovery.is_some())
+        {
+            match recovery::cancel_preparation(writer).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return outcome.map_err(|error| {
+                        error.context(crate::transfer::RemoteExecutionUnconfirmed)
+                    });
+                }
+                Err(cleanup) => {
+                    let detail = format!(
+                        "source ownership remains recoverable with rch jobs recover {}: {cleanup:#}",
+                        writer.snapshot().identity.local_wrapper_id
+                    );
+                    return outcome.map_err(|error| {
+                        error
+                            .context(detail)
+                            .context(crate::transfer::RemoteExecutionUnconfirmed)
+                    });
+                }
             }
         }
-    }
-    outcome
+        outcome
+    };
+    super::ssh::with_owned_offload_ssh(
+        selected_worker_to_config(worker),
+        &connection_config,
+        operation,
+    )
+    .await
 }
 
 /// Source upload and ownership retain the whole selected Git root. Only after

@@ -432,6 +432,110 @@ struct OwnedSshSession {
     session: Session,
     process: OwnedSshProcess,
     _control_dir: Arc<tempfile::TempDir>,
+    can_disable_background: bool,
+}
+
+/// Keep one authenticated SSH master active while external SSH or rsync
+/// subprocesses use its control socket.
+///
+/// The owning [`SshClient`] must also remain alive. This handle neither starts
+/// subprocesses nor retries commands. Call [`Self::complete`] only after every
+/// channel has completed and been reaped; abandoning the handle retires the
+/// master after its other active users finish, just like a cancelled command.
+#[must_use = "hold the transport until its external subprocesses finish"]
+pub struct OwnedSshTransport {
+    socket: PathBuf,
+    can_disable_background: bool,
+    activity: SshProcessUse,
+    _control_dir: Arc<tempfile::TempDir>,
+    pool_admission: Option<PoolWorkerAdmission>,
+}
+
+impl OwnedSshTransport {
+    /// Arguments for attaching to this exact ready master, without opening a
+    /// replacement network connection if the master disappears.
+    ///
+    /// Append these before every other SSH option and before the destination.
+    /// OpenSSH accepts the first ProxyCommand/ProxyJump setting it encounters;
+    /// the failed proxy must therefore precede caller and configuration values.
+    /// The caller must separately check that its worker matches the client
+    /// which issued this handle: a control socket selects the endpoint.
+    ///
+    /// # Errors
+    /// Returns an error after transport draining, disconnection, or pool
+    /// revocation. Previously returned arguments still refuse direct dialing.
+    pub fn arguments(&self) -> Result<Vec<OsString>> {
+        anyhow::ensure!(
+            self.pool_admission
+                .as_ref()
+                .is_none_or(PoolWorkerAdmission::is_current),
+            "SSH worker pool admission was revoked"
+        );
+        let state = self.activity.state.borrow();
+        anyhow::ensure!(
+            !state.draining && !state.stopping && state.outcome.is_none(),
+            "SSH connection is closing or disconnected"
+        );
+        // `-S` names the existing private socket. Unlike a discard port or a
+        // dummy hostname, a failed ProxyCommand also prevents a fallback dial
+        // when callers append the real worker destination and port.
+        let mut arguments = vec![OsString::from("-S"), self.socket.as_os_str().to_owned()];
+        for option in [
+            "ControlMaster=no",
+            "ControlPersist=no",
+            "ProxyCommand=false",
+            "ConnectionAttempts=1",
+            "BatchMode=yes",
+        ] {
+            arguments.push(OsString::from("-o"));
+            arguments.push(OsString::from(option));
+        }
+        if self.can_disable_background {
+            arguments.push(OsString::from("-o"));
+            arguments.push(OsString::from("ForkAfterAuthentication=no"));
+        }
+        arguments.push(OsString::from("-T"));
+        Ok(arguments)
+    }
+
+    /// Configure an otherwise empty SSH command to use this transport.
+    ///
+    /// # Errors
+    /// Returns an error if arguments were already appended, or the transport
+    /// is no longer active. The command is unchanged on either error.
+    pub fn configure(&self, command: &mut std::process::Command) -> Result<()> {
+        anyhow::ensure!(
+            command.get_args().len() == 0,
+            "SSH transport must be configured before other arguments"
+        );
+        command.args(self.arguments()?);
+        Ok(())
+    }
+
+    /// Shell-quoted attachment arguments for rsync's SSH command string.
+    ///
+    /// # Errors
+    /// Returns an error for an inactive transport or arguments which cannot
+    /// be represented safely in the existing UTF-8 shell transport.
+    pub fn shell_args(&self) -> Result<String> {
+        self.arguments()?
+            .iter()
+            .map(|argument| {
+                let value = argument
+                    .to_str()
+                    .context("SSH transport argument is not UTF-8")?;
+                shell_escape_value(value).context("SSH transport argument is not shell-safe")
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(|arguments| arguments.join(" "))
+    }
+
+    /// Release the dispatch's active-use guard after all its channels finish.
+    /// An ordinary nonzero remote exit is complete; an unconfirmed transport
+    /// failure must instead drop this handle without calling this method.
+    pub fn complete(self) {
+        self.activity.complete();
+    }
 }
 
 fn is_expected_health_check_output(stdout: &str) -> bool {
@@ -574,6 +678,28 @@ impl SshClient {
                 .session
                 .as_ref()
                 .is_some_and(|session| session.process.is_running())
+    }
+
+    /// Borrow this ready master's transport for externally owned subprocesses.
+    /// Keep this client alive until the returned handle is completed or dropped.
+    ///
+    /// # Errors
+    /// Returns an error when disconnected, draining, administratively revoked,
+    /// or configured for a Windows worker which requires independent sessions.
+    pub fn external_transport(&self) -> Result<OwnedSshTransport> {
+        anyhow::ensure!(
+            !prefers_system_ssh(&self.config),
+            "Windows workers require independent SSH sessions"
+        );
+        anyhow::ensure!(self.is_connected(), "Not connected to worker");
+        let session = self.session.as_ref().context("Not connected to worker")?;
+        Ok(OwnedSshTransport {
+            socket: session.session.control_socket().to_path_buf(),
+            can_disable_background: session.can_disable_background,
+            activity: session.process.begin_use()?,
+            _control_dir: session._control_dir.clone(),
+            pool_admission: self.pool_admission.clone(),
+        })
     }
 
     #[cfg(test)]
@@ -724,6 +850,7 @@ impl SshClient {
             session: Session::resume(socket.into_boxed_path(), Some(log.into_boxed_path())),
             process,
             _control_dir: control_dir,
+            can_disable_background,
         })
     }
 
@@ -3076,6 +3203,7 @@ mod tests {
 #[cfg(test)]
 mod ssh_connection_tests {
     use super::*;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
 
     struct FakeSsh {
@@ -3219,6 +3347,250 @@ exec sleep 30
             })
             .await
             .expect("owned SSH children must be killed, reaped, and release their sockets");
+        }
+    }
+
+    #[tokio::test]
+    async fn external_transport_attaches_to_ready_master_with_literal_shell_arguments() {
+        for (mode, foreground_option) in [("ready", true), ("old-client", false)] {
+            let fake = FakeSsh::new(mode);
+            let directory = tempfile::Builder::new()
+                .prefix("rch quoted ' control ")
+                .tempdir()
+                .unwrap();
+            let mut client = fake.client(Duration::from_secs(3), true);
+            assert!(client.external_transport().is_err());
+            client
+                .connect_using(&fake.program, Some(directory.path()))
+                .await
+                .unwrap();
+            let transport = client.external_transport().unwrap();
+            let arguments = transport.arguments().unwrap();
+            assert_eq!(arguments[0], "-S");
+            assert_eq!(
+                arguments[1].as_os_str(),
+                client
+                    .session
+                    .as_ref()
+                    .unwrap()
+                    .session
+                    .control_socket()
+                    .as_os_str()
+            );
+            for option in [
+                "ControlMaster=no",
+                "ControlPersist=no",
+                "ProxyCommand=false",
+                "ConnectionAttempts=1",
+                "BatchMode=yes",
+            ] {
+                assert!(arguments.windows(2).any(|pair| pair == ["-o", option]));
+            }
+            assert_eq!(
+                arguments
+                    .iter()
+                    .any(|argument| argument == "ForkAfterAuthentication=no"),
+                foreground_option
+            );
+            assert!(arguments.iter().all(|argument| {
+                !matches!(argument.to_str(), Some("-f" | "-M" | "-N"))
+                    && !argument.to_string_lossy().starts_with("IgnoreUnknown=")
+            }));
+            let mut command = std::process::Command::new("ssh");
+            transport.configure(&mut command).unwrap();
+            let expected_arguments = arguments
+                .iter()
+                .map(OsString::as_os_str)
+                .collect::<Vec<_>>();
+            assert_eq!(command.get_args().collect::<Vec<_>>(), expected_arguments);
+
+            let mut conflicting = std::process::Command::new("ssh");
+            conflicting.args(["-o", "ProxyJump=another-worker"]);
+            assert!(transport.configure(&mut conflicting).is_err());
+            assert_eq!(
+                conflicting.get_args().collect::<Vec<_>>(),
+                ["-o", "ProxyJump=another-worker"]
+            );
+
+            // Exercise the actual POSIX shell parser on rsync's nested command
+            // string, including a private socket path with spaces and a quote.
+            let output = tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "set -- {}; printf '%s\\0' \"$@\"",
+                    transport.shell_args().unwrap()
+                ))
+                .output()
+                .await
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(output.stderr.is_empty(), "{output:?}");
+            assert_eq!(output.stdout.last(), Some(&0));
+            let roundtrip = output.stdout[..output.stdout.len() - 1]
+                .split(|byte| *byte == 0)
+                .map(std::ffi::OsStr::from_bytes)
+                .collect::<Vec<_>>();
+            assert_eq!(roundtrip, expected_arguments);
+
+            transport.complete();
+            client.disconnect().await.unwrap();
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+            fake.assert_reaped().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn external_transport_holds_activity_until_explicit_completion() {
+        let fake = FakeSsh::new("ready");
+        let mut client = fake.client(Duration::from_secs(3), true);
+        client.options.control_persist_idle = Some(Duration::from_secs(1));
+        fake.connect(&mut client).await.unwrap();
+        let transport = client.external_transport().unwrap();
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        assert!(client.is_connected());
+        assert!(transport.arguments().is_ok());
+        transport.complete();
+        let process = &client.session.as_ref().unwrap().process;
+        let status = process
+            .wait_until(Instant::now() + Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert!(!status.success());
+        assert!(!client.is_connected());
+        assert!(client.external_transport().is_err());
+        client.disconnect().await.unwrap();
+        fake.assert_reaped().await;
+    }
+
+    #[tokio::test]
+    async fn abandoned_external_transport_drains_after_other_users_finish() {
+        let fake = FakeSsh::new("ready");
+        let mut client = fake.client(Duration::from_secs(3), true);
+        fake.connect(&mut client).await.unwrap();
+        let abandoned = client.external_transport().unwrap();
+        let active = client.external_transport().unwrap();
+        drop(abandoned);
+        assert!(active.arguments().is_err());
+        assert!(client.external_transport().is_err());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            client
+                .session
+                .as_ref()
+                .unwrap()
+                .process
+                .state
+                .borrow()
+                .outcome
+                .is_none(),
+            "abandoning one dispatch must not stop another active user"
+        );
+        active.complete();
+        let status = client
+            .session
+            .as_ref()
+            .unwrap()
+            .process
+            .wait_until(Instant::now() + Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert!(!status.success());
+        client.disconnect().await.unwrap();
+        fake.assert_reaped().await;
+    }
+
+    #[tokio::test]
+    async fn external_transport_rejects_windows_and_revoked_pool_generation() {
+        let fake = FakeSsh::new("ready");
+        let mut client = fake.client(Duration::from_secs(3), true);
+        let control = PoolWorkerControl::new();
+        client.pool_admission = Some(control.admission());
+        fake.connect(&mut client).await.unwrap();
+        client.config.tags = vec![crate::types::os_tag("windows")];
+        assert!(client.external_transport().is_err());
+        client.config.tags = vec![crate::types::os_tag("linux")];
+        let transport = client.external_transport().unwrap();
+        control.policy.send_modify(|policy| {
+            policy.enabled = false;
+            policy.generation += 1;
+        });
+        control.policy.send_modify(|policy| {
+            policy.enabled = true;
+            policy.generation += 1;
+        });
+        assert!(transport.arguments().is_err());
+        assert!(transport.shell_args().is_err());
+        let mut command = std::process::Command::new("ssh");
+        assert!(transport.configure(&mut command).is_err());
+        assert_eq!(command.get_args().len(), 0);
+        assert!(client.external_transport().is_err());
+        let status = client
+            .session
+            .as_ref()
+            .unwrap()
+            .process
+            .wait_until(Instant::now() + Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert!(!status.success());
+        drop(transport);
+        client.disconnect().await.unwrap();
+        fake.assert_reaped().await;
+    }
+
+    #[tokio::test]
+    async fn external_transport_stale_arguments_never_run_configured_proxy() {
+        let foreground = ssh_can_disable_background(Path::new("ssh"), Duration::from_secs(3))
+            .await
+            .unwrap();
+        let fake = FakeSsh::new(if foreground { "ready" } else { "old-client" });
+        let mut client = fake.client(Duration::from_secs(3), true);
+        fake.connect(&mut client).await.unwrap();
+        let transport = client.external_transport().unwrap();
+        let arguments = transport.arguments().unwrap();
+        let socket = transport.socket.clone();
+        client.disconnect().await.unwrap();
+        assert!(transport.arguments().is_err());
+        assert!(socket.parent().unwrap().is_dir());
+        drop(transport);
+        assert!(!socket.parent().unwrap().exists());
+        fake.assert_reaped().await;
+
+        // The configured proxy is an observable stand-in for a new dial.
+        // First prove real OpenSSH executes it without the attachment policy,
+        // then reuse the captured arguments after the master has disappeared.
+        let config = fake.directory.path().join("client-config");
+        for guarded in [false, true] {
+            let marker = fake.directory.path().join(format!("proxy-{guarded}"));
+            let proxy = format!(
+                "printf attempted > {}; exit 73",
+                shell_escape_value(marker.to_str().unwrap()).unwrap()
+            );
+            std::fs::write(
+                &config,
+                format!(
+                    "Host *\n  ProxyCommand sh -c {}\n  ControlMaster auto\n  ControlPersist 60\n",
+                    shell_escape_value(&proxy).unwrap()
+                ),
+            )
+            .unwrap();
+            let mut command = tokio::process::Command::new("ssh");
+            if guarded {
+                command.args(&arguments);
+            }
+            command
+                .arg("-F")
+                .arg(&config)
+                .args(["-o", "BatchMode=yes", "rch-no-redial.invalid", "exit 0"])
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true);
+            let output = tokio::time::timeout(Duration::from_secs(3), command.output())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(255), "{output:?}");
+            assert!(output.stdout.is_empty(), "{output:?}");
+            assert_eq!(marker.exists(), !guarded, "{output:?}");
         }
     }
 

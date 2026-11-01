@@ -3053,9 +3053,14 @@ pub struct TransferConfig {
     /// When unset, build transfers use 15 seconds. Zero defers to OpenSSH configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_server_alive_interval_secs: Option<u64>,
-    /// SSH ControlPersist idle timeout in seconds (`ssh -o ControlPersist=<N>s`).
+    /// Optional SSH connection-reuse idle window in seconds.
     ///
-    /// - Unset preserves OpenSSH defaults (ControlPersist enabled by default via mux).
+    /// Positive values also enable one owned foreground connection across a
+    /// Unix exec dispatch's control, transfer and execution channels. The active
+    /// dispatch pins that connection until cleanup, then reaps it; no detached
+    /// ControlPersist process is left behind. Windows and automatic recovery
+    /// retain their one-shot transports.
+    /// - Unset does not request connection reuse.
     /// - `0` disables persistence (`ControlPersist=no`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_control_persist_secs: Option<u64>,
