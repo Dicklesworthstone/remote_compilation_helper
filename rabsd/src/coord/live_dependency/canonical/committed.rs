@@ -19,7 +19,7 @@ use rabs_cas::metadata_store::digest_key;
 use rabs_cas::publication::ProvisionalAncestorRef;
 use rabs_key::live_dependency::workspace_dependency_cache::{
     CommittedDependencyPolicy, CommittedWorkspaceDependency,
-    committed_dependency_descriptor_policy, validate_committed_workspace_dependencies,
+    committed_dependency_descriptor_policy, validate_committed_dependency_inventory,
 };
 use rabs_key::live_dependency::{DependencySourceKind, is_empty_metadata_artifact};
 use rabs_key::typed_digest::{DOMAIN_ACTION_KEY, DOMAIN_DESCRIPTOR};
@@ -691,7 +691,8 @@ impl CanonicalPaths {
                 dependencies.push(witness.dependency.clone());
             }
         }
-        validate_committed_workspace_dependencies(
+        validate_committed_dependency_inventory(
+            consumer_policy,
             &self.dependency_facts(&observed.directories)?,
             &dependencies,
         )
@@ -751,7 +752,8 @@ impl CanonicalPaths {
                     }
                 }
             }
-            DependencySourceKind::WorkspaceExecutionOnly => return Ok(()),
+            DependencySourceKind::WorkspaceExecutionOnly
+            | DependencySourceKind::WorkspaceTerminalMetadata => return Ok(()),
         };
         if request
             .canonical_paths

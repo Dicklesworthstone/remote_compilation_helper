@@ -29,6 +29,8 @@ const IMMUTABLE_DAG_RLIB_CLASS: &str = "rustc-immutable-committed-dag-rlib-v1";
 const IMMUTABLE_DAG_METADATA_CLASS: &str = "rustc-immutable-committed-dag-metadata-v1";
 const WORKSPACE_DAG_RLIB_CLASS: &str = "rustc-workspace-committed-dag-rlib-v1";
 const WORKSPACE_DAG_METADATA_CLASS: &str = "rustc-workspace-committed-dag-metadata-v1";
+const WORKSPACE_TERMINAL_LEAF_METADATA_CLASS: &str = "rustc-workspace-terminal-leaf-metadata-v1";
+const WORKSPACE_TERMINAL_METADATA_CLASS: &str = "rustc-workspace-terminal-metadata-v1";
 
 const CLASS_SQL: &str = r#"
 SELECT decision FROM decision_receipts
@@ -119,6 +121,12 @@ pub(super) fn refusal(
             }
             [SqlValue::Text(class)] if class == WORKSPACE_DAG_METADATA_CLASS => {
                 WORKSPACE_DAG_METADATA_CLASS
+            }
+            [SqlValue::Text(class)] if class == WORKSPACE_TERMINAL_LEAF_METADATA_CLASS => {
+                WORKSPACE_TERMINAL_LEAF_METADATA_CLASS
+            }
+            [SqlValue::Text(class)] if class == WORKSPACE_TERMINAL_METADATA_CLASS => {
+                WORKSPACE_TERMINAL_METADATA_CLASS
             }
             // A caller's LowRiskRegistry flag cannot overrule a recorded
             // private/unknown class, even if its per-action evidence passes.
@@ -567,6 +575,14 @@ mod tests {
                 WORKSPACE_DAG_METADATA_CLASS,
                 ActionClassRisk::WorkspaceDagMetadata,
             ),
+            (
+                WORKSPACE_TERMINAL_LEAF_METADATA_CLASS,
+                ActionClassRisk::WorkspaceTerminalLeafMetadata,
+            ),
+            (
+                WORKSPACE_TERMINAL_METADATA_CLASS,
+                ActionClassRisk::WorkspaceTerminalMetadata,
+            ),
         ] {
             let mut store =
                 SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
@@ -586,6 +602,8 @@ mod tests {
                 IMMUTABLE_DAG_METADATA_CLASS,
                 WORKSPACE_DAG_RLIB_CLASS,
                 WORKSPACE_DAG_METADATA_CLASS,
+                WORKSPACE_TERMINAL_LEAF_METADATA_CLASS,
+                WORKSPACE_TERMINAL_METADATA_CLASS,
             ]
             .into_iter()
             .filter(|other_class| *other_class != class)

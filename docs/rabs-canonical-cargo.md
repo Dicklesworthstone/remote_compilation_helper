@@ -1577,10 +1577,59 @@ and replay even when the consumer already has passing comparisons.
 Metadata results earn their own independent samples and persistent class
 quarantine. A qualified hit restores `.rmeta`, dep-info and diagnostics through
 the existing verified installer. A chain of ordinary library checks can therefore
-reuse committed metadata while the final binary or test check retains its
-existing execution policy. Generated/native inputs, project executors, harness
+reuse committed metadata. Eligible final binary and test checks use the separate
+terminal metadata classes below. Generated/native inputs, project executors, harness
 outputs, incremental state and archive output remain outside this metadata
 class. The selected Cargo graph must still contain no project executors.
+
+### Cache binary, example and harness metadata checks
+
+Canonical `check` requests can qualify selected binary, example, standard test
+and benchmark harnesses, and custom `harness=false` test/benchmark roots for
+terminal metadata caching:
+
+```sh
+cargo rabs --rabs-canonical-local ./canonical-compile.json -- check --bin app
+cargo rabs --rabs-canonical-local ./canonical-compile.json -- check --example demo
+cargo rabs --rabs-canonical-local ./canonical-compile.json -- check --test integration
+```
+
+These actions cache compiler metadata, dep-info and diagnostics. They require
+the retained Cargo-selected source, crate type, target, features and exact
+harness invocation in a graph without project executors. Their keys retain the
+complete captured workspace and directory listings, exact compiler environment
+and arguments, output declarations, toolchain and measured `ClosedMetadata`
+runtime. Executable linking, test execution, generated/native inputs and
+incremental state remain outside these classes.
+
+Two independent policies distinguish the source of input authority:
+
+| Terminal class | Key epoch | Required input proof |
+| --- | --- | --- |
+| `rustc-workspace-terminal-leaf-metadata-v1` | 14 | Every retained candidate directory is observed and empty; durable producer ancestry stays empty. |
+| `rustc-workspace-terminal-metadata-v1` | 15 | Every loadable Rust candidate has an exact committed installation witness; the complete nonempty workspace/immutable dependency ancestry remains valid. Exact empty search metadata remains keyed and materialized without producer authority. |
+
+Each class earns its own independent comparison samples and retains separate
+quarantine and serving gates. Library samples cannot qualify a terminal action.
+A missing, changed or quarantined producer blocks the committed terminal class;
+missing ancestry cannot turn it into the dependency-free class.
+
+Rustc ordinarily emits an empty `.rmeta` for these terminal checks. Both worker
+completion and a qualified cache hit install that exact declared file through
+complete-result delivery and replay the validated compiler transcript. Terminal
+results never grant early metadata readiness or become reusable dependency
+producers, including when a compiler emits nonempty terminal metadata. Existing
+library and producer-witness nonempty checks are unchanged.
+
+Broad selections such as `check --all-targets` can leave earlier terminal
+outputs visible in later units' search directories. Exact empty metadata stays
+in the keyed and materialized input inventory without becoming a producer.
+The committed terminal class can retain those files alongside its independently
+verified loadable dependencies; explicit empty externs still refuse. The leaf
+class requires literally empty candidate directories, so a terminal root with
+only earlier empty candidates continues with fresh execution. Selecting an
+individual terminal root allows its independently qualified leaf action to
+replay in a fresh Cargo target.
 
 ### Cache workspace libraries using qualified immutable dependency leaves
 

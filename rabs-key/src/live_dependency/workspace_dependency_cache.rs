@@ -144,6 +144,26 @@ pub(super) const MIXED_METADATA_ISOLATION_PROFILE: &str = "canonical-workspace-c
     authenticated drained receipt and independent mixed-class samples, release \
     and private installation gates";
 
+pub(super) const TERMINAL_METADATA_ISOLATION_PROFILE: &str = "canonical-workspace-terminal-metadata-v1: \
+    driver-retained exact Cargo-selected binary, example, standard test or custom \
+    harness check root in a graph without project executors; explicitly negotiated \
+    canonical-workspace-closed-metadata-v1 ClosedMetadata namespace without procfs \
+    or entropy devices; complete immutable workspace files and every directory \
+    listing, exact argv including crate-type presence, test/cfg flags, cwd and \
+    complete environment; complete retained toolchain and measured ELF runtime; \
+    exact ordered Rust candidate inventory; leaf policy requires no candidates, \
+    including empty search metadata; committed policy requires nonempty loadable \
+    producer ancestry, every loadable candidate's operation-owned installation \
+    generation and exact currently admitted workspace or immutable DAG producer; \
+    exact empty search metadata remains keyed and materialized without producer \
+    authority; explicit empty externs refuse; \
+    no generated/native inputs, proc macros, incremental state, final link or \
+    test execution; exact required metadata including empty files, dep-info and \
+    diagnostic transcript; authenticated completed drained receipt, tracked-read \
+    veto, independent samples and class quarantine; whole-result installation \
+    before transcript replay; no early metadata notification or output producer \
+    witness, regardless of metadata size";
+
 /// Stable logical identity of one retained candidate and its committed producer.
 /// Physical path/generation capabilities stay outside this pure type and key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,6 +206,12 @@ pub enum CommittedDependencyPolicy {
     WorkspaceDagRlib,
     /// Workspace metadata admitting committed immutable dependency DAGs, epoch 13.
     WorkspaceDagMetadata,
+    /// Selected terminal check with an exactly empty Rust candidate inventory,
+    /// independently classified from producer-bearing checks, epoch 14.
+    WorkspaceTerminalLeafMetadata,
+    /// Selected terminal check with complete committed producer ancestry,
+    /// never a producer for another action, epoch 15.
+    WorkspaceTerminalMetadata,
 }
 
 impl CommittedDependencyPolicy {
@@ -199,6 +225,11 @@ impl CommittedDependencyPolicy {
             DependencySourceKind::WorkspaceCommittedMetadata => Some(Self::WorkspaceMetadata),
             DependencySourceKind::WorkspaceMixedRlib => Some(Self::MixedWorkspaceRlib),
             DependencySourceKind::WorkspaceMixedMetadata => Some(Self::MixedWorkspaceMetadata),
+            // The source kind requires a retained policy capability. Only that
+            // capability may select the separately qualified empty-input class.
+            DependencySourceKind::WorkspaceTerminalMetadata => {
+                Some(Self::WorkspaceTerminalMetadata)
+            }
             _ => None,
         }
     }
@@ -215,7 +246,9 @@ impl CommittedDependencyPolicy {
             Self::WorkspaceMetadata
             | Self::MixedWorkspaceMetadata
             | Self::ImmutableDagMetadata
-            | Self::WorkspaceDagMetadata => RemoteDependencyOutputClass::Metadata,
+            | Self::WorkspaceDagMetadata
+            | Self::WorkspaceTerminalLeafMetadata
+            | Self::WorkspaceTerminalMetadata => RemoteDependencyOutputClass::Metadata,
         }
     }
 
@@ -228,6 +261,9 @@ impl CommittedDependencyPolicy {
         match self {
             Self::WorkspaceRlib => validate_committed_workspace_rlib_plan(plan),
             Self::WorkspaceMetadata => validate_committed_workspace_metadata_plan(plan),
+            Self::WorkspaceTerminalLeafMetadata | Self::WorkspaceTerminalMetadata => {
+                validate_terminal_workspace_metadata_plan(plan)
+            }
             Self::MixedWorkspaceRlib
             | Self::MixedWorkspaceMetadata
             | Self::WorkspaceDagRlib
@@ -320,14 +356,91 @@ const WORKSPACE_DAG_METADATA: DagContract = DagContract {
     profile: "canonical-workspace-committed-dag-metadata-v1: selected ordinary check in an executor-free canonical Cargo graph; complete immutable workspace files and directory topology, exact argv and environment, complete retained toolchain and matched ELF runtime; explicitly negotiated canonical-workspace-closed-metadata-v1 ClosedMetadata namespace without procfs or entropy devices; every ordered loadable Rust candidate has its original operation-owned installation generation and exact committed producer action, descriptor, manifest, role and object; exact empty search metadata remains keyed and materialized without producer authority; explicit empty externs refuse; closed, mixed or DAG workspace producers plus qualified immutable leaves and committed immutable DAGs; metadata producers authorize only ProvisionalMetadata rmeta, archive producers may authorize rmeta or whole Materializable rlib; every intermediate retains its own narrower producer policy; complete H028 ancestry and current transitive serving/class safety at commit and every delivery phase; no generated/native inputs, proc macros, incremental state, archive or harness outputs, local or request-owned completion, unresolved or adopted lineage; authenticated drained capture, exact diagnostics and dep-info, separate class samples and existing release and installation gates",
 };
 
+const WORKSPACE_TERMINAL_LEAF_METADATA: DagContract = DagContract {
+    epoch: 14,
+    class: ActionClass::RustcWorkspaceCompile,
+    isolation_domain: "rabs.canonical-workspace-terminal-leaf-metadata.isolation.v1",
+    semantics_domain: "rabs.canonical-workspace-terminal-leaf-metadata.semantics.v1",
+    dependencies_domain: "rabs.canonical-workspace-terminal-leaf-metadata.dependencies.v1",
+    profile: TERMINAL_METADATA_ISOLATION_PROFILE,
+};
+const WORKSPACE_TERMINAL_METADATA: DagContract = DagContract {
+    epoch: 15,
+    class: ActionClass::RustcWorkspaceCompile,
+    isolation_domain: "rabs.canonical-workspace-terminal-metadata.isolation.v1",
+    semantics_domain: "rabs.canonical-workspace-terminal-metadata.semantics.v1",
+    dependencies_domain: "rabs.canonical-workspace-terminal-metadata.dependencies.v1",
+    profile: TERMINAL_METADATA_ISOLATION_PROFILE,
+};
+
 fn dag_contract(policy: CommittedDependencyPolicy) -> Option<&'static DagContract> {
     match policy {
         CommittedDependencyPolicy::ImmutableDagRlib => Some(&IMMUTABLE_DAG_RLIB),
         CommittedDependencyPolicy::ImmutableDagMetadata => Some(&IMMUTABLE_DAG_METADATA),
         CommittedDependencyPolicy::WorkspaceDagRlib => Some(&WORKSPACE_DAG_RLIB),
         CommittedDependencyPolicy::WorkspaceDagMetadata => Some(&WORKSPACE_DAG_METADATA),
+        CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata => {
+            Some(&WORKSPACE_TERMINAL_LEAF_METADATA)
+        }
+        CommittedDependencyPolicy::WorkspaceTerminalMetadata => Some(&WORKSPACE_TERMINAL_METADATA),
         _ => None,
     }
+}
+
+/// Refine a fresh selected terminal check without changing its invocation.
+/// The driver must separately retain the exact root/harness and either empty
+/// candidate inventories or every committed producer's installation capability.
+///
+/// # Errors
+/// A nonfresh plan, ordinary library, linking mode, or unsupported inputs.
+pub fn plan_terminal_workspace_metadata(
+    execution: &DependencyActionPlan,
+) -> Result<DependencyActionPlan, LiveRefusal> {
+    if execution.source_kind != DependencySourceKind::WorkspaceExecutionOnly {
+        return Err(LiveRefusal::Facts(
+            "terminal metadata planning requires the original fresh workspace plan".into(),
+        ));
+    }
+    let mut plan = execution.clone();
+    plan.source_kind = DependencySourceKind::WorkspaceTerminalMetadata;
+    validate_terminal_workspace_metadata_plan(&plan)?;
+    Ok(plan)
+}
+
+/// Exact terminal output boundary. Empty metadata is still a required output;
+/// no binary, test result or downstream producer is inferred from this check.
+///
+/// # Errors
+/// Wrong source class, a nonterminal or linking invocation, generated/native
+/// inputs, or a mismatch with the modeled canonical output/environment contract.
+pub fn validate_terminal_workspace_metadata_plan(
+    plan: &DependencyActionPlan,
+) -> Result<(), LiveRefusal> {
+    workspace_layout(plan)?;
+    let harness = plan
+        .invocation
+        .passthrough
+        .iter()
+        .any(|arg| arg == "--test");
+    let binary = plan.invocation.crate_types.as_slice() == ["bin"];
+    let custom_harness = plan.invocation.crate_types.is_empty()
+        && plan.invocation.cfgs.iter().any(|cfg| cfg == "test");
+    if plan.source_kind != DependencySourceKind::WorkspaceTerminalMetadata
+        || !(binary || harness || custom_harness)
+        || plan.invocation.emit.len() != 2
+        || !plan.invocation.emit.iter().any(|emit| emit == "metadata")
+        || !plan.invocation.emit.iter().any(|emit| emit == "dep-info")
+        || plan.generated_root.is_some()
+        || !plan.native_roots.is_empty()
+        || !plan.invocation.native_libs.is_empty()
+        || remote::remote_dependency_output_class(&plan.invocation)
+            != Ok(RemoteDependencyOutputClass::Metadata)
+    {
+        return Err(LiveRefusal::Facts(
+            "terminal workspace caching requires an exact binary or harness metadata check without generated or native inputs".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Refine the original fresh plan; actual driver selection and every candidate
@@ -523,6 +636,32 @@ pub fn validate_committed_workspace_dependencies(
     Ok(())
 }
 
+/// Validate retained candidate evidence under the explicit consumer policy.
+/// Only the independently keyed terminal leaf policy admits an empty inventory;
+/// every other policy keeps the existing nonempty exact-witness requirement.
+///
+/// # Errors
+/// A nonempty leaf inventory or an incomplete, reordered or unbound producer set.
+pub fn validate_committed_dependency_inventory(
+    policy: CommittedDependencyPolicy,
+    directories: &[DependencyDirectoryFact],
+    dependencies: &[CommittedWorkspaceDependency],
+) -> Result<(), LiveRefusal> {
+    if policy == CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata {
+        if !dependencies.is_empty()
+            || directories
+                .iter()
+                .any(|directory| !directory.artifacts.is_empty())
+        {
+            return Err(LiveRefusal::Facts(
+                "terminal leaf metadata requires every retained Rust candidate directory to be empty".into(),
+            ));
+        }
+        return Ok(());
+    }
+    validate_committed_workspace_dependencies(directories, dependencies)
+}
+
 /// Mechanical namespace admission and complete exact producer binding.
 ///
 /// # Errors
@@ -597,6 +736,14 @@ pub fn remote_committed_dependency_shape(
 ) -> Result<(), RemoteDependencyRefusal> {
     policy.validate_plan(plan)?;
     match policy {
+        CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata
+        | CommittedDependencyPolicy::WorkspaceTerminalMetadata => {
+            remote::remote_execution_shape(plan, directories, toolchain_root)?;
+            validate_committed_dependency_inventory(policy, directories, dependencies)?;
+            let externs = remote::remote_extern_facts(plan, directories)?;
+            artifacts_component(plan, &externs, directories)?;
+            Ok(())
+        }
         CommittedDependencyPolicy::WorkspaceRlib => {
             remote_committed_workspace_rlib_shape(plan, directories, dependencies, toolchain_root)
         }
@@ -809,6 +956,8 @@ pub fn committed_dependency_descriptor_policy(
         CommittedDependencyPolicy::ImmutableDagMetadata,
         CommittedDependencyPolicy::WorkspaceDagRlib,
         CommittedDependencyPolicy::WorkspaceDagMetadata,
+        CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata,
+        CommittedDependencyPolicy::WorkspaceTerminalMetadata,
     ] {
         let contract = dag_contract(policy).expect("DAG policy has a contract");
         if descriptor.action_class == contract.class
@@ -831,12 +980,14 @@ pub fn committed_dependency_descriptor_policy(
 /// descriptor falling through to generic dependency-class authority.
 #[must_use]
 pub fn uses_committed_dependency_namespace(descriptor: &ActionDescriptor) -> bool {
-    (10..=13).contains(&descriptor.key_epoch)
+    (10..=15).contains(&descriptor.key_epoch)
         || [
             &IMMUTABLE_DAG_RLIB,
             &IMMUTABLE_DAG_METADATA,
             &WORKSPACE_DAG_RLIB,
             &WORKSPACE_DAG_METADATA,
+            &WORKSPACE_TERMINAL_LEAF_METADATA,
+            &WORKSPACE_TERMINAL_METADATA,
         ]
         .into_iter()
         .any(|contract| {
@@ -979,6 +1130,24 @@ pub fn remote_committed_dependency_key(
     runtime: &TypedDigest,
 ) -> Result<LiveDependencyKey, RemoteDependencyRefusal> {
     remote_committed_dependency_shape(plan, policy, directories, dependencies, toolchain_root)?;
+    if matches!(
+        policy,
+        CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata
+            | CommittedDependencyPolicy::WorkspaceTerminalMetadata
+    ) {
+        return remote_terminal_workspace_metadata_key(
+            plan,
+            policy,
+            toolchain,
+            directories,
+            dependencies,
+            inputs,
+            build_script_output,
+            toolchain_root,
+            retained_toolchain_sha256,
+            runtime,
+        );
+    }
     match policy {
         CommittedDependencyPolicy::WorkspaceRlib => {
             return remote_committed_workspace_rlib_key(
@@ -1080,6 +1249,91 @@ pub fn remote_committed_dependency_key(
     // Workspace base components already bind the same complete ordered
     // producer tuple; rebind that encoding without changing its source scope.
     key.descriptor.dependency_inputs = compute(contract.dependencies_domain, &provenance.finish());
+    key.descriptor.key_epoch = contract.epoch;
+    key.descriptor.projection_epoch = PROJECTION_EPOCH;
+    key.descriptor.action_class = contract.class;
+    key.descriptor.sandbox_semantic_policy =
+        compute(contract.isolation_domain, contract.profile.as_bytes());
+    key.descriptor.execution_semantics =
+        compute(contract.semantics_domain, contract.profile.as_bytes());
+    key.action_key = compute_action_key(&key.descriptor).final_key;
+    key.descriptor_digest = descriptor_digest(&descriptor_canonical_bytes(&key.descriptor));
+    Ok(key)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn remote_terminal_workspace_metadata_key(
+    plan: &DependencyActionPlan,
+    policy: CommittedDependencyPolicy,
+    toolchain: &ToolchainFacts,
+    directories: &[DependencyDirectoryFact],
+    dependencies: &[CommittedWorkspaceDependency],
+    inputs: &ActionInputManifest,
+    build_script_output: Option<&[u8]>,
+    toolchain_root: &str,
+    retained_toolchain_sha256: &[u8; 32],
+    runtime: &TypedDigest,
+) -> Result<LiveDependencyKey, RemoteDependencyRefusal> {
+    if build_script_output.is_some() {
+        return Err(LiveRefusal::Facts(
+            "terminal metadata caching cannot consume a build-script run record".into(),
+        )
+        .into());
+    }
+    let externs = remote::remote_extern_facts(plan, directories)?;
+    let mut key = captured_action_key(plan, toolchain, &externs, directories, None, inputs)?;
+    remote::bind_remote_execution_inputs(
+        &mut key,
+        plan,
+        toolchain_root,
+        retained_toolchain_sha256,
+        runtime,
+    )?;
+    let contract = dag_contract(policy).expect("terminal policy has an exact contract");
+    let mut provenance = CanonicalEncoder::new();
+    encode_digest(&mut provenance, &key.descriptor.dependency_inputs);
+    provenance.seq(dependencies, |encoder, dependency| {
+        encoder.str(&dependency.path);
+        encode_digest(encoder, &dependency.producer_action);
+        encode_digest(encoder, &dependency.producer_descriptor);
+        encode_digest(encoder, &dependency.producer_manifest);
+        encoder.str(match dependency.role {
+            OutputRole::ProvisionalMetadata => "provisional-metadata",
+            OutputRole::Materializable => "materializable",
+            // Shape validation already excludes every other producer role.
+            _ => unreachable!("terminal input has a checked Rust artifact role"),
+        });
+        encoder.bytes(dependency.virtual_path.as_bytes());
+        encode_digest(encoder, &dependency.object.0);
+    });
+    key.descriptor.dependency_inputs = compute(contract.dependencies_domain, &provenance.finish());
+    let mut environment = CanonicalEncoder::new();
+    environment.seq(&plan.execution_env, |encoder, (name, value)| {
+        encoder.str(name).str(value);
+    });
+    key.descriptor.environment = compute(
+        "rabs.canonical-workspace-terminal-metadata.environment.v1",
+        &environment.finish(),
+    );
+    let mut invocation = CanonicalEncoder::new();
+    invocation
+        .bytes(&plan.invocation.canonical_bytes())
+        .str(&plan.compiler)
+        .str(&plan.cwd)
+        .str(&plan.package_root)
+        .str(&plan.source_root)
+        .str(&plan.out_dir)
+        .str(toolchain_root);
+    invocation.seq(&plan.dependency_dirs, |encoder, directory| {
+        encoder.str(directory);
+    });
+    invocation.seq(&plan.invocation.excluded_presentation, |encoder, flag| {
+        encoder.str(flag);
+    });
+    key.descriptor.normalized_invocation = compute(
+        "rabs.canonical-workspace-terminal-metadata.invocation.v1",
+        &invocation.finish(),
+    );
     key.descriptor.key_epoch = contract.epoch;
     key.descriptor.projection_epoch = PROJECTION_EPOCH;
     key.descriptor.action_class = contract.class;
@@ -1477,6 +1731,243 @@ mod tests {
             &[39; 32],
             &compute(remote::RUNTIME_COHORT_DOMAIN, b"runtime"),
         )
+    }
+
+    fn terminal_execution(
+        target_flags: &[&str],
+        dependency: bool,
+        payload: &str,
+    ) -> DependencyActionPlan {
+        let mut argv = [
+            "/__rabs/toolchain/bin/rustc",
+            "--crate-name=consumer",
+            "--edition=2021",
+            "consumer/src/lib.rs",
+            "--error-format=json",
+            "--json=artifacts",
+            "--emit=dep-info,metadata",
+            "--out-dir=/__rabs/out/cargo/debug/deps",
+            "-Ldependency=/__rabs/out/cargo/debug/deps",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        argv.extend(target_flags.iter().map(|flag| (*flag).to_owned()));
+        if dependency {
+            argv.push(format!("--extern=upstream={OUTPUT}/libupstream.rmeta"));
+        }
+        let env = execution_with_output(false, payload, true).execution_env;
+        plan_canonical_workspace_execution(
+            LiveRustcRequest {
+                argv: &argv,
+                env: &env,
+                cwd: "/__rabs/workspace",
+            },
+            HOST,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn terminal_metadata_keys_bind_shapes_source_environment_and_exact_producers() {
+        let mut keys = Vec::new();
+        for flags in [
+            vec!["--crate-type=bin"],
+            vec!["--crate-type=bin", "--test"],
+            vec!["--crate-type=lib", "--test"],
+            vec!["--test"],
+            vec!["--cfg=test"],
+        ] {
+            for (policy, dependencies) in [
+                (
+                    CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata,
+                    vec![],
+                ),
+                (
+                    CommittedDependencyPolicy::WorkspaceTerminalMetadata,
+                    vec![candidate("libupstream.rmeta")],
+                ),
+            ] {
+                let fresh = terminal_execution(&flags, !dependencies.is_empty(), "one");
+                let plan = plan_terminal_workspace_metadata(&fresh).unwrap();
+                let selected = inputs(&plan);
+                let key = policy_key(&plan, policy, &dependencies, &selected).unwrap();
+                assert_eq!(
+                    committed_dependency_descriptor_policy(&key.descriptor),
+                    Some(policy)
+                );
+                assert_eq!(
+                    key.descriptor.action_class,
+                    ActionClass::RustcWorkspaceCompile
+                );
+                assert_eq!(
+                    key.descriptor.key_epoch,
+                    if dependencies.is_empty() { 14 } else { 15 }
+                );
+                assert!(uses_committed_dependency_namespace(&key.descriptor));
+                assert!(!is_committed_workspace_metadata_descriptor(&key.descriptor));
+                assert!(!is_mixed_workspace_metadata_descriptor(&key.descriptor));
+                assert!(
+                    super::super::workspace_cache::closed_workspace_library_descriptor_class(
+                        &key.descriptor
+                    )
+                    .is_none()
+                );
+                assert!(plan_terminal_workspace_metadata(&plan).is_err());
+                assert_eq!(plan.invocation, fresh.invocation);
+                assert_eq!(plan.outputs, fresh.outputs);
+                let changed = plan_terminal_workspace_metadata(&terminal_execution(
+                    &flags,
+                    !dependencies.is_empty(),
+                    "two",
+                ))
+                .unwrap();
+                assert_ne!(
+                    key.action_key,
+                    policy_key(&changed, policy, &dependencies, &selected)
+                        .unwrap()
+                        .action_key
+                );
+                let mut changed_inputs = selected.clone();
+                changed_inputs.inputs.last_mut().unwrap().object =
+                    ObjectId(digest(b"edited sibling"));
+                assert_ne!(
+                    key.action_key,
+                    policy_key(&plan, policy, &dependencies, &changed_inputs)
+                        .unwrap()
+                        .action_key
+                );
+                if !dependencies.is_empty() {
+                    let mut changed_producer = dependencies.clone();
+                    changed_producer[0].producer_manifest = digest(b"different committed producer");
+                    assert_ne!(
+                        key.action_key,
+                        policy_key(&plan, policy, &changed_producer, &selected)
+                            .unwrap()
+                            .action_key
+                    );
+                }
+                keys.push(key.action_key);
+            }
+        }
+        for (index, key) in keys.iter().enumerate() {
+            assert!(keys[index + 1..].iter().all(|other| other != key));
+        }
+    }
+
+    #[test]
+    fn terminal_metadata_policies_require_exact_empty_or_committed_inventories() {
+        let fresh = terminal_execution(&["--crate-type=bin"], false, "one");
+        let plan = plan_terminal_workspace_metadata(&fresh).unwrap();
+        let inputs = inputs(&plan);
+        let leaf = CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata;
+        let committed = CommittedDependencyPolicy::WorkspaceTerminalMetadata;
+        assert!(policy_key(&plan, leaf, &[], &inputs).is_ok());
+        assert!(policy_key(&plan, committed, &[], &inputs).is_err());
+        // Implicit candidates need authority too; the invocation has no extern.
+        let candidate = candidate("libimplicit.rmeta");
+        assert!(policy_key(&plan, leaf, std::slice::from_ref(&candidate), &inputs).is_err());
+        assert!(policy_key(&plan, committed, std::slice::from_ref(&candidate), &inputs).is_ok());
+        assert!(remote_committed_dependency_shape(&plan, leaf, &[], &[], TOOLCHAIN).is_err());
+        assert!(
+            remote_committed_dependency_shape(
+                &plan,
+                committed,
+                &directories(std::slice::from_ref(&candidate)),
+                &[],
+                TOOLCHAIN,
+            )
+            .is_err()
+        );
+        // Empty search artifacts remain inputs but never establish leaf or
+        // producer authority. A dependent terminal still needs real ancestry.
+        let empty = ExternFact {
+            path: format!("{OUTPUT}/libchecked_binary.rmeta"),
+            content_digest: super::super::empty_metadata_object_digest(),
+        };
+        let mut candidates = directories(std::slice::from_ref(&candidate));
+        candidates[0].artifacts.insert(0, empty.clone());
+        let with_empty = remote_committed_dependency_key(
+            &plan,
+            committed,
+            &toolchain(),
+            &candidates,
+            std::slice::from_ref(&candidate),
+            &inputs,
+            None,
+            TOOLCHAIN,
+            &[39; 32],
+            &compute(remote::RUNTIME_COHORT_DOMAIN, b"runtime"),
+        )
+        .unwrap();
+        assert_ne!(
+            with_empty.action_key,
+            policy_key(&plan, committed, std::slice::from_ref(&candidate), &inputs)
+                .unwrap()
+                .action_key
+        );
+        let invented_empty_producer = CommittedWorkspaceDependency {
+            path: empty.path.clone(),
+            virtual_path: RawBytes::from("libchecked_binary.rmeta"),
+            object: ObjectId(empty.content_digest.clone()),
+            ..candidate.clone()
+        };
+        assert!(
+            validate_committed_dependency_inventory(
+                committed,
+                &candidates,
+                &[invented_empty_producer, candidate],
+            )
+            .is_err()
+        );
+        candidates[0].artifacts = vec![empty];
+        for policy in [leaf, committed] {
+            assert!(
+                remote_committed_dependency_shape(&plan, policy, &candidates, &[], TOOLCHAIN)
+                    .is_err()
+            );
+        }
+        let mut ordinary = fresh.clone();
+        ordinary.invocation.crate_types = vec!["lib".into()];
+        ordinary.outputs = crate::output_derivation::derive_workspace_output_declarations(
+            &ordinary.invocation,
+            HOST,
+        )
+        .unwrap();
+        assert!(plan_terminal_workspace_metadata(&ordinary).is_err());
+        let mut linking = fresh.clone();
+        linking.invocation.emit.push("link".into());
+        assert!(plan_terminal_workspace_metadata(&linking).is_err());
+        let mut generated = fresh.clone();
+        generated.generated_root = Some("/__rabs/out/cargo/debug/build/consumer/out".into());
+        assert!(plan_terminal_workspace_metadata(&generated).is_err());
+        let mut native = fresh;
+        native.invocation.native_libs.push("static=foreign".into());
+        assert!(plan_terminal_workspace_metadata(&native).is_err());
+        let mut missing_source = inputs;
+        missing_source
+            .inputs
+            .retain(|input| !input.virtual_path.as_bytes().ends_with(b"lib.rs"));
+        assert!(policy_key(&plan, leaf, &[], &missing_source).is_err());
+    }
+
+    #[test]
+    fn terminal_metadata_replays_only_after_complete_installation() {
+        let plan = plan_terminal_workspace_metadata(&terminal_execution(
+            &["--crate-type=bin"],
+            false,
+            "one",
+        ))
+        .unwrap();
+        let transcript = format!(
+            "{{\"$message_type\":\"artifact\",\"artifact\":\"{OUTPUT}/consumer.d\",\"emit\":\"dep-info\"}}\n{{\"$message_type\":\"artifact\",\"artifact\":\"{OUTPUT}/libconsumer.rmeta\",\"emit\":\"metadata\"}}\n"
+        );
+        assert_eq!(
+            super::super::metadata_replay_prefix_len(transcript.as_bytes(), &plan),
+            Ok(None)
+        );
+        let malformed = transcript.replace("libconsumer.rmeta", "unselected.rmeta");
+        assert!(super::super::metadata_replay_prefix_len(malformed.as_bytes(), &plan).is_err());
     }
 
     fn immutable_plan(package: &str, metadata: bool) -> DependencyActionPlan {

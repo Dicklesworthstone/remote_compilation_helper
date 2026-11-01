@@ -39,6 +39,7 @@ use rabs_key::live_dependency::workspace_dependency_cache::{
     remote_committed_dependency_isolation_policy, remote_committed_dependency_key,
     remote_committed_dependency_shape, uses_committed_dependency_namespace,
     validate_committed_workspace_metadata_plan, validate_mixed_workspace_library_plan,
+    validate_terminal_workspace_metadata_plan,
 };
 #[cfg(test)]
 use rabs_key::live_dependency::workspace_dependency_cache::{
@@ -993,6 +994,12 @@ impl RemoteValidation {
         };
         inputs.verify(request)?;
         let ancestors = inputs.ancestors();
+        if inputs.policy() == CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata {
+            if !ancestors.is_empty() || !inputs.dependencies().is_empty() {
+                return Err("terminal leaf acquired unexpected producer ancestry".into());
+            }
+            return Ok(ancestors);
+        }
         if ancestors.is_empty() {
             return Err("committed dependency has no producer ancestry".into());
         }
@@ -1001,6 +1008,10 @@ impl RemoteValidation {
 }
 
 fn execution_mode(plan: &DependencyActionPlan) -> Result<DependencyExecutionMode, String> {
+    if plan.source_kind == DependencySourceKind::WorkspaceTerminalMetadata {
+        validate_terminal_workspace_metadata_plan(plan).map_err(|error| error.to_string())?;
+        return Ok(DependencyExecutionMode::ClosedMetadata);
+    }
     if matches!(
         plan.source_kind,
         DependencySourceKind::WorkspaceMixedRlib | DependencySourceKind::WorkspaceMixedMetadata
@@ -2475,6 +2486,9 @@ impl PendingRemoteInstall {
     /// affine execution custody. Neither grants unfinished-producer authority.
     #[must_use]
     pub fn supports_metadata(&self) -> bool {
+        if self.request.plan.source_kind == DependencySourceKind::WorkspaceTerminalMetadata {
+            return false;
+        }
         let owns_result = match &self.result {
             RemoteInstallAuthority::Published => !self.request.is_execution_only(),
             RemoteInstallAuthority::RequestOwned(_) => self.request.is_execution_only(),

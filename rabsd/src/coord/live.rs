@@ -478,6 +478,9 @@ const LIVE_IMMUTABLE_DAG_RLIB_CLASS: &str = "rustc-immutable-committed-dag-rlib-
 const LIVE_IMMUTABLE_DAG_METADATA_CLASS: &str = "rustc-immutable-committed-dag-metadata-v1";
 const LIVE_WORKSPACE_DAG_RLIB_CLASS: &str = "rustc-workspace-committed-dag-rlib-v1";
 const LIVE_WORKSPACE_DAG_METADATA_CLASS: &str = "rustc-workspace-committed-dag-metadata-v1";
+const LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS: &str =
+    "rustc-workspace-terminal-leaf-metadata-v1";
+const LIVE_WORKSPACE_TERMINAL_METADATA_CLASS: &str = "rustc-workspace-terminal-metadata-v1";
 const LIVE_PRIVATE_CLASS: &str = "private-only";
 
 // This is an additional floor, not a replacement for the stored serving policy.
@@ -520,6 +523,12 @@ fn record_descriptor_class(
             CommittedDependencyPolicy::ImmutableDagMetadata => LIVE_IMMUTABLE_DAG_METADATA_CLASS,
             CommittedDependencyPolicy::WorkspaceDagRlib => LIVE_WORKSPACE_DAG_RLIB_CLASS,
             CommittedDependencyPolicy::WorkspaceDagMetadata => LIVE_WORKSPACE_DAG_METADATA_CLASS,
+            CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata => {
+                LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS
+            }
+            CommittedDependencyPolicy::WorkspaceTerminalMetadata => {
+                LIVE_WORKSPACE_TERMINAL_METADATA_CLASS
+            }
         }
     } else if uses_committed_dependency_namespace(descriptor) {
         LIVE_PRIVATE_CLASS
@@ -592,6 +601,12 @@ fn recorded_action_risk(
             }
             [SqlValue::Text(class)] if class == LIVE_WORKSPACE_DAG_METADATA_CLASS => {
                 Ok(ActionClassRisk::WorkspaceDagMetadata)
+            }
+            [SqlValue::Text(class)] if class == LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS => {
+                Ok(ActionClassRisk::WorkspaceTerminalLeafMetadata)
+            }
+            [SqlValue::Text(class)] if class == LIVE_WORKSPACE_TERMINAL_METADATA_CLASS => {
+                Ok(ActionClassRisk::WorkspaceTerminalMetadata)
             }
             [SqlValue::Text(_)] => Ok(ActionClassRisk::Elevated),
             _ => Err(StoreError::Backend(
@@ -5355,8 +5370,9 @@ mod tests {
         use rabs_key::live_dependency::workspace_dependency_cache::{
             CommittedDependencyPolicy, CommittedWorkspaceDependency,
             plan_committed_workspace_metadata, plan_committed_workspace_rlib,
-            plan_mixed_workspace_library, remote_committed_dependency_key,
-            remote_committed_workspace_metadata_key, remote_committed_workspace_rlib_key,
+            plan_mixed_workspace_library, plan_terminal_workspace_metadata,
+            remote_committed_dependency_key, remote_committed_workspace_metadata_key,
+            remote_committed_workspace_rlib_key,
         };
         use rabs_key::live_dependency::{
             DependencyDirectoryFact, DependencySourceKind, ExternFact, LiveRustcRequest,
@@ -5368,6 +5384,15 @@ mod tests {
         // Exercise the real pure key builder and the production durable receipt
         // writer. Compiler execution is covered by the canonical Cargo fixture.
         let descriptor = |emit: &str, policy: Option<CommittedDependencyPolicy>| {
+            let terminal = matches!(
+                policy,
+                Some(
+                    CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata
+                        | CommittedDependencyPolicy::WorkspaceTerminalMetadata
+                )
+            );
+            let has_dependencies = policy.is_some()
+                && policy != Some(CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata);
             let immutable = matches!(
                 policy,
                 Some(
@@ -5396,7 +5421,10 @@ mod tests {
                 argv[3] = format!("{source_root}/src.rs");
                 argv.push("--cap-lints=allow".into());
             }
-            if policy.is_some() {
+            if terminal {
+                argv[2] = "--crate-type=bin".into();
+            }
+            if has_dependencies {
                 argv.push("-Ldependency=/__rabs/out/cargo/debug/deps".into());
                 argv.push(
                     "--extern=upstream=/__rabs/out/cargo/debug/deps/libupstream.rmeta".into(),
@@ -5432,6 +5460,10 @@ mod tests {
                 Some(CommittedDependencyPolicy::WorkspaceMetadata) => {
                     plan_committed_workspace_metadata(&execution)
                 }
+                Some(
+                    CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata
+                    | CommittedDependencyPolicy::WorkspaceTerminalMetadata,
+                ) => plan_terminal_workspace_metadata(&execution),
                 Some(
                     CommittedDependencyPolicy::MixedWorkspaceRlib
                     | CommittedDependencyPolicy::MixedWorkspaceMetadata
@@ -5499,14 +5531,22 @@ mod tests {
                     b"exact metadata",
                 )),
             };
-            let directories = [DependencyDirectoryFact {
-                path: plan.out_dir.clone(),
-                artifacts: vec![ExternFact {
-                    path: binding.path.clone(),
-                    content_digest: binding.object.0.clone(),
-                }],
-            }];
-            let dependencies = [binding];
+            let directories = if has_dependencies {
+                vec![DependencyDirectoryFact {
+                    path: plan.out_dir.clone(),
+                    artifacts: vec![ExternFact {
+                        path: binding.path.clone(),
+                        content_digest: binding.object.0.clone(),
+                    }],
+                }]
+            } else {
+                Vec::new()
+            };
+            let dependencies = if has_dependencies {
+                vec![binding]
+            } else {
+                Vec::new()
+            };
             match (plan.source_kind, policy) {
                 (DependencySourceKind::WorkspaceCommittedMetadata, _) => {
                     remote_committed_workspace_metadata_key(
@@ -5625,6 +5665,20 @@ mod tests {
                 ),
                 ActionClassRisk::WorkspaceDagMetadata,
             ),
+            (
+                descriptor(
+                    "--emit=dep-info,metadata",
+                    Some(CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata),
+                ),
+                ActionClassRisk::WorkspaceTerminalLeafMetadata,
+            ),
+            (
+                descriptor(
+                    "--emit=dep-info,metadata",
+                    Some(CommittedDependencyPolicy::WorkspaceTerminalMetadata),
+                ),
+                ActionClassRisk::WorkspaceTerminalMetadata,
+            ),
         ];
         assert_eq!(descriptors[2].0.key_epoch, 6);
         assert_eq!(descriptors[3].0.key_epoch, 7);
@@ -5647,7 +5701,7 @@ mod tests {
             let mut store = coord.live_cas().unwrap().store().lock().unwrap();
             for (descriptor, _) in &descriptors {
                 record_descriptor_class(&mut *store, descriptor).unwrap();
-                let dag = (10..=13).contains(&descriptor.key_epoch);
+                let dag = (10..=15).contains(&descriptor.key_epoch);
                 for mutation in 0..if dag { 6 } else { 4 } {
                     let mut changed = descriptor.clone();
                     match mutation {

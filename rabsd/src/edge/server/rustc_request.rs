@@ -687,6 +687,8 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
             CommittedDependencyPolicy::MixedWorkspaceMetadata,
             CommittedDependencyPolicy::WorkspaceDagRlib,
             CommittedDependencyPolicy::WorkspaceDagMetadata,
+            CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata,
+            CommittedDependencyPolicy::WorkspaceTerminalMetadata,
         ] {
             let candidate = match policy {
                 CommittedDependencyPolicy::WorkspaceRlib => {
@@ -694,6 +696,10 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
                 }
                 CommittedDependencyPolicy::WorkspaceMetadata => {
                     workspace_dependency_cache::plan_committed_workspace_metadata(&plan)
+                }
+                CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata
+                | CommittedDependencyPolicy::WorkspaceTerminalMetadata => {
+                    workspace_dependency_cache::plan_terminal_workspace_metadata(&plan)
                 }
                 _ => workspace_dependency_cache::plan_mixed_workspace_library(&plan),
             };
@@ -918,6 +924,7 @@ fn decision_reply(
     match decision {
         LiveDecision::Hit(pending) => {
             log("hit", &[("crate", unit), ("key", key_text)]);
+            let metadata = metadata && pending.supports_metadata();
             let mut reply = json!({
                 "kind": "rustc-decision", "decision": "hit",
                 "action_key": key_text, "capture_protocol": 1,

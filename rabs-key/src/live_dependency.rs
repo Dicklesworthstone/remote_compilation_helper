@@ -425,6 +425,10 @@ pub enum DependencySourceKind {
     /// qualified canonical remote immutable dependency leaves. Every retained
     /// candidate still requires exact installed and current publication authority.
     WorkspaceMixedMetadata,
+    /// A selected binary/example or test/bench metadata check. Independent leaf
+    /// and committed-input policies share this complete workspace source scope;
+    /// terminal outputs never establish dependency-producer authority.
+    WorkspaceTerminalMetadata,
 }
 
 impl DependencySourceKind {
@@ -442,6 +446,7 @@ impl DependencySourceKind {
             Self::WorkspaceCommittedMetadata => "canonical-workspace-committed-metadata-v1",
             Self::WorkspaceMixedRlib => "canonical-workspace-committed-mixed-rlib-v1",
             Self::WorkspaceMixedMetadata => "canonical-workspace-committed-mixed-metadata-v1",
+            Self::WorkspaceTerminalMetadata => "canonical-workspace-terminal-metadata-v1",
         }
     }
 
@@ -458,6 +463,7 @@ impl DependencySourceKind {
                 | Self::WorkspaceCommittedMetadata
                 | Self::WorkspaceMixedRlib
                 | Self::WorkspaceMixedMetadata
+                | Self::WorkspaceTerminalMetadata
         )
     }
 }
@@ -1546,6 +1552,7 @@ fn captured_action_key(
                             | DependencySourceKind::WorkspaceCommittedMetadata
                             | DependencySourceKind::WorkspaceMixedRlib
                             | DependencySourceKind::WorkspaceMixedMetadata
+                            | DependencySourceKind::WorkspaceTerminalMetadata
                     )
                     && input.virtual_path.as_bytes()[root.len()..]
                         .split(|byte| *byte == b'/')
@@ -1612,7 +1619,8 @@ fn captured_action_key(
             | DependencySourceKind::WorkspaceCommittedRlib
             | DependencySourceKind::WorkspaceCommittedMetadata
             | DependencySourceKind::WorkspaceMixedRlib
-            | DependencySourceKind::WorkspaceMixedMetadata => {
+            | DependencySourceKind::WorkspaceMixedMetadata
+            | DependencySourceKind::WorkspaceTerminalMetadata => {
                 enc.str("complete-canonical-workspace-execution-tree-v1")
                     .str(plan.source_kind.as_str())
                     .str(&plan.source_root)
@@ -1711,6 +1719,9 @@ fn captured_action_key(
                 }
                 DependencySourceKind::WorkspaceMixedMetadata => {
                     workspace_dependency_cache::MIXED_METADATA_ISOLATION_PROFILE
+                }
+                DependencySourceKind::WorkspaceTerminalMetadata => {
+                    workspace_dependency_cache::TERMINAL_METADATA_ISOLATION_PROFILE
                 }
             }
             .as_bytes(),

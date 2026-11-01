@@ -5190,8 +5190,9 @@ fn closed_workspace_metadata_dag_source(root: &Path) {
         "top/Cargo.toml",
         "[package]\nname='canonical_dag_top'\nversion='0.1.0'\nedition='2021'\nautobins=false\n[dependencies]\ncanonical_dag_middle={path='../middle'}\n[[bin]]\nname='canonical_dag_consumer'\npath='src/main.rs'\n",
     );
-    // This fresh, non-cacheable consumer independently reads the current
-    // inputs. Stale metadata anywhere in the chain fails real rustc checks.
+    // This terminal consumer earns its own qualification against the current
+    // source and environment. Stale metadata anywhere in the chain fails the
+    // real rustc checks during independent comparisons and after input changes.
     write(
         root,
         "top/src/main.rs",
@@ -5742,7 +5743,10 @@ fn mixed_workspace_dag_replay(command: &str) {
 
     let (mut worker, environment) = NativeWorker::start(root);
     let mut keys: Option<BTreeMap<String, String>> = None;
-    let mut private_attempts = BTreeMap::new();
+    let names = WORKSPACE_DAG_NAMES
+        .into_iter()
+        .chain((command == "check").then_some(WORKSPACE_METADATA_DAG_CONSUMER))
+        .collect::<Vec<_>>();
     let mut request_ids = BTreeSet::new();
     let mut executions = 0;
     for number in 1..=5 {
@@ -5757,8 +5761,8 @@ fn mixed_workspace_dag_replay(command: &str) {
                 "max_bytes":268435456,
             });
         }
-        let before_journal = (number > 3 && command == "build")
-            .then(|| read_bounded(&worker.state.join("requests.json")));
+        let before_journal =
+            (number > 3).then(|| read_bounded(&worker.state.join("requests.json")));
         let (code, events, output) =
             run_with_environment(root, 1100 + number, &profile, &environment);
         assert_eq!(code, 0, "{output}\nworker: {:?}", worker.events());
@@ -5775,15 +5779,9 @@ fn mixed_workspace_dag_replay(command: &str) {
         let hit = number > 3;
         let actual = if hit {
             assert_eq!(Some(&hits), keys.as_ref(), "{output}");
-            let expected = if command == "check" {
-                BTreeSet::from([WORKSPACE_METADATA_DAG_CONSUMER])
-            } else {
-                BTreeSet::new()
-            };
-            assert_eq!(
-                offered.keys().map(String::as_str).collect::<BTreeSet<_>>(),
-                expected,
-                "a trained mixed library DAG dispatched compiler work: {output}"
+            assert!(
+                offered.is_empty(),
+                "a trained mixed DAG dispatched compiler work: {output}"
             );
             hits
         } else {
@@ -5797,10 +5795,7 @@ fn mixed_workspace_dag_replay(command: &str) {
                 expected,
                 "every qualifying unit must reach the real worker: {output}"
             );
-            WORKSPACE_DAG_NAMES
-                .into_iter()
-                .map(|name| (name.to_owned(), offered[name].clone()))
-                .collect::<BTreeMap<_, _>>()
+            offered.clone()
         };
         if let Some(previous) = &keys {
             assert_eq!(
@@ -5850,18 +5845,25 @@ fn mixed_workspace_dag_replay(command: &str) {
         }
         assert_qualified_immutable_leaf(root, &actual[WORKSPACE_DAG_NAMES[0]], command);
         if command == "check" {
-            assert_fresh_workspace_execution(
+            if hit {
+                assert!(
+                    events.iter().any(|event| {
+                        event["decision"] == "served"
+                            && event["key"] == actual[WORKSPACE_METADATA_DAG_CONSUMER]
+                    }),
+                    "the cached terminal metadata was not installed: {output}"
+                );
+            }
+            assert_closed_workspace_leaf_evidence(
                 root,
-                &events,
-                &output,
-                WORKSPACE_METADATA_DAG_CONSUMER,
-                &offered[WORKSPACE_METADATA_DAG_CONSUMER],
-                &mut private_attempts,
+                &actual[WORKSPACE_METADATA_DAG_CONSUMER],
+                number.min(3) as usize,
+                "rustc-workspace-terminal-metadata-v1",
             );
         }
         let (files, diagnostics) =
             mixed_workspace_dag_outputs(root, command, &events, &output, &mut targets);
-        assert_closed_workspace_dag_ancestry(root, &actual, &files);
+        assert_workspace_dag_ancestry(root, &actual, &files, &names);
         assert_eq!(
             (files, diagnostics),
             stock,
@@ -5884,7 +5886,7 @@ fn mixed_workspace_dag_replay(command: &str) {
             assert_eq!(
                 read_bounded(&worker.state.join("requests.json")),
                 before,
-                "a mixed archive hit reached the worker request journal"
+                "a complete mixed DAG hit reached the worker request journal"
             );
         }
         keys = Some(actual);
@@ -6031,7 +6033,12 @@ fn warm_committed_metadata_replay(mixed: bool, include_consumer: bool) {
     let mut keys = BTreeMap::new();
     let mut top_keys: [Option<String>; 2] = [None, None];
     let mut cold_top = None;
-    let mut private_attempts = BTreeMap::new();
+    let mut terminal_keys: [Option<String>; 2] = [None, None];
+    let mut cold_terminal = None;
+    let names = WORKSPACE_DAG_NAMES
+        .into_iter()
+        .chain(include_consumer.then_some(WORKSPACE_METADATA_DAG_CONSUMER))
+        .collect::<Vec<_>>();
     let mut request_ids = BTreeSet::new();
     let mut executions = 0;
     let rounds = if include_consumer { 10 } else { 8 };
@@ -6043,10 +6050,11 @@ fn warm_committed_metadata_replay(mixed: bool, include_consumer: bool) {
         // The first cold library cannot see the binary metadata that Cargo
         // creates afterwards. That empty file remains a real keyed input in
         // every warm round, so cold A and warm A earn separate evidence. B is
-        // warm from its first execution. No sample count or serving gate changes.
+        // warm from its first execution. The terminal excludes its own output
+        // but binds that distinct top producer, so it earns separate cold and
+        // warm evidence too. No sample count or serving gate changes.
         let hit = number > if include_consumer { 7 } else { 6 };
-        let before_journal =
-            (hit && !include_consumer).then(|| read_bounded(&worker.state.join("requests.json")));
+        let before_journal = hit.then(|| read_bounded(&worker.state.join("requests.json")));
         // run_with_environment starts and joins a distinct coordinator
         // process each time. The private target family is never changed.
         let (code, events, output) =
@@ -6081,7 +6089,7 @@ fn warm_committed_metadata_replay(mixed: bool, include_consumer: bool) {
         } else {
             BTreeSet::from([WORKSPACE_DAG_NAMES[2]])
         };
-        if include_consumer {
+        if include_consumer && !hit {
             expected_offers.insert(WORKSPACE_METADATA_DAG_CONSUMER);
         }
         assert_eq!(
@@ -6089,14 +6097,17 @@ fn warm_committed_metadata_replay(mixed: bool, include_consumer: bool) {
             expected_offers,
             "Cargo Fresh parents must not be re-executed: {output}"
         );
+        let mut expected_hits = BTreeSet::new();
+        if hit {
+            expected_hits.insert(WORKSPACE_DAG_NAMES[2]);
+            if include_consumer {
+                expected_hits.insert(WORKSPACE_METADATA_DAG_CONSUMER);
+            }
+        }
         assert_eq!(
             hits.keys().map(String::as_str).collect::<BTreeSet<_>>(),
-            if hit {
-                BTreeSet::from([WORKSPACE_DAG_NAMES[2]])
-            } else {
-                BTreeSet::new()
-            },
-            "only the independently qualified edited consumer may replay: {output}"
+            expected_hits,
+            "only independently qualified edited library and terminal actions may replay: {output}"
         );
         if number == 1 {
             for name in &WORKSPACE_DAG_NAMES[..2] {
@@ -6178,14 +6189,47 @@ fn warm_committed_metadata_replay(mixed: bool, include_consumer: bool) {
             assert_qualified_immutable_leaf(root, &keys[WORKSPACE_DAG_NAMES[0]], "check");
         }
         if include_consumer {
-            assert_fresh_workspace_execution(
+            let terminal = actual[WORKSPACE_METADATA_DAG_CONSUMER].clone();
+            if number == 1 {
+                cold_terminal = Some(terminal.clone());
+            } else if let Some(previous) = &terminal_keys[variant] {
+                assert_eq!(
+                    &terminal, previous,
+                    "restoring a prior source variant split its terminal action key"
+                );
+            } else {
+                terminal_keys[variant] = Some(terminal.clone());
+            }
+            if number == 3 {
+                assert_ne!(
+                    Some(&terminal),
+                    cold_terminal.as_ref(),
+                    "the terminal lost its distinct cold/warm top producer identity"
+                );
+                assert_ne!(
+                    terminal_keys[0], terminal_keys[1],
+                    "the source edit must change the terminal key"
+                );
+            }
+            if hit {
+                assert!(
+                    events
+                        .iter()
+                        .any(|event| { event["decision"] == "served" && event["key"] == terminal }),
+                    "the earned terminal metadata hit was not installed: {output}"
+                );
+            }
+            assert_closed_workspace_leaf_evidence(
                 root,
-                &events,
-                &output,
-                WORKSPACE_METADATA_DAG_CONSUMER,
-                &offered[WORKSPACE_METADATA_DAG_CONSUMER],
-                &mut private_attempts,
+                &terminal,
+                if variant == 0 && number > 1 {
+                    (number / 2).min(3) as usize
+                } else {
+                    number.div_ceil(2).min(3) as usize
+                },
+                "rustc-workspace-terminal-metadata-v1",
             );
+            keys.insert(WORKSPACE_METADATA_DAG_CONSUMER.to_owned(), terminal);
         }
         let files = workspace_dag_metadata_files_with_consumer(
             &sole_retained_target(root),
@@ -6193,7 +6237,7 @@ fn warm_committed_metadata_replay(mixed: bool, include_consumer: bool) {
             &WORKSPACE_DAG_NAMES,
             include_consumer,
         );
-        assert_closed_workspace_dag_ancestry(root, &keys, &files);
+        assert_workspace_dag_ancestry(root, &keys, &files, &names);
         assert_eq!(
             &files, &stock[variant].0,
             "stock/warm/replayed metadata bytes differ"
@@ -6220,8 +6264,8 @@ fn warm_committed_metadata_replay(mixed: bool, include_consumer: bool) {
         }
         assert!(fs::read_dir(root.join("ops")).unwrap().next().is_none());
     }
-    assert_eq!(executions, if include_consumer { 19 } else { 8 });
-    assert_eq!(request_ids.len(), if include_consumer { 10 } else { 6 });
+    assert_eq!(executions, if include_consumer { 16 } else { 8 });
+    assert_eq!(request_ids.len(), if include_consumer { 7 } else { 6 });
 
     // Every Cargo unit would now be Fresh. Revocation must reject the trusted
     // seed before Cargo can consume those bytes, even without a new wrapper
@@ -6554,7 +6598,10 @@ fn immutable_workspace_dag_replay(command: &str) {
 
     let (mut worker, environment) = NativeWorker::start(root);
     let mut keys: Option<BTreeMap<String, String>> = None;
-    let mut private_attempts = BTreeMap::new();
+    let names = IMMUTABLE_WORKSPACE_DAG_NAMES
+        .into_iter()
+        .chain((command == "check").then_some(WORKSPACE_METADATA_DAG_CONSUMER))
+        .collect::<Vec<_>>();
     let mut request_ids = BTreeSet::new();
     let mut executions = 0;
     for number in 1..=5 {
@@ -6569,8 +6616,8 @@ fn immutable_workspace_dag_replay(command: &str) {
                 "max_bytes":268435456,
             });
         }
-        let before_journal = (number > 3 && command == "build")
-            .then(|| read_bounded(&worker.state.join("requests.json")));
+        let before_journal =
+            (number > 3).then(|| read_bounded(&worker.state.join("requests.json")));
         let (code, events, output) =
             run_with_environment(root, 1140 + number, &profile, &environment);
         assert_eq!(code, 0, "{output}\nworker: {:?}", worker.events());
@@ -6587,15 +6634,9 @@ fn immutable_workspace_dag_replay(command: &str) {
         let hit = number > 3;
         let actual = if hit {
             assert_eq!(Some(&hits), keys.as_ref(), "{output}");
-            let expected = if command == "check" {
-                BTreeSet::from([WORKSPACE_METADATA_DAG_CONSUMER])
-            } else {
-                BTreeSet::new()
-            };
-            assert_eq!(
-                offered.keys().map(String::as_str).collect::<BTreeSet<_>>(),
-                expected,
-                "a trained immutable library DAG dispatched compiler work: {output}"
+            assert!(
+                offered.is_empty(),
+                "a trained immutable DAG dispatched compiler work: {output}"
             );
             hits
         } else {
@@ -6609,10 +6650,7 @@ fn immutable_workspace_dag_replay(command: &str) {
                 expected,
                 "every qualifying unit must reach the real worker: {output}"
             );
-            IMMUTABLE_WORKSPACE_DAG_NAMES
-                .into_iter()
-                .map(|name| (name.to_owned(), offered[name].clone()))
-                .collect::<BTreeMap<_, _>>()
+            offered.clone()
         };
         if let Some(previous) = &keys {
             assert_eq!(
@@ -6669,13 +6707,20 @@ fn immutable_workspace_dag_replay(command: &str) {
         assert_qualified_immutable_leaf(root, &actual[IMMUTABLE_WORKSPACE_DAG_NAMES[0]], command);
         assert_no_immutable_leaf_qualification(root, &actual[IMMUTABLE_WORKSPACE_DAG_NAMES[1]]);
         if command == "check" {
-            assert_fresh_workspace_execution(
+            if hit {
+                assert!(
+                    events.iter().any(|event| {
+                        event["decision"] == "served"
+                            && event["key"] == actual[WORKSPACE_METADATA_DAG_CONSUMER]
+                    }),
+                    "the cached terminal metadata was not installed: {output}"
+                );
+            }
+            assert_closed_workspace_leaf_evidence(
                 root,
-                &events,
-                &output,
-                WORKSPACE_METADATA_DAG_CONSUMER,
-                &offered[WORKSPACE_METADATA_DAG_CONSUMER],
-                &mut private_attempts,
+                &actual[WORKSPACE_METADATA_DAG_CONSUMER],
+                number.min(3) as usize,
+                "rustc-workspace-terminal-metadata-v1",
             );
         }
         let (files, diagnostics) = workspace_dag_outputs(
@@ -6686,7 +6731,7 @@ fn immutable_workspace_dag_replay(command: &str) {
             &mut targets,
             &IMMUTABLE_WORKSPACE_DAG_NAMES,
         );
-        assert_workspace_dag_ancestry(root, &actual, &files, &IMMUTABLE_WORKSPACE_DAG_NAMES);
+        assert_workspace_dag_ancestry(root, &actual, &files, &names);
         assert_eq!(
             (files, diagnostics),
             stock,
@@ -6709,7 +6754,7 @@ fn immutable_workspace_dag_replay(command: &str) {
             assert_eq!(
                 read_bounded(&worker.state.join("requests.json")),
                 before,
-                "an immutable DAG archive hit reached the worker request journal"
+                "a complete immutable DAG hit reached the worker request journal"
             );
         }
         keys = Some(actual);
@@ -6988,7 +7033,7 @@ fn canonical_workspace_committed_dag_earns_transitive_replay_across_worktrees() 
 }
 
 #[test]
-#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual committed metadata DAG qualification, ancestry, stock comparison and fresh downstream typechecking"]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual committed metadata DAG and terminal-consumer qualification, ancestry and stock comparison"]
 fn canonical_workspace_committed_metadata_dag_earns_transitive_replay_across_worktrees() {
     let (owner, mut profile) = native_fixture();
     let root = owner.path();
@@ -7024,7 +7069,10 @@ fn canonical_workspace_committed_metadata_dag_earns_transitive_replay_across_wor
 
     let (mut worker, environment) = NativeWorker::start(root);
     let mut previous_keys: Option<BTreeMap<String, String>> = None;
-    let mut private_attempts = BTreeMap::new();
+    let names = WORKSPACE_DAG_NAMES
+        .into_iter()
+        .chain([WORKSPACE_METADATA_DAG_CONSUMER])
+        .collect::<Vec<_>>();
     let mut requests = BTreeSet::new();
     let mut executions = 0;
     for number in 1..=8 {
@@ -7053,6 +7101,8 @@ fn canonical_workspace_committed_metadata_dag_earns_transitive_replay_across_wor
             "runtime_epoch":format!("committed-metadata-dag-{number}-v1"),
             "max_bytes":268435456,
         });
+        let hit = matches!(number, 4 | 5);
+        let before_journal = hit.then(|| read_bounded(&worker.state.join("requests.json")));
         let (code, events, output) =
             run_with_environment(root, 950 + number, &profile, &environment);
         assert_eq!(code, 0, "{output}\nworker: {:?}", worker.events());
@@ -7067,17 +7117,15 @@ fn canonical_workspace_committed_metadata_dag_earns_transitive_replay_across_wor
         );
         let offered = decisions(&events, "remote-offer");
         let hits = decisions(&events, "hit");
-        let hit = matches!(number, 4 | 5);
         let keys = if hit {
             assert_eq!(
                 Some(&hits),
                 previous_keys.as_ref(),
-                "only the independently qualified library DAG may replay: {output}"
+                "only the independently qualified DAG and terminal consumer may replay: {output}"
             );
-            assert_eq!(
-                offered.keys().map(String::as_str).collect::<BTreeSet<_>>(),
-                BTreeSet::from([WORKSPACE_METADATA_DAG_CONSUMER]),
-                "a library hit dispatched compiler work: {output}"
+            assert!(
+                offered.is_empty(),
+                "a complete metadata DAG hit dispatched compiler work: {output}"
             );
             hits
         } else {
@@ -7090,16 +7138,13 @@ fn canonical_workspace_committed_metadata_dag_earns_transitive_replay_across_wor
                     .collect::<BTreeSet<_>>(),
                 "every actual Cargo unit must execute: {output}"
             );
-            let keys = WORKSPACE_DAG_NAMES
-                .into_iter()
-                .map(|name| (name.to_owned(), offered[name].clone()))
-                .collect::<BTreeMap<_, _>>();
+            let keys = offered.clone();
             if let Some(previous) = &previous_keys {
-                for name in WORKSPACE_DAG_NAMES {
+                for name in &names {
                     if number <= 3 {
-                        assert_eq!(keys[name], previous[name], "cold targets split {name}");
+                        assert_eq!(keys[*name], previous[*name], "cold targets split {name}");
                     } else {
-                        assert_ne!(keys[name], previous[name], "changed input reused {name}");
+                        assert_ne!(keys[*name], previous[*name], "changed input reused {name}");
                     }
                 }
             }
@@ -7122,7 +7167,7 @@ fn canonical_workspace_committed_metadata_dag_earns_transitive_replay_across_wor
                 "{output}"
             );
         }
-        for (index, name) in WORKSPACE_DAG_NAMES.iter().enumerate() {
+        for (index, name) in names.iter().enumerate() {
             if hit {
                 assert!(
                     events.iter().any(|event| {
@@ -7141,21 +7186,15 @@ fn canonical_workspace_committed_metadata_dag_earns_transitive_replay_across_wor
                 } else {
                     1
                 },
-                if index == 0 {
+                if *name == WORKSPACE_METADATA_DAG_CONSUMER {
+                    "rustc-workspace-terminal-metadata-v1"
+                } else if index == 0 {
                     "rustc-workspace-closed-metadata-v1"
                 } else {
                     "rustc-workspace-committed-metadata-v1"
                 },
             );
         }
-        assert_fresh_workspace_execution(
-            root,
-            &events,
-            &output,
-            WORKSPACE_METADATA_DAG_CONSUMER,
-            &offered[WORKSPACE_METADATA_DAG_CONSUMER],
-            &mut private_attempts,
-        );
         let new_families = fs::read_dir(root.join("state/canonical-compile-v1/private-target-v2"))
             .unwrap()
             .map(|entry| entry.unwrap().path())
@@ -7169,7 +7208,7 @@ fn canonical_workspace_committed_metadata_dag_earns_transitive_replay_across_wor
         let files =
             closed_workspace_metadata_dag_files(&new_families[0].join("seed/target"), &output);
         assert!(families.insert(new_families[0].clone()));
-        assert_closed_workspace_dag_ancestry(root, &keys, &files);
+        assert_workspace_dag_ancestry(root, &keys, &files, &names);
         if number <= 5 {
             assert_eq!(files, stock_files, "stock/cold/hit metadata bytes differ");
             assert_eq!(
@@ -7177,8 +7216,10 @@ fn canonical_workspace_committed_metadata_dag_earns_transitive_replay_across_wor
                 "stock/cold/hit diagnostics differ"
             );
         }
-        executions += if hit { 1 } else { 4 };
-        assert!(requests.insert(worker.completed_receipt()["request_id"].as_u64().unwrap()));
+        executions += offered.len();
+        if !offered.is_empty() {
+            assert!(requests.insert(worker.completed_receipt()["request_id"].as_u64().unwrap()));
+        }
         assert_eq!(
             worker
                 .events()
@@ -7186,8 +7227,15 @@ fn canonical_workspace_committed_metadata_dag_earns_transitive_replay_across_wor
                 .filter(|event| event["kind"] == "worker-toolchain-acquired")
                 .count(),
             executions,
-            "a trained library DAG must skip its compilers while the consumer stays fresh"
+            "a trained metadata DAG and terminal consumer must skip every compiler"
         );
+        if let Some(before) = before_journal {
+            assert_eq!(
+                read_bounded(&worker.state.join("requests.json")),
+                before,
+                "a complete metadata DAG hit reached the worker request journal"
+            );
+        }
         previous_keys = Some(keys);
     }
     assert!(fs::read_dir(root.join("ops")).unwrap().next().is_none());
@@ -7551,7 +7599,7 @@ fn canonical_cargo_workspace_leaf_archives_earn_hits_with_complete_source_closur
 }
 
 #[test]
-#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual stock/worker/cache metadata comparison and a fresh downstream Cargo consumer"]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual stock/worker/cache metadata comparison and independently qualified downstream Cargo consumer replay"]
 fn canonical_cargo_workspace_leaf_metadata_earns_hits_and_typechecks_a_fresh_consumer() {
     const LEAF: &str = "canonical_workspace_leaf";
     const CONSUMER: &str = "canonical_workspace_consumer";
@@ -7587,7 +7635,7 @@ fn canonical_cargo_workspace_leaf_metadata_earns_hits_and_typechecks_a_fresh_con
     let stock_family = stock_target.parent().unwrap().parent().unwrap();
 
     let (mut worker, environment) = NativeWorker::start(root);
-    let mut previous_key: Option<String> = None;
+    let mut previous_keys: Option<BTreeMap<String, String>> = None;
     let mut private_attempts = BTreeMap::new();
     let mut worker_requests = BTreeSet::new();
     let mut executions = 0;
@@ -7620,6 +7668,8 @@ fn canonical_cargo_workspace_leaf_metadata_earns_hits_and_typechecks_a_fresh_con
             ),
             _ => unreachable!(),
         }
+        let hit = matches!(number, 4 | 5);
+        let before_journal = hit.then(|| read_bounded(&worker.state.join("requests.json")));
         let (code, events, output) =
             run_with_environment(root, 850 + number, &profile, &environment);
         assert_eq!(code, 0, "{output}\nworker: {:?}", worker.events());
@@ -7637,20 +7687,17 @@ fn canonical_cargo_workspace_leaf_metadata_earns_hits_and_typechecks_a_fresh_con
         assert!(decisions(&events, "execute").is_empty(), "{output}");
         let offered = decisions(&events, "remote-offer");
         let hits = decisions(&events, "hit");
-        let hit = matches!(number, 4 | 5);
-        let leaf_key = if hit {
+        let keys = if hit {
             assert_eq!(
-                hits,
-                BTreeMap::from([(LEAF.to_owned(), previous_key.as_ref().unwrap().clone())]),
-                "only independently qualified library metadata may replay: {output}"
+                Some(&hits),
+                previous_keys.as_ref(),
+                "only independently qualified library and terminal metadata may replay: {output}"
             );
-            assert_eq!(
-                offered.len(),
-                1,
-                "the leaf hit dispatched compiler work: {output}"
+            assert!(
+                offered.is_empty(),
+                "a complete metadata hit dispatched compiler work: {output}"
             );
-            assert!(offered.contains_key(CONSUMER), "{output}");
-            previous_key.as_ref().unwrap().clone()
+            hits
         } else {
             assert!(
                 hits.is_empty(),
@@ -7665,21 +7712,22 @@ fn canonical_cargo_workspace_leaf_metadata_earns_hits_and_typechecks_a_fresh_con
                 offered.contains_key(LEAF) && offered.contains_key(CONSUMER),
                 "{output}"
             );
-            let key = offered[LEAF].clone();
-            if let Some(previous) = &previous_key {
-                if number <= 3 {
-                    assert_eq!(
-                        &key, previous,
-                        "identical fresh targets split the cache key"
-                    );
-                } else {
-                    assert_ne!(
-                        &key, previous,
-                        "changed closed input reused a workspace key"
-                    );
+            if let Some(previous) = &previous_keys {
+                for name in [LEAF, CONSUMER] {
+                    if number <= 3 {
+                        assert_eq!(
+                            offered[name], previous[name],
+                            "identical fresh targets split the {name} cache key"
+                        );
+                    } else {
+                        assert_ne!(
+                            offered[name], previous[name],
+                            "changed closed input reused a {name} workspace key"
+                        );
+                    }
                 }
             }
-            key
+            offered.clone()
         };
         let admitted = events
             .iter()
@@ -7704,36 +7752,37 @@ fn canonical_cargo_workspace_leaf_metadata_earns_hits_and_typechecks_a_fresh_con
             expected,
             "{output}"
         );
-        if hit {
-            assert!(
-                events
-                    .iter()
-                    .any(|event| event["decision"] == "served" && event["key"] == leaf_key),
-                "the cached metadata was not installed for this consumer: {output}"
+        for (name, class) in [
+            (LEAF, CLASS),
+            (CONSUMER, "rustc-workspace-terminal-metadata-v1"),
+        ] {
+            if hit {
+                assert!(
+                    events.iter().any(|event| {
+                        event["decision"] == "served" && event["key"] == keys[name]
+                    }),
+                    "the cached {name} metadata was not installed: {output}"
+                );
+            }
+            assert_closed_workspace_leaf_evidence(
+                root,
+                &keys[name],
+                if number <= 3 {
+                    number as usize
+                } else if hit {
+                    3
+                } else {
+                    1
+                },
+                class,
             );
         }
-        assert_fresh_workspace_execution(
-            root,
-            &events,
-            &output,
-            CONSUMER,
-            &offered[CONSUMER],
-            &mut private_attempts,
-        );
-        assert_closed_workspace_leaf_evidence(
-            root,
-            &leaf_key,
-            if number <= 3 {
-                number as usize
-            } else if hit {
-                3
-            } else {
-                1
-            },
-            CLASS,
-        );
-        executions += if hit { 1 } else { 2 };
-        assert!(worker_requests.insert(worker.completed_receipt()["request_id"].as_u64().unwrap()));
+        executions += offered.len();
+        if !offered.is_empty() {
+            assert!(
+                worker_requests.insert(worker.completed_receipt()["request_id"].as_u64().unwrap())
+            );
+        }
         assert_eq!(
             worker
                 .events()
@@ -7741,8 +7790,15 @@ fn canonical_cargo_workspace_leaf_metadata_earns_hits_and_typechecks_a_fresh_con
                 .filter(|event| event["kind"] == "worker-toolchain-acquired")
                 .count(),
             executions,
-            "a leaf hit must skip its compiler while the real consumer still executes"
+            "qualified library and terminal metadata hits must skip both compilers"
         );
+        if let Some(before) = before_journal {
+            assert_eq!(
+                read_bounded(&worker.state.join("requests.json")),
+                before,
+                "a complete metadata hit reached the worker request journal"
+            );
+        }
         if number == 5 {
             let families = fs::read_dir(root.join("state/canonical-compile-v1/private-target-v2"))
                 .unwrap()
@@ -7755,8 +7811,9 @@ fn canonical_cargo_workspace_leaf_metadata_earns_hits_and_typechecks_a_fresh_con
                 actual, stock_files,
                 "cache hit changed stock rmeta or dep-info bytes"
             );
+            assert_workspace_dag_ancestry(root, &keys, &actual, &[LEAF, CONSUMER]);
         }
-        previous_key = Some(leaf_key);
+        previous_keys = Some(keys);
     }
 
     // Selecting actual project code removes cache authority for this operation.
@@ -8189,6 +8246,294 @@ fn remote_native_workspace(command: &str) {
     worker.finish();
 }
 
+fn terminal_leaf_metadata_source(root: &Path, kind: &str, harness: Option<bool>) {
+    let harness = harness
+        .map(|value| format!("harness={value}\n"))
+        .unwrap_or_default();
+    write(
+        root,
+        "Cargo.toml",
+        format!(
+            "[package]\nname='canonical_terminal'\nversion='0.1.0'\nedition='2021'\nautobins=false\nautoexamples=false\nautotests=false\nautobenches=false\n[[{kind}]]\nname='{WORKSPACE_METADATA_DAG_CONSUMER}'\npath='main.rs'\n{harness}"
+        ),
+    );
+    write(
+        root,
+        "Cargo.lock",
+        "version=4\n\n[[package]]\nname='canonical_terminal'\nversion='0.1.0'\n",
+    );
+    write(
+        root,
+        "main.rs",
+        "const _: &str = env!(\"CARGO_PRIMARY_PACKAGE\");\npub const SOURCE: &str = include_str!(\"value.txt\");\npub const ENVIRONMENT: &str = env!(\"TERMINAL_METADATA_INPUT\");\nfn retained_dag_warning() {}\nfn main() { panic!(\"RABS_CHECK_TARGET_EXECUTED\"); }\n#[test]\nfn test_body_must_not_run() { panic!(\"RABS_CHECK_TARGET_EXECUTED\"); }\n",
+    );
+    write(root, "value.txt", "terminal metadata source\n");
+}
+
+fn terminal_leaf_metadata_observations(events: &[Value], output: &str) -> Vec<String> {
+    let started = events
+        .iter()
+        .filter(|event| event["kind"] == "canonical-compilation-started")
+        .collect::<Vec<_>>();
+    assert_eq!(started.len(), 1, "{output}");
+    assert_eq!(started[0]["command"], "check", "{output}");
+    assert_eq!(started[0]["private_target_state"], "cold", "{output}");
+    assert!(!output.contains("RABS_CHECK_TARGET_EXECUTED"), "{output}");
+    assert!(
+        !events.iter().any(|event| matches!(
+            event["kind"].as_str(),
+            Some(
+                "rabsd-remote-dependency-failed"
+                    | "rabsd-remote-dependency-install-failed"
+                    | "canonical-build-completed"
+            )
+        )),
+        "terminal metadata must not fall back or deliver a program: {output}"
+    );
+    let artifacts = output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| event["reason"] == "compiler-artifact")
+        .collect::<Vec<_>>();
+    assert_eq!(artifacts.len(), 1, "{output}");
+    assert_eq!(
+        artifacts[0]["target"]["name"],
+        WORKSPACE_METADATA_DAG_CONSUMER
+    );
+    assert_eq!(
+        artifacts[0]["fresh"], false,
+        "Cargo Fresh bypassed the wrapper"
+    );
+    assert!(artifacts[0]["executable"].is_null(), "{output}");
+    workspace_dag_diagnostics(output, &[WORKSPACE_METADATA_DAG_CONSUMER])
+}
+
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; real terminal metadata qualification, empty-file replay, diagnostics and source/environment invalidation"]
+fn canonical_terminal_metadata_leaves_earn_hits_without_running_programs_or_harnesses() {
+    use rabs_cas::metadata_store::RabsMetadataStore;
+
+    for (kind, harness) in [
+        ("bin", None),
+        ("example", None),
+        ("test", Some(true)),
+        ("test", Some(false)),
+        ("bench", Some(true)),
+        ("bench", Some(false)),
+    ] {
+        let (owner, mut profile) = native_fixture();
+        let root = owner.path();
+        let first = root.join("terminal-a");
+        let second = root.join("terminal-b");
+        terminal_leaf_metadata_source(&first, kind, harness);
+        terminal_leaf_metadata_source(&second, kind, harness);
+        profile["source_root"] = json!(first);
+        profile["vendor"] = Value::Null;
+        profile["command"] = json!("check");
+        profile["selection"] = json!({});
+        profile["selection"][kind] = json!([WORKSPACE_METADATA_DAG_CONSUMER]);
+        profile["env"] = json!({"TERMINAL_METADATA_INPUT":"original terminal environment"});
+        profile["target_cache"] =
+            json!({"runtime_epoch":"terminal-metadata-stock-v1", "max_bytes":268435456});
+
+        let (code, events, output) = run(root, 1300, &profile);
+        assert_eq!(code, 0, "{kind}/{harness:?}: {output}");
+        for decision in ["remote-offer", "execute", "hit"] {
+            assert!(decisions(&events, decision).is_empty(), "{output}");
+        }
+        let stock_diagnostics = terminal_leaf_metadata_observations(&events, &output);
+        let stock_target = sole_retained_target(root);
+        let stock_files = workspace_dag_metadata_files(&stock_target, &output, &[]);
+        let mut families = BTreeSet::from([stock_target
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf()]);
+
+        let (mut worker, environment) = NativeWorker::start(root);
+        let mut previous_key: Option<String> = None;
+        let mut request_ids = BTreeSet::new();
+        let mut executions = 0;
+        for number in 1..=7 {
+            match number {
+                1..=4 => {}
+                5 => profile["source_root"] = json!(second),
+                6 => write(&second, "value.txt", "changed terminal source bytes\n"),
+                7 => {
+                    profile["env"]["TERMINAL_METADATA_INPUT"] =
+                        json!("changed declared terminal environment")
+                }
+                _ => unreachable!(),
+            }
+            // Retain actual delivered bytes, but never let a previous Cargo
+            // target satisfy the request before the terminal cache is checked.
+            profile["target_cache"] = json!({
+                "runtime_epoch":format!("terminal-metadata-{number}-v1"),
+                "max_bytes":268435456,
+            });
+            let hit = matches!(number, 4 | 5);
+            let journal = hit.then(|| read_bounded(&worker.state.join("requests.json")));
+            let (code, events, output) =
+                run_with_environment(root, 1300 + number, &profile, &environment);
+            assert_eq!(code, 0, "{kind}/{harness:?}: {output}");
+            let diagnostics = terminal_leaf_metadata_observations(&events, &output);
+            let offered = decisions(&events, "remote-offer");
+            let hits = decisions(&events, "hit");
+            assert!(decisions(&events, "execute").is_empty(), "{output}");
+            let key = if hit {
+                assert!(
+                    offered.is_empty(),
+                    "a trained terminal hit dispatched rustc: {output}"
+                );
+                assert_eq!(
+                    hits,
+                    BTreeMap::from([(
+                        WORKSPACE_METADATA_DAG_CONSUMER.to_owned(),
+                        previous_key.as_ref().unwrap().clone(),
+                    )]),
+                    "the exact independently trained terminal action must replay: {output}"
+                );
+                previous_key.as_ref().unwrap().clone()
+            } else {
+                assert!(
+                    hits.is_empty(),
+                    "unearned or invalidated terminal hit: {output}"
+                );
+                assert_eq!(offered.len(), 1, "{output}");
+                let key = offered[WORKSPACE_METADATA_DAG_CONSUMER].clone();
+                if let Some(previous) = &previous_key {
+                    if number <= 3 {
+                        assert_eq!(&key, previous, "cold target split terminal identity");
+                    } else {
+                        assert_ne!(&key, previous, "changed input reused terminal identity");
+                    }
+                }
+                key
+            };
+            let expected = offered.values().cloned().collect::<BTreeSet<_>>();
+            for event_kind in [
+                "rabsd-remote-dependency-admitted",
+                "rabsd-remote-dependency-executed",
+            ] {
+                let actual = events
+                    .iter()
+                    .filter(|event| event["kind"] == event_kind)
+                    .map(|event| event["key"].as_str().unwrap().to_owned())
+                    .collect::<Vec<_>>();
+                assert_eq!(actual.len(), expected.len(), "{event_kind}: {output}");
+                assert_eq!(actual.into_iter().collect::<BTreeSet<_>>(), expected);
+            }
+            if hit {
+                assert!(
+                    events
+                        .iter()
+                        .any(|event| { event["decision"] == "served" && event["key"] == key }),
+                    "cached terminal files were not installed: {output}"
+                );
+            }
+            assert_closed_workspace_leaf_evidence(
+                root,
+                &key,
+                if number <= 3 {
+                    number as usize
+                } else if hit {
+                    3
+                } else {
+                    1
+                },
+                "rustc-workspace-terminal-leaf-metadata-v1",
+            );
+            let cas = rabsd::janitor::store::mount_and_reconcile(
+                &root.join("state/canonical-compile-v1/cas"),
+            )
+            .unwrap();
+            assert!(
+                cas.store()
+                    .lock()
+                    .unwrap()
+                    .list_provisional_ancestors(&key)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_no_immutable_leaf_qualification(root, &key);
+            let new_families =
+                fs::read_dir(root.join("state/canonical-compile-v1/private-target-v2"))
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .filter(|family| !families.contains(family))
+                    .collect::<Vec<_>>();
+            assert_eq!(
+                new_families.len(),
+                1,
+                "each check needs its own cold target"
+            );
+            let files =
+                workspace_dag_metadata_files(&new_families[0].join("seed/target"), &output, &[]);
+            assert!(families.insert(new_families[0].clone()));
+            if number <= 5 {
+                assert_eq!(
+                    files, stock_files,
+                    "stock/cold/hit empty metadata or dep-info differs"
+                );
+                assert_eq!(
+                    diagnostics, stock_diagnostics,
+                    "terminal diagnostics changed on replay"
+                );
+            }
+            executions += offered.len();
+            if !offered.is_empty() {
+                assert!(
+                    request_ids.insert(worker.completed_receipt()["request_id"].as_u64().unwrap())
+                );
+            }
+            assert_eq!(
+                worker
+                    .events()
+                    .iter()
+                    .filter(|event| event["kind"] == "worker-toolchain-acquired")
+                    .count(),
+                executions,
+                "a terminal hit acquired a compiler"
+            );
+            if let Some(journal) = journal {
+                assert_eq!(read_bounded(&worker.state.join("requests.json")), journal);
+            }
+            previous_key = Some(key);
+        }
+
+        // An actual type error after successful replay must reach rustc and
+        // fail. Returning the earlier empty rmeta would incorrectly succeed.
+        let body = fs::read_to_string(second.join("main.rs")).unwrap();
+        write(
+            &second,
+            "main.rs",
+            format!("{body}\nconst _: [(); 1] = [(); 2];\n"),
+        );
+        profile["target_cache"] =
+            json!({"runtime_epoch":"terminal-metadata-invalid-v1", "max_bytes":268435456});
+        let (code, events, output) = run_with_environment(root, 1308, &profile, &environment);
+        assert_ne!(
+            code, 0,
+            "invalid source replayed successful terminal metadata: {output}"
+        );
+        assert!(decisions(&events, "hit").is_empty(), "{output}");
+        assert!(output.contains("mismatched types"), "{output}");
+        assert_eq!(
+            worker
+                .events()
+                .iter()
+                .filter(|event| event["kind"] == "worker-toolchain-acquired")
+                .count(),
+            executions + 1,
+            "changed invalid terminal input never reached the worker"
+        );
+        assert!(fs::read_dir(root.join("ops")).unwrap().next().is_none());
+        worker.finish();
+        let _retained = owner.keep();
+    }
+}
+
 fn metadata_check_targets(root: &Path, leaf: u32) {
     source(root, leaf);
     // Keep the unused development-macro files in the snapshot, but select a
@@ -8238,8 +8583,10 @@ fn metadata_check_targets(root: &Path, leaf: u32) {
 }
 
 #[test]
-#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual all-target Cargo checks, metadata installation and fresh workspace execution"]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual all-target Cargo checks, exact metadata installation and independently qualified workspace attempts"]
 fn canonical_cargo_check_offloads_binary_example_and_test_harness_metadata_without_running_them() {
+    use rabs_cas::metadata_store::{RabsMetadataStore, SqlValue};
+
     let (owner, mut profile) = native_fixture();
     let first = owner.path().join("source-a");
     let second = owner.path().join("source-b");
@@ -8258,6 +8605,7 @@ fn canonical_cargo_check_offloads_binary_example_and_test_harness_metadata_witho
         ("metadata_standard_bench".to_owned(), 1),
     ]);
     let mut attempts = BTreeMap::new();
+    let mut published_attempts = BTreeMap::<String, usize>::new();
     let mut previous_keys = BTreeSet::new();
     let mut previous_receipt: Option<Value> = None;
     let mut final_output = String::new();
@@ -8282,7 +8630,7 @@ fn canonical_cargo_check_offloads_binary_example_and_test_harness_metadata_witho
         );
         assert!(
             decisions(&events, "hit").is_empty() && decisions(&events, "execute").is_empty(),
-            "a workspace unit used cache authority or local fallback: {output}"
+            "fewer than three matching executions cannot earn a hit or use local fallback: {output}"
         );
         assert!(
             !events.iter().any(|event| matches!(
@@ -8329,14 +8677,61 @@ fn canonical_cargo_check_offloads_binary_example_and_test_harness_metadata_witho
         for (key, name) in &offered {
             if expected.contains_key(name) {
                 *observed.entry(name.clone()).or_insert(0_usize) += 1;
-                workspace_keys.insert(assert_fresh_workspace_execution(
-                    owner.path(),
-                    &events,
-                    &output,
-                    name,
-                    key,
-                    &mut attempts,
-                ));
+                let published_class = {
+                    let cas = rabsd::janitor::store::mount_and_reconcile(
+                        &owner.path().join("state/canonical-compile-v1/cas"),
+                    )
+                    .unwrap();
+                    let mut store = cas.store().lock().unwrap();
+                    if store.published_manifest_key_str(key).unwrap().is_some() {
+                        let rows = store.query(
+                            "SELECT decision FROM decision_receipts WHERE kind = ?1 AND subject = ?2 AND seq = 0",
+                            &[
+                                SqlValue::Text("rabs-live-action-class-v1".into()),
+                                SqlValue::Text(key.clone()),
+                            ],
+                        ).unwrap();
+                        let [row] = rows.as_slice() else {
+                            panic!("published metadata lacks its exact class: {rows:?}");
+                        };
+                        let [SqlValue::Text(class)] = row.as_slice() else {
+                            panic!("invalid metadata class record: {row:?}");
+                        };
+                        Some(class.clone())
+                    } else {
+                        None
+                    }
+                };
+                if let Some(class) = published_class {
+                    assert!(
+                        matches!(
+                            class.as_str(),
+                            "rustc-workspace-closed-metadata-v1"
+                                | "rustc-workspace-committed-metadata-v1"
+                                | "rustc-workspace-committed-mixed-metadata-v1"
+                                | "rustc-workspace-committed-dag-metadata-v1"
+                                | "rustc-workspace-terminal-leaf-metadata-v1"
+                                | "rustc-workspace-terminal-metadata-v1"
+                        ),
+                        "a check borrowed an incompatible publication class: {class}"
+                    );
+                    let count = published_attempts.entry(key.clone()).or_default();
+                    *count += 1;
+                    assert_closed_workspace_leaf_evidence(owner.path(), key, *count, &class);
+                    workspace_keys.insert(key.clone());
+                } else {
+                    // Earlier empty terminal outputs may be visible candidates
+                    // without producer authority. Preserve fresh execution and
+                    // its absence-of-publication proof for those later units.
+                    workspace_keys.insert(assert_fresh_workspace_execution(
+                        owner.path(),
+                        &events,
+                        &output,
+                        name,
+                        key,
+                        &mut attempts,
+                    ));
+                }
             }
         }
         assert_eq!(

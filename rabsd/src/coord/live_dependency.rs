@@ -510,6 +510,13 @@ impl PendingServe {
         &self.manifest_key
     }
 
+    /// Terminal check outputs are delivered only as a complete result. Their
+    /// required metadata file may be empty and never starts a dependent unit.
+    #[must_use]
+    pub fn supports_metadata(&self) -> bool {
+        self.request.plan.source_kind != DependencySourceKind::WorkspaceTerminalMetadata
+    }
+
     fn verify_inputs(&self) -> Result<(), String> {
         self.request
             .verify_enforced_read_closure(self.remote_validation.as_ref())?;

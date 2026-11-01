@@ -28,6 +28,11 @@ pub fn metadata_replay_prefix_len(
     // Revalidate the rendered path fields, including escaped/ambiguous events.
     // Selection is not a second, weaker transcript admission grammar.
     canonicalize_compiler_transcript(rendered, plan)?;
+    if plan.source_kind == super::DependencySourceKind::WorkspaceTerminalMetadata {
+        // Terminal checks can emit an empty required rmeta and never authorize
+        // a dependent compiler. Replay every event after the complete install.
+        return Ok(None);
+    }
     let mut remaining = BTreeSet::new();
     for output in &plan.outputs.declarations {
         if output.class == OutputClass::ProvisionalMetadata {
