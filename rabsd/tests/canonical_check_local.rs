@@ -10,6 +10,7 @@
 use rabs_asupersync::process_groups::ManagedProcessGroup;
 use rabs_asupersync::region_tree::Attribution;
 use rabs_asupersync::stream_drain::DrainLimits;
+use rabs_asupersync::termination::{TerminationPolicy, graceful_shutdown};
 use rabs_asupersync::worker_transport::TlsFiles;
 use rabs_sandbox::canonical_namespace::HostIsolationSupport;
 use serde_json::{Value, json};
@@ -608,6 +609,39 @@ impl SharedServiceChild {
             self.diagnostics(),
         )
     }
+
+    fn shutdown(mut self, budget: Duration) -> Result<(), String> {
+        let started = Instant::now();
+        let final_wait = Duration::from_secs(2).min(budget / 2);
+        let receipt = graceful_shutdown(
+            self.process.as_mut().unwrap(),
+            &TerminationPolicy {
+                grace: budget.saturating_sub(final_wait),
+                final_wait,
+                ..TerminationPolicy::default()
+            },
+        );
+        if receipt.ownership_resolved {
+            self.process.take();
+        }
+        // Output is already drained into ordinary files. Keep the foreground
+        // client's fast cancellation policy separate from orderly service
+        // shutdown: removing a complete retained SDK can exceed 250ms.
+        if receipt.ownership_resolved
+            && !receipt.kill_sent
+            && receipt
+                .leader_exit
+                .is_some_and(|exit| exit.exit_code == Some(0) && exit.signal.is_none())
+            && started.elapsed() < budget
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "native service did not shut down cooperatively within {budget:?}: {receipt:?}\n{}",
+                self.diagnostics()
+            ))
+        }
+    }
 }
 
 impl Drop for SharedServiceChild {
@@ -617,6 +651,55 @@ impl Drop for SharedServiceChild {
                 process.wait_with_bounded_drain_budget(&DrainLimits::new(&self.drain), 0, || true);
         }
     }
+}
+
+#[test]
+fn shared_service_shutdown_allows_cleanup_and_rejects_escalation_or_nonzero_exit() {
+    let root = tempfile::tempdir().unwrap();
+    let spawn = |name: &str, handler: &str| {
+        let mut command = Command::new("/bin/sh");
+        command.current_dir(root.path()).args([
+            "-c",
+            &format!(
+                "trap '{handler}' TERM; printf ready > {name}.ready; while :; do sleep 0.01; done"
+            ),
+        ]);
+        let mut child = SharedServiceChild::spawn(root.path(), name, command);
+        let started = Instant::now();
+        while !root.path().join(format!("{name}.ready")).exists() {
+            child.assert_running();
+            assert!(started.elapsed() < Duration::from_secs(2));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        child
+    };
+
+    let legacy = spawn("legacy", "sleep 0.4; printf clean > legacy.clean; exit 0");
+    let (code, _, diagnostics) = legacy.finish(Duration::from_secs(3), true);
+    assert_eq!(code, -1, "{diagnostics}");
+    assert!(!root.path().join("legacy.clean").exists());
+
+    spawn(
+        "cooperative",
+        "sleep 0.4; printf clean > cooperative.clean; exit 0",
+    )
+    .shutdown(Duration::from_secs(3))
+    .unwrap();
+    assert_eq!(
+        fs::read(root.path().join("cooperative.clean")).unwrap(),
+        b"clean"
+    );
+
+    let uncooperative = spawn("ignores-term", "");
+    let pgid = uncooperative.process.as_ref().unwrap().pgid();
+    let error = uncooperative.shutdown(Duration::from_secs(3)).unwrap_err();
+    assert!(error.contains("kill_sent: true"), "{error}");
+    assert!(rabs_asupersync::process_groups::members_from_proc(pgid).is_empty());
+
+    let error = spawn("nonzero", "exit 7")
+        .shutdown(Duration::from_secs(3))
+        .unwrap_err();
+    assert!(error.contains("exit_code: Some(7)"), "{error}");
 }
 
 fn shared_service_command(root: &Path) -> Command {
@@ -1579,7 +1662,7 @@ fn canonical_shared_remote_flight_survives_origin_cancellation() {
         worker.completed_receipt()["request_id"].as_u64().unwrap()
             > receipt["request_id"].as_u64().unwrap()
     );
-    service.finish(Duration::from_secs(15), true);
+    service.shutdown(Duration::from_secs(15)).unwrap();
     worker.finish();
 }
 
@@ -1806,7 +1889,7 @@ fn canonical_shared_remote_queue_coalesces_and_survives_origin_cancellation() {
         !surviving_operation.exists(),
         "completed delivery retained its subscriber operation"
     );
-    service.finish(Duration::from_secs(15), true);
+    service.shutdown(Duration::from_secs(15)).unwrap();
     worker.finish();
 }
 
@@ -2116,7 +2199,7 @@ fn canonical_shared_workspace_queue_keeps_fresh_executions_and_cancels_one_waite
         "local fallback or cache replay cannot satisfy fresh queued workspace execution: {events:?}"
     );
     assert!(all_operations.iter().all(|path| !path.exists()));
-    service.finish(Duration::from_secs(15), true);
+    service.shutdown(Duration::from_secs(15)).unwrap();
     worker.finish();
 
     // Open the production store only after the service has released it. Two
@@ -2384,7 +2467,7 @@ fn canonical_shared_remote_failover_preserves_generation_and_surviving_subscribe
         !origin_operation.exists(),
         "the retry retained its departed origin"
     );
-    service.finish(Duration::from_secs(15), true);
+    service.shutdown(Duration::from_secs(15)).unwrap();
     second_worker.finish();
 }
 
@@ -2609,7 +2692,7 @@ fn canonical_shared_service_overlaps_builds_scopes_cancellation_and_reuses_priva
         "cancelled Cargo root did not drain"
     );
     service.assert_running();
-    service.finish(Duration::from_secs(15), true);
+    service.shutdown(Duration::from_secs(15)).unwrap();
     assert!(
         retained_service_toolchains(&root.join("state")).is_empty(),
         "service shutdown must join preparation and release its retained images"
@@ -2765,7 +2848,7 @@ fn canonical_shared_service_queues_before_capture_and_cancels_only_waiting_inter
     let (code, events, output) = warm.finish(Duration::from_secs(180), false);
     assert_eq!(code, 0, "{output}");
     assert_shared_service_build(root, 7003, &events, &output, "B:244\n", "restored");
-    service.finish(Duration::from_secs(15), true);
+    service.shutdown(Duration::from_secs(15)).unwrap();
 }
 
 #[test]
@@ -3161,7 +3244,7 @@ fn canonical_explicit_environment(shared: bool) {
     assert!(output.contains("EXPLICIT_ENV_TEST=50"), "{output}");
 
     if let Some(service) = service {
-        service.finish(Duration::from_secs(15), true);
+        service.shutdown(Duration::from_secs(15)).unwrap();
     } else {
         profile["command"] = json!("run");
         profile["selection"] = json!({"run_args":["--verify-runtime"]});
