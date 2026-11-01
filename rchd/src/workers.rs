@@ -398,12 +398,191 @@ enum DrainCompletionAction {
 }
 
 /// Transport recovery is independent of both operator intent and capability
-/// quarantine. Only the health monitor may dial a transport that is down.
+/// quarantine. Current health checks and historical ownership recovery share
+/// this state even after an endpoint leaves the configured inventory.
 #[derive(Debug, Default)]
 struct WorkerTransportState {
     failures: u32,
     down: bool,
+    connected: bool,
+    positive_evidence: Option<TransportProbeDeadline>,
     next_probe: Option<TransportProbeDeadline>,
+}
+
+#[derive(Debug, Clone)]
+struct RecoveryTransportPolicy {
+    circuit: CircuitBreakerConfig,
+    normal_interval: Duration,
+    probe_timeout: Duration,
+}
+
+impl Default for RecoveryTransportPolicy {
+    fn default() -> Self {
+        let health = crate::health::HealthConfig::default();
+        Self {
+            circuit: health.circuit,
+            normal_interval: health.check_interval,
+            probe_timeout: health.check_timeout,
+        }
+    }
+}
+
+/// A transport belongs to immutable connection coordinates, not a mutable
+/// worker ID. Retargeting A -> B -> A must not reset A's outage clock or allow
+/// cancellation and lease recovery to become independent outage probes.
+#[derive(Debug)]
+struct EndpointTransport {
+    state: Mutex<WorkerTransportState>,
+    probe: Arc<Mutex<()>>,
+    recovery: Arc<Mutex<()>>,
+    changes: watch::Sender<u64>,
+}
+
+impl EndpointTransport {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(WorkerTransportState::default()),
+            probe: Arc::new(Mutex::new(())),
+            recovery: Arc::new(Mutex::new(())),
+            changes: watch::channel(0).0,
+        }
+    }
+
+    fn revision(&self) -> u64 {
+        *self.changes.borrow()
+    }
+
+    fn revision_guard(&self) -> BackgroundProbe {
+        let changes = self.changes.subscribe();
+        let revision = *changes.borrow();
+        BackgroundProbe {
+            changes,
+            revision,
+            transport: None,
+        }
+    }
+
+    fn revoke(&self) {
+        self.changes
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+    }
+
+    async fn reset(&self) {
+        let mut state = self.state.lock().await;
+        *state = WorkerTransportState::default();
+        self.revoke();
+    }
+
+    async fn record_result(
+        &self,
+        connected: bool,
+        normal_interval: Duration,
+        circuit: &CircuitBreakerConfig,
+    ) -> (bool, bool) {
+        let mut state = self.state.lock().await;
+        self.record_result_locked(&mut state, connected, normal_interval, circuit)
+    }
+
+    async fn record_probe_result(
+        &self,
+        network: &BackgroundProbe,
+        connected: bool,
+        normal_interval: Duration,
+        circuit: &CircuitBreakerConfig,
+    ) -> Option<(bool, bool)> {
+        let mut state = self.state.lock().await;
+        network
+            .is_current()
+            .then(|| self.record_result_locked(&mut state, connected, normal_interval, circuit))
+    }
+
+    fn record_result_locked(
+        &self,
+        state: &mut WorkerTransportState,
+        connected: bool,
+        normal_interval: Duration,
+        circuit: &CircuitBreakerConfig,
+    ) -> (bool, bool) {
+        let was_down = state.down;
+        state.connected = connected;
+        state.positive_evidence = connected.then(|| TransportProbeDeadline::new(normal_interval));
+        if connected {
+            state.failures = 0;
+            state.down = false;
+        } else {
+            state.failures = state.failures.saturating_add(1);
+            state.down |= state.failures >= circuit.failure_threshold.max(1);
+        }
+        let down = state.down;
+        if down || was_down {
+            state.next_probe = Some(TransportProbeDeadline::new(if down {
+                circuit.recovery_probe_interval()
+            } else {
+                normal_interval
+            }));
+        }
+        if !connected {
+            // All producers, including a current worker reintroduced during a
+            // historical probe, lose their old network permission together.
+            self.revoke();
+        }
+        (was_down, down)
+    }
+
+    async fn historical_recovery_eligible(&self) -> bool {
+        if self.recovery.try_lock().is_err() {
+            return false;
+        }
+        let state = self.state.lock().await;
+        let due = state
+            .next_probe
+            .is_none_or(|deadline| deadline.remaining().is_zero());
+        (state.connected
+            && !state.down
+            && state
+                .positive_evidence
+                .is_some_and(|evidence| !evidence.remaining().is_zero()))
+            || (due && self.probe.try_lock().is_ok())
+    }
+}
+
+#[derive(Debug, Default)]
+struct EndpointTransports {
+    endpoints: std::sync::Mutex<HashMap<WorkerEndpointIdentity, Arc<EndpointTransport>>>,
+}
+
+impl EndpointTransports {
+    fn get(&self, config: &WorkerConfig) -> Arc<EndpointTransport> {
+        let identity = WorkerEndpointIdentity::from_config(config);
+        let mut endpoints = self
+            .endpoints
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(transport) = endpoints.get(&identity) {
+            return transport.clone();
+        }
+        // A failed or unproven endpoint must retain its threshold and slow
+        // cadence even once the next probe becomes due. Only expired positive
+        // evidence with no worker/operation owner is safe to forget.
+        endpoints.retain(|_, transport| {
+            if Arc::strong_count(transport) != 1 {
+                return true;
+            }
+            let Ok(state) = transport.state.try_lock() else {
+                return true;
+            };
+            !(state.connected
+                && !state.down
+                && state.failures == 0
+                && state
+                    .positive_evidence
+                    .is_some_and(|evidence| evidence.remaining().is_zero()))
+        });
+        endpoints
+            .entry(identity)
+            .or_insert_with(|| Arc::new(EndpointTransport::new()))
+            .clone()
+    }
 }
 
 /// Store elapsed-time arithmetic instead of adding an operator-supplied u64
@@ -435,40 +614,149 @@ impl TransportProbeDeadline {
 pub(crate) struct BackgroundProbe {
     changes: watch::Receiver<u64>,
     revision: u64,
+    transport: Option<(watch::Receiver<u64>, u64)>,
 }
 
 impl BackgroundProbe {
     pub(crate) fn is_current(&self) -> bool {
         *self.changes.borrow() == self.revision
+            && self
+                .transport
+                .as_ref()
+                .is_none_or(|(changes, revision)| *changes.borrow() == *revision)
     }
 
     pub(crate) async fn run<F: std::future::Future>(&mut self, operation: F) -> Option<F::Output> {
         if !self.is_current() {
             return None;
         }
-        tokio::select! {
+        let result = tokio::select! {
             biased;
             _ = self.changes.changed() => None,
-            result = operation => self.is_current().then_some(result),
-        }
+            () = async {
+                match &mut self.transport {
+                    Some((changes, _)) => { let _ = changes.changed().await; }
+                    None => std::future::pending().await,
+                }
+            } => None,
+            result = operation => Some(result),
+        };
+        self.is_current().then_some(result).flatten()
     }
 }
 
 pub(crate) struct HealthProbePermit {
     pub(crate) network: BackgroundProbe,
+    pub(crate) endpoint: WorkerEndpointSnapshot,
     /// Recovery uses a fresh, bounded connection rather than reviving either
     /// warm pool before the worker has proved it can run a command.
     pub(crate) isolated: bool,
+    transport: Arc<EndpointTransport>,
     _singleflight: OwnedMutexGuard<()>,
 }
 
-/// Transport evidence may defer owned-work recovery only for the endpoint
-/// that evidence describes. Administrative intent is checked independently
-/// by worker ID, including when the owned endpoint is no longer in inventory.
-pub(crate) enum OwnedRecoveryAdmission {
-    Deferred,
-    Historical,
-    Current(BackgroundProbe),
+/// Speculative admission is side-effect free. The operation lane and any due
+/// historical probe are claimed only when `run` is polled under the caller's
+/// stable worker-ID administrative permit.
+pub(crate) struct OwnedRecoveryPermit {
+    endpoint: WorkerConfig,
+    transport: Arc<EndpointTransport>,
+    policy: RecoveryTransportPolicy,
+    current: Option<BackgroundProbe>,
+    health_changes: watch::Sender<u64>,
+}
+
+/// The health monitor may have skipped a reintroduced endpoint while its
+/// historical probe held this lane. Wake it after releasing the mutex even
+/// when the probe future is cancelled, without resetting the shared deadline.
+struct HistoricalProbeFlight {
+    singleflight: Option<OwnedMutexGuard<()>>,
+    health_changes: watch::Sender<u64>,
+}
+
+impl Drop for HistoricalProbeFlight {
+    fn drop(&mut self) {
+        // Notify only once the monitor can acquire the lane; notifying first
+        // could make it observe a busy lane and sleep through the next probe.
+        drop(self.singleflight.take());
+        self.health_changes
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+    }
+}
+
+impl OwnedRecoveryPermit {
+    pub(crate) async fn run<F: std::future::Future>(&mut self, operation: F) -> Option<F::Output> {
+        let endpoint = self.endpoint.clone();
+        let timeout = self.policy.probe_timeout;
+        self.run_with_probe(
+            operation,
+            crate::health::probe_owned_recovery_transport(&endpoint, timeout),
+        )
+        .await
+    }
+
+    async fn run_with_probe<F: std::future::Future, P: std::future::Future<Output = bool>>(
+        &mut self,
+        operation: F,
+        probe: P,
+    ) -> Option<F::Output> {
+        let _operation = self.transport.recovery.clone().try_lock_owned().ok()?;
+        if let Some(current) = &mut self.current {
+            if !current.is_current() || self.transport.state.lock().await.down {
+                return None;
+            }
+            return current.run(operation).await;
+        }
+
+        let mut network = self.transport.revision_guard();
+        let needs_probe = {
+            let state = self.transport.state.lock().await;
+            !(state.connected
+                && !state.down
+                && state
+                    .positive_evidence
+                    .is_some_and(|evidence| !evidence.remaining().is_zero()))
+        };
+        if needs_probe {
+            let flight = HistoricalProbeFlight {
+                singleflight: Some(self.transport.probe.clone().try_lock_owned().ok()?),
+                health_changes: self.health_changes.clone(),
+            };
+            {
+                let mut state = self.transport.state.lock().await;
+                if state
+                    .next_probe
+                    .is_some_and(|deadline| !deadline.remaining().is_zero())
+                {
+                    return None;
+                }
+                // Reserve the next probe before any SSH work, including the
+                // local capability check. Aborting this future cannot grant
+                // unchecked recovery or move the next attempt earlier.
+                state.connected = false;
+                state.positive_evidence = None;
+                state.next_probe = Some(TransportProbeDeadline::new(if state.down {
+                    self.policy.circuit.recovery_probe_interval()
+                } else {
+                    self.policy.normal_interval
+                }));
+            }
+            let connected = network.run(probe).await?;
+            self.transport
+                .record_probe_result(
+                    &network,
+                    connected,
+                    self.policy.normal_interval,
+                    &self.policy.circuit,
+                )
+                .await?;
+            if !connected {
+                return None;
+            }
+            drop(flight);
+        }
+        network.run(operation).await
+    }
 }
 
 /// State of a single worker.
@@ -491,11 +779,12 @@ pub struct WorkerState {
     /// consumer, so a bypassed or canary-pending worker stays out of the
     /// scheduler automatically with no extra bookkeeping.
     lifecycle: RwLock<WorkerLifecycle>,
-    transport: Mutex<WorkerTransportState>,
+    transport: std::sync::RwLock<Arc<EndpointTransport>>,
+    endpoint_transports: Arc<EndpointTransports>,
     connection_ready: AtomicBool,
+    ready_transport_revision: AtomicU64,
     network_changes: watch::Sender<u64>,
     network_transition: Mutex<()>,
-    health_probe: Arc<Mutex<()>>,
     /// Both daemon SSH pools obey the same worker lifecycle. Keeping their
     /// registrations on the worker also covers disables outside the HTTP API.
     ssh_pools: RwLock<Vec<Arc<rch_common::SshPool>>>,
@@ -594,7 +883,7 @@ struct WorkerEndpointIncarnation {
 
 /// Stable coordinates used by durable filesystem obligations. CPU capacity
 /// and descriptive tags do not change the filesystem that failed.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct WorkerEndpointIdentity {
     pub id: WorkerId,
@@ -657,6 +946,19 @@ impl WorkerState {
     }
 
     fn with_disk_slot_policy(config: WorkerConfig, disk_slot_policy: DiskSlotPolicy) -> Self {
+        Self::with_endpoint_transports(
+            config,
+            disk_slot_policy,
+            Arc::new(EndpointTransports::default()),
+        )
+    }
+
+    fn with_endpoint_transports(
+        config: WorkerConfig,
+        disk_slot_policy: DiskSlotPolicy,
+        endpoint_transports: Arc<EndpointTransports>,
+    ) -> Self {
+        let transport = endpoint_transports.get(&config);
         Self {
             id: config.id.clone(),
             config: RwLock::new(config),
@@ -665,11 +967,12 @@ impl WorkerState {
                 retired: AtomicBool::new(false),
             }),
             lifecycle: RwLock::new(WorkerLifecycle::new()),
-            transport: Mutex::new(WorkerTransportState::default()),
+            transport: std::sync::RwLock::new(transport),
+            endpoint_transports,
             connection_ready: AtomicBool::new(true),
+            ready_transport_revision: AtomicU64::new(0),
             network_changes: watch::channel(0).0,
             network_transition: Mutex::new(()),
-            health_probe: Arc::new(Mutex::new(())),
             ssh_pools: RwLock::new(Vec::new()),
             used_slots: Arc::new(AtomicU32::new(0)),
             speed_score: AtomicU64::new(50.0_f64.to_bits()), // Default mid-range score
@@ -697,6 +1000,18 @@ impl WorkerState {
             .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
 
+    fn transport(&self) -> Arc<EndpointTransport> {
+        self.transport
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    fn connection_is_ready(&self) -> bool {
+        self.connection_ready.load(Ordering::Acquire)
+            && self.ready_transport_revision.load(Ordering::Acquire) == self.transport().revision()
+    }
+
     pub(crate) fn require_connection_probe(&self) {
         self.connection_ready.store(false, Ordering::Release);
         self.revoke_background_network();
@@ -713,7 +1028,7 @@ impl WorkerState {
     }
 
     pub(crate) async fn background_network_allowed(&self) -> bool {
-        self.connection_ready.load(Ordering::Acquire) && self.admin_allows_network().await
+        self.connection_is_ready() && self.admin_allows_network().await
     }
 
     pub(crate) async fn background_probe(&self) -> Option<BackgroundProbe> {
@@ -727,7 +1042,13 @@ impl WorkerState {
     pub(crate) fn network_revision_guard(&self) -> BackgroundProbe {
         let changes = self.network_changes.subscribe();
         let revision = *changes.borrow();
-        BackgroundProbe { changes, revision }
+        let transport_changes = self.transport().changes.subscribe();
+        let transport_revision = *transport_changes.borrow();
+        BackgroundProbe {
+            changes,
+            revision,
+            transport: Some((transport_changes, transport_revision)),
+        }
     }
 
     /// Fence publication against disable/enable ABA. Endpoint guards protect
@@ -743,41 +1064,17 @@ impl WorkerState {
     }
 
     pub(crate) async fn transport_is_down(&self) -> bool {
-        self.transport.lock().await.down
-    }
-
-    /// Keep automatic cancellation/recovery from becoming extra outage probes
-    /// between the worker's bounded health checks. This does not grant build
-    /// ownership or adopt today's config: callers still use their immutable
-    /// admitted endpoint. Matching coordinates include recovered snapshots
-    /// from a prior daemon; they do not require a current runtime incarnation.
-    pub(crate) async fn owned_recovery_admission(
-        &self,
-        owned: &WorkerConfig,
-    ) -> OwnedRecoveryAdmission {
-        let permit = self.network_revision_guard();
-        let current = self.config.read().await;
-        if self.is_endpoint_retired() || !permit.is_current() {
-            return OwnedRecoveryAdmission::Deferred;
-        }
-        if !same_endpoint(&current, owned) {
-            return OwnedRecoveryAdmission::Historical;
-        }
-        if self.transport_is_down().await || !permit.is_current() {
-            return OwnedRecoveryAdmission::Deferred;
-        }
-        // Readiness/circuit/storage quarantine cannot veto termination of
-        // already-owned work. A subsequent transport failure or retarget
-        // revokes this permit without holding the config lock across SSH.
-        OwnedRecoveryAdmission::Current(permit)
+        self.transport().state.lock().await.down
     }
 
     pub(crate) async fn next_health_probe_in(&self) -> Option<Duration> {
-        if !self.admin_allows_network().await || self.health_probe.try_lock().is_err() {
+        let transport = self.transport();
+        if !self.admin_allows_network().await || transport.probe.try_lock().is_err() {
             return None;
         }
         Some(
-            self.transport
+            transport
+                .state
                 .lock()
                 .await
                 .next_probe
@@ -807,29 +1104,36 @@ impl WorkerState {
         normal_interval: Duration,
         circuit: &CircuitBreakerConfig,
     ) -> Option<HealthProbePermit> {
-        let singleflight = self.health_probe.clone().try_lock_owned().ok()?;
-        let changes = self.network_changes.subscribe();
-        let revision = *changes.borrow();
-        let network = BackgroundProbe { changes, revision };
+        let config = self.config.read().await;
+        let transport = self.transport();
+        let singleflight = transport.probe.clone().try_lock_owned().ok()?;
+        let network = self.network_revision_guard();
         if !self.admin_allows_network().await || !network.is_current() {
             return None;
         }
-        let mut transport = self.transport.lock().await;
-        if transport
+        let mut state = transport.state.lock().await;
+        if state
             .next_probe
             .is_some_and(|deadline| !deadline.remaining().is_zero())
         {
             return None;
         }
-        let delay = if transport.down {
+        let delay = if state.down {
             circuit.recovery_probe_interval()
         } else {
             normal_interval
         };
-        transport.next_probe = Some(TransportProbeDeadline::new(delay));
+        state.next_probe = Some(TransportProbeDeadline::new(delay));
+        drop(state);
         Some(HealthProbePermit {
             network,
-            isolated: !self.connection_ready.load(Ordering::Acquire),
+            endpoint: WorkerEndpointSnapshot {
+                config: config.clone(),
+                generation: self.endpoint_incarnation.generation.load(Ordering::Acquire),
+                incarnation: Some(self.endpoint_incarnation.clone()),
+            },
+            isolated: !self.connection_is_ready(),
+            transport,
             _singleflight: singleflight,
         })
     }
@@ -843,25 +1147,43 @@ impl WorkerState {
         normal_interval: Duration,
         circuit: &CircuitBreakerConfig,
     ) -> (bool, bool) {
-        let mut transport = self.transport.lock().await;
-        let was_down = transport.down;
-        if connected {
-            transport.failures = 0;
-            transport.down = false;
-        } else {
-            transport.failures = transport.failures.saturating_add(1);
-            transport.down |= transport.failures >= circuit.failure_threshold.max(1);
+        self.record_transport_result_for(&self.transport(), connected, normal_interval, circuit)
+            .await
+    }
+
+    /// The health task owns the governor it actually probed. Its publication
+    /// must never follow a mutable worker ID to a replacement endpoint.
+    pub(crate) async fn record_health_transport_result(
+        &self,
+        permit: &HealthProbePermit,
+        connected: bool,
+        normal_interval: Duration,
+        circuit: &CircuitBreakerConfig,
+    ) -> Option<(bool, bool)> {
+        if !permit.network.is_current() || !Arc::ptr_eq(&self.transport(), &permit.transport) {
+            return None;
         }
-        let down = transport.down;
-        let delay = if down {
-            circuit.recovery_probe_interval()
-        } else {
-            normal_interval
-        };
-        if down || was_down {
-            transport.next_probe = Some(TransportProbeDeadline::new(delay));
-        }
-        drop(transport);
+        Some(
+            self.record_transport_result_for(
+                &permit.transport,
+                connected,
+                normal_interval,
+                circuit,
+            )
+            .await,
+        )
+    }
+
+    async fn record_transport_result_for(
+        &self,
+        transport: &EndpointTransport,
+        connected: bool,
+        normal_interval: Duration,
+        circuit: &CircuitBreakerConfig,
+    ) -> (bool, bool) {
+        let (was_down, down) = transport
+            .record_result(connected, normal_interval, circuit)
+            .await;
         if connected {
             // Do not reopen pools after a disable that raced the completed
             // probe. The health publisher also fences its network generation.
@@ -874,6 +1196,8 @@ impl WorkerState {
                 DrainCompletionAction::Disable { .. }
             ) && !self.is_endpoint_retired()
             {
+                self.ready_transport_revision
+                    .store(transport.revision(), Ordering::Release);
                 self.connection_ready.store(true, Ordering::Release);
                 self.set_pooled_connections_enabled(true).await;
             }
@@ -964,7 +1288,11 @@ impl WorkerState {
         self.disk_capacity_generation.fetch_add(1, Ordering::AcqRel);
         if endpoint_changed {
             self.require_connection_probe();
-            *self.transport.lock().await = WorkerTransportState::default();
+            *self
+                .transport
+                .write()
+                .unwrap_or_else(|error| error.into_inner()) =
+                self.endpoint_transports.get(&new_config);
             self.set_pooled_connections_enabled(false).await;
             self.endpoint_incarnation
                 .generation
@@ -1170,7 +1498,7 @@ impl WorkerState {
             // / `RecoveredPendingCanary` quarantine (eligibility axis) becomes
             // authoritative as soon as it's written, not only on the next
             // selection round.
-            if !self.connection_ready.load(Ordering::Acquire)
+            if !self.connection_is_ready()
                 || !lifecycle_accepts_new_builds(*self.lifecycle.read().await)
             {
                 return false;
@@ -1199,7 +1527,7 @@ impl WorkerState {
                     // bypass quarantine landed between our initial read and the
                     // CAS, roll the reservation back.
                     if lifecycle_accepts_new_builds(*self.lifecycle.read().await)
-                        && self.connection_ready.load(Ordering::Acquire)
+                        && self.connection_is_ready()
                         && self.used_slots() <= self.effective_total_slots().await
                     {
                         return true;
@@ -1705,7 +2033,12 @@ impl WorkerState {
         }
         *self.lifecycle.write().await = lifecycle;
         self.revoke_background_network();
-        *self.transport.lock().await = WorkerTransportState::default();
+        let ready = self.connection_is_ready();
+        let transport = self.transport();
+        transport.reset().await;
+        self.connection_ready.store(ready, Ordering::Release);
+        self.ready_transport_revision
+            .store(transport.revision(), Ordering::Release);
         // Admission still requires the next health probe for monitored daemon
         // workers. An explicit enable does not prove the SSH endpoint is up.
         self.set_pooled_connections_enabled(self.background_network_allowed().await)
@@ -1882,6 +2215,8 @@ pub struct WorkerPool {
     monitor_connections: bool,
     ssh_pools: Arc<RwLock<Vec<Arc<rch_common::SshPool>>>>,
     admin_disable_store: Option<Arc<Mutex<AdminDisableStore>>>,
+    endpoint_transports: Arc<EndpointTransports>,
+    recovery_transport_policy: RecoveryTransportPolicy,
 }
 
 impl WorkerPool {
@@ -1903,6 +2238,8 @@ impl WorkerPool {
             monitor_connections: false,
             ssh_pools: Arc::new(RwLock::new(Vec::new())),
             admin_disable_store: None,
+            endpoint_transports: Arc::new(EndpointTransports::default()),
+            recovery_transport_policy: RecoveryTransportPolicy::default(),
         }
     }
 
@@ -1911,6 +2248,86 @@ impl WorkerPool {
     pub fn with_connection_monitoring(mut self) -> Self {
         self.monitor_connections = true;
         self
+    }
+
+    /// Historical endpoints obey the same failure threshold, normal cadence,
+    /// recovery cadence and total probe budget as current health checks.
+    pub fn with_recovery_transport_policy(
+        mut self,
+        circuit: CircuitBreakerConfig,
+        normal_interval: Duration,
+        probe_timeout: Duration,
+    ) -> Self {
+        self.recovery_transport_policy = RecoveryTransportPolicy {
+            circuit,
+            normal_interval: normal_interval.max(Duration::from_millis(1)),
+            probe_timeout: probe_timeout.max(Duration::from_millis(1)),
+        };
+        self
+    }
+
+    /// Inspect eligibility without taking a lane, consuming a due probe, or
+    /// performing I/O. Lease-directory scans may freely discard this permit;
+    /// `run` rechecks and claims admission under the caller's admin guard.
+    pub(crate) async fn owned_recovery_admission(
+        &self,
+        endpoint: &WorkerConfig,
+    ) -> Option<OwnedRecoveryPermit> {
+        {
+            let workers = self.workers.read().await;
+            if let Some(worker) = workers.get(&endpoint.id) {
+                let config = worker.config.read().await;
+                if same_endpoint(&config, endpoint) && !worker.is_endpoint_retired() {
+                    let transport = worker.transport();
+                    let network = worker.network_revision_guard();
+                    let state = transport.state.lock().await;
+                    if state.down
+                        || (!state.connected && !worker.connection_is_ready())
+                        || !network.is_current()
+                        || transport.recovery.try_lock().is_err()
+                    {
+                        return None;
+                    }
+                    drop(state);
+                    return Some(OwnedRecoveryPermit {
+                        endpoint: endpoint.clone(),
+                        transport,
+                        policy: self.recovery_transport_policy.clone(),
+                        current: Some(network),
+                        health_changes: self.endpoint_changes.clone(),
+                    });
+                }
+            }
+        }
+        let transport = self.endpoint_transports.get(endpoint);
+        if !transport.historical_recovery_eligible().await {
+            return None;
+        }
+        Some(OwnedRecoveryPermit {
+            endpoint: endpoint.clone(),
+            transport,
+            policy: self.recovery_transport_policy.clone(),
+            current: None,
+            health_changes: self.endpoint_changes.clone(),
+        })
+    }
+
+    /// Supply explicit transport evidence in tests that exercise admission
+    /// around a local future rather than spawning an actual SSH subprocess.
+    #[cfg(test)]
+    pub(crate) async fn record_owned_recovery_transport_result(
+        &self,
+        endpoint: &WorkerConfig,
+        connected: bool,
+    ) {
+        self.endpoint_transports
+            .get(endpoint)
+            .record_result(
+                connected,
+                self.recovery_transport_policy.normal_interval,
+                &self.recovery_transport_policy.circuit,
+            )
+            .await;
     }
 
     pub fn with_admin_disable_store(mut self, store: Arc<Mutex<AdminDisableStore>>) -> Self {
@@ -1979,9 +2396,10 @@ impl WorkerPool {
             }
         }
 
-        let state = Arc::new(WorkerState::with_disk_slot_policy(
+        let state = Arc::new(WorkerState::with_endpoint_transports(
             config,
             self.disk_slot_policy,
+            self.endpoint_transports.clone(),
         ));
         // Keep the durable intent lock through registry publication. Otherwise
         // an enable racing a remove/re-add could publish a stale disable (or
@@ -2043,8 +2461,20 @@ impl WorkerPool {
 
     /// Add a worker with a pre-configured state (for testing).
     #[cfg(test)]
-    pub async fn add_worker_state(&self, state: WorkerState) {
-        let id = state.config.read().await.id.clone();
+    pub async fn add_worker_state(&self, mut state: WorkerState) {
+        let config = state.config.read().await.clone();
+        let id = config.id.clone();
+        // Preserve the explicitly prepared test state's evidence while making
+        // later inventory changes use the same endpoint registry as the pool.
+        self.endpoint_transports
+            .endpoints
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(
+                WorkerEndpointIdentity::from_config(&config),
+                state.transport(),
+            );
+        state.endpoint_transports = self.endpoint_transports.clone();
         let mut workers = self.workers.write().await;
         if workers.insert(id.clone(), Arc::new(state)).is_none() {
             self.worker_count.fetch_add(1, Ordering::SeqCst);
@@ -2147,7 +2577,7 @@ impl WorkerPool {
         for worker in workers.values() {
             let status = worker.status().await;
             if (status == WorkerStatus::Healthy || status == WorkerStatus::Degraded)
-                && worker.connection_ready.load(Ordering::Acquire)
+                && worker.connection_is_ready()
             {
                 healthy.push(worker.clone());
             }
@@ -2845,7 +3275,16 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn offline_worker_owned_recovery_uses_only_matching_transport_evidence() {
         let config = recovered_worker_config("owned-recovery", 4);
-        let worker = WorkerState::new(config.clone());
+        let pool = WorkerPool::new();
+        pool.add_worker(config.clone()).await;
+        let worker = pool.get(&config.id).await.unwrap();
+        worker
+            .record_transport_result(
+                true,
+                Duration::from_secs(30),
+                &CircuitBreakerConfig::default(),
+            )
+            .await;
         worker.require_connection_probe();
         worker.open_circuit().await;
         worker
@@ -2854,11 +3293,10 @@ mod tests {
         assert!(!worker.background_network_allowed().await);
         // Admission/readiness and storage/circuit quarantine cannot prohibit
         // recovery of a process group that this worker already owns.
-        let OwnedRecoveryAdmission::Current(mut permit) =
-            worker.owned_recovery_admission(&config).await
-        else {
-            panic!("non-transport quarantine blocked owned recovery");
-        };
+        let mut permit = pool
+            .owned_recovery_admission(&config)
+            .await
+            .expect("non-transport quarantine blocked authenticated owned recovery");
         let operation = permit.run(std::future::pending::<()>());
         tokio::pin!(operation);
         std::future::poll_fn(|cx| {
@@ -2877,31 +3315,477 @@ mod tests {
             operation.await.is_none(),
             "new outage must revoke in-flight recovery"
         );
-        assert!(matches!(
-            worker.owned_recovery_admission(&config).await,
-            OwnedRecoveryAdmission::Deferred
-        ));
+        assert!(pool.owned_recovery_admission(&config).await.is_none());
 
         let historical = WorkerConfig {
             host: "old-owned.example".into(),
             ..config.clone()
         };
-        assert!(matches!(
-            worker.owned_recovery_admission(&historical).await,
-            OwnedRecoveryAdmission::Historical
-        ));
+        assert!(pool.owned_recovery_admission(&historical).await.is_some());
         worker
             .record_transport_result(true, Duration::from_secs(30), &circuit)
             .await;
-        assert!(matches!(
-            worker.owned_recovery_admission(&config).await,
-            OwnedRecoveryAdmission::Current(_)
-        ));
+        assert!(pool.owned_recovery_admission(&config).await.is_some());
         assert_eq!(
             worker.eligibility().await,
             EligibilityState::TemporaryBypass
         );
         assert_eq!(worker.circuit_state().await, Some(CircuitState::Open));
+    }
+
+    fn historical_transport_policy() -> CircuitBreakerConfig {
+        CircuitBreakerConfig {
+            failure_threshold: 3,
+            open_cooldown_secs: 900,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn historical_endpoint_probe_threshold_and_scans_share_one_clock() {
+        let circuit = historical_transport_policy();
+        let heartbeat = Duration::from_secs(30);
+        let pool = WorkerPool::new().with_recovery_transport_policy(
+            circuit.clone(),
+            heartbeat,
+            Duration::from_secs(10),
+        );
+        let endpoint = recovered_worker_config("historical-threshold", 16);
+        let attempts = AtomicUsize::new(0);
+
+        for failure in 1..=5 {
+            // Repeated speculative scans and abandoned permits consume no
+            // probe and do not push the shared deadline into the future.
+            for _ in 0..16 {
+                assert!(pool.owned_recovery_admission(&endpoint).await.is_some());
+            }
+            let mut admitted = pool.owned_recovery_admission(&endpoint).await.unwrap();
+            assert!(
+                admitted
+                    .run_with_probe(
+                        async { panic!("a failed preflight cannot poll owned recovery") },
+                        async {
+                            attempts.fetch_add(1, Ordering::SeqCst);
+                            false
+                        },
+                    )
+                    .await
+                    .is_none()
+            );
+            assert_eq!(attempts.load(Ordering::SeqCst), failure);
+            let delay = if failure < 3 {
+                heartbeat
+            } else {
+                Duration::from_secs(900)
+            };
+            for _ in 0..16 {
+                assert!(pool.owned_recovery_admission(&endpoint).await.is_none());
+            }
+            tokio::time::advance(delay - Duration::from_secs(1)).await;
+            assert!(pool.owned_recovery_admission(&endpoint).await.is_none());
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+
+        // An unrelated lookup after the outage deadline has expired must not
+        // prune this down endpoint and reset its consecutive-failure history.
+        assert!(
+            pool.owned_recovery_admission(&recovered_worker_config("other", 4))
+                .await
+                .is_some()
+        );
+        let state = pool.endpoint_transports.get(&endpoint);
+        assert_eq!(state.state.lock().await.failures, 5);
+        assert!(state.state.lock().await.down);
+
+        let mut recovered = pool.owned_recovery_admission(&endpoint).await.unwrap();
+        assert_eq!(
+            recovered.run_with_probe(async { 7 }, async { true }).await,
+            Some(7)
+        );
+        // Positive evidence is shared, so several owners can finish at the
+        // producer cadence rather than one owner per heartbeat interval.
+        for owner in 0..16 {
+            let mut admitted = pool.owned_recovery_admission(&endpoint).await.unwrap();
+            assert_eq!(
+                admitted
+                    .run_with_probe(async { owner }, async {
+                        panic!("fresh evidence should be reused")
+                    },)
+                    .await,
+                Some(owner)
+            );
+        }
+        assert_eq!(state.state.lock().await.failures, 0);
+        assert!(!state.state.lock().await.down);
+        tokio::time::advance(heartbeat).await;
+        let mut stale = pool.owned_recovery_admission(&endpoint).await.unwrap();
+        assert!(
+            stale
+                .run_with_probe(
+                    async { panic!("expired positive evidence cannot bypass a failed probe") },
+                    async { false },
+                )
+                .await
+                .is_none()
+        );
+        assert_eq!(state.state.lock().await.failures, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn historical_endpoint_cancelled_probe_keeps_deadline_and_shared_flight() {
+        let heartbeat = Duration::from_secs(30);
+        let pool = WorkerPool::new().with_recovery_transport_policy(
+            historical_transport_policy(),
+            heartbeat,
+            Duration::from_secs(10),
+        );
+        let endpoint = recovered_worker_config("historical-cancelled-probe", 4);
+        let mut first = pool.owned_recovery_admission(&endpoint).await.unwrap();
+        let mut queued = pool.owned_recovery_admission(&endpoint).await.unwrap();
+        let attempts = AtomicUsize::new(0);
+        {
+            let pending = first.run_with_probe(
+                async { panic!("unfinished preflight cannot poll the recovery") },
+                async {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending().await
+                },
+            );
+            tokio::pin!(pending);
+            std::future::poll_fn(|context| {
+                assert!(std::future::Future::poll(pending.as_mut(), context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+            assert!(pool.owned_recovery_admission(&endpoint).await.is_none());
+            assert!(
+                queued
+                    .run_with_probe(async { panic!("competing recovery was polled") }, async {
+                        panic!("competing preflight was polled")
+                    },)
+                    .await
+                    .is_none()
+            );
+
+            // Reintroducing A cannot create a second health-probe mutex.
+            pool.add_worker(endpoint.clone()).await;
+            let worker = pool.get(&endpoint.id).await.unwrap();
+            assert!(
+                worker
+                    .health_probe_permit(heartbeat, &historical_transport_policy())
+                    .await
+                    .is_none()
+            );
+        }
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        pool.remove_worker(&endpoint.id).await;
+        assert!(pool.owned_recovery_admission(&endpoint).await.is_none());
+        tokio::time::advance(heartbeat - Duration::from_secs(1)).await;
+        assert!(pool.owned_recovery_admission(&endpoint).await.is_none());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(pool.owned_recovery_admission(&endpoint).await.is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn historical_endpoint_probe_release_wakes_reintroduced_health_without_resetting_deadline()
+     {
+        let heartbeat = Duration::from_secs(30);
+        let circuit = historical_transport_policy();
+        for down in [false, true] {
+            for completed in [false, true] {
+                let pool = WorkerPool::new()
+                    .with_connection_monitoring()
+                    .with_recovery_transport_policy(
+                        circuit.clone(),
+                        heartbeat,
+                        Duration::from_secs(10),
+                    );
+                let endpoint = recovered_worker_config("historical-probe-return", 8);
+                if down {
+                    for _ in 0..circuit.failure_threshold {
+                        pool.record_owned_recovery_transport_result(&endpoint, false)
+                            .await;
+                    }
+                    tokio::time::advance(Duration::from_secs(900)).await;
+                }
+                let mut admitted = pool.owned_recovery_admission(&endpoint).await.unwrap();
+                let mut changes;
+                let worker;
+                {
+                    let (complete, result) = tokio::sync::oneshot::channel();
+                    let pending =
+                        admitted.run_with_probe(async { 7 }, async { result.await.unwrap() });
+                    tokio::pin!(pending);
+                    std::future::poll_fn(|context| {
+                        assert!(std::future::Future::poll(pending.as_mut(), context).is_pending());
+                        std::task::Poll::Ready(())
+                    })
+                    .await;
+
+                    // Health sees the new current A, but its shared flight is
+                    // busy and the monitor may choose the 900-second fallback.
+                    pool.add_worker(endpoint.clone()).await;
+                    pool.restore_recovered_slots(&endpoint.id, 3).await.unwrap();
+                    worker = pool.get(&endpoint.id).await.unwrap();
+                    assert!(worker.next_health_probe_in().await.is_none());
+                    changes = pool.subscribe_endpoint_changes();
+                    tokio::time::advance(Duration::from_secs(5)).await;
+                    assert!(!changes.has_changed().unwrap());
+                    if completed {
+                        complete.send(true).unwrap();
+                        assert_eq!(pending.await, Some(7));
+                    }
+                    // Otherwise dropping the actual probe future exercises
+                    // the same release path as administrative cancellation.
+                }
+                assert!(
+                    changes.has_changed().unwrap(),
+                    "probe completion/cancellation must wake current health"
+                );
+                changes.changed().await.unwrap();
+                let remaining = if down && completed {
+                    heartbeat
+                } else if down {
+                    Duration::from_secs(895)
+                } else {
+                    Duration::from_secs(25)
+                };
+                assert_eq!(worker.next_health_probe_in().await, Some(remaining));
+                assert!(!worker.background_network_allowed().await);
+                assert_eq!(worker.used_slots(), 3);
+                tokio::time::advance(remaining).await;
+                assert!(
+                    worker
+                        .health_probe_permit(heartbeat, &circuit)
+                        .await
+                        .is_some()
+                );
+                assert_eq!(worker.used_slots(), 3);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn historical_endpoint_operation_lane_leaves_health_free_and_revocable() {
+        let heartbeat = Duration::from_secs(30);
+        let circuit = CircuitBreakerConfig {
+            failure_threshold: 1,
+            ..historical_transport_policy()
+        };
+        let pool = WorkerPool::new()
+            .with_connection_monitoring()
+            .with_recovery_transport_policy(circuit.clone(), heartbeat, Duration::from_secs(10));
+        let endpoint = recovered_worker_config("historical-active-recovery", 8);
+        pool.record_owned_recovery_transport_result(&endpoint, true)
+            .await;
+        let mut first = pool.owned_recovery_admission(&endpoint).await.unwrap();
+        let mut queued = pool.owned_recovery_admission(&endpoint).await.unwrap();
+        let pending = first.run_with_probe(std::future::pending::<()>(), async {
+            panic!("recent positive evidence should need no probe")
+        });
+        tokio::pin!(pending);
+        std::future::poll_fn(|context| {
+            assert!(std::future::Future::poll(pending.as_mut(), context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(
+            queued
+                .run_with_probe(
+                    async { panic!("lease and cancellation must not overlap this endpoint") },
+                    async { panic!("a competing operation cannot launch a probe") },
+                )
+                .await
+                .is_none()
+        );
+
+        pool.add_worker(endpoint.clone()).await;
+        pool.restore_recovered_slots(&endpoint.id, 3).await.unwrap();
+        let current = pool.get(&endpoint.id).await.unwrap();
+        let probe = current
+            .health_probe_permit(heartbeat, &circuit)
+            .await
+            .expect("owned work must not hold the health probe lane");
+        assert_eq!(
+            current
+                .record_health_transport_result(&probe, false, heartbeat, &circuit)
+                .await,
+            Some((false, true))
+        );
+        assert!(
+            pending.await.is_none(),
+            "current health revokes historical recovery"
+        );
+        assert_eq!(current.used_slots(), 3);
+        assert!(pool.owned_recovery_admission(&endpoint).await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn historical_endpoint_failure_revokes_reintroduced_background_without_rejoining_it() {
+        let heartbeat = Duration::from_secs(30);
+        let circuit = CircuitBreakerConfig {
+            failure_threshold: 1,
+            ..historical_transport_policy()
+        };
+        let pool = WorkerPool::new()
+            .with_connection_monitoring()
+            .with_recovery_transport_policy(circuit.clone(), heartbeat, Duration::from_secs(10));
+        let endpoint = recovered_worker_config("historical-background", 8);
+        pool.add_worker(endpoint.clone()).await;
+        let worker = pool.get(&endpoint.id).await.unwrap();
+        worker
+            .record_transport_result(true, heartbeat, &circuit)
+            .await;
+        assert!(worker.reserve_slots(3).await);
+        let mut background = worker.background_probe().await.unwrap();
+        let pending = background.run(std::future::pending::<()>());
+        tokio::pin!(pending);
+        std::future::poll_fn(|context| {
+            assert!(std::future::Future::poll(pending.as_mut(), context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+
+        // This is the same governor publication a historical probe performs
+        // if A returns to inventory while its SSH command is in flight.
+        pool.record_owned_recovery_transport_result(&endpoint, false)
+            .await;
+        assert!(pending.await.is_none());
+        assert!(!worker.background_network_allowed().await);
+        assert!(!worker.reserve_slots(1).await);
+        assert!(pool.healthy_workers().await.is_empty());
+        pool.record_owned_recovery_transport_result(&endpoint, true)
+            .await;
+        assert!(
+            !worker.background_network_allowed().await,
+            "a historical echo is not current scheduling health"
+        );
+        assert!(!worker.reserve_slots(1).await);
+        assert_eq!(worker.used_slots(), 3);
+        worker
+            .record_transport_result(true, heartbeat, &circuit)
+            .await;
+        assert!(worker.background_network_allowed().await);
+        assert_eq!(worker.used_slots(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn historical_endpoint_late_publication_cannot_overwrite_enable_reset() {
+        let transport = Arc::new(EndpointTransport::new());
+        let network = transport.revision_guard();
+        let circuit = historical_transport_policy();
+        let state = transport.state.lock().await;
+        let reset = transport.reset();
+        tokio::pin!(reset);
+        std::future::poll_fn(|context| {
+            assert!(std::future::Future::poll(reset.as_mut(), context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let publication =
+            transport.record_probe_result(&network, true, Duration::from_secs(30), &circuit);
+        tokio::pin!(publication);
+        std::future::poll_fn(|context| {
+            assert!(std::future::Future::poll(publication.as_mut(), context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(state);
+        reset.await;
+        assert!(
+            publication.await.is_none(),
+            "the queued pre-enable result has lost its epoch"
+        );
+        let state = transport.state.lock().await;
+        assert!(!state.connected);
+        assert!(state.positive_evidence.is_none());
+        assert!(state.next_probe.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn historical_endpoint_enable_and_late_health_preserve_other_endpoint_clock() {
+        let heartbeat = Duration::from_secs(30);
+        let circuit = CircuitBreakerConfig {
+            failure_threshold: 1,
+            ..historical_transport_policy()
+        };
+        let pool = WorkerPool::new().with_recovery_transport_policy(
+            circuit.clone(),
+            heartbeat,
+            Duration::from_secs(10),
+        );
+        let original = recovered_worker_config("historical-enable", 8);
+        pool.add_worker(original.clone()).await;
+        let worker = pool.get(&original.id).await.unwrap();
+        assert!(worker.reserve_slots(3).await);
+        let old_probe = worker
+            .health_probe_permit(heartbeat, &circuit)
+            .await
+            .unwrap();
+        worker
+            .record_transport_result(false, heartbeat, &circuit)
+            .await;
+        let mut replacement = original.clone();
+        replacement.host = "replacement.example".into();
+        pool.add_worker(replacement).await;
+        worker.enable().await;
+        assert!(
+            worker
+                .record_health_transport_result(&old_probe, true, heartbeat, &circuit)
+                .await
+                .is_none()
+        );
+        assert!(!worker.background_network_allowed().await);
+        assert!(pool.owned_recovery_admission(&original).await.is_none());
+        assert_eq!(worker.used_slots(), 3);
+        drop(old_probe);
+        tokio::time::advance(Duration::from_secs(899)).await;
+        pool.add_worker(original.clone()).await;
+        assert!(worker.transport_is_down().await);
+        assert_eq!(
+            worker.next_health_probe_in().await,
+            Some(Duration::from_secs(1))
+        );
+        assert!(pool.owned_recovery_admission(&original).await.is_none());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(
+            worker
+                .health_probe_permit(heartbeat, &circuit)
+                .await
+                .is_some()
+        );
+        assert_eq!(worker.used_slots(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn historical_endpoint_startup_unknown_current_waits_for_health_evidence() {
+        let pool = WorkerPool::new().with_connection_monitoring();
+        let endpoint = recovered_worker_config("historical-startup", 4);
+        pool.add_worker(endpoint.clone()).await;
+        pool.restore_recovered_slots(&endpoint.id, 3).await.unwrap();
+        let worker = pool.get(&endpoint.id).await.unwrap();
+        assert!(pool.owned_recovery_admission(&endpoint).await.is_none());
+        let circuit = CircuitBreakerConfig::default();
+        let probe = worker
+            .health_probe_permit(Duration::from_secs(30), &circuit)
+            .await
+            .unwrap();
+        assert!(pool.owned_recovery_admission(&endpoint).await.is_none());
+        worker
+            .record_health_transport_result(&probe, true, Duration::from_secs(30), &circuit)
+            .await
+            .unwrap();
+        let mut owned = pool.owned_recovery_admission(&endpoint).await.unwrap();
+        assert_eq!(
+            owned
+                .run_with_probe(async { 7 }, async {
+                    panic!("current health already proved transport")
+                })
+                .await,
+            Some(7)
+        );
+        assert_eq!(worker.used_slots(), 3);
     }
 
     #[tokio::test(start_paused = true)]

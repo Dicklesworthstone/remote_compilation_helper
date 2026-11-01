@@ -107,9 +107,25 @@ intent too. When an active job's admitted endpoint matches the current worker
 and that transport is down, automatic cleanup waits for health recovery instead
 of letting separate job retries create their own connection loop. This does not
 block cleanup solely because of storage pressure or a command failure on a
-reachable worker. Historical endpoints belonging to removed or retargeted
-workers retain their existing bounded recovery path; cleanup never redirects
-an old job to its replacement.
+reachable worker.
+
+When a job belongs to a removed worker or to the host used before a configuration
+change, cancellation and abandoned-client recovery share admission for that
+original endpoint. Its failure count and recovery deadline survive removal,
+retargeting, and reintroduction during the daemon's lifetime. A different job or
+recovery journal cannot bypass the same endpoint's cooldown. The endpoint key
+includes worker ID, host, SSH user, identity file, and declared operating system;
+an unavailable original host does not suspend a healthy replacement.
+
+An unverified historical endpoint requires one bounded, foreground SSH probe
+before automatic cleanup can run. Successful probe evidence is reused for the
+normal health interval, and cancellation and lease recovery serialize their
+operations on that endpoint. After daemon restart, retained endpoints start
+unverified and must establish connectivity again. The probe does not warm an
+inventory connection pool, make a worker schedulable, or prove that a build has
+terminated. Cleanup always uses the job's admitted coordinates and its own
+ownership evidence. Administrative disablement still applies to all historical
+endpoints associated with that worker ID.
 
 Deferring or cancelling an automatic recovery attempt retains its active build,
 slot reservation, and durable recovery journal. Stopping local SSH processes is
@@ -153,6 +169,12 @@ The complementary `cargo test -p rchd --bin rchd offline_worker` suite exercises
 an entire day of recovery scheduling with Tokio's virtual clock, a 900-second
 cooldown, extreme interval values, concurrent probe exclusion, and durable-state
 failure cases.
+
+`cargo test -p rchd --bin rchd historical_endpoint` covers retained outage
+deadlines, historical recovery admission, and cancellation/lease concurrency.
+Its Linux subprocess fixtures count real invocations of an instrumented SSH
+executable while checking that durable ownership and exact slot reservations
+survive deferral. These fixtures do not contact a remote host.
 
 ## What To Do When a Circuit Opens
 
