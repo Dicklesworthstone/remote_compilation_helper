@@ -1577,6 +1577,38 @@ impl WorkerState {
     /// Sets status to Disabled and records the timestamp and reason.
     pub async fn disable(&self, reason: Option<String>) {
         let _transition = self.network_transition.lock().await;
+        self.disable_locked(reason).await;
+    }
+
+    /// Apply a completed probe's disable policy only to the worker and
+    /// administrative decision that admitted it. Retain both guards through
+    /// the transition so retarget, removal, and a later enable cannot race the
+    /// comparison. Existing build reservations remain owned by this state.
+    pub(crate) async fn disable_from_probe(
+        &self,
+        endpoint: &WorkerEndpointSnapshot,
+        admission: &BackgroundProbe,
+        admitted_admin: AdminIntent,
+        reason: Option<String>,
+    ) -> bool {
+        let Some(_endpoint) = self.lock_current_endpoint(endpoint).await else {
+            return false;
+        };
+        let Some(_transition) = self.lock_network_publication(admission).await else {
+            return false;
+        };
+        if self.lifecycle.read().await.admin != admitted_admin
+            || !self.background_network_allowed().await
+        {
+            return false;
+        }
+        self.disable_locked(reason).await;
+        true
+    }
+
+    /// Caller owns network_transition; conditional publishers also retain the
+    /// endpoint guard. Do not reacquire either lock while applying the change.
+    async fn disable_locked(&self, reason: Option<String>) {
         *self.drain_completion.write().await = DrainCompletionAction::StayDrained;
         self.lifecycle
             .write()
@@ -2439,6 +2471,10 @@ pub async fn handle_worker_enable(
     ctx: &DaemonContext,
     worker_id: &WorkerId,
 ) -> WorkerStateResponse {
+    // Historical builds survive inventory removal and daemon restart. Read
+    // their ownership before taking administration/registry locks; no history
+    // guard may span durable writes or publication of administrative intent.
+    let historical_slots = historical_worker_slots(ctx, worker_id);
     // Resolve the ID only after serializing durable intent, and retain the
     // registry lease through the live change. Otherwise reload can replace a
     // worker while this handler waits, and an acknowledged enable can affect
@@ -2502,15 +2538,52 @@ pub async fn handle_worker_enable(
                 active_slots: None,
             }
         }
-        None => WorkerStateResponse {
-            status: "error".to_string(),
-            worker_id: worker_id.to_string(),
-            action: "enable".to_string(),
-            new_status: None,
-            reason: None,
-            message: Some(format!("Worker '{}' not found", worker_id)),
-            active_slots: None,
-        },
+        None => {
+            let mut response = WorkerStateResponse {
+                status: "error".to_string(),
+                worker_id: worker_id.to_string(),
+                action: "enable".to_string(),
+                new_status: None,
+                reason: None,
+                message: Some(format!("Worker '{}' not found", worker_id)),
+                active_slots: None,
+            };
+            let known_disable = durable
+                .as_ref()
+                .is_some_and(|store| store.effective_disable(worker_id.as_str()).is_some());
+            if historical_slots.is_none() && !known_disable {
+                return response;
+            }
+            response.active_slots = Some(historical_slots.unwrap_or(0));
+            let Some(store) = &mut durable else {
+                response.message = Some(
+                    "Historical worker administration requires durable administrative state".into(),
+                );
+                return response;
+            };
+            if let Some(bypass) = &ctx.bypass_store
+                && let Err(error) = bypass.lock().await.remove(worker_id.as_str())
+            {
+                response.message = Some(format!(
+                    "Could not clear durable bypass for historical worker: {error}"
+                ));
+                return response;
+            }
+            if let Err(error) = store.remove(worker_id.as_str()) {
+                response.message = Some(format!(
+                    "Could not clear durable disable for historical worker: {error}"
+                ));
+                return response;
+            }
+            // Clearing intent permits only recovery of already-owned work.
+            // Keep the ID absent from inventory and leave its slots/history
+            // untouched. A concurrent re-add inherits the durable enable.
+            response.status = "ok".into();
+            response.message = Some(
+                "Historical worker enabled for recovery; it remains absent from inventory".into(),
+            );
+            response
+        }
     }
 }
 
@@ -2521,6 +2594,7 @@ pub async fn handle_worker_disable(
     reason: Option<String>,
     drain_first: bool,
 ) -> WorkerStateResponse {
+    let historical_slots = historical_worker_slots(ctx, worker_id);
     // Keep the same store -> registry -> worker order as enable and insertion.
     // A concurrent remove/re-add must either precede this lookup or inherit the
     // disable after publication; it cannot remain active behind a successful
@@ -2608,16 +2682,64 @@ pub async fn handle_worker_disable(
                 }
             }
         }
-        None => WorkerStateResponse {
-            status: "error".to_string(),
-            worker_id: worker_id.to_string(),
-            action: "disable".to_string(),
-            new_status: None,
-            reason,
-            message: Some(format!("Worker '{}' not found", worker_id)),
-            active_slots: None,
-        },
+        None => {
+            let mut response = WorkerStateResponse {
+                status: "error".to_string(),
+                worker_id: worker_id.to_string(),
+                action: "disable".to_string(),
+                new_status: None,
+                reason: reason.clone(),
+                message: Some(format!("Worker '{}' not found", worker_id)),
+                active_slots: None,
+            };
+            let known_disable = durable
+                .as_ref()
+                .is_some_and(|store| store.effective_disable(worker_id.as_str()).is_some());
+            if historical_slots.is_none() && !known_disable {
+                return response;
+            }
+            response.active_slots = Some(historical_slots.unwrap_or(0));
+            let Some(store) = &mut durable else {
+                response.message = Some(
+                    "Historical worker administration requires durable administrative state".into(),
+                );
+                return response;
+            };
+            // An absent worker has no live drain state. Suspend automatic
+            // historical recovery immediately even for drain-first requests,
+            // retaining the build's exact endpoint and reservation. Upsert
+            // revokes active stable-ID permits before its fallible write.
+            let saved = store.upsert(rch_common::bypass_record::AdminDisableRecord {
+                worker_id: worker_id.to_string(),
+                reason,
+                disabled_unix_ms: u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
+            });
+            response.new_status = Some("disabled".into());
+            match saved {
+                Ok(()) => {
+                    response.status = "ok".into();
+                    response.message = Some(
+                        "Historical worker disabled for automatic recovery; existing ownership and slots are retained".into(),
+                    );
+                }
+                Err(error) => {
+                    response.message = Some(format!(
+                        "Worker recovery suspended in this daemon; durable state could not be saved: {error}"
+                    ));
+                }
+            }
+            response
+        }
     }
+}
+
+fn historical_worker_slots(ctx: &DaemonContext, worker_id: &WorkerId) -> Option<u32> {
+    ctx.history
+        .active_builds()
+        .into_iter()
+        .filter(|build| build.worker_id == worker_id.as_str())
+        .map(|build| build.slots)
+        .reduce(u32::saturating_add)
 }
 
 fn worker_status_label(status: WorkerStatus) -> &'static str {
@@ -3174,6 +3296,426 @@ mod tests {
             AdminDisableStore::try_load(path).is_err(),
             "restart must refuse unreadable intent"
         );
+    }
+
+    async fn removed_worker_administration_fixture(
+        disabled: bool,
+    ) -> (tempfile::TempDir, DaemonContext, WorkerConfig, u64, u64) {
+        use crate::history::BuildHistory;
+
+        let directory = tempfile::tempdir().unwrap();
+        let history_path = directory.path().join("history.jsonl");
+        let admin_path = directory.path().join("admin.json");
+        let config = recovered_worker_config("historical-worker", 8);
+        let original = WorkerState::new(config.clone());
+        let history = BuildHistory::new(10).with_persistence(history_path.clone());
+        let wrapper = rch_common::job_identity::JobIdentity::new_local().local_wrapper_id;
+        let build = history
+            .try_start_active_build_with_waiter(
+                "historical-project".into(),
+                config.id.to_string(),
+                "cargo check".into(),
+                0,
+                Some(wrapper.clone()),
+                3,
+                rch_common::BuildLocation::Remote,
+                None,
+                crate::disk_pressure::DiskHeadroomAdmission::default(),
+                Some(original.endpoint_snapshot().await),
+            )
+            .unwrap()
+            .unwrap();
+        history
+            .record_build_heartbeat(rch_common::BuildHeartbeatRequest {
+                build_id: build.id,
+                worker_id: config.id.clone(),
+                hook_pid: None,
+                local_wrapper_id: Some(wrapper),
+                remote_pgid_file: Some("/owned/historical-build.pgid".into()),
+                phase: rch_common::BuildHeartbeatPhase::Execute,
+                detail: None,
+                progress_counter: Some(1),
+                progress_percent: None,
+            })
+            .unwrap();
+        let peer = history.start_active_build(
+            "unrelated-project".into(),
+            "peer".into(),
+            "cargo test".into(),
+            0,
+            2,
+            rch_common::BuildLocation::Remote,
+        );
+        if disabled {
+            AdminDisableStore::with_path(&admin_path)
+                .upsert(rch_common::bypass_record::AdminDisableRecord {
+                    worker_id: config.id.to_string(),
+                    reason: Some("intentional maintenance".into()),
+                    disabled_unix_ms: 1,
+                })
+                .unwrap();
+        }
+        drop(history);
+        let store = Arc::new(Mutex::new(AdminDisableStore::try_load(admin_path).unwrap()));
+        let pool = WorkerPool::new()
+            .with_connection_monitoring()
+            .with_admin_disable_store(store.clone());
+        pool.add_worker(recovered_worker_config("peer", 8)).await;
+        let mut context = crate::test_daemon_context(pool.clone());
+        context.admin_disable_store = Some(store);
+        context.history = Arc::new(BuildHistory::load_from_file(&history_path, 10).unwrap());
+        for active in context.history.active_builds() {
+            pool.restore_recovered_slots(&WorkerId::new(&active.worker_id), active.slots)
+                .await
+                .unwrap();
+        }
+        assert!(pool.get(&config.id).await.is_none());
+        assert_eq!(pool.recovered_absent_slots.read().await[&config.id], 3);
+        (directory, context, config, build.id, peer.id)
+    }
+
+    #[tokio::test]
+    async fn offline_worker_removed_restart_can_disable_historical_recovery() {
+        for drain in [false, true] {
+            let (directory, context, config, build, peer) =
+                removed_worker_administration_fixture(false).await;
+            let store = context.admin_disable_store.as_ref().unwrap();
+            let mut admitted = store
+                .lock()
+                .await
+                .automatic_network_permit(config.id.as_str())
+                .unwrap();
+            let response = handle_worker_disable(
+                &context,
+                &config.id,
+                Some("stop historical recovery".into()),
+                drain,
+            )
+            .await;
+            assert_eq!(response.status, "ok", "{response:?}");
+            assert_eq!(response.new_status.as_deref(), Some("disabled"));
+            assert_eq!(response.active_slots, Some(3));
+            assert!(
+                admitted
+                    .run(async { panic!("disabled historical recovery was polled") })
+                    .await
+                    .is_none()
+            );
+            assert!(context.pool.get(&config.id).await.is_none());
+            assert_eq!(
+                context.pool.recovered_absent_slots.read().await[&config.id],
+                3
+            );
+            let cancelled = context
+                .cancellation
+                .cancel_build(
+                    &context,
+                    build,
+                    crate::cancellation::CancelReason::StuckDetector,
+                    true,
+                )
+                .await;
+            assert_eq!(cancelled.status, "deferred");
+            assert_eq!(cancelled.slots_released, 0);
+            assert!(context.history.active_build(build).is_some());
+            assert!(context.history.active_build(peer).is_some());
+            assert_eq!(
+                context
+                    .pool
+                    .get(&WorkerId::new("peer"))
+                    .await
+                    .unwrap()
+                    .used_slots(),
+                2
+            );
+
+            let restarted = Arc::new(Mutex::new(
+                AdminDisableStore::try_load(directory.path().join("admin.json")).unwrap(),
+            ));
+            assert!(
+                restarted
+                    .lock()
+                    .await
+                    .automatic_network_permit(config.id.as_str())
+                    .is_none()
+            );
+            let pool = WorkerPool::new().with_admin_disable_store(restarted);
+            pool.restore_recovered_slots(&config.id, 3).await.unwrap();
+            pool.add_worker(config.clone()).await;
+            let returned = pool.get(&config.id).await.unwrap();
+            assert!(returned.is_disabled().await);
+            assert_eq!(returned.used_slots(), 3);
+            assert!(
+                returned
+                    .health_probe_permit(Duration::from_secs(30), &CircuitBreakerConfig::default())
+                    .await
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_worker_removed_restart_can_enable_historical_recovery() {
+        let (directory, context, config, build, peer) =
+            removed_worker_administration_fixture(true).await;
+        let store = context.admin_disable_store.as_ref().unwrap();
+        assert!(
+            store
+                .lock()
+                .await
+                .automatic_network_permit(config.id.as_str())
+                .is_none()
+        );
+        let response = handle_worker_enable(&context, &config.id).await;
+        assert_eq!(response.status, "ok", "{response:?}");
+        assert_eq!(response.active_slots, Some(3));
+        assert!(context.pool.get(&config.id).await.is_none());
+        assert_eq!(
+            context.pool.recovered_absent_slots.read().await[&config.id],
+            3
+        );
+        let mut admitted = store
+            .lock()
+            .await
+            .automatic_network_permit(config.id.as_str())
+            .unwrap();
+        assert_eq!(admitted.run(async { 7 }).await, Some(7));
+        assert!(
+            AdminDisableStore::try_load(directory.path().join("admin.json"))
+                .unwrap()
+                .get(config.id.as_str())
+                .is_none()
+        );
+        let original = context.history.active_build(build).unwrap();
+        assert_eq!(original.worker_endpoint.unwrap().config.host, config.host);
+        assert!(context.history.active_build(peer).is_some());
+        assert_eq!(
+            context
+                .pool
+                .get(&WorkerId::new("peer"))
+                .await
+                .unwrap()
+                .used_slots(),
+            2
+        );
+        context.pool.add_worker(config.clone()).await;
+        let returned = context.pool.get(&config.id).await.unwrap();
+        assert!(!returned.is_disabled().await);
+        assert_eq!(returned.used_slots(), 3);
+        assert!(!returned.background_network_allowed().await);
+        assert!(
+            returned
+                .health_probe_permit(Duration::from_secs(30), &CircuitBreakerConfig::default())
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_worker_absent_admin_failure_retains_suspension_until_durable_enable() {
+        let (directory, context, config, build, peer) =
+            removed_worker_administration_fixture(false).await;
+        let path = directory.path().join("admin.json");
+        let store = context.admin_disable_store.as_ref().unwrap();
+        let mut old_permit = store
+            .lock()
+            .await
+            .automatic_network_permit(config.id.as_str())
+            .unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let disabled =
+            handle_worker_disable(&context, &config.id, Some("maintenance".into()), false).await;
+        assert_eq!(disabled.status, "error");
+        assert_eq!(disabled.new_status.as_deref(), Some("disabled"));
+        assert!(
+            disabled
+                .message
+                .unwrap()
+                .contains("durable state could not be saved")
+        );
+        assert!(store.lock().await.get(config.id.as_str()).is_none());
+        assert!(
+            store
+                .lock()
+                .await
+                .automatic_network_permit(config.id.as_str())
+                .is_none()
+        );
+        for _ in 0..2 {
+            let enabled = handle_worker_enable(&context, &config.id).await;
+            assert_eq!(enabled.status, "error");
+            assert!(
+                enabled
+                    .message
+                    .unwrap()
+                    .contains("Could not clear durable disable")
+            );
+            assert!(
+                store
+                    .lock()
+                    .await
+                    .automatic_network_permit(config.id.as_str())
+                    .is_none()
+            );
+        }
+        std::fs::rename(&path, directory.path().join("blocked-admin-path")).unwrap();
+        assert_eq!(
+            handle_worker_enable(&context, &config.id).await.status,
+            "ok"
+        );
+        assert!(
+            store
+                .lock()
+                .await
+                .automatic_network_permit(config.id.as_str())
+                .is_some()
+        );
+        assert!(
+            old_permit
+                .run(async { panic!("an old permission survived disable/enable") })
+                .await
+                .is_none()
+        );
+        assert!(
+            AdminDisableStore::try_load(&path)
+                .unwrap()
+                .get(config.id.as_str())
+                .is_none()
+        );
+        assert!(context.pool.get(&config.id).await.is_none());
+        assert_eq!(
+            context.pool.recovered_absent_slots.read().await[&config.id],
+            3
+        );
+        assert!(context.history.active_build(build).is_some());
+        assert!(context.history.active_build(peer).is_some());
+    }
+
+    #[tokio::test]
+    async fn offline_worker_absent_administration_rejects_unknown_but_accepts_retained_intent() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("admin.json");
+        let mut persisted = AdminDisableStore::with_path(&path);
+        persisted
+            .upsert(rch_common::bypass_record::AdminDisableRecord {
+                worker_id: "remembered".into(),
+                reason: Some("hardware maintenance".into()),
+                disabled_unix_ms: 1,
+            })
+            .unwrap();
+        drop(persisted);
+        let store = Arc::new(Mutex::new(AdminDisableStore::try_load(&path).unwrap()));
+        let pool = WorkerPool::new().with_admin_disable_store(store.clone());
+        let mut context = crate::test_daemon_context(pool.clone());
+        context.admin_disable_store = Some(store.clone());
+        let before = std::fs::read(&path).unwrap();
+        let unknown = WorkerId::new("never-configured-or-owned");
+        assert_eq!(
+            handle_worker_disable(&context, &unknown, None, false)
+                .await
+                .status,
+            "error"
+        );
+        assert_eq!(
+            handle_worker_enable(&context, &unknown).await.status,
+            "error"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(
+            store
+                .lock()
+                .await
+                .effective_disable(unknown.as_str())
+                .is_none()
+        );
+        let known = WorkerId::new("remembered");
+        let refreshed =
+            handle_worker_disable(&context, &known, Some("still offline".into()), true).await;
+        assert_eq!(refreshed.status, "ok");
+        assert_eq!(refreshed.active_slots, Some(0));
+        assert_eq!(
+            store
+                .lock()
+                .await
+                .get(known.as_str())
+                .unwrap()
+                .reason
+                .as_deref(),
+            Some("still offline")
+        );
+        let enabled = handle_worker_enable(&context, &known).await;
+        assert_eq!(enabled.status, "ok");
+        assert_eq!(enabled.active_slots, Some(0));
+        assert!(pool.is_empty());
+        assert!(AdminDisableStore::try_load(&path).unwrap().all().is_empty());
+    }
+
+    #[tokio::test]
+    async fn offline_worker_historical_administration_serializes_reintroduction() {
+        for enabling in [false, true] {
+            let (_directory, context, config, build, peer) =
+                removed_worker_administration_fixture(enabling).await;
+            let store = context.admin_disable_store.as_ref().unwrap();
+            let durable = store.lock().await;
+            let transition = async {
+                if enabling {
+                    handle_worker_enable(&context, &config.id).await
+                } else {
+                    handle_worker_disable(&context, &config.id, Some("operator".into()), false)
+                        .await
+                }
+            };
+            tokio::pin!(transition);
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(transition.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            let replacement = WorkerConfig {
+                host: "replacement.example.invalid".into(),
+                ..config.clone()
+            };
+            let addition = context.pool.add_worker(replacement.clone());
+            tokio::pin!(addition);
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(addition.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            drop(durable);
+            let (response, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+                tokio::join!(transition, addition)
+            })
+            .await
+            .expect("historical administration and registration must complete");
+            assert_eq!(response.status, "ok");
+            let current = context.pool.get(&config.id).await.unwrap();
+            assert_eq!(current.is_disabled().await, !enabling);
+            assert_eq!(current.config.read().await.host, replacement.host);
+            assert_eq!(current.used_slots(), 3);
+            assert!(context.pool.recovered_absent_slots.read().await.is_empty());
+            assert_eq!(
+                context
+                    .history
+                    .active_build(build)
+                    .unwrap()
+                    .worker_endpoint
+                    .unwrap()
+                    .config
+                    .host,
+                config.host
+            );
+            assert!(context.history.active_build(peer).is_some());
+            assert_eq!(
+                context
+                    .pool
+                    .get(&WorkerId::new("peer"))
+                    .await
+                    .unwrap()
+                    .used_slots(),
+                2
+            );
+        }
     }
 
     #[tokio::test]

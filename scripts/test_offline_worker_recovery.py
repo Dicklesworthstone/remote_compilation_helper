@@ -681,6 +681,47 @@ def run_disabled_worker_reload(binary, root, openssh):
         assert removed["removed"] == 0, removed
         assert_disabled_phase("removed_with_owned_build", removed)
 
+        # A restart restores the active reservation without recreating the
+        # removed inventory entry. Operator controls must still reach its
+        # durable worker ID so historical recovery can be suspended/resumed.
+        fixture.stop()
+        fixture.start()
+
+        def assert_absent_owned_phase(name):
+            observation = fixture.observe(3.2, "offline")
+            state = owned_state()
+            phase = {"observation": observation, "state": state,
+                     "new_dials_since_disable": len(fixture.dials("offline")) - disabled_dials}
+            results["phases"][name] = phase
+            retain_observations()
+            assert state["worker"] is None, phase
+            assert state["active_build"] is not None, phase
+            assert state["active_build"]["worker_id"] == "offline", phase
+            assert state["active_build"]["slots"] == 3, phase
+            assert observation["dial_attempts"] == 0, phase
+            assert phase["new_dials_since_disable"] == 0, phase
+            assert observation["sampled_peak_live_transport_processes"] == 0, phase
+            assert fixture.select("offline") is None
+            peer = fixture.select("healthy")
+            assert peer and peer["id"] == "healthy", peer
+
+        assert_absent_owned_phase("removed_restart_absent")
+        response = fixture.request("POST /workers/offline/enable")
+        results["absent_enable"] = response
+        retain_observations()
+        assert response.get("status") == "ok", response
+        assert response.get("active_slots") == 3, response
+        assert_absent_owned_phase("absent_enabled_without_inventory")
+        response = fixture.request(
+            "POST /workers/offline/disable?reason=historical-recovery-fixture")
+        results["absent_disable"] = response
+        retain_observations()
+        assert response.get("status") == "ok", response
+        assert response.get("active_slots") == 3, response
+        fixture.stop()
+        fixture.start()
+        assert_absent_owned_phase("absent_disabled_restart")
+
         # Reintroduce the exact original configuration while the reservation
         # still belongs to its original worker; no changed field can hide an
         # omitted transition for an otherwise identical inventory entry.

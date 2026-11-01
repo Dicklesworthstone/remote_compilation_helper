@@ -3,7 +3,9 @@
 //! Executes periodic remote compilation verification tests and stores
 //! run history for CLI/dashboard reporting.
 
-use crate::workers::WorkerPool;
+use crate::workers::{
+    AdminIntent, BackgroundProbe, WorkerEndpointSnapshot, WorkerPool, WorkerState,
+};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rch_common::remote_compilation::RemoteCompilationTest;
@@ -20,7 +22,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, sleep};
 use tokio_cron_scheduler::{Job, JobScheduler};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 pub const DEFAULT_RUN_CAPACITY: usize = 100;
 pub const DEFAULT_RESULT_CAPACITY: usize = 500;
@@ -59,6 +61,32 @@ pub struct SelfTestResultRecord {
     pub local_time_ms: Option<u64>,
     pub remote_time_ms: Option<u64>,
     pub error: Option<String>,
+}
+
+/// Publication authority stays in memory until the fleet-wide result barrier
+/// completes. The public/history record remains diagnostic and cannot by
+/// itself authorize a mutation of a reusable worker ID.
+#[derive(Debug)]
+struct SelfTestCompletion {
+    record: SelfTestResultRecord,
+    authority: Option<SelfTestAuthority>,
+}
+
+#[derive(Debug)]
+struct SelfTestAuthority {
+    worker: Arc<WorkerState>,
+    endpoint: WorkerEndpointSnapshot,
+    admission: BackgroundProbe,
+    admin: AdminIntent,
+}
+
+impl SelfTestCompletion {
+    fn unowned(record: SelfTestResultRecord) -> Self {
+        Self {
+            record,
+            authority: None,
+        }
+    }
 }
 
 /// Run response with per-worker results.
@@ -446,7 +474,7 @@ impl SelfTestService {
         }
 
         let workers_tested = results.len();
-        let workers_passed = results.iter().filter(|r| r.passed).count();
+        let workers_passed = results.iter().filter(|r| r.record.passed).count();
         let workers_failed = workers_tested.saturating_sub(workers_passed);
 
         let completed_at = Utc::now();
@@ -468,12 +496,15 @@ impl SelfTestService {
 
         self.history.record_run(run.clone());
         for result in &results {
-            self.history.record_result(result.clone());
+            self.history.record_result(result.record.clone());
         }
 
         self.apply_failure_actions(&results).await;
 
-        Ok(SelfTestRunReport { run, results })
+        Ok(SelfTestRunReport {
+            run,
+            results: results.into_iter().map(|result| result.record).collect(),
+        })
     }
 
     async fn resolve_workers(
@@ -523,44 +554,68 @@ impl SelfTestService {
         Ok(result)
     }
 
-    async fn apply_failure_actions(&self, results: &[SelfTestResultRecord]) {
+    async fn apply_failure_actions(&self, results: &[SelfTestCompletion]) {
         if results.is_empty() {
             return;
         }
 
-        for result in results.iter().filter(|r| !r.passed) {
+        for completion in results.iter().filter(|r| !r.record.passed) {
+            let result = &completion.record;
             // Cancelling maintenance after a state change is not evidence of
             // worker failure. In particular, a temporary transport outage must
             // not become a permanent administrative disable through this path.
             if result.error.as_deref() == Some(SELF_TEST_SUSPENDED) {
                 continue;
             }
+            let Some(authority) = &completion.authority else {
+                // A refused or panicked task never established a completed
+                // probe against a known incarnation. Its diagnostic remains
+                // in history, but it cannot disable an arbitrary current ID.
+                continue;
+            };
             match self.config.on_failure {
                 SelfTestFailureAction::Alert => {
+                    let Some(_endpoint) = authority
+                        .worker
+                        .lock_current_endpoint(&authority.endpoint)
+                        .await
+                    else {
+                        continue;
+                    };
+                    let Some(_publication) = authority
+                        .worker
+                        .lock_network_publication(&authority.admission)
+                        .await
+                    else {
+                        continue;
+                    };
+                    if authority.worker.lifecycle().await.admin != authority.admin {
+                        continue;
+                    }
                     warn!(
                         "Self-test failed for worker {}: {:?}",
                         result.worker_id, result.error
                     );
                 }
-                SelfTestFailureAction::DisableWorker => {
-                    warn!(
-                        "Self-test failed for worker {}: disabling worker",
-                        result.worker_id
-                    );
-                    let id = WorkerId::new(result.worker_id.clone());
-                    self.pool
-                        .set_status(&id, rch_common::WorkerStatus::Disabled)
-                        .await;
-                }
-                SelfTestFailureAction::AlertAndDisable => {
-                    warn!(
-                        "Self-test failed for worker {}: alert + disable",
-                        result.worker_id
-                    );
-                    let id = WorkerId::new(result.worker_id.clone());
-                    self.pool
-                        .set_status(&id, rch_common::WorkerStatus::Disabled)
-                        .await;
+                SelfTestFailureAction::DisableWorker | SelfTestFailureAction::AlertAndDisable => {
+                    if authority
+                        .worker
+                        .disable_from_probe(
+                            &authority.endpoint,
+                            &authority.admission,
+                            authority.admin,
+                            None,
+                        )
+                        .await
+                    {
+                        warn!(
+                            "Self-test failed for worker {}: disabling worker",
+                            result.worker_id
+                        );
+                    } else {
+                        debug!(worker = %result.worker_id,
+                            "Discarding self-test failure action after worker state changed");
+                    }
                 }
             }
         }
@@ -619,12 +674,12 @@ async fn run_single_worker_test(
     options: &SelfTestRunOptions,
     config: &SelfTestConfig,
     pool: &WorkerPool,
-) -> SelfTestResultRecord {
+) -> SelfTestCompletion {
     let worker_id = worker.id.to_string();
     let timeout_total = options.timeout;
 
     if let Some(reason) = canary_unsupported(worker) {
-        return SelfTestResultRecord {
+        return SelfTestCompletion::unowned(SelfTestResultRecord {
             run_id,
             worker_id,
             passed: false,
@@ -633,21 +688,34 @@ async fn run_single_worker_test(
             local_time_ms: None,
             remote_time_ms: None,
             error: Some(reason),
-        };
+        });
     }
 
     let Some(state) = pool.get(&worker.id).await else {
-        return failed_worker_result(run_id, &worker_id, &anyhow::anyhow!(SELF_TEST_SUSPENDED));
+        return SelfTestCompletion::unowned(failed_worker_result(
+            run_id,
+            &worker_id,
+            &anyhow::anyhow!(SELF_TEST_SUSPENDED),
+        ));
     };
     let Some(mut admission) = state.background_probe().await else {
-        return failed_worker_result(run_id, &worker_id, &anyhow::anyhow!(SELF_TEST_SUSPENDED));
+        return SelfTestCompletion::unowned(failed_worker_result(
+            run_id,
+            &worker_id,
+            &anyhow::anyhow!(SELF_TEST_SUSPENDED),
+        ));
     };
     let current = state.endpoint_snapshot().await;
     if crate::workers::WorkerEndpointIdentity::from_config(&current.config)
         != crate::workers::WorkerEndpointIdentity::from_config(worker)
     {
-        return failed_worker_result(run_id, &worker_id, &anyhow::anyhow!(SELF_TEST_SUSPENDED));
+        return SelfTestCompletion::unowned(failed_worker_result(
+            run_id,
+            &worker_id,
+            &anyhow::anyhow!(SELF_TEST_SUSPENDED),
+        ));
     }
+    let admitted_admin = state.lifecycle().await.admin;
 
     let retry_loop = async {
         let retry_delay =
@@ -710,9 +778,13 @@ async fn run_single_worker_test(
         .run(tokio::time::timeout(timeout_total, retry_loop))
         .await
     else {
-        return failed_worker_result(run_id, &worker_id, &anyhow::anyhow!(SELF_TEST_SUSPENDED));
+        return SelfTestCompletion::unowned(failed_worker_result(
+            run_id,
+            &worker_id,
+            &anyhow::anyhow!(SELF_TEST_SUSPENDED),
+        ));
     };
-    match outcome {
+    let record = match outcome {
         Ok(record) => record,
         Err(_elapsed) => SelfTestResultRecord {
             run_id,
@@ -727,17 +799,26 @@ async fn run_single_worker_test(
                 timeout_total
             )),
         },
+    };
+    SelfTestCompletion {
+        record,
+        authority: Some(SelfTestAuthority {
+            worker: state,
+            endpoint: current,
+            admission,
+            admin: admitted_admin,
+        }),
     }
 }
 
 /// A panicked worker task becomes a failure record instead of losing the run.
 fn self_test_task_result(
     run_id: u64,
-    joined: std::result::Result<SelfTestResultRecord, tokio::task::JoinError>,
-) -> SelfTestResultRecord {
+    joined: std::result::Result<SelfTestCompletion, tokio::task::JoinError>,
+) -> SelfTestCompletion {
     joined.unwrap_or_else(|join_err| {
         warn!("Self-test task panicked: {}", join_err);
-        SelfTestResultRecord {
+        SelfTestCompletion::unowned(SelfTestResultRecord {
             run_id,
             worker_id: "unknown".to_string(),
             passed: false,
@@ -746,7 +827,7 @@ fn self_test_task_result(
             local_time_ms: None,
             remote_time_ms: None,
             error: Some(format!("Task panicked: {}", join_err)),
-        }
+        })
     })
 }
 
@@ -957,6 +1038,206 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_self_test_failure_cannot_disable_a_new_endpoint_or_admin_decision() {
+        for (action, transition) in [
+            SelfTestFailureAction::Alert,
+            SelfTestFailureAction::DisableWorker,
+            SelfTestFailureAction::AlertAndDisable,
+        ]
+        .into_iter()
+        .flat_map(|action| {
+            [
+                "unchanged",
+                "already_draining",
+                "capacity_update",
+                "retarget",
+                "retarget_aba",
+                "remove_readd",
+                "disable_enable",
+                "operator_disable",
+                "drain",
+            ]
+            .map(|transition| (action, transition))
+        }) {
+            let project = tempfile::tempdir().unwrap();
+            let pool = WorkerPool::new();
+            let mut config = WorkerConfig {
+                id: WorkerId::new("self-test-owner"),
+                host: "original.invalid".into(),
+                user: "builder".into(),
+                identity_file: "/dev/null".into(),
+                total_slots: 4,
+                ..WorkerConfig::default()
+            };
+            pool.add_worker(config.clone()).await;
+            let original = pool.get(&config.id).await.unwrap();
+            assert!(original.reserve_slots(1).await);
+            if transition == "already_draining" {
+                original.drain().await;
+            }
+            let self_test = SelfTestConfig {
+                on_failure: action,
+                retry_count: 0,
+                ..SelfTestConfig::default()
+            };
+            // A real failed self-test, completed before the fleet-wide result
+            // barrier. The empty project fails before cargo or SSH is started.
+            let result = run_single_worker_test(
+                7,
+                &config,
+                project.path(),
+                &SelfTestRunOptions::default(),
+                &self_test,
+                &pool,
+            )
+            .await;
+            assert!(!result.record.passed);
+            assert!(
+                result
+                    .record
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("Failed to create test change"),
+                "{result:?}"
+            );
+            let current_slots = match transition {
+                "unchanged" | "already_draining" => 1,
+                "capacity_update" => {
+                    config.total_slots = 8;
+                    config.priority += 1;
+                    config.tags.push("new-description".into());
+                    pool.add_worker(config.clone()).await;
+                    1
+                }
+                "retarget" => {
+                    config.host = "replacement.invalid".into();
+                    pool.add_worker(config.clone()).await;
+                    1
+                }
+                "retarget_aba" => {
+                    let mut replacement = config.clone();
+                    replacement.host = "replacement.invalid".into();
+                    pool.add_worker(replacement).await;
+                    pool.add_worker(config.clone()).await;
+                    1
+                }
+                "remove_readd" => {
+                    assert!(pool.remove_worker(&config.id).await);
+                    pool.add_worker(config.clone()).await;
+                    let replacement = pool.get(&config.id).await.unwrap();
+                    assert!(!Arc::ptr_eq(&original, &replacement));
+                    assert!(replacement.reserve_slots(2).await);
+                    2
+                }
+                "disable_enable" => {
+                    original.disable(Some("operator maintenance".into())).await;
+                    original.enable().await;
+                    1
+                }
+                "operator_disable" => {
+                    original.disable(Some("operator maintenance".into())).await;
+                    1
+                }
+                "drain" => {
+                    original.drain().await;
+                    1
+                }
+                _ => unreachable!(),
+            };
+            let service = SelfTestService::new(
+                pool.clone(),
+                self_test,
+                Arc::new(SelfTestHistory::new(4, 4)),
+            );
+            service.apply_failure_actions(&[result]).await;
+            let current = pool.get(&config.id).await.unwrap();
+            assert_eq!(
+                current.is_disabled().await,
+                transition == "operator_disable"
+                    || (matches!(
+                        transition,
+                        "unchanged" | "already_draining" | "capacity_update"
+                    ) && action != SelfTestFailureAction::Alert),
+                "completed evidence must belong to the current endpoint and administrative epoch: {action:?}, {transition}"
+            );
+            if transition == "operator_disable" {
+                assert_eq!(
+                    current.disabled_reason().await.as_deref(),
+                    Some("operator maintenance")
+                );
+            }
+            if transition == "drain" {
+                assert!(current.is_draining().await);
+            }
+            assert_eq!(current.used_slots(), current_slots);
+            assert_eq!(original.used_slots(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_self_test_waiting_to_publish_yields_to_an_operator_enable() {
+        let project = tempfile::tempdir().unwrap();
+        let pool = WorkerPool::new();
+        let config = WorkerConfig {
+            id: WorkerId::new("publication-race"),
+            host: "original.invalid".into(),
+            ..WorkerConfig::default()
+        };
+        pool.add_worker(config.clone()).await;
+        let worker = pool.get(&config.id).await.unwrap();
+        assert!(worker.reserve_slots(1).await);
+        let self_test = SelfTestConfig {
+            on_failure: SelfTestFailureAction::AlertAndDisable,
+            retry_count: 0,
+            ..SelfTestConfig::default()
+        };
+        let completion = run_single_worker_test(
+            11,
+            &config,
+            project.path(),
+            &SelfTestRunOptions::default(),
+            &self_test,
+            &pool,
+        )
+        .await;
+        assert!(!completion.record.passed);
+        let service = SelfTestService::new(pool, self_test, Arc::new(SelfTestHistory::new(4, 4)));
+
+        // Both operations queue on the actual publication mutex. FIFO order
+        // lets the operator's newer decision finish first without sleeps or
+        // transport hooks; the delayed failure must re-check after acquiring it.
+        let authority = completion.authority.as_ref().unwrap();
+        let held = worker
+            .lock_network_publication(&authority.admission)
+            .await
+            .unwrap();
+        let enable = worker.enable();
+        tokio::pin!(enable);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(enable.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let publication = service.apply_failure_actions(std::slice::from_ref(&completion));
+        tokio::pin!(publication);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(publication.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(enable, publication)
+        })
+        .await
+        .expect("operator enable and stale publication must not deadlock");
+        assert!(!worker.is_disabled().await);
+        assert_eq!(worker.used_slots(), 1);
+        assert!(worker.disabled_reason().await.is_none());
+    }
+
+    #[tokio::test]
     async fn named_self_tests_cannot_connect_to_suspended_workers_or_disable_transient_failures() {
         for operator_disabled in [false, true] {
             let pool = WorkerPool::new();
@@ -1008,7 +1289,7 @@ mod tests {
             )
             .await
             .expect("a suspended worker is refused before local or remote work");
-            assert_eq!(result.error.as_deref(), Some(SELF_TEST_SUSPENDED));
+            assert_eq!(result.record.error.as_deref(), Some(SELF_TEST_SUSPENDED));
             let service =
                 SelfTestService::new(pool, self_test, Arc::new(SelfTestHistory::new(4, 4)));
             service.apply_failure_actions(&[result]).await;
@@ -1082,6 +1363,7 @@ mod tests {
         )
         .await
         .expect("a Windows worker is refused without attempting the canary");
+        let record = record.record;
         assert!(!record.passed);
         assert_eq!((record.run_id, record.worker_id.as_str()), (9, "win"));
         let error = record.error.unwrap();
