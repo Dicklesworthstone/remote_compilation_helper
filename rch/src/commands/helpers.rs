@@ -19,6 +19,11 @@ const DAEMON_COMMAND_IO_TIMEOUT: Duration = Duration::from_secs(10);
 const DAEMON_RESTART_ADMISSION_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(unix)]
 const DAEMON_CAPABILITIES_REFRESH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(90);
+/// A busy-worker cancellation can consume 60s in the daemon. Keep the
+/// completion response inside a larger client budget instead of abandoning
+/// it at the ordinary 10s status-query deadline (issue #129).
+#[cfg(unix)]
+const DAEMON_CANCELLATION_RESPONSE_TIMEOUT: Duration = Duration::from_secs(75);
 /// Extra wall-clock margin added on top of a self-test's per-worker `timeout`
 /// budget when waiting for the daemon response. The daemon caps each worker's
 /// whole canary (local build → remote build → rsync-back → hash verify) at the
@@ -781,6 +786,8 @@ pub(crate) async fn send_daemon_command_to_socket(
 fn daemon_command_response_timeout(command: &str) -> Duration {
     if daemon_command_is_capabilities_refresh(command) {
         DAEMON_CAPABILITIES_REFRESH_RESPONSE_TIMEOUT
+    } else if daemon_command_is_build_cancellation(command) {
+        DAEMON_CANCELLATION_RESPONSE_TIMEOUT
     } else if command.starts_with("POST /restart-admission") {
         // A daemon on a host at load ~130 took over 10 s to answer; the
         // barrier is an operator action, so wait for its verdict.
@@ -798,6 +805,24 @@ fn daemon_command_response_timeout(command: &str) -> Duration {
     } else {
         DAEMON_COMMAND_IO_TIMEOUT
     }
+}
+
+#[cfg(unix)]
+fn daemon_command_is_build_cancellation(command: &str) -> bool {
+    let mut words = command.lines().next().unwrap_or("").split_whitespace();
+    if words.next() != Some("POST") {
+        return false;
+    }
+    let path = words.next().unwrap_or("").split('?').next().unwrap_or("");
+    if path == "/builds/cancel-all" {
+        // The daemon owns a bounded batch after caller disconnect. This
+        // allowance covers one full cancellation window; larger batches can
+        // outlive it and remain inspectable through active history/events.
+        return true;
+    }
+    path.strip_prefix("/builds/")
+        .and_then(|rest| rest.strip_suffix("/cancel"))
+        .is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 /// If `command` is a `POST /self-test/run` request, return its per-worker
@@ -923,6 +948,35 @@ mod daemon_command_tests {
             daemon_command_response_timeout("GET /status\n"),
             DAEMON_COMMAND_IO_TIMEOUT
         );
+    }
+
+    #[test]
+    fn busy_worker_cancellation_waits_for_the_daemon_cleanup_budget() {
+        for command in [
+            "POST /builds/42/cancel\n",
+            "POST /builds/42/cancel?force=true&local_wrapper_id=owner\n",
+            "POST /builds/cancel-all?force=false\n",
+        ] {
+            assert_eq!(
+                daemon_command_response_timeout(command),
+                DAEMON_CANCELLATION_RESPONSE_TIMEOUT,
+                "{command}"
+            );
+        }
+        for command in [
+            "GET /builds/42/cancel\n",
+            "POST /builds/42/cancel-extra\n",
+            "POST /builds/not-an-id/cancel\n",
+            "POST /builds//cancel\n",
+            "POST /builds/cancel-all-extra\n",
+            "GET /status\n",
+        ] {
+            assert_eq!(
+                daemon_command_response_timeout(command),
+                DAEMON_COMMAND_IO_TIMEOUT,
+                "{command}"
+            );
+        }
     }
 
     #[test]

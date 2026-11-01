@@ -1,14 +1,9 @@
-# Owned rch-build lifecycle: supervisor outside, leader alive until scoped stop.
-# Only then publish durable completion/release ownership. V1 covers the process
-# group; configured V2 also covers setsid descendants. The argv ABI is unchanged.
+# Owned supervisor: V1 covers the group; V2 also covers detached descendants.
+# Completion requires proven cleanup. Keep comments compact: this source is
+# quoted through four transport layers within the Linux argument-size limit.
 
-# Dash redirects an asynchronous command's stdin to /dev/null BEFORE applying
-# that command's redirections: <&0 alone cannot preserve the original input.
-# Borrow an unused descriptor, duplicate the original open file description,
-# then explicitly bind it back to fd 0 in the child. Never reopen a pathname
-# (which resets file offsets), spool input, or overwrite inherited authority FDs.
-# Linux still requires a fenced procfs view. Darwin inspects inherited FDs
-# with fstat, not /dev/fd path guesses or a Linux-only descriptor directory.
+# Preserve the open input description across dash asynchronous redirection.
+# Borrow only a free FD; never reopen paths or overwrite inherited authority.
 rch_scope_launch_fds() {
     __sl_open_fds=
     case "$(uname -s)" in
@@ -22,10 +17,8 @@ rch_scope_launch_fds() {
                 fi
             done;;
         Darwin)
-            # NO command substitution: bash can allocate its capture pipe in
-            # closed fd 0/2, making the child observe a different descriptor set.
-            # Encode stdin/stderr presence and ONE free slot in exit 64..94.
-            # Startup errors, missing Python and signals are outside that range.
+            # No substitution: its pipe would change the FD set. Encode input,
+            # stderr and a free slot in status 64..94, outside startup failures.
             __sl_fd_probe=0
             python3 -I -S -c '
 import errno, os, sys
@@ -72,8 +65,7 @@ rch_scope_launch_save_input() {
     for __sl_input_candidate in 4 5 6 7 8 9; do
         if ! rch_scope_launch_fd_open "$__sl_input_candidate"; then
             __sl_input=$__sl_input_candidate
-            # Only this literal single-digit selection enters eval. No input,
-            # path, argument or environment value becomes shell program text.
+            # Only this validated single digit enters eval as program text.
             eval "exec $__sl_input<&0" || return 1
             __sl_input_redirect="0<&$__sl_input $__sl_input<&-"
             return 0
@@ -91,8 +83,7 @@ rch_scope_launch_close_input() {
     __sl_input=
 }
 
-# Snapshot receiver policy once. Never let removal/change between route selection
-# and child launch silently put a requested scope on the legacy PGID-only route.
+# Snapshot policy once; changes must not downgrade a requested scope to V1.
 rch_scope_launch_select() {
     rch_launch_nice= rch_launch_slice= rch_launch_manager=user
     rch_policy_select_file || return 125
@@ -119,13 +110,10 @@ rch_scope_launch_process() {
     rch_valid_pgid "$1" || return 2
     if [ "$(uname -s)" = Darwin ]; then
         if ! rch_darwin_process "$1"; then
-            # libproc failure alone is unknown. A separate, signal-free kernel
-            # ESRCH can prove absence (including a setup child that exited
-            # before publishing). A live/reused PID, EPERM, timeout or failed
-            # helper supplies NO birth or signal authority. Do not conflate
-            # this one process with an empty workload group: the existing
-            # receipt-bound census remains mandatory after admission.
-            rch_launch_absence=$(rch_control_capture 1s python3 -I -S -c '
+            # Only independent ESRCH proves this process absent after libproc
+            # failure. This never proves group absence or authorizes signals.
+            rch_observation_budget
+            rch_launch_absence=$(rch_control_capture "${rch_observation_seconds}s" python3 -I -S -c '
 import errno, os, sys
 try:
     os.getpgid(int(sys.argv[1]))
@@ -160,9 +148,9 @@ sys.exit(1)
 # does not expire early because its starting fractional second was discarded.
 rch_scope_launch_clock() {
     if [ "$(uname -s)" = Darwin ]; then
-        # Apple's CLOCK_MONOTONIC_RAW uses the continuous clock, including
-        # suspend; Python's monotonic() uses mach_absolute_time, which does not.
-        rch_launch_now=$(rch_control_capture 1s python3 -I -S -c \
+        # Darwin continuous time includes suspend; Python monotonic does not.
+        rch_observation_budget
+        rch_launch_now=$(rch_control_capture "${rch_observation_seconds}s" python3 -I -S -c \
             'import time; print(time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW) // 10000000)') || return 1
         rch_scope_uint "$rch_launch_now" && [ "${#rch_launch_now}" -le 15 ]
         return $?
@@ -180,17 +168,13 @@ rch_scope_launch_parent_alive() {
     rch_scope_launch_process "$__sl_parent" && [ "$rch_launch_birth" = "$__sl_parent_start" ]
 }
 
-# Best-effort marker delivery must not delay hard cleanup behind a full pipe.
-# The shared bounded helper supports Darwin without coreutils. Map fd 3 onto
-# stdout BEFORE it starts: its Python fallback does not inherit extra FDs.
+# Bound marker delivery. Map fd 3 before Python closes nonstandard descriptors.
 rch_scope_launch_deadline_marker() {
     rch_group_timeout --signal=KILL 1s /bin/sh -c 'printf "\n%s\n" "$1"' rch-deadline "$1" \
         >&3 2>/dev/null </dev/null
 }
 
-# Bound diagnostics in a private helper group so a blocked consumer cannot hold
-# source/activity FDs forever. Silence timeout diagnostics too. Delivery failure
-# changes no terminal status, receipt, claim, or cleanup verdict.
+# Bound diagnostics without changing receipt, claim, status or cleanup verdict.
 rch_scope_launch_message() (
     rch_group_timeout --signal=KILL 1s /bin/sh -c '
         case "$2" in
@@ -211,18 +195,13 @@ rch_scope_launch_binding_matches() {
     fi
 }
 
-# Used ONLY by the still-executing leader/watchdog inside its own group. Its
-# current membership pins that group even if the leader died. $$ in a watchdog
-# subshell names the leader, so obtain the actual caller PID from the verified
-# procfs view. This is not historical receipt authority or an orphan adopter;
-# the outside supervisor must still use birth-fenced cancellation and census.
+# In-session watchdog membership pins its own group even after leader death.
+# Historical receipts still need outside birth-fenced cancellation and census.
 rch_scope_launch_kill_self() {
     if [ "$rch_scope_bound" = 1 ]; then
         rch_scope_operation kill
     elif [ "$(uname -s)" = Darwin ]; then
-        # This helper inherits the executing watchdog's group. Its kernel
-        # membership pins that group even if the native identity helper fails.
-        # No historical PID or receipt grants this in-session-only authority.
+        # Kernel membership grants this in-session authority, never a receipt.
         rch_valid_pgid "$rch_pgid" || return 1
         python3 -I -S -c '
 import os, signal, sys
@@ -255,8 +234,11 @@ rch_scope_launch_child() {
         [ -n "$rch_policy_nice$rch_policy_slice" ] || return 0
         rch_policy_enforce
     }
+    rch_observation_clock || exit 125
+    rch_observation_deadline=$((rch_observation_now + 6000))
     rch_remote_record "$__sl_record" "$__sl_build" || exit 125
     rch_scope_launch_binding_matches || exit 125
+    unset rch_observation_deadline
     __sl_cancelled=0
     trap '__sl_cancelled=1' HUP INT TERM
     while [ ! -f "$__sl_control/go" ]; do
@@ -268,17 +250,13 @@ rch_scope_launch_child() {
     done
     rch_scope_launch_clock || exit 255
     __sl_started=$rch_launch_now
-    # This watchdog lives in the group and survives a SIGKILL of the outside
-    # supervisor. It remains armed after the command reports its exit status,
-    # until the supervisor stops the group/scope. V2 additionally covers
-    # detached descendants; V1 makes no claim beyond its own process group.
+    # Watchdog survives supervisor loss and remains armed after payload exit
+    # until proven cleanup. Only V2 covers detached descendants.
     (
         trap '' HUP INT TERM
         while :; do
-            # The outside parent can still be alive after this group's leader
-            # crashes. Without the leader, fresh cancellation cannot acquire
-            # birth authority. This executing member still pins its own group
-            # and must stop it, even when no build deadline was requested.
+            # This member must stop its pinned group after leader loss, even
+            # with a live supervisor and no configured build deadline.
             if ! rch_scope_launch_parent_alive || ! rch_remote_leader_matches; then
                 rch_scope_launch_kill_self
                 exit 255
@@ -296,17 +274,15 @@ rch_scope_launch_child() {
             sleep 0.2 3>&- || exit 255
         done
     ) >/dev/null 2>&1 </dev/null &
-    # Start the watchdog first so it never inherits the borrowed input FD.
-    # Admission has already occurred: failure here is uncertain execution,
-    # never the pre-workload capability refusal that permits fallback.
+    # Watchdog must not inherit borrowed input. Post-admission failure is
+    # uncertain execution, never a pre-workload refusal permitting fallback.
     rch_scope_launch_save_input || { rch_scope_launch_kill_self; exit 255; }
     eval '"$@" 3>&- '"$__sl_input_redirect"' &'
     __sl_payload=$!
     rch_scope_launch_close_input
     wait "$__sl_payload"; __sl_status=$?
     [ "$__sl_cancelled" != 1 ] || __sl_status=143
-    # This is only a command-status report, NEVER a completion receipt. The
-    # parent still has to prove the whole process/cgroup tree has stopped.
+    # Payload status is NOT completion: the parent must prove tree cleanup.
     (umask 077; set -C; printf 'RCH_SCOPED_RESULT_V1:%s:%s:%s:%s\n' \
         "$__sl_build" "$rch_pgid" "$rch_start" "$__sl_status" > "$__sl_control/result.tmp") &&
         mv "$__sl_control/result.tmp" "$__sl_control/result" || exit 255
@@ -341,9 +317,7 @@ rch_scope_launch_read_owned_record() {
         [ "$rch_start" = "$__sl_child_start" ]
 }
 
-# Before the gate opens, only trusted setup helpers can be running. Stop that
-# exact child/group on admission failure; never use this PGID-only path once
-# payload execution has been admitted. A V2 record still requires scope cleanup.
+# Only before admission: stop the exact setup child. V2 also needs scope cleanup.
 rch_scope_launch_stop_setup() {
     rch_scope_launch_process "$__sl_child"
     case $? in 1) return 0;; 0) ;; *) return 1;; esac
@@ -355,9 +329,7 @@ rch_scope_launch_stop_setup() {
     fi
 }
 
-# Exec preserves the direct-child PID and all inherited authority/input FDs.
-# macOS has setsid(2), not a stock setsid(1). Never let a missing executable
-# silently turn a supervised group into an unowned legacy launch.
+# Preserve child PID and FDs. Darwin supplies setsid(2) through Python.
 rch_scope_launch_exec() {
     case "$(uname -s)" in
         Linux) exec setsid "$@";;
@@ -366,29 +338,19 @@ rch_scope_launch_exec() {
     esac
 }
 
-# Exit 255 on unconfirmed cleanup: transfer orchestration already treats it as
-# unknown remote completion and retains recovery/source authority. Do not turn
-# cleanup uncertainty into an ordinary compiler failure or a setup fallback.
+# Exit 255 retains ownership on unknown completion; it never permits fallback.
 rch_scope_launch_supervise() {
     __sl_record=$1; __sl_limit=$2; __sl_marker=$3; __sl_build=$4; shift 4
     case "$__sl_record" in /*) ;; *) return 125;; esac
-    # The record names ONE admitted execution, not permission to launch it
-    # again. Keep the control directory as a one-shot claim, even if a lost
-    # caller never reached record publication or the record is later retired.
-    # mkdir is the atomic arbiter for simultaneous supervisors; a randomized
-    # control directory admitted both and let the second overwrite the record.
-    # Existing legacy records also refuse before any child or mutation starts.
-    # Outer durable execution/source grants remain required: an older writer
-    # that ignores this directory does not participate in its arbitration.
+    # Atomic one-shot claim: neither lost publication nor retired receipt allows
+    # a second execution. Outer durable execution/source grants remain required.
     if [ -e "$__sl_record" ] || [ -L "$__sl_record" ]; then
         rch_scope_launch_message RCH_SCOPED_LAUNCH_ALREADY_OWNED >&2
         return 255
     fi
     __sl_control="$__sl_record.supervisor.v1"
     (umask 077; mkdir -m 700 -- "$__sl_control") 2>/dev/null || {
-        # Only an existing claim means another launch owns this record. Any
-        # other failure (missing parent, EDQUOT, ENOSPC) claimed and started
-        # nothing: report the pre-workload refusal the caller may retry.
+        # Existing claims retain ownership; other mkdir errors started nothing.
         if [ -e "$__sl_control" ] || [ -L "$__sl_control" ]; then
             rch_scope_launch_message RCH_SCOPED_LAUNCH_ALREADY_OWNED >&2
             return 255
@@ -396,14 +358,12 @@ rch_scope_launch_supervise() {
         rch_scope_launch_message "$__sl_marker" setup >&2
         return 125
     }
-    # Recheck after acquisition for an older launcher which has no claim.
-    # Do not remove/adopt either its record or this invocation's new fence.
+    # Recheck legacy writers; never remove or adopt their record or this fence.
     if [ -e "$__sl_record" ] || [ -L "$__sl_record" ]; then
         rch_scope_launch_message RCH_SCOPED_LAUNCH_ALREADY_OWNED >&2
         return 255
     fi
-    # Claim before policy selection: a policy changed since an earlier run
-    # must not turn its duplicate into a pre-workload fallback permission.
+    # Claim first: changed policy must not grant fallback to a duplicate launch.
     rch_scope_launch_select || {
         rch_scope_launch_message "$__sl_marker" setup >&2
         return 125
@@ -416,8 +376,7 @@ rch_scope_launch_supervise() {
         Darwin) command -v python3 >/dev/null 2>&1 || return 125;;
         *) return 125;;
     esac
-    # No observer may share the new child's group or cgroup. Capture this
-    # supervisor's birth before launch for the child's lost-parent watchdog.
+    # Capture supervisor birth for the lost-parent watchdog before launch.
     rch_scope_launch_process "$$" && rch_scope_launch_clock || {
         rch_scope_launch_message "$__sl_marker" setup >&2
         return 125
@@ -430,20 +389,15 @@ rch_scope_launch_supervise() {
         rch_scope_launch_message "$__sl_marker" setup >&2
         return 125
     }
-    # Arguments and the literal source expand as QUOTED argument values inside
-    # eval; only the fixed descriptor redirection is assembled as syntax.
+    # Only the fixed FD redirection becomes eval syntax; data stays quoted.
     eval 'rch_scope_launch_exec /bin/sh -c "$rch_launch_source
 rch_scope_launch_child \"\$@\"" rch-scoped-child \
         "$__sl_record" "$__sl_control" "$__sl_marker" "$__sl_build" \
         "$$" "$__sl_parent_start" "$__sl_limit" \
         "$rch_launch_nice" "$rch_launch_slice" "$rch_launch_manager" "$@" '"$__sl_input_redirect"' &'
     __sl_child=$!
-    # Bash can print asynchronous "Killed" notices at ANY command boundary,
-    # not just wait. Once the child has inherited the real streams, keep the
-    # observer's own stderr quiet for the entire remaining lifecycle. Its
-    # otherwise-unused stdout carries only bounded refusal messages back to
-    # the original stderr. No inherited authority FD or payload stream changes.
-    # A deliberately closed stderr stays closed in the already-launched child.
+    # Silence asynchronous shell notices after child stream inheritance. Route
+    # bounded diagnostics via stdout to original stderr; preserve closed stderr.
     if rch_scope_launch_fd_open 2; then
         rch_scope_launch_finish 1>&2 2>/dev/null
     else
@@ -451,12 +405,12 @@ rch_scope_launch_child \"\$@\"" rch-scoped-child \
     fi
 }
 
-# Same supervising shell and direct child: do not turn this into a subprocess,
-# which would break the child's parent-birth binding and cancellation traps.
-# stdout here is the original diagnostic stream, NOT the workload's stdout.
+# Must remain in the supervising shell for birth binding and cancellation traps.
+# stdout here is the original diagnostic stream, never payload stdout.
 rch_scope_launch_finish() {
     rch_scope_launch_close_input
     __sl_child_start=; __sl_admitted=0; __sl_admission_record=; __sl_reason=setup
+    __sl_admission_observations=0
     rch_scope_launch_clock || return 255
     __sl_setup_started=$rch_launch_now
     while :; do
@@ -473,6 +427,11 @@ rch_scope_launch_finish() {
         if [ "$__sl_cancelled" = 1 ]; then __sl_reason=cancelled; break; fi
         rch_scope_launch_clock || { __sl_reason=unknown; break; }
         if [ "$__sl_admitted" = 0 ]; then
+            # One deadline covers publication and all admission observations.
+            if [ "$((rch_launch_now - __sl_setup_started))" -ge 6000 ]; then
+                [ "$__sl_admission_observations" = 0 ] || __sl_reason=unknown
+                break
+            fi
             if [ -e "$__sl_record" ] || [ -L "$__sl_record" ]; then
                 if ! rch_scope_launch_read_owned_record; then
                     __sl_reason=unknown; break
@@ -480,23 +439,38 @@ rch_scope_launch_finish() {
                 # Live birth proves presence; only cleanup needs a full census.
                 rch_remote_leader_matches || { __sl_reason=unknown; break; }
                 if [ $rch_scope_bound = 1 ]; then
+                    __sl_admission_observations=$((__sl_admission_observations + 1))
+                    rch_observation_deadline=$((__sl_setup_started + 6000))
                     rch_scope_operation state
-                    [ $? = 1 ] || { __sl_reason=unknown; break; }
+                    __sl_scope_state=$?
+                    unset rch_observation_deadline
+                    case "$__sl_scope_state" in
+                        1) ;;
+                        2)
+                            # Retry only unknown with gate closed. Each pass
+                            # revalidates child birth and the complete receipt.
+                            if [ "$__sl_admission_observations" -lt 3 ]; then
+                                sleep 0.1 || { __sl_reason=unknown; break; }
+                                continue
+                            fi
+                            __sl_reason=unknown; break;;
+                        *) __sl_reason=unknown; break;;
+                    esac
                 fi
                 rch_scope_launch_clock || { __sl_reason=unknown; break; }
+                if [ "$((rch_launch_now - __sl_setup_started))" -ge 6000 ]; then
+                    __sl_reason=unknown; break
+                fi
+                if [ "$__sl_cancelled" = 1 ]; then __sl_reason=cancelled; break; fi
+                rch_remote_leader_matches || { __sl_reason=unknown; break; }
                 __sl_started=$rch_launch_now
-                # Mark admitted before publication: an uncertain gate write
-                # cannot authorize the pre-payload group-only cleanup path.
-                # Keep the complete admitted binding in memory. Receipt loss or
-                # replacement must neither redirect cleanup nor erase our duty
-                # to stop this already-authorized workload.
+                # Mark admitted BEFORE gate write. Retain its binding in memory:
+                # receipt loss/replacement cannot redirect or waive cleanup.
                 __sl_admission_record=$rch_record
                 __sl_admitted=1
                 (umask 077; set -C; printf '%s\n' go > "$__sl_control/go") || {
                     __sl_reason=unknown; break;
                 }
-            elif [ "$((rch_launch_now - __sl_setup_started))" -ge 6000 ]; then
-                __sl_reason=setup; break
             fi
         else
             if [ -e "$__sl_control/result" ] || [ -L "$__sl_control/result" ]; then
@@ -511,19 +485,15 @@ rch_scope_launch_finish() {
     done
     __sl_cleanup=0
     if [ "$__sl_admitted" = 1 ]; then
-        # Nothing after admission reloads the identity fields. The cancellation
-        # primitive revalidates their live process/scope authority before every
-        # signal and still requires the full post-kill emptiness proof.
+        # Revalidate signal authority and prove emptiness using admitted identity.
         rch_remote_cancel_loaded kill || __sl_cleanup=1
-        # A damaged durable record still forbids reporting confirmed completion.
-        # Read it ONLY in a subshell, after attempting owned cleanup: otherwise
-        # even a failed parse can replace the binding used for cancellation.
+        # Check record AFTER cleanup in a subshell; parsing cannot replace our
+        # admitted identity. Record damage still forbids confirmed completion.
         (rch_scope_launch_read_owned_record &&
             [ "$rch_record" = "$__sl_admission_record" ]) || __sl_cleanup=1
     else
         rch_scope_launch_stop_setup || __sl_cleanup=1
-        # Wait before inspecting the receipt: publication cannot race recovery
-        # once this setup child has stopped. No payload passed the private gate.
+        # Reap before reading: setup publication cannot then race recovery.
         if [ "$__sl_cleanup" = 0 ]; then wait "$__sl_child"; __sl_wait=$?; fi
         if [ -e "$__sl_record" ] || [ -L "$__sl_record" ]; then
             if rch_scope_launch_read_owned_record; then
@@ -538,8 +508,7 @@ rch_scope_launch_finish() {
         return 255
     fi
     if [ "$__sl_admitted" = 1 ]; then wait "$__sl_child"; __sl_wait=$?; fi
-    # Deadline evidence wins a raced compiler report, exactly as the existing
-    # stream marker does. Retain the marker/status/control files for recovery.
+    # Deadline wins raced payload status. Retain evidence for recovery.
     if [ "$__sl_reason" = deadline ] || [ -f "$__sl_control/deadline" ]; then
         rch_scope_launch_deadline_marker "$__sl_marker"
         return 137
@@ -554,3 +523,25 @@ rch_scope_launch_finish() {
     rch_scope_launch_message "$__sl_marker" setup
     return 125
 }
+
+# Recovery probes actual policy/admission/execution/completion. Uncertainty
+# retains evidence and emits no healthy sentinel. Caller cap:120s including SSH.
+rch_process_health_probe() (
+    rch_health_base=${TMPDIR:-/tmp}
+    case "$rch_health_base" in /*) ;; *) exit 1;; esac
+    rch_health_dir=$(umask 077; mktemp -d "$rch_health_base/rch-process-health.XXXXXXXXXX") || exit 1
+    /bin/sh -c '
+rch_launch_source=$1; shift
+command eval "$rch_launch_source" || exit 125
+exec 3>&2
+rch_scope_launch_supervise "$@"
+' rch-process-health "$rch_launch_source" \
+        "$rch_health_dir/receipt" 5 RCH_PROCESS_HEALTH_DEADLINE 0 /bin/sh -c ':' || exit 1
+    # Only a proven completed attempt can discard its private probe evidence.
+    # There are no user paths or recursive deletions in this cleanup.
+    rm -f -- "$rch_health_dir/receipt" \
+        "$rch_health_dir/receipt.supervisor.v1/go" \
+        "$rch_health_dir/receipt.supervisor.v1/result" || exit 1
+    rmdir -- "$rch_health_dir/receipt.supervisor.v1" "$rch_health_dir" || exit 1
+    printf '%s\n' RCH_PROCESS_HEALTH_V1
+)
