@@ -5999,7 +5999,7 @@ fn warm_committed_metadata_replay(mixed: bool) {
                 if index < 2 {
                     1
                 } else {
-                    ((number + 1) / 2).min(3) as usize
+                    number.div_ceil(2).min(3) as usize
                 },
                 class,
             );

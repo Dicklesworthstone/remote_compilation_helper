@@ -2539,7 +2539,10 @@ sys.exit(99)
 
             let valid = Fixture::new("valid").await;
             let receipt = valid.receipt().await.unwrap();
-            assert_eq!(receipt.roots, [valid.prepared.manifest.clone()]);
+            assert_eq!(
+                receipt.roots.as_slice(),
+                std::slice::from_ref(&valid.prepared.manifest)
+            );
             assert_eq!(receipt.root_count, 1);
             let legacy = finalize_source_content_receipt(
                 &valid.worker,
@@ -2683,7 +2686,10 @@ sys.exit(99)
             )
             .await
             .unwrap();
-            assert_eq!(receipt.roots, [timestamped.prepared.manifest.clone()]);
+            assert_eq!(
+                receipt.roots.as_slice(),
+                std::slice::from_ref(&timestamped.prepared.manifest)
+            );
             timestamped.corrupt_same_size_and_mtime();
             let error = timestamped.owned(true).await.unwrap_err();
             assert!(error.to_string().contains("sha256:input.txt"), "{error:#}");
