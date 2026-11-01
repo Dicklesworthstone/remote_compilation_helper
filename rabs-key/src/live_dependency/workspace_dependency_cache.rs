@@ -32,6 +32,17 @@ const METADATA_KEY_EPOCH: u32 = 7;
 const METADATA_POLICY_DOMAIN: &str = "rabs.canonical-workspace-committed-metadata.isolation.v1";
 const METADATA_SEMANTICS_DOMAIN: &str = "rabs.canonical-workspace-committed-metadata.semantics.v1";
 const METADATA_SEMANTICS: &str = "completed independently supervised pure Rust metadata check; canonical-workspace-closed-metadata-v1 explicitly negotiated in ClosedMetadata mode without procfs or entropy devices; complete sealed workspace and exact environment; every retained Rust candidate bound to exact committed workspace producer action, descriptor, manifest and logical output; no provisional, adopted, local fallback or request-owned producer authority; transitive current producer safety at commit and replay; separate metadata class, capture and independent sample gates";
+const MIXED_RLIB_KEY_EPOCH: u32 = 8;
+const MIXED_METADATA_KEY_EPOCH: u32 = 9;
+const MIXED_RLIB_POLICY_DOMAIN: &str = "rabs.canonical-workspace-committed-mixed-rlib.isolation.v1";
+const MIXED_METADATA_POLICY_DOMAIN: &str =
+    "rabs.canonical-workspace-committed-mixed-metadata.isolation.v1";
+const MIXED_RLIB_SEMANTICS_DOMAIN: &str =
+    "rabs.canonical-workspace-committed-mixed-rlib.semantics.v1";
+const MIXED_METADATA_SEMANTICS_DOMAIN: &str =
+    "rabs.canonical-workspace-committed-mixed-metadata.semantics.v1";
+const MIXED_RLIB_SEMANTICS: &str = "completed independently supervised pure Rust archive; complete sealed workspace and exact environment; every retained candidate bound to exact committed archive-workspace producer or separately qualified canonical remote immutable dependency archive leaf; exact producer action, descriptor, manifest, output role and whole object identity; empty external-leaf ancestry and per-intermediate workspace producer policy; no provisional, adopted, local fallback or request-owned producer authority; current transitive producer safety, authenticated drained capture and independent mixed-class samples";
+const MIXED_METADATA_SEMANTICS: &str = "completed independently supervised pure Rust metadata check; explicitly negotiated ClosedMetadata namespace without procfs or entropy devices; complete sealed workspace and exact environment; every retained candidate bound to exact committed workspace producer or separately qualified canonical remote immutable dependency leaf; metadata producers authorize only metadata outputs, archive producers may authorize metadata and whole archives; exact producer action, descriptor, manifest, output role and object identity; empty external-leaf ancestry and per-intermediate workspace producer policy; no provisional, adopted, local fallback or request-owned producer authority; current transitive producer safety, authenticated drained capture and independent mixed-class samples";
 
 pub(super) const ISOLATION_PROFILE: &str = "canonical-workspace-committed-rlib-v1: \
     driver-retained Cargo-selected ordinary library build in a graph without \
@@ -73,6 +84,55 @@ pub(super) const METADATA_ISOLATION_PROFILE: &str = "canonical-workspace-committ
     safety revalidated; exact dep-info, tracked-control-variable veto and \
     authenticated drained receipt; separate metadata publication class and \
     independent samples, release and private installation gates";
+
+pub(super) const MIXED_RLIB_ISOLATION_PROFILE: &str = "canonical-workspace-committed-mixed-rlib-v1: \
+    driver-retained ordinary library build in a Cargo graph without project \
+    executors; canonical-workspace-exec-v3 Rlib namespace with complete immutable \
+    workspace and every immediate directory listing; exact argv, cwd, environment \
+    and output placement; complete retained toolchain and measured ELF runtime; \
+    no procfs or entropy devices, private null device, fresh output, HOME and temp; \
+    exact read-only candidate inventories in original order, including transitive \
+    alternatives and whole explicit archives; every candidate physically installed \
+    from an already committed closed or mixed archive-workspace producer, or a \
+    separately qualified canonical remote immutable dependency archive leaf; \
+    external registry, Git and checked directory-source leaves require zero \
+    explicit externs, zero retained candidates, no generated/native inputs and \
+    empty durable ancestry; qualification binds exact action, descriptor, manifest \
+    and original remote execution mode after verified published installation; \
+    metadata-only external or workspace producers cannot authorize archive \
+    consumers; exact producer output roles and whole object identities; original \
+    file generations, current qualification and transitive producer safety \
+    rechecked at publication and delivery; each intermediate retains its own \
+    ancestry policy; no project executors, generated/native inputs, proc macros, \
+    incremental state, final links, provisional adoption, local completion, \
+    fallback or request-owned producer authority; exact dep-info and tracked \
+    environment veto, authenticated drained receipt and independent mixed-class \
+    samples, release and private installation gates";
+
+pub(super) const MIXED_METADATA_ISOLATION_PROFILE: &str = "canonical-workspace-committed-mixed-metadata-v1: \
+    driver-retained ordinary library check in a Cargo graph without project \
+    executors; canonical-workspace-closed-metadata-v1 explicitly negotiated in \
+    ClosedMetadata mode; complete immutable workspace and every immediate \
+    directory listing; exact argv, cwd, environment and output placement; complete \
+    retained toolchain and measured ELF runtime; no procfs or entropy devices, \
+    private null device, fresh output, HOME and temp; exact read-only candidate \
+    inventories in original order, including transitive alternatives and whole \
+    explicit archives; every candidate physically installed from a committed \
+    closed or mixed workspace producer, or a separately qualified canonical \
+    remote immutable dependency leaf; external registry, Git and checked \
+    directory-source leaves require zero explicit externs, zero retained \
+    candidates, no generated/native inputs and empty durable ancestry; qualification \
+    binds exact action, descriptor, manifest and original remote execution mode \
+    after verified published installation; metadata producers authorize only \
+    ProvisionalMetadata rmeta, archive producers may authorize rmeta or whole \
+    Materializable rlib; original file generations, current qualification and \
+    transitive producer safety rechecked at publication and delivery; each \
+    intermediate retains its own ancestry policy; no project executors, \
+    generated/native inputs, proc macros, incremental state, archive or harness \
+    outputs, final links, provisional adoption, local completion, fallback or \
+    request-owned producer authority; exact dep-info and tracked environment veto, \
+    authenticated drained receipt and independent mixed-class samples, release \
+    and private installation gates";
 
 /// Stable logical identity of one retained candidate and its committed producer.
 /// Physical path/generation capabilities stay outside this pure type and key.
@@ -180,6 +240,67 @@ pub fn validate_committed_workspace_metadata_plan(
     Ok(())
 }
 
+/// Refine a fresh workspace plan into the separately keyed mixed-producer
+/// class. The canonical driver must still retain the selected executor-free
+/// graph and exact committed installation capability for every candidate.
+///
+/// # Errors
+/// A nonfresh plan or an invocation outside ordinary closed library compilation.
+pub fn plan_mixed_workspace_library(
+    execution: &DependencyActionPlan,
+) -> Result<DependencyActionPlan, LiveRefusal> {
+    if execution.source_kind != DependencySourceKind::WorkspaceExecutionOnly {
+        return Err(LiveRefusal::Facts(
+            "mixed workspace planning requires the original fresh workspace plan".into(),
+        ));
+    }
+    let mut plan = execution.clone();
+    plan.source_kind = match remote::remote_dependency_output_class(&plan.invocation)
+        .map_err(|error| LiveRefusal::Facts(error.to_string()))?
+    {
+        RemoteDependencyOutputClass::Rlib => DependencySourceKind::WorkspaceMixedRlib,
+        RemoteDependencyOutputClass::Metadata => DependencySourceKind::WorkspaceMixedMetadata,
+    };
+    validate_mixed_workspace_library_plan(&plan)?;
+    Ok(plan)
+}
+
+/// Validate the pure mixed-producer invocation boundary and return its exact
+/// output class. This does not qualify any producer or authorize publication.
+///
+/// # Errors
+/// Wrong class, nonlibrary/codegen outputs, harness or generated/native inputs.
+pub fn validate_mixed_workspace_library_plan(
+    plan: &DependencyActionPlan,
+) -> Result<RemoteDependencyOutputClass, LiveRefusal> {
+    workspace_layout(plan)?;
+    let output = match plan.source_kind {
+        DependencySourceKind::WorkspaceMixedRlib => RemoteDependencyOutputClass::Rlib,
+        DependencySourceKind::WorkspaceMixedMetadata => RemoteDependencyOutputClass::Metadata,
+        _ => {
+            return Err(LiveRefusal::Facts(
+                "mixed workspace libraries require their distinct producer policy class".into(),
+            ));
+        }
+    };
+    if !matches!(plan.invocation.crate_types.as_slice(), [kind] if matches!(kind.as_str(), "lib" | "rlib"))
+        || plan
+            .invocation
+            .passthrough
+            .iter()
+            .any(|argument| argument == "--test")
+        || plan.generated_root.is_some()
+        || !plan.native_roots.is_empty()
+        || !plan.invocation.native_libs.is_empty()
+        || remote::remote_dependency_output_class(&plan.invocation) != Ok(output)
+    {
+        return Err(LiveRefusal::Facts(
+            "mixed workspace caching requires an ordinary closed Rust library without generated or native inputs".into(),
+        ));
+    }
+    Ok(output)
+}
+
 /// Require an exact binding for every retained candidate in the same ordered
 /// directory/member inventory used to build the worker's read-only namespace.
 ///
@@ -258,6 +379,26 @@ pub fn remote_committed_workspace_metadata_shape(
     Ok(())
 }
 
+/// Admit the complete mixed-producer namespace and exact ordered witnesses.
+/// A candidate's actual producer class and immutable-leaf qualification remain
+/// live coordinator obligations, never assertions supplied by these pure facts.
+///
+/// # Errors
+/// Unsupported invocation, namespace, extern or incomplete candidate provenance.
+pub fn remote_mixed_workspace_library_shape(
+    plan: &DependencyActionPlan,
+    directories: &[DependencyDirectoryFact],
+    dependencies: &[CommittedWorkspaceDependency],
+    toolchain_root: &str,
+) -> Result<(), RemoteDependencyRefusal> {
+    validate_mixed_workspace_library_plan(plan)?;
+    remote::remote_execution_shape(plan, directories, toolchain_root)?;
+    validate_committed_workspace_dependencies(directories, dependencies)?;
+    let externs = remote::remote_extern_facts(plan, directories)?;
+    artifacts_component(plan, &externs, directories)?;
+    Ok(())
+}
+
 fn isolation_policy() -> TypedDigest {
     compute(POLICY_DOMAIN, ISOLATION_PROFILE.as_bytes())
 }
@@ -274,6 +415,29 @@ fn metadata_isolation_policy() -> TypedDigest {
 
 fn metadata_execution_semantics() -> TypedDigest {
     compute(METADATA_SEMANTICS_DOMAIN, METADATA_SEMANTICS.as_bytes())
+}
+
+fn mixed_isolation_policy(output: RemoteDependencyOutputClass) -> TypedDigest {
+    let (domain, profile) = match output {
+        RemoteDependencyOutputClass::Rlib => {
+            (MIXED_RLIB_POLICY_DOMAIN, MIXED_RLIB_ISOLATION_PROFILE)
+        }
+        RemoteDependencyOutputClass::Metadata => (
+            MIXED_METADATA_POLICY_DOMAIN,
+            MIXED_METADATA_ISOLATION_PROFILE,
+        ),
+    };
+    compute(domain, profile.as_bytes())
+}
+
+fn mixed_execution_semantics(output: RemoteDependencyOutputClass) -> TypedDigest {
+    let (domain, semantics) = match output {
+        RemoteDependencyOutputClass::Rlib => (MIXED_RLIB_SEMANTICS_DOMAIN, MIXED_RLIB_SEMANTICS),
+        RemoteDependencyOutputClass::Metadata => {
+            (MIXED_METADATA_SEMANTICS_DOMAIN, MIXED_METADATA_SEMANTICS)
+        }
+    };
+    compute(domain, semantics.as_bytes())
 }
 
 /// Separately versioned policy for the committed-producer archive class.
@@ -300,6 +464,18 @@ pub fn remote_committed_workspace_metadata_isolation_policy(
     Ok(metadata_isolation_policy())
 }
 
+/// Distinct mixed-producer policy, never the older workspace-only policy.
+///
+/// # Errors
+/// The invocation is outside its mixed archive or closed metadata contract.
+pub fn remote_mixed_workspace_library_isolation_policy(
+    plan: &DependencyActionPlan,
+) -> Result<TypedDigest, RemoteDependencyRefusal> {
+    Ok(mixed_isolation_policy(
+        validate_mixed_workspace_library_plan(plan)?,
+    ))
+}
+
 /// Descriptor classification only; never a replacement for live witnesses.
 #[must_use]
 pub fn is_committed_workspace_rlib_descriptor(descriptor: &ActionDescriptor) -> bool {
@@ -319,6 +495,30 @@ pub fn is_committed_workspace_metadata_descriptor(descriptor: &ActionDescriptor)
         && descriptor.projection_epoch == PROJECTION_EPOCH
         && descriptor.sandbox_semantic_policy == metadata_isolation_policy()
         && descriptor.execution_semantics == metadata_execution_semantics()
+}
+
+/// Classify only the exact mixed archive identity, never producer authority.
+#[must_use]
+pub fn is_mixed_workspace_rlib_descriptor(descriptor: &ActionDescriptor) -> bool {
+    descriptor.action_class == ActionClass::RustcWorkspaceCompile
+        && descriptor.key_epoch == MIXED_RLIB_KEY_EPOCH
+        && descriptor.projection_epoch == PROJECTION_EPOCH
+        && descriptor.sandbox_semantic_policy
+            == mixed_isolation_policy(RemoteDependencyOutputClass::Rlib)
+        && descriptor.execution_semantics
+            == mixed_execution_semantics(RemoteDependencyOutputClass::Rlib)
+}
+
+/// Classify only the exact mixed metadata identity, never producer authority.
+#[must_use]
+pub fn is_mixed_workspace_metadata_descriptor(descriptor: &ActionDescriptor) -> bool {
+    descriptor.action_class == ActionClass::RustcWorkspaceCompile
+        && descriptor.key_epoch == MIXED_METADATA_KEY_EPOCH
+        && descriptor.projection_epoch == PROJECTION_EPOCH
+        && descriptor.sandbox_semantic_policy
+            == mixed_isolation_policy(RemoteDependencyOutputClass::Metadata)
+        && descriptor.execution_semantics
+            == mixed_execution_semantics(RemoteDependencyOutputClass::Metadata)
 }
 
 fn encode_digest(encoder: &mut CanonicalEncoder, digest: &TypedDigest) {
@@ -358,6 +558,7 @@ pub fn remote_committed_workspace_rlib_key(
         retained_toolchain_sha256,
         runtime,
         RemoteDependencyOutputClass::Rlib,
+        false,
     )
 }
 
@@ -392,6 +593,41 @@ pub fn remote_committed_workspace_metadata_key(
         retained_toolchain_sha256,
         runtime,
         RemoteDependencyOutputClass::Metadata,
+        false,
+    )
+}
+
+/// Bind complete workspace inputs and every exact committed producer identity
+/// under the separate mixed-producer contract. Live leaf qualification, current
+/// lineage and physical generations remain mandatory outside this pure key.
+///
+/// # Errors
+/// Incomplete evidence, unbound runtime, unsupported inputs or missing provenance.
+#[allow(clippy::too_many_arguments)]
+pub fn remote_mixed_workspace_library_key(
+    plan: &DependencyActionPlan,
+    toolchain: &ToolchainFacts,
+    directories: &[DependencyDirectoryFact],
+    dependencies: &[CommittedWorkspaceDependency],
+    inputs: &ActionInputManifest,
+    build_script_output: Option<&[u8]>,
+    toolchain_root: &str,
+    retained_toolchain_sha256: &[u8; 32],
+    runtime: &TypedDigest,
+) -> Result<LiveDependencyKey, RemoteDependencyRefusal> {
+    let output = validate_mixed_workspace_library_plan(plan)?;
+    remote_committed_workspace_key(
+        plan,
+        toolchain,
+        directories,
+        dependencies,
+        inputs,
+        build_script_output,
+        toolchain_root,
+        retained_toolchain_sha256,
+        runtime,
+        output,
+        true,
     )
 }
 
@@ -407,12 +643,16 @@ fn remote_committed_workspace_key(
     retained_toolchain_sha256: &[u8; 32],
     runtime: &TypedDigest,
     output: RemoteDependencyOutputClass,
+    mixed: bool,
 ) -> Result<LiveDependencyKey, RemoteDependencyRefusal> {
-    match output {
-        RemoteDependencyOutputClass::Rlib => {
+    match (mixed, output) {
+        (true, _) => {
+            remote_mixed_workspace_library_shape(plan, directories, dependencies, toolchain_root)?;
+        }
+        (false, RemoteDependencyOutputClass::Rlib) => {
             remote_committed_workspace_rlib_shape(plan, directories, dependencies, toolchain_root)?;
         }
-        RemoteDependencyOutputClass::Metadata => {
+        (false, RemoteDependencyOutputClass::Metadata) => {
             remote_committed_workspace_metadata_shape(
                 plan,
                 directories,
@@ -454,11 +694,17 @@ fn remote_committed_workspace_key(
         encode_digest(encoder, &dependency.object.0);
     });
     key.descriptor.dependency_inputs = compute(
-        match output {
-            RemoteDependencyOutputClass::Rlib => {
+        match (mixed, output) {
+            (true, RemoteDependencyOutputClass::Rlib) => {
+                "rabs.canonical-workspace-committed-mixed-rlib.dependencies.v1"
+            }
+            (true, RemoteDependencyOutputClass::Metadata) => {
+                "rabs.canonical-workspace-committed-mixed-metadata.dependencies.v1"
+            }
+            (false, RemoteDependencyOutputClass::Rlib) => {
                 "rabs.canonical-workspace-committed-rlib.dependencies.v1"
             }
-            RemoteDependencyOutputClass::Metadata => {
+            (false, RemoteDependencyOutputClass::Metadata) => {
                 "rabs.canonical-workspace-committed-metadata.dependencies.v1"
             }
         },
@@ -469,11 +715,17 @@ fn remote_committed_workspace_key(
         encoder.str(name).str(value);
     });
     key.descriptor.environment = compute(
-        match output {
-            RemoteDependencyOutputClass::Rlib => {
+        match (mixed, output) {
+            (true, RemoteDependencyOutputClass::Rlib) => {
+                "rabs.canonical-workspace-committed-mixed-rlib.environment.v1"
+            }
+            (true, RemoteDependencyOutputClass::Metadata) => {
+                "rabs.canonical-workspace-committed-mixed-metadata.environment.v1"
+            }
+            (false, RemoteDependencyOutputClass::Rlib) => {
                 "rabs.canonical-workspace-committed-rlib.environment.v1"
             }
-            RemoteDependencyOutputClass::Metadata => {
+            (false, RemoteDependencyOutputClass::Metadata) => {
                 "rabs.canonical-workspace-committed-metadata.environment.v1"
             }
         },
@@ -495,29 +747,39 @@ fn remote_committed_workspace_key(
         encoder.str(flag);
     });
     key.descriptor.normalized_invocation = compute(
-        match output {
-            RemoteDependencyOutputClass::Rlib => {
+        match (mixed, output) {
+            (true, RemoteDependencyOutputClass::Rlib) => {
+                "rabs.canonical-workspace-committed-mixed-rlib.invocation.v1"
+            }
+            (true, RemoteDependencyOutputClass::Metadata) => {
+                "rabs.canonical-workspace-committed-mixed-metadata.invocation.v1"
+            }
+            (false, RemoteDependencyOutputClass::Rlib) => {
                 "rabs.canonical-workspace-committed-rlib.invocation.v1"
             }
-            RemoteDependencyOutputClass::Metadata => {
+            (false, RemoteDependencyOutputClass::Metadata) => {
                 "rabs.canonical-workspace-committed-metadata.invocation.v1"
             }
         },
         &invocation.finish(),
     );
-    key.descriptor.key_epoch = match output {
-        RemoteDependencyOutputClass::Rlib => KEY_EPOCH,
-        RemoteDependencyOutputClass::Metadata => METADATA_KEY_EPOCH,
+    key.descriptor.key_epoch = match (mixed, output) {
+        (false, RemoteDependencyOutputClass::Rlib) => KEY_EPOCH,
+        (false, RemoteDependencyOutputClass::Metadata) => METADATA_KEY_EPOCH,
+        (true, RemoteDependencyOutputClass::Rlib) => MIXED_RLIB_KEY_EPOCH,
+        (true, RemoteDependencyOutputClass::Metadata) => MIXED_METADATA_KEY_EPOCH,
     };
     key.descriptor.projection_epoch = PROJECTION_EPOCH;
     key.descriptor.action_class = ActionClass::RustcWorkspaceCompile;
-    key.descriptor.sandbox_semantic_policy = match output {
-        RemoteDependencyOutputClass::Rlib => isolation_policy(),
-        RemoteDependencyOutputClass::Metadata => metadata_isolation_policy(),
+    key.descriptor.sandbox_semantic_policy = match (mixed, output) {
+        (true, output) => mixed_isolation_policy(output),
+        (false, RemoteDependencyOutputClass::Rlib) => isolation_policy(),
+        (false, RemoteDependencyOutputClass::Metadata) => metadata_isolation_policy(),
     };
-    key.descriptor.execution_semantics = match output {
-        RemoteDependencyOutputClass::Rlib => execution_semantics(),
-        RemoteDependencyOutputClass::Metadata => metadata_execution_semantics(),
+    key.descriptor.execution_semantics = match (mixed, output) {
+        (true, output) => mixed_execution_semantics(output),
+        (false, RemoteDependencyOutputClass::Rlib) => execution_semantics(),
+        (false, RemoteDependencyOutputClass::Metadata) => metadata_execution_semantics(),
     };
     key.action_key = compute_action_key(&key.descriptor).final_key;
     key.descriptor_digest = descriptor_digest(&descriptor_canonical_bytes(&key.descriptor));
@@ -716,6 +978,249 @@ mod tests {
             &[39; 32],
             &compute(remote::RUNTIME_COHORT_DOMAIN, b"runtime"),
         )
+    }
+
+    fn mixed_key(
+        plan: &DependencyActionPlan,
+        dependencies: &[CommittedWorkspaceDependency],
+        inputs: &ActionInputManifest,
+    ) -> Result<LiveDependencyKey, RemoteDependencyRefusal> {
+        remote_mixed_workspace_library_key(
+            plan,
+            &toolchain(),
+            &directories(dependencies),
+            dependencies,
+            inputs,
+            None,
+            TOOLCHAIN,
+            &[39; 32],
+            &compute(remote::RUNTIME_COHORT_DOMAIN, b"runtime"),
+        )
+    }
+
+    #[test]
+    fn mixed_workspace_profiles_cannot_borrow_prior_workspace_or_other_output_authority() {
+        let dependencies = vec![candidate("libupstream.rmeta")];
+        for metadata in [false, true] {
+            let fresh = execution_with_output(false, "one", metadata);
+            let mixed = plan_mixed_workspace_library(&fresh).unwrap();
+            let prior = if metadata {
+                plan_committed_workspace_metadata(&fresh).unwrap()
+            } else {
+                plan_committed_workspace_rlib(&fresh).unwrap()
+            };
+            let input = inputs(&mixed);
+            let actual = mixed_key(&mixed, &dependencies, &input).unwrap();
+            let previous = if metadata {
+                metadata_key(&prior, &dependencies, &input).unwrap()
+            } else {
+                key(&prior, &dependencies, &input).unwrap()
+            };
+            assert_eq!(actual.descriptor.key_epoch, if metadata { 9 } else { 8 });
+            assert_eq!(previous.descriptor.key_epoch, if metadata { 7 } else { 6 });
+            assert_ne!(actual.action_key, previous.action_key);
+            assert_ne!(
+                actual.descriptor.dependency_inputs,
+                previous.descriptor.dependency_inputs
+            );
+            assert_ne!(
+                actual.descriptor.environment,
+                previous.descriptor.environment
+            );
+            assert_ne!(
+                actual.descriptor.normalized_invocation,
+                previous.descriptor.normalized_invocation
+            );
+            assert_eq!(
+                is_mixed_workspace_metadata_descriptor(&actual.descriptor),
+                metadata
+            );
+            assert_eq!(
+                is_mixed_workspace_rlib_descriptor(&actual.descriptor),
+                !metadata
+            );
+            assert!(!is_committed_workspace_rlib_descriptor(&actual.descriptor));
+            assert!(!is_committed_workspace_metadata_descriptor(
+                &actual.descriptor
+            ));
+            assert!(!is_mixed_workspace_rlib_descriptor(&previous.descriptor));
+            assert!(!is_mixed_workspace_metadata_descriptor(
+                &previous.descriptor
+            ));
+            assert_eq!(
+                remote_mixed_workspace_library_isolation_policy(&mixed).unwrap(),
+                actual.descriptor.sandbox_semantic_policy
+            );
+            assert!(key(&mixed, &dependencies, &input).is_err());
+            assert!(metadata_key(&mixed, &dependencies, &input).is_err());
+            for other in [&fresh, &prior] {
+                assert!(validate_mixed_workspace_library_plan(other).is_err());
+                assert!(mixed_key(other, &dependencies, &input).is_err());
+            }
+            assert!(plan_mixed_workspace_library(&mixed).is_err());
+            for field in 0..4 {
+                let mut forged = actual.descriptor.clone();
+                match field {
+                    0 => forged.key_epoch = previous.descriptor.key_epoch,
+                    1 => forged.projection_epoch += 1,
+                    2 => {
+                        forged.sandbox_semantic_policy =
+                            previous.descriptor.sandbox_semantic_policy.clone()
+                    }
+                    _ => {
+                        forged.execution_semantics = previous.descriptor.execution_semantics.clone()
+                    }
+                }
+                assert!(!is_mixed_workspace_rlib_descriptor(&forged));
+                assert!(!is_mixed_workspace_metadata_descriptor(&forged));
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_workspace_keys_every_candidate_whole_archive_and_exact_producer_identity() {
+        let dependencies = vec![
+            candidate("libupstream.rlib"),
+            candidate("libupstream.rmeta"),
+        ];
+        for metadata in [false, true] {
+            let plan = plan_mixed_workspace_library(&execution_with_output(true, "one", metadata))
+                .unwrap();
+            let input = inputs(&plan);
+            let original = mixed_key(&plan, &dependencies, &input).unwrap();
+            for field in 0..4 {
+                let mut changed = dependencies.clone();
+                match field {
+                    0 => changed[0].producer_action = digest(b"another committed producer"),
+                    1 => changed[0].producer_descriptor = digest(b"another producer descriptor"),
+                    2 => changed[0].producer_manifest = digest(b"another producer publication"),
+                    _ => {
+                        changed[0].object =
+                            ObjectId(digest(b"same metadata, different archive code"))
+                    }
+                }
+                assert_ne!(
+                    mixed_key(&plan, &changed, &input).unwrap().action_key,
+                    original.action_key
+                );
+            }
+            let retained = directories(&dependencies);
+            for changed in [
+                Vec::new(),
+                dependencies[1..].to_vec(),
+                vec![dependencies[1].clone(), dependencies[0].clone()],
+            ] {
+                assert!(
+                    remote_mixed_workspace_library_shape(&plan, &retained, &changed, TOOLCHAIN)
+                        .is_err()
+                );
+            }
+            let mut wrong_role = dependencies.clone();
+            wrong_role[1].role = OutputRole::Materializable;
+            assert!(mixed_key(&plan, &wrong_role, &input).is_err());
+            let mut unknown = dependencies.clone();
+            unknown.push(candidate("proc_macro.so"));
+            assert!(mixed_key(&plan, &unknown, &input).is_err());
+            assert!(mixed_key(&plan, &dependencies[1..], &input).is_err());
+        }
+    }
+
+    #[test]
+    fn mixed_workspace_retains_complete_inputs_and_rejects_generated_native_and_harnesses() {
+        let dependencies = vec![candidate("libupstream.rmeta")];
+        for metadata in [false, true] {
+            let plan = plan_mixed_workspace_library(&execution_with_output(false, "one", metadata))
+                .unwrap();
+            let input = inputs(&plan);
+            let original = mixed_key(&plan, &dependencies, &input).unwrap().action_key;
+            let mut changed = input.clone();
+            changed.inputs.last_mut().unwrap().object = ObjectId(digest(b"changed sibling"));
+            assert_ne!(
+                mixed_key(&plan, &dependencies, &changed)
+                    .unwrap()
+                    .action_key,
+                original
+            );
+            let mut missing = input.clone();
+            missing.directory_enumerations.pop();
+            assert!(mixed_key(&plan, &dependencies, &missing).is_err());
+            let mut topology = input.clone();
+            topology.directory_enumerations[0]
+                .entries
+                .push(RawBytes::from("z_empty"));
+            topology.directory_enumerations.push(DirectoryEnumeration {
+                virtual_path: RawBytes::new(plan.input_virtual_path("z_empty").into_bytes()),
+                entries: Vec::new(),
+            });
+            assert_ne!(
+                mixed_key(&plan, &dependencies, &topology)
+                    .unwrap()
+                    .action_key,
+                original
+            );
+            let environment =
+                plan_mixed_workspace_library(&execution_with_output(false, "two", metadata))
+                    .unwrap();
+            assert_ne!(
+                mixed_key(&environment, &dependencies, &input)
+                    .unwrap()
+                    .action_key,
+                original
+            );
+            for field in 0..5 {
+                let mut unsupported = plan.clone();
+                match field {
+                    0 => {
+                        unsupported.generated_root =
+                            Some("/__rabs/out/cargo/debug/build/generated/out".into())
+                    }
+                    1 => unsupported
+                        .native_roots
+                        .push("/__rabs/out/cargo/debug/build/native/out".into()),
+                    2 => unsupported
+                        .invocation
+                        .native_libs
+                        .push("static=native".into()),
+                    3 => unsupported.invocation.passthrough.push("--test".into()),
+                    _ => unsupported.invocation.codegen.push((
+                        "incremental".into(),
+                        Some("/__rabs/out/cargo/incremental".into()),
+                    )),
+                }
+                assert!(
+                    mixed_key(&unsupported, &dependencies, &input).is_err(),
+                    "field={field}"
+                );
+            }
+            assert!(
+                remote_mixed_workspace_library_key(
+                    &plan,
+                    &toolchain(),
+                    &directories(&dependencies),
+                    &dependencies,
+                    &input,
+                    Some(b"cargo:rustc-env=UNDECLARED=value"),
+                    TOOLCHAIN,
+                    &[39; 32],
+                    &compute(remote::RUNTIME_COHORT_DOMAIN, b"runtime"),
+                )
+                .is_err()
+            );
+            assert!(
+                remote_mixed_workspace_library_key(
+                    &plan,
+                    &toolchain(),
+                    &directories(&dependencies),
+                    &dependencies,
+                    &input,
+                    None,
+                    TOOLCHAIN,
+                    &[39; 32],
+                    &digest(b"unmeasured runtime"),
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

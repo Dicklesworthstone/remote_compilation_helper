@@ -418,6 +418,13 @@ pub enum DependencySourceKind {
     /// inventory comes from verified, already committed workspace producers.
     /// Its strict metadata namespace and serving class are distinct from archives.
     WorkspaceCommittedMetadata,
+    /// Closed workspace archive with committed workspace producers or separately
+    /// qualified canonical remote immutable dependency archive leaves.
+    WorkspaceMixedRlib,
+    /// Closed workspace metadata with committed workspace producers or separately
+    /// qualified canonical remote immutable dependency leaves. Every retained
+    /// candidate still requires exact installed and current publication authority.
+    WorkspaceMixedMetadata,
 }
 
 impl DependencySourceKind {
@@ -433,6 +440,8 @@ impl DependencySourceKind {
             Self::WorkspaceClosedMetadata => "canonical-workspace-closed-metadata-v1",
             Self::WorkspaceCommittedRlib => "canonical-workspace-committed-rlib-v1",
             Self::WorkspaceCommittedMetadata => "canonical-workspace-committed-metadata-v1",
+            Self::WorkspaceMixedRlib => "canonical-workspace-committed-mixed-rlib-v1",
+            Self::WorkspaceMixedMetadata => "canonical-workspace-committed-mixed-metadata-v1",
         }
     }
 
@@ -447,6 +456,8 @@ impl DependencySourceKind {
                 | Self::WorkspaceClosedMetadata
                 | Self::WorkspaceCommittedRlib
                 | Self::WorkspaceCommittedMetadata
+                | Self::WorkspaceMixedRlib
+                | Self::WorkspaceMixedMetadata
         )
     }
 }
@@ -1492,6 +1503,8 @@ fn captured_action_key(
                             | DependencySourceKind::WorkspaceClosedMetadata
                             | DependencySourceKind::WorkspaceCommittedRlib
                             | DependencySourceKind::WorkspaceCommittedMetadata
+                            | DependencySourceKind::WorkspaceMixedRlib
+                            | DependencySourceKind::WorkspaceMixedMetadata
                     )
                     && input.virtual_path.as_bytes()[root.len()..]
                         .split(|byte| *byte == b'/')
@@ -1556,7 +1569,9 @@ fn captured_action_key(
             | DependencySourceKind::WorkspaceClosedRlib
             | DependencySourceKind::WorkspaceClosedMetadata
             | DependencySourceKind::WorkspaceCommittedRlib
-            | DependencySourceKind::WorkspaceCommittedMetadata => {
+            | DependencySourceKind::WorkspaceCommittedMetadata
+            | DependencySourceKind::WorkspaceMixedRlib
+            | DependencySourceKind::WorkspaceMixedMetadata => {
                 enc.str("complete-canonical-workspace-execution-tree-v1")
                     .str(plan.source_kind.as_str())
                     .str(&plan.source_root)
@@ -1649,6 +1664,12 @@ fn captured_action_key(
                 }
                 DependencySourceKind::WorkspaceCommittedMetadata => {
                     workspace_dependency_cache::METADATA_ISOLATION_PROFILE
+                }
+                DependencySourceKind::WorkspaceMixedRlib => {
+                    workspace_dependency_cache::MIXED_RLIB_ISOLATION_PROFILE
+                }
+                DependencySourceKind::WorkspaceMixedMetadata => {
+                    workspace_dependency_cache::MIXED_METADATA_ISOLATION_PROFILE
                 }
             }
             .as_bytes(),
