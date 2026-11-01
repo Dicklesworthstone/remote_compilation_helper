@@ -811,15 +811,36 @@ pub fn probe_capability(worker_id: &str) -> CapabilityReport {
     }
 }
 
+fn parse_load_x100(text: &str) -> Option<u64> {
+    let first = text.split_whitespace().next()?;
+    let (whole, fraction) = first.split_once('.')?;
+    if whole.is_empty()
+        || fraction.len() != 2
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    whole
+        .parse::<u64>()
+        .ok()?
+        .checked_mul(100)?
+        .checked_add(fraction.parse().ok()?)
+}
+
+/// Sample the one-minute host load without turning unavailable data into idle
+/// capacity. Linux's procfs value has exactly two decimal places.
+#[must_use]
+pub fn sample_load_x100() -> Option<u64> {
+    std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|text| parse_load_x100(&text))
+}
+
 /// Sample this host's real pressure (heartbeat payload).
 #[must_use]
 pub fn sample_pressure(staging_dir: &std::path::Path) -> PressureSample {
-    let load_x100 = std::fs::read_to_string("/proc/loadavg")
-        .ok()
-        .and_then(|text| text.split_whitespace().next().map(str::to_string))
-        .and_then(|first| first.parse::<f64>().ok())
-        .map(|load| (load * 100.0) as u64)
-        .unwrap_or(0);
+    let load_x100 = sample_load_x100().unwrap_or(0);
     // 0 means unknown where the platform probe is unavailable.
     let free_disk_mib = free_disk_mib(staging_dir);
     PressureSample {
@@ -1897,6 +1918,30 @@ pub fn admit_worker(
 mod tests {
     use super::*;
     use rabs_protocol::capability_tokens::{CapabilityKind, mint};
+
+    #[test]
+    fn cpu_load_sampling_keeps_unavailable_and_invalid_values_distinct_from_idle() {
+        assert_eq!(parse_load_x100("0.00 0.01 0.02 1/20 123\n"), Some(0));
+        assert_eq!(parse_load_x100("12.34 10.00 9.00 2/30 123\n"), Some(1234));
+        assert_eq!(
+            parse_load_x100("184467440737095516.15 0.00 0.00"),
+            Some(u64::MAX)
+        );
+        for invalid in [
+            "",
+            "NaN",
+            "inf",
+            "-1.00",
+            "+1.00",
+            "1.0",
+            "1.000",
+            ".10",
+            "184467440737095516.16",
+            "184467440737095517.00",
+        ] {
+            assert_eq!(parse_load_x100(invalid), None, "{invalid}");
+        }
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

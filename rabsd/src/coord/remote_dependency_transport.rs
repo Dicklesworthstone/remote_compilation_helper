@@ -13,8 +13,8 @@
 //! result, with the original transfer deadline and authenticated incarnation.
 
 use super::secure_worker_delivery::{
-    OperationCancellation, PinnedWorkerAdmission, WorkerAdmissionHook, parse_worker_pin,
-    validate_authenticated_worker_execution_capabilities,
+    OperationCancellation, PinnedWorkerAdmission, StandbyLoad, WorkerAdmissionHook,
+    parse_worker_pin, validate_authenticated_worker_execution_capabilities,
 };
 use super::source_delivery::SourceUpload;
 #[cfg(test)]
@@ -239,6 +239,16 @@ impl RemoteDependencyTransport {
         }
     }
 
+    /// Pressure is advisory and belongs only to this still-current connection.
+    /// Stale, absent or malformed samples leave ordinary placement available.
+    pub(crate) fn placement_load(&self, generation: u64, now: Instant) -> Option<StandbyLoad> {
+        let snapshot = self.readiness.snapshot()?;
+        if snapshot.generation != generation {
+            return None;
+        }
+        snapshot.load.filter(|load| load.fresh_at(now))
+    }
+
     /// Recheck after taking physical capacity so a revoked snapshot cannot
     /// make the ready pass claim a disconnected or replaced connection. The
     /// complete ordinary capability/challenge checks still run at dispatch.
@@ -270,6 +280,15 @@ impl RemoteDependencyTransport {
     #[cfg(test)]
     pub(crate) fn advertise_for_test(&self, hello: &Value) -> impl Drop + use<> {
         self.readiness.publish_for_test(hello)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn advertise_at_for_test(
+        &self,
+        hello: &Value,
+        received: Instant,
+    ) -> impl Drop + use<> {
+        self.readiness.publish_for_test_at(hello, received)
     }
 
     /// Bind once for the lifetime of the configured pool. The owner keeps its
@@ -835,6 +854,40 @@ mod tests {
         assert_eq!(std::fs::read_dir(state.path()).unwrap().count(), 0);
         drop((reserved, second));
         assert!(!transport.occupied.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn placement_pressure_expires_without_revoking_readiness_or_capacity() {
+        let transport = transport();
+        let now = Instant::now();
+        let hello = serde_json::json!({"slots":4, "load_x100":1200});
+        let first = transport.advertise_at_for_test(&hello, now);
+        let PlacementReadiness::Ready(generation) = transport.placement_readiness(None) else {
+            panic!("the authenticated connection should be ready");
+        };
+        let expires = now + rabs_protocol::worker_standby::LOAD_MAX_AGE;
+        assert!(transport.placement_load(generation, now).is_some());
+        assert!(transport.placement_load(generation, expires).is_some());
+        assert!(
+            transport
+                .placement_load(generation, expires + Duration::from_nanos(1))
+                .is_none()
+        );
+        assert!(
+            transport
+                .placement_load(generation, now - Duration::from_nanos(1))
+                .is_none()
+        );
+        let reserved = transport.try_reserve_for(None, Some(generation)).unwrap();
+        drop(reserved);
+        let replacement = transport.advertise_at_for_test(&hello, now);
+        assert!(transport.placement_load(generation, now).is_none());
+        drop((first, replacement));
+        assert_eq!(
+            transport.placement_readiness(None),
+            PlacementReadiness::Unknown
+        );
+        assert!(transport.placement_load(generation, now).is_none());
     }
 
     #[test]

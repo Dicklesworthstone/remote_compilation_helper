@@ -1204,7 +1204,7 @@ for this operation-owned coordinator.
 
 The dependency-worker pool binds each configured endpoint when the pool is
 created and keeps it bound through the pool's lifetime. Matching workers that
-advertise `worker-standby-v1` can stay connected between compiler requests. A
+advertise `worker-standby-v2` can stay connected between compiler requests. A
 direct invocation owns these listeners until its coordinator finishes; the
 shared service described below keeps them available between Cargo commands.
 Workers can therefore reconnect and become ready while the coordinator has no
@@ -1560,7 +1560,7 @@ cargo rabs --rabs-canonical-local ./canonical-compile.json -- check --workspace 
 The class requires the strict `closed-metadata` worker context and retains the
 complete captured workspace, directory listings, exact compiler environment,
 arguments, toolchain and runtime. It keys every explicit extern and every
-implicit retained candidate, together with the exact committed producer action,
+loadable implicit candidate, together with the exact committed producer action,
 descriptor, manifest, logical output and entire artifact identity. Producers
 must be closed workspace metadata or archive actions whose outputs were
 verified and installed by the same retained Cargo operation. External dependency
@@ -1596,7 +1596,7 @@ cargo rabs --rabs-canonical-local ./canonical-compile.json -- check --workspace 
 
 The external producer must have run through the canonical remote lane, have a
 successful committed result, and have its actual output verified and installed
-by this Cargo operation. It must have no explicit externs, no retained Rust
+by this Cargo operation. It must have no explicit externs, no loadable Rust
 candidates (including unnamed alternatives), no generated or native inputs, and
 no recorded producer ancestry. An ordinary dependency-cache entry, a local
 compiler result, a copied artifact, a raw fallback or a request-owned result
@@ -1634,7 +1634,7 @@ dependencies before those outputs reach workspace libraries. For example,
 registry or vendored A can feed immutable B, which feeds workspace C and D.
 The commands and retained canonical mount layout remain the same.
 
-Each non-leaf external compiler request must bind every retained Rust candidate
+Each non-leaf external compiler request must bind every loadable Rust candidate
 to an exact producer installed by this Cargo operation. This includes candidates
 not named by an explicit `--extern`. The descriptor hashes the producer action,
 descriptor, committed manifest, output role and whole object identity together
@@ -1795,12 +1795,21 @@ The service's existing request queue continues to own work waiting for a slot.
 
 Standby first verifies the worker's TLS public-key pin, configured name and
 TLS-derived peer identity, then selects the explicitly advertised
-`worker-standby-v1` exchange. The coordinator sends a heartbeat every 15 seconds;
+`worker-standby-v2` exchange. The coordinator sends a heartbeat every 15 seconds;
 each ping and matching pong share a 10-second budget. The worker allows at most
 45 seconds for the next complete idle record. A failed heartbeat closes that
 connection so the worker's outward loop can reconnect to the same listener.
 Confirmed readiness also wakes queued placement and clears the endpoint's
 connection cooldown.
+
+Workers include their measured one-minute CPU load in the authenticated hello
+and refresh it in idle heartbeat replies. Among compatible ready workers, the
+pool prefers lower load per advertised CPU. Equal scores retain round-robin
+order. Unknown measurements and samples older than 30 seconds at the coordinator
+keep their round-robin positions; load never excludes a worker or grants another
+slot. A disconnected or replaced connection loses its pressure hint together
+with its readiness. Capability checks and ordinary execution admission still run
+after placement.
 
 An assigned request starts ordinary session admission with a fresh 10-second
 challenge budget. An outstanding heartbeat must finish before this transition.
@@ -2057,6 +2066,18 @@ metadata-check consumer can therefore use its committed-dependency cache after
 a source edit while unchanged parents remain Cargo-Fresh, subject to the usual
 sampling and input checks.
 
+Ordinary `check --workspace --lib --bins` and check-mode harnesses can leave
+empty `.rmeta` files in those same dependency directories. Rust's crate locator
+skips their metadata; RABS still hashes their exact paths and bytes, copies them
+into the worker's read-only input view, and rechecks their original file
+generations before upload and installation. These files require no committed
+producer witness and never become producer ancestry. Empty metadata explicitly
+named by `--extern`, an empty archive, an unqualified nonempty candidate, a
+symlink, or a previously known producer truncated to empty still refuses cache
+qualification. Removing or adding even an empty file changes the action key.
+The first cold compile and the first warm compile with a new binary placeholder
+therefore qualify separately under the existing comparison requirements.
+
 Restoring target bytes alone never grants committed authority. Ordinary local
 and request-owned results, unknown files and older seeds without recorded
 provenance add no installation witnesses. This does not narrow the
@@ -2066,6 +2087,18 @@ provenance checks, the operation fails before Cargo starts. Known producers are
 checked again at the end of a retainable run, before accepting completion or
 delivering retained build artifacts, so newly quarantined ancestry cannot become
 an optional save failure.
+
+The native tests
+`canonical_warm_workspace_metadata_with_bins_preserves_committed_provenance_across_restarts`
+and
+`canonical_warm_mixed_metadata_with_bins_preserves_committed_provenance_across_restarts`
+exercise this path with real Cargo, isolated workers and a separate stock
+control. They alternate two source variants, restart the coordinator for every
+operation, retain Cargo-Fresh parents, require the binary check to execute each
+time, and earn library replay from actual comparisons. They also quarantine a
+retained producer and require rejection before Cargo starts. They require the
+same full Linux namespace capability and matching binaries as the other native
+cache fixtures; their presence is not evidence that they have run.
 
 The persistent service serializes target-cache I/O around open/restore and around
 completed capture, releasing that lock while Cargo runs. Waiting for this lock,

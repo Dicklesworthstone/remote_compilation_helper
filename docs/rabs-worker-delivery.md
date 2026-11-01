@@ -79,13 +79,21 @@ configured pool, and shutdown joins its listener owners before releasing state.
 
 ### Authenticated standby negotiation
 
-The worker advertises `worker-standby-v1` in its authenticated hello. A
+The worker advertises `worker-standby-v2` in its authenticated hello. A
 coordinator that supports standby can keep this same TLS connection available
 by selecting that version with `standby-ready`, then sending a numbered
 `standby-ping` every 15 seconds. The worker replies with the matching
 `standby-pong`. The sequence starts at one and increases by exactly one;
 replayed, skipped, unknown-version or authority-bearing standby records close
 the connection. Plaintext fixture connections cannot enter standby.
+
+The hello and each pong include `load_x100`, the measured one-minute host load
+multiplied by 100, or `null` when the platform cannot observe it. The coordinator
+compares fresh load per advertised CPU when placing dependency compilations.
+Receipt age is measured only on the coordinator, with a 30-second lifetime;
+unknown or expired load preserves ordinary round-robin placement. These hints
+remain bound to the authenticated connection and do not change execution
+capacity, capabilities or lease authority.
 
 Standby does not admit a session, allocate a request, start an execution lease,
 change the request journal or authorize retained-result access. When work is

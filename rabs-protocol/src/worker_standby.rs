@@ -3,19 +3,23 @@
 //! Standby authenticates no session and grants no execution or result access.
 //! The ordinary session challenge still owns those transitions after work is
 //! assigned. Sequence numbers fence delayed, duplicated, or reordered heartbeats
-//! within this one connection; they never identify an execution.
+//! within this one connection; they never identify an execution. Optional CPU
+//! load measurements guide placement only, never execution admission.
 
 use std::fmt;
 use std::time::Duration;
 
 /// Explicit capability advertised by workers that can wait for assignment.
-pub const VERSION: &str = "worker-standby-v1";
+pub const VERSION: &str = "worker-standby-v2";
 /// Coordinator heartbeat cadence while no operation is assigned.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 /// One heartbeat must complete within this budget, including its write.
 pub const PONG_TIMEOUT: Duration = Duration::from_secs(10);
 /// Worker deadline for each complete coordinator record during standby.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(45);
+/// Maximum coordinator receipt age for an advisory CPU-load measurement.
+/// Unknown or expired measurements preserve ordinary worker selection.
+pub const LOAD_MAX_AGE: Duration = Duration::from_secs(30);
 
 /// A frame violates the negotiated standby exchange.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

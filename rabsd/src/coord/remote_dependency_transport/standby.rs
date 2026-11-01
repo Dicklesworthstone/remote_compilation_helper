@@ -6,7 +6,7 @@
 
 use super::{cancelled, failure, until_cancelled};
 use crate::coord::secure_worker_delivery::{
-    OperationCancellation, PinnedWorkerAdmission, StandbyPeer, WorkerAdmissionHook,
+    OperationCancellation, PinnedWorkerAdmission, StandbyLoad, StandbyPeer, WorkerAdmissionHook,
     prepare_standby, receive_standby_with_admission,
 };
 use crate::coord::source_delivery::SourceUpload;
@@ -32,10 +32,11 @@ use std::time::Instant;
 /// Advisory evidence from the exact authenticated connection currently parked
 /// on this owner. A generation is never reused, including across a disconnect.
 /// It grants no request, execution lease, or durable worker admission.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct Advertisement {
     pub generation: u64,
     pub hello: Value,
+    pub load: Option<StandbyLoad>,
 }
 
 #[derive(Debug, Default)]
@@ -65,6 +66,7 @@ impl Readiness {
     fn publish(
         self: &Arc<Self>,
         hello: &Value,
+        load: Option<StandbyLoad>,
         changed: Arc<dyn Fn() + Send + Sync>,
     ) -> io::Result<AdvertisementOwner> {
         let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
@@ -79,6 +81,7 @@ impl Readiness {
         state.current = Some(Arc::new(Advertisement {
             generation,
             hello: hello.clone(),
+            load,
         }));
         Ok(AdvertisementOwner {
             readiness: Arc::clone(self),
@@ -102,7 +105,21 @@ impl Readiness {
 
     #[cfg(test)]
     pub(super) fn publish_for_test(self: &Arc<Self>, hello: &Value) -> AdvertisementOwner {
-        self.publish(hello, Arc::new(|| {})).unwrap()
+        self.publish_for_test_at(hello, Instant::now())
+    }
+
+    #[cfg(test)]
+    pub(super) fn publish_for_test_at(
+        self: &Arc<Self>,
+        hello: &Value,
+        received: Instant,
+    ) -> AdvertisementOwner {
+        self.publish(
+            hello,
+            StandbyLoad::observe(hello, &hello["load_x100"], received),
+            Arc::new(|| {}),
+        )
+        .unwrap()
     }
 }
 
@@ -112,6 +129,28 @@ pub(super) struct AdvertisementOwner {
     readiness: Arc<Readiness>,
     generation: u64,
     changed: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl AdvertisementOwner {
+    fn refresh_load(&self, load: Option<StandbyLoad>) {
+        let updated = {
+            let mut state = self
+                .readiness
+                .0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            match state.current.as_mut() {
+                Some(current) if current.generation == self.generation => {
+                    Arc::make_mut(current).load = load;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if updated {
+            (self.changed)();
+        }
+    }
 }
 
 impl Drop for AdvertisementOwner {
@@ -153,7 +192,13 @@ impl ParkedPeer {
     ) -> io::Result<Self> {
         let advertisement = peer
             .supported()
-            .then(|| readiness.publish(peer.scheduling_hello(), Arc::clone(changed)))
+            .then(|| {
+                readiness.publish(
+                    peer.scheduling_hello(),
+                    peer.scheduling_load(),
+                    Arc::clone(changed),
+                )
+            })
             .transpose()?;
         Ok(Self {
             advertisement,
@@ -791,6 +836,7 @@ fn run_owner(
         }
         if let Some(parked_peer) = parked.as_mut() {
             let peer = &mut parked_peer.peer;
+            let advertisement = &parked_peer.advertisement;
             // Old workers can be used for an already waiting request, but an
             // absent optional protocol cannot justify keeping them idle.
             if !peer.supported()
@@ -798,7 +844,11 @@ fn run_owner(
                     runtime,
                     within_pending_boundary(
                         mailbox,
-                        peer.wait_for_work(mailbox.ready(), mailbox.shutdown.clone()),
+                        peer.wait_for_work(mailbox.ready(), mailbox.shutdown.clone(), |load| {
+                            if let Some(advertisement) = advertisement {
+                                advertisement.refresh_load(load);
+                            }
+                        }),
                     ),
                 )
                 .is_err()
@@ -863,11 +913,15 @@ mod tests {
             counted.fetch_add(1, Ordering::Relaxed);
         });
         let earlier = readiness
-            .publish(&json!({"incarnation":"earlier"}), Arc::clone(&changed))
+            .publish(
+                &json!({"incarnation":"earlier"}),
+                None,
+                Arc::clone(&changed),
+            )
             .unwrap();
         let old_snapshot = readiness.snapshot().unwrap();
         let current = readiness
-            .publish(&json!({"incarnation":"current"}), changed)
+            .publish(&json!({"incarnation":"current"}), None, changed)
             .unwrap();
         let generation = readiness.snapshot().unwrap().generation;
         assert!(generation > old_snapshot.generation);
@@ -893,13 +947,37 @@ mod tests {
         assert!(readiness.snapshot().is_none());
         assert_eq!(
             readiness
-                .publish(&json!({}), Arc::new(|| {}))
+                .publish(&json!({}), None, Arc::new(|| {}))
                 .err()
                 .unwrap()
                 .kind(),
             io::ErrorKind::Interrupted
         );
         drop(owner);
+        assert!(readiness.snapshot().is_none());
+    }
+
+    #[test]
+    fn heartbeat_load_updates_only_its_connection_and_clears_unknown_samples() {
+        let readiness = Arc::new(Readiness::default());
+        let hello = json!({"slots":4, "load_x100":400});
+        let first = readiness.publish_for_test(&hello);
+        let original = readiness.snapshot().unwrap();
+        let updated = StandbyLoad::observe(&hello, &json!(125), Instant::now());
+        first.refresh_load(updated);
+        let refreshed = readiness.snapshot().unwrap();
+        assert_eq!(refreshed.generation, original.generation);
+        assert_eq!(refreshed.load, updated);
+        assert_ne!(original.load, refreshed.load);
+
+        let replacement = readiness.publish_for_test(&hello);
+        let current = readiness.snapshot().unwrap();
+        first.refresh_load(None);
+        assert_eq!(readiness.snapshot().unwrap().load, current.load);
+        replacement.refresh_load(None);
+        assert!(readiness.snapshot().unwrap().load.is_none());
+        readiness.close();
+        replacement.refresh_load(updated);
         assert!(readiness.snapshot().is_none());
     }
 

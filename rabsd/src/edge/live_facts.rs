@@ -2663,6 +2663,67 @@ mod tests {
     }
 
     #[test]
+    fn empty_metadata_keeps_its_generation_transport_bytes_and_output_alias_fence() {
+        use rabs_key::live_dependency::is_empty_metadata_artifact;
+
+        for mutation in ["filled", "replaced", "symlink", "output-alias"] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().join("deps");
+            std::fs::create_dir(&root).unwrap();
+            let empty = root.join("libchecked_binary.rmeta");
+            std::fs::write(&empty, b"").unwrap();
+            std::fs::write(root.join("libdependency.rmeta"), b"real metadata").unwrap();
+            let roots = vec![(root.clone(), vec!["libcurrent.rmeta".into()], Vec::new())];
+            let output = (root.clone(), vec!["libcurrent.rmeta".into()]);
+            let (members, _) = walk_dependencies(&roots).unwrap();
+            let observed =
+                capture_dependencies(&LiveFacts::new(), roots, members, output, None).unwrap();
+            let candidates = observed.candidate_generations().unwrap();
+            assert_eq!(candidates.len(), 2);
+            assert_eq!(candidates[0].0, empty);
+            assert_eq!(candidates[0].1.size(), 0);
+            assert!(is_empty_metadata_artifact(
+                empty.to_str().unwrap(),
+                &candidates[0].2,
+            ));
+            let retained = observed.retained_artifacts(|| false).unwrap();
+            assert_eq!(retained.len(), 2);
+            assert_eq!(retained[0].0, "dependencies/0000/libchecked_binary.rmeta");
+            assert!(retained[0].1.bytes().is_empty());
+            assert_eq!(retained[1].1.bytes(), b"real metadata");
+            match mutation {
+                "filled" => std::fs::write(&empty, b"new unregistered crate bytes").unwrap(),
+                "replaced" => {
+                    std::fs::rename(&empty, root.join("old-placeholder")).unwrap();
+                    std::fs::write(&empty, b"").unwrap();
+                }
+                "symlink" => {
+                    std::fs::rename(&empty, root.join("old-placeholder")).unwrap();
+                    std::os::unix::fs::symlink("old-placeholder", &empty).unwrap();
+                }
+                _ => std::fs::hard_link(&empty, root.join("libcurrent.rmeta")).unwrap(),
+            }
+            if mutation == "output-alias" {
+                let (current_members, _) = walk_dependencies(&observed.roots).unwrap();
+                assert!(matches!(
+                    capture_dependencies(
+                        &LiveFacts::new(),
+                        observed.roots.clone(),
+                        current_members,
+                        observed.output.clone(),
+                        None,
+                    ),
+                    Err(FactsMiss::Refused(reason)) if reason.contains("aliases a declared output")
+                ));
+            }
+            assert!(observed.verify_unchanged().is_err(), "{mutation}");
+            assert!(observed.candidate_generations().is_err(), "{mutation}");
+            assert!(observed.retained_artifacts(|| false).is_err(), "{mutation}");
+            assert!(retained[0].1.bytes().is_empty(), "sealed bytes changed");
+        }
+    }
+
+    #[test]
     fn overlapping_dependency_actions_reuse_bytes_while_each_inventory_stays_exact() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("deps");

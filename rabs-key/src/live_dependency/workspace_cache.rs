@@ -7,8 +7,9 @@
 //! graph with no project executors. Archive and metadata executions require
 //! distinct, independently supervised worker profiles without procfs or entropy
 //! devices. Ordinary workspace metadata execution is not this closed profile.
-//! Generated/native inputs, explicit externs and implicit crate candidates
-//! remain in the fresh execution-only class.
+//! Generated/native inputs, explicit externs and loadable implicit crate
+//! candidates remain in the fresh execution-only class. Exact empty metadata
+//! is still keyed and supplied as an inert file in the read-only input view.
 
 use super::remote::{self, RemoteDependencyOutputClass, RemoteDependencyRefusal};
 use super::workspace_execution::workspace_layout;
@@ -24,18 +25,18 @@ use rabs_protocol::descriptor::{ActionClass, ActionDescriptor};
 use rabs_protocol::input_evidence::ActionInputManifest;
 use rabs_protocol::result_identity::TypedDigest;
 
-// Keep the archive profile and its domains/encodings byte-for-byte stable.
-// Closed metadata introduces its own identity rather than widening Rlib or
-// borrowing the ordinary metadata namespace's filesystem policy.
+// Archive and metadata policies remain independently keyed. The policy text
+// binds exact-empty search metadata admission without borrowing the ordinary
+// metadata namespace's filesystem or producer authority.
 const KEY_EPOCH: u32 = 4;
 const PROJECTION_EPOCH: u32 = 1;
 const POLICY_DOMAIN: &str = "rabs.canonical-workspace-closed-rlib.isolation.v1";
 const SEMANTICS_DOMAIN: &str = "rabs.canonical-workspace-closed-rlib.semantics.v1";
-const SEMANTICS: &str = "completed independently supervised pure Rust leaf-library archive; complete sealed workspace and every directory listing; no project executors, externs, crate candidates, generated or native inputs; exact environment; authenticated drained receipt; existing publication, independent verification, class quarantine and private installation gates";
+const SEMANTICS: &str = "completed independently supervised pure Rust leaf-library archive; complete sealed workspace and every directory listing; no project executors, externs, loadable crate candidates, generated or native inputs; exact empty search metadata remains keyed and materialized without producer authority; exact environment; authenticated drained receipt; existing publication, independent verification, class quarantine and private installation gates";
 const METADATA_KEY_EPOCH: u32 = 5;
 const METADATA_POLICY_DOMAIN: &str = "rabs.canonical-workspace-closed-metadata.isolation.v1";
 const METADATA_SEMANTICS_DOMAIN: &str = "rabs.canonical-workspace-closed-metadata.semantics.v1";
-const METADATA_SEMANTICS: &str = "completed independently supervised pure Rust leaf-library metadata check; canonical-workspace-closed-metadata-v1 explicitly negotiated in closed-metadata mode without procfs or entropy devices; complete sealed workspace and every directory listing; no project executors, externs, crate candidates, generated or native inputs; exact environment; authenticated drained receipt; existing publication, independent verification, class quarantine and private installation gates";
+const METADATA_SEMANTICS: &str = "completed independently supervised pure Rust leaf-library metadata check; canonical-workspace-closed-metadata-v1 explicitly negotiated in closed-metadata mode without procfs or entropy devices; complete sealed workspace and every directory listing; no project executors, externs, loadable crate candidates, generated or native inputs; exact empty search metadata remains keyed and materialized without producer authority; exact environment; authenticated drained receipt; existing publication, independent verification, class quarantine and private installation gates";
 
 pub(super) const ISOLATION_PROFILE: &str = "canonical-workspace-closed-rlib-v1: \
     driver-retained Cargo-selected ordinary library build in a graph without \
@@ -47,7 +48,8 @@ pub(super) const ISOLATION_PROFILE: &str = "canonical-workspace-closed-rlib-v1: 
     independently retained complete toolchain and measured ELF runtime; \
     no procfs or entropy devices, only private null device, fresh private \
     output, HOME and temporary storage; no generated tree, native input, \
-    explicit extern or implicit Rust artifact candidate; no project code \
+    explicit extern or loadable implicit Rust artifact candidate; exact empty \
+    search metadata remains keyed and materialized without producer authority; no project code \
     execution, proc macro, incremental state, external linker, binary or \
     harness output, control socket or local wrapper completion authority; \
     compiler dep-info and tracked-control-variable read veto required; exact \
@@ -67,8 +69,9 @@ pub(super) const METADATA_ISOLATION_PROFILE: &str = "canonical-workspace-closed-
     behavior; exact complete presented environment; independently retained \
     complete toolchain and measured ELF runtime; no procfs or entropy devices, \
     only private null device, fresh private output, HOME and temporary storage; \
-    no generated tree, native input, explicit extern or implicit Rust artifact \
-    candidate; no project code execution, proc macro, incremental state, \
+    no generated tree, native input, explicit extern or loadable implicit Rust \
+    artifact candidate; exact empty search metadata remains keyed and materialized \
+    without producer authority; no project code execution, proc macro, incremental state, \
     external linker, archive, binary or harness output, control socket or local \
     wrapper completion authority; compiler dep-info and tracked-control-variable \
     read veto required; exact metadata, dep-info and diagnostic transcript \
@@ -144,7 +147,7 @@ impl ClosedWorkspaceLibraryClass {
 
 /// Refine a modeled fresh workspace invocation into a closed library candidate.
 /// This is pure planning, not cache authority. The coordinator must retain the
-/// selected Cargo graph, validate empty candidate inventories, and own the exact
+/// selected Cargo graph, exclude loadable candidates, and own the exact
 /// enforced worker context before publication or replay can be considered.
 ///
 /// # Errors
@@ -233,12 +236,13 @@ pub(super) fn validate_pure_workspace_rlib(plan: &DependencyActionPlan) -> Resul
 }
 
 /// Mechanical preparation admission for the closed leaf-library classes.
-/// Empty search inventories are semantic negative inputs: an implicit crate
-/// candidate must not sneak a procedural macro or uncommitted producer into
-/// this class merely because no `--extern` argument named it.
+/// Search inventories may contain only exact empty metadata, which remains
+/// keyed and materialized. An implicit loadable crate must not sneak a
+/// procedural macro or uncommitted producer into this class merely because no
+/// `--extern` argument named it.
 ///
 /// # Errors
-/// An incomplete/reordered candidate inventory, any candidate, unsupported
+/// An incomplete/reordered inventory, any loadable candidate, unsupported
 /// loader/runtime layout, or an invocation outside the closed leaf subset.
 pub fn remote_closed_workspace_library_shape(
     plan: &DependencyActionPlan,
@@ -249,13 +253,19 @@ pub fn remote_closed_workspace_library_shape(
     remote::remote_execution_shape(plan, directories, toolchain_root)?;
     if directories
         .iter()
-        .any(|directory| !directory.artifacts.is_empty())
+        .flat_map(|directory| &directory.artifacts)
+        .any(|artifact| {
+            !super::is_empty_metadata_artifact(&artifact.path, &artifact.content_digest)
+        })
     {
         return Err(LiveRefusal::Facts(
-            "closed workspace leaf libraries require empty Rust candidate inventories".into(),
+            "closed workspace leaf libraries require no loadable Rust candidates".into(),
         )
         .into());
     }
+    // Empty metadata is still an exact namespace member: its path, ordering
+    // and output-alias checks cannot be skipped with producer qualification.
+    super::artifacts_component(plan, &[], directories)?;
     Ok(())
 }
 
@@ -298,7 +308,7 @@ pub fn closed_workspace_library_descriptor_class(
 ///
 /// # Errors
 /// An invalid class, incomplete file/directory closure, generated run record,
-/// unbound toolchain/runtime, or a nonempty Rust candidate inventory.
+/// unbound toolchain/runtime, or an inventory with loadable Rust candidates.
 #[allow(clippy::too_many_arguments)]
 pub fn remote_closed_workspace_library_key(
     plan: &DependencyActionPlan,
@@ -826,6 +836,47 @@ mod tests {
                     |_| true
                 )
                 .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn closed_workspace_libraries_keep_exact_empty_metadata_in_the_action_key() {
+        for class in CLASSES {
+            let plan = plan(class);
+            let keyed = |directories: &[DependencyDirectoryFact]| {
+                remote_closed_workspace_library_key(
+                    &plan,
+                    &toolchain(),
+                    directories,
+                    &inputs(&plan),
+                    None,
+                    TOOLCHAIN,
+                    &[39; 32],
+                    &compute(remote::RUNTIME_COHORT_DOMAIN, b"runtime"),
+                )
+            };
+            let mut candidates = directories(&plan);
+            let original = keyed(&candidates).unwrap().action_key;
+            candidates[0].artifacts.push(ExternFact {
+                path: format!("{OUTPUT}/libchecked_binary.rmeta"),
+                content_digest: super::super::empty_metadata_object_digest(),
+            });
+            let with_empty = keyed(&candidates).unwrap().action_key;
+            assert_ne!(with_empty, original, "empty metadata must stay keyed");
+            candidates[0].artifacts[0].path = format!("{OUTPUT}/libother_binary.rmeta");
+            assert_ne!(keyed(&candidates).unwrap().action_key, with_empty);
+            candidates[0].artifacts[0].content_digest.bytes[0] ^= 1;
+            assert!(
+                keyed(&candidates).is_err(),
+                "nonempty unknown metadata must refuse"
+            );
+            candidates[0].artifacts[0].content_digest =
+                super::super::empty_metadata_object_digest();
+            candidates[0].artifacts[0].path = format!("{OUTPUT}/libother_binary.rlib");
+            assert!(
+                keyed(&candidates).is_err(),
+                "empty archives are not inert metadata"
             );
         }
     }

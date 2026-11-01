@@ -5898,16 +5898,28 @@ fn mixed_workspace_dag_replay(command: &str) {
 #[test]
 #[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; restored Cargo Fresh parents must preserve committed metadata authority across coordinator restarts and producer revocation"]
 fn canonical_warm_workspace_metadata_preserves_committed_provenance_across_restarts() {
-    warm_committed_metadata_replay(false);
+    warm_committed_metadata_replay(false, false);
 }
 
 #[test]
 #[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; restored immutable and workspace producers must preserve mixed metadata authority across coordinator restarts and producer revocation"]
 fn canonical_warm_mixed_metadata_preserves_committed_provenance_across_restarts() {
-    warm_committed_metadata_replay(true);
+    warm_committed_metadata_replay(true, false);
 }
 
-fn warm_committed_metadata_replay(mixed: bool) {
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; real warm check lib+bin output must retain empty metadata while edited libraries earn replay across coordinator restarts"]
+fn canonical_warm_workspace_metadata_with_bins_preserves_committed_provenance_across_restarts() {
+    warm_committed_metadata_replay(false, true);
+}
+
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; real warm mixed check lib+bin output must retain empty metadata and immutable ancestry while edited libraries earn replay"]
+fn canonical_warm_mixed_metadata_with_bins_preserves_committed_provenance_across_restarts() {
+    warm_committed_metadata_replay(true, true);
+}
+
+fn warm_committed_metadata_replay(mixed: bool, include_consumer: bool) {
     use rabs_cas::metadata_store::{QuarantineScope, RabsMetadataStore};
 
     let (owner, mut profile) = native_fixture();
@@ -5917,6 +5929,8 @@ fn warm_committed_metadata_replay(mixed: bool) {
     for source in [&first, &second] {
         if mixed {
             mixed_workspace_dag_source(source, false);
+        } else if include_consumer {
+            closed_workspace_metadata_dag_source(source);
         } else {
             closed_workspace_dag_source(source);
         }
@@ -5935,6 +5949,9 @@ fn warm_committed_metadata_replay(mixed: bool) {
     profile["source_root"] = json!(first);
     profile["command"] = json!("check");
     profile["selection"] = json!({"workspace":true,"lib":true});
+    if include_consumer {
+        profile["selection"]["bins"] = json!(true);
+    }
     profile["env"] = json!({"WORKSPACE_DAG_INPUT":"warm committed metadata environment"});
     profile["jobs"] = json!(1);
     profile["target_cache"] =
@@ -5974,14 +5991,14 @@ fn warm_committed_metadata_replay(mixed: bool) {
             } else {
                 &WORKSPACE_DAG_NAMES[..2]
             },
-            false,
+            include_consumer,
         );
         stock.push((
             workspace_dag_metadata_files_with_consumer(
                 &sole_retained_target(&stock_root),
                 &output,
                 &WORKSPACE_DAG_NAMES,
-                false,
+                include_consumer,
             ),
             diagnostics,
         ));
@@ -6013,15 +6030,23 @@ fn warm_committed_metadata_replay(mixed: bool) {
     let (mut worker, environment) = NativeWorker::start(root);
     let mut keys = BTreeMap::new();
     let mut top_keys: [Option<String>; 2] = [None, None];
+    let mut cold_top = None;
+    let mut private_attempts = BTreeMap::new();
     let mut request_ids = BTreeSet::new();
     let mut executions = 0;
-    for number in 1..=8 {
+    let rounds = if include_consumer { 10 } else { 8 };
+    for number in 1..=rounds {
         let variant = ((number - 1) % 2) as usize;
         let source = if number < 5 { &first } else { &second };
         profile["source_root"] = json!(source);
         write(source, "top-value.txt", variants[variant]);
-        let hit = number > 6;
-        let before_journal = hit.then(|| read_bounded(&worker.state.join("requests.json")));
+        // The first cold library cannot see the binary metadata that Cargo
+        // creates afterwards. That empty file remains a real keyed input in
+        // every warm round, so cold A and warm A earn separate evidence. B is
+        // warm from its first execution. No sample count or serving gate changes.
+        let hit = number > if include_consumer { 7 } else { 6 };
+        let before_journal =
+            (hit && !include_consumer).then(|| read_bounded(&worker.state.join("requests.json")));
         // run_with_environment starts and joins a distinct coordinator
         // process each time. The private target family is never changed.
         let (code, events, output) =
@@ -6037,7 +6062,7 @@ fn warm_committed_metadata_replay(mixed: bool) {
             } else {
                 &WORKSPACE_DAG_NAMES[..2]
             },
-            false,
+            include_consumer,
         );
         assert!(decisions(&events, "execute").is_empty(), "{output}");
         assert!(
@@ -6049,13 +6074,16 @@ fn warm_committed_metadata_replay(mixed: bool) {
         );
         let offered = decisions(&events, "remote-offer");
         let hits = decisions(&events, "hit");
-        let expected_offers = if number == 1 {
+        let mut expected_offers = if number == 1 {
             BTreeSet::from(WORKSPACE_DAG_NAMES)
         } else if hit {
             BTreeSet::new()
         } else {
             BTreeSet::from([WORKSPACE_DAG_NAMES[2]])
         };
+        if include_consumer {
+            expected_offers.insert(WORKSPACE_METADATA_DAG_CONSUMER);
+        }
         assert_eq!(
             offered.keys().map(String::as_str).collect::<BTreeSet<_>>(),
             expected_offers,
@@ -6077,7 +6105,9 @@ fn warm_committed_metadata_replay(mixed: bool) {
         }
         let actual = if hit { &hits } else { &offered };
         let top = actual[WORKSPACE_DAG_NAMES[2]].clone();
-        if let Some(previous) = &top_keys[variant] {
+        if include_consumer && number == 1 {
+            cold_top = Some(top.clone());
+        } else if let Some(previous) = &top_keys[variant] {
             assert_eq!(
                 &top, previous,
                 "restoring a prior source variant split its action key"
@@ -6085,7 +6115,14 @@ fn warm_committed_metadata_replay(mixed: bool) {
         } else {
             top_keys[variant] = Some(top.clone());
         }
-        if number == 2 {
+        if include_consumer && number == 3 {
+            assert_ne!(
+                Some(&top),
+                cold_top.as_ref(),
+                "the binary's empty metadata was dropped from the warm action identity"
+            );
+        }
+        if number == if include_consumer { 3 } else { 2 } {
             assert_ne!(
                 top_keys[0], top_keys[1],
                 "the source edit must change the consumer key"
@@ -6129,6 +6166,8 @@ fn warm_committed_metadata_replay(mixed: bool) {
                 &keys[*name],
                 if index < 2 {
                     1
+                } else if include_consumer && variant == 0 && number > 1 {
+                    (number / 2).min(3) as usize
                 } else {
                     number.div_ceil(2).min(3) as usize
                 },
@@ -6138,11 +6177,21 @@ fn warm_committed_metadata_replay(mixed: bool) {
         if mixed {
             assert_qualified_immutable_leaf(root, &keys[WORKSPACE_DAG_NAMES[0]], "check");
         }
+        if include_consumer {
+            assert_fresh_workspace_execution(
+                root,
+                &events,
+                &output,
+                WORKSPACE_METADATA_DAG_CONSUMER,
+                &offered[WORKSPACE_METADATA_DAG_CONSUMER],
+                &mut private_attempts,
+            );
+        }
         let files = workspace_dag_metadata_files_with_consumer(
             &sole_retained_target(root),
             &output,
             &WORKSPACE_DAG_NAMES,
-            false,
+            include_consumer,
         );
         assert_closed_workspace_dag_ancestry(root, &keys, &files);
         assert_eq!(
@@ -6171,8 +6220,8 @@ fn warm_committed_metadata_replay(mixed: bool) {
         }
         assert!(fs::read_dir(root.join("ops")).unwrap().next().is_none());
     }
-    assert_eq!(executions, 8);
-    assert_eq!(request_ids.len(), 6);
+    assert_eq!(executions, if include_consumer { 19 } else { 8 });
+    assert_eq!(request_ids.len(), if include_consumer { 10 } else { 6 });
 
     // Every Cargo unit would now be Fresh. Revocation must reject the trusted
     // seed before Cargo can consume those bytes, even without a new wrapper
@@ -6199,7 +6248,7 @@ fn warm_committed_metadata_replay(mixed: bool) {
             )
             .unwrap();
     }
-    let (code, events, output) = run_with_environment(root, 1220, &profile, &environment);
+    let (code, events, output) = run_with_environment(root, 1225, &profile, &environment);
     assert_ne!(code, 0, "a revoked warm producer reached Cargo: {output}");
     assert!(
         output.to_ascii_lowercase().contains("quarantin"),

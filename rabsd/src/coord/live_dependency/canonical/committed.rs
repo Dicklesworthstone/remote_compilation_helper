@@ -17,11 +17,11 @@ use rabs_cas::digest_set::ATP_OBJECT_CONTENT_DOMAIN;
 use rabs_cas::manifest_codec::encode_manifest_v1;
 use rabs_cas::metadata_store::digest_key;
 use rabs_cas::publication::ProvisionalAncestorRef;
-use rabs_key::live_dependency::DependencySourceKind;
 use rabs_key::live_dependency::workspace_dependency_cache::{
     CommittedDependencyPolicy, CommittedWorkspaceDependency,
     committed_dependency_descriptor_policy, validate_committed_workspace_dependencies,
 };
+use rabs_key::live_dependency::{DependencySourceKind, is_empty_metadata_artifact};
 use rabs_key::typed_digest::{DOMAIN_ACTION_KEY, DOMAIN_DESCRIPTOR};
 use rabs_protocol::authority::CoordinatorAuthority;
 use rabs_protocol::raw_bytes::RawBytes;
@@ -268,6 +268,8 @@ pub struct CommittedWorkspaceInputs {
     consumer_policy: CommittedDependencyPolicy,
     coordinator: Weak<CoordLive>,
     authority: CoordinatorAuthority,
+    // Includes exact empty metadata, whose membership/bytes remain inputs even
+    // though it has no producer entry in `dependencies`.
     generations: Vec<(PathBuf, FileSig)>,
     dependencies: Vec<CommittedWorkspaceDependency>,
 }
@@ -321,23 +323,30 @@ impl CommittedWorkspaceInputs {
             return Err("committed dependency coordinator authority changed".into());
         }
         let candidates = self.observed.candidate_generations()?;
-        if candidates.len() != self.generations.len() || candidates.len() != self.dependencies.len()
-        {
+        if candidates.len() != self.generations.len() {
             return Err("committed dependency inventory changed".into());
         }
-        for (((path, generation, digest), (expected_path, expected_generation)), dependency) in
-            candidates
-                .iter()
-                .zip(&self.generations)
-                .zip(&self.dependencies)
+        let mut dependencies = self.dependencies.iter();
+        for ((path, generation, digest), (expected_path, expected_generation)) in
+            candidates.iter().zip(&self.generations)
         {
-            if path != expected_path
-                || generation != expected_generation
-                || digest != &dependency.object.0
-                || self.paths.physical(Path::new(&dependency.path))? != *path
-            {
+            if path != expected_path || generation != expected_generation {
                 return Err("committed dependency generation changed after capture".into());
             }
+            if empty_metadata_observation(path, generation, digest)? {
+                continue;
+            }
+            let dependency = dependencies
+                .next()
+                .ok_or("committed dependency inventory lost a producer")?;
+            if digest != &dependency.object.0
+                || self.paths.physical(Path::new(&dependency.path))? != *path
+            {
+                return Err("committed dependency object changed after capture".into());
+            }
+        }
+        if dependencies.next().is_some() {
+            return Err("committed dependency inventory gained a producer".into());
         }
         coordinator.verify_committed_dependencies(&self.dependencies, self.consumer_policy)?;
         self.observed.verify_unchanged()
@@ -372,6 +381,20 @@ impl CommittedWorkspaceInputs {
             })
             .collect()
     }
+}
+
+fn empty_metadata_observation(
+    path: &Path,
+    generation: &FileSig,
+    digest: &TypedDigest,
+) -> Result<bool, String> {
+    let empty = path
+        .to_str()
+        .is_some_and(|path| is_empty_metadata_artifact(path, digest));
+    if empty && generation.size() != 0 {
+        return Err("empty metadata identity differs from its observed length".into());
+    }
+    Ok(empty)
 }
 
 impl CanonicalPaths {
@@ -620,9 +643,11 @@ impl CanonicalPaths {
         checkpoint(stopped).map_err(|error| error.to_string())
     }
 
-    /// Every retained candidate, including unreferenced alternatives, must be an
+    /// Every loadable candidate, including unreferenced alternatives, must be an
     /// exact current generation installed by this operation from an admitted
-    /// producer. The consumer class retains its own producer-policy boundary.
+    /// producer. Exact empty search metadata keeps its original observation and
+    /// remains keyed/materialized, without inventing producer authority. The
+    /// consumer class retains its own producer-policy boundary.
     pub(crate) fn capture_committed_inputs(
         self: &Arc<Self>,
         coordinator: &Arc<CoordLive>,
@@ -640,6 +665,16 @@ impl CanonicalPaths {
                 .lock()
                 .map_err(|_| "committed output registry poisoned")?;
             for (path, generation, digest) in candidates {
+                if empty_metadata_observation(&path, &generation, &digest)? {
+                    // An emptied known producer is not an unrelated Cargo bin
+                    // placeholder. Preserve its original installation fence;
+                    // truncation must never hide a known producer or revocation.
+                    if registered.contains_key(&path) {
+                        return Err("committed Rust output was replaced by empty metadata".into());
+                    }
+                    generations.push((path, generation));
+                    continue;
+                }
                 let witness = registered
                     .get(&path)
                     .ok_or("retained Rust candidate has no committed installation witness")?;
@@ -1087,6 +1122,145 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn empty_search_metadata_keeps_exact_observation_across_restoration_without_a_producer() {
+        let fixture = WorkspaceLineageFixture::new();
+        let offer = fixture.commit_leaf(
+            76,
+            &[(
+                "libupstream.rmeta",
+                OutputRole::ProvisionalMetadata,
+                METADATA,
+            )],
+        );
+        let original = paths();
+        let installed = install_bytes(&original, &offer, "libupstream.rmeta", METADATA);
+        register(&original, &fixture, &offer, &[installed]).unwrap();
+        let empty_name = "libchecked_binary.rmeta";
+        let empty = original
+            .physical(&Path::new(OUTPUT).join(empty_name))
+            .unwrap();
+        std::fs::write(&empty, b"").unwrap();
+        let observed = observed(&original, false);
+        assert_eq!(observed.candidate_generations().unwrap().len(), 2);
+        let before = original
+            .capture_committed_inputs(
+                &fixture.coord,
+                Arc::clone(&observed),
+                CommittedDependencyPolicy::WorkspaceMetadata,
+            )
+            .unwrap();
+        before.verify_original().unwrap();
+        assert_eq!(before.generations.len(), 2);
+        assert_eq!(before.dependencies().len(), 1);
+        assert_eq!(before.ancestors().len(), 1);
+        assert!(
+            observed.retained_artifacts(|| false).unwrap()[0]
+                .1
+                .bytes()
+                .is_empty()
+        );
+        let seeds = original
+            .export_committed_outputs(&fixture.coord, &|| false)
+            .unwrap();
+        assert_eq!(
+            seeds.len(),
+            1,
+            "empty metadata must not mint durable producer provenance"
+        );
+
+        let restored = paths();
+        install_bytes(&restored, &offer, "libupstream.rmeta", METADATA);
+        let copied_empty = restored
+            .physical(&Path::new(OUTPUT).join(empty_name))
+            .unwrap();
+        std::fs::write(&copied_empty, b"").unwrap();
+        fixture.coord.mark_down();
+        let restarted = Arc::new(CoordLive::with_cas(Arc::clone(&fixture.cas)));
+        restarted
+            .acquire_boot_authority("empty-metadata-restart")
+            .unwrap();
+        restarted.mark_up();
+        assert!(before.verify_original().is_err());
+        assert_eq!(
+            restored
+                .rehydrate_committed_outputs(&restarted, restored_owner(&restored, seeds), &|| {
+                    false
+                },)
+                .unwrap(),
+            1,
+        );
+        let current = restored
+            .capture_committed_inputs(
+                &restarted,
+                self::observed(&restored, false),
+                CommittedDependencyPolicy::WorkspaceMetadata,
+            )
+            .unwrap();
+        current.verify_original().unwrap();
+        assert_eq!(current.dependencies(), before.dependencies());
+        assert_eq!(current.generations.len(), 2);
+        assert_ne!(current.generations[0].1, before.generations[0].1);
+
+        std::fs::write(&copied_empty, b"unknown loadable candidate").unwrap();
+        assert!(current.verify_original().is_err());
+        assert!(
+            restored
+                .capture_committed_inputs(
+                    &restarted,
+                    self::observed(&restored, false),
+                    CommittedDependencyPolicy::WorkspaceMetadata,
+                )
+                .is_err(),
+            "fresh observation cannot authorize an unregistered nonempty sibling",
+        );
+        std::fs::write(&copied_empty, b"").unwrap();
+        let current = restored
+            .capture_committed_inputs(
+                &restarted,
+                self::observed(&restored, false),
+                CommittedDependencyPolicy::WorkspaceMetadata,
+            )
+            .unwrap();
+        fixture.quarantine(&offer.manifest.action_key);
+        assert!(current.verify_original().is_err());
+        assert!(matches!(
+            restored.export_committed_outputs(&restarted, &|| false),
+            Err(CommittedOutputExportError::InvalidProducer(_)),
+        ));
+    }
+
+    #[test]
+    fn truncating_a_known_producer_never_turns_it_into_inert_metadata() {
+        let fixture = WorkspaceLineageFixture::new();
+        let offer = fixture.commit_leaf(
+            77,
+            &[(
+                "libupstream.rmeta",
+                OutputRole::ProvisionalMetadata,
+                METADATA,
+            )],
+        );
+        let paths = paths();
+        let installed = install_bytes(&paths, &offer, "libupstream.rmeta", METADATA);
+        let physical = installed.path.clone();
+        register(&paths, &fixture, &offer, &[installed]).unwrap();
+        std::fs::write(physical, b"").unwrap();
+        let error = paths
+            .capture_committed_inputs(
+                &fixture.coord,
+                observed(&paths, false),
+                CommittedDependencyPolicy::WorkspaceMetadata,
+            )
+            .unwrap_err();
+        assert!(error.contains("replaced by empty metadata"), "{error}");
+        fixture.quarantine(&offer.manifest.action_key);
+        assert!(matches!(
+            paths.export_committed_outputs(&fixture.coord, &|| false),
+            Err(CommittedOutputExportError::InvalidProducer(_)),
+        ));
     }
 
     #[test]

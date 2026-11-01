@@ -818,10 +818,44 @@ pub(crate) struct StandbyPeer {
     state: StandbyState,
 }
 
+/// CPU pressure reported by one authenticated idle connection. Receipt time is
+/// coordinator-local; neither the sample nor its CPU count grants capacity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StandbyLoad {
+    load_x100: u64,
+    slots: u64,
+    received: Instant,
+}
+
+impl StandbyLoad {
+    pub(crate) fn observe(hello: &Value, value: &Value, received: Instant) -> Option<Self> {
+        let slots = hello["slots"].as_u64()?;
+        if slots == 0 || slots > u64::from(u32::MAX) {
+            return None;
+        }
+        Some(Self {
+            load_x100: value.as_u64()?,
+            slots,
+            received,
+        })
+    }
+
+    pub(crate) fn fresh_at(self, now: Instant) -> bool {
+        now.checked_duration_since(self.received)
+            .is_some_and(|age| age <= worker_standby::LOAD_MAX_AGE)
+    }
+
+    pub(crate) fn compare(self, other: Self) -> std::cmp::Ordering {
+        (u128::from(self.load_x100) * u128::from(other.slots))
+            .cmp(&(u128::from(other.load_x100) * u128::from(self.slots)))
+    }
+}
+
 struct StandbyState {
     hello: Value,
     buffered: Vec<u8>,
     supported: bool,
+    load: Option<StandbyLoad>,
     completed_heartbeats: u64,
     next_ping: Instant,
     failed: bool,
@@ -858,6 +892,7 @@ async fn prepare_standby_records<S: AsyncRead + AsyncWrite + Unpin>(
     asupersync::time::timeout(asupersync::time::wall_now(), ADMISSION_BUDGET, async {
         let mut buffered = Vec::new();
         let hello = read_record(stream, &mut buffered).await?;
+        let received = Instant::now();
         require(
             hello["kind"] == "worker-hello"
                 && hello["worker_id"].as_str() == Some(expected_worker)
@@ -888,10 +923,16 @@ async fn prepare_standby_records<S: AsyncRead + AsyncWrite + Unpin>(
             )
             .await?;
         }
+        let load = if supported {
+            StandbyLoad::observe(&hello, &hello["load_x100"], received)
+        } else {
+            None
+        };
         Ok(StandbyState {
             hello,
             buffered,
             supported,
+            load,
             completed_heartbeats: 0,
             next_ping: Instant::now() + worker_standby::HEARTBEAT_INTERVAL,
             failed: false,
@@ -927,11 +968,16 @@ fn standby_cancelled() -> io::Error {
 }
 
 impl StandbyState {
-    async fn wait_for_work<S: AsyncRead + AsyncWrite + Unpin, F: Future<Output = ()>>(
+    async fn wait_for_work<
+        S: AsyncRead + AsyncWrite + Unpin,
+        F: Future<Output = ()>,
+        U: FnMut(Option<StandbyLoad>),
+    >(
         &mut self,
         stream: &mut S,
         work: F,
         shutdown: OperationCancellation,
+        mut on_load: U,
     ) -> io::Result<()> {
         require(
             self.supported && !self.failed,
@@ -1002,18 +1048,30 @@ impl StandbyState {
                     .await?;
                     let pong = read_record(stream, &mut self.buffered).await?;
                     require(
-                        pong.as_object().is_some_and(|fields| fields.len() == 3)
-                            && pong["kind"] == "standby-pong"
+                        pong.as_object().is_some_and(|fields| {
+                            fields.len() >= 3
+                                && fields.keys().all(|key| {
+                                    matches!(
+                                        key.as_str(),
+                                        "kind" | "version" | "sequence" | "load_x100"
+                                    )
+                                })
+                        }) && pong["kind"] == "standby-pong"
                             && pong["version"] == worker_standby::VERSION
                             && pong["sequence"].as_u64() == Some(sequence),
                         "invalid worker standby pong",
-                    )
+                    )?;
+                    Ok(StandbyLoad::observe(
+                        &self.hello,
+                        &pong["load_x100"],
+                        Instant::now(),
+                    ))
                 },
             ));
             // After a ping starts, consume its exact pong before assignment.
             // Dropping a partial write/read on shutdown only closes this peer;
             // it can never hand an unfinished exchange to session admission.
-            poll_fn(|cx| {
+            let load = poll_fn(|cx| {
                 if stopped.as_mut().poll(cx).is_ready() {
                     return Poll::Ready(Err(standby_cancelled()));
                 }
@@ -1030,6 +1088,8 @@ impl StandbyState {
             self.completed_heartbeats = sequence;
             self.next_ping = next_ping;
             self.failed = false;
+            self.load = load;
+            on_load(load);
         }
     }
 }
@@ -1039,6 +1099,10 @@ impl StandbyPeer {
     /// durable worker admission, a request id, a session or execution authority.
     pub(crate) fn scheduling_hello(&self) -> &Value {
         &self.state.hello
+    }
+
+    pub(crate) fn scheduling_load(&self) -> Option<StandbyLoad> {
+        self.state.load
     }
 
     /// Whether the hello explicitly selected the optional idle exchange.
@@ -1052,14 +1116,15 @@ impl StandbyPeer {
     }
 
     /// Await assignment with bounded heartbeats, peer EOF detection and shutdown.
-    pub(crate) async fn wait_for_work<F: Future<Output = ()>>(
+    pub(crate) async fn wait_for_work<F: Future<Output = ()>, U: FnMut(Option<StandbyLoad>)>(
         &mut self,
         work: F,
         shutdown: OperationCancellation,
+        on_load: U,
     ) -> io::Result<()> {
         let result = self
             .state
-            .wait_for_work(&mut self.peer.stream, work, shutdown)
+            .wait_for_work(&mut self.peer.stream, work, shutdown, on_load)
             .await;
         self.state.failed |= result.is_err();
         result
@@ -3593,6 +3658,27 @@ mod tests {
     }
 
     #[test]
+    fn standby_load_uses_receipt_age_exact_ratios_and_unknown_data() {
+        let now = Instant::now();
+        let observed = StandbyLoad::observe(&json!({"slots":4}), &json!(200), now).unwrap();
+        let equal = StandbyLoad::observe(&json!({"slots":1}), &json!(50), now).unwrap();
+        assert_eq!(observed.compare(equal), std::cmp::Ordering::Equal);
+        let enormous =
+            StandbyLoad::observe(&json!({"slots":u32::MAX}), &json!(u64::MAX), now).unwrap();
+        assert_eq!(observed.compare(enormous), std::cmp::Ordering::Less);
+        assert_eq!(enormous.compare(observed), std::cmp::Ordering::Greater);
+        assert!(observed.fresh_at(now + worker_standby::LOAD_MAX_AGE));
+        assert!(!observed.fresh_at(now + worker_standby::LOAD_MAX_AGE + Duration::from_nanos(1)));
+        assert!(!observed.fresh_at(now - Duration::from_nanos(1)));
+        for slots in [Value::Null, json!(0), json!(-1), json!(u64::MAX)] {
+            assert!(StandbyLoad::observe(&json!({"slots":slots}), &json!(0), now).is_none());
+        }
+        for sample in [Value::Null, json!(-1), json!("unknown"), json!(0.5)] {
+            assert!(StandbyLoad::observe(&json!({"slots":4}), &sample, now).is_none());
+        }
+    }
+
+    #[test]
     fn standby_negotiation_checks_transport_identity_and_claims_before_any_reply() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
@@ -3634,8 +3720,17 @@ mod tests {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .unwrap();
-        for offered in [hello(), standby_hello()] {
-            let supported = offered.get("standby_protocols").is_some();
+        let mut earlier = hello();
+        earlier["standby_protocols"] = json!(["worker-standby-v1"]);
+        earlier["load_x100"] = json!(0);
+        for offered in [hello(), earlier, standby_hello()] {
+            let supported = offered["standby_protocols"]
+                .as_array()
+                .is_some_and(|versions| {
+                    versions
+                        .iter()
+                        .any(|version| version == worker_standby::VERSION)
+                });
             let tail = format!("{}\n", response());
             let mut wire =
                 RecordWire::new(format!("{offered}\n{tail}").into_bytes(), RECORD_READ_BYTES);
@@ -3655,6 +3750,7 @@ mod tests {
                 );
             } else {
                 assert!(wire.written.is_empty());
+                assert!(prepared.load.is_none());
             }
         }
     }
@@ -3716,8 +3812,12 @@ mod tests {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .unwrap();
-        let offered = standby_hello();
-        let pong = json!({"kind":"standby-pong", "version":worker_standby::VERSION, "sequence":1});
+        let mut offered = standby_hello();
+        offered["load_x100"] = json!(1200);
+        let pong = json!({
+            "kind":"standby-pong", "version":worker_standby::VERSION,
+            "sequence":1, "load_x100":125,
+        });
         let assignment = OperationCancellation::new();
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut wire = StandbyWire {
@@ -3731,6 +3831,8 @@ mod tests {
             prepare_standby_records(&mut wire, standby_identity(), "worker", [1; 32]),
         )
         .unwrap();
+        assert_eq!(prepared.load.unwrap().load_x100, 1200);
+        let mut observed_loads = Vec::new();
         prepared.next_ping = Instant::now();
         rabs_asupersync::daemon_runtime::block_on_top_level(
             &runtime,
@@ -3738,10 +3840,14 @@ mod tests {
                 &mut wire,
                 assignment.cancelled(),
                 OperationCancellation::new(),
+                |load| observed_loads.push(load),
             ),
         )
         .unwrap();
         assert_eq!(prepared.completed_heartbeats, 1);
+        assert_eq!(observed_loads, vec![prepared.load]);
+        assert_eq!(prepared.load.unwrap().load_x100, 125);
+        assert!(prepared.load.unwrap().fresh_at(Instant::now()));
         assert_eq!(prepared.buffered, format!("{}\n", response()).as_bytes());
         assert_eq!(
             sent.lock()
@@ -3796,6 +3902,57 @@ mod tests {
     }
 
     #[test]
+    fn standby_unknown_pressure_clears_previous_load_without_blocking_assignment() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        for sample in [
+            None,
+            Some(Value::Null),
+            Some(json!("unknown")),
+            Some(json!(-1)),
+        ] {
+            let mut offered = standby_hello();
+            offered["load_x100"] = json!(500);
+            let mut pong = json!({
+                "kind":"standby-pong", "version":worker_standby::VERSION, "sequence":1,
+            });
+            if let Some(sample) = sample {
+                pong["load_x100"] = sample;
+            }
+            let assignment = OperationCancellation::new();
+            let mut wire = StandbyWire {
+                wire: RecordWire::new(format!("{offered}\n").into_bytes(), RECORD_READ_BYTES),
+                after_ping: Some(format!("{pong}\n").into_bytes()),
+                assignment: assignment.clone(),
+                sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+            };
+            let mut prepared = rabs_asupersync::daemon_runtime::block_on_top_level(
+                &runtime,
+                prepare_standby_records(&mut wire, standby_identity(), "worker", [1; 32]),
+            )
+            .unwrap();
+            assert!(prepared.load.is_some());
+            prepared.next_ping = Instant::now();
+            let mut observed = Vec::new();
+            rabs_asupersync::daemon_runtime::block_on_top_level(
+                &runtime,
+                prepared.wait_for_work(
+                    &mut wire,
+                    assignment.cancelled(),
+                    OperationCancellation::new(),
+                    |load| observed.push(load),
+                ),
+            )
+            .unwrap();
+            assert_eq!(prepared.completed_heartbeats, 1);
+            assert!(prepared.load.is_none());
+            assert_eq!(observed, vec![None]);
+            assert!(!prepared.failed);
+        }
+    }
+
+    #[test]
     fn standby_assignment_cannot_skip_an_invalid_pong() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
@@ -3830,6 +3987,7 @@ mod tests {
                     &mut wire,
                     assignment.cancelled(),
                     OperationCancellation::new(),
+                    |_| panic!("an invalid pong must not publish pressure"),
                 ),
             )
             .unwrap_err();
@@ -3863,6 +4021,7 @@ mod tests {
                     &mut wire,
                     std::future::pending(),
                     OperationCancellation::new(),
+                    |_| panic!("an unsolicited record must not publish pressure"),
                 ),
             )
             .unwrap_err();
@@ -3883,7 +4042,9 @@ mod tests {
         stop.cancel();
         let failure = rabs_asupersync::daemon_runtime::block_on_top_level(
             &runtime,
-            prepared.wait_for_work(&mut wire, std::future::ready(()), stop),
+            prepared.wait_for_work(&mut wire, std::future::ready(()), stop, |_| {
+                panic!("stopped standby must not publish pressure")
+            }),
         )
         .unwrap_err();
         assert_eq!(failure.kind(), io::ErrorKind::Interrupted);
