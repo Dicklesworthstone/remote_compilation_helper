@@ -113,13 +113,9 @@ pub struct CancellationRecord {
     pub remote_pgid_file: Option<String>,
     /// The reservation was abandoned (see [`provably_abandoned_unlaunched`]):
     /// without a record path it needs no remote kill; with one, a record the
-    /// worker no longer has confirms that nothing runs under it.
+    /// original admitted worker no longer has confirms that nothing runs under it.
     #[serde(skip)]
     pub abandoned_unlaunched: bool,
-    /// Current coordinates of `worker_id`, used only to ask an abandoned
-    /// legacy build's worker for its record (see [`legacy_probe_config`]).
-    #[serde(skip)]
-    legacy_probe_config: Option<rch_common::WorkerConfig>,
 }
 
 /// Silence far past every remote lifetime cap: the in-session watchdog (30
@@ -181,24 +177,6 @@ pub(crate) fn client_lease_owns_source(wrapper: &str) -> bool {
                 crate::api::lease_owns_unretired_source(&lease)
             }),
     }
-}
-
-/// Ownership snapshots written before admitted endpoints were recorded
-/// recover their builds without one, so the remote probe could never run and
-/// the stuck detector retried an abandoned build every tick, forever
-/// (bd-ilds6: two such builds held a slot each for 30h on one dispatcher,
-/// across a restart). Only such an abandoned build may ask its worker ID's
-/// current endpoint. That answer never becomes execution ownership: cleanup
-/// and feedback still see no endpoint.
-async fn legacy_probe_config(
-    ctx: &DaemonContext,
-    record: &CancellationRecord,
-) -> Option<rch_common::WorkerConfig> {
-    if record.worker_endpoint.is_some() || !record.abandoned_unlaunched {
-        return None;
-    }
-    let worker = ctx.pool.get(&WorkerId::new(&record.worker_id)).await?;
-    Some(worker.endpoint_snapshot().await.config)
 }
 
 /// A recycled PID proves that the original process has exited; it never
@@ -490,7 +468,6 @@ impl CancellationOrchestrator {
                 hook_process_identity: build.hook_process_identity.clone(),
                 abandoned_unlaunched,
                 remote_pgid_file: build.remote_pgid_file,
-                legacy_probe_config: None,
             };
             active.insert(build_id, record.clone());
             (
@@ -546,7 +523,6 @@ impl CancellationOrchestrator {
             record.remote_pgid_file = current.remote_pgid_file;
             record.hook_process_identity = current.hook_process_identity.clone();
             record.slots = current.slots;
-            record.legacy_probe_config = legacy_probe_config(&context, &record).await;
 
             owner.events.emit(
                 "cancellation_requested",
@@ -591,6 +567,8 @@ impl CancellationOrchestrator {
             // confirmation must not lose its slot-release/history owner.
             owner.run_cleanup(&context, &mut record).await;
             owner.record_cancellation_stats(&record).await;
+            let missing_endpoint = remote_cancellation_required(&record)
+                && cancellation_transport_endpoint(&record).is_none();
 
             CancelBuildResponse {
                 status: if record.state == CancellationState::Completed {
@@ -608,6 +586,11 @@ impl CancellationOrchestrator {
                     }
                     (CancellationState::Completed, false) => {
                         "Build cancellation completed".to_string()
+                    }
+                    _ if missing_endpoint => {
+                        "Original worker endpoint is unavailable; current inventory cannot prove \
+                         historical process absence. Active build and reservations retained"
+                            .to_string()
                     }
                     _ => {
                         "Cancellation unconfirmed; active build and reservations retained for retry"
@@ -694,7 +677,7 @@ impl CancellationOrchestrator {
             if ctx.admin_disable_store.is_none() && worker.is_disabled().await {
                 return false;
             }
-            if let Some((owned, _)) = cancellation_transport_endpoint(record) {
+            if let Some(owned) = cancellation_transport_endpoint(record) {
                 match worker.owned_recovery_admission(owned).await {
                     OwnedRecoveryAdmission::Deferred => return false,
                     OwnedRecoveryAdmission::Current(mut permit) => {
@@ -1202,26 +1185,23 @@ impl CancellationOrchestrator {
 // sent to workers, including the process-table verification after signalling.
 const REMOTE_CANCELLATION_SCRIPT: &str = include_str!("cancellation_remote.sh");
 
-/// Build a cancellation transport from immutable admission evidence. Looking
-/// up today's worker ID here can send an old build's signal to a replacement,
-/// so [`legacy_probe_config`] coordinates only ask whether the record is gone
-/// and never signal.
+/// Build a cancellation transport only from immutable admission evidence.
+/// Today's worker ID may name a replacement. Even a read-only absence probe
+/// against that replacement cannot settle the historical build's reservation.
+/// Persisted admission coordinates remain usable after restart; missing legacy
+/// coordinates stay unknown instead of inheriting current inventory authority.
 fn cancellation_transport_endpoint(
     record: &CancellationRecord,
-) -> Option<(&rch_common::WorkerConfig, bool)> {
-    let (config, admitted) = match record.worker_endpoint.as_ref() {
-        Some(endpoint) => (&endpoint.config, true),
-        None if record.abandoned_unlaunched => (record.legacy_probe_config.as_ref()?, false),
-        None => return None,
-    };
-    (config.id.as_str() == record.worker_id).then_some((config, admitted))
+) -> Option<&rch_common::WorkerConfig> {
+    let config = &record.worker_endpoint.as_ref()?.config;
+    (config.id.as_str() == record.worker_id).then_some(config)
 }
 
 fn build_remote_kill_command(
     record: &CancellationRecord,
     can_disable_background: bool,
 ) -> Option<tokio::process::Command> {
-    let (config, admitted) = cancellation_transport_endpoint(record)?;
+    let config = cancellation_transport_endpoint(record)?;
     let mut ssh = tokio::process::Command::new("ssh");
     rch_common::ssh::configure_oneshot_ssh(&mut ssh, can_disable_background);
     ssh.args([
@@ -1237,11 +1217,7 @@ fn build_remote_kill_command(
     if let Some(options) = rch_common::ssh::identities_only_args(&config.identity_file) {
         ssh.args(options);
     }
-    let script = if admitted {
-        build_remote_kill_script(record.remote_pgid_file.as_deref(), record.build_id)
-    } else {
-        build_remote_record_probe_script(record.remote_pgid_file.as_deref(), record.build_id)
-    };
+    let script = build_remote_kill_script(record.remote_pgid_file.as_deref(), record.build_id);
     ssh.arg(format!("{}@{}", config.user, config.host))
         .arg(script)
         // The timeout owns this local SSH process even if the caller exits.
@@ -1286,26 +1262,6 @@ async fn remote_cancellation_output(
     })
 }
 
-/// The absence check of `cancellation_remote.sh` without its signalling: a
-/// record still present behind unadmitted coordinates keeps the reservation.
-const REMOTE_RECORD_PROBE_SCRIPT: &str = r#"if [ ! -e "$1" ] && [ ! -L "$1" ]; then
-    printf 'RCH_REMOTE_RECORD_ABSENT_V1:%s\n' "$2"
-    exit 42
-fi
-exit 43
-"#;
-
-fn build_remote_record_probe_script(remote_pgid_file: Option<&str>, build_id: u64) -> String {
-    let Some(remote_pgid_file) = remote_pgid_file else {
-        return "exit 42".to_owned();
-    };
-    format!(
-        "sh -c {} sh {} {build_id}",
-        shell_escape::escape(std::borrow::Cow::Borrowed(REMOTE_RECORD_PROBE_SCRIPT)),
-        shell_escape::escape(std::borrow::Cow::Borrowed(remote_pgid_file)),
-    )
-}
-
 fn build_remote_kill_script(remote_pgid_file: Option<&str>, build_id: u64) -> String {
     let Some(remote_pgid_file) = remote_pgid_file else {
         // Matching command text cannot prove that a build's descendants exited.
@@ -1324,7 +1280,7 @@ fn build_remote_kill_script(remote_pgid_file: Option<&str>, build_id: u64) -> St
     )
 }
 
-/// Without a recorded process-group file both worker scripts are `exit 42`,
+/// Without a recorded process-group file the worker script is `exit 42`,
 /// which prints no receipt: no SSH answer can confirm a kill
 /// ([`remote_kill_confirmed`]) or prove the record absent
 /// ([`remote_record_absent`]), so the reservation is retained either way.
@@ -1674,7 +1630,6 @@ wait
             hook_process_identity: None,
             remote_pgid_file: None,
             abandoned_unlaunched: false,
-            legacy_probe_config: None,
         }
     }
 
@@ -1685,10 +1640,9 @@ wait
         let mut record = test_record(CancellationState::TermSent, 0, false);
         record.remote_pgid_file = None;
         assert!(!remote_answer_can_confirm(&record));
-        // Both worker scripts degrade to `exit 42`, which prints no receipt,
+        // The worker script degrades to `exit 42`, which prints no receipt,
         // so skipping the SSH cannot change the outcome.
         assert_eq!(build_remote_kill_script(None, 42), "exit 42");
-        assert_eq!(build_remote_record_probe_script(None, 42), "exit 42");
         let output = std::process::Output {
             status: std::process::ExitStatus::from_raw(42 << 8),
             stdout: Vec::new(),
@@ -1795,71 +1749,30 @@ wait
         assert!(provably_abandoned_unlaunched(&build, now, no_lease));
     }
 
-    /// bd-ilds6: a build recovered from a pre-endpoint ownership snapshot has
-    /// no admitted coordinates, so the stuck detector retried it every tick,
-    /// forever. Once abandoned, its worker ID's current endpoint may prove
-    /// that the record is gone, but it is never sent the signalling protocol.
-    #[tokio::test]
-    async fn abandoned_legacy_build_probes_current_endpoint_for_absence_only() {
-        let pool = WorkerPool::new();
-        let current = rch_common::WorkerConfig {
-            id: WorkerId::new("w1"),
-            host: "current.example".into(),
-            user: "current-user".into(),
-            identity_file: "/current/key".into(),
-            ..rch_common::WorkerConfig::default()
-        };
-        pool.add_worker(current.clone()).await;
-        let ctx = make_test_context(pool, Arc::new(BuildHistory::new(10)));
+    /// A replacement may have no record while the original worker still does.
+    /// Age and a reusable worker ID cannot turn that absence into evidence
+    /// about the historical process, even for bd-ilds6 legacy ownership rows.
+    #[test]
+    fn abandoned_legacy_build_never_builds_transport_without_admitted_endpoint() {
         let mut record = test_record(CancellationState::Requested, 0, false);
         record.remote_pgid_file = Some("/tmp/rch-run/p/42.pgid".into());
-
-        // Not abandoned: unknown coordinates stay unknown.
-        assert!(legacy_probe_config(&ctx, &record).await.is_none());
-        record.legacy_probe_config = Some(current);
-        assert!(build_remote_kill_command(&record, false).is_none());
-
-        record.abandoned_unlaunched = true;
-        record.legacy_probe_config = legacy_probe_config(&ctx, &record).await;
-        let argv: Vec<_> = build_remote_kill_command(&record, true)
-            .unwrap()
-            .as_std()
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
-        assert!(argv.windows(2).any(|args| args == ["-i", "/current/key"]));
-        for option in [
-            "ConnectionAttempts=1",
-            "ControlMaster=no",
-            "ControlPersist=no",
-            "ControlPath=none",
-            "ForkAfterAuthentication=no",
-        ] {
-            assert!(argv.windows(2).any(|args| args == ["-o", option]));
+        for abandoned in [false, true] {
+            record.abandoned_unlaunched = abandoned;
+            assert!(cancellation_transport_endpoint(&record).is_none());
+            assert!(build_remote_kill_command(&record, false).is_none());
+            assert!(build_remote_kill_command(&record, true).is_none());
         }
-        assert_eq!(argv[argv.len() - 2], "current-user@current.example");
-        assert_eq!(
-            argv.last().unwrap(),
-            &build_remote_record_probe_script(Some("/tmp/rch-run/p/42.pgid"), 42)
-        );
-        assert!(!argv.last().unwrap().contains("rch_remote_cancel"));
-
-        // An ID no longer in inventory has nothing to ask, and coordinates
-        // resolved for another ID are never used.
-        record.worker_id = "gone".into();
-        assert!(legacy_probe_config(&ctx, &record).await.is_none());
-        assert!(build_remote_kill_command(&record, false).is_none());
     }
 
     #[tokio::test]
-    async fn legacy_record_probe_proves_absence_and_never_signals() {
+    async fn admitted_record_script_proves_absence_and_preserves_unverified_record() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("group with 'quote $dollar;`tick`.pgid");
         let probe = |path: std::path::PathBuf| async move {
             // The worker's login shell runs the probe exactly as SSH passes it.
             tokio::process::Command::new("/bin/sh")
                 .arg("-c")
-                .arg(build_remote_record_probe_script(path.to_str(), 42))
+                .arg(build_remote_kill_script(path.to_str(), 42))
                 .stdin(std::process::Stdio::null())
                 .output()
                 .await
@@ -1869,13 +1782,14 @@ wait
         assert!(remote_record_absent(&absent, 42), "{absent:?}");
         assert!(!remote_record_absent(&absent, 41));
 
-        std::fs::write(&path, std::process::id().to_string()).unwrap();
+        let unverified_record = format!("unverified legacy pid {}\n", std::process::id());
+        std::fs::write(&path, &unverified_record).unwrap();
         let present = probe(path.clone()).await;
-        assert_eq!(present.status.code(), Some(43), "{present:?}");
+        assert_eq!(present.status.code(), Some(42), "{present:?}");
         assert!(present.stdout.is_empty());
         assert!(!remote_record_absent(&present, 42));
         assert!(!remote_kill_confirmed(&present, 42));
-        assert_eq!(build_remote_record_probe_script(None, 42), "exit 42");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), unverified_record);
     }
 
     #[test]
@@ -2561,7 +2475,6 @@ wait
             hook_process_identity: None,
             remote_pgid_file: None,
             abandoned_unlaunched: false,
-            legacy_probe_config: None,
         };
 
         orch.execute_cancellation(&mut record, false).await;
@@ -2597,7 +2510,6 @@ wait
             hook_process_identity: None,
             remote_pgid_file: None,
             abandoned_unlaunched: false,
-            legacy_probe_config: None,
         };
 
         orch.execute_cancellation(&mut record, false).await;
@@ -3760,6 +3672,197 @@ esac
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn legacy_cancellation_cannot_release_from_a_replacement_endpoints_absence() {
+        if let Some(root) =
+            std::env::var_os("RCH_ADMIN_CANCEL_TEST_ROOT").map(std::path::PathBuf::from)
+        {
+            for admitted in [false, true] {
+                let case = root.join(if admitted { "admitted" } else { "legacy" });
+                std::fs::create_dir_all(case.join("original")).unwrap();
+                std::fs::create_dir_all(case.join("replacement")).unwrap();
+                let original_record = case.join("original/owned-build.pgid");
+                let original_bytes = b"original worker process evidence remains unverified\n";
+                std::fs::write(&original_record, original_bytes).unwrap();
+                let config = rch_common::WorkerConfig {
+                    id: WorkerId::new("retargeted-cancellation"),
+                    host: "original.example".into(),
+                    user: "original-user".into(),
+                    identity_file: "/original/key".into(),
+                    total_slots: 8,
+                    ..rch_common::WorkerConfig::default()
+                };
+                let pool = WorkerPool::new();
+                pool.add_worker(config.clone()).await;
+                let worker = pool.get(&config.id).await.unwrap();
+                let history_path = case.join("history.jsonl");
+                let history = BuildHistory::new(10).with_persistence(history_path.clone());
+                let endpoint = if admitted {
+                    Some(worker.endpoint_snapshot().await)
+                } else {
+                    None
+                };
+                let target = history
+                    .try_start_active_build_with_waiter(
+                        "historical-build".into(),
+                        config.id.to_string(),
+                        "cargo test".into(),
+                        0,
+                        None,
+                        3,
+                        rch_common::BuildLocation::Remote,
+                        None,
+                        crate::disk_pressure::DiskHeadroomAdmission::default(),
+                        endpoint,
+                    )
+                    .unwrap()
+                    .unwrap();
+                history
+                    .record_build_heartbeat(rch_common::BuildHeartbeatRequest {
+                        build_id: target.id,
+                        worker_id: config.id.clone(),
+                        hook_pid: None,
+                        local_wrapper_id: None,
+                        remote_pgid_file: Some("owned-build.pgid".into()),
+                        phase: rch_common::BuildHeartbeatPhase::Execute,
+                        detail: None,
+                        progress_counter: Some(1),
+                        progress_percent: None,
+                    })
+                    .unwrap();
+                let unrelated = history.start_active_build(
+                    "unrelated-owner".into(),
+                    config.id.to_string(),
+                    "cargo check".into(),
+                    0,
+                    2,
+                    rch_common::BuildLocation::Remote,
+                );
+                // A real persisted legacy ownership row supplies the age;
+                // do not advance Tokio away from the process timeout clock.
+                let ownership_path = history_path.with_extension("ownership.json");
+                let mut snapshot: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&ownership_path).unwrap()).unwrap();
+                let stale = (chrono::Utc::now() - ChronoDuration::hours(7)).to_rfc3339();
+                let row = snapshot["active"]
+                    .as_array_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|row| row["id"].as_u64() == Some(target.id))
+                    .unwrap();
+                for field in ["started_at", "last_heartbeat_at", "last_progress_at"] {
+                    row[field] = serde_json::json!(stale);
+                }
+                std::fs::write(&ownership_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+                drop(history);
+
+                // The ID is retargeted, then the daemon restarts with that
+                // replacement. Its empty directory cannot prove anything
+                // about the process record retained on the original worker.
+                let replacement = rch_common::WorkerConfig {
+                    host: "replacement.example".into(),
+                    user: "replacement-user".into(),
+                    identity_file: "/replacement/key".into(),
+                    ..config.clone()
+                };
+                worker.update_config(replacement.clone()).await;
+                let restored = Arc::new(BuildHistory::load_from_file(&history_path, 10).unwrap());
+                let pool = WorkerPool::new();
+                pool.add_worker(replacement).await;
+                for active in restored.active_builds() {
+                    pool.restore_recovered_slots(&WorkerId::new(&active.worker_id), active.slots)
+                        .await
+                        .unwrap();
+                }
+                let current = pool.get(&config.id).await.unwrap();
+                assert_eq!(current.used_slots(), 5);
+                assert!(provably_abandoned_unlaunched(
+                    &restored.active_build(target.id).unwrap(),
+                    Instant::now(),
+                    |_| false,
+                ));
+                let ctx = make_test_context(pool, restored.clone());
+                let orch = CancellationOrchestrator::new(
+                    CancellationConfig {
+                        remote_kill_timeout: Duration::from_secs(5),
+                        cleanup_timeout: Duration::from_secs(8),
+                        ..test_config()
+                    },
+                    test_events(),
+                );
+                std::fs::write(root.join("build-id"), target.id.to_string()).unwrap();
+                std::fs::write(root.join("case-root"), case.to_str().unwrap()).unwrap();
+                std::fs::write(root.join("mode"), "worker-root").unwrap();
+                let failed = orch
+                    .cancel_build(&ctx, target.id, CancelReason::StuckDetector, true)
+                    .await;
+                assert_eq!(
+                    failed.status,
+                    "failed",
+                    "admitted={admitted}: {failed:?}; ssh={:?}",
+                    std::fs::read_to_string(root.join("ssh-argv")),
+                );
+                assert_eq!(failed.slots_released, 0);
+                assert_eq!(current.used_slots(), 5);
+                assert!(restored.active_build(target.id).is_some());
+                assert!(restored.active_build(unrelated.id).is_some());
+                assert!(!restored.has_terminal_build(target.id));
+                assert_eq!(std::fs::read(&original_record).unwrap(), original_bytes);
+                let persisted = BuildHistory::load_from_file(&history_path, 10).unwrap();
+                assert_eq!(persisted.active_build(target.id).unwrap().slots, 3);
+                assert!(persisted.active_build(unrelated.id).is_some());
+
+                if admitted {
+                    let argv = std::fs::read_to_string(root.join("ssh-argv")).unwrap();
+                    assert!(
+                        argv.lines()
+                            .any(|arg| arg == "original-user@original.example")
+                    );
+                    assert!(!argv.contains("replacement-user@replacement.example"));
+                    // Only the original endpoint's later absence may settle
+                    // its exact restored reservation. Preserve the old bytes.
+                    std::fs::rename(&original_record, case.join("retained-process-evidence"))
+                        .unwrap();
+                    let completed = orch
+                        .cancel_build(&ctx, target.id, CancelReason::StuckDetector, true)
+                        .await;
+                    assert_eq!(completed.status, "cancelled", "{completed:?}");
+                    assert_eq!(completed.slots_released, 3);
+                    assert_eq!(current.used_slots(), 2);
+                    assert!(restored.active_build(target.id).is_none());
+                    assert!(restored.active_build(unrelated.id).is_some());
+                    assert!(restored.has_terminal_build(target.id));
+                    let confirmed_dials = std::fs::read_to_string(root.join("dials")).unwrap();
+                    assert_eq!(confirmed_dials.lines().count(), 2);
+                    let duplicate = orch
+                        .cancel_build(&ctx, target.id, CancelReason::StuckDetector, true)
+                        .await;
+                    assert_eq!(duplicate.slots_released, 0);
+                    assert_eq!(current.used_slots(), 2);
+                    assert_eq!(
+                        std::fs::read_to_string(root.join("dials")).unwrap(),
+                        confirmed_dials
+                    );
+                    let restarted = BuildHistory::load_from_file(&history_path, 10).unwrap();
+                    assert!(restarted.active_build(target.id).is_none());
+                    assert_eq!(restarted.active_build(unrelated.id).unwrap().slots, 2);
+                } else {
+                    assert!(failed.message.unwrap().contains("Original worker endpoint"));
+                    assert!(
+                        !root.join("dials").exists(),
+                        "unknown endpoint must never dial"
+                    );
+                }
+            }
+            std::fs::write(root.join("child-completed"), "ok").unwrap();
+            return;
+        }
+        run_admin_cancel_fixture(
+            "cancellation::tests::legacy_cancellation_cannot_release_from_a_replacement_endpoints_absence",
+        ).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn offline_worker_automatic_cancellation_respects_disable_and_owned_recovery() {
         use rch_common::bypass_record::AdminDisableStore;
 
@@ -4057,7 +4160,18 @@ printf '%s\n' "$$" >> "$RCH_ADMIN_CANCEL_TEST_ROOT/dials"
 printf '%s\n' "$@" > "$RCH_ADMIN_CANCEL_TEST_ROOT/ssh-argv"
 id=$(/bin/cat "$RCH_ADMIN_CANCEL_TEST_ROOT/build-id") || exit 99
 mode=$(/bin/cat "$RCH_ADMIN_CANCEL_TEST_ROOT/mode") || exit 99
-if [ "$mode" = hang ]; then
+if [ "$mode" = worker-root ]; then
+    target=; script=
+    for argument in "$@"; do target=$script; script=$argument; done
+    case "$target" in
+        original-user@original.example) worker_root=original;;
+        replacement-user@replacement.example) worker_root=replacement;;
+        *) exit 99;;
+    esac
+    case_root=$(/bin/cat "$RCH_ADMIN_CANCEL_TEST_ROOT/case-root") || exit 99
+    cd "$case_root/$worker_root" || exit 99
+    exec /bin/sh -c "$script"
+elif [ "$mode" = hang ]; then
     /bin/sh -c 'printf "%s\n" "$$" > "$RCH_ADMIN_CANCEL_TEST_ROOT/proxy-pid"; exec /bin/sleep 60' &
     wait
 else
