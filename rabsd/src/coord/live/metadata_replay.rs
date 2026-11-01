@@ -6,7 +6,7 @@
 use super::{
     CoordLive, ReplayInstallPermit, ServeError, ServeOutcome, declare_coordinator_domains,
     live_producer_gate, live_replay_gate_for_install, live_replay_permit_or_continuation,
-    output_install,
+    output_install, workspace_ancestors,
 };
 use rabs_cas::materialization::staged::SelectedActionOutputs;
 use rabs_cas::metadata_store::{RabsMetadataStore, digest_key};
@@ -91,6 +91,13 @@ impl InstallContext<'_> {
             && let Some(refusal) = live_producer_gate(store, self.action).map_err(store_error)?
         {
             return Ok(Some(ServeOutcome::ExecutePrivately(refusal)));
+        }
+        if let Err(reason) =
+            workspace_ancestors::check_serving(store, self.action, now, self.now_epoch)
+        {
+            return Ok(Some(ServeOutcome::ExecutePrivately(
+                super::ReplayRefusal::CommittedDependency(reason),
+            )));
         }
         match store
             .published_manifest_key(self.action)

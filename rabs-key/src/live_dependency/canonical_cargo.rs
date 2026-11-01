@@ -114,7 +114,8 @@ pub(super) fn canonical_layout(plan: &DependencyActionPlan) -> Result<(), LiveRe
         }
         DependencySourceKind::WorkspaceExecutionOnly
         | DependencySourceKind::WorkspaceClosedRlib
-        | DependencySourceKind::WorkspaceClosedMetadata => {
+        | DependencySourceKind::WorkspaceClosedMetadata
+        | DependencySourceKind::WorkspaceCommittedRlib => {
             return Err(LiveRefusal::NotDependencySource(plan.package_root.clone()));
         }
     };

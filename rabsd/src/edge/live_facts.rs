@@ -587,6 +587,42 @@ pub struct DependencyFacts {
 }
 
 impl DependencyFacts {
+    /// Original path, generation and object identity of every retained Rust
+    /// candidate. These observations do not establish committed provenance.
+    pub(crate) fn candidate_generations(
+        &self,
+    ) -> Result<Vec<(PathBuf, FileSig, TypedDigest)>, String> {
+        self.verify_unchanged()?;
+        if self.roots.len() != self.members.len() || self.roots.len() != self.directories.len() {
+            return Err("dependency candidate observation is incomplete".into());
+        }
+        let mut candidates = Vec::new();
+        for ((root, _, _), (members, directory)) in self
+            .roots
+            .iter()
+            .zip(self.members.iter().zip(&self.directories))
+        {
+            if root.to_str() != Some(directory.path.as_str())
+                || members.len() != directory.artifacts.len()
+            {
+                return Err(
+                    "dependency candidate facts differ from their original inventory".into(),
+                );
+            }
+            for ((name, signature), fact) in members.iter().zip(&directory.artifacts) {
+                let path = root.join(name);
+                if path.to_str() != Some(fact.path.as_str())
+                    || candidates.len() >= MAX_DEPENDENCY_FILES
+                {
+                    return Err("dependency candidate path or count is invalid".into());
+                }
+                candidates.push((path, *signature, fact.content_digest.clone()));
+            }
+        }
+        self.verify_unchanged()?;
+        Ok(candidates)
+    }
+
     /// Retain the exact candidate bytes for a remote metadata action.
     ///
     /// Paths are relative to the shared source transfer manifest:

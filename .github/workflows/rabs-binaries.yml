@@ -201,6 +201,7 @@ jobs:
           cargo test --release -p rabsd --test live_replay --test live_class_safety --test live_sprt_budget --locked
           cargo test --release -p rabsd --test publication_lineage --locked
           cargo test --release -p rabsd --lib coord::live::metadata_replay --locked
+          cargo test --release -p rabsd --lib coord::live::workspace_ancestors --locked
           cargo test --release -p rabsd --lib coord::live::output_install --locked
           cargo test --release -p rabsd --lib edge::server --locked
           cargo test --release -p rabs-wrap --test live_dependency_e2e --locked
@@ -324,6 +325,12 @@ jobs:
         run: |
           cargo test --release -p rabsd --test canonical_check_local --locked \
             canonical_cargo_build_offloads_archives_replays_and_delivers_a_working_binary \
+            -- --ignored --exact --nocapture
+          cargo test --release -p rabsd --test canonical_check_local --locked \
+            canonical_workspace_committed_dag_earns_transitive_replay_across_worktrees \
+            -- --ignored --exact --nocapture
+          cargo test --release -p rabsd --test canonical_check_local --locked \
+            canonical_workspace_dag_refuses_cache_authority_from_a_local_fallback_producer \
             -- --ignored --exact --nocapture
       - name: Canonical Cargo captures generated metadata inputs and invalidates changed OUT_DIR
         timeout-minutes: 30

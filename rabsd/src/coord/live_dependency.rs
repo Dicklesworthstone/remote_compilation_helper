@@ -334,6 +334,50 @@ fn verify_metadata_head(
     Ok(())
 }
 
+/// Register only the physically installed nonempty metadata of a published
+/// archive result. The operation owner rechecks current durable provenance.
+fn remember_committed_metadata(
+    coord: &Arc<CoordLive>,
+    request: &LiveDependencyRequest,
+    manifest: &CanonicalActionResultManifest,
+    manifest_key: &str,
+    files: &[PathBuf],
+) -> Result<(), String> {
+    if !matches!(
+        request.plan.source_kind,
+        DependencySourceKind::WorkspaceClosedRlib | DependencySourceKind::WorkspaceCommittedRlib
+    ) {
+        return Ok(());
+    }
+    let paths = request
+        .canonical_paths
+        .as_ref()
+        .ok_or("missing canonical installation owner")?;
+    let mut installed = Vec::new();
+    for path in files {
+        let output = committed_output(manifest, path)?;
+        if output.role == OutputRole::ProvisionalMetadata {
+            installed.push(known_installed_output(path, &output.object.0)?);
+        }
+    }
+    paths.remember_committed_outputs(coord, request, manifest, manifest_key, &installed)
+}
+
+fn remember_committed_installation(
+    coord: &Arc<CoordLive>,
+    request: &LiveDependencyRequest,
+    manifest: &CanonicalActionResultManifest,
+    manifest_key: &str,
+    result: &InstallResult,
+) -> Result<(), String> {
+    if let InstallResult::Served { installed, .. } = result
+        && let Some(paths) = &request.canonical_paths
+    {
+        paths.remember_committed_outputs(coord, request, manifest, manifest_key, installed)?;
+    }
+    Ok(())
+}
+
 /// The lane's answer to one request.
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -506,6 +550,13 @@ impl PendingServe {
                 // Recheck the original observations after reading every head
                 // file; no refreshed memo can bless a changed package/input.
                 self.verify_inputs()?;
+                remember_committed_metadata(
+                    &self.coord,
+                    &self.request,
+                    &self.manifest,
+                    &self.manifest_key,
+                    files,
+                )?;
                 let callback = metadata_ready.as_mut().ok_or("missing metadata receiver")?;
                 callback(&transcript[..prefix_len.ok_or("missing metadata prefix")?])
             };
@@ -561,6 +612,15 @@ impl PendingServe {
                         .to_vec(),
                     installed,
                 );
+                if let Err(reason) = remember_committed_installation(
+                    &self.coord,
+                    &self.request,
+                    &self.manifest,
+                    &self.manifest_key,
+                    &result,
+                ) {
+                    return install_fault(reason, metadata_exposed);
+                }
                 match result {
                     InstallResult::Fault(reason) => install_fault(reason, metadata_exposed),
                     result => result,
@@ -915,6 +975,16 @@ fn verify_canonical_surface_free_of_roots(
 }
 
 impl LiveDependencyLane {
+    /// Qualify exact observed candidates against this operation's installations
+    /// and the coordinator's current committed producer lineage.
+    pub(crate) fn committed_workspace_inputs(
+        &self,
+        paths: &Arc<canonical::CanonicalPaths>,
+        dependencies: Arc<DependencyFacts>,
+    ) -> Result<Arc<canonical::CommittedWorkspaceInputs>, String> {
+        paths.capture_committed_workspace_inputs(&self.coord, dependencies)
+    }
+
     /// The lane over a live coordinator.
     #[must_use]
     pub fn new(coord: Arc<CoordLive>) -> Self {
@@ -1384,6 +1454,13 @@ impl ExecutionAttempt {
         let plan = &self.request.plan;
         self.request.verify_package()?;
         self.request.dependencies.verify_unchanged()?;
+        let committed_ancestors = match &self.remote_validation {
+            Some(validation) => validation.committed_ancestors(&self.request)?,
+            None if plan.source_kind == DependencySourceKind::WorkspaceCommittedRlib => {
+                return Err("committed workspace capture has no remote producer capability".into());
+            }
+            None => Vec::new(),
+        };
         let input_roots = mappings_for_plan(plan);
         let transcript = canonicalize_compiler_transcript(&report.stderr, plan)?;
         self.request.verify_canonical_surface(
@@ -1495,6 +1572,14 @@ impl ExecutionAttempt {
                     })
                 }).collect::<Vec<_>>(),
                 "compiler": plan.compiler,
+                "committed_workspace_ancestors": committed_ancestors.iter().map(|ancestor| {
+                    serde_json::json!({
+                        "producer": digest_key(&ancestor.producer_action_key),
+                        "role": format!("{:?}", ancestor.role),
+                        "path": ancestor.virtual_path.escaped(),
+                        "object": digest_key(&ancestor.consumed_object.0),
+                    })
+                }).collect::<Vec<_>>(),
                 "out_dir": plan.out_dir,
             }))
             .map_err(|error| error.to_string())?;
@@ -1560,7 +1645,7 @@ impl ExecutionAttempt {
             transcript_id.clone(),
             transcript_id.0.clone(),
             &declared,
-            Vec::new(),
+            committed_ancestors.clone(),
         )
         .map_err(|error| format!("offer: {error:?}"))?;
         let manifest_bytes = encode_manifest_v1(&stamped.manifest);
@@ -1587,7 +1672,7 @@ impl ExecutionAttempt {
             evidence_id,
             transcript_id.0.clone(),
             &declared,
-            Vec::new(),
+            committed_ancestors,
         )
         .map_err(|error| format!("offer: {error:?}"))?;
         if encode_manifest_v1(&offer.manifest) != manifest_bytes {

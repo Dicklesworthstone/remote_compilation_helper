@@ -18,6 +18,9 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod committed;
+pub use committed::CommittedWorkspaceInputs;
+
 const ROOTS: [&str; 5] = [
     "/__rabs/workspace",
     "/__rabs/cargo-home",
@@ -50,6 +53,7 @@ pub struct CanonicalPaths {
     workspace_tests_selected: bool,
     workspace_benches_selected: bool,
     workspace_bulk_harnesses_selected: bool,
+    committed_outputs: committed::CommittedOutputs,
 }
 
 /// One generated tree's filesystem backing and Cargo-visible record spelling.
@@ -227,6 +231,7 @@ impl CanonicalPaths {
             workspace_tests_selected: false,
             workspace_benches_selected: false,
             workspace_bulk_harnesses_selected: false,
+            committed_outputs: committed::CommittedOutputs::default(),
         }))
     }
 
@@ -406,6 +411,22 @@ impl CanonicalPaths {
                 "closed workspace library caching requires a Cargo graph without project executors"
                     .into(),
             );
+        }
+        Ok(())
+    }
+
+    /// Dependency-bearing archive caching retains the selected ordinary build
+    /// unit and executor-free graph boundary; committed candidates additionally
+    /// require the operation-owned installation capability.
+    pub(crate) fn require_workspace_committed_rlib(
+        &self,
+        plan: &DependencyActionPlan,
+    ) -> Result<(), String> {
+        rabs_key::live_dependency::workspace_dependency_cache::validate_committed_workspace_rlib_plan(plan)
+            .map_err(|error| error.to_string())?;
+        self.require_workspace_execution(plan)?;
+        if self.closed_dependency_execution_required {
+            return Err("committed workspace archive caching requires a Cargo graph without project executors".into());
         }
         Ok(())
     }

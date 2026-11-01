@@ -21,6 +21,7 @@ const CLASS_RECEIPT: &str = "rabs-live-action-class-v1";
 const DEPENDENCY_CLASS: &str = "rustc-dependency-compile";
 const WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-closed-rlib-v1";
 const WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-closed-metadata-v1";
+const WORKSPACE_COMMITTED_RLIB_CLASS: &str = "rustc-workspace-committed-rlib-v1";
 
 const CLASS_SQL: &str = r#"
 SELECT decision FROM decision_receipts
@@ -87,6 +88,9 @@ pub(super) fn refusal(
             [SqlValue::Text(class)] if class == WORKSPACE_RLIB_CLASS => WORKSPACE_RLIB_CLASS,
             [SqlValue::Text(class)] if class == WORKSPACE_METADATA_CLASS => {
                 WORKSPACE_METADATA_CLASS
+            }
+            [SqlValue::Text(class)] if class == WORKSPACE_COMMITTED_RLIB_CLASS => {
+                WORKSPACE_COMMITTED_RLIB_CLASS
             }
             // A caller's LowRiskRegistry flag cannot overrule a recorded
             // private/unknown class, even if its per-action evidence passes.
@@ -504,6 +508,57 @@ mod tests {
             })
         );
         assert_eq!(refusal(&mut reopened, &dependency).unwrap(), None);
+    }
+
+    #[test]
+    fn committed_workspace_producer_class_keeps_its_own_sample_floor_and_hold() {
+        let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+        let requested = published(&mut store, 1, 10);
+        bind(&mut store, &requested, WORKSPACE_COMMITTED_RLIB_CLASS);
+        let culprit = published(&mut store, 2, 11);
+        bind(&mut store, &culprit, WORKSPACE_COMMITTED_RLIB_CLASS);
+        let leaf = published(&mut store, 3, 12);
+        bind(&mut store, &leaf, WORKSPACE_RLIB_CLASS);
+        samples(&mut store, 3, 12, 3, 0);
+        let policy = SamplingPolicy::sample_all(2, 10_000);
+        assert!(matches!(
+            super::super::decide(
+                &mut store,
+                &action(1),
+                ActionClassRisk::CommittedWorkspaceRlib,
+                &policy,
+                false
+            )
+            .unwrap(),
+            SampleGateDecision::ExecutePrivately(
+                PrivateExecutionReason::InsufficientVerificationSamples {
+                    observed: 0,
+                    required: 2
+                }
+            )
+        ));
+        samples(&mut store, 1, 10, 2, 0);
+        assert_eq!(
+            super::super::decide(
+                &mut store,
+                &action(1),
+                ActionClassRisk::CommittedWorkspaceRlib,
+                &policy,
+                false
+            )
+            .unwrap(),
+            SampleGateDecision::ServeFromCache
+        );
+        incident(&mut store, &culprit, "semantic");
+        assert_eq!(
+            refusal(&mut store, &requested).unwrap(),
+            Some(PrivateExecutionReason::ClassSafetyHold {
+                class: WORKSPACE_COMMITTED_RLIB_CLASS.into(),
+                culprit_action_key: culprit,
+                reason: "divergence-incident",
+            })
+        );
+        assert_eq!(refusal(&mut store, &leaf).unwrap(), None);
     }
 
     #[test]

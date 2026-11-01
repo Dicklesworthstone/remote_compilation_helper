@@ -1432,9 +1432,10 @@ metadata and dep-info output only. Both require a retained Cargo unit graph with
 no project executors, no explicit external crates or implicit Rust artifact
 candidates, no generated inputs or native libraries, and no incremental state.
 The captured Rust standard library remains available through the retained
-toolchain. Test harnesses, binaries, procedural macros, libraries consuming other
-project or dependency artifacts, and generated/native workspace units retain
-their existing fresh-execution or ordinary Cargo paths.
+toolchain. Libraries consuming other workspace artifacts may qualify for the
+separate committed-producer build class below. Test harnesses, binaries,
+procedural macros, external dependency consumers and generated/native workspace
+units retain their existing fresh-execution or ordinary Cargo paths.
 
 Each class keys the **complete captured workspace**, including sibling files,
 every directory listing and empty directories. It also binds the exact compiler
@@ -1478,6 +1479,64 @@ execution or reuse paths. Source, environment or workspace-directory changes
 require a different action identity. Missing, unsupported or changed evidence
 preserves the existing refusal and fallback rules, including the prohibition on
 a second compilation while a remote execution is uncertain.
+
+### Cache workspace library builds with committed dependencies
+
+Ordinary pure Rust workspace library builds can also qualify when they consume
+other workspace libraries. This supports chains and branching graphs through
+the same canonical local profile:
+
+```sh
+cargo rabs --rabs-canonical-local ./canonical-compile.json -- build --workspace --lib
+```
+
+Every retained `.rmeta` or `.rlib` candidate in every compiler search directory
+must have been installed from an already committed closed-workspace **archive
+build** in the same retained Cargo operation. This includes transitive and
+unnamed candidates, not only explicit `--extern` arguments. The coordinator
+records the exact producer action, descriptor, canonical result manifest,
+logical output and object identity together with the installed file generation.
+The reusable key includes those stable identities and the entire retained
+artifact bytes; physical backing paths and file generations remain private to
+the operation so a different checkout can reuse the same canonical action.
+
+Verified metadata from a completed, committed producer can qualify a consumer
+before that producer's archive finishes installing. The metadata witness is
+registered only after the actual head is verified and before Cargo receives
+the compiler notification. An archive receives its own witness only after
+successful complete installation. A manifest declaration, ordinary local
+compiler completion or fresh request-owned result does not grant a witness.
+Replacing a candidate with identical bytes still invalidates the old file
+generation until another verified installation establishes its provenance.
+
+The existing worker candidate projection remains unchanged: non-explicit
+archives shadowed by nonempty metadata are omitted from the retained namespace.
+An explicit archive is retained in full and needs its own witness even when a
+same-name metadata file exists. Cargo's later creation of a primary archive
+hard link can change that archive's recorded generation; an explicit consumer
+then conservatively executes afresh. Unknown or unattributed candidates also
+keep the consumer on its existing fresh-execution path. Cacheable metadata-only checks,
+external dependency producers, generated/native inputs, procedural macros,
+incremental state and final links do not qualify for this initial dependent
+archive class. The selected graph must still contain no project executors.
+
+The separate `canonical-workspace-committed-rlib-v1` policy uses key epoch 6 and
+its own serving class and verification evidence. Like the leaf classes, it
+retains the complete captured workspace, all directory listings, exact compiler
+environment and arguments, complete toolchain and measured runtime. It uses the
+existing closed `rlib` worker context. This remains a conservative complete-input
+cache; it does not establish minimal source discovery or general provisional
+metadata reuse.
+
+Publication records the exact committed producer references in the existing
+durable ancestry graph. The coordinator rechecks their transitive closure under
+the publication lock and again during cache lookup, metadata installation and
+archive-tail installation. Missing publications, changed objects, adoption,
+cycles, expired serving validity, quarantine and adverse producer evidence
+refuse reuse. A consumer must still earn its own independent comparisons and
+pass release, class and replay gates; its producers' samples do not count for it.
+After metadata exposure, a later revocation or delivery failure remains a
+terminal delivery error and cannot authorize local fallback.
 
 ### Local Clippy with reusable dependency compilation
 
@@ -2068,6 +2127,32 @@ drains on the worker before ordinary Cargo fallback, without earning publication
 or verification evidence. These fixtures require the same full native namespace
 capabilities as the dependency fixtures; adding them does not establish that they
 have passed on a deployment host.
+
+The committed-dependency class has two additional native acceptance cases:
+
+```sh
+RABS_CANONICAL_TEST_WRAPPER="$PWD/target/debug/rabs-wrap" \
+RABS_TEST_WORKER_BIN="$PWD/target/debug/rabs-wkr" \
+  cargo test -p rabsd --test canonical_check_local --locked \
+    canonical_workspace_committed_dag_earns_transitive_replay_across_worktrees \
+    -- --ignored --exact --nocapture
+
+RABS_CANONICAL_TEST_WRAPPER="$PWD/target/debug/rabs-wrap" \
+RABS_TEST_WORKER_BIN="$PWD/target/debug/rabs-wkr" \
+  cargo test -p rabsd --test canonical_check_local --locked \
+    canonical_workspace_dag_refuses_cache_authority_from_a_local_fallback_producer \
+    -- --ignored --exact --nocapture
+```
+
+The first builds a real A-to-B-to-C library chain with transitive type lookup,
+requires initial publication and two independent comparisons per unit, and
+matches durable ancestor identities to the delivered artifacts. Unchanged and
+relocated builds must replay exact outputs and diagnostics without advancing
+the worker journal. The second requires a producer's denied process-filesystem
+read to settle on the worker before local fallback; successful downstream remote
+compilations must remain fresh and acquire no cache publication or samples.
+These cases must run on a host with the complete native namespace capability;
+their presence or an ignored-test result is not execution evidence.
 
 The full compiler-skip test is explicitly opt-in because it needs the complete
 Linux namespace capability and an installed native wrapper. Build the binaries

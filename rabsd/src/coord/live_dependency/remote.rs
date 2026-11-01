@@ -7,7 +7,7 @@
 //! manifest-specific wrapper acknowledgment. A transport-loss result never
 //! declares an unobserved remote compiler drained.
 
-use super::canonical::CanonicalPaths;
+use super::canonical::{CanonicalPaths, CommittedWorkspaceInputs};
 use super::{
     CanonicalActionResultManifest, CapturedLocalResult, CompletionOutcome, CompletionReport,
     CoordLive, DependencyActionPlan, ExecutionAttempt, InstallResult, LiveDecision,
@@ -33,6 +33,10 @@ use rabs_key::live_dependency::workspace_cache::{
     ClosedWorkspaceLibraryClass, closed_workspace_library_descriptor_class,
     remote_closed_workspace_library_isolation_policy, remote_closed_workspace_library_key,
     remote_closed_workspace_library_shape, validate_closed_workspace_library_plan,
+};
+use rabs_key::live_dependency::workspace_dependency_cache::{
+    is_committed_workspace_rlib_descriptor, remote_committed_workspace_rlib_isolation_policy,
+    remote_committed_workspace_rlib_key, remote_committed_workspace_rlib_shape,
 };
 use rabs_key::live_dependency::{
     DependencyDirectoryFact, DependencySourceKind, ToolchainFacts, native_input_directories,
@@ -568,6 +572,7 @@ pub(super) struct RemoteValidation {
     execution_mode: DependencyExecutionMode,
     canonical_cargo: bool,
     action_key: TypedDigest,
+    committed_workspace_inputs: Option<Arc<CommittedWorkspaceInputs>>,
 }
 
 impl RemoteValidation {
@@ -606,6 +611,21 @@ impl RemoteValidation {
                 .as_ref()
                 .ok_or("closed workspace library lost its retained Cargo graph")?
                 .require_workspace_closed_library(&request.plan)?;
+        } else if request.plan.source_kind == DependencySourceKind::WorkspaceCommittedRlib {
+            request
+                .canonical_paths
+                .as_ref()
+                .ok_or("committed workspace archive lost its retained Cargo graph")?
+                .require_workspace_committed_rlib(&request.plan)?;
+            self.committed_workspace_inputs
+                .as_ref()
+                .ok_or("committed workspace archive lost its producer capability")?
+                .verify(request)?;
+        }
+        if request.plan.source_kind != DependencySourceKind::WorkspaceCommittedRlib
+            && self.committed_workspace_inputs.is_some()
+        {
+            return Err("committed producer capability belongs to a different class".into());
         }
         let shape = match request.plan.source_kind {
             DependencySourceKind::WorkspaceExecutionOnly => {
@@ -615,6 +635,15 @@ impl RemoteValidation {
             | DependencySourceKind::WorkspaceClosedMetadata => {
                 remote_closed_workspace_library_shape(&request.plan, &directories, &toolchain)
             }
+            DependencySourceKind::WorkspaceCommittedRlib => remote_committed_workspace_rlib_shape(
+                &request.plan,
+                &directories,
+                self.committed_workspace_inputs
+                    .as_ref()
+                    .ok_or("missing committed workspace input capability")?
+                    .dependencies(),
+                &toolchain,
+            ),
             _ => remote_dependency_shape(&request.plan, &directories, &toolchain),
         };
         shape.map_err(|error| error.to_string())?;
@@ -644,6 +673,25 @@ impl RemoteValidation {
         // authorize a compiler skip under the earlier input generation.
         let physical = request.io_plan()?;
         verify_package_generation(&request.package, &physical)
+    }
+
+    pub(super) fn committed_ancestors(
+        &self,
+        request: &LiveDependencyRequest,
+    ) -> Result<Vec<rabs_cas::publication::ProvisionalAncestorRef>, String> {
+        if request.plan.source_kind != DependencySourceKind::WorkspaceCommittedRlib {
+            return Ok(Vec::new());
+        }
+        let inputs = self
+            .committed_workspace_inputs
+            .as_ref()
+            .ok_or("committed workspace archive lost its producer capability")?;
+        inputs.verify(request)?;
+        let ancestors = inputs.ancestors();
+        if ancestors.is_empty() {
+            return Err("committed workspace archive has no producer ancestry".into());
+        }
+        Ok(ancestors)
     }
 }
 
@@ -692,6 +740,14 @@ fn verify_execution_policy(
                 );
             }
             remote_closed_workspace_library_isolation_policy(plan)
+        }
+        DependencySourceKind::WorkspaceCommittedRlib => {
+            if !is_committed_workspace_rlib_descriptor(&key.descriptor) {
+                return Err(
+                    "remote workspace descriptor differs from its committed archive class".into(),
+                );
+            }
+            remote_committed_workspace_rlib_isolation_policy(plan)
         }
         _ => remote_dependency_isolation_policy(plan),
     }
@@ -814,6 +870,7 @@ impl RemoteDependencies {
         build_script_output: Option<&[u8]>,
         argv: &[String],
         canonical: Option<&CanonicalPaths>,
+        committed_workspace_inputs: Option<Arc<CommittedWorkspaceInputs>>,
     ) -> Result<Option<(LiveDependencyKey, RemoteInvocation)>, String> {
         if plan.canonical_cargo != canonical.is_some() {
             return Err("remote canonical key requires its retained driver capability".into());
@@ -827,10 +884,23 @@ impl RemoteDependencies {
             canonical
                 .ok_or("closed workspace library requires its retained Cargo graph")?
                 .require_workspace_closed_library(plan)?;
+        } else if plan.source_kind == DependencySourceKind::WorkspaceCommittedRlib {
+            canonical
+                .ok_or("committed workspace archive requires its retained Cargo graph")?
+                .require_workspace_committed_rlib(plan)?;
+            committed_workspace_inputs
+                .as_ref()
+                .ok_or("committed workspace key requires its exact producer capability")?
+                .verify_original()?;
         } else if workspace {
             canonical
                 .ok_or("workspace execution requires its retained Cargo graph")?
                 .require_workspace_execution(plan)?;
+        }
+        if plan.source_kind != DependencySourceKind::WorkspaceCommittedRlib
+            && committed_workspace_inputs.is_some()
+        {
+            return Err("committed producer capability cannot qualify a different class".into());
         }
         if argv.first().map(String::as_str) != Some(plan.compiler.as_str()) {
             return Err("remote argv does not name the observed compiler".into());
@@ -850,6 +920,15 @@ impl RemoteDependencies {
             | DependencySourceKind::WorkspaceClosedMetadata => {
                 remote_closed_workspace_library_shape(plan, directories, &visible_root)
             }
+            DependencySourceKind::WorkspaceCommittedRlib => remote_committed_workspace_rlib_shape(
+                plan,
+                directories,
+                committed_workspace_inputs
+                    .as_ref()
+                    .ok_or("missing committed workspace input capability")?
+                    .dependencies(),
+                &visible_root,
+            ),
             _ => remote_dependency_shape(plan, directories, &visible_root),
         };
         shape.map_err(|error| error.to_string())?;
@@ -877,22 +956,41 @@ impl RemoteDependencies {
             Path::new(&physical.out_dir),
         )
         .map_err(|error| format!("edge runtime cohort: {error}"))?;
-        let key_builder = match plan.source_kind {
-            DependencySourceKind::WorkspaceExecutionOnly => remote_workspace_execution_key,
-            DependencySourceKind::WorkspaceClosedRlib
-            | DependencySourceKind::WorkspaceClosedMetadata => remote_closed_workspace_library_key,
-            _ => remote_dependency_key,
-        };
-        let key = key_builder(
-            plan,
-            toolchain,
-            directories,
-            inputs,
-            build_script_output,
-            &visible_root,
-            &retained.image().identity().sha256,
-            &runtime,
-        )
+        let key = if plan.source_kind == DependencySourceKind::WorkspaceCommittedRlib {
+            remote_committed_workspace_rlib_key(
+                plan,
+                toolchain,
+                directories,
+                committed_workspace_inputs
+                    .as_ref()
+                    .ok_or("missing committed workspace input capability")?
+                    .dependencies(),
+                inputs,
+                build_script_output,
+                &visible_root,
+                &retained.image().identity().sha256,
+                &runtime,
+            )
+        } else {
+            let key_builder = match plan.source_kind {
+                DependencySourceKind::WorkspaceExecutionOnly => remote_workspace_execution_key,
+                DependencySourceKind::WorkspaceClosedRlib
+                | DependencySourceKind::WorkspaceClosedMetadata => {
+                    remote_closed_workspace_library_key
+                }
+                _ => remote_dependency_key,
+            };
+            key_builder(
+                plan,
+                toolchain,
+                directories,
+                inputs,
+                build_script_output,
+                &visible_root,
+                &retained.image().identity().sha256,
+                &runtime,
+            )
+        }
         .map_err(|error| error.to_string())?;
         let runtime_bytes: [u8; 32] = runtime
             .bytes
@@ -987,6 +1085,7 @@ impl RemoteDependencies {
             execution_mode: context.execution_mode(),
             canonical_cargo: context.canonical_cargo(),
             action_key: key.action_key.clone(),
+            committed_workspace_inputs,
         };
         Ok(Some((
             key,
@@ -2079,6 +2178,7 @@ impl PendingRemoteInstall {
         } else {
             None
         };
+        let published = matches!(&self.result, RemoteInstallAuthority::Published);
         let mut metadata_exposed = false;
         let mut notify = |files: &[PathBuf]| -> Result<(), String> {
             // The complete reserved head is already visible, even if an
@@ -2088,6 +2188,15 @@ impl PendingRemoteInstall {
             verify_metadata_head(plan, &self.output.manifest, files)?;
             self.validation.verify(request)?;
             verify_request(request)?;
+            if published {
+                super::remember_committed_metadata(
+                    &self.coord,
+                    request,
+                    &self.output.manifest,
+                    &self.output.manifest_key,
+                    files,
+                )?;
+            }
             let callback = metadata_ready.as_mut().ok_or("missing metadata receiver")?;
             callback(&transcript[..prefix_len.ok_or("missing metadata prefix")?])
         };
@@ -2175,6 +2284,17 @@ impl PendingRemoteInstall {
                         .to_vec(),
                     installed,
                 );
+                if published
+                    && let Err(reason) = super::remember_committed_installation(
+                        &self.coord,
+                        request,
+                        &self.output.manifest,
+                        &self.output.manifest_key,
+                        &result,
+                    )
+                {
+                    return install_fault(reason, metadata_exposed);
+                }
                 match result {
                     InstallResult::Fault(reason) => install_fault(reason, metadata_exposed),
                     result => result,

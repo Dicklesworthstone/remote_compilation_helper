@@ -209,6 +209,29 @@ pub fn validate_closed_workspace_library_plan(
     Ok(class)
 }
 
+/// Invocation boundary for dependency-bearing archives only. Callers separately
+/// require their exact class, candidate closure and committed producer authority.
+pub(super) fn validate_pure_workspace_rlib(plan: &DependencyActionPlan) -> Result<(), LiveRefusal> {
+    workspace_layout(plan)?;
+    if !matches!(plan.invocation.crate_types.as_slice(), [kind] if matches!(kind.as_str(), "lib" | "rlib"))
+        || plan
+            .invocation
+            .passthrough
+            .iter()
+            .any(|arg| arg == "--test")
+        || plan.generated_root.is_some()
+        || !plan.native_roots.is_empty()
+        || !plan.invocation.native_libs.is_empty()
+        || remote::remote_dependency_output_class(&plan.invocation)
+            != Ok(RemoteDependencyOutputClass::Rlib)
+    {
+        return Err(LiveRefusal::Facts(
+            "workspace cache admits only closed pure Rust library archives without generated or native inputs".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Mechanical preparation admission for the closed leaf-library classes.
 /// Empty search inventories are semantic negative inputs: an implicit crate
 /// candidate must not sneak a procedural macro or uncommitted producer into

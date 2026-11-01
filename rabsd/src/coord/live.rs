@@ -27,7 +27,10 @@
 mod metadata_replay;
 mod output_install;
 mod request_owned_install;
+mod workspace_ancestors;
 pub(super) use request_owned_install::RequestOwnedInstallError;
+#[cfg(all(test, unix))]
+pub(crate) use workspace_ancestors::tests::WorkspaceLineageFixture;
 #[cfg(test)]
 mod produced_result_tests;
 
@@ -146,6 +149,9 @@ pub enum CommitRefusal {
     Offer(OfferRefusal),
     /// A store error surfaced outside `process_offer`.
     Store(String),
+    /// A committed-only workspace input no longer has exact, live producer
+    /// authority. This offer was not published.
+    CommittedDependency(String),
 }
 
 /// Why the live coordinator did not grant or renew a worker-bound
@@ -214,6 +220,9 @@ impl std::fmt::Display for CommitRefusal {
             Self::StoreUnavailable => write!(f, "store lock poisoned"),
             Self::Offer(refusal) => write!(f, "offer refused: {refusal:?}"),
             Self::Store(error) => write!(f, "store error: {error}"),
+            Self::CommittedDependency(reason) => {
+                write!(f, "committed workspace dependency refused: {reason}")
+            }
             Self::StaleAuthority {
                 offered_term,
                 active_term,
@@ -241,6 +250,9 @@ pub enum ReplayRefusal {
     FreshVerificationRequired,
     /// The existing class/evidence/sampling policy requires private execution.
     Sampling(PrivateExecutionReason),
+    /// A workspace result's committed producer closure is unavailable or has
+    /// been revoked. This is not permission to reuse the consumer's old bytes.
+    CommittedDependency(String),
 }
 
 /// The answer to a serve request that is not a fault.
@@ -458,6 +470,7 @@ const LIVE_CLASS_RECEIPT: &str = "rabs-live-action-class-v1";
 const LIVE_DEPENDENCY_CLASS: &str = "rustc-dependency-compile";
 const LIVE_WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-closed-rlib-v1";
 const LIVE_WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-closed-metadata-v1";
+const LIVE_COMMITTED_WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-committed-rlib-v1";
 const LIVE_PRIVATE_CLASS: &str = "private-only";
 
 // This is an additional floor, not a replacement for the stored serving policy.
@@ -485,6 +498,10 @@ fn record_descriptor_class(
         == rabs_protocol::descriptor::ActionClass::RustcDependencyCompile
     {
         LIVE_DEPENDENCY_CLASS
+    } else if rabs_key::live_dependency::workspace_dependency_cache::is_committed_workspace_rlib_descriptor(
+        descriptor,
+    ) {
+        LIVE_COMMITTED_WORKSPACE_RLIB_CLASS
     } else {
         match closed_workspace_library_descriptor_class(descriptor) {
             Some(ClosedWorkspaceLibraryClass::Rlib) => LIVE_WORKSPACE_RLIB_CLASS,
@@ -526,6 +543,9 @@ fn recorded_action_risk(
             }
             [SqlValue::Text(class)] if class == LIVE_WORKSPACE_METADATA_CLASS => {
                 Ok(ActionClassRisk::ClosedWorkspaceMetadata)
+            }
+            [SqlValue::Text(class)] if class == LIVE_COMMITTED_WORKSPACE_RLIB_CLASS => {
+                Ok(ActionClassRisk::CommittedWorkspaceRlib)
             }
             [SqlValue::Text(_)] => Ok(ActionClassRisk::Elevated),
             _ => Err(StoreError::Backend(
@@ -4120,11 +4140,25 @@ impl CoordLive {
             .lock()
             .map_err(|_| CommitRefusal::StoreUnavailable)?;
 
+        // H028 proves exact committed objects, but deliberately permits
+        // explicit provisional adoption. The committed-only workspace class
+        // has a narrower contract and also inherits current producer vetoes.
+        // Check it under this same publication lock; neither a retained edge
+        // witness nor a previously successful lookup can authorize this offer.
+        workspace_ancestors::check_offer(
+            &mut *store,
+            offer,
+            workspace_ancestors::now_micros(),
+            0,
+            &|| self.lease_now_ms(),
+        )
+        .map_err(CommitRefusal::CommittedDependency)?;
+
         // Retain this action's pre-offer baseline for comparison feedback.
         // Producers are resolved on demand by the SAME admission walk below,
-        // after its fences, through the already-held store. No second graph
-        // walk, eager manifest map, nested metadata lock, or daemon-lifetime
-        // cache of producer state is needed.
+        // after its fences, through the already-held store. No eager manifest
+        // map, nested metadata lock, or daemon-lifetime cache of producer state
+        // can substitute for the publication engine's own lineage validation.
         let committed_key = store
             .published_manifest_key(&offer.manifest.action_key)
             .map_err(|e| CommitRefusal::Store(format!("{e:?}")))?;
@@ -4405,6 +4439,13 @@ impl CoordLive {
             // A corrupt publication pointer must not substitute another
             // action's otherwise valid, content-addressed output manifest.
             return Ok(ServeOutcome::ManifestUnavailable { key: manifest_key });
+        }
+        if let Err(reason) =
+            workspace_ancestors::check_serving(&mut *store, action_key, now_unix_micros, now_epoch)
+        {
+            return Ok(ServeOutcome::ExecutePrivately(
+                ReplayRefusal::CommittedDependency(reason),
+            ));
         }
         if sampling.is_some()
             && live_replay_permit(&mut *store, action_key, &manifest_key)

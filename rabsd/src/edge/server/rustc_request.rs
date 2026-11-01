@@ -656,6 +656,7 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
     // A refusal keeps the original fresh workspace plan, before any action or
     // worker attempt exists. The captured full-workspace image is identical for
     // both profiles; its class label never supplies cache authority by itself.
+    let mut committed_workspace_inputs = None;
     if workspace_requested
         && let Some(paths) = &live.canonical
         && let Ok(candidate) =
@@ -669,6 +670,19 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
         .is_ok()
     {
         plan = candidate;
+    }
+    if workspace_requested
+        && plan.source_kind == rabs_key::live_dependency::DependencySourceKind::WorkspaceExecutionOnly
+        && let Some(paths) = &live.canonical
+        && let Ok(candidate) = rabs_key::live_dependency::workspace_dependency_cache::plan_committed_workspace_rlib(&plan)
+        && paths.require_workspace_committed_rlib(&candidate).is_ok()
+        && let Ok(committed) = live.lane.committed_workspace_inputs(paths, Arc::clone(&dependencies))
+        && rabs_key::live_dependency::workspace_dependency_cache::remote_committed_workspace_rlib_shape(
+            &candidate, &key_directories, committed.dependencies(), rabs_sandbox::layout::TOOLCHAIN,
+        ).is_ok()
+    {
+        plan = candidate;
+        committed_workspace_inputs = Some(committed);
     }
     let key_result = if workspace_requested {
         Err(rabs_key::live_dependency::LiveRefusal::Facts("workspace units require their independently isolated worker profile and cannot use local dependency cache authority".into()))
@@ -734,6 +748,7 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
                 package.build_script_output.as_deref(),
                 &parsed.argv,
                 live.canonical.as_deref(),
+                committed_workspace_inputs.clone(),
             ) {
                 Ok(Some((remote_key, invocation))) => {
                     Some((remote_key, Arc::clone(remote), invocation))

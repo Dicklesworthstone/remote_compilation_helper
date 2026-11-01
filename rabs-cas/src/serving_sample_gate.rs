@@ -68,6 +68,10 @@ pub enum ActionClassRisk {
     /// negotiated closed metadata namespace. Archive and dependency evidence
     /// cannot promote this separately qualified class.
     ClosedWorkspaceMetadata,
+    /// Complete-workspace archives whose entire retained Rust candidate set
+    /// comes from exact committed workspace producers. Separate class evidence
+    /// and transitive producer safety are required; dependency SPRT stays closed.
+    CommittedWorkspaceRlib,
     /// Anything else: general workspace outputs, tool-generated code, unknown
     /// classes. Never sampled.
     Elevated,
