@@ -375,6 +375,55 @@ impl CommittedWorkspaceInputs {
 }
 
 impl CanonicalPaths {
+    /// Recheck every registered producer at operation completion, including
+    /// Cargo Fresh outputs and builds that do not retain a private target.
+    /// This checks current publication standing, not optional seed eligibility:
+    /// a changed local file must not hide another producer's revoked ancestry.
+    /// No physical output lookup is needed, so the barrier remains valid after
+    /// the completed target moves to its independent output owner.
+    pub(crate) fn verify_completed_producers(
+        &self,
+        coordinator: &Arc<CoordLive>,
+        stopped: &dyn Fn() -> bool,
+    ) -> io::Result<()> {
+        checkpoint(stopped)?;
+        let authority = coordinator
+            .authority()
+            .ok_or_else(|| io::Error::other("completed target has no coordinator authority"))?;
+        let dependencies = {
+            let registered = self
+                .committed_outputs
+                .0
+                .lock()
+                .map_err(|_| io::Error::other("committed output registry poisoned"))?;
+            if registered
+                .values()
+                .any(|witness| witness.authority != authority)
+            {
+                return Err(io::Error::other(
+                    "completed target lost its original coordinator authority",
+                ));
+            }
+            registered
+                .values()
+                .map(|witness| witness.dependency.clone())
+                .collect::<Vec<_>>()
+        };
+        let verified = Self::verify_seed_producers(coordinator, &authority, &dependencies, stopped);
+        // Cancellation can arrive while the durable lineage check is running.
+        // Preserve its terminal Interrupted classification instead of turning
+        // it into an optional target-retention warning or a generic refusal.
+        checkpoint(stopped)?;
+        verified.map_err(|error| match error {
+            CommittedOutputExportError::CannotRetain(reason) => {
+                io::Error::new(io::ErrorKind::Interrupted, reason)
+            }
+            CommittedOutputExportError::InvalidProducer(reason) => io::Error::other(format!(
+                "completed target provenance is no longer valid: {reason}"
+            )),
+        })
+    }
+
     /// Capture only this operation's verified installed producers after Cargo
     /// and publication writers drain, while the coordinator is still live.
     /// Raw target files and local/request-owned results never enter this map.
@@ -1312,6 +1361,146 @@ mod tests {
     }
 
     #[test]
+    fn completed_producer_barrier_rejects_revocation_without_target_export() {
+        let fixture = WorkspaceLineageFixture::new();
+        let offer = fixture.commit_metadata_leaf(
+            80,
+            &[(
+                "libupstream.rmeta",
+                OutputRole::ProvisionalMetadata,
+                METADATA,
+            )],
+        );
+        let original = paths();
+        let installed = install_bytes(&original, &offer, "libupstream.rmeta", METADATA);
+        register(&original, &fixture, &offer, &[installed]).unwrap();
+        // No target-state owner or seed export is involved. Completion safety
+        // comes from the operation's actual installed producer witnesses.
+        original
+            .verify_completed_producers(&fixture.coord, &|| false)
+            .unwrap();
+        fixture.quarantine(&offer.manifest.action_key);
+        let error = original
+            .verify_completed_producers(&fixture.coord, &|| false)
+            .unwrap_err();
+        assert!(error.to_string().contains("completed target provenance"));
+    }
+
+    #[test]
+    fn completed_producer_barrier_rechecks_ancestry_after_copy_and_target_move() {
+        let fixture = WorkspaceLineageFixture::new();
+        let ancestor = fixture.commit_metadata_leaf(
+            81,
+            &[(
+                "libancestor.rmeta",
+                OutputRole::ProvisionalMetadata,
+                b"original ancestor metadata",
+            )],
+        );
+        let offer = fixture.prepare_metadata(
+            82,
+            vec![ProvisionalAncestorRef {
+                producer_action_key: ancestor.manifest.action_key.clone(),
+                role: OutputRole::ProvisionalMetadata,
+                virtual_path: RawBytes::from("libancestor.rmeta"),
+                consumed_object: ancestor.manifest.logical_outputs[0].object.clone(),
+            }],
+            &[(
+                "libupstream.rmeta",
+                OutputRole::ProvisionalMetadata,
+                METADATA,
+            )],
+        );
+        fixture.commit(&offer);
+        let original = paths();
+        let installed = install_bytes(&original, &offer, "libupstream.rmeta", METADATA);
+        let original_output = installed.path.clone();
+        register(&original, &fixture, &offer, &[installed]).unwrap();
+        let seeds = original
+            .export_committed_outputs(&fixture.coord, &|| false)
+            .unwrap();
+        assert_eq!(seeds.len(), 1);
+        let copied = paths();
+        std::fs::copy(
+            &original_output,
+            copied
+                .physical(&Path::new(OUTPUT).join("libupstream.rmeta"))
+                .unwrap(),
+        )
+        .unwrap();
+        seeds
+            .verify_target(&copied.physical(Path::new(TARGET_ROOT)).unwrap(), &|| false)
+            .unwrap();
+        let original_target = original.physical(Path::new(TARGET_ROOT)).unwrap();
+        std::fs::rename(
+            &original_target,
+            original._owner.path().join("completed-target"),
+        )
+        .unwrap();
+        assert!(!original_target.exists());
+        original
+            .verify_completed_producers(&fixture.coord, &|| false)
+            .expect("moving a completed tree does not change its registered producer identities");
+        // The export and actual copied bytes were both valid. A later upstream
+        // quarantine must still prevent completion, even though the immediate
+        // producer and its copied artifact are unchanged.
+        fixture.quarantine(&ancestor.manifest.action_key);
+        assert!(
+            original
+                .verify_completed_producers(&fixture.coord, &|| false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn completed_producer_barrier_preserves_cancellation_and_original_authority() {
+        let fixture = WorkspaceLineageFixture::new();
+        let offer = fixture.commit_metadata_leaf(
+            83,
+            &[(
+                "libupstream.rmeta",
+                OutputRole::ProvisionalMetadata,
+                METADATA,
+            )],
+        );
+        let original = paths();
+        let installed = install_bytes(&original, &offer, "libupstream.rmeta", METADATA);
+        register(&original, &fixture, &offer, &[installed]).unwrap();
+        original
+            .verify_completed_producers(&fixture.coord, &|| false)
+            .unwrap();
+        let stopped = std::sync::atomic::AtomicBool::new(true);
+        assert_eq!(
+            original
+                .verify_completed_producers(&fixture.coord, &|| {
+                    stopped.load(std::sync::atomic::Ordering::Acquire)
+                })
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert!(stopped.load(std::sync::atomic::Ordering::Acquire));
+        fixture.coord.mark_down();
+        assert!(
+            original
+                .verify_completed_producers(&fixture.coord, &|| false)
+                .is_err()
+        );
+        fixture.coord.mark_up();
+        original
+            .verify_completed_producers(&fixture.coord, &|| false)
+            .unwrap();
+        fixture
+            .coord
+            .acquire_boot_authority("workspace-lineage-fixture")
+            .unwrap();
+        let error = original
+            .verify_completed_producers(&fixture.coord, &|| false)
+            .unwrap_err();
+        assert!(error.to_string().contains("original coordinator authority"));
+    }
+
+    #[test]
     fn target_export_refuses_changed_generations_and_never_discovers_unregistered_producers() {
         let fixture = WorkspaceLineageFixture::new();
         let offer = fixture.commit_metadata_leaf(
@@ -1389,7 +1578,20 @@ mod tests {
         let installed = install_bytes(&original, &fresh, "libupstream.rmeta", METADATA);
         register(&original, &fixture, &fresh, &[installed]).unwrap();
         std::fs::write(&changed_path, b"a locally replaced output").unwrap();
+        assert!(matches!(
+            original.export_committed_outputs(&fixture.coord, &|| false),
+            Err(CommittedOutputExportError::CannotRetain(_))
+        ));
+        original
+            .verify_completed_producers(&fixture.coord, &|| false)
+            .expect("a local replacement alone can prevent retention without revoking producers");
         fixture.quarantine(&fresh.manifest.action_key);
+        assert!(
+            original
+                .verify_completed_producers(&fixture.coord, &|| false)
+                .is_err(),
+            "an optional capture warning must not bypass completion's current producer check"
+        );
         assert!(
             matches!(
                 original.export_committed_outputs(&fixture.coord, &|| false),

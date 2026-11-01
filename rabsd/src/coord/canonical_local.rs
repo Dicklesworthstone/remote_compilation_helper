@@ -1509,10 +1509,24 @@ fn run_operation(
             )
         }
     };
-    let controller = Arc::new(ShutdownController::new());
-    if shared.is_none() {
-        controller.listen_for_signals();
-    }
+    // The edge must drain before target capture, but current producer standing
+    // must still be checked after that potentially lengthy copy. Give the
+    // standalone coordinator its own lifetime, just as a shared service does.
+    // Its signal listener remains active through capture and final delivery;
+    // an unexpected coordinator exit still cancels the operation.
+    let standalone_coordinator = shared
+        .is_none()
+        .then(|| {
+            let controller = Arc::new(ShutdownController::new());
+            controller.listen_for_signals();
+            ServerOwner::start_operation(
+                None,
+                Some(Arc::clone(&coord)),
+                Arc::clone(&stopped),
+                controller,
+            )
+        })
+        .transpose()?;
     let activity = CanonicalActivity::new();
     let config = EdgeServerConfig {
         socket_path: socket.clone(),
@@ -1539,10 +1553,10 @@ fn run_operation(
         None => canonical_edge_work(config, Arc::clone(&paths), Arc::clone(&activity)),
     };
     let server = ServerOwner::start_operation(
-        edge,
-        shared.is_none().then(|| Arc::clone(&coord)),
+        Some(edge),
+        None,
         Arc::clone(&stopped),
-        controller,
+        Arc::new(ShutdownController::new()),
     )?;
     wait_ready(&server, &socket, &coord, &stopped)?;
     // A private target clone can make Cargo skip an unchanged producer. Restore
@@ -1619,81 +1633,106 @@ fn run_operation(
                     CompilationCommand::Test | CompilationCommand::Run | CompilationCommand::Bench
                 ) && compiled.status.code().is_some())
         });
-    // Export after the last publication, while its current authority is still
-    // alive. Nonshared server shutdown retires that authority. Persistence
-    // below still requires a clean shutdown and a verified private tree copy.
+    // Export after the last publication. The coordinator remains live through
+    // capture and completion; this historical seed inventory is not a final
+    // producer-safety decision. Persistence still requires a clean edge drain
+    // and a verified private tree copy.
     let target_provenance = (retain_target && publication_drain.is_ok())
         .then(|| paths.export_committed_outputs(&coord, &cancelled));
     let shutdown = server.finish();
     let compiled = result?;
     publication_drain.map_err(io::Error::other)?;
     let receipt = shutdown?;
+    // Always join the standalone authority and retain its real shutdown receipt,
+    // even when capture or the final producer barrier refuses this operation.
+    let completion = (|| -> io::Result<Option<PathBuf>> {
+        require(
+            receipt.clean(),
+            "canonical operation edge did not drain cleanly",
+        )?;
+        // The operator-owned image is mounted read-only in the build, but a
+        // host mutation must still invalidate this operation before publication
+        // or delivery. Do not substitute the mutable toolchain source.
+        preparation.checkpoint()?;
+        if let Some(retained) = &retained_toolchain {
+            retained.image().verify_retained_generation(cancelled)?;
+        }
+        if let Some(Err(CommittedOutputExportError::InvalidProducer(reason))) = &target_provenance {
+            return Err(io::Error::other(format!(
+                "completed target provenance is no longer valid: {reason}"
+            )));
+        }
+        if !streamed {
+            output.replay(&compiled)?;
+        }
+        if let (Some(cache), Some(provenance)) = (&target_state, target_provenance) {
+            // Compiler, session and publication writers are gone. The separate
+            // coordinator remains live only for current safety checks. A normal
+            // program/harness failure can retain compiled artifacts too; Cargo
+            // and the requested bodies execute again, with no saved outcome.
+            let capture = || -> io::Result<()> {
+                // An export failure must preserve the old seed. Capturing with
+                // an empty inventory would erase known Fresh provenance.
+                let provenance = provenance.map_err(io::Error::other)?;
+                let _cache_guard = shared
+                    .as_ref()
+                    .map(|runtime| {
+                        acquire_target_cache_lock(&runtime.target_cache_lock, &cancelled)
+                    })
+                    .transpose()?;
+                preparation.checkpoint()?;
+                cache.capture(&target_root, &provenance)
+            };
+            if let Err(error) = capture() {
+                if error.kind() == io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+                output.warning("capture", &error)?;
+            }
+        }
+        // This barrier is mandatory even with target retention disabled or an
+        // optional capture warning. Another service root can revoke a known
+        // producer while this root waits, copies or hashes its private target.
+        paths.verify_completed_producers(&coord, &cancelled)?;
+        let delivered = if compiled.status.success()
+            && (profile.command == CompilationCommand::Build || profile.no_run())
+        {
+            require(
+                paths
+                    .physical(Path::new(TARGET))
+                    .map_err(io::Error::other)?
+                    == target_root,
+                "completed target differs from its retained canonical mount",
+            )?;
+            Some(retain_build_target(&profile.operation_root, &target_root)?)
+        } else {
+            None
+        };
+        // The rename's fsync can block too. Producer checks use the original
+        // registered identities, not the now-moved target's physical paths.
+        paths.verify_completed_producers(&coord, &cancelled)?;
+        Ok(delivered)
+    })();
+    let coordinator_shutdown = standalone_coordinator
+        .map(ServerOwner::finish)
+        .transpose()?;
+    let receipt = match coordinator_shutdown {
+        Some(coordinator_receipt) => merge_shutdown_receipts(receipt, coordinator_receipt),
+        None => receipt,
+    };
+    output.line(&receipt.to_json_line())?;
     require(
         receipt.clean(),
         "canonical coordinator did not drain cleanly",
     )?;
-    // The operator-owned image is mounted read-only in the build, but a host
-    // mutation must still invalidate this operation before target publication
-    // or delivery. Do not substitute the now-current mutable toolchain source.
+    let delivered = completion?;
     preparation.checkpoint()?;
-    if let Some(retained) = &retained_toolchain {
-        retained.image().verify_retained_generation(cancelled)?;
+    if shared.is_some() {
+        // Shared publication writers outlive this operation, including receipt
+        // I/O above. Standalone writers have cleanly joined under StateOwner.
+        paths.verify_completed_producers(&coord, &cancelled)?;
     }
-    if let Some(Err(CommittedOutputExportError::InvalidProducer(reason))) = &target_provenance {
-        // Cargo may have used a retained output without invoking its compiler
-        // wrapper at all. Revocation discovered at the final live boundary
-        // therefore fails this operation, even when every unit was Fresh.
-        return Err(io::Error::other(format!(
-            "completed target provenance is no longer valid: {reason}"
-        )));
-    }
-    if !streamed {
-        output.replay(&compiled)?;
-    }
-    output.line(&receipt.to_json_line())?;
-    if let (Some(cache), Some(provenance)) = (&target_state, target_provenance) {
-        // Retain state only after compiler, session, publication and coordinator
-        // drain. Delivered files remain independent of this saved generation.
-        // A normal program/harness failure can retain compiled artifacts too.
-        // Cargo and the requested bodies execute again; no outcome is saved.
-        let capture = || -> io::Result<()> {
-            // An export failure must preserve the old seed. Capturing with an
-            // empty inventory would erase known provenance and allow later
-            // Cargo Fresh reuse to bypass its current publication checks.
-            let provenance = provenance.map_err(io::Error::other)?;
-            let _cache_guard = shared
-                .as_ref()
-                .map(|runtime| acquire_target_cache_lock(&runtime.target_cache_lock, &cancelled))
-                .transpose()?;
-            preparation.checkpoint()?;
-            cache.capture(&target_root, &provenance)
-        };
-        if let Err(error) = capture() {
-            if error.kind() == io::ErrorKind::Interrupted {
-                return Err(error);
-            }
-            output.warning("capture", &error)?;
-        }
-    }
-    // Capture stops with its owner. If cancellation arrived just after its
-    // atomic publication, preserve the valid seed but never deliver outputs
-    // to a cancelled caller or one that lost coordinator authority.
-    preparation.checkpoint()?;
-    if compiled.status.success()
-        && (profile.command == CompilationCommand::Build || profile.no_run())
-    {
-        // No Cargo process, wrapper session or materializer remains. Verify
-        // the retained target mapping once more before moving its completed
-        // tree to a fresh private output owner. Captured source, toolchain,
-        // credentials and control sockets stay with the temporary operation.
-        require(
-            paths
-                .physical(Path::new(TARGET))
-                .map_err(io::Error::other)?
-                == target_root,
-            "completed target differs from its retained canonical mount",
-        )?;
-        let delivered = retain_build_target(&profile.operation_root, &target_root)?;
+    if let Some(delivered) = delivered {
         output.event(
             json!({"kind":"canonical-build-completed", "version":PROFILE_VERSION,
                 "command":profile.command.as_str(), "tests_executed":false,
@@ -2083,7 +2122,7 @@ struct ServerOwner {
 }
 impl ServerOwner {
     fn start_operation(
-        edge: SubsystemWork,
+        edge: Option<SubsystemWork>,
         coordinator: Option<Arc<CoordLive>>,
         stopped: Arc<AtomicBool>,
         controller: Arc<ShutdownController>,
@@ -2095,12 +2134,14 @@ impl ServerOwner {
         // the caller; the cancellation flag is never reset.
         let normal_shutdown = Arc::new(AtomicBool::new(false));
         let options = DaemonRunOptions {
-            edge_work: Some(stop_on_unexpected_exit(
-                edge,
-                Arc::clone(&stopped),
-                Arc::clone(&controller),
-                Arc::clone(&normal_shutdown),
-            )),
+            edge_work: edge.map(|edge| {
+                stop_on_unexpected_exit(
+                    edge,
+                    Arc::clone(&stopped),
+                    Arc::clone(&controller),
+                    Arc::clone(&normal_shutdown),
+                )
+            }),
             coord_work: coordinator.map(|coord| {
                 stop_on_unexpected_exit(
                     coordinator_work(coord),
@@ -2139,6 +2180,21 @@ impl ServerOwner {
             .map_err(io::Error::other)
     }
 }
+
+/// Preserve both owners' actual subsystem outcomes in the operation's existing
+/// single receipt. Timings are aggregate measured durations; cleanliness still
+/// comes only from the runtime's recorded obligation outcomes.
+fn merge_shutdown_receipts(
+    mut edge: ShutdownReceipt,
+    coordinator: ShutdownReceipt,
+) -> ShutdownReceipt {
+    edge.subsystems.extend(coordinator.subsystems);
+    edge.boot_ms = edge.boot_ms.saturating_add(coordinator.boot_ms);
+    edge.shutdown_ms = edge.shutdown_ms.saturating_add(coordinator.shutdown_ms);
+    edge.recovered_from_unclean |= coordinator.recovered_from_unclean;
+    edge
+}
+
 impl Drop for ServerOwner {
     fn drop(&mut self) {
         self.request_shutdown();
@@ -3182,7 +3238,8 @@ mod tests {
         let controller = Arc::new(ShutdownController::new());
         let edge: SubsystemWork = Box::new(|_, _| Box::pin(async { Ok(()) }));
         let server =
-            ServerOwner::start_operation(edge, None, Arc::clone(&stopped), controller).unwrap();
+            ServerOwner::start_operation(Some(edge), None, Arc::clone(&stopped), controller)
+                .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !stopped.load(Ordering::Acquire) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
@@ -3204,7 +3261,8 @@ mod tests {
             })
         });
         let server =
-            ServerOwner::start_operation(edge, None, Arc::clone(&stopped), controller).unwrap();
+            ServerOwner::start_operation(Some(edge), None, Arc::clone(&stopped), controller)
+                .unwrap();
         started.recv_timeout(Duration::from_secs(5)).unwrap();
         stopped.store(true, Ordering::Release);
         assert!(server.finish().unwrap().clean());
@@ -3287,6 +3345,13 @@ mod tests {
         let socket = owner.path().join("home/rustc.sock");
         let stopped = Arc::new(AtomicBool::new(false));
         let controller = Arc::new(ShutdownController::new());
+        let coordinator = ServerOwner::start_operation(
+            None,
+            Some(Arc::clone(&coord)),
+            Arc::clone(&stopped),
+            controller,
+        )
+        .unwrap();
         let activity = CanonicalActivity::new();
         let edge = canonical_edge_work(
             EdgeServerConfig {
@@ -3296,17 +3361,18 @@ mod tests {
                 prepared_operations: None,
                 live_dependency: Some(LiveDependencyLane::new(coord.clone())),
             },
-            paths,
+            Arc::clone(&paths),
             Arc::clone(&activity),
         );
         let server = ServerOwner::start_operation(
-            edge,
-            Some(Arc::clone(&coord)),
+            Some(edge),
+            None,
             Arc::clone(&stopped),
-            controller,
+            Arc::new(ShutdownController::new()),
         )
         .unwrap();
         wait_ready(&server, &socket, &coord, &stopped).unwrap();
+        let authority = coord.authority().unwrap();
         let stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -3342,15 +3408,33 @@ mod tests {
         }
         // Leave the peer open deliberately. The embedded daemon must cancel
         // and join its own session before releasing socket/path ownership.
-        assert!(server.finish().unwrap().clean());
+        let edge_receipt = server.finish().unwrap();
+        assert!(edge_receipt.clean());
         assert!(!socket.exists());
         assert!(!stopped.load(Ordering::Acquire));
-        assert!(!coord.available());
+        assert!(coord.available());
+        assert_eq!(coord.authority().unwrap(), authority);
         assert_eq!(activity.active_sessions(), 0);
         let cancelled = || stopped.load(Ordering::Acquire);
         PreparationControl::new(&cancelled, None)
             .checkpoint()
-            .expect("clean standalone shutdown must allow target capture and final delivery");
+            .expect("clean edge shutdown must allow target capture under live authority");
+        paths
+            .verify_completed_producers(&coord, &cancelled)
+            .unwrap();
+        let coordinator_receipt = coordinator.finish().unwrap();
+        assert!(coordinator_receipt.clean());
+        assert!(!coord.available());
+        assert!(!stopped.load(Ordering::Acquire));
+        assert!(
+            paths
+                .verify_completed_producers(&coord, &cancelled)
+                .is_err()
+        );
+        let outcomes = edge_receipt.subsystems.len() + coordinator_receipt.subsystems.len();
+        let receipt = merge_shutdown_receipts(edge_receipt, coordinator_receipt);
+        assert!(receipt.clean());
+        assert_eq!(receipt.subsystems.len(), outcomes);
     }
 
     fn reuse_source(source: &[u8], manifest: &[u8], cache: Option<&[u8]>) -> SourceManifest {
