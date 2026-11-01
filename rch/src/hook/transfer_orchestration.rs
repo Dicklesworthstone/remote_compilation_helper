@@ -193,6 +193,20 @@ pub(super) fn ensure_remote_process_setup_after_completion(
     pipeline.ensure_remote_process_setup(result)
 }
 
+/// A fresh custom-target pipeline must retain the same source grant as the
+/// execution pipeline. Its size/header probes and rsync sender are activities
+/// too: cancellation must drain them and fence queued reads before releasing
+/// the target pool to another invocation.
+fn bind_retrieval_source_authority(
+    pipeline: TransferPipeline,
+    source_identity: Option<&str>,
+) -> anyhow::Result<TransferPipeline> {
+    match source_identity {
+        Some(identity) => pipeline.with_source_authority(identity.to_owned()),
+        None => Ok(pipeline),
+    }
+}
+
 /// A recovery request can interrupt collection, never execution. Keep the same
 /// session and authority guards outside this boundary across the one explicit
 /// retry, and wait for transport cancellation to reap its receiver first.
@@ -723,7 +737,6 @@ fn clean_overlay_execution_pipeline(
         .with_disk_source_root(source_root)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn admitted_execution_disk_budget(
     returned: Option<rch_common::BuildDiskBudget>,
     command: &str,
@@ -757,6 +770,7 @@ fn admitted_execution_disk_budget(
     Ok(budget)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_remote_compilation_inner(
     worker: &SelectedWorker,
     command: &str,
@@ -3068,6 +3082,8 @@ async fn execute_remote_compilation_inner(
                 .with_compilation_kind(kind)
                 .with_remote_path_override(remote_target_path.clone())
                 .with_worker_platform(WorkerPlatform::from_worker(&worker_config));
+                let target_pipeline =
+                    bind_retrieval_source_authority(target_pipeline, source_identity)?;
                 let target_pipeline = match recovery_session.as_ref() {
                     Some(session) => session.staging_pipeline("target", &target_pipeline)?,
                     None => target_pipeline,
@@ -3706,6 +3722,274 @@ mod tests {
     use super::foreign_artifact_gate_disabled_from_value;
     use super::{CleanOverlaySpec, clean_overlay_freshness_identity};
     use std::path::PathBuf;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn custom_target_retrieval_retains_exact_source_activity() {
+        use super::*;
+        use rch_common::ssh::OwnedProcessGroup;
+        use sha2::{Digest as _, Sha256};
+        use std::os::unix::fs::PermissionsExt;
+
+        const IDENTITY: &str = "a124a124a124a124a124a124a124a124";
+        const OTHER: &str = "b124b124b124b124b124b124b124b124";
+        const CHILD: &str = "RCH_CUSTOM_TARGET_ACTIVITY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let fixture = tempfile::Builder::new()
+                .disable_cleanup(true)
+                .tempdir()
+                .unwrap();
+            let rsync = rch_common::rsync_flavor::resolve_rsync(None).unwrap();
+            let ssh = fixture.path().join("ssh");
+            // The only transport substitution is SSH. Execute its remote
+            // command with real flock, shell and rsync, translating the
+            // worker's registry into this fixture's private filesystem.
+            std::fs::write(
+                &ssh,
+                r#"#!/usr/bin/env python3
+import os, sys, tempfile
+for index, arg in enumerate(sys.argv[1:], 1):
+    if arg in ("fixture.invalid", "worker@fixture.invalid"):
+        command = " ".join(sys.argv[index + 1:])
+        worker_registry = "/var/tmp/rch-source-authority-locks/claims-v1"
+        registry = os.environ["RCH_CUSTOM_TARGET_REGISTRY"]
+        command = command.replace(worker_registry, registry)
+        script = b""
+        if command == "sh -s":
+            # Header probes carry their authority wrapper on stdin. Only
+            # translate shell-script input; rsync's binary stream stays intact.
+            script = sys.stdin.buffer.read().replace(worker_registry.encode(), registry.encode())
+            payload = tempfile.TemporaryFile()
+            payload.write(script)
+            payload.seek(0)
+            os.dup2(payload.fileno(), 0)
+        identity = os.environ["RCH_CUSTOM_TARGET_IDENTITY"]
+        if identity in command or identity.encode() in script:
+            with open(os.environ["RCH_CUSTOM_TARGET_STARTED"], "a") as started:
+                started.write(str(os.getpid()) + "\n")
+        os.execvp("sh", ["sh", "-c", command])
+sys.exit(99)
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .arg("custom_target_retrieval_retains_exact_source_activity")
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env(CHILD, "1")
+                .env("RCH_MOCK_SSH", "0")
+                .env("RCH_CUSTOM_TARGET_ROOT", fixture.path())
+                .env(
+                    "RCH_CUSTOM_TARGET_REGISTRY",
+                    fixture.path().join("registry"),
+                )
+                .env("RCH_CUSTOM_TARGET_STARTED", fixture.path().join("started"))
+                .env("RCH_CUSTOM_TARGET_IDENTITY", IDENTITY)
+                .env("RCH_CUSTOM_TARGET_RSYNC", &rsync.path)
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        fixture.path().display(),
+                        std::env::var("PATH").unwrap()
+                    ),
+                )
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = OwnedProcessGroup::spawn(&mut command).unwrap();
+            let mut stdout = child.take_stdout().unwrap();
+            let mut stderr = child.take_stderr().unwrap();
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let (status, output, error) = tokio::time::timeout(Duration::from_secs(45), async {
+                tokio::join!(
+                    child.wait(),
+                    stdout.read_to_end(&mut out),
+                    stderr.read_to_end(&mut err)
+                )
+            })
+            .await
+            .expect("custom target activity fixture timed out");
+            output.unwrap();
+            error.unwrap();
+            assert!(
+                status.unwrap().success(),
+                "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&out),
+                String::from_utf8_lossy(&err)
+            );
+            return;
+        }
+
+        let root = PathBuf::from(std::env::var_os("RCH_CUSTOM_TARGET_ROOT").unwrap());
+        let registry = root.join("registry");
+        let source = root.join("worker-target");
+        let local = root.join("local-target");
+        let other_source = root.join("other-worker-target");
+        let other_local = root.join("other-local-target");
+        std::fs::create_dir_all(&registry).unwrap();
+        std::fs::create_dir_all(source.join("debug")).unwrap();
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::create_dir_all(other_source.join("debug")).unwrap();
+        std::fs::create_dir_all(&other_local).unwrap();
+        let bytes = b"exact output from the completed invocation\n";
+        let other_bytes = b"a different invocation's completed output\n";
+        std::fs::write(source.join("debug/tool"), bytes).unwrap();
+        std::fs::write(other_source.join("debug/tool"), other_bytes).unwrap();
+        let claim = format!("{}\n", source.display());
+        let digest = Sha256::digest(claim.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let other_claim = format!("{}\n", other_source.display());
+        let other_digest = Sha256::digest(other_claim.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let record = registry.join(format!("{IDENTITY}.{digest}.claim"));
+        let other_record = registry.join(format!("{OTHER}.{other_digest}.claim"));
+        std::fs::write(&other_record, &other_claim).unwrap();
+        let worker = WorkerConfig {
+            id: WorkerId::new("custom-target-activity"),
+            host: "fixture.invalid".into(),
+            user: "worker".into(),
+            identity_file: "/unused/test-key".into(),
+            total_slots: 1,
+            priority: 100,
+            tags: Vec::new(),
+            tools: Vec::new(),
+        };
+        let rsync = rch_common::rsync_flavor::resolve_rsync(Some(
+            &std::env::var("RCH_CUSTOM_TARGET_RSYNC").unwrap(),
+        ))
+        .unwrap();
+        let pipeline = |identity: Option<&str>, remote: &Path, destination: &Path| {
+            bind_retrieval_source_authority(
+                TransferPipeline::new(
+                    destination.to_owned(),
+                    "custom-target".into(),
+                    "custom-target".into(),
+                    TransferConfig {
+                        max_transfer_time_ms: Some(10_000),
+                        retrieval_min_free_bytes: 0,
+                        retry: rch_common::RetryConfig {
+                            max_attempts: 1,
+                            total_timeout_ms: 10_000,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                )
+                .with_rsync(rsync.clone())
+                .with_remote_path_override(remote.to_str().unwrap()),
+                identity,
+            )
+            .unwrap()
+        };
+        let patterns = vec!["debug/**".to_owned()];
+
+        // Another invocation's active grant cannot authorize this invocation's
+        // read. The old fresh custom-target pipeline downloads it anyway.
+        let absent = pipeline(Some(IDENTITY), &source, &local)
+            .retrieve_artifacts(&worker, &patterns)
+            .await;
+        assert!(
+            absent.is_err(),
+            "retrieval borrowed another invocation's grant"
+        );
+        assert!(!local.join("debug/tool").exists());
+        assert_eq!(std::fs::read_to_string(&other_record).unwrap(), other_claim);
+
+        std::fs::write(&record, &claim).unwrap();
+        let activity = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(registry.join(format!("{IDENTITY}.activity.lock")))
+            .unwrap();
+        activity.lock().unwrap();
+        let started = root.join("started");
+        let previous = std::fs::read_to_string(&started)
+            .map(|text| text.lines().count())
+            .unwrap_or(0);
+        let queued_pipeline = pipeline(Some(IDENTITY), &source, &local);
+        let queued_worker = worker.clone();
+        let queued_patterns = patterns.clone();
+        let mut queued = tokio::spawn(async move {
+            queued_pipeline
+                .retrieve_artifacts(&queued_worker, &queued_patterns)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let entered = std::fs::read_to_string(&started)
+                    .map(|text| text.lines().count())
+                    .unwrap_or(0);
+                if entered > previous {
+                    break;
+                }
+                tokio::select! {
+                    result = &mut queued => panic!("retrieval bypassed its activity lock: {result:?}"),
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {},
+                }
+            }
+        })
+        .await
+        .expect("retrieval never reached its remote activity admission");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut queued)
+                .await
+                .is_err(),
+            "retrieval crossed a held activity lock"
+        );
+
+        // An unrelated admitted reader can still inspect and collect its
+        // exact bytes while this invocation's activity is blocked.
+        let other = pipeline(Some(OTHER), &other_source, &other_local);
+        let headers = other
+            .artifact_header_probe(&worker, &patterns, |path| path == "debug/tool")
+            .await
+            .unwrap();
+        assert_eq!(
+            headers,
+            vec![("debug/tool".to_owned(), other_bytes.to_vec())]
+        );
+        other.retrieve_artifacts(&worker, &patterns).await.unwrap();
+        assert_eq!(
+            std::fs::read(other_local.join("debug/tool")).unwrap(),
+            other_bytes
+        );
+        assert!(!local.join("debug/tool").exists());
+
+        // Cancellation can arrive while a transport is queued. It must be
+        // rechecked AFTER acquiring the exact activity lock, before reading
+        // the target pool, including the dry-run size probe.
+        std::fs::write(
+            registry.join(format!("{IDENTITY}.{digest}.cancelling")),
+            &claim,
+        )
+        .unwrap();
+        drop(activity);
+        let cancelled = tokio::time::timeout(Duration::from_secs(5), queued)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            cancelled.is_err(),
+            "queued cancelled retrieval read the pool"
+        );
+        assert!(!local.join("debug/tool").exists());
+        assert_eq!(
+            std::fs::read(other_local.join("debug/tool")).unwrap(),
+            other_bytes
+        );
+        assert_eq!(std::fs::read_to_string(&record).unwrap(), claim);
+        assert_eq!(std::fs::read_to_string(&other_record).unwrap(), other_claim);
+    }
 
     #[cfg(unix)]
     #[tokio::test]
