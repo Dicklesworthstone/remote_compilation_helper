@@ -414,6 +414,10 @@ pub enum DependencySourceKind {
     /// Closed canonical workspace archive whose entire retained Rust candidate
     /// inventory comes from verified, already committed workspace producers.
     WorkspaceCommittedRlib,
+    /// Closed canonical workspace metadata whose entire retained Rust candidate
+    /// inventory comes from verified, already committed workspace producers.
+    /// Its strict metadata namespace and serving class are distinct from archives.
+    WorkspaceCommittedMetadata,
 }
 
 impl DependencySourceKind {
@@ -428,6 +432,7 @@ impl DependencySourceKind {
             Self::WorkspaceClosedRlib => "canonical-workspace-closed-rlib-v1",
             Self::WorkspaceClosedMetadata => "canonical-workspace-closed-metadata-v1",
             Self::WorkspaceCommittedRlib => "canonical-workspace-committed-rlib-v1",
+            Self::WorkspaceCommittedMetadata => "canonical-workspace-committed-metadata-v1",
         }
     }
 
@@ -441,6 +446,7 @@ impl DependencySourceKind {
                 | Self::WorkspaceClosedRlib
                 | Self::WorkspaceClosedMetadata
                 | Self::WorkspaceCommittedRlib
+                | Self::WorkspaceCommittedMetadata
         )
     }
 }
@@ -1485,6 +1491,7 @@ fn captured_action_key(
                             | DependencySourceKind::WorkspaceClosedRlib
                             | DependencySourceKind::WorkspaceClosedMetadata
                             | DependencySourceKind::WorkspaceCommittedRlib
+                            | DependencySourceKind::WorkspaceCommittedMetadata
                     )
                     && input.virtual_path.as_bytes()[root.len()..]
                         .split(|byte| *byte == b'/')
@@ -1548,7 +1555,8 @@ fn captured_action_key(
             DependencySourceKind::WorkspaceExecutionOnly
             | DependencySourceKind::WorkspaceClosedRlib
             | DependencySourceKind::WorkspaceClosedMetadata
-            | DependencySourceKind::WorkspaceCommittedRlib => {
+            | DependencySourceKind::WorkspaceCommittedRlib
+            | DependencySourceKind::WorkspaceCommittedMetadata => {
                 enc.str("complete-canonical-workspace-execution-tree-v1")
                     .str(plan.source_kind.as_str())
                     .str(&plan.source_root)
@@ -1638,6 +1646,9 @@ fn captured_action_key(
                 }
                 DependencySourceKind::WorkspaceCommittedRlib => {
                     workspace_dependency_cache::ISOLATION_PROFILE
+                }
+                DependencySourceKind::WorkspaceCommittedMetadata => {
+                    workspace_dependency_cache::METADATA_ISOLATION_PROFILE
                 }
             }
             .as_bytes(),
