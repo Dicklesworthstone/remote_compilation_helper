@@ -61,6 +61,10 @@ impl Fixture {
     }
 
     fn with_comparisons(comparisons: u128) -> Self {
+        Self::with_archive(comparisons, true)
+    }
+
+    fn with_archive(comparisons: u128, archive: bool) -> Self {
         let root = crate::test_util::private_tempdir();
         let cas = Arc::new(mount_and_reconcile(&root.path().join("cas")).unwrap());
         let coord = Arc::new(CoordLive::with_cas(Arc::clone(&cas)));
@@ -103,6 +107,11 @@ impl Fixture {
                 object: head,
             },
         ];
+        if !archive {
+            manifest
+                .logical_outputs
+                .retain(|output| output.role != OutputRole::Materializable);
+        }
         let declared: Vec<_> = manifest
             .logical_outputs
             .iter()
@@ -170,7 +179,7 @@ impl Fixture {
             &self.offer.manifest.action_key,
             &digest_key(&self.offer.manifest_id.0),
             destination,
-            &Self::expected(destination),
+            &self.expected(destination),
             now_micros(),
             callback,
         )
@@ -185,19 +194,25 @@ impl Fixture {
             &self.offer.manifest.action_key,
             &digest_key(&self.offer.manifest_id.0),
             destination,
-            &Self::expected(destination),
+            &self.expected(destination),
             now_micros(),
             callback,
         )
     }
 
-    fn expected(destination: &Path) -> ExpectedOutputs {
+    fn expected(&self, destination: &Path) -> ExpectedOutputs {
         ExpectedOutputs::WithDepInfo {
-            paths: BTreeSet::from([
-                "fixture.d".into(),
-                "libfixture.rmeta".into(),
-                "libfixture.rlib".into(),
-            ]),
+            paths: self
+                .offer
+                .manifest
+                .logical_outputs
+                .iter()
+                .map(|output| {
+                    std::str::from_utf8(output.virtual_path.as_bytes())
+                        .unwrap()
+                        .to_owned()
+                })
+                .collect(),
             mappings: vec![(
                 b"/__rabs/out".to_vec(),
                 destination.as_os_str().as_bytes().to_vec(),
@@ -311,6 +326,98 @@ fn metadata_delivery_is_sticky_across_receiver_authority_manifest_evidence_and_t
 #[test]
 fn published_producer_metadata_rechecks_gates_and_keeps_all_post_head_failures_sticky() {
     assert_delivery_faults(true);
+}
+
+#[test]
+fn changed_or_missing_metadata_head_after_ack_never_installs_a_tail_or_reports_success() {
+    for producer in [false, true] {
+        for archive in [false, true] {
+            for name in ["fixture.d", "libfixture.rmeta"] {
+                for missing in [false, true] {
+                    let fixture = Fixture::with_archive(if producer { 0 } else { 2 }, archive);
+                    let destination = fixture.root.path().join("changed-head");
+                    let head = vec![
+                        destination.join("libfixture.rmeta"),
+                        destination.join("fixture.d"),
+                    ];
+                    let changed = destination.join(name);
+                    let mut calls = 0;
+                    let mut ready = |files: &[PathBuf]| {
+                        calls += 1;
+                        assert_eq!(files, head);
+                        assert_eq!(std::fs::read(&head[0]).unwrap(), HEAD);
+                        assert_eq!(
+                            std::fs::read(&head[1]).unwrap(),
+                            format!("{}/libfixture.rmeta:\n", destination.display()).as_bytes()
+                        );
+                        assert!(fixture.cas.store().try_lock().is_ok());
+                        assert!(!destination.join("libfixture.rlib").exists());
+                        if missing {
+                            // Preserve the fixture bytes but remove their promised
+                            // destination, as another writer can do during ACK.
+                            std::fs::rename(&changed, changed.with_extension("displaced")).unwrap();
+                        } else {
+                            std::fs::write(&changed, b"changed while metadata ACK waited").unwrap();
+                        }
+                        Ok(())
+                    };
+                    let result = if producer {
+                        fixture.produce(&destination, Some(&mut ready))
+                    } else {
+                        fixture.install(&destination, Some(&mut ready))
+                    };
+                    assert_eq!(calls, 1);
+                    assert!(
+                        matches!(result, Err(ServeError::MetadataExposed { installed, reason })
+                            if installed == head && reason.contains(name)),
+                        "producer={producer}, archive={archive}, file={name}, missing={missing}"
+                    );
+                    assert!(!destination.join("libfixture.rlib").exists());
+                    if missing {
+                        assert!(!changed.exists());
+                    } else {
+                        assert_eq!(
+                            std::fs::read(&changed).unwrap(),
+                            b"changed while metadata ACK waited"
+                        );
+                    }
+                    assert_eq!(fixture.installs(), i64::from(!producer));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn unchanged_metadata_only_head_finishes_after_ack_without_an_archive_tail() {
+    for producer in [false, true] {
+        let fixture = Fixture::with_archive(if producer { 0 } else { 2 }, false);
+        let destination = fixture.root.path().join("metadata-only");
+        let head = vec![
+            destination.join("libfixture.rmeta"),
+            destination.join("fixture.d"),
+        ];
+        let mut calls = 0;
+        let mut ready = |files: &[PathBuf]| {
+            calls += 1;
+            assert_eq!(files, head);
+            assert!(fixture.cas.store().try_lock().is_ok());
+            Ok(())
+        };
+        let result = if producer {
+            fixture.produce(&destination, Some(&mut ready))
+        } else {
+            fixture.install(&destination, Some(&mut ready))
+        };
+        assert_eq!(calls, 1);
+        assert!(matches!(result, Ok(ServeOutcome::Served { files }) if files == head));
+        assert_eq!(std::fs::read(&head[0]).unwrap(), HEAD);
+        assert_eq!(
+            std::fs::read(&head[1]).unwrap(),
+            format!("{}/libfixture.rmeta:\n", destination.display()).as_bytes()
+        );
+        assert_eq!(fixture.installs(), i64::from(!producer));
+    }
 }
 
 fn assert_delivery_faults(producer: bool) {
