@@ -161,6 +161,27 @@ class InstallationVerificationTests(unittest.TestCase):
         self.assertIn("expected bytes", receipt["error"])
         self.assertEqual(snapshot(self.bin), before)
 
+    def test_collaborative_umask_install_verifies_but_writable_manifest_refuses(self):
+        previous_umask = os.umask(0o002)
+        try:
+            self.install()
+        finally:
+            os.umask(previous_umask)
+        manifest = self.bin / installer.CURRENT / "manifest.json"
+        self.assertEqual(stat.S_IMODE(manifest.stat().st_mode), 0o600)
+        before = snapshot(self.bin)
+        receipt = installer.verification_result(self.expected(), self.bin)
+        self.assertEqual(receipt["state"], "verified", receipt)
+        self.assertEqual(snapshot(self.bin), before)
+        self.assertFalse(self.marker.exists())
+
+        manifest.chmod(0o664)
+        before = snapshot(self.bin)
+        receipt = installer.verification_result(self.expected(), self.bin)
+        self.assertEqual(receipt["state"], "unverified", receipt)
+        self.assertIn("unsafe active generation manifest", receipt["error"])
+        self.assertEqual(snapshot(self.bin), before)
+
     def test_self_consistent_modified_manifest_is_not_expected_release_authority(self):
         self.install()
         active = self.bin / installer.CURRENT

@@ -348,6 +348,7 @@ def install(paths, bin_dir, machine):
             json.dump(manifest, writer, sort_keys=True, indent=2)
             writer.write("\n")
             writer.flush()
+            os.fchmod(writer.fileno(), 0o600)
             os.fsync(writer.fileno())
         generation_fd = os.open(generation, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
