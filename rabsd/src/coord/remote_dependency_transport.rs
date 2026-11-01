@@ -1,8 +1,9 @@
-//! One bounded authenticated worker connection for a live dependency action.
+//! Owned authenticated worker readiness and bounded live dependency delivery.
 //!
-//! Workers reconnect outward to the configured listener. A caller reserves the
-//! sole slot before offering remote execution, then moves the reservation to a
-//! dedicated blocking lane. TLS identity, challenge and durable boot admission
+//! A process-lifetime listener keeps an explicitly negotiated, TLS-pinned
+//! worker ready between requests. Idle readiness grants no execution authority.
+//! A caller reserves the sole slot before offering remote execution, then moves
+//! the reservation to a dedicated blocking lane. Challenge and durable boot admission
 //! precede its live-coordinator callback; a refused callback sends no inputs or
 //! execution request. The ordinary receiver verifies private delivery bytes.
 //! Publication, Cargo output installation and fallback remain with the caller.
@@ -13,15 +14,15 @@
 
 use super::secure_worker_delivery::{
     OperationCancellation, PinnedWorkerAdmission, WorkerAdmissionHook, parse_worker_pin,
-    receive_authenticated_continuation, receive_authenticated_with_admission,
 };
 use super::source_delivery::SourceUpload;
+#[cfg(test)]
+use super::worker_delivery::worker_transport_error;
 use super::worker_delivery::{
-    Delivery, DeliveryFailure, DeliveryMode, SealedResult, toolchain_transfer,
-    transport_interrupted, validate_request, worker_transport_error,
+    Delivery, DeliveryFailure, SealedResult, toolchain_transfer, transport_interrupted,
+    validate_request,
 };
-use asupersync::runtime::RuntimeBuilder;
-use rabs_asupersync::worker_transport::{TlsFiles, accept_peer};
+use rabs_asupersync::worker_transport::TlsFiles;
 use rabs_protocol::worker_fence::WorkerSessionOffer;
 use rabs_sandbox::dependency_context::{
     CANONICAL_DEPENDENCY_CONTEXT_VERSION, CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION,
@@ -38,6 +39,8 @@ use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
+mod standby;
+
 /// Includes both the outward reconnect and TLS handshake. The established ATP
 /// receiver separately bounds authentication, transfer, execution and cleanup.
 const CONNECT_BUDGET: Duration = Duration::from_secs(60);
@@ -45,7 +48,8 @@ const CONNECT_BUDGET: Duration = Duration::from_secs(60);
 /// A bounded placement hint, not an execution lease or a result quarantine.
 /// Failed workers otherwise consume another connection budget on every turn
 /// through the live pool. The next ordinary request may probe after this delay;
-/// no timer, background task or second dispatch is created here.
+/// no second dispatch is created here. Authenticated standby readiness clears
+/// this connectivity hint and wakes placement without granting an execution.
 const FIRST_CONNECTION_COOLDOWN: Duration = Duration::from_secs(5);
 const MAX_CONNECTION_COOLDOWN: Duration = Duration::from_secs(60);
 
@@ -118,7 +122,9 @@ pub struct RemoteDependencyTransport {
     state: PathBuf,
     tls: TlsFiles,
     occupied: AtomicBool,
-    cooldown: Mutex<ConnectionCooldown>,
+    stopped: AtomicBool,
+    cooldown: Arc<Mutex<ConnectionCooldown>>,
+    listener: Mutex<Option<Arc<standby::Listener>>>,
 }
 
 impl RemoteDependencyTransport {
@@ -162,7 +168,9 @@ impl RemoteDependencyTransport {
             state,
             tls,
             occupied: AtomicBool::new(false),
-            cooldown: Mutex::new(ConnectionCooldown::default()),
+            stopped: AtomicBool::new(false),
+            cooldown: Arc::new(Mutex::new(ConnectionCooldown::default())),
+            listener: Mutex::new(None),
         })
     }
 
@@ -203,6 +211,60 @@ impl RemoteDependencyTransport {
         &self.worker
     }
 
+    /// Bind once for the lifetime of the configured pool. The owner keeps its
+    /// native reactor and authenticated idle peer on one thread; no socket is
+    /// transferred between runtimes. A second start cannot replace that owner.
+    pub(crate) fn start_listener(
+        &self,
+        available: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> io::Result<()> {
+        let mut owner = self
+            .listener
+            .lock()
+            .map_err(|_| io::Error::other("remote listener owner poisoned"))?;
+        if self.stopped.load(Ordering::Acquire) {
+            return Err(cancelled());
+        }
+        if owner.is_some() {
+            return Ok(());
+        }
+        let cooldown = Arc::clone(&self.cooldown);
+        let ready = Arc::new(move || {
+            if let Ok(mut cooldown) = cooldown.lock() {
+                cooldown.completed();
+            }
+            if let Some(available) = &available {
+                available();
+            }
+        });
+        let listener = Arc::new(standby::Listener::start(
+            self.address,
+            self.worker.clone(),
+            self.pin,
+            self.tls.clone(),
+            ready,
+        )?);
+        if self.stopped.load(Ordering::Acquire) {
+            listener.shutdown()?;
+            return Err(cancelled());
+        }
+        *owner = Some(listener);
+        Ok(())
+    }
+
+    /// Seal admission, cancel pending/active transport work and join the owned
+    /// listener before its enclosing coordinator or retained state is released.
+    /// This is idempotent, but a stopped endpoint can never be started again.
+    pub(crate) fn shutdown(&self) -> io::Result<()> {
+        self.stopped.store(true, Ordering::Release);
+        let owner = self
+            .listener
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        owner.map_or(Ok(()), |owner| owner.shutdown())
+    }
+
     /// Reserve before telling Cargo's wrapper that remote work is admitted.
     /// There is no queue or sleeping waiter. The owned guard is `Send`, so the
     /// caller can hand it from the socket handler to a bounded blocking lane.
@@ -234,6 +296,9 @@ impl RemoteDependencyTransport {
     }
 
     fn try_reserve_at(self: &Arc<Self>, now: Instant) -> io::Result<RemoteDependencyReservation> {
+        if self.stopped.load(Ordering::Acquire) {
+            return Err(cancelled());
+        }
         self.occupied
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| {
@@ -251,6 +316,9 @@ impl RemoteDependencyTransport {
             dispatch_attempted: false,
             continuation: None,
         };
+        if self.stopped.load(Ordering::Acquire) {
+            return Err(cancelled());
+        }
         let cooldown = self.cooldown.try_lock().map_err(|_| {
             // Contended or poisoned local hints exclude only THIS candidate,
             // never strand the slot or abort selection of a healthy peer.
@@ -353,11 +421,13 @@ impl RemoteDependencyTransport {
                 }
             }
         }
-        let acceptor = self
-            .tls
-            .acceptor()
-            .map_err(io::Error::other)
-            .map_err(&before_dispatch)?;
+        self.start_listener(None).map_err(&before_dispatch)?;
+        let listener = self
+            .listener
+            .lock()
+            .map_err(|_| before_dispatch(io::Error::other("remote listener owner poisoned")))?
+            .clone()
+            .ok_or_else(|| before_dispatch(io::Error::other("remote listener owner missing")))?;
         // This exclusive store is transport identity fencing. The callback
         // below must separately admit the actual offer into the LIVE authority.
         let admission = match admission {
@@ -365,79 +435,30 @@ impl RemoteDependencyTransport {
             None => PinnedWorkerAdmission::open(&self.state, &self.worker, self.pin)
                 .map_err(&before_dispatch)?,
         };
-        let runtime = RuntimeBuilder::current_thread().build().map_err(|error| {
-            before_dispatch(io::Error::other(format!(
-                "remote dependency runtime: {error:?}"
-            )))
-        })?;
-        let peer = rabs_asupersync::daemon_runtime::block_on_top_level(&runtime, async {
-            let exchange = async {
-                let listener = asupersync::net::TcpListener::bind(self.address)
-                    .await
-                    .map_err(|error| {
-                        io::Error::new(
-                            error.kind(),
-                            format!("remote dependency TLS listen: {error}"),
-                        )
-                    })?;
-                let (stream, _) = listener.accept().await.map_err(worker_transport_error)?;
-                // The TLS boundary exposes authentication failures as text.
-                // Do not infer transport retry eligibility from that text.
-                accept_peer(&acceptor, stream)
-                    .await
-                    .map_err(io::Error::other)
-            };
-            until_cancelled(&cancellation, async {
-                let budget = connection_deadline
-                    .checked_duration_since(Instant::now())
-                    .filter(|remaining| !remaining.is_zero())
-                    .ok_or_else(|| {
-                        worker_transport_error(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "remote dependency worker connection deadline exceeded",
-                        ))
-                    })?;
-                asupersync::time::timeout(asupersync::time::wall_now(), budget, exchange)
-                    .await
-                    .map_err(|_| {
-                        worker_transport_error(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "remote dependency worker connection deadline exceeded",
-                        ))
-                    })?
-            })
-            .await
-        })
-        .map_err(&before_dispatch)?;
-
-        match operation {
+        let operation = match operation {
             ReservedOperation::Execute {
                 upload,
                 on_admitted,
-            } => receive_authenticated_with_admission(
-                &runtime,
-                peer,
-                admission,
-                request,
-                destination,
-                DeliveryMode::Execute,
-                Some(upload),
-                None,
-                cancellation,
-                None,
-                Some(on_admitted),
-            ),
-            ReservedOperation::Continue(sealed) => receive_authenticated_continuation(
-                &runtime,
-                peer,
-                admission,
-                request,
-                destination,
-                None,
-                cancellation,
-                *sealed,
-            ),
-        }
+            } => standby::Operation::Execute {
+                upload: Box::new(upload.clone()),
+                on_admitted,
+            },
+            ReservedOperation::Continue(sealed) => standby::Operation::Continue(sealed),
+        };
+        listener.deliver(standby::Assignment {
+            admission,
+            request: request.clone(),
+            destination: destination.to_path_buf(),
+            cancellation,
+            connection_deadline,
+            operation,
+        })
+    }
+}
+
+impl Drop for RemoteDependencyTransport {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
     }
 }
 
@@ -495,6 +516,9 @@ impl RemoteDependencyReservation {
     /// part of the decision lane. The persistent worker lock stays owned until
     /// execute finishes or this reservation is dropped.
     pub fn allocate_request_id(&mut self) -> io::Result<u64> {
+        if self.transport.stopped.load(Ordering::Acquire) {
+            return Err(cancelled());
+        }
         if self.dispatch_attempted {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -800,6 +824,28 @@ mod tests {
         thread.join().unwrap();
         drop(transport.try_reserve().unwrap());
         assert!(transport.try_reserve().is_ok());
+    }
+
+    #[test]
+    fn shutdown_seals_new_reservations_and_unstarted_admission() {
+        let transport = transport();
+        let mut reserved = transport.try_reserve().unwrap();
+        transport.shutdown().unwrap();
+        transport.shutdown().unwrap();
+        assert_eq!(
+            reserved.allocate_request_id().unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert!(reserved.admission.is_none());
+        drop(reserved);
+        assert_eq!(
+            transport.try_reserve().unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(
+            transport.start_listener(None).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
     }
 
     #[test]

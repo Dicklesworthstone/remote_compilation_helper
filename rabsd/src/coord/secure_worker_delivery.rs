@@ -31,13 +31,17 @@ use rabs_protocol::identity_store::{IdentityStore, TransportIdentity, TrustScope
 use rabs_protocol::version_negotiation::{VersionHello, VersionRange};
 use rabs_protocol::worker_fence::WorkerSessionOffer;
 use rabs_protocol::worker_session::{CoordinatorSession, SessionPolicy, WorkerHelloClaims};
+use rabs_protocol::worker_standby;
 use rabs_sandbox::toolchain_transfer::TOOLCHAIN_UPLOAD_BUDGET;
 use serde_json::{Value, json};
 use std::ffi::OsStr;
 use std::fs::File;
+use std::future::{Future, poll_fn};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
+use std::pin::pin;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 mod admission;
@@ -762,6 +766,256 @@ async fn read_record<S: AsyncRead + Unpin>(
     }
 }
 
+/// The original authenticated stream and its unconsumed bytes remain on the
+/// listener's runtime until an operation claims this connection. Preparing or
+/// heartbeating it never creates a session, boot fence, token or execution lease.
+pub(crate) struct StandbyPeer {
+    peer: AuthenticatedPeer,
+    state: StandbyState,
+}
+
+struct StandbyState {
+    hello: Value,
+    buffered: Vec<u8>,
+    supported: bool,
+    completed_heartbeats: u64,
+    next_ping: Instant,
+    failed: bool,
+}
+
+async fn write_standby_record<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    frame: &Value,
+) -> io::Result<()> {
+    let mut bytes = serde_json::to_vec(frame)?;
+    require(
+        bytes.len() <= MAX_JSON_RECORD,
+        "standby record exceeds ATP limit",
+    )?;
+    bytes.push(b'\n');
+    stream
+        .write_all(&bytes)
+        .await
+        .map_err(worker_transport_error)?;
+    stream.flush().await.map_err(worker_transport_error)
+}
+
+async fn prepare_standby_records<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    identity: TransportIdentity,
+    expected_worker: &str,
+    pin: [u8; 32],
+) -> io::Result<StandbyState> {
+    require(
+        pin != [0; 32] && identity.peer_id == pin && identity.fingerprint == pin,
+        "authenticated standby worker key does not match configured SPKI pin",
+    )?;
+    require(!expected_worker.is_empty(), "empty expected standby worker")?;
+    asupersync::time::timeout(asupersync::time::wall_now(), ADMISSION_BUDGET, async {
+        let mut buffered = Vec::new();
+        let hello = read_record(stream, &mut buffered).await?;
+        require(
+            hello["kind"] == "worker-hello"
+                && hello["worker_id"].as_str() == Some(expected_worker)
+                && hello["peer_id"].as_str() == Some(hex(&identity.peer_id).as_str()),
+            "standby hello does not name the configured authenticated worker",
+        )?;
+        let supported = match hello.get("standby_protocols") {
+            None => false,
+            Some(value) => {
+                let protocols = value
+                    .as_array()
+                    .ok_or_else(|| invalid("invalid standby protocols"))?;
+                require(
+                    protocols.iter().all(Value::is_string),
+                    "invalid standby protocols",
+                )?;
+                protocols
+                    .iter()
+                    .any(|value| value == worker_standby::VERSION)
+            }
+        };
+        if supported {
+            write_standby_record(
+                stream,
+                &json!({
+                    "kind":"standby-ready", "version":worker_standby::VERSION,
+                }),
+            )
+            .await?;
+        }
+        Ok(StandbyState {
+            hello,
+            buffered,
+            supported,
+            completed_heartbeats: 0,
+            next_ping: Instant::now() + worker_standby::HEARTBEAT_INTERVAL,
+            failed: false,
+        })
+    })
+    .await
+    .map_err(|_| {
+        worker_transport_error(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "worker standby hello deadline",
+        ))
+    })?
+}
+
+/// Read the ordinary hello under a finite budget and select standby only when
+/// explicitly advertised. A legacy peer may be assigned immediately, but cannot
+/// be parked. The configured pin and TLS-derived peer identity precede any reply.
+pub(crate) async fn prepare_standby(
+    mut peer: AuthenticatedPeer,
+    expected_worker: &str,
+    pin: [u8; 32],
+) -> io::Result<StandbyPeer> {
+    let state =
+        prepare_standby_records(&mut peer.stream, peer.identity, expected_worker, pin).await?;
+    Ok(StandbyPeer { peer, state })
+}
+
+fn standby_cancelled() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Interrupted,
+        "worker standby stopped before assignment",
+    )
+}
+
+impl StandbyState {
+    async fn wait_for_work<S: AsyncRead + AsyncWrite + Unpin, F: Future<Output = ()>>(
+        &mut self,
+        stream: &mut S,
+        work: F,
+        shutdown: OperationCancellation,
+    ) -> io::Result<()> {
+        require(
+            self.supported && !self.failed,
+            "worker connection cannot enter standby",
+        )?;
+        let mut work = pin!(work);
+        let mut stopped = pin!(shutdown.cancelled());
+        loop {
+            enum Wake {
+                Work,
+                Ping,
+                Record(io::Result<Value>),
+            }
+            let wake = {
+                let mut reading = pin!(read_record(stream, &mut self.buffered));
+                let mut heartbeat = pin!(asupersync::time::sleep(
+                    asupersync::time::wall_now(),
+                    self.next_ping.saturating_duration_since(Instant::now()),
+                ));
+                poll_fn(|cx| {
+                    if stopped.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(Err(standby_cancelled()));
+                    }
+                    // Assignment already ready must not incur another round
+                    // trip. Partial inbound bytes stay owned by the same stream
+                    // and reader, including their original ATP frame deadline.
+                    if work.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(Ok(Wake::Work));
+                    }
+                    if let Poll::Ready(record) = reading.as_mut().poll(cx) {
+                        return Poll::Ready(Ok(Wake::Record(record)));
+                    }
+                    if heartbeat.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(Ok(Wake::Ping));
+                    }
+                    Poll::Pending
+                })
+                .await?
+            };
+            match wake {
+                Wake::Work => return Ok(()),
+                Wake::Record(record) => {
+                    record?;
+                    return Err(invalid("unsolicited worker record during standby"));
+                }
+                Wake::Ping => {}
+            }
+            let sequence = self
+                .completed_heartbeats
+                .checked_add(1)
+                .ok_or_else(|| invalid("worker standby sequence exhausted"))?;
+            let next_ping = Instant::now() + worker_standby::HEARTBEAT_INTERVAL;
+            // Burning the exchange before the first possible write also fences
+            // callers that drop this future while a ping or pong is partial.
+            // Only a complete matching pong makes this peer promotable again.
+            self.failed = true;
+            let mut exchange = pin!(asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                worker_standby::PONG_TIMEOUT,
+                async {
+                    write_standby_record(
+                        stream,
+                        &json!({
+                            "kind":"standby-ping", "version":worker_standby::VERSION,
+                            "sequence":sequence,
+                        }),
+                    )
+                    .await?;
+                    let pong = read_record(stream, &mut self.buffered).await?;
+                    require(
+                        pong.as_object().is_some_and(|fields| fields.len() == 3)
+                            && pong["kind"] == "standby-pong"
+                            && pong["version"] == worker_standby::VERSION
+                            && pong["sequence"].as_u64() == Some(sequence),
+                        "invalid worker standby pong",
+                    )
+                },
+            ));
+            // After a ping starts, consume its exact pong before assignment.
+            // Dropping a partial write/read on shutdown only closes this peer;
+            // it can never hand an unfinished exchange to session admission.
+            poll_fn(|cx| {
+                if stopped.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(Err(standby_cancelled()));
+                }
+                exchange.as_mut().poll(cx).map(|result| {
+                    result.map_err(|_| {
+                        worker_transport_error(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "worker standby pong deadline",
+                        ))
+                    })?
+                })
+            })
+            .await?;
+            self.completed_heartbeats = sequence;
+            self.next_ping = next_ping;
+            self.failed = false;
+        }
+    }
+}
+
+impl StandbyPeer {
+    /// Whether the hello explicitly selected the optional idle exchange.
+    pub(crate) fn supported(&self) -> bool {
+        self.state.supported
+    }
+
+    /// Diagnostic evidence of complete round trips, never admission authority.
+    pub(crate) fn completed_heartbeats(&self) -> u64 {
+        self.state.completed_heartbeats
+    }
+
+    /// Await assignment with bounded heartbeats, peer EOF detection and shutdown.
+    pub(crate) async fn wait_for_work<F: Future<Output = ()>>(
+        &mut self,
+        work: F,
+        shutdown: OperationCancellation,
+    ) -> io::Result<()> {
+        let result = self
+            .state
+            .wait_for_work(&mut self.peer.stream, work, shutdown)
+            .await;
+        self.state.failed |= result.is_err();
+        result
+    }
+}
+
 /// One operator owns this runtime and stream; block_on is never nested. Absolute
 /// phase deadlines survive fragmented reads, telemetry and repeated range reads.
 struct RecordPeer<'a, S> {
@@ -799,6 +1053,22 @@ impl<'a, S> RecordPeer<'a, S> {
     fn with_artifact_byte_cache(mut self, cache: Option<Arc<ArtifactByteCache>>) -> Self {
         self.artifact_byte_cache = cache;
         self
+    }
+
+    /// Replay only the consumed hello into the ordinary admission reader. Its
+    /// unconsumed tail and the underlying ATP decoder stay on this connection.
+    /// Keeping the initial record in the existing buffer also preserves the
+    /// operator's cancellation-aware read path.
+    fn with_initial_record(mut self, hello: &Value, buffered: Vec<u8>) -> io::Result<Self> {
+        let mut initial = serde_json::to_vec(hello)?;
+        require(
+            initial.len() <= MAX_JSON_RECORD,
+            "worker hello exceeds ATP limit",
+        )?;
+        initial.push(b'\n');
+        initial.extend(buffered);
+        self.buffered = initial;
+        Ok(self)
     }
 
     /// A live continuation borrows the original execution's transfer budget.
@@ -1295,38 +1565,54 @@ pub fn receive_authenticated_with_admission(
         observer,
         on_admitted,
         None,
+        None,
     )
 }
 
-/// Continue delivery of the successful sealed result already observed by this
-/// live execution. This can only retrieve that exact result, from the same
-/// authenticated worker incarnation, within the original transfer deadline.
-/// It cannot admit another live attempt, upload inputs, or dispatch a compiler.
-/// Local prefix reuse stays in the explicit operator recovery path.
+/// Promote an idle authenticated peer on its original owning runtime. The
+/// complete prefetched hello passes through the ordinary capability and session
+/// checks, under a fresh admission budget. Continuation remains result-only and
+/// retains the original sealed result's deadline and identity restrictions.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn receive_authenticated_continuation(
+pub(crate) fn receive_standby_with_admission(
     runtime: &Runtime,
-    peer: AuthenticatedPeer,
+    peer: StandbyPeer,
     admission: PinnedWorkerAdmission,
     request: &Value,
     destination: &Path,
-    resume_source: Option<&ResumeSource>,
+    upload: Option<&SourceUpload>,
     cancellation: OperationCancellation,
-    sealed_result: SealedResult,
+    on_admitted: Option<WorkerAdmissionHook>,
+    continuation: Option<SealedResult>,
 ) -> Result<Delivery, DeliveryFailure> {
+    let mode = if continuation.is_some() {
+        DeliveryMode::Resume
+    } else {
+        DeliveryMode::Execute
+    };
+    if peer.state.failed {
+        return Err(DeliveryFailure {
+            directory: destination.to_path_buf(),
+            execution_may_have_run: mode == DeliveryMode::Resume,
+            transport_interrupted: false,
+            sealed_result: None,
+            detail: "failed standby connection cannot enter session admission".into(),
+        });
+    }
     receive_authenticated_inner(
         runtime,
-        peer,
+        peer.peer,
         admission,
         request,
         destination,
-        DeliveryMode::Resume,
+        mode,
+        upload,
         None,
-        resume_source,
         cancellation,
         None,
-        None,
-        Some(sealed_result),
+        on_admitted,
+        continuation,
+        Some((peer.state.hello, peer.state.buffered)),
     )
 }
 
@@ -1344,6 +1630,7 @@ fn receive_authenticated_inner(
     observer: Option<crate::coord::prepared_operation::PreviewObserver>,
     on_admitted: Option<WorkerAdmissionHook>,
     live_continuation: Option<SealedResult>,
+    initial_record: Option<(Value, Vec<u8>)>,
 ) -> Result<Delivery, DeliveryFailure> {
     let failure = |error: io::Error| DeliveryFailure {
         directory: destination.to_path_buf(),
@@ -1401,6 +1688,11 @@ fn receive_authenticated_inner(
     let cache = configured_artifact_byte_cache().map_err(&failure)?;
     let mut records =
         RecordPeer::new(runtime, peer.stream, request).with_artifact_byte_cache(cache);
+    if let Some((hello, buffered)) = initial_record {
+        records = records
+            .with_initial_record(&hello, buffered)
+            .map_err(&failure)?;
+    }
     if let Some(continuation) = &live_continuation {
         records = records.before(continuation.deadline());
     }
@@ -3178,6 +3470,318 @@ mod tests {
         ) -> std::task::Poll<io::Result<()>> {
             std::task::Poll::Ready(Ok(()))
         }
+    }
+
+    fn standby_hello() -> Value {
+        let mut hello = hello();
+        hello["standby_protocols"] = json!([worker_standby::VERSION]);
+        hello
+    }
+
+    fn standby_identity() -> TransportIdentity {
+        TransportIdentity {
+            peer_id: [1; 32],
+            fingerprint: [1; 32],
+        }
+    }
+
+    #[test]
+    fn standby_negotiation_checks_transport_identity_and_claims_before_any_reply() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        for case in [
+            "zero-pin",
+            "peer-id",
+            "fingerprint",
+            "worker-name",
+            "hello-peer",
+            "protocol-type",
+        ] {
+            let mut identity = standby_identity();
+            let mut pin = [1; 32];
+            let mut offered = standby_hello();
+            match case {
+                "zero-pin" => pin = [0; 32],
+                "peer-id" => identity.peer_id = [2; 32],
+                "fingerprint" => identity.fingerprint = [2; 32],
+                "worker-name" => offered["worker_id"] = json!("other-worker"),
+                "hello-peer" => offered["peer_id"] = json!(hex(&[2; 32])),
+                _ => offered["standby_protocols"] = json!(worker_standby::VERSION),
+            }
+            let mut wire = RecordWire::new(format!("{offered}\n").into_bytes(), RECORD_READ_BYTES);
+            let result = rabs_asupersync::daemon_runtime::block_on_top_level(
+                &runtime,
+                prepare_standby_records(&mut wire, identity, "worker", pin),
+            );
+            assert!(result.is_err(), "{case}");
+            assert!(wire.written.is_empty(), "{case}");
+            if matches!(case, "zero-pin" | "peer-id" | "fingerprint") {
+                assert_eq!(wire.reads, 0, "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn standby_prepare_preserves_legacy_hello_and_coalesced_admission_bytes() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        for offered in [hello(), standby_hello()] {
+            let supported = offered.get("standby_protocols").is_some();
+            let tail = format!("{}\n", response());
+            let mut wire =
+                RecordWire::new(format!("{offered}\n{tail}").into_bytes(), RECORD_READ_BYTES);
+            let prepared = rabs_asupersync::daemon_runtime::block_on_top_level(
+                &runtime,
+                prepare_standby_records(&mut wire, standby_identity(), "worker", [1; 32]),
+            )
+            .unwrap();
+            assert_eq!(prepared.hello, offered);
+            assert_eq!(prepared.supported, supported);
+            assert_eq!(prepared.completed_heartbeats, 0);
+            assert_eq!(prepared.buffered, tail.as_bytes());
+            if supported {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&wire.written).unwrap(),
+                    json!({"kind":"standby-ready", "version":worker_standby::VERSION})
+                );
+            } else {
+                assert!(wire.written.is_empty());
+            }
+        }
+    }
+
+    /// A worker becomes assignable during the ping write, before its pong has
+    /// been read. This exercises the promotion race without wall-clock sleeps.
+    struct StandbyWire {
+        wire: RecordWire,
+        after_ping: Option<Vec<u8>>,
+        assignment: OperationCancellation,
+        sent: Arc<std::sync::Mutex<Vec<Value>>>,
+    }
+
+    impl AsyncRead for StandbyWire {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buffer: &mut asupersync::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            if this.wire.input.is_empty() {
+                return Poll::Pending;
+            }
+            std::pin::Pin::new(&mut this.wire).poll_read(cx, buffer)
+        }
+    }
+
+    impl AsyncWrite for StandbyWire {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            let frame = serde_json::from_slice::<Value>(bytes).unwrap();
+            if frame["kind"] == "standby-ping" {
+                this.wire.input.extend(this.after_ping.take().unwrap());
+                this.assignment.cancel();
+            }
+            this.sent.lock().unwrap().push(frame);
+            Poll::Ready(Ok(bytes.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn standby_assignment_finishes_pong_and_preserves_the_original_admission_path() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let offered = standby_hello();
+        let pong = json!({"kind":"standby-pong", "version":worker_standby::VERSION, "sequence":1});
+        let assignment = OperationCancellation::new();
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut wire = StandbyWire {
+            wire: RecordWire::new(format!("{offered}\n").into_bytes(), RECORD_READ_BYTES),
+            after_ping: Some(format!("{pong}\n{}\n", response()).into_bytes()),
+            assignment: assignment.clone(),
+            sent: Arc::clone(&sent),
+        };
+        let mut prepared = rabs_asupersync::daemon_runtime::block_on_top_level(
+            &runtime,
+            prepare_standby_records(&mut wire, standby_identity(), "worker", [1; 32]),
+        )
+        .unwrap();
+        prepared.next_ping = Instant::now();
+        rabs_asupersync::daemon_runtime::block_on_top_level(
+            &runtime,
+            prepared.wait_for_work(
+                &mut wire,
+                assignment.cancelled(),
+                OperationCancellation::new(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(prepared.completed_heartbeats, 1);
+        assert_eq!(prepared.buffered, format!("{}\n", response()).as_bytes());
+        assert_eq!(
+            sent.lock()
+                .unwrap()
+                .iter()
+                .map(|frame| frame["kind"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["standby-ready", "standby-ping"]
+        );
+
+        let request = request();
+        let raw = RecordPeer::new(&runtime, wire, &request)
+            .with_initial_record(&prepared.hello, prepared.buffered)
+            .unwrap();
+        let raw = interrupt::OperatorPeer::with_interrupts(
+            raw,
+            interrupt::OperationInterrupts::new(OperationCancellation::new()),
+        );
+        let (_owner, admission) = with_admission(Script::default());
+        let mut peer = AdmittedPeer::new(
+            raw,
+            standby_identity(),
+            [1; 32],
+            &request,
+            [10, 20, 30],
+            DeliveryMode::Execute,
+            admission,
+        )
+        .unwrap();
+        assert!(peer.authentication().is_none());
+        assert!(peer.send(&request).is_err());
+        let consumed = peer.receive().unwrap();
+        assert_eq!(consumed, offered);
+        peer.negotiate(&consumed, &grant()).unwrap();
+        assert_eq!(peer.authentication().unwrap().session_id, 10);
+        peer.send(&request).unwrap();
+        assert!(peer.send(&request).is_err());
+        assert_eq!(
+            sent.lock()
+                .unwrap()
+                .iter()
+                .map(|frame| frame["kind"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "standby-ready",
+                "standby-ping",
+                "session-challenge",
+                "session-ok",
+                "canonical-exec"
+            ]
+        );
+    }
+
+    #[test]
+    fn standby_assignment_cannot_skip_an_invalid_pong() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        for pong in [
+            json!({"kind":"standby-pong", "version":worker_standby::VERSION, "sequence":0}),
+            json!({"kind":"standby-pong", "version":worker_standby::VERSION, "sequence":2}),
+            json!({"kind":"standby-pong", "version":"other", "sequence":1}),
+            json!({"kind":"worker-auth", "version":worker_standby::VERSION, "sequence":1}),
+            json!({"kind":"standby-pong", "version":worker_standby::VERSION, "sequence":1, "request_id":7}),
+        ] {
+            let assignment = OperationCancellation::new();
+            let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut wire = StandbyWire {
+                wire: RecordWire::new(
+                    format!("{}\n", standby_hello()).into_bytes(),
+                    RECORD_READ_BYTES,
+                ),
+                after_ping: Some(format!("{pong}\n").into_bytes()),
+                assignment: assignment.clone(),
+                sent: Arc::clone(&sent),
+            };
+            let mut prepared = rabs_asupersync::daemon_runtime::block_on_top_level(
+                &runtime,
+                prepare_standby_records(&mut wire, standby_identity(), "worker", [1; 32]),
+            )
+            .unwrap();
+            prepared.next_ping = Instant::now();
+            let failure = rabs_asupersync::daemon_runtime::block_on_top_level(
+                &runtime,
+                prepared.wait_for_work(
+                    &mut wire,
+                    assignment.cancelled(),
+                    OperationCancellation::new(),
+                ),
+            )
+            .unwrap_err();
+            assert_eq!(failure.kind(), io::ErrorKind::InvalidData, "{pong}");
+            assert_eq!(prepared.completed_heartbeats, 0);
+            assert_eq!(sent.lock().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn standby_idle_detects_eof_and_unsolicited_records_and_stop_precedes_assignment() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        for (tail, kind) in [
+            ("", io::ErrorKind::UnexpectedEof),
+            ("{}\n", io::ErrorKind::InvalidData),
+        ] {
+            let mut wire = RecordWire::new(
+                format!("{}\n{tail}", standby_hello()).into_bytes(),
+                RECORD_READ_BYTES,
+            );
+            let mut prepared = rabs_asupersync::daemon_runtime::block_on_top_level(
+                &runtime,
+                prepare_standby_records(&mut wire, standby_identity(), "worker", [1; 32]),
+            )
+            .unwrap();
+            let failure = rabs_asupersync::daemon_runtime::block_on_top_level(
+                &runtime,
+                prepared.wait_for_work(
+                    &mut wire,
+                    std::future::pending(),
+                    OperationCancellation::new(),
+                ),
+            )
+            .unwrap_err();
+            assert_eq!(failure.kind(), kind);
+            assert_eq!(prepared.completed_heartbeats, 0);
+        }
+        let mut wire = RecordWire::new(
+            format!("{}\n", standby_hello()).into_bytes(),
+            RECORD_READ_BYTES,
+        );
+        let mut prepared = rabs_asupersync::daemon_runtime::block_on_top_level(
+            &runtime,
+            prepare_standby_records(&mut wire, standby_identity(), "worker", [1; 32]),
+        )
+        .unwrap();
+        let reads = wire.reads;
+        let stop = OperationCancellation::new();
+        stop.cancel();
+        let failure = rabs_asupersync::daemon_runtime::block_on_top_level(
+            &runtime,
+            prepared.wait_for_work(&mut wire, std::future::ready(()), stop),
+        )
+        .unwrap_err();
+        assert_eq!(failure.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(wire.reads, reads);
+        assert_eq!(prepared.completed_heartbeats, 0);
     }
 
     #[cfg(unix)]

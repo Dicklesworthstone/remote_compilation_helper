@@ -69,10 +69,13 @@ RABS_WORKER_STATE_DIR="$HOME/.cache/rabs-leaf-worker" \
     --coordinator coordinator.example.internal:7092 --worker-id leaf-worker
 ```
 
-The daemon binds this listener when an eligible wrapper request has accepted
-remote execution. Keep the worker's reconnect loop running without `--once`;
-there is no idle connection queue on the listener. Preserve its
-durable state across reconnects and restarts.
+The daemon binds this listener when it starts the configured dependency-worker
+pool. It retains one authenticated standby connection for that worker between
+requests, with a bounded heartbeat exchange and fresh admission for each job.
+Keep the worker's reconnect loop running without `--once`; after completing
+one operation it reconnects and can wait for the next assignment. Preserve its
+durable state across reconnects and restarts. Listener startup errors refuse the
+configured pool, and shutdown joins its listener owners before releasing state.
 
 ### Authenticated standby negotiation
 

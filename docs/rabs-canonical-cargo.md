@@ -1202,6 +1202,14 @@ mixed or invalid explicit settings refuse startup. Credentials and transport
 state remain outside the Cargo namespace; no normal daemon needs to be started
 for this operation-owned coordinator.
 
+The dependency-worker pool binds each configured endpoint when the pool is
+created and keeps it bound through the pool's lifetime. Matching workers that
+advertise `worker-standby-v1` can stay connected between compiler requests. A
+direct invocation owns these listeners until its coordinator finishes; the
+shared service described below keeps them available between Cargo commands.
+Workers can therefore reconnect and become ready while the coordinator has no
+compiler request waiting.
+
 The worker must explicitly advertise `canonical-dependency-exec-v4` and support
 the selected `metadata` or `rlib` execution mode. Both peers retain that exact version and mode through
 authenticated admission. An older worker cannot silently reinterpret the request
@@ -1587,6 +1595,40 @@ Configure the service process's dependency-worker pool and mutual-TLS environmen
 before startup, using the worker settings above. The service reads that operator
 configuration once. A submitting client's worker environment cannot replace the
 service's pool or credentials.
+
+Service startup binds every configured dependency-worker endpoint before
+announcing readiness. Each configured worker has one listener owner thread,
+at most one authenticated idle connection, and at most one pending or active
+transport assignment. The existing 1–32 worker limit bounds these owners. A
+failed endpoint bind refuses startup and closes the endpoints already started.
+The service's existing request queue continues to own work waiting for a slot.
+
+Standby first verifies the worker's TLS public-key pin, configured name and
+TLS-derived peer identity, then selects the explicitly advertised
+`worker-standby-v1` exchange. The coordinator sends a heartbeat every 15 seconds;
+each ping and matching pong share a 10-second budget. The worker allows at most
+45 seconds for the next complete idle record. A failed heartbeat closes that
+connection so the worker's outward loop can reconnect to the same listener.
+Confirmed readiness also wakes queued placement and clears the endpoint's
+connection cooldown.
+
+An assigned request starts ordinary session admission with a fresh 10-second
+challenge budget. An outstanding heartbeat must finish before this transition.
+The durable worker incarnation checks, request identity, live-action admission
+and execution lease are established for that request; idle heartbeats allocate
+none of them and leave the worker's execution journal unchanged. Each connection
+still carries one operation. After verified completion, the worker reconnects
+and can wait for the next command. A peer without standby support can use
+ordinary admission when an assignment is already waiting, but is not retained
+as an idle peer.
+
+Shutdown stops new worker reservations, wakes idle acceptance and heartbeat
+waits, and cancels pending assignments. Active operations retain their existing
+cancellation, cleanup and verified-delivery ownership. The service joins each
+listener owner before releasing its coordinator authority and state lock;
+restarting the service can bind the same configured endpoints while the workers
+continue their outward reconnect loops. A possible execution remains subject
+to the existing recovery restrictions throughout this drain.
 
 Add the existing socket to each local canonical profile, keeping its `state_root`
 equal to the service's state root:

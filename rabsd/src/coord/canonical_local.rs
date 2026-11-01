@@ -472,6 +472,7 @@ impl SharedRuntime {
             .remote_executions
             .as_ref()
             .map_or(Ok(()), |owner| owner.shutdown());
+        let remote = self.remote.as_ref().map_or(Ok(()), |pool| pool.shutdown());
         let toolchains = self.toolchains.shutdown();
         let server = self
             .server
@@ -485,6 +486,7 @@ impl SharedRuntime {
             )?;
         }
         executions.map_err(io::Error::other)?;
+        remote?;
         toolchains?;
         Ok(())
     }
@@ -534,6 +536,9 @@ impl Drop for SharedRuntime {
         self.stopped.store(true, Ordering::Release);
         if let Some(executions) = &self.remote_executions {
             let _ = executions.shutdown();
+        }
+        if let Some(remote) = &self.remote {
+            let _ = remote.shutdown();
         }
         let _ = self.toolchains.shutdown();
         // Explicit join precedes field destruction, particularly StateOwner's

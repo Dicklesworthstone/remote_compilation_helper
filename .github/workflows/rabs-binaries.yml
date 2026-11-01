@@ -274,6 +274,9 @@ jobs:
             canonical_shared_service_queues_before_capture_and_cancels_only_waiting_interest \
             -- --ignored --exact --nocapture
           cargo test --release -p rabsd --test canonical_check_local --locked \
+            canonical_shared_service_keeps_worker_ready_between_real_cargo_requests \
+            -- --ignored --exact --nocapture
+          cargo test --release -p rabsd --test canonical_check_local --locked \
             canonical_shared_remote_flight_survives_origin_cancellation \
             -- --ignored --exact --nocapture
           cargo test --release -p rabsd --test canonical_check_local --locked \

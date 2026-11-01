@@ -1286,6 +1286,80 @@ mod tests {
             .unwrap()
     }
 
+    fn shared_edge_tls() -> (
+        tempfile::TempDir,
+        rabs_asupersync::worker_transport::TlsFiles,
+    ) {
+        // Public fixture-only PEM pair from Asupersync revision
+        // 78b64636e99fea4ea2d868096576021dd3b8e519, tests/fixtures/tls/server.{crt,key}.
+        // This test loads the real listener configuration and proves ownership;
+        // it does not connect a worker or claim mutual-TLS handshake coverage.
+        const CERTIFICATE: &str = "-----BEGIN CERTIFICATE-----
+MIIDfTCCAmWgAwIBAgIUMZzMJ3NK/wivEV0AwjZDNkssbEswDQYJKoZIhvcNAQEL
+BQAwWTELMAkGA1UEBhMCVVMxDTALBgNVBAgMBFRlc3QxDTALBgNVBAcMBFRlc3Qx
+GDAWBgNVBAoMD0FzdXBlclN5bmMgVGVzdDESMBAGA1UEAwwJbG9jYWxob3N0MB4X
+DTI2MDQxNzE1MzU0OVoXDTI3MDQxNzE1MzU0OVowWTELMAkGA1UEBhMCVVMxDTAL
+BgNVBAgMBFRlc3QxDTALBgNVBAcMBFRlc3QxGDAWBgNVBAoMD0FzdXBlclN5bmMg
+VGVzdDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A
+MIIBCgKCAQEA03m4ymChRuwkz/8f4NmC3bV9ULUgokYvES6txVgT/AfiVi6UvjXq
+gRiPuYaApQHd2p++QjbajOtzSyF2jA4ppV+38Fp9p5oZ8I/lQjKNf5iHB8avfR4u
+JHI657nVLkaZEzEDtUppbyNqGvImLiPl988IVE7GvKv0wsqILDNMzHZ0rRyCN8X3
+EPNieyLQLHktFyS/mgMo9gOhSFScIvqDugFn8Jnughjf1pA0sKP+MkPqNhOqb5Z7
+80J3CY7eWpSjAce/4lhVil5Shw1GGgcF/akUOhW/NPSpSXakMDziMppE3vdiuq3x
+CuUo3RjxLTEDMZMNenmxzkJrl6qFbDwwrQIDAQABoz0wOzAaBgNVHREEEzARggls
+b2NhbGhvc3SHBH8AAAEwHQYDVR0OBBYEFNd3Kvfz9xQK6XoMh+x6NQ4ic/1pMA0G
+CSqGSIb3DQEBCwUAA4IBAQBNe7cm2OHxsDazdxpM5cdmm0SNJyylB7PA/UiW5U77
+FAdLCY7ZLTPea2JtwvYd5CEsIwxoFMVVUvVob+XZ/z6gmEOR/uoU35ZYQRr33mra
+4j4QQN/DCwLJZcphPBG3pOJ/YJnfH/eK27rPedBBnW4ToqUkpvLJ/6JFwVZqfg1t
+64y7WiDWjrsPcSAu8IyarftzYcS3oburaCIVIwmBCsXiqBE8JQnR+ugWFDRpcFm2
+EbIZ9RGthziUAqaMII0tLrtmtqfo3WGYk2U6vCFBjPPELt1xdXc4XdKd9NGKdsZg
+H9r88mCrkoRF5+i212Whkr3HEgmespDlar+lXr9CdYA8
+-----END CERTIFICATE-----
+";
+        const PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDTebjKYKFG7CTP
+/x/g2YLdtX1QtSCiRi8RLq3FWBP8B+JWLpS+NeqBGI+5hoClAd3an75CNtqM63NL
+IXaMDimlX7fwWn2nmhnwj+VCMo1/mIcHxq99Hi4kcjrnudUuRpkTMQO1SmlvI2oa
+8iYuI+X3zwhUTsa8q/TCyogsM0zMdnStHII3xfcQ82J7ItAseS0XJL+aAyj2A6FI
+VJwi+oO6AWfwme6CGN/WkDSwo/4yQ+o2E6pvlnvzQncJjt5alKMBx7/iWFWKXlKH
+DUYaBwX9qRQ6Fb809KlJdqQwPOIymkTe92K6rfEK5SjdGPEtMQMxkw16ebHOQmuX
+qoVsPDCtAgMBAAECggEAA4HuVbT6l9GM3sJNhg41hHXhKTiH3Qkq+K78hNxsIG8F
+Cwbkwq7kP9XndF1Nvu7j/h9OKYz9XP7+v41DiRknCa4nv93QXbpJmdrZI5rxC9+8
+xZ0/BeU9QK+AWJ2VcpoLKe1TMWuVihldRiskBPnlc5HEgpl35GM5wQ1Y6trC+FUq
+6i6rfk7byVp87hsJXwPnwD+JKGQHX8TK9VLOt2I0DTdPPfTn9OwWpuMXYn5M6mdv
+WT5fqa0feOil/fJAzSiP74GEpEjuXF7SQQoK7wcFyuuANnpGlSmtxek8bSmkBdfE
+rlvVw6asVdwKH9nJ410ZhME6NOUXGn+qQg4ru1NXBQKBgQDzxz843wkRr2mp3XEj
+dIqIwY8OJ+N5VzphftHkJlAAkG7oiu3+v+2nlgKSTRBaujbMwbJ8/V1/UjuNCrMl
+DYo+lBeI28ic2+z2QH3wWJoPp83wLrplW/IB+EU3E/v39u1QEvhzswf3yu93g3yf
+ZaO9vqE0iLcUXxGEaRqhVCHZBwKBgQDeE+MD4E8gNW7OYPCt4kJNoVoDa7iWd+M4
+OTKivvswooolmty1KCJe4bP1YvG/F+FeS7Og1aiVd8jDO1Ooe5YHJnURJ6Ist5W3
+r8Njolk4w0ygKduwpdfOReLr9OhRvm7kwJHdBD+Hm7h2u9bJnlchr4fgc7EwBMt0
+jdfFmKy/qwKBgQCQSoQSXnmYvTIWuBrKeKWzEpZhM50B6m6E3LLRjxfVbagn/mum
+WOYLRtBY1kJy4TukcJX8Q19/CCZ1cjrdGKmWJsPTXvvcVJRqoXupslfmIlXT72Sm
+sAiLv+8ADdUbTU3kEoZ6vSJfOgAJxosSMe/8VIRIew+agDb3H9sCWLD8KwKBgQDG
+bAZeJEEOii9i/oKNGqgbLJt8ivb2mk/OoGx5tSJCpjfAucmRozZyiD9+dNWC5Bdd
+ZU4t2jkys0ASECQDWckGwnm+xibExZNj+AsgLqKBcR45zKyZ/NQBXbgPE1ewEfKL
+OPQbAfyxcZUzoUmcA3negzNofHZIbUBL96Be0Lco2QKBgFJ6j9+xMwsseuXcMS7Z
+9L2bHZBRM2wWT8X/Q9Vb7NUQszwGOW66CAYj7FwYLQopwn1c0WILapNDKMMynpMQ
+w4A6Ocebs4nRz++9jSWop0dGQk+1rOMAGJSsHFR3c4doTmDkrjDRes/KixqxcKms
+LLP5zfllg2HIttG0BDm4D3jF
+-----END PRIVATE KEY-----
+";
+        let root = crate::test_util::private_tempdir();
+        let certificate = root.path().join("fixture.pem");
+        let private_key = root.path().join("fixture.key");
+        std::fs::write(&certificate, CERTIFICATE).unwrap();
+        std::fs::write(&private_key, PRIVATE_KEY).unwrap();
+        let tls = rabs_asupersync::worker_transport::TlsFiles {
+            ca: certificate.clone(),
+            certificate,
+            private_key,
+        };
+        tls.acceptor()
+            .expect("fixture must load the production TLS acceptor");
+        (root, tls)
+    }
+
     #[test]
     fn canonical_edges_share_service_pool_without_environment_or_request_override() {
         use super::super::{CanonicalActivity, CanonicalBinding, CanonicalRemote};
@@ -1297,24 +1371,35 @@ mod tests {
         if std::env::var_os(CHILD).is_none() {
             // Configure the actual environment reader in a private subprocess;
             // never mutate this parallel test harness's process environment.
-            let result = std::process::Command::new(std::env::current_exe().unwrap())
+            let (_tls_owner, tls) = shared_edge_tls();
+            let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = reserved.local_addr().unwrap();
+            let pin: String = tls
+                .local_identity()
+                .unwrap()
+                .fingerprint
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
                 .args(["--exact", TEST, "--nocapture"])
                 .env_clear()
                 .env(CHILD, "1")
                 .env(
                     "RABS_DEPENDENCY_WORKERS_JSON",
                     json!([{
-                        "listen":"127.0.0.1:19081",
+                        "listen":address.to_string(),
                         "worker_id":"service-worker",
-                        "worker_spki_sha256":"17".repeat(32),
+                        "worker_spki_sha256":pin,
                     }])
                     .to_string(),
                 )
-                .env("RABS_COORD_TLS_CA", "/private/ca.pem")
-                .env("RABS_COORD_TLS_CERT", "/private/coord.pem")
-                .env("RABS_COORD_TLS_KEY", "/private/coord.key")
-                .output()
-                .unwrap();
+                .env("RABS_COORD_TLS_CA", &tls.ca)
+                .env("RABS_COORD_TLS_CERT", &tls.certificate)
+                .env("RABS_COORD_TLS_KEY", &tls.private_key);
+            drop(reserved);
+            let result = command.output().unwrap();
             assert!(
                 result.status.success(),
                 "{}\n{}",
@@ -1424,6 +1509,10 @@ mod tests {
 
         // Standalone canonical operation behavior remains explicit: its own
         // binding reads operator configuration once and owns a separate pool.
+        // Join the service listener before a new owner binds the same endpoint;
+        // retained Arc/configuration identity remains observable after shutdown.
+        executions.shutdown().unwrap();
+        pool.shutdown().unwrap();
         let standalone_state = state.path().join("standalone-shadow");
         let standalone = binding(CanonicalRemote::FromEnvironment)
             .live_edge(LiveDependencyLane::new(coord), &standalone_state)
@@ -1434,6 +1523,7 @@ mod tests {
         );
         assert!(!Arc::ptr_eq(standalone.remote.as_ref().unwrap(), &pool));
         assert!(standalone_state.join("dependency-workers").is_dir());
+        standalone.remote.as_ref().unwrap().shutdown().unwrap();
         println!("{COMPLETE}");
     }
 

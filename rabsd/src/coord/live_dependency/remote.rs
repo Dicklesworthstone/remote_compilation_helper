@@ -318,6 +318,35 @@ impl DependencyWorkerPool {
         }
     }
 
+    fn start(&self) -> io::Result<()> {
+        let availability = Arc::downgrade(&self.availability);
+        let ready: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            if let Some(availability) = availability.upgrade() {
+                availability.notify();
+            }
+        });
+        for worker in &self.workers {
+            if let Err(error) = worker.start_listener(Some(Arc::clone(&ready))) {
+                // A partial pool is never returned as a successfully started
+                // service. Close and join every endpoint already started.
+                let _ = self.shutdown();
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn shutdown(&self) -> io::Result<()> {
+        let mut first_error = None;
+        for worker in &self.workers {
+            if let Err(error) = worker.shutdown() {
+                first_error.get_or_insert(error);
+            }
+        }
+        self.availability.notify();
+        first_error.map_or(Ok(()), Err)
+    }
+
     fn try_claim(&self, key: &TypedDigest) -> io::Result<PendingActionClaim> {
         let mut actions = self
             .pending
@@ -740,8 +769,12 @@ impl RemoteDependencies {
             .collect::<io::Result<Vec<_>>>()?;
         let mut configuration = configured.value();
         configuration["dependency_context"] = json!(context_version);
+        let workers = DependencyWorkerPool::new(workers);
+        // Bind before any invocation is admitted. The same pool is shared by
+        // persistent service operations, so worker readiness survives idle time.
+        workers.start()?;
         Ok(Some(Arc::new(Self {
-            workers: DependencyWorkerPool::new(workers),
+            workers,
             state,
             configuration,
             toolchain: Mutex::new(None),
@@ -752,6 +785,12 @@ impl RemoteDependencies {
     #[must_use]
     pub fn worker_count(&self) -> usize {
         self.workers.workers.len()
+    }
+
+    /// Stop idle listeners and join any transport drain before the service
+    /// releases its coordinator authority or process-wide state lock.
+    pub(crate) fn shutdown(&self) -> io::Result<()> {
+        self.workers.shutdown()
     }
 
     /// The connected daemon's pinned workers, for launcher compatibility checks.

@@ -935,6 +935,219 @@ fn shared_remote_source(root: &Path, label: &str, value: u32) {
 }
 
 #[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; real idle TLS heartbeats, fresh Cargo checks and graceful service restart"]
+fn canonical_shared_service_keeps_worker_ready_between_real_cargo_requests() {
+    fn heartbeat_count(worker: &NativeWorker) -> usize {
+        worker
+            .events()
+            .iter()
+            .filter(|event| event["kind"] == "worker-standby-heartbeat")
+            .count()
+    }
+
+    fn await_heartbeat(
+        worker: &mut NativeWorker,
+        service: &mut SharedServiceChild,
+        previous: usize,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        while heartbeat_count(worker) <= previous {
+            service.assert_running();
+            assert!(
+                worker
+                    .process
+                    .as_mut()
+                    .unwrap()
+                    .leader_try_wait()
+                    .unwrap()
+                    .is_none(),
+                "worker exited while idle: {:?}",
+                worker.events()
+            );
+            assert!(
+                Instant::now() < deadline,
+                "worker never completed a real idle heartbeat: {:?}\n{}",
+                worker.events(),
+                service.diagnostics()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn stop_service(service: SharedServiceChild, address: &str) {
+        let pid = service.process.as_ref().unwrap().pgid();
+        let pid = rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap();
+        rustix::process::kill_process(pid, rustix::process::Signal::TERM).unwrap();
+        let (code, _, output) = service.finish(Duration::from_secs(30), false);
+        assert_eq!(
+            code, 0,
+            "service did not finish its graceful drain: {output}"
+        );
+        // A successful normal exit is required above: a forced process kill
+        // could also release the port while hiding a stuck listener owner.
+        let rebound =
+            TcpListener::bind(address).expect("standby listener survived service shutdown");
+        drop(rebound);
+    }
+
+    let (owner, mut profile) = native_fixture();
+    let root = owner.path();
+    let source = root.join("standby-source");
+    write(
+        &source,
+        "Cargo.toml",
+        "[package]\nname='standby_app'\nversion='0.1.0'\nedition='2021'\n",
+    );
+    write(
+        &source,
+        "Cargo.lock",
+        "version=4\n\n[[package]]\nname='standby_app'\nversion='0.1.0'\n",
+    );
+    profile["source_root"] = json!(source);
+    profile["vendor"] = Value::Null;
+    profile["command"] = json!("check");
+    profile["selection"] = json!({"bins":true});
+    let socket = root.join("canonical-service.sock");
+    profile["service_socket"] = json!(socket);
+    let service_profile = root.join("standby-service.json");
+    fs::write(
+        &service_profile,
+        serde_json::to_vec(&json!({
+            "version":"canonical-compile-service-v1", "state_root":root.join("state"),
+            "socket":socket, "max_roots":2, "jobs_per_root":1,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let (mut worker, environment) = NativeWorker::start(root);
+    let address = &environment
+        .iter()
+        .find(|(name, _)| name == "RABS_DEPENDENCY_WORKER_LISTEN")
+        .unwrap()
+        .1;
+    let start_service = |generation| {
+        let mut command = shared_service_command(root);
+        command
+            .envs(environment.iter().map(|(name, value)| (name, value)))
+            .arg("--canonical-compile-service")
+            .arg(&service_profile);
+        let mut service =
+            SharedServiceChild::spawn(root, &format!("standby-service-{generation}"), command);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !service
+            .events()
+            .iter()
+            .any(|event| event["kind"] == "canonical-service-listening")
+        {
+            service.assert_running();
+            assert!(Instant::now() < deadline, "{}", service.diagnostics());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        service
+    };
+    let mut service = start_service(0);
+    await_heartbeat(&mut worker, &mut service, 0);
+    let initial: Value =
+        serde_json::from_slice(&read_bounded(&worker.state.join("requests.json"))).unwrap();
+    assert!(initial.get("last").is_some_and(Value::is_null));
+    assert!(fs::read_dir(root.join("ops")).unwrap().next().is_none());
+    assert!(
+        !service.events().iter().any(|event| {
+            matches!(
+                event["kind"].as_str(),
+                Some("rabsd-remote-dependency-admitted" | "rabsd-remote-dependency-executed")
+            )
+        }),
+        "standby must not manufacture an admitted operation"
+    );
+
+    let mut last_request = 0;
+    for number in 0..3 {
+        if number == 2 {
+            stop_service(service, address);
+            service = start_service(1);
+        }
+        if number != 0 {
+            let before = read_bounded(&worker.state.join("requests.json"));
+            let heartbeats = heartbeat_count(&worker);
+            await_heartbeat(&mut worker, &mut service, heartbeats);
+            assert_eq!(
+                read_bounded(&worker.state.join("requests.json")),
+                before,
+                "idle authentication and heartbeats must not change execution ownership"
+            );
+        }
+        let value = 41 + number;
+        write(&source, "src/value.rs", format!("{value}\n"));
+        write(
+            &source,
+            "src/main.rs",
+            format!(
+                "const VALUE: usize = include!(\"value.rs\");\nconst _: [(); {value}] = [(); VALUE];\nfn main() {{ println!(\"{{VALUE}}\"); }}\n"
+            ),
+        );
+        let previous_events = service.events().len();
+        let client = shared_service_client(root, 5300 + number, &profile);
+        let (code, events, output) = client.finish(Duration::from_secs(300), false);
+        assert_eq!(code, 0, "{output}\n{}", service.diagnostics());
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["kind"] == "canonical-build-completed"),
+            "a check must not claim to deliver a retained build target: {output}"
+        );
+        let artifacts = output
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|event| {
+                event["reason"] == "compiler-artifact" && event["target"]["name"] == "standby_app"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(artifacts.len(), 1, "{output}");
+        assert_eq!(artifacts[0]["fresh"], false, "{output}");
+        let receipt = worker.completed_receipt();
+        let request = receipt["request_id"].as_u64().unwrap();
+        assert!(
+            request > last_request,
+            "a prior receipt cannot satisfy a fresh check"
+        );
+        last_request = request;
+        let current = service.events();
+        let current = &current[previous_events..];
+        let handoffs = current
+            .iter()
+            .filter(|event| event["kind"] == "rabsd-worker-standby-dispatch")
+            .collect::<Vec<_>>();
+        assert_eq!(handoffs.len(), 1, "{current:?}");
+        assert_eq!(handoffs[0]["request_id"], request);
+        assert!(handoffs[0]["completed_heartbeats"].as_u64().unwrap() > 0);
+        for kind in [
+            "rabsd-remote-dependency-admitted",
+            "rabsd-remote-dependency-executed",
+        ] {
+            assert_eq!(
+                current.iter().filter(|event| event["kind"] == kind).count(),
+                1,
+                "every check must use one actual worker execution: {current:?}"
+            );
+        }
+        assert!(!decisions(current, "hit").contains_key("standby_app"));
+        assert!(!decisions(current, "execute").contains_key("standby_app"));
+        let journal: Value =
+            serde_json::from_slice(&read_bounded(&worker.state.join("requests.json"))).unwrap();
+        assert_eq!(journal["boot_generation"], initial["boot_generation"]);
+        assert_eq!(journal["incarnation"], initial["incarnation"]);
+    }
+    // Finish while the worker is parked, not only after an execution socket
+    // closes. This exercises the idle owner's explicit shutdown and join.
+    let heartbeats = heartbeat_count(&worker);
+    await_heartbeat(&mut worker, &mut service, heartbeats);
+    stop_service(service, address);
+    worker.finish();
+    assert!(fs::read_dir(root.join("ops")).unwrap().next().is_none());
+}
+
+#[test]
 #[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual concurrent canonical Cargo clients, shared TLS compiler execution and origin cancellation"]
 fn canonical_shared_remote_flight_survives_origin_cancellation() {
     let (owner, mut first_profile) = native_fixture();
