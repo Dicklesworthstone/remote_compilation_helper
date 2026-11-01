@@ -2,7 +2,7 @@
 """Install a complete, opt-in RABS toolset without changing Cargo or services.
 
 Accepts an extracted release bundle or Cargo's split-profile build directory.
-Generations are retained; one atomic symlink switch activates all four tools.
+Generations are retained; one atomic symlink switch activates all five tools.
 The supplied files must already be trusted: hashing detects copy corruption,
 not publisher authenticity. Verify the release signature/checksum first.
 
@@ -19,6 +19,12 @@ are reported as not-started; a lost installation receipt remains unconfirmed.
 Use --ssh-jobs 1..8 for bounded parallel deployment (default 1). Reports retain
 the requested host order. Cancellation stops queued work and owned SSH clients;
 it cannot undo a remote activation or authorize an automatic installation retry.
+
+After a lost acknowledgment, --verify --from-image TRANSFER_BIN checks whether
+the intended toolset is currently active, locally or on explicitly selected
+--ssh hosts. Verification reads existing files under the installation lock;
+it never installs, executes tools, or changes Cargo or services. A trusted
+--from-archive, --from-bundle or --from-build also selects expected bytes.
 """
 
 import argparse
@@ -91,6 +97,36 @@ if hashlib.sha256(source).hexdigest() != installer["sha256"]:
 namespace = {"__name__": "rabs_ssh_receiver", "__file__": "<rabs-ssh-installer>"}
 exec(compile(source, "<rabs-ssh-installer>", "exec"), namespace)
 namespace["receive_deployment"](header, sys.stdin.buffer, source)
+'''
+
+REMOTE_VERIFY_BOOTSTRAP = r'''
+import hashlib, json, sys
+def exact(count):
+    result = bytearray()
+    while len(result) < count:
+        chunk = sys.stdin.buffer.read(count - len(result))
+        if not chunk:
+            raise ValueError("truncated RABS verification request")
+        result.extend(chunk)
+    return bytes(result)
+def unique(pairs):
+    result = {}
+    for name, value in pairs:
+        if name in result:
+            raise ValueError("duplicate verification field")
+        result[name] = value
+    return result
+header = json.loads(exact(65536), object_pairs_hook=unique)
+inspector = header["inspector"]
+size = inspector["bytes"]
+if type(size) is not int or not 0 < size <= 131072:
+    raise ValueError("invalid verification inspector")
+source = exact(size)
+if hashlib.sha256(source).hexdigest() != inspector["sha256"]:
+    raise ValueError("verification inspector digest mismatch")
+namespace = {"__name__": "rabs_ssh_verifier", "__file__": "<rabs-ssh-verifier>"}
+exec(compile(source, "<rabs-ssh-verifier>", "exec"), namespace)
+namespace["receive_verification"](header, sys.stdin.buffer, source)
 '''
 
 
@@ -346,6 +382,379 @@ def install(paths, bin_dir, machine):
         if lock is not None:
             os.close(lock)
         os.close(directory)
+
+
+def unique_json(data):
+    def unique(pairs):
+        result = {}
+        for name, value in pairs:
+            if name in result:
+                raise InstallError("duplicate verification JSON field")
+            result[name] = value
+        return result
+    try:
+        return json.loads(data, object_pairs_hook=unique)
+    except (ValueError, UnicodeError, RecursionError) as error:
+        raise InstallError("invalid verification JSON") from error
+
+
+def validate_toolset(manifest):
+    if (not isinstance(manifest, dict) or set(manifest) != {"schema", "machine", "files"}
+            or type(manifest["schema"]) is not int or manifest["schema"] != 1
+            or type(manifest["machine"]) is not int
+            or manifest["machine"] not in TARGET_MACHINES.values()
+            or not isinstance(manifest["files"], dict) or set(manifest["files"]) != set(TOOLS)):
+        raise InstallError("invalid complete RABS toolset manifest")
+    total = 0
+    for name, entry in manifest["files"].items():
+        limit = 1024 * 1024 if name == "cargo-rabs" else MAX_FILE_BYTES
+        if (not isinstance(entry, dict) or set(entry) != {"bytes", "sha256"}
+                or type(entry["bytes"]) is not int or not 0 < entry["bytes"] <= limit
+                or not isinstance(entry["sha256"], str)
+                or re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]) is None):
+            raise InstallError("invalid expected executable identity: " + name)
+        total += entry["bytes"]
+    if total > MAX_ARCHIVE_BYTES:
+        raise InstallError("expected toolset exceeds its byte limit")
+    return manifest
+
+
+def toolset_digest(expected):
+    return hashlib.sha256(json.dumps(validate_toolset(expected), sort_keys=True,
+                                     separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def inspect_tool_bytes(name, reader, size):
+    """Hash exactly one bounded tool without executing it or following links."""
+    limit = 1024 * 1024 if name == "cargo-rabs" else MAX_FILE_BYTES
+    if type(size) is not int or not 0 < size <= limit:
+        raise InstallError("invalid executable size: " + name)
+    remaining = size
+    digest = hashlib.sha256()
+    prefix = b""
+    launcher = bytearray()
+    while remaining:
+        chunk = reader.read(min(1024 * 1024, remaining))
+        if not chunk:
+            raise InstallError("truncated executable: " + name)
+        remaining -= len(chunk)
+        digest.update(chunk)
+        if len(prefix) < 64:
+            prefix = (prefix + chunk)[:64]
+        if name == "cargo-rabs":
+            launcher.extend(chunk)
+    machine = None
+    if name == "cargo-rabs":
+        if not prefix.startswith(b"#!/usr/bin/env python3\n"):
+            raise InstallError("invalid cargo-rabs Python launcher")
+        ast.parse(launcher.decode("utf-8"), filename="cargo-rabs")
+    else:
+        machine = int.from_bytes(prefix[18:20], "little")
+        if machine not in TARGET_MACHINES.values():
+            raise InstallError("unsupported executable architecture: " + name)
+        require_native_elf(name, prefix, machine)
+    return {"bytes": size, "sha256": digest.hexdigest()}, machine
+
+
+def inspect_tool_file(name, path, directory=None, installed=False, expected=None):
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                         dir_fd=directory)
+    with os.fdopen(descriptor, "rb") as reader:
+        before = os.fstat(reader.fileno())
+        if (not stat.S_ISREG(before.st_mode) or not before.st_mode & 0o111
+                or (installed and (before.st_uid != os.geteuid() or before.st_nlink != 1
+                                   or stat.S_IMODE(before.st_mode) != 0o555))):
+            raise InstallError("unsafe executable ownership, mode or type: " + name)
+        if expected is not None and before.st_size != expected["bytes"]:
+            raise InstallError("active executable size differs from expected bytes: " + name)
+        identity, machine = inspect_tool_bytes(name, reader, before.st_size)
+        if (reader.read(1) or signature(os.fstat(reader.fileno())) != signature(before)
+                or signature(os.stat(path, dir_fd=directory, follow_symlinks=False)) != signature(before)):
+            raise InstallError("executable changed during verification: " + name)
+    return identity, machine, signature(before)
+
+
+def expected_toolset(paths):
+    if set(paths) != set(TOOLS):
+        raise InstallError("verification requires exactly the five RABS tools")
+    observed = {name: signature(path.lstat()) for name, path in paths.items()}
+    if sum(identity[2] for identity in observed.values()) > MAX_ARCHIVE_BYTES:
+        raise InstallError("expected toolset exceeds its byte limit")
+    files = {}
+    machines = set()
+    for name in TOOLS:
+        files[name], machine, identity = inspect_tool_file(name, paths[name])
+        if identity != observed[name]:
+            raise InstallError("expected tool changed during capture: " + name)
+        if machine is not None:
+            machines.add(machine)
+    for name, path in paths.items():
+        if signature(path.lstat()) != observed[name]:
+            raise InstallError("expected toolset changed during capture: " + name)
+    if len(machines) != 1:
+        raise InstallError("expected toolset mixes executable architectures")
+    return validate_toolset({"schema": 1, "machine": machines.pop(), "files": files})
+
+
+def expected_from_image(path):
+    """Recover expected bytes from the retained image, not its header alone.
+
+    The old installer is hashed as data and never executed. A successful read
+    binds every payload byte and refuses trailing/truncated/corrupt images.
+    """
+    path = Path(path).absolute()
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    with os.fdopen(descriptor, "rb") as reader:
+        before = os.fstat(reader.fileno())
+        if (not stat.S_ISREG(before.st_mode)
+                or not TRANSFER_HEADER_BYTES < before.st_size
+                <= TRANSFER_HEADER_BYTES + MAX_ARCHIVE_BYTES + MAX_INSTALLER_BYTES):
+            raise InstallError("invalid retained deployment image")
+        header = unique_json(reader.read(TRANSFER_HEADER_BYTES))
+        total = validate_deployment_header(header)
+        if before.st_size != TRANSFER_HEADER_BYTES + total:
+            raise InstallError("retained deployment image length differs")
+        files = {}
+        machines = set()
+        for entry in header["files"]:
+            name = entry["name"]
+            if name == "install-rabs":
+                data = reader.read(entry["bytes"])
+                actual = {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+            else:
+                actual, machine = inspect_tool_bytes(name, reader, entry["bytes"])
+                files[name] = actual
+                if machine is not None:
+                    machines.add(machine)
+            if actual != {"bytes": entry["bytes"], "sha256": entry["sha256"]}:
+                raise InstallError("retained deployment image digest mismatch: " + name)
+        if (reader.read(1) or signature(os.fstat(reader.fileno())) != signature(before)
+                or signature(path.lstat()) != signature(before)):
+            raise InstallError("retained deployment image changed during verification")
+    if len(machines) != 1:
+        raise InstallError("retained deployment image mixes executable architectures")
+    return validate_toolset({"schema": 1, "machine": machines.pop(), "files": files}), header["bin_dir"]
+
+
+def existing_install_directory(path, private=False, parent=None):
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         dir_fd=parent)
+    metadata = os.fstat(descriptor)
+    if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) & (0o077 if private else 0o022):
+        os.close(descriptor)
+        raise InstallError("unsafe existing installation directory: " + str(path))
+    return descriptor
+
+
+def verify_generation_inventory(directory):
+    inventory = set()
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            inventory.add(entry.name)
+            if len(inventory) > len(TOOLS) + 1:
+                raise InstallError("active generation has unexpected entries")
+    if inventory != set(TOOLS) | {"manifest.json"}:
+        raise InstallError("active generation has an incomplete or unexpected inventory")
+
+
+def verify_installed(expected, bin_dir):
+    """Observe one complete current generation while excluding normal activation.
+
+    Open only existing paths, including the lock. Revalidate names and held
+    descriptors after hashing, so replacement cannot turn a mixed observation
+    into a successful recovery report. This is a present-state observation;
+    it does not reconstruct the lost acknowledgment or prove a running process.
+    """
+    validate_toolset(expected)
+    if host_machine() != expected["machine"]:
+        raise InstallError("expected toolset is not native to this host")
+    root = Path(bin_dir).absolute()
+    directory = existing_install_directory(root)
+    opened = [directory]
+    try:
+        lock = os.open(".rabs-install.lock", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                       | os.O_CLOEXEC, dir_fd=directory)
+        opened.append(lock)
+        lock_metadata = os.fstat(lock)
+        if (not stat.S_ISREG(lock_metadata.st_mode) or lock_metadata.st_uid != os.geteuid()
+                or lock_metadata.st_nlink != 1 or stat.S_IMODE(lock_metadata.st_mode) & 0o077):
+            raise InstallError("unsafe RABS installation lock")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise InstallError("RABS installation is active; current generation was not verified") from error
+        check_links(directory)
+        links = {name: (signature(os.stat(name, dir_fd=directory, follow_symlinks=False)),
+                        os.readlink(name, dir_fd=directory)) for name in TOOLS + (CURRENT,)}
+        current = links[CURRENT][1]
+        generation = current.split("/")[1]
+        versions = existing_install_directory(VERSIONS, private=True, parent=directory)
+        opened.append(versions)
+        active = existing_install_directory(generation, private=True, parent=versions)
+        opened.append(active)
+        active_identity = signature(os.fstat(active))
+        verify_generation_inventory(active)
+        manifest_fd = os.open("manifest.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                              | os.O_CLOEXEC, dir_fd=active)
+        with os.fdopen(manifest_fd, "rb") as reader:
+            before = os.fstat(reader.fileno())
+            if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid()
+                    or before.st_nlink != 1 or stat.S_IMODE(before.st_mode) & 0o022
+                    or not 0 < before.st_size <= TRANSFER_HEADER_BYTES):
+                raise InstallError("unsafe active generation manifest")
+            manifest = validate_toolset(unique_json(reader.read(TRANSFER_HEADER_BYTES + 1)))
+            if signature(os.fstat(reader.fileno())) != signature(before):
+                raise InstallError("active generation manifest changed during verification")
+        observed = {"manifest.json": signature(before)}
+        if manifest != expected:
+            raise InstallError("active generation {} differs from the expected toolset".format(generation))
+        files = {}
+        for name in TOOLS:
+            files[name], machine, observed[name] = inspect_tool_file(
+                name, name, active, installed=True, expected=expected["files"][name])
+            if files[name] != expected["files"][name] or machine not in (None, expected["machine"]):
+                raise InstallError("active executable differs from expected bytes: " + name)
+        for name, identity in observed.items():
+            if signature(os.stat(name, dir_fd=active, follow_symlinks=False)) != identity:
+                raise InstallError("active generation changed during verification: " + name)
+        verify_generation_inventory(active)
+        if signature(os.fstat(active)) != active_identity:
+            raise InstallError("active generation directory changed during verification")
+        for name, identity in links.items():
+            if (signature(os.stat(name, dir_fd=directory, follow_symlinks=False)),
+                    os.readlink(name, dir_fd=directory)) != identity:
+                raise InstallError("active generation links changed during verification: " + name)
+        for name, parent, descriptor in [(VERSIONS, directory, versions),
+                                         (generation, versions, active),
+                                         (".rabs-install.lock", directory, lock)]:
+            named = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            held = os.fstat(descriptor)
+            if (named.st_dev, named.st_ino) != (held.st_dev, held.st_ino):
+                raise InstallError("installation path changed during verification: " + name)
+        verify_directory(root, directory)
+        return {"kind": "rabs-install-verification", "state": "verified", "bin_dir": str(root),
+                "generation": generation, "machine": expected["machine"], "files": files,
+                "expected_toolset_sha256": toolset_digest(expected), "installation_changed": False,
+                "services_started": False, "cargo_config_changed": False}
+    finally:
+        for descriptor in reversed(opened):
+            os.close(descriptor)
+
+
+def verification_result(expected, bin_dir):
+    try:
+        return verify_installed(expected, bin_dir)
+    except (InstallError, OSError, SyntaxError, UnicodeError, RecursionError) as error:
+        return {"kind": "rabs-install-verification", "state": "unverified",
+                "bin_dir": str(Path(bin_dir).absolute()), "error": str(error)[:4096],
+                "expected_toolset_sha256": toolset_digest(expected), "installation_changed": False,
+                "services_started": False, "cargo_config_changed": False}
+
+
+def validate_verification_request(header):
+    if (not isinstance(header, dict)
+            or set(header) != {"schema", "kind", "inspector", "expected", "bin_dir"}
+            or type(header["schema"]) is not int or header["schema"] != 1
+            or header["kind"] != "rabs-verify-request"):
+        raise InstallError("invalid verification request")
+    root = header["bin_dir"]
+    if root is not None and (not isinstance(root, str) or not os.path.isabs(root) or "\0" in root):
+        raise InstallError("invalid verification installation root")
+    inspector = header["inspector"]
+    if (not isinstance(inspector, dict) or set(inspector) != {"bytes", "sha256"}
+            or type(inspector["bytes"]) is not int or not 0 < inspector["bytes"] <= MAX_INSTALLER_BYTES
+            or not isinstance(inspector["sha256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", inspector["sha256"]) is None):
+        raise InstallError("invalid verification inspector identity")
+    validate_toolset(header["expected"])
+
+
+def receive_verification(header, reader, source):
+    validate_verification_request(header)
+    if (len(source) != header["inspector"]["bytes"]
+            or hashlib.sha256(source).hexdigest() != header["inspector"]["sha256"]
+            or reader.read(1)):
+        raise InstallError("verification request identity or termination differs")
+    root = header["bin_dir"] or str(Path.home() / ".local" / "bin")
+    result = verification_result(header["expected"], root)
+    result.update({"transport": "ssh", "inspector_sha256": header["inspector"]["sha256"]})
+    print(json.dumps(result, sort_keys=True), flush=True)
+
+
+def prepare_verification(expected, bin_dir):
+    source = Path(__file__).resolve()
+    descriptor = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    with os.fdopen(descriptor, "rb") as reader:
+        before = os.fstat(reader.fileno())
+        if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= MAX_INSTALLER_BYTES:
+            raise InstallError("invalid verification inspector size or type")
+        code = reader.read(MAX_INSTALLER_BYTES + 1)
+        if (len(code) != before.st_size or signature(os.fstat(reader.fileno())) != signature(before)
+                or signature(source.lstat()) != signature(before)):
+            raise InstallError("verification inspector changed during capture")
+    header = {"schema": 1, "kind": "rabs-verify-request", "expected": expected,
+              "bin_dir": bin_dir, "inspector": {"bytes": len(code),
+                                               "sha256": hashlib.sha256(code).hexdigest()}}
+    validate_verification_request(header)
+    encoded = json.dumps(header, sort_keys=True).encode("utf-8")
+    if len(encoded) > TRANSFER_HEADER_BYTES:
+        raise InstallError("verification request exceeds its byte limit")
+    stage = Path(tempfile.mkdtemp(prefix="rabs-verify-send-"))
+    wire = stage / "request.bin"
+    with wire.open("xb") as writer:
+        writer.write(encoded.ljust(TRANSFER_HEADER_BYTES, b" "))
+        writer.write(code)
+        writer.flush()
+        os.fchmod(writer.fileno(), 0o400)
+        os.fsync(writer.fileno())
+    return wire, header, signature(wire.lstat())
+
+
+def verification_reply(stdout, header):
+    receipt = unique_json(stdout.decode("utf-8"))
+    if (not isinstance(receipt, dict) or receipt.get("kind") != "rabs-install-verification"
+            or receipt.get("state") not in ("verified", "unverified")
+            or receipt.get("transport") != "ssh"
+            or receipt.get("inspector_sha256") != header["inspector"]["sha256"]
+            or receipt.get("expected_toolset_sha256") != toolset_digest(header["expected"])
+            or receipt.get("installation_changed") is not False
+            or receipt.get("services_started") is not False
+            or receipt.get("cargo_config_changed") is not False):
+        raise InstallError("remote verification receipt does not bind this inspection")
+    root = receipt.get("bin_dir")
+    if (not isinstance(root, str) or not os.path.isabs(root) or "\0" in root
+            or (header["bin_dir"] is not None and root != str(Path(header["bin_dir"]).absolute()))):
+        raise InstallError("remote verification destination differs")
+    if receipt["state"] == "verified":
+        if (not isinstance(receipt.get("generation"), str)
+                or re.fullmatch(r"gen-[a-zA-Z0-9_-]+", receipt["generation"]) is None
+                or receipt.get("files") != header["expected"]["files"]
+                or type(receipt.get("machine")) is not int
+                or receipt["machine"] != header["expected"]["machine"]
+                or any(type(entry.get("bytes")) is not int for entry in receipt["files"].values())):
+            raise InstallError("remote verified generation or file identities differ")
+    elif not isinstance(receipt.get("error"), str) or not 0 < len(receipt["error"]) <= 4096:
+        raise InstallError("remote verification refusal has no bounded reason")
+    return receipt
+
+
+def verify_hosts(expected, hosts, bin_dir, timeout, jobs=1):
+    validate_deploy_options(hosts, bin_dir, timeout, MIN_DEPLOY_RESERVE)
+    validate_parallelism(jobs)
+    wire, header, identity = prepare_verification(expected, bin_dir)
+    def inspect(host, cancelled):
+        if cancelled.is_set():
+            return {"host": host, "state": "unverified", "error": "verification cancelled before inspection"}
+        try:
+            receipt = verification_reply(
+                ssh_exchange(ssh_command(host, timeout, REMOTE_VERIFY_BOOTSTRAP),
+                             wire, identity, timeout, cancelled), header)
+            return {"host": host, "state": receipt["state"], "receipt": receipt}
+        except (InstallError, OSError, UnicodeError, subprocess.SubprocessError, RecursionError) as error:
+            return {"host": host, "state": "unverified", "error": str(error)[:4096]}
+    return {"kind": "rabs-verified", "workers": run_hosts(hosts, jobs, inspect),
+            "expected_toolset_sha256": toolset_digest(expected), "installation_changed": False,
+            "services_started": False, "cargo_config_changed": False}
 
 
 def deployment_space(path, required):
@@ -792,6 +1201,10 @@ def main(argv=None):
                         help="flat release archive whose publisher signature has already been verified")
     source.add_argument("--from-target", action="append", metavar="TARGET=TAR_GZ",
                         help="authenticated release archive per Linux GNU target; repeat for a mixed SSH fleet")
+    source.add_argument("--from-image", metavar="TRANSFER_BIN",
+                        help="retained transfer_image to inspect after a lost acknowledgment; requires --verify")
+    parser.add_argument("--verify", action="store_true",
+                        help="read-only comparison of the active generation with the selected expected toolset")
     parser.add_argument("--bin-dir", help="absolute destination; default is the destination user's ~/.local/bin")
     parser.add_argument("--ssh", action="append", default=[], metavar="HOST",
                         help="deploy over authenticated SSH; repeat for workers (mixed architectures with --from-target)")
@@ -806,6 +1219,34 @@ def main(argv=None):
         validate_parallelism(args.ssh_jobs)
         if not args.ssh and args.ssh_jobs != 1:
             raise InstallError("--ssh-jobs requires at least one --ssh worker")
+        if args.from_image and not args.verify:
+            raise InstallError("--from-image requires --verify; retained images are never reinstalled automatically")
+        if args.verify:
+            if args.from_target:
+                raise InstallError("verify one intended toolset at a time; select its retained --from-image or --from-archive")
+            if args.ssh:
+                validate_deploy_options(args.ssh, args.bin_dir, args.ssh_timeout, MIN_DEPLOY_RESERVE)
+            if args.from_image:
+                expected, original_bin_dir = expected_from_image(args.from_image)
+                if (args.bin_dir is not None
+                        and (original_bin_dir is None
+                             or Path(args.bin_dir).absolute() != Path(original_bin_dir).absolute())):
+                    raise InstallError("--bin-dir differs from the retained deployment destination")
+                args.bin_dir = original_bin_dir
+            elif args.from_archive:
+                with tempfile.TemporaryDirectory(prefix="rabs-verify-bundle-") as temporary:
+                    unpack_archive(args.from_archive, Path(temporary))
+                    expected = expected_toolset(source_files(temporary, None))
+            else:
+                expected = expected_toolset(source_files(args.from_bundle, args.from_build))
+            if args.ssh:
+                result = verify_hosts(expected, args.ssh, args.bin_dir, args.ssh_timeout, args.ssh_jobs)
+                failed = any(worker["state"] != "verified" for worker in result["workers"])
+            else:
+                result = verification_result(expected, args.bin_dir or str(Path.home() / ".local" / "bin"))
+                failed = result["state"] != "verified"
+            print(json.dumps(result, sort_keys=True))
+            return int(failed)
         if args.from_target:
             result = deploy_targets(args.from_target, args.ssh, args.bin_dir, args.ssh_timeout,
                                     args.ssh_reserve_mib * 1024 * 1024, args.ssh_jobs)
@@ -835,7 +1276,8 @@ def main(argv=None):
         else:
             paths = source_files(args.from_bundle, args.from_build)
             result = install(paths, args.bin_dir, machine)
-    except (InstallError, OSError, SyntaxError, UnicodeError, tarfile.TarError, EOFError, zlib.error) as error:
+    except (InstallError, OSError, SyntaxError, UnicodeError, RecursionError,
+            tarfile.TarError, EOFError, zlib.error) as error:
         print("install-rabs: " + str(error), file=sys.stderr)
         return 1
     print(json.dumps(result, sort_keys=True))

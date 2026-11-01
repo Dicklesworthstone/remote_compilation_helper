@@ -1,7 +1,7 @@
 # Deploying the RABS toolset over SSH
 
 `install-rabs --ssh HOST` transfers and installs `cargo-rabs`, `rabs-wrap`,
-`rabsd`, and `rabs-wkr` together. Repeat `--ssh` for up to 32 distinct SSH
+`rabsd`, `rabs-wkr`, and `rabs-cargo-root` together. Repeat `--ssh` for up to 32 distinct SSH
 host aliases. This is the S7 tool-distribution path: it does **not** turn the
 host-local dependency cache into fleet-wide canonical execution, start services,
 reconfigure Cargo, or qualify a release to serve cached compiler outputs.
@@ -31,7 +31,7 @@ not restart or kill them. Existing daemon configuration is not changed.
 
 An extracted, trusted bundle works with `--from-bundle`. Locally built tools
 work with `--from-build /path/to/target/<target-triple>`, which selects
-`wrapper-release/rabs-wrap`, `daemon-release/{rabsd,rabs-wkr}`, and the
+`wrapper-release/rabs-wrap`, `daemon-release/{rabsd,rabs-wkr,rabs-cargo-root}`, and the
 checkout's `scripts/cargo-rabs`. No compiler runs on the deployment path.
 
 ## Transport and activation
@@ -42,7 +42,7 @@ process first. Agent forwarding and port forwarding are disabled; no project
 source, Cargo environment, or credentials are included in the transfer.
 
 The dispatcher captures one private transfer image containing the installer
-and all four tools, checking source file identities before and after capture.
+and all five tools, checking source file identities before and after capture.
 Every worker receives those same bytes. The receiver verifies the complete
 inventory, exact sizes, SHA-256 digests, and stream termination before calling
 the existing installer. All tools become current via one atomic generation
@@ -70,10 +70,9 @@ does not prevent attempts on the other distinct, explicitly selected workers.
 **An unconfirmed result is not proof that installation did not happen.** A
 connection may fail after the active generation was switched. The command
 never retries that worker automatically, invents a rollback, or starts an old
-or new daemon to guess the outcome. Inspect the worker's `.rabs-current` link
-and retained `.rabs-versions/<generation>/manifest.json` before another
-operator-directed installation. Compare the current files' actual hashes
-against the desired toolset; the manifest alone is not a fresh content check.
+or new daemon to guess the outcome. Use the read-only verification command
+below to check whether the intended toolset is now active before considering
+another operator-directed installation.
 
 The sender retains the `transfer_image` path reported in the JSON result.
 Successful receipts also name the receiver's `staging_dir`. Incomplete remote
@@ -81,6 +80,71 @@ stages use private `rabs-deploy-recv-*` directories under that worker's temporar
 directory. Staging and previous generations are not automatically deleted.
 Retained stages therefore consume disk and require deliberate operator
 retention management; the installer makes no garbage-collection claim.
+
+### Verify an interrupted activation
+
+Use the `transfer_image` path from the original deployment result and the same
+SSH user/host. The image retains the exact bytes sent, even if the original
+build directory has subsequently changed:
+
+```sh
+python3 scripts/install-rabs --verify \
+  --from-image /absolute/path/to/rabs-deploy-send-IDENTITY/transfer.bin \
+  --ssh worker-a
+```
+
+This checks the image's complete payload against its recorded hashes, then
+asks the worker to inspect its current managed generation. It sends only the
+current inspector and expected file identities, without retransmitting tools.
+The receiver opens the existing installation lock for shared read access,
+checks all public links and the active generation manifest, and hashes all
+five actual executable files. It also checks native ELF identity, launcher
+syntax, ownership and permissions, and rechecks file/link identities after
+reading. A manifest alone cannot establish success. No installed executable
+is run, no destination or lock is created, and no generation is activated,
+replaced, repaired or removed. An installation already holding the lock
+produces an unverified result instead of a partial observation.
+
+The original image selects the original destination. If its `bin_dir` was
+omitted, verification again uses the remote user's `~/.local/bin`. An explicit
+`--bin-dir` that changes the image's destination is refused. For a mixed fleet,
+select the corresponding image from the original result's `transfer_images`
+map and verify that architecture's hosts together; a wrong-architecture
+toolset cannot verify. Repeat `--ssh` and use `--ssh-jobs 1..8` to check several
+hosts with the existing strict SSH policy, per-host deadline and output cap.
+
+You can instead select an already authenticated release archive, an extracted
+bundle, or matching local build outputs:
+
+```sh
+python3 scripts/install-rabs --verify \
+  --from-archive /absolute/path/to/authenticated-linux-release.tar.gz \
+  --ssh worker-a --ssh worker-b --ssh-jobs 2
+
+python3 scripts/install-rabs --verify \
+  --from-bundle /absolute/path/to/trusted-bundle \
+  --bin-dir /absolute/path/to/installed/bin
+```
+
+Omitting `--ssh` checks the local installation. Verification accepts one
+expected toolset per invocation; `--from-target` is an installation option.
+Expected archives/images must already be trusted. Comparison hashes detect
+changed bytes and bind the result to that selected toolset; they do not
+authenticate its publisher or establish Rust build qualification.
+
+An SSH result has `kind: "rabs-verified"`; each worker is `verified` or
+`unverified`. A successful receipt names the observed generation and includes
+all file hashes and `expected_toolset_sha256`. Local verification emits the
+same per-installation receipt directly. Exit status is **zero only when every
+requested installation currently matches the expected toolset**. Missing,
+corrupt, mixed, unsafe, concurrently changing or unreachable installations
+produce a nonzero result with a reason. No automatic retry or rollback follows.
+
+A successful check resolves whether the desired files are active **now**.
+The earlier lost acknowledgment remains unconfirmed as a historical event;
+verification does not prove which deployment activated those bytes, which
+generation a running process uses, or whether coordinator admission and Cargo
+serving work. Existing services and Cargo configuration remain untouched.
 
 ## Regression coverage
 
