@@ -47,6 +47,10 @@ use rabs_cas::metadata_store::{ActionEntryRow, RabsMetadataStore, SqlValue, dige
 use rabs_cas::publication::{
     OfferPreparedActionResult, PublicationOutcome, observable_result_digest_v1,
 };
+use rabs_key::live_dependency::workspace_dependency_cache::{
+    CommittedDependencyPolicy, committed_dependency_descriptor_policy,
+    uses_committed_dependency_namespace,
+};
 use rabs_key::live_dependency::{
     DependencyActionPlan, DependencySourceKind, LiveDependencyKey,
     canonicalize_compiler_transcript, canonicalize_placements, check_dependency_cache_read_closure,
@@ -126,6 +130,13 @@ impl LiveDependencyRequest {
     }
 
     fn verify_read_closure(&self) -> Result<(), String> {
+        if committed_dependency_descriptor_policy(&self.key.descriptor).is_some()
+            || uses_committed_dependency_namespace(&self.key.descriptor)
+        {
+            return Err(
+                "committed dependencies require their retained isolated remote proof".into(),
+            );
+        }
         if self.plan.source_kind.is_workspace() {
             return Err(
                 "workspace actions require an independently isolated remote compiler".into(),
@@ -989,13 +1000,13 @@ fn verify_canonical_surface_free_of_roots(
 impl LiveDependencyLane {
     /// Qualify exact observed candidates against this operation's installations
     /// and the coordinator's current committed producer lineage.
-    pub(crate) fn committed_workspace_inputs(
+    pub(crate) fn committed_inputs(
         &self,
         paths: &Arc<canonical::CanonicalPaths>,
         dependencies: Arc<DependencyFacts>,
-        consumer_kind: DependencySourceKind,
+        policy: CommittedDependencyPolicy,
     ) -> Result<Arc<canonical::CommittedWorkspaceInputs>, String> {
-        paths.capture_committed_workspace_inputs(&self.coord, dependencies, consumer_kind)
+        paths.capture_committed_inputs(&self.coord, dependencies, policy)
     }
 
     /// The lane over a live coordinator.
@@ -1469,15 +1480,14 @@ impl ExecutionAttempt {
         self.request.dependencies.verify_unchanged()?;
         let committed_ancestors = match &self.remote_validation {
             Some(validation) => validation.committed_ancestors(&self.request)?,
-            None if matches!(
-                plan.source_kind,
-                DependencySourceKind::WorkspaceCommittedRlib
-                    | DependencySourceKind::WorkspaceCommittedMetadata
-                    | DependencySourceKind::WorkspaceMixedRlib
-                    | DependencySourceKind::WorkspaceMixedMetadata
-            ) =>
+            None if CommittedDependencyPolicy::from_source_kind(plan.source_kind).is_some()
+                || committed_dependency_descriptor_policy(&self.request.key.descriptor)
+                    .is_some()
+                || uses_committed_dependency_namespace(&self.request.key.descriptor) =>
             {
-                return Err("committed workspace capture has no remote producer capability".into());
+                return Err(
+                    "committed dependency capture has no remote producer capability".into(),
+                );
             }
             None => Vec::new(),
         };

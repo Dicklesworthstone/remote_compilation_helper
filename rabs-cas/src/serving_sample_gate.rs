@@ -82,6 +82,19 @@ pub enum ActionClassRisk {
     /// Workspace checks with qualified immutable leaves and committed workspace
     /// producers, independently sampled from both dependency and archive classes.
     MixedWorkspaceMetadata,
+    /// Immutable dependency archives whose complete retained candidate set has
+    /// committed immutable producer ancestry. Generic dependency samples do
+    /// not qualify this independently keyed provenance contract.
+    ImmutableDagRlib,
+    /// Immutable dependency checks with exact committed immutable ancestry.
+    /// Metadata and archive producer contracts remain independently sampled.
+    ImmutableDagMetadata,
+    /// Workspace archives that admit committed immutable dependency DAGs as
+    /// well as the narrower existing workspace and immutable-leaf classes.
+    WorkspaceDagRlib,
+    /// Workspace checks whose committed producer graph may include separately
+    /// qualified immutable dependency DAGs. Requires its own class evidence.
+    WorkspaceDagMetadata,
     /// Anything else: general workspace outputs, tool-generated code, unknown
     /// classes. Never sampled.
     Elevated,

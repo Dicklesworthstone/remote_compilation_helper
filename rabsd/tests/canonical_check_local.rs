@@ -5079,6 +5079,26 @@ fn closed_workspace_metadata_dag_observations(
     output: &str,
     target_state: &str,
 ) -> Vec<String> {
+    workspace_dag_metadata_observations(events, output, target_state, &WORKSPACE_DAG_NAMES)
+}
+
+fn workspace_dag_metadata_observations(
+    events: &[Value],
+    output: &str,
+    target_state: &str,
+    names: &[&str],
+) -> Vec<String> {
+    workspace_dag_metadata_observations_with_fresh(events, output, target_state, names, &[], true)
+}
+
+fn workspace_dag_metadata_observations_with_fresh(
+    events: &[Value],
+    output: &str,
+    target_state: &str,
+    names: &[&str],
+    fresh: &[&str],
+    include_consumer: bool,
+) -> Vec<String> {
     let started = events
         .iter()
         .filter(|event| event["kind"] == "canonical-compilation-started")
@@ -5098,27 +5118,54 @@ fn closed_workspace_metadata_dag_observations(
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter(|event| event["reason"] == "compiler-artifact")
         .collect::<Vec<_>>();
-    assert_eq!(artifacts.len(), 4, "{output}");
-    for name in WORKSPACE_DAG_NAMES
-        .into_iter()
-        .chain([WORKSPACE_METADATA_DAG_CONSUMER])
+    assert_eq!(
+        artifacts.len(),
+        names.len() + usize::from(include_consumer),
+        "{output}"
+    );
+    for name in names
+        .iter()
+        .copied()
+        .chain(include_consumer.then_some(WORKSPACE_METADATA_DAG_CONSUMER))
     {
         let matching = artifacts
             .iter()
             .filter(|event| event["target"]["name"] == name)
             .collect::<Vec<_>>();
         assert_eq!(matching.len(), 1, "{name}: {output}");
-        assert_eq!(matching[0]["fresh"], false, "{output}");
+        assert_eq!(
+            matching[0]["fresh"],
+            fresh.contains(&name),
+            "{name}: {output}"
+        );
         assert!(matching[0]["executable"].is_null(), "{output}");
     }
-    closed_workspace_dag_diagnostics(output)
+    workspace_dag_diagnostics(output, names)
 }
 
 fn closed_workspace_metadata_dag_files(target: &Path, output: &str) -> BTreeMap<String, Vec<u8>> {
+    workspace_dag_metadata_files(target, output, &WORKSPACE_DAG_NAMES)
+}
+
+fn workspace_dag_metadata_files(
+    target: &Path,
+    output: &str,
+    names: &[&str],
+) -> BTreeMap<String, Vec<u8>> {
+    workspace_dag_metadata_files_with_consumer(target, output, names, true)
+}
+
+fn workspace_dag_metadata_files_with_consumer(
+    target: &Path,
+    output: &str,
+    names: &[&str],
+    include_consumer: bool,
+) -> BTreeMap<String, Vec<u8>> {
     let mut files = BTreeMap::new();
-    for name in WORKSPACE_DAG_NAMES
-        .into_iter()
-        .chain([WORKSPACE_METADATA_DAG_CONSUMER])
+    for name in names
+        .iter()
+        .copied()
+        .chain(include_consumer.then_some(WORKSPACE_METADATA_DAG_CONSUMER))
     {
         let metadata = delivered_cargo_outputs(target, output, name, "rmeta");
         assert_eq!(metadata.len(), 1, "{name}: {output}");
@@ -5161,13 +5208,24 @@ fn closed_workspace_metadata_dag_files(target: &Path, output: &str) -> BTreeMap<
                 .is_none()
         );
     }
-    assert_eq!(files.len(), 8);
+    assert_eq!(
+        files.len(),
+        (names.len() + usize::from(include_consumer)) * 2
+    );
     files
 }
 
 fn closed_workspace_dag_outputs(
     events: &[Value],
     output: &str,
+) -> (PathBuf, BTreeMap<String, Vec<u8>>, Vec<String>) {
+    workspace_dag_archive_outputs(events, output, &WORKSPACE_DAG_NAMES)
+}
+
+fn workspace_dag_archive_outputs(
+    events: &[Value],
+    output: &str,
+    names: &[&str],
 ) -> (PathBuf, BTreeMap<String, Vec<u8>>, Vec<String>) {
     let completed = events
         .iter()
@@ -5176,7 +5234,7 @@ fn closed_workspace_dag_outputs(
     assert_eq!(completed.len(), 1, "{output}");
     let target = PathBuf::from(completed[0]["target_directory"].as_str().unwrap());
     let mut files = BTreeMap::new();
-    for name in WORKSPACE_DAG_NAMES {
+    for &name in names {
         let artifacts = output
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -5235,11 +5293,11 @@ fn closed_workspace_dag_outputs(
             assert!(extensions.contains(required), "missing {name} {required}");
         }
     }
-    let diagnostics = closed_workspace_dag_diagnostics(output);
+    let diagnostics = workspace_dag_diagnostics(output, names);
     (target, files, diagnostics)
 }
 
-fn closed_workspace_dag_diagnostics(output: &str) -> Vec<String> {
+fn workspace_dag_diagnostics(output: &str, names: &[&str]) -> Vec<String> {
     let diagnostics = output
         .lines()
         .filter(|line| {
@@ -5247,7 +5305,7 @@ fn closed_workspace_dag_diagnostics(output: &str) -> Vec<String> {
                 event["reason"] == "compiler-message"
                     && event["target"]["name"]
                         .as_str()
-                        .is_some_and(|name| WORKSPACE_DAG_NAMES.contains(&name))
+                        .is_some_and(|name| names.contains(&name))
             })
         })
         .map(str::to_owned)
@@ -5266,6 +5324,15 @@ fn assert_closed_workspace_dag_ancestry(
     keys: &BTreeMap<String, String>,
     files: &BTreeMap<String, Vec<u8>>,
 ) {
+    assert_workspace_dag_ancestry(root, keys, files, &WORKSPACE_DAG_NAMES);
+}
+
+fn assert_workspace_dag_ancestry(
+    root: &Path,
+    keys: &BTreeMap<String, String>,
+    files: &BTreeMap<String, Vec<u8>>,
+    names: &[&str],
+) {
     use rabs_cas::digest_set::{DigestRequest, StreamingObjectWriter};
     use rabs_cas::metadata_store::{RabsMetadataStore, digest_key};
 
@@ -5273,13 +5340,13 @@ fn assert_closed_workspace_dag_ancestry(
         rabsd::janitor::store::mount_and_reconcile(&root.join("state/canonical-compile-v1/cas"))
             .unwrap();
     let mut store = cas.store().lock().unwrap();
-    for (index, name) in WORKSPACE_DAG_NAMES.iter().enumerate() {
+    for (index, name) in names.iter().enumerate() {
         let ancestors = store.list_provisional_ancestors(&keys[*name]).unwrap();
         let actual = ancestors
             .iter()
             .map(|ancestor| ancestor.producer_action_key.clone())
             .collect::<BTreeSet<_>>();
-        let expected = WORKSPACE_DAG_NAMES[..index]
+        let expected = names[..index]
             .iter()
             .map(|name| keys[*name].clone())
             .collect::<BTreeSet<_>>();
@@ -5400,19 +5467,30 @@ fn mixed_workspace_dag_outputs(
     output: &str,
     targets: &mut BTreeSet<PathBuf>,
 ) -> (BTreeMap<String, Vec<u8>>, Vec<String>) {
+    workspace_dag_outputs(root, command, events, output, targets, &WORKSPACE_DAG_NAMES)
+}
+
+fn workspace_dag_outputs(
+    root: &Path,
+    command: &str,
+    events: &[Value],
+    output: &str,
+    targets: &mut BTreeSet<PathBuf>,
+    names: &[&str],
+) -> (BTreeMap<String, Vec<u8>>, Vec<String>) {
     if command == "check" {
-        let diagnostics = closed_workspace_metadata_dag_observations(events, output, "cold");
+        let diagnostics = workspace_dag_metadata_observations(events, output, "cold", names);
         let new_targets = fs::read_dir(root.join("state/canonical-compile-v1/private-target-v2"))
             .unwrap()
             .map(|entry| entry.unwrap().path().join("seed/target"))
             .filter(|target| !targets.contains(target))
             .collect::<Vec<_>>();
         assert_eq!(new_targets.len(), 1, "check did not retain a fresh target");
-        let files = closed_workspace_metadata_dag_files(&new_targets[0], output);
+        let files = workspace_dag_metadata_files(&new_targets[0], output, names);
         assert!(targets.insert(new_targets[0].clone()));
         (files, diagnostics)
     } else {
-        let (target, files, diagnostics) = closed_workspace_dag_outputs(events, output);
+        let (target, files, diagnostics) = workspace_dag_archive_outputs(events, output, names);
         assert!(targets.insert(target));
         (files, diagnostics)
     }
@@ -5687,6 +5765,344 @@ fn mixed_workspace_dag_replay(command: &str) {
 }
 
 #[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; restored Cargo Fresh parents must preserve committed metadata authority across coordinator restarts and producer revocation"]
+fn canonical_warm_workspace_metadata_preserves_committed_provenance_across_restarts() {
+    warm_committed_metadata_replay(false);
+}
+
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; restored immutable and workspace producers must preserve mixed metadata authority across coordinator restarts and producer revocation"]
+fn canonical_warm_mixed_metadata_preserves_committed_provenance_across_restarts() {
+    warm_committed_metadata_replay(true);
+}
+
+fn warm_committed_metadata_replay(mixed: bool) {
+    use rabs_cas::metadata_store::{QuarantineScope, RabsMetadataStore};
+
+    let (owner, mut profile) = native_fixture();
+    let root = owner.path();
+    let first = root.join("warm-metadata-a");
+    let second = root.join("warm-metadata-b");
+    for source in [&first, &second] {
+        if mixed {
+            mixed_workspace_dag_source(source, false);
+        } else {
+            closed_workspace_dag_source(source);
+        }
+        let library = fs::read_to_string(source.join("top/src/lib.rs")).unwrap();
+        write(
+            source,
+            "top/src/lib.rs",
+            format!(
+                "{library}\npub const EDIT: usize = include_str!(\"../../top-value.txt\").len();\n"
+            ),
+        );
+        // Membership stays identical throughout. Only this already-present
+        // file changes; neither parent reads it.
+        write(source, "top-value.txt", "a");
+    }
+    profile["source_root"] = json!(first);
+    profile["command"] = json!("check");
+    profile["selection"] = json!({"workspace":true,"lib":true});
+    profile["env"] = json!({"WORKSPACE_DAG_INPUT":"warm committed metadata environment"});
+    profile["jobs"] = json!(1);
+    profile["target_cache"] =
+        json!({"runtime_epoch":"warm-committed-metadata-v1","max_bytes":268435456});
+    if !mixed {
+        profile["vendor"] = Value::Null;
+    }
+
+    // Independent stock controls use their own store and target family. They
+    // cannot seed remote qualification or change its required sample count.
+    let stock_root = root.join("stock-control");
+    for directory in [
+        stock_root.clone(),
+        stock_root.join("state"),
+        stock_root.join("ops"),
+    ] {
+        fs::DirBuilder::new().mode(0o700).create(directory).unwrap();
+    }
+    let mut stock_profile = profile.clone();
+    stock_profile["state_root"] = json!(stock_root.join("state"));
+    stock_profile["operation_root"] = json!(stock_root.join("ops"));
+    let variants = ["a", "bb"];
+    let mut stock = Vec::new();
+    for (variant, value) in variants.iter().enumerate() {
+        write(&first, "top-value.txt", value);
+        let (code, events, output) = run(root, 1200 + variant as u32, &stock_profile);
+        assert_eq!(code, 0, "{output}");
+        assert!(decisions(&events, "remote-offer").is_empty(), "{output}");
+        assert!(decisions(&events, "hit").is_empty(), "{output}");
+        let diagnostics = workspace_dag_metadata_observations_with_fresh(
+            &events,
+            &output,
+            if variant == 0 { "cold" } else { "restored" },
+            &WORKSPACE_DAG_NAMES,
+            if variant == 0 {
+                &[]
+            } else {
+                &WORKSPACE_DAG_NAMES[..2]
+            },
+            false,
+        );
+        stock.push((
+            workspace_dag_metadata_files_with_consumer(
+                &sole_retained_target(&stock_root),
+                &output,
+                &WORKSPACE_DAG_NAMES,
+                false,
+            ),
+            diagnostics,
+        ));
+    }
+    let (top_metadata, first_bytes) = stock[0]
+        .0
+        .iter()
+        .find(|(path, _)| {
+            path.ends_with(".rmeta")
+                && Path::new(path)
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with(&format!("lib{}-", WORKSPACE_DAG_NAMES[2]))
+        })
+        .unwrap();
+    assert_ne!(
+        first_bytes, &stock[1].0[top_metadata],
+        "the public constant edit must change actual metadata bytes"
+    );
+    assert!(
+        fs::read_dir(stock_root.join("ops"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+
+    let (mut worker, environment) = NativeWorker::start(root);
+    let mut keys = BTreeMap::new();
+    let mut top_keys: [Option<String>; 2] = [None, None];
+    let mut request_ids = BTreeSet::new();
+    let mut executions = 0;
+    for number in 1..=8 {
+        let variant = ((number - 1) % 2) as usize;
+        let source = if number < 5 { &first } else { &second };
+        profile["source_root"] = json!(source);
+        write(source, "top-value.txt", variants[variant]);
+        let hit = number > 6;
+        let before_journal = hit.then(|| read_bounded(&worker.state.join("requests.json")));
+        // run_with_environment starts and joins a distinct coordinator
+        // process each time. The private target family is never changed.
+        let (code, events, output) =
+            run_with_environment(root, 1210 + number, &profile, &environment);
+        assert_eq!(code, 0, "{output}\nworker: {:?}", worker.events());
+        let diagnostics = workspace_dag_metadata_observations_with_fresh(
+            &events,
+            &output,
+            if number == 1 { "cold" } else { "restored" },
+            &WORKSPACE_DAG_NAMES,
+            if number == 1 {
+                &[]
+            } else {
+                &WORKSPACE_DAG_NAMES[..2]
+            },
+            false,
+        );
+        assert!(decisions(&events, "execute").is_empty(), "{output}");
+        assert!(
+            !events.iter().any(|event| matches!(
+                event["kind"].as_str(),
+                Some("rabsd-remote-dependency-failed" | "rabsd-remote-dependency-install-failed")
+            )),
+            "warm metadata completion fell back locally: {output}"
+        );
+        let offered = decisions(&events, "remote-offer");
+        let hits = decisions(&events, "hit");
+        let expected_offers = if number == 1 {
+            BTreeSet::from(WORKSPACE_DAG_NAMES)
+        } else if hit {
+            BTreeSet::new()
+        } else {
+            BTreeSet::from([WORKSPACE_DAG_NAMES[2]])
+        };
+        assert_eq!(
+            offered.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+            expected_offers,
+            "Cargo Fresh parents must not be re-executed: {output}"
+        );
+        assert_eq!(
+            hits.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+            if hit {
+                BTreeSet::from([WORKSPACE_DAG_NAMES[2]])
+            } else {
+                BTreeSet::new()
+            },
+            "only the independently qualified edited consumer may replay: {output}"
+        );
+        if number == 1 {
+            for name in &WORKSPACE_DAG_NAMES[..2] {
+                keys.insert((*name).to_owned(), offered[*name].clone());
+            }
+        }
+        let actual = if hit { &hits } else { &offered };
+        let top = actual[WORKSPACE_DAG_NAMES[2]].clone();
+        if let Some(previous) = &top_keys[variant] {
+            assert_eq!(
+                &top, previous,
+                "restoring a prior source variant split its action key"
+            );
+        } else {
+            top_keys[variant] = Some(top.clone());
+        }
+        if number == 2 {
+            assert_ne!(
+                top_keys[0], top_keys[1],
+                "the source edit must change the consumer key"
+            );
+        }
+        if hit {
+            assert!(
+                events
+                    .iter()
+                    .any(|event| { event["decision"] == "served" && event["key"] == top }),
+                "the earned metadata hit was not installed: {output}"
+            );
+        }
+        keys.insert(WORKSPACE_DAG_NAMES[2].to_owned(), top);
+        let expected = offered.values().cloned().collect::<BTreeSet<_>>();
+        for kind in [
+            "rabsd-remote-dependency-admitted",
+            "rabsd-remote-dependency-executed",
+        ] {
+            let actual = events
+                .iter()
+                .filter(|event| event["kind"] == kind)
+                .map(|event| event["key"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(actual.len(), expected.len(), "{kind}: {output}");
+            assert_eq!(
+                actual.into_iter().collect::<BTreeSet<_>>(),
+                expected,
+                "{output}"
+            );
+        }
+        for (index, name) in WORKSPACE_DAG_NAMES.iter().enumerate() {
+            let class = match (mixed, index) {
+                (true, 0) => "rustc-dependency-compile",
+                (false, 0) => "rustc-workspace-closed-metadata-v1",
+                (true, _) => "rustc-workspace-committed-mixed-metadata-v1",
+                (false, _) => "rustc-workspace-committed-metadata-v1",
+            };
+            assert_closed_workspace_leaf_evidence(
+                root,
+                &keys[*name],
+                if index < 2 {
+                    1
+                } else {
+                    ((number + 1) / 2).min(3) as usize
+                },
+                class,
+            );
+        }
+        if mixed {
+            assert_qualified_immutable_leaf(root, &keys[WORKSPACE_DAG_NAMES[0]], "check");
+        }
+        let files = workspace_dag_metadata_files_with_consumer(
+            &sole_retained_target(root),
+            &output,
+            &WORKSPACE_DAG_NAMES,
+            false,
+        );
+        assert_closed_workspace_dag_ancestry(root, &keys, &files);
+        assert_eq!(
+            &files, &stock[variant].0,
+            "stock/warm/replayed metadata bytes differ"
+        );
+        assert_eq!(
+            &diagnostics, &stock[variant].1,
+            "stock/warm/replayed diagnostics differ"
+        );
+        executions += offered.len();
+        if !offered.is_empty() {
+            assert!(request_ids.insert(worker.completed_receipt()["request_id"].as_u64().unwrap()));
+        }
+        assert_eq!(
+            worker
+                .events()
+                .iter()
+                .filter(|event| event["kind"] == "worker-toolchain-acquired")
+                .count(),
+            executions,
+            "only current compiler offers may acquire a worker toolchain"
+        );
+        if let Some(before) = before_journal {
+            assert_eq!(read_bounded(&worker.state.join("requests.json")), before);
+        }
+        assert!(fs::read_dir(root.join("ops")).unwrap().next().is_none());
+    }
+    assert_eq!(executions, 8);
+    assert_eq!(request_ids.len(), 6);
+
+    // Every Cargo unit would now be Fresh. Revocation must reject the trusted
+    // seed before Cargo can consume those bytes, even without a new wrapper
+    // request. Dropping only the registry proof would leave revoked metadata
+    // usable through ordinary Cargo freshness.
+    let seed_metadata = sole_retained_target(root)
+        .parent()
+        .unwrap()
+        .join("metadata.json");
+    let before_seed = read_bounded(&seed_metadata);
+    let before_journal = read_bounded(&worker.state.join("requests.json"));
+    {
+        let cas = rabsd::janitor::store::mount_and_reconcile(
+            &root.join("state/canonical-compile-v1/cas"),
+        )
+        .unwrap();
+        cas.store()
+            .lock()
+            .unwrap()
+            .add_quarantine(
+                QuarantineScope::ActionEntry,
+                &keys[WORKSPACE_DAG_NAMES[0]],
+                "native warm-target producer revocation",
+            )
+            .unwrap();
+    }
+    let (code, events, output) = run_with_environment(root, 1220, &profile, &environment);
+    assert_ne!(code, 0, "a revoked warm producer reached Cargo: {output}");
+    assert!(
+        output.to_ascii_lowercase().contains("quarantin"),
+        "{output}"
+    );
+    assert!(output.contains(&keys[WORKSPACE_DAG_NAMES[0]]), "{output}");
+    assert!(
+        !events.iter().any(|event| matches!(
+            event["kind"].as_str(),
+            Some(
+                "canonical-compilation-started"
+                    | "rabsd-remote-dependency-admitted"
+                    | "rabsd-remote-dependency-executed"
+            )
+        )),
+        "revoked committed bytes must be refused before Cargo starts: {output}"
+    );
+    assert!(
+        !output
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(|event| event["reason"] == "compiler-artifact"),
+        "Cargo used the revoked warm target: {output}"
+    );
+    assert_eq!(
+        read_bounded(&worker.state.join("requests.json")),
+        before_journal
+    );
+    assert_eq!(read_bounded(&seed_metadata), before_seed);
+    assert!(fs::read_dir(root.join("ops")).unwrap().next().is_none());
+    worker.finish();
+}
+
+#[test]
 #[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; denied external compiler input and real local fallback must not qualify either mixed workspace class"]
 fn canonical_workspace_mixed_dependency_dag_refuses_cache_authority_from_a_local_fallback_producer()
 {
@@ -5802,6 +6218,443 @@ fn canonical_workspace_mixed_dependency_dag_refuses_cache_authority_from_a_local
                         .unwrap()
                         .is_empty(),
                     "an unqualified external leaf authorized mixed replay"
+                );
+            }
+        }
+        worker.finish();
+    }
+}
+
+const IMMUTABLE_WORKSPACE_DAG_NAMES: [&str; 4] = [
+    WORKSPACE_DAG_NAMES[0],
+    "canonical_dag_external",
+    WORKSPACE_DAG_NAMES[1],
+    WORKSPACE_DAG_NAMES[2],
+];
+
+fn immutable_workspace_dag_source(root: &Path, denied_middle: bool) {
+    mixed_workspace_dag_source(root, false);
+    let leaf: Value = serde_json::from_slice(&read_bounded(
+        &root.join("vendor/canonical_dag_leaf/.cargo-checksum.json"),
+    ))
+    .unwrap();
+    let leaf = leaf["package"].as_str().unwrap();
+    let mut middle = "pub use canonical_dag_leaf::Payload;\npub const fn payload() -> Payload { canonical_dag_leaf::payload() }\n".to_owned();
+    if denied_middle {
+        middle.push_str("pub const PROCESS: &str = include_str!(\"/proc/self/status\");\n");
+    }
+    let external = vendor(
+        root,
+        IMMUTABLE_WORKSPACE_DAG_NAMES[1],
+        BTreeMap::from([
+            (
+                "Cargo.toml",
+                "[package]\nname='canonical_dag_external'\nversion='0.1.0'\nedition='2021'\n[dependencies]\ncanonical_dag_leaf='=0.1.0'\n",
+            ),
+            ("src/lib.rs", middle.as_str()),
+        ]),
+    );
+    write(
+        root,
+        "Cargo.lock",
+        format!(
+            "version=4\n\n[[package]]\nname='canonical_dag_external'\nversion='0.1.0'\nsource='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='{external}'\ndependencies=['canonical_dag_leaf']\n\n[[package]]\nname='canonical_dag_leaf'\nversion='0.1.0'\nsource='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='{leaf}'\n\n[[package]]\nname='canonical_dag_middle'\nversion='0.1.0'\ndependencies=['canonical_dag_external']\n\n[[package]]\nname='canonical_dag_top'\nversion='0.1.0'\ndependencies=['canonical_dag_middle']\n"
+        ),
+    );
+    write(
+        root,
+        "middle/Cargo.toml",
+        "[package]\nname='canonical_dag_middle'\nversion='0.1.0'\nedition='2021'\n[dependencies]\ncanonical_dag_external='=0.1.0'\n",
+    );
+    // Both workspace libraries must resolve Payload through two immutable
+    // producers. Neither workspace manifest declares the defining leaf.
+    write(
+        root,
+        "middle/src/lib.rs",
+        "pub use canonical_dag_external::Payload;\npub const SOURCE: &str = include_str!(\"../../shared/value.txt\");\npub const ENVIRONMENT: &str = env!(\"WORKSPACE_DAG_INPUT\");\npub const fn payload() -> Payload { canonical_dag_external::payload() }\n",
+    );
+}
+
+fn assert_no_immutable_leaf_qualification(root: &Path, key: &str) {
+    use rabs_cas::metadata_store::{RabsMetadataStore, SqlValue};
+
+    let cas =
+        rabsd::janitor::store::mount_and_reconcile(&root.join("state/canonical-compile-v1/cas"))
+            .unwrap();
+    assert!(
+        cas.store()
+            .lock()
+            .unwrap()
+            .query(
+                "SELECT decision FROM decision_receipts WHERE kind = ?1 AND subject = ?2",
+                &[
+                    SqlValue::Text("rabs-committed-immutable-leaf-v1".into()),
+                    SqlValue::Text(key.to_owned()),
+                ],
+            )
+            .unwrap()
+            .is_empty(),
+        "local publication or a non-leaf producer acquired immutable-leaf authority"
+    );
+}
+
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual immutable dependency DAG and workspace archive publication, independent samples and relocated replay"]
+fn canonical_workspace_immutable_dependency_dag_archives_earn_transitive_replay_across_worktrees() {
+    immutable_workspace_dag_replay("build");
+}
+
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual immutable dependency DAG and workspace metadata publication with fresh downstream typechecking"]
+fn canonical_workspace_immutable_dependency_dag_metadata_earns_transitive_replay_across_worktrees()
+{
+    immutable_workspace_dag_replay("check");
+}
+
+fn immutable_workspace_dag_replay(command: &str) {
+    let (owner, mut profile) = native_fixture();
+    let root = owner.path();
+    let first = root.join("immutable-dag-a");
+    let second = root.join("immutable-dag-b");
+    immutable_workspace_dag_source(&first, false);
+    immutable_workspace_dag_source(&second, false);
+    profile["source_root"] = json!(first);
+    profile["command"] = json!(command);
+    profile["selection"] = json!({"workspace":true,"lib":true});
+    if command == "check" {
+        profile["selection"]["bins"] = json!(true);
+    }
+    profile["env"] = json!({"WORKSPACE_DAG_INPUT":"committed immutable DAG environment"});
+    profile["jobs"] = json!(1);
+    assert_eq!(profile["vendor"], "vendor");
+    assert!(profile.get("target_cache").is_none());
+
+    let mut stock_profile = profile.clone();
+    if command == "check" {
+        stock_profile["target_cache"] =
+            json!({"runtime_epoch":"immutable-dag-metadata-stock-v1", "max_bytes":268435456});
+    }
+    let (code, events, output) = run(root, 1140, &stock_profile);
+    assert_eq!(code, 0, "{output}");
+    assert!(decisions(&events, "remote-offer").is_empty(), "{output}");
+    assert!(decisions(&events, "hit").is_empty(), "{output}");
+    let stock_local = decisions(&events, "execute");
+    assert!(
+        stock_local
+            .keys()
+            .all(|name| IMMUTABLE_WORKSPACE_DAG_NAMES[..2].contains(&name.as_str())),
+        "stock workspace units cannot acquire local cache authority: {output}"
+    );
+    if command == "check" {
+        assert_eq!(
+            stock_local
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                IMMUTABLE_WORKSPACE_DAG_NAMES[0],
+                IMMUTABLE_WORKSPACE_DAG_NAMES[1]
+            ]),
+            "the control must actually publish both ordinary local dependency metadata results: {output}"
+        );
+        for key in stock_local.values() {
+            assert_closed_workspace_leaf_evidence(root, key, 1, "rustc-dependency-compile");
+            assert_no_immutable_leaf_qualification(root, key);
+        }
+    }
+    let mut targets = BTreeSet::new();
+    let stock = workspace_dag_outputs(
+        root,
+        command,
+        &events,
+        &output,
+        &mut targets,
+        &IMMUTABLE_WORKSPACE_DAG_NAMES,
+    );
+
+    let (mut worker, environment) = NativeWorker::start(root);
+    let mut keys: Option<BTreeMap<String, String>> = None;
+    let mut private_attempts = BTreeMap::new();
+    let mut request_ids = BTreeSet::new();
+    let mut executions = 0;
+    for number in 1..=5 {
+        if number == 5 {
+            profile["source_root"] = json!(second);
+        }
+        if command == "check" {
+            // Only the private target family changes: the exact action keys
+            // below must remain stable, and Cargo must request every compiler.
+            profile["target_cache"] = json!({
+                "runtime_epoch":format!("immutable-dag-metadata-{number}-v1"),
+                "max_bytes":268435456,
+            });
+        }
+        let before_journal = (number > 3 && command == "build")
+            .then(|| read_bounded(&worker.state.join("requests.json")));
+        let (code, events, output) =
+            run_with_environment(root, 1140 + number, &profile, &environment);
+        assert_eq!(code, 0, "{output}\nworker: {:?}", worker.events());
+        assert!(decisions(&events, "execute").is_empty(), "{output}");
+        assert!(
+            !events.iter().any(|event| matches!(
+                event["kind"].as_str(),
+                Some("rabsd-remote-dependency-failed" | "rabsd-remote-dependency-install-failed")
+            )),
+            "immutable DAG qualification fell back locally: {output}"
+        );
+        let offered = decisions(&events, "remote-offer");
+        let hits = decisions(&events, "hit");
+        let hit = number > 3;
+        let actual = if hit {
+            assert_eq!(Some(&hits), keys.as_ref(), "{output}");
+            let expected = if command == "check" {
+                BTreeSet::from([WORKSPACE_METADATA_DAG_CONSUMER])
+            } else {
+                BTreeSet::new()
+            };
+            assert_eq!(
+                offered.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+                expected,
+                "a trained immutable library DAG dispatched compiler work: {output}"
+            );
+            hits
+        } else {
+            assert!(hits.is_empty(), "unearned immutable DAG hit: {output}");
+            let mut expected = BTreeSet::from(IMMUTABLE_WORKSPACE_DAG_NAMES);
+            if command == "check" {
+                expected.insert(WORKSPACE_METADATA_DAG_CONSUMER);
+            }
+            assert_eq!(
+                offered.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+                expected,
+                "every qualifying unit must reach the real worker: {output}"
+            );
+            IMMUTABLE_WORKSPACE_DAG_NAMES
+                .into_iter()
+                .map(|name| (name.to_owned(), offered[name].clone()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        if let Some(previous) = &keys {
+            assert_eq!(
+                &actual, previous,
+                "cold or relocated roots split immutable DAG keys"
+            );
+        }
+        let expected = offered.values().cloned().collect::<BTreeSet<_>>();
+        for kind in [
+            "rabsd-remote-dependency-admitted",
+            "rabsd-remote-dependency-executed",
+        ] {
+            let actual = events
+                .iter()
+                .filter(|event| event["kind"] == kind)
+                .map(|event| event["key"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(actual.len(), expected.len(), "{kind}: {output}");
+            assert_eq!(
+                actual.into_iter().collect::<BTreeSet<_>>(),
+                expected,
+                "{output}"
+            );
+        }
+        for (index, name) in IMMUTABLE_WORKSPACE_DAG_NAMES.iter().enumerate() {
+            if hit {
+                assert!(
+                    events.iter().any(|event| {
+                        event["decision"] == "served" && event["key"] == actual[*name]
+                    }),
+                    "a cached immutable DAG output was not installed: {output}"
+                );
+            }
+            if let Some(local) = stock_local.get(*name) {
+                assert_ne!(
+                    &actual[*name], local,
+                    "an ordinary local dependency lent authority to the committed DAG"
+                );
+            }
+            let class = match (index, command) {
+                (0, _) => "rustc-dependency-compile",
+                (1, "build") => "rustc-immutable-committed-dag-rlib-v1",
+                (1, _) => "rustc-immutable-committed-dag-metadata-v1",
+                (_, "build") => "rustc-workspace-committed-dag-rlib-v1",
+                _ => "rustc-workspace-committed-dag-metadata-v1",
+            };
+            assert_closed_workspace_leaf_evidence(
+                root,
+                &actual[*name],
+                number.min(3) as usize,
+                class,
+            );
+        }
+        assert_qualified_immutable_leaf(root, &actual[IMMUTABLE_WORKSPACE_DAG_NAMES[0]], command);
+        assert_no_immutable_leaf_qualification(root, &actual[IMMUTABLE_WORKSPACE_DAG_NAMES[1]]);
+        if command == "check" {
+            assert_fresh_workspace_execution(
+                root,
+                &events,
+                &output,
+                WORKSPACE_METADATA_DAG_CONSUMER,
+                &offered[WORKSPACE_METADATA_DAG_CONSUMER],
+                &mut private_attempts,
+            );
+        }
+        let (files, diagnostics) = workspace_dag_outputs(
+            root,
+            command,
+            &events,
+            &output,
+            &mut targets,
+            &IMMUTABLE_WORKSPACE_DAG_NAMES,
+        );
+        assert_workspace_dag_ancestry(root, &actual, &files, &IMMUTABLE_WORKSPACE_DAG_NAMES);
+        assert_eq!(
+            (files, diagnostics),
+            stock,
+            "stock/cold/hit immutable DAG bytes differ"
+        );
+        executions += offered.len();
+        if !offered.is_empty() {
+            assert!(request_ids.insert(worker.completed_receipt()["request_id"].as_u64().unwrap()));
+        }
+        assert_eq!(
+            worker
+                .events()
+                .iter()
+                .filter(|event| event["kind"] == "worker-toolchain-acquired")
+                .count(),
+            executions,
+            "only independently offered compiler requests may execute"
+        );
+        if let Some(before) = before_journal {
+            assert_eq!(
+                read_bounded(&worker.state.join("requests.json")),
+                before,
+                "an immutable DAG archive hit reached the worker request journal"
+            );
+        }
+        keys = Some(actual);
+    }
+    if command == "check" {
+        assert!(fs::read_dir(root.join("ops")).unwrap().next().is_none());
+    }
+    worker.finish();
+}
+
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; a qualified immutable leaf cannot turn a locally falling-back external middle into workspace cache authority"]
+fn canonical_workspace_immutable_dependency_dag_refuses_cache_authority_from_a_local_fallback_middle()
+ {
+    use rabs_cas::metadata_store::{RabsMetadataStore, SqlValue};
+
+    for command in ["build", "check"] {
+        let (owner, mut profile) = native_fixture();
+        let root = owner.path();
+        let source = root.join("immutable-dag-fallback");
+        immutable_workspace_dag_source(&source, true);
+        profile["source_root"] = json!(source);
+        profile["command"] = json!(command);
+        profile["selection"] = json!({"workspace":true,"lib":true});
+        if command == "check" {
+            profile["selection"]["bins"] = json!(true);
+        }
+        profile["env"] = json!({"WORKSPACE_DAG_INPUT":"unqualified external middle"});
+        profile["jobs"] = json!(1);
+        let (mut worker, environment) = NativeWorker::start(root);
+        let mut fresh_attempts = BTreeMap::new();
+        for number in 1..=2 {
+            let (code, events, output) =
+                run_with_environment(root, 1160 + number, &profile, &environment);
+            assert_eq!(
+                code, 0,
+                "fallback must preserve valid Cargo {command}: {output}"
+            );
+            assert!(decisions(&events, "hit").is_empty(), "{output}");
+            assert!(decisions(&events, "execute").is_empty(), "{output}");
+            assert!(
+                !output
+                    .contains("canonical-project-executors-require-isolated-dependency-execution"),
+                "the graph guard preempted the external provenance control: {output}"
+            );
+            let offered = decisions(&events, "remote-offer");
+            let mut expected = BTreeSet::from(IMMUTABLE_WORKSPACE_DAG_NAMES);
+            if command == "check" {
+                expected.insert(WORKSPACE_METADATA_DAG_CONSUMER);
+            }
+            assert_eq!(
+                offered.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+                expected,
+                "{output}"
+            );
+            let leaf = &offered[IMMUTABLE_WORKSPACE_DAG_NAMES[0]];
+            assert_closed_workspace_leaf_evidence(
+                root,
+                leaf,
+                number as usize,
+                "rustc-dependency-compile",
+            );
+            assert_qualified_immutable_leaf(root, leaf, command);
+            let middle = &offered[IMMUTABLE_WORKSPACE_DAG_NAMES[1]];
+            assert!(
+                events.iter().any(|event| {
+                    event["kind"] == "rabsd-remote-dependency-failed" && event["key"] == *middle
+                }),
+                "the external middle did not take actual compiler or closure fallback: {output}"
+            );
+            assert!(
+                !events.iter().any(|event| {
+                    event["kind"] == "rabsd-remote-dependency-executed" && event["key"] == *middle
+                }),
+                "a denied external middle was accepted: {output}"
+            );
+            assert_no_immutable_leaf_qualification(root, middle);
+            for name in &IMMUTABLE_WORKSPACE_DAG_NAMES[2..] {
+                assert_fresh_workspace_execution(
+                    root,
+                    &events,
+                    &output,
+                    name,
+                    &offered[*name],
+                    &mut fresh_attempts,
+                );
+            }
+            if command == "check" {
+                workspace_dag_metadata_observations(
+                    &events,
+                    &output,
+                    "disabled",
+                    &IMMUTABLE_WORKSPACE_DAG_NAMES,
+                );
+                assert_fresh_workspace_execution(
+                    root,
+                    &events,
+                    &output,
+                    WORKSPACE_METADATA_DAG_CONSUMER,
+                    &offered[WORKSPACE_METADATA_DAG_CONSUMER],
+                    &mut fresh_attempts,
+                );
+            } else {
+                workspace_dag_archive_outputs(&events, &output, &IMMUTABLE_WORKSPACE_DAG_NAMES);
+            }
+            worker.completed_receipt();
+            let cas = rabsd::janitor::store::mount_and_reconcile(
+                &root.join("state/canonical-compile-v1/cas"),
+            )
+            .unwrap();
+            let mut store = cas.store().lock().unwrap();
+            assert!(store.published_manifest_key_str(middle).unwrap().is_none());
+            assert!(!store.has_evidence_key(middle).unwrap());
+            assert!(!store.has_serving_state_key(middle).unwrap());
+            for key in offered.values().filter(|key| *key != leaf) {
+                assert!(store.list_provisional_ancestors(key).unwrap().is_empty());
+                assert!(
+                    store
+                        .query(
+                            "SELECT attempt_hex FROM verification_samples WHERE action_key = ?1",
+                            &[SqlValue::Text(key.clone())],
+                        )
+                        .unwrap()
+                        .is_empty(),
+                    "an unqualified external middle authorized downstream replay"
                 );
             }
         }

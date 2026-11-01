@@ -7,6 +7,7 @@
 
 #[cfg(test)]
 use rabs_key::live_dependency::DependencySourceKind;
+use rabs_key::live_dependency::workspace_dependency_cache::CommittedDependencyPolicy;
 use rabs_key::live_dependency::{
     DependencyActionPlan, DependencyDirectoryFact, ExternFact, LiveRustcRequest, PlannedExtern,
 };
@@ -20,6 +21,7 @@ use std::sync::Arc;
 
 mod committed;
 pub use committed::CommittedWorkspaceInputs;
+pub(crate) use committed::{CommittedOutputExportError, CommittedOutputSeeds};
 
 const ROOTS: [&str; 5] = [
     "/__rabs/workspace",
@@ -421,51 +423,38 @@ impl CanonicalPaths {
         Ok(())
     }
 
-    /// Dependency-bearing archive caching retains the selected ordinary build
-    /// unit and executor-free graph boundary; committed candidates additionally
-    /// require the operation-owned installation capability.
-    pub(crate) fn require_workspace_committed_rlib(
+    /// The exact committed policy validates source origin and compiler shape.
+    /// Workspace consumers also retain selected-unit and executor-free graph
+    /// authority. Immutable dependencies use their retained package mounts and
+    /// require isolated execution plus committed inputs at the remote boundary.
+    pub(crate) fn require_committed_dependency_library(
         &self,
         plan: &DependencyActionPlan,
+        policy: CommittedDependencyPolicy,
     ) -> Result<(), String> {
-        rabs_key::live_dependency::workspace_dependency_cache::validate_committed_workspace_rlib_plan(plan)
+        policy
+            .validate_plan(plan)
             .map_err(|error| error.to_string())?;
-        self.require_workspace_execution(plan)?;
-        if self.closed_dependency_execution_required {
-            return Err("committed workspace archive caching requires a Cargo graph without project executors".into());
-        }
-        Ok(())
-    }
-
-    /// Committed metadata caching requires its independently qualified check
-    /// invocation, retained Cargo-selected unit, and executor-free graph.
-    pub(crate) fn require_workspace_committed_metadata(
-        &self,
-        plan: &DependencyActionPlan,
-    ) -> Result<(), String> {
-        rabs_key::live_dependency::workspace_dependency_cache::validate_committed_workspace_metadata_plan(plan)
-            .map_err(|error| error.to_string())?;
-        self.require_workspace_execution(plan)?;
-        if self.closed_dependency_execution_required {
-            return Err("committed workspace metadata caching requires a Cargo graph without project executors".into());
-        }
-        Ok(())
-    }
-
-    /// Mixed-producer caching preserves the same selected ordinary unit and
-    /// graph boundary. Its additional producer authority is checked separately
-    /// from exact physical installation witnesses and current durable lineage.
-    pub(crate) fn require_workspace_mixed_library(
-        &self,
-        plan: &DependencyActionPlan,
-    ) -> Result<(), String> {
-        rabs_key::live_dependency::workspace_dependency_cache::validate_mixed_workspace_library_plan(plan)
-            .map_err(|error| error.to_string())?;
-        self.require_workspace_execution(plan)?;
-        if self.closed_dependency_execution_required {
-            return Err(
-                "mixed workspace caching requires a Cargo graph without project executors".into(),
-            );
+        if plan.source_kind.is_workspace() {
+            self.require_workspace_execution(plan)?;
+            if self.closed_dependency_execution_required {
+                return Err(
+                    "committed workspace caching requires a Cargo graph without project executors"
+                        .into(),
+                );
+            }
+        } else {
+            for root in [&plan.source_root, &plan.package_root] {
+                let physical = self.physical(Path::new(root))?;
+                if !std::fs::symlink_metadata(physical)
+                    .map_err(|error| error.to_string())?
+                    .is_dir()
+                {
+                    return Err(
+                        "immutable committed source lost its retained package directory".into(),
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -1454,7 +1443,22 @@ mod tests {
             .unwrap();
             assert!(paths.require_workspace_closed_library(&closed).is_err());
             let mixed = rabs_key::live_dependency::workspace_dependency_cache::plan_mixed_workspace_library(&execution).unwrap();
-            assert!(paths.require_workspace_mixed_library(&mixed).is_err());
+            let policy = CommittedDependencyPolicy::from_source_kind(mixed.source_kind).unwrap();
+            assert!(
+                paths
+                    .require_committed_dependency_library(&mixed, policy)
+                    .is_err()
+            );
+            let dag_policy = if mode == "build" {
+                CommittedDependencyPolicy::WorkspaceDagRlib
+            } else {
+                CommittedDependencyPolicy::WorkspaceDagMetadata
+            };
+            assert!(
+                paths
+                    .require_committed_dependency_library(&mixed, dag_policy)
+                    .is_err()
+            );
             let graph = serde_json::json!({"version":1,"roots":[0],"units":[{
                 "pkg_id":"path+file:///__rabs/workspace/app#project@0.1.0",
                 "target":{"kind":["lib"],"crate_types":["lib"],"name":"project-lib",
@@ -1468,9 +1472,22 @@ mod tests {
                 .with_workspace_units(graph.workspace_units(), None)
                 .unwrap();
             assert!(paths.require_workspace_closed_library(&closed).is_ok());
-            paths.require_workspace_mixed_library(&mixed).unwrap();
-            assert!(paths.require_workspace_mixed_library(&execution).is_err());
-            assert!(paths.require_workspace_mixed_library(&closed).is_err());
+            paths
+                .require_committed_dependency_library(&mixed, policy)
+                .unwrap();
+            paths
+                .require_committed_dependency_library(&mixed, dag_policy)
+                .unwrap();
+            assert!(
+                paths
+                    .require_committed_dependency_library(&execution, policy)
+                    .is_err()
+            );
+            assert!(
+                paths
+                    .require_committed_dependency_library(&closed, policy)
+                    .is_err()
+            );
             assert!(
                 paths.require_workspace_closed_library(&execution).is_err(),
                 "the fresh profile must not gain cache authority"
@@ -1482,7 +1499,12 @@ mod tests {
             unselected_mixed.invocation.crate_name = Some("unselected".into());
             assert!(
                 paths
-                    .require_workspace_mixed_library(&unselected_mixed)
+                    .require_committed_dependency_library(&unselected_mixed, policy)
+                    .is_err()
+            );
+            assert!(
+                paths
+                    .require_committed_dependency_library(&unselected_mixed, dag_policy)
                     .is_err()
             );
             let mut other_mode = execution.clone();
@@ -1497,7 +1519,15 @@ mod tests {
             )
             .unwrap();
             let other_mixed = rabs_key::live_dependency::workspace_dependency_cache::plan_mixed_workspace_library(&other_mode).unwrap();
-            assert!(paths.require_workspace_mixed_library(&other_mixed).is_err());
+            assert!(
+                paths
+                    .require_committed_dependency_library(
+                        &other_mixed,
+                        CommittedDependencyPolicy::from_source_kind(other_mixed.source_kind)
+                            .unwrap(),
+                    )
+                    .is_err()
+            );
             let other_mode =
                 rabs_key::live_dependency::workspace_cache::plan_closed_workspace_library(
                     &other_mode,
@@ -1509,10 +1539,107 @@ mod tests {
             );
             let guarded = paths.require_closed_dependency_execution().unwrap();
             assert!(guarded.require_workspace_closed_library(&closed).is_err());
-            assert!(guarded.require_workspace_mixed_library(&mixed).is_err());
+            assert!(
+                guarded
+                    .require_committed_dependency_library(&mixed, policy)
+                    .is_err()
+            );
+            assert!(
+                guarded
+                    .require_committed_dependency_library(&mixed, dag_policy)
+                    .is_err()
+            );
             assert!(
                 guarded.require_workspace_execution(&execution).is_ok(),
                 "project executors retain fresh remote execution"
+            );
+        }
+    }
+
+    #[test]
+    fn immutable_dag_requires_its_retained_package_mount_and_exact_output_policy() {
+        use rabs_key::live_dependency::plan_canonical_cargo_dependency_action;
+
+        for (policy, emit) in [
+            (
+                CommittedDependencyPolicy::ImmutableDagMetadata,
+                "dep-info,metadata",
+            ),
+            (
+                CommittedDependencyPolicy::ImmutableDagRlib,
+                "dep-info,metadata,link",
+            ),
+        ] {
+            let (_owner, paths) = fixture();
+            // A project executor elsewhere in the Cargo graph still requires
+            // isolated execution; it does not invalidate immutable package
+            // ownership or grant local completion any cache authority.
+            let paths = paths.require_closed_dependency_execution().unwrap();
+            let package = "/__rabs/cargo-home/registry/src/fixture-index/dag-1.0.0";
+            let argv = vec![
+                "/__rabs/toolchain/bin/rustc".into(),
+                "--crate-name=dag".into(),
+                "--crate-type=lib".into(),
+                format!("--emit={emit}"),
+                "--cap-lints=allow".into(),
+                "--error-format=json".into(),
+                "--out-dir=/__rabs/out/cargo/debug/deps".into(),
+                format!("{package}/lib.rs"),
+            ];
+            let env = vec![
+                ("CARGO_HOME".into(), "/__rabs/cargo-home".into()),
+                ("HOME".into(), "/__rabs/home".into()),
+                ("CARGO_MANIFEST_DIR".into(), package.into()),
+                ("CARGO_PKG_NAME".into(), "dag".into()),
+            ];
+            let plan = plan_canonical_cargo_dependency_action(
+                LiveRustcRequest {
+                    argv: &argv,
+                    cwd: package,
+                    env: &env,
+                },
+                "x86_64-unknown-linux-gnu",
+                None,
+            )
+            .unwrap();
+            policy.validate_plan(&plan).unwrap();
+            assert!(
+                paths
+                    .require_committed_dependency_library(&plan, policy)
+                    .is_err()
+            );
+            let physical = paths.physical(Path::new(package)).unwrap();
+            std::fs::create_dir_all(&physical).unwrap();
+            std::fs::write(physical.join("lib.rs"), b"pub fn value() {}\n").unwrap();
+            paths
+                .require_committed_dependency_library(&plan, policy)
+                .unwrap();
+            assert!(paths.require_local_capture().is_err());
+            let other = if policy == CommittedDependencyPolicy::ImmutableDagMetadata {
+                CommittedDependencyPolicy::ImmutableDagRlib
+            } else {
+                CommittedDependencyPolicy::ImmutableDagMetadata
+            };
+            assert!(
+                paths
+                    .require_committed_dependency_library(&plan, other)
+                    .is_err()
+            );
+            assert!(
+                paths
+                    .require_committed_dependency_library(
+                        &plan,
+                        CommittedDependencyPolicy::WorkspaceDagMetadata,
+                    )
+                    .is_err()
+            );
+            let retained = physical.with_file_name("retained-dag-1.0.0");
+            std::fs::rename(&physical, &retained).unwrap();
+            std::os::unix::fs::symlink(&retained, &physical).unwrap();
+            assert!(
+                paths
+                    .require_committed_dependency_library(&plan, policy)
+                    .is_err()
             );
         }
     }
@@ -1532,9 +1659,10 @@ mod tests {
         .unwrap();
         let execution = workspace_plan();
         let metadata = plan_committed_workspace_metadata(&execution).unwrap();
+        let policy = CommittedDependencyPolicy::WorkspaceMetadata;
         assert!(
             paths
-                .require_workspace_committed_metadata(&metadata)
+                .require_committed_dependency_library(&metadata, policy)
                 .is_err()
         );
         let graph = workspace_graph("path+file:///__rabs/workspace/app#project@0.1.0");
@@ -1542,14 +1670,21 @@ mod tests {
             .with_workspace_units(graph.workspace_units(), None)
             .unwrap();
         paths
-            .require_workspace_committed_metadata(&metadata)
+            .require_committed_dependency_library(&metadata, policy)
             .unwrap();
         assert!(
             paths
-                .require_workspace_committed_metadata(&execution)
+                .require_committed_dependency_library(&execution, policy)
                 .is_err()
         );
-        assert!(paths.require_workspace_committed_rlib(&metadata).is_err());
+        assert!(
+            paths
+                .require_committed_dependency_library(
+                    &metadata,
+                    CommittedDependencyPolicy::WorkspaceRlib,
+                )
+                .is_err()
+        );
         let mut archive = execution.clone();
         archive.invocation.emit.push("link".into());
         archive.outputs = rabs_key::output_derivation::derive_workspace_output_declarations(
@@ -1560,7 +1695,7 @@ mod tests {
         let archive = plan_committed_workspace_rlib(&archive).unwrap();
         assert!(
             paths
-                .require_workspace_committed_metadata(&archive)
+                .require_committed_dependency_library(&archive, policy)
                 .is_err()
         );
         for mutation in 0..3 {
@@ -1570,12 +1705,16 @@ mod tests {
                 1 => other.invocation.features.clear(),
                 _ => other.target_triple = "aarch64-unknown-linux-gnu".into(),
             }
-            assert!(paths.require_workspace_committed_metadata(&other).is_err());
+            assert!(
+                paths
+                    .require_committed_dependency_library(&other, policy)
+                    .is_err()
+            );
         }
         let guarded = paths.require_closed_dependency_execution().unwrap();
         assert!(
             guarded
-                .require_workspace_committed_metadata(&metadata)
+                .require_committed_dependency_library(&metadata, policy)
                 .is_err()
         );
         guarded.require_workspace_execution(&execution).unwrap();

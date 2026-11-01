@@ -50,6 +50,7 @@ use crate::coord::live_dependency::{
 use crate::edge::live_facts::{FactsMiss, GENERATED_ROOT, LiveFacts};
 use rabs_cas::metadata_store::digest_key;
 use rabs_key::build_script_directives::bind_rustc_environment;
+use rabs_key::live_dependency::workspace_dependency_cache::{self, CommittedDependencyPolicy};
 use rabs_key::live_dependency::{
     ExternFact, LiveRustcRequest, PlannedExtern, constructed_environment,
 };
@@ -672,46 +673,97 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
         plan = candidate;
     }
     if workspace_requested
-        && plan.source_kind == rabs_key::live_dependency::DependencySourceKind::WorkspaceExecutionOnly
+        && plan.source_kind
+            == rabs_key::live_dependency::DependencySourceKind::WorkspaceExecutionOnly
         && let Some(paths) = &live.canonical
-        && let Ok(candidate) = rabs_key::live_dependency::workspace_dependency_cache::plan_committed_workspace_rlib(&plan)
-        && paths.require_workspace_committed_rlib(&candidate).is_ok()
-        && let Ok(committed) = live.lane.committed_workspace_inputs(paths, Arc::clone(&dependencies), candidate.source_kind)
-        && rabs_key::live_dependency::workspace_dependency_cache::remote_committed_workspace_rlib_shape(
-            &candidate, &key_directories, committed.dependencies(), rabs_sandbox::layout::TOOLCHAIN,
-        ).is_ok()
     {
-        plan = candidate;
-        committed_workspace_inputs = Some(committed);
+        // Keep existing identities whenever their narrower producer policy
+        // suffices. Only the new DAG classes may consume immutable non-leaves;
+        // every candidate must still belong to this operation's installation.
+        for policy in [
+            CommittedDependencyPolicy::WorkspaceRlib,
+            CommittedDependencyPolicy::WorkspaceMetadata,
+            CommittedDependencyPolicy::MixedWorkspaceRlib,
+            CommittedDependencyPolicy::MixedWorkspaceMetadata,
+            CommittedDependencyPolicy::WorkspaceDagRlib,
+            CommittedDependencyPolicy::WorkspaceDagMetadata,
+        ] {
+            let candidate = match policy {
+                CommittedDependencyPolicy::WorkspaceRlib => {
+                    workspace_dependency_cache::plan_committed_workspace_rlib(&plan)
+                }
+                CommittedDependencyPolicy::WorkspaceMetadata => {
+                    workspace_dependency_cache::plan_committed_workspace_metadata(&plan)
+                }
+                _ => workspace_dependency_cache::plan_mixed_workspace_library(&plan),
+            };
+            let Ok(candidate) = candidate else { continue };
+            if paths
+                .require_committed_dependency_library(&candidate, policy)
+                .is_err()
+            {
+                continue;
+            }
+            let Ok(committed) =
+                live.lane
+                    .committed_inputs(paths, Arc::clone(&dependencies), policy)
+            else {
+                continue;
+            };
+            if workspace_dependency_cache::remote_committed_dependency_shape(
+                &candidate,
+                policy,
+                &key_directories,
+                committed.dependencies(),
+                rabs_sandbox::layout::TOOLCHAIN,
+            )
+            .is_err()
+            {
+                continue;
+            }
+            plan = candidate;
+            committed_workspace_inputs = Some(committed);
+            break;
+        }
     }
-    if workspace_requested
-        && plan.source_kind == rabs_key::live_dependency::DependencySourceKind::WorkspaceExecutionOnly
+    if !workspace_requested
+        && request.get("remote_protocol").and_then(Value::as_u64) == Some(1)
+        && live.remote.is_some()
         && let Some(paths) = &live.canonical
-        && let Ok(candidate) = rabs_key::live_dependency::workspace_dependency_cache::plan_committed_workspace_metadata(&plan)
-        && paths.require_workspace_committed_metadata(&candidate).is_ok()
-        && let Ok(committed) = live.lane.committed_workspace_inputs(paths, Arc::clone(&dependencies), candidate.source_kind)
-        && rabs_key::live_dependency::workspace_dependency_cache::remote_committed_workspace_metadata_shape(
-            &candidate, &key_directories, committed.dependencies(), rabs_sandbox::layout::TOOLCHAIN,
-        ).is_ok()
     {
-        plan = candidate;
-        committed_workspace_inputs = Some(committed);
-    }
-    // Preserve the existing workspace-only identities whenever their narrower
-    // provenance policy suffices. The independently versioned mixed class is
-    // considered only after those proofs refuse the retained candidate set.
-    if workspace_requested
-        && plan.source_kind == rabs_key::live_dependency::DependencySourceKind::WorkspaceExecutionOnly
-        && let Some(paths) = &live.canonical
-        && let Ok(candidate) = rabs_key::live_dependency::workspace_dependency_cache::plan_mixed_workspace_library(&plan)
-        && paths.require_workspace_mixed_library(&candidate).is_ok()
-        && let Ok(committed) = live.lane.committed_workspace_inputs(paths, Arc::clone(&dependencies), candidate.source_kind)
-        && rabs_key::live_dependency::workspace_dependency_cache::remote_mixed_workspace_library_shape(
-            &candidate, &key_directories, committed.dependencies(), rabs_sandbox::layout::TOOLCHAIN,
-        ).is_ok()
-    {
-        plan = candidate;
-        committed_workspace_inputs = Some(committed);
+        // External source origin is unchanged. A separate remote policy binds
+        // complete committed ancestry into its descriptor; a local key or a
+        // generic remote dependency publication cannot inherit that authority.
+        for policy in [
+            CommittedDependencyPolicy::ImmutableDagRlib,
+            CommittedDependencyPolicy::ImmutableDagMetadata,
+        ] {
+            if paths
+                .require_committed_dependency_library(&plan, policy)
+                .is_err()
+            {
+                continue;
+            }
+            let Ok(committed) =
+                live.lane
+                    .committed_inputs(paths, Arc::clone(&dependencies), policy)
+            else {
+                continue;
+            };
+            if workspace_dependency_cache::remote_committed_dependency_shape(
+                &plan,
+                policy,
+                &key_directories,
+                committed.dependencies(),
+                rabs_sandbox::layout::TOOLCHAIN,
+            )
+            .is_err()
+            {
+                continue;
+            }
+            committed_workspace_inputs = Some(committed);
+            break;
+        }
     }
     let key_result = if workspace_requested {
         Err(rabs_key::live_dependency::LiveRefusal::Facts("workspace units require their independently isolated worker profile and cannot use local dependency cache authority".into()))

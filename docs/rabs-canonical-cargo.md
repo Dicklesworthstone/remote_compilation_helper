@@ -1611,13 +1611,53 @@ producers, with complete explicit archive bytes retained. Metadata producers
 authorize only `.rmeta` outputs. Checks still explicitly negotiate
 `ClosedMetadata`; builds retain the existing closed archive worker context.
 
-This first external-producer expansion deliberately admits leaves only. An
-external crate with its own Rust dependencies, an unqualified candidate in the
-retained directory, or a Cargo graph containing build scripts or procedural
-macros keeps workspace consumers on their existing fresh-execution path. The
-complete workspace, directory inventories, environment, invocation, toolchain
-and runtime remain keyed. Minimal observed read closures and general external
-dependency DAG qualification remain separate work.
+These epoch 8/9 profiles deliberately admit immutable leaves only. External
+crates with their own committed dependencies require the separately keyed DAG
+profiles below. An unqualified retained candidate or a workspace Cargo graph
+containing build scripts or procedural macros still keeps the workspace
+consumer on its existing fresh-execution path.
+
+### Cache through committed immutable dependency chains
+
+Canonical builds and checks can also cache a chain of immutable external
+dependencies before those outputs reach workspace libraries. For example,
+registry or vendored A can feed immutable B, which feeds workspace C and D.
+The commands and retained canonical mount layout remain the same.
+
+Each non-leaf external compiler request must bind every retained Rust candidate
+to an exact producer installed by this Cargo operation. This includes candidates
+not named by an explicit `--extern`. The descriptor hashes the producer action,
+descriptor, committed manifest, output role and whole object identity together
+with the existing source, invocation, environment, toolchain and runtime inputs.
+The published result retains that same ancestry. Historical generic dependency
+entries, source labels or a path containing equal bytes cannot supply it.
+
+The new policies earn independent comparison evidence and class safety holds:
+
+| Consumer | Archive policy / key epoch | Metadata policy / key epoch |
+|---|---|---|
+| Immutable dependency DAG | `canonical-immutable-committed-dag-rlib-v1` / 10 | `canonical-immutable-committed-dag-metadata-v1` / 11 |
+| Workspace consuming immutable DAGs | `canonical-workspace-committed-dag-rlib-v1` / 12 | `canonical-workspace-committed-dag-metadata-v1` / 13 |
+
+An immutable DAG producer can consume qualified immutable leaves and other
+immutable DAG producers. Workspace DAG consumers can additionally consume the
+existing narrower workspace classes. Every intermediate producer keeps its own
+policy, including when a shared ancestor was already checked under a broader
+consumer. Archive consumers require archive-class producers; metadata consumers
+may use metadata or whole archives. Immutable metadata retains the existing
+dependency `Metadata` execution view, while workspace checks explicitly retain
+`ClosedMetadata`. No worker namespace or execution capability is broadened.
+
+Publication, cached replay and fresh-result installation recheck the complete
+transitive graph against current publication, class, object and quarantine
+state. A local-fallback middle crate cannot qualify its descendants. Revocation
+after metadata delivery remains terminal even for metadata-only results.
+
+This support remains limited to ordinary pure libraries without generated,
+native, proc-macro or incremental inputs, and workspace consumers retain the
+executor-free Cargo graph requirement. Complete package/workspace contents and
+directory inventories remain keyed. Minimal observed read closures, general
+build-script replay and arbitrary external-input graphs remain separate work.
 
 ### Local Clippy with reusable dependency compilation
 
@@ -1996,6 +2036,27 @@ separate the seed family. Immutable registry/Git/vendor inputs remain exact.
 This allows workspace crates to stay fresh without granting them action-cache
 publication or skipping Cargo's current command.
 
+Retained targets can also carry the provenance of qualified committed dependency
+outputs that the driver actually verified and installed. That inventory is
+covered by the target seed's integrity seal. After a complete independent target
+restore and coordinator startup, the driver verifies the artifact bytes, current
+publication and class eligibility, and complete producer ancestry, including
+immutable-leaf qualification and quarantine. It then grants fresh installation
+witnesses bound to this operation's files and coordinator. An eligible
+metadata-check consumer can therefore use its committed-dependency cache after
+a source edit while unchanged parents remain Cargo-Fresh, subject to the usual
+sampling and input checks.
+
+Restoring target bytes alone never grants committed authority. Ordinary local
+and request-owned results, unknown files and older seeds without recorded
+provenance add no installation witnesses. This does not narrow the
+complete-workspace action keys or relax the source-exact target families required
+for code-generating graphs. If restored producer witnesses fail current
+provenance checks, the operation fails before Cargo starts. Known producers are
+checked again at the end of a retainable run, before accepting completion or
+delivering retained build artifacts, so newly quarantined ancestry cannot become
+an optional save failure.
+
 The persistent service serializes target-cache I/O around open/restore and around
 completed capture, releasing that lock while Cargo runs. Waiting for this lock,
 scanning and hashing inputs, and copying target state observe the requesting
@@ -2029,11 +2090,12 @@ can recover its own target state even after an intervening source edit or
 build selected a different family.
 
 The `canonical-compilation-started` stderr record reports
-`private_target_state` as `disabled`, `cold` or `restored`. A failed optional
-restore keeps its partial copy unmounted and runs the current command cold,
-unless the operation was cancelled;
-a failed save preserves Cargo's actual result. Both report a
-`canonical-target-state-unavailable` diagnostic. A new seed is saved only after
+`private_target_state` as `disabled`, `cold` or `restored`, and
+`restored_committed_outputs` counts the installation witnesses re-established
+for this operation. A failed optional snapshot restore keeps its partial copy
+unmounted and runs the current command cold, unless the operation was cancelled;
+an optional storage failure during save preserves Cargo's actual result. Both
+report a `canonical-target-state-unavailable` diagnostic. A new seed is saved only after
 complete compiler/session/coordinator drain and either successful Cargo execution
 or a normally exited Test, Run or Bench command. A failing test, program or
 benchmark may therefore retain its compiled artifacts for the next invocation;

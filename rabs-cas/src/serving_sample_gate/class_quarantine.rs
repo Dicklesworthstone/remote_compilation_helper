@@ -25,6 +25,10 @@ const WORKSPACE_COMMITTED_RLIB_CLASS: &str = "rustc-workspace-committed-rlib-v1"
 const WORKSPACE_COMMITTED_METADATA_CLASS: &str = "rustc-workspace-committed-metadata-v1";
 const WORKSPACE_MIXED_RLIB_CLASS: &str = "rustc-workspace-committed-mixed-rlib-v1";
 const WORKSPACE_MIXED_METADATA_CLASS: &str = "rustc-workspace-committed-mixed-metadata-v1";
+const IMMUTABLE_DAG_RLIB_CLASS: &str = "rustc-immutable-committed-dag-rlib-v1";
+const IMMUTABLE_DAG_METADATA_CLASS: &str = "rustc-immutable-committed-dag-metadata-v1";
+const WORKSPACE_DAG_RLIB_CLASS: &str = "rustc-workspace-committed-dag-rlib-v1";
+const WORKSPACE_DAG_METADATA_CLASS: &str = "rustc-workspace-committed-dag-metadata-v1";
 
 const CLASS_SQL: &str = r#"
 SELECT decision FROM decision_receipts
@@ -103,6 +107,18 @@ pub(super) fn refusal(
             }
             [SqlValue::Text(class)] if class == WORKSPACE_MIXED_METADATA_CLASS => {
                 WORKSPACE_MIXED_METADATA_CLASS
+            }
+            [SqlValue::Text(class)] if class == IMMUTABLE_DAG_RLIB_CLASS => {
+                IMMUTABLE_DAG_RLIB_CLASS
+            }
+            [SqlValue::Text(class)] if class == IMMUTABLE_DAG_METADATA_CLASS => {
+                IMMUTABLE_DAG_METADATA_CLASS
+            }
+            [SqlValue::Text(class)] if class == WORKSPACE_DAG_RLIB_CLASS => {
+                WORKSPACE_DAG_RLIB_CLASS
+            }
+            [SqlValue::Text(class)] if class == WORKSPACE_DAG_METADATA_CLASS => {
+                WORKSPACE_DAG_METADATA_CLASS
             }
             // A caller's LowRiskRegistry flag cannot overrule a recorded
             // private/unknown class, even if its per-action evidence passes.
@@ -541,6 +557,16 @@ mod tests {
                 WORKSPACE_MIXED_METADATA_CLASS,
                 ActionClassRisk::MixedWorkspaceMetadata,
             ),
+            (IMMUTABLE_DAG_RLIB_CLASS, ActionClassRisk::ImmutableDagRlib),
+            (
+                IMMUTABLE_DAG_METADATA_CLASS,
+                ActionClassRisk::ImmutableDagMetadata,
+            ),
+            (WORKSPACE_DAG_RLIB_CLASS, ActionClassRisk::WorkspaceDagRlib),
+            (
+                WORKSPACE_DAG_METADATA_CLASS,
+                ActionClassRisk::WorkspaceDagMetadata,
+            ),
         ] {
             let mut store =
                 SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
@@ -556,6 +582,10 @@ mod tests {
                 WORKSPACE_COMMITTED_METADATA_CLASS,
                 WORKSPACE_MIXED_RLIB_CLASS,
                 WORKSPACE_MIXED_METADATA_CLASS,
+                IMMUTABLE_DAG_RLIB_CLASS,
+                IMMUTABLE_DAG_METADATA_CLASS,
+                WORKSPACE_DAG_RLIB_CLASS,
+                WORKSPACE_DAG_METADATA_CLASS,
             ]
             .into_iter()
             .filter(|other_class| *other_class != class)
