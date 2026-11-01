@@ -1,0 +1,2066 @@
+{
+  "schema_version": 1,
+  "issue": {
+    "number": 128,
+    "url": "https://github.com/Dicklesworthstone/remote_compilation_helper/issues/128"
+  },
+  "recorded_on": "2026-11-01",
+  "status": "completed",
+  "provenance": {
+    "baseline_revision": "dceec4f39021c5fb0be3b43276f83063c0d7fe75",
+    "incorporated_upstream_revision": "4885980acc7c4782900a9c364a031a9714d74ee6",
+    "candidate_head_at_snapshot": "3b69bf587fd8cc66fd16e8e0872996e2f27a86e4",
+    "published_commits": [
+      {
+        "revision": "2c77f402407a2c27fdbbefb2a38ac68f2f924772",
+        "parent": "5163bfb6c76f3b91d3f1e06c7ff60d85cf3586b2",
+        "subject": "fix(rchd): retain recovery records when durable enable fails",
+        "publication": "Published directly to main by the coordinating runner."
+      },
+      {
+        "revision": "9f267909cba71ede3b23dfae74f83987d7b2dc33",
+        "parent": "4885980acc7c4782900a9c364a031a9714d74ee6",
+        "summary": "Disablement and inventory-retirement lifecycle fix",
+        "publication": "Published directly to main by the coordinating runner; final committed worker/reload/harness blobs match the measured daemon and fixture."
+      },
+      {
+        "revision": "33e681245dec8a66580e4a5141d119c81a25f8c0",
+        "parent": "9f267909cba71ede3b23dfae74f83987d7b2dc33",
+        "subject": "fix(rch): retain source ownership during custom target retrieval",
+        "orchestration_source_blob": "89154dd21df58d6335853d24d2b5d19d4a03eeda",
+        "publication": "Published directly to main; coordinating runner verified both GitHub references, and local HEAD is synchronized."
+      },
+      {
+        "revision": "3b69bf587fd8cc66fd16e8e0872996e2f27a86e4",
+        "parent": "33e681245dec8a66580e4a5141d119c81a25f8c0",
+        "subject": "fix(rabs): restore recovery fixtures and workspace validation",
+        "role": "Supporting correction for full-workspace validation",
+        "publication": "Published directly to main; all seven committed source blobs equal the accepted source snapshot."
+      }
+    ],
+    "source_blobs": {
+      "rch-common/src/bypass_record.rs": "e173b8e10f04c9008aedc21481b47989bc7f5b8e",
+      "rchd/src/bypass_recovery_service.rs": "ef8aa58eb16cf745bb573ebb2cf2805eed104b6c",
+      "rchd/src/workers.rs": "1461d0e1ebe225cab5bf9b8e0bb8039ba5989e9f",
+      "rchd/src/reload.rs": "af0d1a26206776b9b3c1ca1d92e5828ecbf68edf",
+      "rch/src/hook/transfer_orchestration.rs": "89154dd21df58d6335853d24d2b5d19d4a03eeda",
+      "scripts/test_offline_worker_recovery.py": "a863628c97ab53963a520eabd8049ef6734763ef"
+    },
+    "source_scope": "The earlier OpenSSH daemon was built after incorporated upstream 5163bfb6, with the recorded common/daemon blobs and SHA-256 16b2b041. The second publication preserves incoming 4885980a and identical owned worker/reload/harness blobs. RCH code is published at 33e68124 with orchestration blob 89154dd2. The combined CLI selected suite passed on prior blob 08b8729a; only a misplaced pre-existing Clippy allowance was subsequently relocated. Strict CLI lint, final formatting, executable build, and 17 daemon plus 8 jobs lifecycle tests passed on that published RCH source. Final synthetic process integration used rebuilt daemon b7a0785e and CLI c331c6d0, distinct from earlier OpenSSH measurements. The supporting seven-file RABS correction was tested and published unchanged as 3b69bf58; full-workspace check, strict Clippy, formatting and selected runtime tests all passed. No blanket all-workspace runtime-test claim is made.",
+    "candidate_process_binary": {
+      "path": "/tmp/rch-target-candidate/debug/rchd",
+      "sha256": "16b2b0419e9402808c11839ab448b1e1ee0f275a00f2df53718e99c365c6d8b6"
+    },
+    "prior_evidence": [
+      "offline_worker_issue_128.md",
+      "offline_worker_issue_128_followup.json"
+    ],
+    "additional_upstream_at_second_publication": {
+      "revision": "4885980acc7c4782900a9c364a031a9714d74ee6",
+      "scope": "Concurrent RABS leaf metadata and RCH disk-budget/Darwin census changes were preserved. They did not alter the owned worker/reload/harness files. Combined CLI testing passed both the new upstream disk-budget regression and the owned custom-target retrieval regression."
+    },
+    "process_compilation_upstream_revision": "5163bfb6c76f3b91d3f1e06c7ff60d85cf3586b2",
+    "discarded_unpublished_commits": [
+      {
+        "revision": "4c875b3b634787a9749e181a358fd01861eb8d29",
+        "parent": "9f267909cba71ede3b23dfae74f83987d7b2dc33",
+        "summary": "Custom-target retrieval source-authority fix",
+        "status": "Discarded without publication: its blob predates restoration of the pre-existing too_many_arguments allowance to execute_remote_compilation_inner."
+      }
+    ],
+    "final_integration_binaries": {
+      "file": {
+        "path": "/tmp/rch-continuation-final-binaries.json",
+        "sha256": "b6ed91e3eb7534f67de810b71353c96f350908b3af0c1f182a83ff3a86a92bba",
+        "size_bytes": 400,
+        "summaries": [],
+        "compile_source_paths": []
+      },
+      "raw": {
+        "source_commit": "33e681245dec8a66580e4a5141d119c81a25f8c0",
+        "binaries": {
+          "rch": {
+            "path": "/tmp/rch-target-candidate/debug/rch",
+            "sha256": "c331c6d0d76b70850d85654b668241fc1ef43128e937622699394719768a1431"
+          },
+          "rchd": {
+            "path": "/tmp/rch-target-candidate/debug/rchd",
+            "sha256": "b7a0785e3b59a05fc725d2b023ebdb86ff5cd7b9395da812135ad1aabc13d934"
+          }
+        }
+      }
+    },
+    "rch_validation_code_commit": "33e681245dec8a66580e4a5141d119c81a25f8c0",
+    "workspace_validation_code_commit": "3b69bf587fd8cc66fd16e8e0872996e2f27a86e4"
+  },
+  "defects": [
+    {
+      "id": "failed_bypass_retirement",
+      "files": [
+        "rch-common/src/bypass_record.rs",
+        "rchd/src/bypass_recovery_service.rs"
+      ],
+      "baseline": "A failed durable remove deleted the live bypass record, stranding an existing quarantine outside the recovery scanner.",
+      "correction": "Persist the proposed map before replacing the live map; failed retirement retains the exact record and its recovery path.",
+      "baseline_tests": [
+        "bypass_record::tests::bypass_failed_retirement_keeps_live_record_until_durable_clear",
+        "bypass_recovery_service::tests::failed_manual_enable_retains_recovery_and_active_reservations"
+      ]
+    },
+    {
+      "id": "disabled_inventory_retirement",
+      "files": [
+        "rchd/src/workers.rs",
+        "rchd/src/reload.rs"
+      ],
+      "baseline": "Configuration retirement replaced Disabled with Draining while three owned slots prevented removal, allowing new background SSH dials.",
+      "correction": "Track configuration absence independently from operator intent, retain pending disablement, and clear only removal intent on identical reintroduction.",
+      "baseline_tests": [
+        "workers::tests::operator_disable_dominates_subsequent_drain_requests",
+        "workers::tests::removal_reintroduction_preserves_later_operator_intent",
+        "reload::tests::reload_removal_preserves_durable_disable_and_owned_slots"
+      ],
+      "candidate_process_requirement": "Removal, identical re-addition and daemon restart must produce zero dials while three original slots remain owned. Explicit enable must await successful health evidence; explicit original-build release is the only slot-completion event.",
+      "additional_recovery_guarantee": "Same-endpoint inventory-only resume wakes waiting monitors while preserving the existing next-probe deadline. A paused-clock test checks healthy 30-second and offline 900-second due times exactly."
+    },
+    {
+      "id": "custom_target_retrieval_authority",
+      "files": [
+        "rch/src/hook/transfer_orchestration.rs"
+      ],
+      "source_finding": "The fresh custom-target transfer pipeline omitted the execution pipeline's source-authority identity.",
+      "correction": "Attach the original identity before staging so size/header probes, rsync and retrieval retries use the same activity and cancellation fence.",
+      "test": "hook::transfer_orchestration::tests::custom_target_retrieval_retains_exact_source_activity",
+      "runtime_validation_status": "passed on the combined source after integrating upstream 4885980a",
+      "baseline_runtime_status": "Not executed successfully; baseline attempts stopped during compilation."
+    }
+  ],
+  "baseline_unit_logs": {
+    "rch-continuation-bypass-store-before.log": {
+      "path": "/tmp/rch-continuation-bypass-store-before.log",
+      "sha256": "6cc02e1d7264f0bd5eed0789afbc9473a081b9acc33f11d51040cccbb0ca9e08",
+      "size_bytes": 1585,
+      "test_summaries": [
+        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2505 filtered out; finished in 0.00s"
+      ],
+      "text": "    Finished `test` profile [unoptimized] target(s) in 0.17s\n     Running unittests src/lib.rs (/tmp/rch-target-candidate/debug/build/rch-common/4630366a1b82faae/out/rch_common-4630366a1b82faae)\n\nrunning 1 test\ntest bypass_record::tests::bypass_failed_retirement_keeps_live_record_until_durable_clear ... FAILED\n\nfailures:\n\n---- bypass_record::tests::bypass_failed_retirement_keeps_live_record_until_durable_clear stdout ----\n\nthread 'bypass_record::tests::bypass_failed_retirement_keeps_live_record_until_durable_clear' (379954) panicked at rch-common/src/bypass_record.rs:1309:13:\nassertion `left == right` failed\n  left: None\n right: Some(BypassRecord { schema_version: \"1.0.0\", worker_id: \"css\", host: \"203.0.113.20\", user: \"ubuntu\", failure_class: DiskInodePressure, reason_code: DiskFull, state: TemporaryBypass, first_failure_unix_ms: 1700000000000, last_failure_unix_ms: 1700000000000, next_probe_unix_ms: 1700000030000, backoff: BypassBackoff { current_ms: 30000, attempts: 0, max_ms: 900000 }, consecutive_failures: 1, consecutive_passes: 0, last_diagnostic: \"worker filesystem full\", auto_rejoin: AutoRejoinCriteria { required_consecutive_passes: 2, canary_required: true }, local_fallback_allowed: true, disk_roots: [], details: {} })\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    bypass_record::tests::bypass_failed_retirement_keeps_live_record_until_durable_clear\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2505 filtered out; finished in 0.00s\n\nerror: test failed, to rerun pass `-p rch-common --lib`\n"
+    },
+    "rch-continuation-bypass-recovery-before.log": {
+      "path": "/tmp/rch-continuation-bypass-recovery-before.log",
+      "sha256": "7a5e6bc8ec4488641c05ebbbb6b257d484f45cdbc26186acb554df4e7ceef46a",
+      "size_bytes": 1887,
+      "test_summaries": [
+        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1923 filtered out; finished in 0.01s"
+      ],
+      "text": "   Compiling rch-common v2.1.34 (/tmp/rch-main-dceec4f3-validation/rch-common)\n   Compiling rch-telemetry v2.1.34 (/tmp/rch-main-dceec4f3-validation/rch-telemetry)\n   Compiling rchd v2.1.34 (/tmp/rch-main-dceec4f3-validation/rchd)\n    Finished `test` profile [unoptimized] target(s) in 1m 29s\n     Running unittests src/main.rs (/tmp/rch-target-candidate/debug/build/rchd/f7b2068d0df87851/out/rchd-f7b2068d0df87851)\n\nrunning 1 test\ntest bypass_recovery_service::tests::failed_manual_enable_retains_recovery_and_active_reservations ... FAILED\n\nfailures:\n\n---- bypass_recovery_service::tests::failed_manual_enable_retains_recovery_and_active_reservations stdout ----\n\nthread 'bypass_recovery_service::tests::failed_manual_enable_retains_recovery_and_active_reservations' (390569) panicked at rchd/src/bypass_recovery_service.rs:1576:17:\nassertion `left == right` failed\n  left: None\n right: Some(BypassRecord { schema_version: \"1.0.0\", worker_id: \"css\", host: \"h\", user: \"u\", failure_class: DiskInodePressure, reason_code: DiskFull, state: TemporaryBypass, first_failure_unix_ms: 1700000000000, last_failure_unix_ms: 1700000000000, next_probe_unix_ms: 1700000030000, backoff: BypassBackoff { current_ms: 30000, attempts: 0, max_ms: 900000 }, consecutive_failures: 1, consecutive_passes: 0, last_diagnostic: \"worker filesystem full\", auto_rejoin: AutoRejoinCriteria { required_consecutive_passes: 2, canary_required: true }, local_fallback_allowed: true, disk_roots: [], details: {\"recovery_endpoint_v1\": \"[\\\"h\\\",\\\"u\\\",\\\"/dev/null\\\",null]\"} })\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    bypass_recovery_service::tests::failed_manual_enable_retains_recovery_and_active_reservations\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1923 filtered out; finished in 0.01s\n\nerror: test failed, to rerun pass `-p rchd --bin rchd`\n"
+    },
+    "rch-continuation-disable-before.log": {
+      "path": "/tmp/rch-continuation-disable-before.log",
+      "sha256": "a63949cf55fc02bc57b76321b75d9ac91deae4491fc7bdad54cc384f38c54024",
+      "size_bytes": 1809,
+      "test_summaries": [
+        "test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 1924 filtered out; finished in 0.00s"
+      ],
+      "text": "   Compiling rchd v2.1.34 (/tmp/rch-main-dceec4f3-validation/rchd)\n    Finished `test` profile [unoptimized] target(s) in 1m 33s\n     Running unittests src/main.rs (/tmp/rch-target-candidate/debug/build/rchd/f7b2068d0df87851/out/rchd-f7b2068d0df87851)\n\nrunning 3 tests\ntest workers::tests::removal_reintroduction_preserves_later_operator_intent ... FAILED\ntest workers::tests::operator_disable_dominates_subsequent_drain_requests ... FAILED\ntest reload::tests::reload_removal_preserves_durable_disable_and_owned_slots ... FAILED\n\nfailures:\n\n---- workers::tests::removal_reintroduction_preserves_later_operator_intent stdout ----\n\nthread 'workers::tests::removal_reintroduction_preserves_later_operator_intent' (395512) panicked at rchd/src/workers.rs:4988:13:\ndrain\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n---- workers::tests::operator_disable_dominates_subsequent_drain_requests stdout ----\n\nthread 'workers::tests::operator_disable_dominates_subsequent_drain_requests' (395511) panicked at rchd/src/workers.rs:4947:17:\nassertion `left == right` failed\n  left: Draining\n right: Disabled\n\n---- reload::tests::reload_removal_preserves_durable_disable_and_owned_slots stdout ----\n\nthread 'reload::tests::reload_removal_preserves_durable_disable_and_owned_slots' (395510) panicked at rchd/src/reload.rs:1948:17:\nassertion `left == right` failed\n  left: Draining\n right: Disabled\n\n\nfailures:\n    reload::tests::reload_removal_preserves_durable_disable_and_owned_slots\n    workers::tests::operator_disable_dominates_subsequent_drain_requests\n    workers::tests::removal_reintroduction_preserves_later_operator_intent\n\ntest result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 1924 filtered out; finished in 0.00s\n\nerror: test failed, to rerun pass `-p rchd --bin rchd`\n"
+    }
+  },
+  "baseline_process_runs": [
+    {
+      "transport": "SSH subprocess fixture",
+      "binary": {
+        "path": "/tmp/rchd-dceec4f3-before-reload",
+        "sha256": "d92ac5721f892808108c1fb059bcce630131d781b0d5ca113a2ec866963cbe22"
+      },
+      "status": "failed",
+      "result_file": {
+        "path": "/tmp/rch-disabled-reload-baseline-avp5upww/results.json",
+        "sha256": "69af0a6c43e87906bb8a5eb23eee7959ffd5f7981e19839b27652779d8070c69",
+        "size_bytes": 2246
+      },
+      "observations_file": {
+        "path": "/tmp/rch-disabled-reload-baseline-avp5upww/fixture/reload-observations.json",
+        "sha256": "7604889ba0ed19cca6c5228cc9473691fdc617c7c4adf2ca39b040572b41e163",
+        "size_bytes": 2791
+      },
+      "observations": {
+        "reservation_slots": 3,
+        "phases": {
+          "removed_with_owned_build": {
+            "observation": {
+              "seconds": 3.23959356100022,
+              "dial_attempts": 2,
+              "minimum_dial_spacing_seconds": 0.21123278199956985,
+              "sampled_peak_live_transport_processes": 1,
+              "daemon_cpu_seconds": 0.020000000000000004,
+              "peak_daemon_rss_bytes": 40099840,
+              "daemon_log_lines": 2
+            },
+            "state": {
+              "worker": {
+                "id": "offline",
+                "host": "offline",
+                "user": "root",
+                "status": "draining",
+                "circuit_state": "closed",
+                "used_slots": 3,
+                "total_slots": 64,
+                "speed_score": 50,
+                "last_error": null,
+                "consecutive_failures": 0,
+                "recovery_in_secs": null,
+                "failure_history": [
+                  true,
+                  true,
+                  true,
+                  true
+                ],
+                "pressure_state": "telemetry_gap",
+                "pressure_confidence": "low",
+                "pressure_reason_code": "telemetry_unavailable",
+                "pressure_policy_rule": "fail_open_telemetry_gap",
+                "pressure_disk_free_gb": 900,
+                "pressure_disk_total_gb": 1000,
+                "pressure_disk_free_ratio": 0.9,
+                "pressure_build_disk_free_gb": 900,
+                "pressure_build_disk_total_gb": 1000,
+                "pressure_disk_io_util_pct": null,
+                "pressure_memory_pressure": null,
+                "pressure_telemetry_age_secs": null,
+                "pressure_telemetry_fresh": false
+              },
+              "active_build": {
+                "id": 30089923071574017,
+                "project_id": "disabled-reload-owned-reservation",
+                "worker_id": "offline",
+                "command": "<unknown>",
+                "started_at": "2026-11-01T02:12:57.164538430+00:00",
+                "last_heartbeat_at": "2026-11-01T02:12:57.164538430+00:00",
+                "heartbeat_age_secs": 3,
+                "last_progress_at": "2026-11-01T02:12:57.164538430+00:00",
+                "progress_age_secs": 3,
+                "heartbeat_phase": "sync_up",
+                "heartbeat_detail": "build_started",
+                "heartbeat_counter": 0,
+                "heartbeat_percent": null,
+                "slots": 3,
+                "detector_hook_alive": true,
+                "detector_heartbeat_stale": false,
+                "detector_progress_stale": false,
+                "detector_confidence": 0,
+                "detector_build_age_secs": 0,
+                "detector_slots_owned": 3,
+                "detector_last_evaluated_at": null
+              }
+            },
+            "new_dials_since_disable": 2,
+            "reload_response": {
+              "added": 0,
+              "removed": 0,
+              "success": true,
+              "updated": 0,
+              "warnings": [
+                "Worker offline has active jobs, draining instead of removing"
+              ]
+            }
+          }
+        },
+        "dials_before_inventory_changes": 3
+      },
+      "diagnostic_log": {
+        "path": "/tmp/rch-disabled-reload-baseline.log",
+        "sha256": "02ef502ddebd8a0216e9403c939e0787193a80ca811e2fd1b02827f60fd6d63e",
+        "size_bytes": 4683
+      }
+    },
+    {
+      "transport": "local OpenSSH with deterministic worker protocol",
+      "binary": {
+        "path": "/tmp/rchd-dceec4f3-before-reload",
+        "sha256": "d92ac5721f892808108c1fb059bcce630131d781b0d5ca113a2ec866963cbe22"
+      },
+      "status": "failed",
+      "result_file": {
+        "path": "/tmp/rch-disabled-reload-baseline-openssh-3majt9xy/results.json",
+        "sha256": "ac3d60a0b1194b5bdb0f492b35ffc307ed476079198c9e6649ad464e467bc8a9",
+        "size_bytes": 2282
+      },
+      "observations_file": {
+        "path": "/tmp/rch-disabled-reload-baseline-openssh-3majt9xy/fixture/reload-observations.json",
+        "sha256": "dcddb1e11a0b8acb8d64cc79bee92574d2d684caa9012eac77780a2ff0b3d779",
+        "size_bytes": 2793
+      },
+      "observations": {
+        "reservation_slots": 3,
+        "phases": {
+          "removed_with_owned_build": {
+            "observation": {
+              "seconds": 3.2455770740016305,
+              "dial_attempts": 2,
+              "minimum_dial_spacing_seconds": 0.27012201999968966,
+              "sampled_peak_live_transport_processes": 1,
+              "daemon_cpu_seconds": 0.039999999999999994,
+              "peak_daemon_rss_bytes": 40460288,
+              "daemon_log_lines": 2
+            },
+            "state": {
+              "worker": {
+                "id": "offline",
+                "host": "offline",
+                "user": "root",
+                "status": "draining",
+                "circuit_state": "closed",
+                "used_slots": 3,
+                "total_slots": 64,
+                "speed_score": 50,
+                "last_error": null,
+                "consecutive_failures": 0,
+                "recovery_in_secs": null,
+                "failure_history": [
+                  true,
+                  true,
+                  true,
+                  true
+                ],
+                "pressure_state": "telemetry_gap",
+                "pressure_confidence": "low",
+                "pressure_reason_code": "telemetry_unavailable",
+                "pressure_policy_rule": "fail_open_telemetry_gap",
+                "pressure_disk_free_gb": 900,
+                "pressure_disk_total_gb": 1000,
+                "pressure_disk_free_ratio": 0.9,
+                "pressure_build_disk_free_gb": 900,
+                "pressure_build_disk_total_gb": 1000,
+                "pressure_disk_io_util_pct": null,
+                "pressure_memory_pressure": null,
+                "pressure_telemetry_age_secs": null,
+                "pressure_telemetry_fresh": false
+              },
+              "active_build": {
+                "id": 30089924917067777,
+                "project_id": "disabled-reload-owned-reservation",
+                "worker_id": "offline",
+                "command": "<unknown>",
+                "started_at": "2026-11-01T02:14:47.449607004+00:00",
+                "last_heartbeat_at": "2026-11-01T02:14:47.449607004+00:00",
+                "heartbeat_age_secs": 3,
+                "last_progress_at": "2026-11-01T02:14:47.449607004+00:00",
+                "progress_age_secs": 3,
+                "heartbeat_phase": "sync_up",
+                "heartbeat_detail": "build_started",
+                "heartbeat_counter": 0,
+                "heartbeat_percent": null,
+                "slots": 3,
+                "detector_hook_alive": true,
+                "detector_heartbeat_stale": false,
+                "detector_progress_stale": false,
+                "detector_confidence": 0,
+                "detector_build_age_secs": 0,
+                "detector_slots_owned": 3,
+                "detector_last_evaluated_at": null
+              }
+            },
+            "new_dials_since_disable": 2,
+            "reload_response": {
+              "added": 0,
+              "removed": 0,
+              "success": true,
+              "updated": 0,
+              "warnings": [
+                "Worker offline has active jobs, draining instead of removing"
+              ]
+            }
+          }
+        },
+        "dials_before_inventory_changes": 3
+      },
+      "diagnostic_log": {
+        "path": "/tmp/rch-disabled-reload-baseline-openssh.log",
+        "sha256": "0077e049b1b06967ef40ee436b8881c292904951dc0c38a018a7081957438488",
+        "size_bytes": 4737
+      }
+    }
+  ],
+  "baseline_process_cleanup": {
+    "checked": true,
+    "method": "Read /proc identities using the PID birth ticks recorded by each dial; each direct-run wrapper first verified matching /proc and PID namespaces.",
+    "recorded_dials_per_run": 7,
+    "identity_matching_live_transports_after_cleanup": 0
+  },
+  "validation": {
+    "common_unit_suite": {
+      "status": "passed",
+      "passed": 2498,
+      "failed": 0,
+      "ignored": 8,
+      "runtime_seconds": 24.06,
+      "compile_seconds": 48.37,
+      "source_compile_observed": "/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rch-common",
+      "log": {
+        "path": "/tmp/rch-continuation-common-tests-final.log",
+        "sha256": "72804bed6bad82173c174ab070b510589dad33fd5eb8926914ab1f2a2d87c275",
+        "size_bytes": 187117,
+        "test_summaries": [
+          "test result: ok. 2498 passed; 0 failed; 8 ignored; 0 measured; 0 filtered out; finished in 24.06s"
+        ]
+      },
+      "ignored_test_results": [
+        "test remote_compilation::tests::build_remote_mock_command_failure ... ignored, uses global mock state; run with --test-threads=1",
+        "test remote_compilation::tests::build_remote_mock_success ... ignored, uses global mock state; run with --test-threads=1",
+        "test remote_compilation::tests::rsync_from_worker_mock_artifact_failure ... ignored, uses global mock state; run with --test-threads=1",
+        "test remote_compilation::tests::rsync_from_worker_mock_success ... ignored, uses global mock state; run with --test-threads=1",
+        "test remote_compilation::tests::rsync_to_worker_mock_ssh_failure ... ignored, uses global mock state; run with --test-threads=1",
+        "test remote_compilation::tests::rsync_to_worker_mock_success ... ignored, uses global mock state; run with --test-threads=1",
+        "test remote_compilation::tests::use_mock_transport_with_global_override ... ignored, uses global mock state; run with --test-threads=1",
+        "test remote_compilation::tests::use_mock_transport_with_real_host ... ignored, uses global mock state; run with --test-threads=1"
+      ]
+    },
+    "daemon_unit_suite": {
+      "status": "passed",
+      "passed": 1929,
+      "failed": 0,
+      "ignored": 0,
+      "runtime_seconds": 132.15,
+      "compile_duration": "1m 07s",
+      "log": {
+        "path": "/tmp/rch-continuation-daemon-tests-complete.log",
+        "sha256": "94a1b16befaaf79bf69c8625205e07aa43b33707ddce07f6b5d88e97c9452dbd",
+        "size_bytes": 150388,
+        "summaries": [
+          "    Finished `test` profile [unoptimized] target(s) in 1m 07s",
+          "test result: ok. 1929 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 132.15s"
+        ],
+        "compile_source_paths": [
+          "   Compiling rchd v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rchd)"
+        ]
+      },
+      "new_regressions_passed": [
+        "bypass_recovery_service::tests::failed_manual_enable_retains_recovery_and_active_reservations",
+        "reload::tests::reload_removal_preserves_durable_disable_and_owned_slots",
+        "workers::tests::operator_disable_dominates_subsequent_drain_requests",
+        "workers::tests::removal_reintroduction_preserves_later_operator_intent",
+        "workers::tests::inventory_drain_keeps_owned_monitoring_and_restores_pools_on_return",
+        "workers::tests::inventory_resume_wakes_health_without_resetting_recovery_deadline"
+      ],
+      "earlier_accepted_run_before_final_wakeup": {
+        "status": "passed",
+        "passed": 1928,
+        "failed": 0,
+        "ignored": 0,
+        "runtime_seconds": 132.05,
+        "compile_duration": "6m 08s",
+        "log": {
+          "path": "/tmp/rch-continuation-daemon-tests-final.log",
+          "sha256": "eeabe7b92139eea37d90d55ac735631f3ed21810e81fca09333cf1fdbc5de278",
+          "size_bytes": 150506,
+          "summaries": [
+            "    Finished `test` profile [unoptimized] target(s) in 6m 08s",
+            "test result: ok. 1928 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 132.05s"
+          ],
+          "compile_source_paths": [
+            "   Compiling rch-common v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rch-common)",
+            "   Compiling rch-telemetry v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rch-telemetry)",
+            "   Compiling rchd v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rchd)"
+          ]
+        }
+      }
+    },
+    "candidate_disabled_reload_synthetic": {
+      "status": "passed",
+      "phase_dial_counts": {
+        "removed_with_owned_build": 0,
+        "identical_reintroduction": 0,
+        "disabled_restart": 0
+      },
+      "original_slots_preserved_until_explicit_release": 3,
+      "enable_refused_probe_dials": 2,
+      "recovery_latency_seconds": 3.492923341000278,
+      "raw_results_key": "candidate_disabled_reload_process_runs.raw_results.runs.synthetic"
+    },
+    "candidate_disabled_reload_openssh": {
+      "status": "passed",
+      "phase_dial_counts": {
+        "removed_with_owned_build": 0,
+        "identical_reintroduction": 0,
+        "disabled_restart": 0
+      },
+      "original_slots_preserved_until_explicit_release": 3,
+      "enable_refused_probe_dials": 2,
+      "recovery_latency_seconds": 3.475344086000405,
+      "raw_results_key": "candidate_disabled_reload_process_runs.raw_results.runs.openssh"
+    },
+    "custom_target_retrieval_regression": {
+      "status": "passed",
+      "test": "hook::transfer_orchestration::tests::custom_target_retrieval_retains_exact_source_activity",
+      "accepted_log_key": "validation.combined_cli_selected_suite.log",
+      "baseline_runtime_red_proof": "Not obtained; baseline test attempts did not compile successfully.",
+      "earlier_accepted_log_key": "validation.pre_4885_cli_selected_suite.log"
+    },
+    "common_daemon_all_targets_strict_clippy": {
+      "status": "passed",
+      "compile_duration": "1m 35s",
+      "scope": "rch-common and rchd, all targets, warnings denied",
+      "log": {
+        "path": "/tmp/rch-continuation-core-clippy-complete.log",
+        "sha256": "b6f7194d30ca9988cbca7c4508114c3b68bacc037b4043dd6b074a930aa3f7aa",
+        "size_bytes": 364,
+        "summaries": [
+          "    Finished `dev` profile [unoptimized] target(s) in 1m 35s"
+        ],
+        "compile_source_paths": [
+          "   Compiling rch-common v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rch-common)",
+          "    Checking rch-telemetry v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rch-telemetry)",
+          "    Checking rchd v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rchd)"
+        ]
+      }
+    },
+    "final_formatting": {
+      "status": "passed",
+      "source_head": "33e681245dec8a66580e4a5141d119c81a25f8c0",
+      "log": {
+        "path": "/tmp/rch-continuation-final-format.log",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "size_bytes": 0,
+        "summaries": [],
+        "compile_source_paths": []
+      },
+      "evidence": "Coordinating runner confirmed exit 0 on the final published source; successful cargo fmt --check output is empty."
+    },
+    "cli_validation": {
+      "status": "passed",
+      "scope": "Combined selected suite, strict all-target CLI lint, final executable build, and jobs lifecycle integration all passed; individual gates retain their exact source snapshots."
+    },
+    "workspace_validation": {
+      "status": "passed",
+      "scope": "Full-workspace check, strict all-target Clippy, formatting and the selected RABS runtime tests passed on the same seven-file correction snapshot, published unchanged as 3b69bf58. The selected suites passed 6 rabs-cas tests and 58 rabsd tests; one pre-existing reflink-filesystem test stayed ignored. Intermediate failed attempts are retained. This does not claim a complete RABS qualification or an all-workspace runtime test run.",
+      "attempts": [
+        {
+          "status": "failed",
+          "source_commit": "33e681245dec8a66580e4a5141d119c81a25f8c0",
+          "terminal_status_file": {
+            "path": "/tmp/rch-continuation-final-workspace-status.json",
+            "sha256": "d7a2b2fb109f3f1683bdb37c4d1330a286bc31071ef4b755e66bcdfec312a7df",
+            "size_bytes": 337
+          },
+          "terminal_status": {
+            "source_commit": "33e681245dec8a66580e4a5141d119c81a25f8c0",
+            "completed_at": "2026-11-01T03:14:04.431606+00:00",
+            "workspace_check_exit_code": 101,
+            "workspace_clippy_exit_code": 101,
+            "commands": [
+              "cargo check --locked --workspace --all-targets",
+              "cargo clippy --locked --workspace --all-targets -- -D warnings"
+            ]
+          },
+          "workspace_check_log": {
+            "path": "/tmp/rch-continuation-final-workspace-check.log",
+            "sha256": "80a48afb93f63b98f343fab8448afe4bcad9cf344bc638abc6e08696d5ee896c",
+            "size_bytes": 5762,
+            "text": "    Checking rabs-key v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabs-key)\n    Checking rch-common v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rch-common)\n    Checking rabs-cas v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabs-cas)\n    Checking rabs-sandbox v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabs-sandbox)\n    Checking asupersync v0.5.0 (https://github.com/Dicklesworthstone/asupersync.git?rev=78b64636e99fea4ea2d868096576021dd3b8e519#78b64636)\n    Checking rabs-asupersync v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabs-asupersync)\n    Checking tinystr v0.8.4\n    Checking tokio-util v0.7.19\n    Checking icu_locale_core v2.3.0\n    Checking zerotrie v0.2.5\n    Checking icu_provider v2.3.1\n    Checking icu_collections v2.3.0\n    Checking h2 v0.4.19\n    Checking hyper v1.11.1\n    Checking hyper-util v0.1.20\n    Checking tower v0.5.3\n    Checking icu_properties v2.3.0\n    Checking icu_normalizer v2.3.0\n    Checking idna_adapter v1.2.2\n    Checking tokio-stream v0.1.19\n    Checking half v2.7.1\n   Compiling alloca v0.4.0\n    Checking ciborium-ll v0.2.2\n    Checking idna v1.1.0\n    Checking rayon-core v1.13.0\n    Checking hyper-timeout v0.5.2\n    Checking opentelemetry v0.32.0\n    Checking tonic v0.14.6\n    Checking rayon v1.12.0\n    Checking url v2.5.8\n    Checking ciborium v0.2.2\n    Checking tokio-rustls v0.26.5\n    Checking tinytemplate v1.2.1\n    Checking criterion v0.8.2\n    Checking hyper-rustls v0.27.9\n    Checking tower-http v0.6.11\n    Checking rustls-platform-verifier v0.7.0\n    Checking rabs-replay v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabs-replay)\n    Checking reqwest v0.13.5\n    Checking tonic-prost v0.14.6\n    Checking opentelemetry_sdk v0.32.1\n    Checking tonic-types v0.14.6\n    Checking opentelemetry-proto v0.32.0\n    Checking opentelemetry-http v0.32.0\n    Checking opentelemetry-otlp v0.32.0\n    Checking rabs-scheduler v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabs-scheduler)\n    Checking rch-telemetry v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rch-telemetry)\n    Checking rabsd v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabsd)\n    Checking ahash v0.8.12\n    Checking ftui-core v0.7.0\n    Checking ftui-a11y v0.7.0\n    Checking ftui-render v0.7.0\n    Checking ftui-layout v0.7.0\n    Checking ftui-style v0.7.0\n    Checking ftui-backend v0.7.0\n    Checking ftui-text v0.7.0\n    Checking icu_locale_fallback v2.3.0\n    Checking ftui-runtime v0.7.0\n    Checking icu_segmenter v2.3.0\n    Checking textwrap v0.16.4\n    Checking ftui-widgets v0.7.0\n    Checking terminal_size v0.4.4\n    Checking dialoguer v0.12.0\n    Checking miette v7.6.0\n    Checking zip v8.6.0\n    Checking indicatif v0.18.6\n    Checking pulldown-cmark v0.13.4\n    Checking ftui v0.7.0\n    Checking tru v0.2.4\n    Checking ftui-tty v0.7.0\n    Checking insta v1.48.0\n   Compiling darling_core v0.20.11\n   Compiling darling_macro v0.20.11\n   Compiling darling v0.20.11\n   Compiling derive_builder_core v0.20.2\n   Compiling derive_builder_macro v0.20.2\n   Compiling strum_macros v0.27.2\n    Checking strum v0.27.2\n   Compiling phf_macros v0.11.3\n    Checking derive_builder v0.20.2\n    Checking rabs-wkr v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabs-wkr)\n    Checking axum-core v0.5.6\n    Checking phf v0.11.3\n    Checking inotify v0.11.5\n    Checking croner v3.0.1\n    Checking chrono-tz v0.10.4\n    Checking serde_urlencoded v0.7.1\n    Checking webpki-roots v1.0.9\n    Checking notify-types v2.1.0\n    Checking serde_path_to_error v0.1.20\n   Compiling num-derive v0.4.2\n    Checking axum v0.8.9\n    Checking ureq v3.4.2\n    Checking cron v0.17.0\n    Checking tokio-cron-scheduler v0.15.1\n    Checking notify v8.2.0\n    Checking tracing-opentelemetry v0.33.0\n    Checking rchd v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rchd)\n    Checking rch v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rch)\n    Checking rch-wkr v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rch-wkr)\nerror[E0599]: no method named `execute` found for struct `MutexGuard<'_, SqlMetadataStore<RusqliteEngine>>` in the current scope\n   --> rabsd/src/coord/live/metadata_replay/tests.rs:322:57\n    |\n322 |                     fixture.cas.store().lock().unwrap().execute(\n    |                     ------------------------------------^^^^^^^ method not found in `MutexGuard<'_, SqlMetadataStore<RusqliteEngine>>`\n    |\n    = note: the full name for the type has been written to '/tmp/rch-target-candidate/debug/build/rabsd/87d39ff7e1f45f28/out/rabsd-87d39ff7e1f45f28.long-type-1700538889191953133.txt'\n    = note: consider using `--verbose` to print the full type name to the console\n\nwarning: taking a mutable reference to a `const` item\n    --> rabsd/src/coord/source_delivery/preparation/cargo/git.rs:1583:17\n     |\n1583 |                 &mut MAX_ARCHIVE_MEMBERS,\n     |                 ^^^^^^^^^^^^^^^^^^^^^^^^\n     |\n     = note: each usage of a `const` item creates a new temporary\n     = note: the mutable reference will refer to this temporary, not the original `const` item\nnote: `const` item defined here\n    --> rabsd/src/coord/source_delivery/preparation/cargo/registry.rs:29:1\n     |\n  29 | pub(super) const MAX_ARCHIVE_MEMBERS: usize = 100_000;\n     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n     = note: `#[warn(const_item_mutation)]` on by default\n\nFor more information about this error, try `rustc --explain E0599`.\nwarning: `rabsd` (lib test) generated 1 warning\nerror: could not compile `rabsd` (lib test) due to 1 previous error; 1 warning emitted\n"
+          },
+          "workspace_clippy_log": {
+            "path": "/tmp/rch-continuation-final-workspace-clippy.log",
+            "sha256": "e30358c6b13fa4a7a93335109b0ece25f18464ff552b1172317c4aad0fc3abc6",
+            "size_bytes": 3726,
+            "text": "   Compiling rch-common v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rch-common)\n    Checking rabs-cas v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabs-cas)\n    Checking rabs-sandbox v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabs-sandbox)\n    Checking rabs-asupersync v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabs-asupersync)\n    Checking rabs-replay v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabs-replay)\n    Checking rabs-scheduler v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabs-scheduler)\n    Checking rch-telemetry v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rch-telemetry)\n    Checking rabsd v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabsd)\nerror: very complex type used. Consider factoring parts into `type` definitions\n    --> rabsd/src/coord/live_dependency/remote.rs:2017:29\n     |\n2017 |         mut metadata_ready: Option<&mut dyn FnMut(&[u8]) -> Result<(), String>>,\n     |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n     |\n     = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#type_complexity\n     = note: `-D clippy::type-complexity` implied by `-D warnings`\n     = help: to override `-D warnings` add `#[allow(clippy::type_complexity)]`\n\nerror: very complex type used. Consider factoring parts into `type` definitions\n   --> rabsd/src/coord/live_dependency.rs:477:29\n    |\n477 |         mut metadata_ready: Option<&mut dyn FnMut(&[u8]) -> Result<(), String>>,\n    |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    |\n    = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#type_complexity\n\nerror: large size difference between variants\n   --> rabsd/src/coord/remote_dependency_transport.rs:102:1\n    |\n102 | /  enum ReservedOperation<'a> {\n103 | |/     Execute {\n104 | ||         upload: &'a SourceUpload,\n105 | ||         on_admitted: WorkerAdmissionHook,\n106 | ||     },\n    | ||_____- the second-largest variant contains at least 24 bytes\n107 | |      Continue(SealedResult),\n    | |      ---------------------- the largest variant contains at least 232 bytes\n108 | |  }\n    | |__^ the entire enum is at least 232 bytes\n    |\n    = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#large_enum_variant\n    = note: `-D clippy::large-enum-variant` implied by `-D warnings`\n    = help: to override `-D warnings` add `#[allow(clippy::large_enum_variant)]`\nhelp: consider boxing the large fields or introducing indirection in some other way to reduce the total size of the enum\n    |\n107 -     Continue(SealedResult),\n107 +     Continue(Box<SealedResult>),\n    |\n\nerror: large size difference between variants\n  --> rabsd/src/coord/source_delivery.rs:43:1\n   |\n43 | / enum PreparationToolchain {\n44 | |     Captured(PreparedToolchain),\n   | |     --------------------------- the largest variant contains at least 216 bytes\n45 | |     Retained(Arc<RetainedToolchain>),\n   | |     -------------------------------- the second-largest variant contains at least 8 bytes\n46 | | }\n   | |_^ the entire enum is at least 216 bytes\n   |\n   = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#large_enum_variant\nhelp: consider boxing the large fields or introducing indirection in some other way to reduce the total size of the enum\n   |\n44 -     Captured(PreparedToolchain),\n44 +     Captured(Box<PreparedToolchain>),\n   |\n\nerror: could not compile `rabsd` (lib) due to 4 previous errors\n"
+          },
+          "findings": [
+            "RABS metadata corruption test calls execute on encapsulated SqlMetadataStore, which no longer exposes that method (E0599).",
+            "Cargo Git preparation test takes a mutable reference to a const value.",
+            "Two metadata-ready callback signatures trigger type_complexity.",
+            "ReservedOperation and PreparationToolchain trigger large_enum_variant."
+          ],
+          "resource_kill_observed": false,
+          "followup": "Narrow corrections in the existing RABS implementation/test files are being prepared. Preserve corruption assertions and production store encapsulation, then rerun the workspace gates."
+        },
+        {
+          "status": "partially_passed",
+          "terminal_status_file": {
+            "path": "/tmp/rch-continuation-workspace-status-corrected.json",
+            "sha256": "fb6320aa6c5a8271d8ce9c88222835ca2d1a2184fbcd8f600e13d1257e517f51",
+            "size_bytes": 781,
+            "summaries": []
+          },
+          "terminal_status": {
+            "base_commit": "33e681245dec8a66580e4a5141d119c81a25f8c0",
+            "source_blobs": {
+              "rabsd/src/coord/live/metadata_replay/tests.rs": "3b87c142896b67db4e0f18217e1d339ee6336268",
+              "rabsd/src/coord/live_dependency.rs": "2961a5233031ba4e6dc9e6f4a96cda93aed55bf6",
+              "rabsd/src/coord/live_dependency/remote.rs": "db40eb264f04802dd84bcebddd340003199b71a9",
+              "rabsd/src/coord/remote_dependency_transport.rs": "e2dcc2e85ab0a658dc3b347c7eb88784499da9b3",
+              "rabsd/src/coord/source_delivery.rs": "9d4f41622d0cb9519b0d462cd01476d8ee84ba54",
+              "rabsd/src/coord/source_delivery/preparation/cargo/git.rs": "96e4058f4b30c73726f0ee868297d152145fbfe1"
+            },
+            "completed_at": "2026-11-01T03:21:21.175818+00:00",
+            "workspace_check_exit_code": 0,
+            "workspace_clippy_exit_code": 101
+          },
+          "workspace_check": {
+            "status": "passed",
+            "compile_duration": "1m 29s",
+            "log": {
+              "path": "/tmp/rch-continuation-workspace-check-corrected.log",
+              "sha256": "b8e14e774bf3daef11b0790f2d0b93b18eee47d896c4750a52e62422d522e96c",
+              "size_bytes": 1414,
+              "summaries": [
+                "    Finished `dev` profile [unoptimized] target(s) in 1m 29s"
+              ]
+            }
+          },
+          "workspace_clippy": {
+            "status": "failed",
+            "log": {
+              "path": "/tmp/rch-continuation-workspace-clippy-corrected.log",
+              "sha256": "ef4854feb50cf3134c148ee01262d3557bf133d4c15d4a573a084e34fb96dee3",
+              "size_bytes": 1865,
+              "summaries": [],
+              "text": "   Compiling rch-common v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rch-common)\n    Checking rch-telemetry v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rch-telemetry)\n    Checking rabsd v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabsd)\n    Checking rabs-wkr v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabs-wkr)\n    Checking rchd v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rchd)\n    Checking rch v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rch)\n    Checking rch-wkr v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rch-wkr)\n    Checking rabs-scheduler v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabs-scheduler)\nerror: very complex type used. Consider factoring parts into `type` definitions\n   --> rabsd/src/coord/live/metadata_replay/tests.rs:165:19\n    |\n165 |         callback: Option<&mut dyn FnMut(&[PathBuf]) -> Result<(), String>>,\n    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    |\n    = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#type_complexity\n    = note: `-D clippy::type-complexity` implied by `-D warnings`\n    = help: to override `-D warnings` add `#[allow(clippy::type_complexity)]`\n\nerror: very complex type used. Consider factoring parts into `type` definitions\n   --> rabsd/src/coord/live/metadata_replay/tests.rs:180:19\n    |\n180 |         callback: Option<&mut dyn FnMut(&[PathBuf]) -> Result<(), String>>,\n    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    |\n    = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#type_complexity\n\nerror: could not compile `rabsd` (lib test) due to 2 previous errors\n"
+            },
+            "findings": "Two remaining test-local metadata-ready callback signatures trigger type_complexity; a named test-local callback alias preserves the callback contract."
+          }
+        },
+        {
+          "status": "failed",
+          "command": "cargo clippy --locked --workspace --all-targets -- -D warnings",
+          "log": {
+            "path": "/tmp/rch-continuation-workspace-clippy-complete.log",
+            "sha256": "31040dd392b0205a1dd7d9e54883632e044f036f3497c420fec046c674a69b32",
+            "size_bytes": 1965,
+            "summaries": [],
+            "text": "    Checking rabsd v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabsd)\n    Checking rabs-scheduler v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabs-scheduler)\n    Checking rch-telemetry v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rch-telemetry)\n    Checking rabs-cas v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabs-cas)\nerror: unnecessary use of `clone` to create a slice from a reference\n   --> rabs-cas/src/materialization/staged/metadata_pipeline_tests.rs:106:5\n    |\n106 |     assert_eq!(selected_head.selected[0].locations, [head_source.clone()]);\n    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    |\n    = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#cloned_ref_to_slice_refs\n    = note: `-D clippy::cloned-ref-to-slice-refs` implied by `-D warnings`\n    = help: to override `-D warnings` add `#[allow(clippy::cloned_ref_to_slice_refs)]`\n\nerror: unnecessary use of `clone` to create a slice from a reference\n   --> rabs-cas/src/materialization/staged/metadata_pipeline_tests.rs:107:5\n    |\n107 | /     assert_eq!(\n108 | |         selected_head.selected[1].locations,\n109 | |         [dep_info_source.clone()]\n110 | |     );\n    | |_____^\n    |\n    = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#cloned_ref_to_slice_refs\n\nerror: unnecessary use of `clone` to create a slice from a reference\n   --> rabs-cas/src/materialization/staged/metadata_pipeline_tests.rs:113:5\n    |\n113 |     assert_eq!(tail_selection.selected[0].locations, [tail_source.clone()]);\n    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    |\n    = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#cloned_ref_to_slice_refs\n\nerror: could not compile `rabs-cas` (lib test) due to 3 previous errors\n"
+          },
+          "findings": "Three unnecessary cloned-reference slice assertions in rabs-cas metadata pipeline tests; comparisons preserved using as_slice and std::slice::from_ref."
+        }
+      ],
+      "accepted_source_snapshot": {
+        "base_commit": "33e681245dec8a66580e4a5141d119c81a25f8c0",
+        "source_blobs": {
+          "rabs-cas/src/materialization/staged/metadata_pipeline_tests.rs": "83efe16cd070b70f696ce47b5edbb0d558219013",
+          "rabsd/src/coord/live/metadata_replay/tests.rs": "f6776b33844b6eccd13e42bc14251ffb77cc3804",
+          "rabsd/src/coord/live_dependency.rs": "2961a5233031ba4e6dc9e6f4a96cda93aed55bf6",
+          "rabsd/src/coord/live_dependency/remote.rs": "db40eb264f04802dd84bcebddd340003199b71a9",
+          "rabsd/src/coord/remote_dependency_transport.rs": "e2dcc2e85ab0a658dc3b347c7eb88784499da9b3",
+          "rabsd/src/coord/source_delivery.rs": "9d4f41622d0cb9519b0d462cd01476d8ee84ba54",
+          "rabsd/src/coord/source_delivery/preparation/cargo/git.rs": "96e4058f4b30c73726f0ee868297d152145fbfe1"
+        },
+        "published_commit": "3b69bf587fd8cc66fd16e8e0872996e2f27a86e4"
+      },
+      "accepted_strict_clippy": {
+        "status": "passed",
+        "command": "cargo clippy --locked --workspace --all-targets -- -D warnings",
+        "exit_code": 0,
+        "compile_seconds": 58.4,
+        "source_snapshot_key": "validation.workspace_validation.accepted_source_snapshot",
+        "log": {
+          "path": "/tmp/rch-continuation-workspace-clippy-accepted.log",
+          "sha256": "63531b849529df8da6746c297e65051edb60128c3a49a4c8ae188dfe5d48f2f0",
+          "size_bytes": 1212,
+          "summaries": [
+            "    Finished `dev` profile [unoptimized] target(s) in 58.40s"
+          ],
+          "text": "    Checking rabs-cas v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabs-cas)\n    Checking rch-common v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rch-common)\n    Checking rabs-asupersync v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabs-asupersync)\n    Checking rabs-wkr v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabs-wkr)\n    Checking rabs-action v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabs-action)\n    Checking rabs-sandbox v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabs-sandbox)\n    Checking rabs-key v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabs-key)\n    Checking rabs-wrap v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabs-wrap)\n    Checking rabs-protocol v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabs-protocol)\n    Checking rabs-scheduler v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabs-scheduler)\n    Checking rabs-replay v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabs-replay)\n    Finished `dev` profile [unoptimized] target(s) in 58.40s\n"
+        }
+      },
+      "final_same_source_check": {
+        "status": "passed",
+        "command": "cargo check --locked --workspace --all-targets",
+        "exit_code": 0,
+        "compile_seconds": 18.13,
+        "source_snapshot_key": "validation.workspace_validation.accepted_source_snapshot",
+        "log": {
+          "path": "/tmp/rch-continuation-workspace-check-accepted.log",
+          "sha256": "6c83be4b137f4ae1c9942e76d9bb6eb152c95f1f27fef7f80f4a3af2d6d43181",
+          "size_bytes": 253,
+          "text": "    Checking rabsd v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabsd)\n    Checking rabs-cas v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabs-cas)\n    Finished `dev` profile [unoptimized] target(s) in 18.13s\n"
+        }
+      },
+      "final_correction_formatting": {
+        "status": "passed",
+        "command": "cargo fmt --all -- --check",
+        "exit_code": 0,
+        "source_snapshot_key": "validation.workspace_validation.accepted_source_snapshot",
+        "log": {
+          "path": "/tmp/rch-continuation-workspace-format-accepted.log",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0,
+          "text": ""
+        },
+        "evidence": "Coordinating runner confirmed successful exit; successful formatting output is empty."
+      },
+      "relevant_runtime_tests": {
+        "status": "passed",
+        "exit_code": 0,
+        "compile_duration": "7m 18s",
+        "source_commit": "3b69bf587fd8cc66fd16e8e0872996e2f27a86e4",
+        "source_snapshot_key": "validation.workspace_validation.accepted_source_snapshot",
+        "executed_before_publication_of_identical_source": true,
+        "workdir": "/workspace/scratch/8a5910f9cc83/remote_compilation_helper",
+        "environment_prefix": "env PATH=/tmp/rch-cargo/bin:$PATH CARGO_HOME=/tmp/rch-cargo RUSTUP_HOME=/tmp/rch-rustup CARGO_NET_GIT_FETCH_WITH_CLI=true CARGO_HTTP_USER_AGENT='remote_compilation_helper-agent (+https://github.com/Dicklesworthstone/remote_compilation_helper)' CARGO_BUILD_JOBS=1 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 MALLOC_CONF='narenas:1,dirty_decay_ms:0,muzzy_decay_ms:0' RUSTFLAGS='-Zthreads=1 -Zmir-opt-level=0 -Zunstable-options --jobs-backend=1' CARGO_TARGET_DIR=/tmp/rch-target-candidate",
+        "command": "cargo -Zprofile-hint-mostly-unused --config 'profile.dev.package.\"asupersync@0.5.0\".hint-mostly-unused=true' --config 'profile.test.package.\"asupersync@0.5.0\".hint-mostly-unused=true' test --locked -p rabsd -p rabs-cas --lib -- coord::live::metadata_replay::tests:: coord::live_dependency::tests:: coord::live_dependency::remote::tests:: coord::remote_dependency_transport::tests:: coord::source_delivery::tests:: pinned_submodule_member_closure_is_recursive_bounded_and_cycle_checked materialization::staged::metadata_pipeline_tests:: --test-threads=4",
+        "command_provenance": "Exact invocation supplied by the coordinating runner.",
+        "log": {
+          "path": "/tmp/rch-continuation-workspace-recovery-tests.log",
+          "sha256": "c864bf2a531ae4cf6a43735698d49b55d9c6d9f2c38c1cf7260a04245ec7c1ca",
+          "size_bytes": 27734,
+          "summaries": [
+            "    Finished `test` profile [unoptimized] target(s) in 7m 18s",
+            "test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 405 filtered out; finished in 0.26s",
+            "test result: ok. 58 passed; 0 failed; 1 ignored; 0 measured; 1285 filtered out; finished in 0.67s"
+          ],
+          "compile_source_paths": [
+            "   Compiling rabs-key v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabs-key)",
+            "   Compiling rabs-action v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabs-action)",
+            "   Compiling rabs-asupersync v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabs-asupersync)",
+            "   Compiling rabs-cas v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabs-cas)",
+            "   Compiling rabs-sandbox v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabs-sandbox)",
+            "   Compiling rabs-scheduler v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabs-scheduler)",
+            "   Compiling rabsd v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabsd)"
+          ]
+        },
+        "packages": {
+          "rabs-cas": {
+            "passed": 6,
+            "failed": 0,
+            "ignored": 0,
+            "filtered_out": 405,
+            "runtime_seconds": 0.26,
+            "test_results": [
+              "test materialization::staged::metadata_pipeline_tests::empty_and_nonmetadata_selections_keep_the_complete_normal_path ... ok",
+              "test materialization::staged::metadata_pipeline_tests::corrupt_tail_is_quarantined_without_replacing_or_undoing_the_exposed_head ... ok",
+              "test materialization::staged::metadata_pipeline_tests::complete_selection_rejects_cross_phase_aliases_and_unavailable_tail_before_staging ... ok",
+              "test materialization::staged::metadata_pipeline_tests::replaced_private_tail_is_retained_as_evidence_and_never_installed ... ok",
+              "test materialization::staged::metadata_pipeline_tests::tail_rechecks_selected_location_and_logical_quarantine_after_metadata_install ... ok",
+              "test materialization::staged::metadata_pipeline_tests::metadata_and_dep_info_are_installed_while_the_exact_bulk_tail_remains_unstaged ... ok"
+            ]
+          },
+          "rabsd": {
+            "passed": 58,
+            "failed": 0,
+            "ignored": 1,
+            "filtered_out": 1285,
+            "runtime_seconds": 0.67,
+            "test_results": [
+              "test coord::live::metadata_replay::tests::a_changed_preview_manifest_refuses_before_metadata_or_any_destination_write ... ok",
+              "test coord::live::metadata_replay::tests::metadata_callback_unlocks_store_and_holds_every_destination_until_tail_finishes ... ok",
+              "test coord::live::metadata_replay::tests::metadata_and_tail_complete_on_the_final_replay_allowance ... ok",
+              "test coord::live::metadata_replay::tests::published_producer_pipelines_without_spending_or_creating_cache_replay_authority ... ok",
+              "test coord::remote_dependency_transport::tests::a_reserved_worker_cannot_accept_another_offer_and_can_move_to_its_lane ... ok",
+              "test coord::remote_dependency_transport::tests::a_verified_exchange_resets_connectivity_even_for_a_failed_compilation ... ok",
+              "test coord::remote_dependency_transport::tests::cancellation_preempts_a_pending_connection_future ... ok",
+              "test coord::remote_dependency_transport::tests::configuration_requires_reachable_fixed_port_and_explicit_identity ... ok",
+              "test coord::remote_dependency_transport::tests::connectivity_failure_excludes_only_that_worker_without_allocating_work ... ok",
+              "test coord::remote_dependency_transport::tests::contended_connectivity_state_never_strands_worker_capacity ... ok",
+              "test coord::remote_dependency_transport::tests::cooldown_expiring_after_refused_probe_keeps_its_immediate_queue_wake ... ok",
+              "test coord::remote_dependency_transport::tests::cooldown_expiry_allows_only_one_concurrent_probe_without_resetting_history ... ok",
+              "test coord::remote_dependency_transport::tests::cooldown_is_bounded_exponential_and_polling_does_not_renew_it ... ok",
+              "test coord::remote_dependency_transport::tests::allocation_keeps_the_persistent_worker_lock_until_reservation_release ... ok",
+              "test coord::remote_dependency_transport::tests::local_errors_and_caller_cancellation_neither_penalize_nor_rehabilitate ... ok",
+              "test coord::remote_dependency_transport::tests::lost_ack_cools_placement_without_discarding_verified_delivery ... ok",
+              "test coord::remote_dependency_transport::tests::queue_cooldown_deadline_is_absolute_and_grants_no_reservation ... ok",
+              "test coord::remote_dependency_transport::tests::queue_cooldown_snapshot_waits_for_current_writer_and_reports_poison ... ok",
+              "test coord::remote_dependency_transport::tests::uncertain_execution_remains_uncertain_after_cooldown_expires ... ok",
+              "test coord::remote_dependency_transport::tests::workspace_preflight_accepts_exact_retained_upload_without_losing_existing_versions ... ok",
+              "test coord::source_delivery::preparation::cargo::git::tests::pinned_submodule_member_closure_is_recursive_bounded_and_cycle_checked ... ok",
+              "test coord::remote_dependency_transport::tests::execution_keeps_capacity_until_drop_and_cannot_repeat_a_reserved_dispatch ... ok",
+              "test coord::source_delivery::tests::all_cached_claim_without_bytes_or_without_seal_ack_cannot_finish_negotiation ... ok",
+              "test coord::source_delivery::tests::cargo_home_tests::captured_registry_bytes_transfer_and_replay_without_credentials_or_request_rewriting ... ok",
+              "test coord::source_delivery::tests::ambiguous_or_invalid_preparation_never_creates_a_bundle ... ok",
+              "test coord::source_delivery::tests::cargo_home_tests::missing_or_changed_registry_support_stops_before_bytes_and_execution ... ok",
+              "test coord::source_delivery::tests::cargo_home_tests::missing_final_registry_seal_never_crosses_the_real_delivery_execution_frontier ... ok",
+              "test coord::source_delivery::tests::cargo_home_tests::registry_request_validation_and_preparation_refuse_unsupported_or_unselected_state ... ok",
+              "test coord::source_delivery::tests::closure_cache_hints_reuse_other_roots_without_widening_selection ... ok",
+              "test coord::source_delivery::tests::closure_identity_ignores_selection_order_but_binds_dependency_bytes_and_modes ... ok",
+              "test coord::source_delivery::tests::closure_namespace_refuses_unsafe_hidden_duplicate_and_excess_roots ... ok",
+              "test coord::source_delivery::tests::closure_transfer_preserves_sibling_layout_and_one_retained_generation ... ok",
+              "test coord::source_delivery::tests::cargo_home_tests::prepared_registry_bundle_retains_selection_and_warm_transfer_still_requires_seal ... ok",
+              "test coord::source_delivery::tests::dependency_bundle_refuses_unmodeled_members_and_duplicate_names ... ok",
+              "test coord::source_delivery::tests::daemon_template_retains_allocation_intent_and_exact_inputs_without_becoming_a_wire_request ... ok",
+              "test coord::source_delivery::tests::empty_generated_bundle_keeps_mount_intent_without_inventing_manifest_files ... ok",
+              "test coord::source_delivery::tests::generated_bundle_refuses_incoherent_or_repeated_source_selection ... ok",
+              "test coord::live::metadata_replay::tests::published_producer_metadata_rechecks_gates_and_keeps_all_post_head_failures_sticky ... ok",
+              "test coord::source_delivery::tests::dependency_bundle_transfers_retained_package_and_exact_metadata_closure ... ok",
+              "test coord::source_delivery::tests::incomplete_or_nonregular_root_refuses_the_entire_closure_projection ... ok",
+              "test coord::source_delivery::tests::malformed_missing_hints_never_upload_extra_files_or_reach_seal ... ok",
+              "test coord::source_delivery::tests::mixed_source_transfers_only_missing_captured_files ... ok",
+              "test coord::source_delivery::tests::generated_dependency_bundle_transfers_one_retained_snapshot_and_resumes_exactly ... ok",
+              "test coord::source_delivery::tests::preparation_preserves_executable_modes_and_rejects_tampered_retained_source ... ok",
+              "test coord::source_delivery::tests::preparation_does_not_follow_selected_symlinks_or_replace_existing_bundles ... ok",
+              "test coord::live::metadata_replay::tests::metadata_delivery_is_sticky_across_receiver_authority_manifest_evidence_and_tail_failures ... ok",
+              "test coord::source_delivery::tests::negotiation_and_ack_failures_stop_before_seal_or_execution ... ok",
+              "test coord::source_delivery::tests::preparation_requires_an_absolute_new_destination_and_absolute_source ... ok",
+              "test coord::source_delivery::tests::source_authority_cannot_select_or_start_unretained_toolchain_reuse ... ok",
+              "test coord::source_delivery::tests::source_request_validation_rejects_aliases_and_changed_identity ... ok",
+              "test coord::source_delivery::tests::toolchain_capture_requires_real_reflink_and_retains_independent_bytes ... ignored, requires RABS_REFLINK_TEST_ROOT on a real reflink-capable filesystem",
+              "test coord::source_delivery::tests::propagated_native_bundle_retains_exact_bytes_and_empty_directories ... ok",
+              "test coord::source_delivery::tests::unresolved_cargo_plans_are_refused_before_execution_or_resume ... ok",
+              "test coord::source_delivery::tests::unresolved_preparation_fields_cannot_be_dispatched_even_with_a_valid_manifest ... ok",
+              "test coord::source_delivery::tests::prepared_bundle_retains_exact_bytes_and_is_consumed_by_the_real_source_sender ... ok",
+              "test coord::source_delivery::tests::workspace_execution_upload_requires_every_file_and_empty_directory_from_one_capture ... ok",
+              "test coord::source_delivery::tests::transmits_only_selected_captured_bytes_even_after_checkout_changes ... ok",
+              "test coord::source_delivery::tests::warm_source_sends_no_chunks_but_preserves_manifest_and_final_seal ... ok",
+              "test coord::source_delivery::tests::shared_dependency_byte_owners_transfer_into_independent_real_receivers ... ok"
+            ]
+          }
+        },
+        "ignored_tests": [
+          {
+            "name": "coord::source_delivery::tests::toolchain_capture_requires_real_reflink_and_retains_independent_bytes",
+            "reason": "requires RABS_REFLINK_TEST_ROOT on a real reflink-capable filesystem",
+            "pre_existing_in_commit": "33e681245dec8a66580e4a5141d119c81a25f8c0",
+            "log_result": "test coord::source_delivery::tests::toolchain_capture_requires_real_reflink_and_retains_independent_bytes ... ignored, requires RABS_REFLINK_TEST_ROOT on a real reflink-capable filesystem"
+          }
+        ],
+        "important_passed_tests": [
+          "coord::live::metadata_replay::tests::published_producer_metadata_rechecks_gates_and_keeps_all_post_head_failures_sticky",
+          "coord::live::metadata_replay::tests::metadata_delivery_is_sticky_across_receiver_authority_manifest_evidence_and_tail_failures",
+          "coord::source_delivery::preparation::cargo::git::tests::pinned_submodule_member_closure_is_recursive_bounded_and_cycle_checked"
+        ]
+      },
+      "supporting_publication": {
+        "status": "published",
+        "revision": "3b69bf587fd8cc66fd16e8e0872996e2f27a86e4",
+        "parent": "33e681245dec8a66580e4a5141d119c81a25f8c0",
+        "subject": "fix(rabs): restore recovery fixtures and workspace validation",
+        "publication": "Published directly to main; coordinating runner verified GitHub references and local HEAD. Source blobs exactly match the accepted check, Clippy, formatting and runtime snapshot."
+      },
+      "source_snapshot_file": {
+        "file": {
+          "path": "/tmp/rch-continuation-workspace-source.json",
+          "sha256": "f2762654fd5874cdd51eecb88b935ea373c139fa214ee73189a2bb9f2d9d6579",
+          "size_bytes": 823
+        },
+        "raw": {
+          "base_commit": "33e681245dec8a66580e4a5141d119c81a25f8c0",
+          "recorded_at": "2026-11-01T03:29:34.235902+00:00",
+          "source_blobs": {
+            "rabs-cas/src/materialization/staged/metadata_pipeline_tests.rs": "83efe16cd070b70f696ce47b5edbb0d558219013",
+            "rabsd/src/coord/live/metadata_replay/tests.rs": "f6776b33844b6eccd13e42bc14251ffb77cc3804",
+            "rabsd/src/coord/live_dependency.rs": "2961a5233031ba4e6dc9e6f4a96cda93aed55bf6",
+            "rabsd/src/coord/live_dependency/remote.rs": "db40eb264f04802dd84bcebddd340003199b71a9",
+            "rabsd/src/coord/remote_dependency_transport.rs": "e2dcc2e85ab0a658dc3b347c7eb88784499da9b3",
+            "rabsd/src/coord/source_delivery.rs": "9d4f41622d0cb9519b0d462cd01476d8ee84ba54",
+            "rabsd/src/coord/source_delivery/preparation/cargo/git.rs": "96e4058f4b30c73726f0ee868297d152145fbfe1"
+          }
+        }
+      }
+    },
+    "broader_lifecycle_integration": {
+      "status": "passed",
+      "source_head": "33e681245dec8a66580e4a5141d119c81a25f8c0",
+      "daemon_tests_passed": 17,
+      "jobs_tests_passed": 8,
+      "gate_keys": [
+        "final_daemon_lifecycle_integration",
+        "final_jobs_lifecycle_integration"
+      ]
+    },
+    "normal_daemon_build": {
+      "status": "passed",
+      "compile_seconds": 23.2,
+      "log": {
+        "path": "/tmp/rch-continuation-daemon-build-complete.log",
+        "sha256": "e60d192e2cdf705194efaaa39f988368b43769c07feadb91c30510e55113b090",
+        "size_bytes": 152,
+        "summaries": [
+          "    Finished `dev` profile [unoptimized] target(s) in 23.20s"
+        ],
+        "compile_source_paths": [
+          "   Compiling rchd v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rchd)"
+        ]
+      },
+      "binary": {
+        "path": "/tmp/rch-target-candidate/debug/rchd",
+        "sha256": "16b2b0419e9402808c11839ab448b1e1ee0f275a00f2df53718e99c365c6d8b6"
+      }
+    },
+    "full_openssh_process_suite": {
+      "status": "passed",
+      "output_root": "/tmp/rch-continuation-openssh",
+      "raw_results_key": "full_openssh_process_run.raw_results",
+      "binary_hash_unchanged": true,
+      "prolonged_outage_dials": 3,
+      "prolonged_outage_seconds": 9.205702901999757,
+      "minimum_outage_dial_spacing_seconds": 3.0583170289974078,
+      "all_cleanup_identity_checks_passed": true
+    },
+    "pre_4885_cli_selected_suite": {
+      "status": "passed",
+      "passed": 66,
+      "failed": 0,
+      "ignored": 0,
+      "filtered_out": 3886,
+      "runtime_seconds": 0.85,
+      "compile_duration": "1m 33s",
+      "source_scope": "Candidate repository before integrating upstream 4885980a; custom-target orchestration blob 9788f9b3dc8e4d877231de3b6f82ef30a81fd1c1.",
+      "log": {
+        "path": "/tmp/rch-continuation-cli-tests-complete.log",
+        "sha256": "2d3ff59cee60114bf532bf5251a761c02c1ef4fe7ffe2b3cc92bc145032995e5",
+        "size_bytes": 6926,
+        "summaries": [
+          "    Finished `test` profile [unoptimized] target(s) in 1m 33s",
+          "test hook::transfer_orchestration::tests::custom_target_retrieval_retains_exact_source_activity ... ok",
+          "test result: ok. 66 passed; 0 failed; 0 ignored; 0 measured; 3886 filtered out; finished in 0.85s"
+        ],
+        "compile_source_paths": [
+          "   Compiling rch v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rch)"
+        ]
+      }
+    },
+    "pre_4885_cli_all_targets_strict_clippy": {
+      "status": "passed",
+      "compile_duration": "1m 32s",
+      "scope": "rch, all targets, warnings denied; before integrating upstream 4885980a.",
+      "log": {
+        "path": "/tmp/rch-continuation-cli-clippy-complete.log",
+        "sha256": "219e35165171a09f82205aeb4c0ea00cf3b6f1718848ebe0044a3eb136adb9e1",
+        "size_bytes": 560,
+        "summaries": [
+          "    Finished `dev` profile [unoptimized] target(s) in 1m 32s"
+        ],
+        "compile_source_paths": [
+          "    Checking rch v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rch)"
+        ]
+      }
+    },
+    "pre_4885_formatting": {
+      "status": "passed",
+      "log": {
+        "path": "/tmp/rch-continuation-format-complete.log",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "size_bytes": 0,
+        "summaries": [],
+        "compile_source_paths": []
+      },
+      "evidence": "Coordinating runner reported successful exit of final cargo fmt --all -- --check; successful output is empty.",
+      "earlier_pass": {
+        "base_revision": "8327a4065ebdeb4affca341fcad3fdc782fea8fe",
+        "status": "passed",
+        "log": {
+          "path": "/tmp/rch-continuation-format.log",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0
+        },
+        "evidence": "Coordinating runner reported successful exit; fmt --check is silent on success."
+      },
+      "source_scope": "Passed on the candidate snapshot before integrating upstream 4885980a; not the final combined-main formatting gate."
+    },
+    "combined_cli_selected_suite": {
+      "status": "passed",
+      "passed": 67,
+      "failed": 0,
+      "ignored": 0,
+      "filtered_out": 3886,
+      "runtime_seconds": 0.8,
+      "compile_duration": "1m 56s",
+      "source_head": "9f267909cba71ede3b23dfae74f83987d7b2dc33",
+      "orchestration_source_blob": "08b8729a01d903be387c320e9b21df9766c5d4ea",
+      "log": {
+        "path": "/tmp/rch-continuation-combined-cli-tests.log",
+        "sha256": "c87900483d46ae23870b5d132a67005396755a594473fbc0f5602187b3e1431b",
+        "size_bytes": 7448,
+        "summaries": [
+          "    Finished `test` profile [unoptimized] target(s) in 1m 56s",
+          "test hook::transfer_orchestration::tests::admitted_execution_disk_budget_preserves_reservation_and_floor ... ok",
+          "test hook::transfer_orchestration::tests::custom_target_retrieval_retains_exact_source_activity ... ok",
+          "test result: ok. 67 passed; 0 failed; 0 ignored; 0 measured; 3886 filtered out; finished in 0.80s"
+        ],
+        "compile_source_paths": [
+          "   Compiling rch-common v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rch-common)",
+          "   Compiling rch-telemetry v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rch-telemetry)",
+          "   Compiling rch v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rch)"
+        ]
+      },
+      "later_source_adjustment": "Subsequent source blob 89154dd21df58d6335853d24d2b5d19d4a03eeda only restores the existing Clippy exception to its original function; the accepted tests ran before that annotation relocation."
+    },
+    "combined_cli_all_targets_strict_clippy": {
+      "status": "passed",
+      "compile_duration": "1m 10s",
+      "scope": "rch, all targets, warnings denied",
+      "source_head": "33e681245dec8a66580e4a5141d119c81a25f8c0",
+      "orchestration_source_blob": "89154dd21df58d6335853d24d2b5d19d4a03eeda",
+      "log": {
+        "path": "/tmp/rch-continuation-combined-cli-clippy-final.log",
+        "sha256": "4fc87538e4f08ede4f920c0093df215213973922f451e41e34c2b65f94c34ad0",
+        "size_bytes": 150,
+        "text": "    Checking rch v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rch)\n    Finished `dev` profile [unoptimized] target(s) in 1m 10s\n"
+      },
+      "previous_failed_integration_attempt": {
+        "status": "failed",
+        "path": "/tmp/rch-continuation-combined-cli-clippy.log",
+        "sha256": "4751f7d0791c67cf9d21d95d872fd3c30b4d3a0bcd1c3a5d1d37c6a07dec90a3",
+        "size_bytes": 1278,
+        "text": "   Compiling rch-common v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rch-common)\n    Checking rabs-key v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabs-key)\n    Checking rabs-cas v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rabs-cas)\n    Checking rch-telemetry v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rch-telemetry)\n    Checking rch v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rch)\nerror: this function has too many arguments (22/7)\n   --> rch/src/hook/transfer_orchestration.rs:774:1\n    |\n774 | / async fn execute_remote_compilation_inner(\n775 | |     worker: &SelectedWorker,\n776 | |     command: &str,\n777 | |     transfer_config: TransferConfig,\n...   |\n796 | |     pooled_target_store_base: Option<&str>,\n797 | | ) -> anyhow::Result<RemoteExecutionResult> {\n    | |__________________________________________^\n    |\n    = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#too_many_arguments\n    = note: `-D clippy::too-many-arguments` implied by `-D warnings`\n    = help: to override `-D warnings` add `#[allow(clippy::too_many_arguments)]`\n\nerror: could not compile `rch` (bin \"rch\" test) due to 1 previous error\n",
+        "reason": "Incoming disk-budget helper was placed between the existing too_many_arguments allowance and execute_remote_compilation_inner, accidentally applying the allowance to the helper. The allowance was restored to its original function; this changes lint annotation placement only."
+      }
+    },
+    "combined_formatting_before_lint_relocation": {
+      "status": "passed",
+      "source_head": "9f267909cba71ede3b23dfae74f83987d7b2dc33",
+      "orchestration_source_blob": "08b8729a01d903be387c320e9b21df9766c5d4ea",
+      "log": {
+        "path": "/tmp/rch-continuation-combined-format.log",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "size_bytes": 0,
+        "summaries": [],
+        "compile_source_paths": []
+      },
+      "evidence": "Coordinating runner reported successful exit on the combined source. cargo fmt --check produces no output on success."
+    },
+    "final_cli_executable_build": {
+      "status": "passed",
+      "source_head": "33e681245dec8a66580e4a5141d119c81a25f8c0",
+      "compile_duration": "1m 05s",
+      "binary": {
+        "path": "/tmp/rch-target-candidate/debug/rch",
+        "sha256": "c331c6d0d76b70850d85654b668241fc1ef43128e937622699394719768a1431"
+      },
+      "log": {
+        "path": "/tmp/rch-continuation-final-cli-build.log",
+        "sha256": "d2bc50e3647ddd563cab2dfac3e2bb3ce4f06b98e078540228a6f4be612acdf0",
+        "size_bytes": 362,
+        "summaries": [
+          "    Finished `dev` profile [unoptimized] target(s) in 1m 05s"
+        ],
+        "compile_source_paths": [
+          "   Compiling rch-common v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rch-common)",
+          "   Compiling rch-telemetry v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rch-telemetry)",
+          "   Compiling rch v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rch)"
+        ]
+      }
+    },
+    "final_daemon_lifecycle_integration": {
+      "status": "passed",
+      "source_head": "33e681245dec8a66580e4a5141d119c81a25f8c0",
+      "passed": 17,
+      "failed": 0,
+      "ignored": 0,
+      "runtime_seconds": 133.56,
+      "compile_seconds": 47.73,
+      "includes": "offline_worker_process_recovery, running the full synthetic offline-worker fixture and its ownership assertions",
+      "daemon_binary": {
+        "path": "/tmp/rch-target-candidate/debug/rchd",
+        "sha256": "b7a0785e3b59a05fc725d2b023ebdb86ff5cd7b9395da812135ad1aabc13d934"
+      },
+      "cli_binary": {
+        "path": "/tmp/rch-target-candidate/debug/rch",
+        "sha256": "c331c6d0d76b70850d85654b668241fc1ef43128e937622699394719768a1431"
+      },
+      "log": {
+        "path": "/tmp/rch-continuation-final-daemon-lifecycle.log",
+        "sha256": "751badd98b687edceb16f0c4fdae2ead35ee2ff9b458f15d81b14d5fae21d18b",
+        "size_bytes": 1774,
+        "summaries": [
+          "    Finished `test` profile [unoptimized] target(s) in 47.73s",
+          "test offline_worker_process_recovery ... ok",
+          "test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 133.56s"
+        ],
+        "compile_source_paths": [
+          "   Compiling rch-common v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rch-common)",
+          "   Compiling rch-telemetry v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rch-telemetry)",
+          "   Compiling rchd v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rchd)"
+        ]
+      }
+    },
+    "final_jobs_lifecycle_integration": {
+      "status": "passed",
+      "source_head": "33e681245dec8a66580e4a5141d119c81a25f8c0",
+      "passed": 8,
+      "failed": 0,
+      "ignored": 0,
+      "runtime_seconds": 6.23,
+      "compile_seconds": 44.16,
+      "cli_binary": {
+        "path": "/tmp/rch-target-candidate/debug/rch",
+        "sha256": "c331c6d0d76b70850d85654b668241fc1ef43128e937622699394719768a1431"
+      },
+      "log": {
+        "path": "/tmp/rch-continuation-final-jobs-lifecycle.log",
+        "sha256": "2af51a9b10031dda7093ebe3c76f317623d5e40c723b58f205f33285ad119ada",
+        "size_bytes": 1007,
+        "summaries": [
+          "    Finished `test` profile [unoptimized] target(s) in 44.16s",
+          "test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.23s"
+        ],
+        "compile_source_paths": [
+          "   Compiling rch v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rch)"
+        ]
+      }
+    }
+  },
+  "excluded_attempts": [
+    {
+      "path": "/tmp/rch-continuation-common-tests.log",
+      "sha256": "840fe87f47ccbfe341aaa26dbd1bd4ccf6be6e5fc34f8c533efb0c4731419f05",
+      "reason": "Stale baseline artifact reused through the shared Cargo target directory. Excluded from candidate correctness evidence despite the invocation's target-directory name."
+    },
+    {
+      "path": "/tmp/rch-continuation-target-before.log",
+      "sha256": "02eb15cea4c6b6e0e75ef8bda5952647810662629602f279218e96ec6ec0ef85",
+      "reason": "Initial grafted regression failed to compile; no custom-target test executed."
+    },
+    {
+      "path": "/tmp/rch-continuation-target-before-v2.log",
+      "sha256": "d7ded6480967bfa13bbfcba3c551d640a3b6cca7d278861456e89e6db1452b1b",
+      "reason": "Corrected baseline test compilation was terminated with SIGKILL while compiling the rch test binary; no custom-target test executed."
+    },
+    {
+      "path": "/tmp/rch-continuation-cli-tests.log",
+      "sha256": "11dbadb1e77323e6515744b654ce898bfa989aeab400b08be23d6f50a8ee363a",
+      "size_bytes": 8706,
+      "summaries": [
+        "    Finished `test` profile [unoptimized] target(s) in 2m 00s",
+        "test hook::transfer_orchestration::tests::custom_target_retrieval_retains_exact_source_activity ... FAILED",
+        "---- hook::transfer_orchestration::tests::custom_target_retrieval_retains_exact_source_activity stdout ----",
+        "thread 'hook::transfer_orchestration::tests::custom_target_retrieval_retains_exact_source_activity' (479776) panicked at rch/src/hook/transfer_orchestration.rs:3725:13:",
+        "test hook::transfer_orchestration::tests::custom_target_retrieval_retains_exact_source_activity ... FAILED",
+        "    hook::transfer_orchestration::tests::custom_target_retrieval_retains_exact_source_activity",
+        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3951 filtered out; finished in 0.25s",
+        "thread 'hook::transfer_orchestration::tests::custom_target_retrieval_retains_exact_source_activity' (479784) panicked at rch/src/hook/transfer_orchestration.rs:3863:14:",
+        "    hook::transfer_orchestration::tests::custom_target_retrieval_retains_exact_source_activity",
+        "test result: FAILED. 65 passed; 1 failed; 0 ignored; 0 measured; 3886 filtered out; finished in 0.79s"
+      ],
+      "compile_source_paths": [
+        "   Compiling rch v2.1.34 (/workspace/scratch/8a5910f9cc83/remote_compilation_helper/rch)"
+      ],
+      "reason": "Candidate run had 65 passing tests and one failing custom-target fixture. The SSH fixture translated authority paths in argv but initially omitted translation in piped stdin, so its isolated activity-lock path was missing. This was a fixture error, corrected before the accepted 66-test run; it is not an application baseline failure."
+    },
+    {
+      "path": "/tmp/rch-continuation-upstream-domain-tests.log",
+      "sha256": "1edab09d37d5d8ccd8ac73211fcdf872c9ae2c4264df32cde72df61f57caab38",
+      "size_bytes": 2754,
+      "summaries": [],
+      "compile_source_paths": [],
+      "reason": "Coordinating runner explicitly cancelled its own pre-4885980a compilation before integration. No domain test result is claimed."
+    }
+  ],
+  "limits": [
+    "The new process baselines are current-main daemon regressions, not reproduction of every behavior or rate originally measured with RCH 1.x.",
+    "OpenSSH mode performs real local authentication with deterministic worker commands; no live Tailscale/VPN traffic or remote compilation was measured.",
+    "The three-slot reservation and active-build history exercise ownership and restart behavior without claiming a remote compiler was executing.",
+    "No RABS product qualification, performance improvement, release packaging or fleet deployment is claimed.",
+    "Custom-target retrieval has source evidence and a passing candidate regression; baseline attempts stopped during compilation, so no failing baseline execution is claimed.",
+    "Targeted RABS runtime validation passed 6 rabs-cas and 58 rabsd tests; one pre-existing test requiring a real reflink filesystem remained ignored. These are selected suites, not a full-workspace runtime test run.",
+    "The common suite retained eight existing ignored tests that use global mock state and request a serial run; the accepted common-suite count excludes them."
+  ],
+  "candidate_disabled_reload_process_runs": {
+    "result_file": {
+      "path": "/tmp/rch-disabled-reload-candidate-snhjke2m/results.json",
+      "sha256": "c52a05b1e3c0d3281765f98186d4c4697faaf44771804cb1ada12071c47d1550",
+      "size_bytes": 18818,
+      "summaries": [],
+      "compile_source_paths": []
+    },
+    "diagnostic_log": {
+      "path": "/tmp/rch-continuation-disabled-reload-candidate.log",
+      "sha256": "6118616664b373d4ceb897bdbe5c8de6583e6ec011518a2c776cf3bd424e71c0",
+      "size_bytes": 17084,
+      "summaries": [],
+      "compile_source_paths": []
+    },
+    "raw_results": {
+      "binary_before": {
+        "path": "/tmp/rch-target-candidate/debug/rchd",
+        "sha256": "16b2b0419e9402808c11839ab448b1e1ee0f275a00f2df53718e99c365c6d8b6"
+      },
+      "output_root": "/tmp/rch-disabled-reload-candidate-snhjke2m",
+      "runs": {
+        "openssh": {
+          "transport": "local OpenSSH with deterministic worker protocol",
+          "observations": {
+            "reservation_slots": 3,
+            "phases": {
+              "removed_with_owned_build": {
+                "observation": {
+                  "seconds": 3.2318434699991485,
+                  "dial_attempts": 0,
+                  "minimum_dial_spacing_seconds": null,
+                  "sampled_peak_live_transport_processes": 0,
+                  "daemon_cpu_seconds": 0.009999999999999995,
+                  "peak_daemon_rss_bytes": 38539264,
+                  "daemon_log_lines": 2
+                },
+                "state": {
+                  "worker": {
+                    "id": "offline",
+                    "host": "offline",
+                    "user": "root",
+                    "status": "disabled",
+                    "circuit_state": "closed",
+                    "used_slots": 3,
+                    "total_slots": 64,
+                    "speed_score": 50.0,
+                    "last_error": null,
+                    "consecutive_failures": 0,
+                    "recovery_in_secs": null,
+                    "failure_history": [
+                      true
+                    ],
+                    "pressure_state": "telemetry_gap",
+                    "pressure_confidence": "low",
+                    "pressure_reason_code": "telemetry_unavailable",
+                    "pressure_policy_rule": "fail_open_telemetry_gap",
+                    "pressure_disk_free_gb": 900.0,
+                    "pressure_disk_total_gb": 1000.0,
+                    "pressure_disk_free_ratio": 0.9,
+                    "pressure_build_disk_free_gb": 900.0,
+                    "pressure_build_disk_total_gb": 1000.0,
+                    "pressure_disk_io_util_pct": null,
+                    "pressure_memory_pressure": null,
+                    "pressure_telemetry_age_secs": null,
+                    "pressure_telemetry_fresh": false
+                  },
+                  "active_build": {
+                    "id": 30089960065335297,
+                    "project_id": "disabled-reload-owned-reservation",
+                    "worker_id": "offline",
+                    "command": "<unknown>",
+                    "started_at": "2026-11-01T02:49:42.061147845+00:00",
+                    "last_heartbeat_at": "2026-11-01T02:49:42.061147845+00:00",
+                    "heartbeat_age_secs": 3,
+                    "last_progress_at": "2026-11-01T02:49:42.061147845+00:00",
+                    "progress_age_secs": 3,
+                    "heartbeat_phase": "sync_up",
+                    "heartbeat_detail": "build_started",
+                    "heartbeat_counter": 0,
+                    "heartbeat_percent": null,
+                    "slots": 3,
+                    "detector_hook_alive": true,
+                    "detector_heartbeat_stale": false,
+                    "detector_progress_stale": false,
+                    "detector_confidence": 0.0,
+                    "detector_build_age_secs": 0,
+                    "detector_slots_owned": 3,
+                    "detector_last_evaluated_at": null
+                  }
+                },
+                "new_dials_since_disable": 0,
+                "reload_response": {
+                  "added": 0,
+                  "removed": 0,
+                  "success": true,
+                  "updated": 0,
+                  "warnings": [
+                    "Worker offline has active jobs, draining instead of removing"
+                  ]
+                }
+              },
+              "identical_reintroduction": {
+                "observation": {
+                  "seconds": 3.241819946997566,
+                  "dial_attempts": 0,
+                  "minimum_dial_spacing_seconds": null,
+                  "sampled_peak_live_transport_processes": 0,
+                  "daemon_cpu_seconds": 0.01999999999999999,
+                  "peak_daemon_rss_bytes": 38539264,
+                  "daemon_log_lines": 0
+                },
+                "state": {
+                  "worker": {
+                    "id": "offline",
+                    "host": "offline",
+                    "user": "root",
+                    "status": "disabled",
+                    "circuit_state": "closed",
+                    "used_slots": 3,
+                    "total_slots": 64,
+                    "speed_score": 50.0,
+                    "last_error": null,
+                    "consecutive_failures": 0,
+                    "recovery_in_secs": null,
+                    "failure_history": [
+                      true
+                    ],
+                    "pressure_state": "telemetry_gap",
+                    "pressure_confidence": "low",
+                    "pressure_reason_code": "telemetry_unavailable",
+                    "pressure_policy_rule": "fail_open_telemetry_gap",
+                    "pressure_disk_free_gb": 900.0,
+                    "pressure_disk_total_gb": 1000.0,
+                    "pressure_disk_free_ratio": 0.9,
+                    "pressure_build_disk_free_gb": 900.0,
+                    "pressure_build_disk_total_gb": 1000.0,
+                    "pressure_disk_io_util_pct": null,
+                    "pressure_memory_pressure": null,
+                    "pressure_telemetry_age_secs": null,
+                    "pressure_telemetry_fresh": false
+                  },
+                  "active_build": {
+                    "id": 30089960065335297,
+                    "project_id": "disabled-reload-owned-reservation",
+                    "worker_id": "offline",
+                    "command": "<unknown>",
+                    "started_at": "2026-11-01T02:49:42.061147845+00:00",
+                    "last_heartbeat_at": "2026-11-01T02:49:42.061147845+00:00",
+                    "heartbeat_age_secs": 6,
+                    "last_progress_at": "2026-11-01T02:49:42.061147845+00:00",
+                    "progress_age_secs": 6,
+                    "heartbeat_phase": "sync_up",
+                    "heartbeat_detail": "build_started",
+                    "heartbeat_counter": 0,
+                    "heartbeat_percent": null,
+                    "slots": 3,
+                    "detector_hook_alive": true,
+                    "detector_heartbeat_stale": false,
+                    "detector_progress_stale": false,
+                    "detector_confidence": 0.0,
+                    "detector_build_age_secs": 4,
+                    "detector_slots_owned": 3,
+                    "detector_last_evaluated_at": "2026-11-01T02:49:46.286416450+00:00"
+                  }
+                },
+                "new_dials_since_disable": 0,
+                "reload_response": {
+                  "added": 0,
+                  "removed": 0,
+                  "success": true,
+                  "updated": 1,
+                  "warnings": []
+                }
+              },
+              "disabled_restart": {
+                "observation": {
+                  "seconds": 3.246182408001914,
+                  "dial_attempts": 0,
+                  "minimum_dial_spacing_seconds": null,
+                  "sampled_peak_live_transport_processes": 0,
+                  "daemon_cpu_seconds": 0.019999999999999997,
+                  "peak_daemon_rss_bytes": 33550336,
+                  "daemon_log_lines": 7
+                },
+                "state": {
+                  "worker": {
+                    "id": "offline",
+                    "host": "offline",
+                    "user": "root",
+                    "status": "disabled",
+                    "circuit_state": "closed",
+                    "used_slots": 3,
+                    "total_slots": 0,
+                    "speed_score": 50.0,
+                    "last_error": null,
+                    "consecutive_failures": 0,
+                    "recovery_in_secs": null,
+                    "failure_history": [],
+                    "pressure_state": "telemetry_gap",
+                    "pressure_confidence": "low",
+                    "pressure_reason_code": "disk_metrics_unavailable",
+                    "pressure_policy_rule": "fail_open_missing_disk_metrics",
+                    "pressure_disk_free_gb": null,
+                    "pressure_disk_total_gb": null,
+                    "pressure_disk_free_ratio": null,
+                    "pressure_disk_io_util_pct": null,
+                    "pressure_memory_pressure": null,
+                    "pressure_telemetry_age_secs": null,
+                    "pressure_telemetry_fresh": false
+                  },
+                  "active_build": {
+                    "id": 30089960065335297,
+                    "project_id": "disabled-reload-owned-reservation",
+                    "worker_id": "offline",
+                    "command": "<unknown>",
+                    "started_at": "2026-11-01T02:49:42.061147845+00:00",
+                    "last_heartbeat_at": "2026-11-01T02:49:42.061147845+00:00",
+                    "heartbeat_age_secs": 9,
+                    "last_progress_at": "2026-11-01T02:49:42.061147845+00:00",
+                    "progress_age_secs": 9,
+                    "heartbeat_phase": "sync_up",
+                    "heartbeat_detail": "build_started",
+                    "heartbeat_counter": 0,
+                    "heartbeat_percent": null,
+                    "slots": 3,
+                    "detector_hook_alive": true,
+                    "detector_heartbeat_stale": false,
+                    "detector_progress_stale": false,
+                    "detector_confidence": 0.0,
+                    "detector_build_age_secs": 6,
+                    "detector_slots_owned": 3,
+                    "detector_last_evaluated_at": "2026-11-01T02:49:48.696259062+00:00"
+                  }
+                },
+                "new_dials_since_disable": 0
+              }
+            },
+            "dials_before_inventory_changes": 3,
+            "enable_refused_probe_dials": 2,
+            "recovery_latency_seconds": 3.475344086000405,
+            "reservation_slots_preserved_until_explicit_release": 3
+          },
+          "status": "passed"
+        },
+        "synthetic": {
+          "transport": "SSH subprocess fixture",
+          "observations": {
+            "reservation_slots": 3,
+            "phases": {
+              "removed_with_owned_build": {
+                "observation": {
+                  "seconds": 3.2329283529979875,
+                  "dial_attempts": 0,
+                  "minimum_dial_spacing_seconds": null,
+                  "sampled_peak_live_transport_processes": 0,
+                  "daemon_cpu_seconds": 0.01999999999999999,
+                  "peak_daemon_rss_bytes": 38498304,
+                  "daemon_log_lines": 2
+                },
+                "state": {
+                  "worker": {
+                    "id": "offline",
+                    "host": "offline",
+                    "user": "root",
+                    "status": "disabled",
+                    "circuit_state": "closed",
+                    "used_slots": 3,
+                    "total_slots": 64,
+                    "speed_score": 50.0,
+                    "last_error": null,
+                    "consecutive_failures": 0,
+                    "recovery_in_secs": null,
+                    "failure_history": [
+                      true
+                    ],
+                    "pressure_state": "telemetry_gap",
+                    "pressure_confidence": "low",
+                    "pressure_reason_code": "telemetry_unavailable",
+                    "pressure_policy_rule": "fail_open_telemetry_gap",
+                    "pressure_disk_free_gb": 900.0,
+                    "pressure_disk_total_gb": 1000.0,
+                    "pressure_disk_free_ratio": 0.9,
+                    "pressure_build_disk_free_gb": 900.0,
+                    "pressure_build_disk_total_gb": 1000.0,
+                    "pressure_disk_io_util_pct": null,
+                    "pressure_memory_pressure": null,
+                    "pressure_telemetry_age_secs": null,
+                    "pressure_telemetry_fresh": false
+                  },
+                  "active_build": {
+                    "id": 30089960316993537,
+                    "project_id": "disabled-reload-owned-reservation",
+                    "worker_id": "offline",
+                    "command": "<unknown>",
+                    "started_at": "2026-11-01T02:49:57.340523166+00:00",
+                    "last_heartbeat_at": "2026-11-01T02:49:57.340523166+00:00",
+                    "heartbeat_age_secs": 3,
+                    "last_progress_at": "2026-11-01T02:49:57.340523166+00:00",
+                    "progress_age_secs": 3,
+                    "heartbeat_phase": "sync_up",
+                    "heartbeat_detail": "build_started",
+                    "heartbeat_counter": 0,
+                    "heartbeat_percent": null,
+                    "slots": 3,
+                    "detector_hook_alive": true,
+                    "detector_heartbeat_stale": false,
+                    "detector_progress_stale": false,
+                    "detector_confidence": 0.0,
+                    "detector_build_age_secs": 0,
+                    "detector_slots_owned": 3,
+                    "detector_last_evaluated_at": null
+                  }
+                },
+                "new_dials_since_disable": 0,
+                "reload_response": {
+                  "added": 0,
+                  "removed": 0,
+                  "success": true,
+                  "updated": 0,
+                  "warnings": [
+                    "Worker offline has active jobs, draining instead of removing"
+                  ]
+                }
+              },
+              "identical_reintroduction": {
+                "observation": {
+                  "seconds": 3.24125395900046,
+                  "dial_attempts": 0,
+                  "minimum_dial_spacing_seconds": null,
+                  "sampled_peak_live_transport_processes": 0,
+                  "daemon_cpu_seconds": 0.020000000000000004,
+                  "peak_daemon_rss_bytes": 38498304,
+                  "daemon_log_lines": 0
+                },
+                "state": {
+                  "worker": {
+                    "id": "offline",
+                    "host": "offline",
+                    "user": "root",
+                    "status": "disabled",
+                    "circuit_state": "closed",
+                    "used_slots": 3,
+                    "total_slots": 64,
+                    "speed_score": 50.0,
+                    "last_error": null,
+                    "consecutive_failures": 0,
+                    "recovery_in_secs": null,
+                    "failure_history": [
+                      true
+                    ],
+                    "pressure_state": "telemetry_gap",
+                    "pressure_confidence": "low",
+                    "pressure_reason_code": "telemetry_unavailable",
+                    "pressure_policy_rule": "fail_open_telemetry_gap",
+                    "pressure_disk_free_gb": 900.0,
+                    "pressure_disk_total_gb": 1000.0,
+                    "pressure_disk_free_ratio": 0.9,
+                    "pressure_build_disk_free_gb": 900.0,
+                    "pressure_build_disk_total_gb": 1000.0,
+                    "pressure_disk_io_util_pct": null,
+                    "pressure_memory_pressure": null,
+                    "pressure_telemetry_age_secs": null,
+                    "pressure_telemetry_fresh": false
+                  },
+                  "active_build": {
+                    "id": 30089960316993537,
+                    "project_id": "disabled-reload-owned-reservation",
+                    "worker_id": "offline",
+                    "command": "<unknown>",
+                    "started_at": "2026-11-01T02:49:57.340523166+00:00",
+                    "last_heartbeat_at": "2026-11-01T02:49:57.340523166+00:00",
+                    "heartbeat_age_secs": 6,
+                    "last_progress_at": "2026-11-01T02:49:57.340523166+00:00",
+                    "progress_age_secs": 6,
+                    "heartbeat_phase": "sync_up",
+                    "heartbeat_detail": "build_started",
+                    "heartbeat_counter": 0,
+                    "heartbeat_percent": null,
+                    "slots": 3,
+                    "detector_hook_alive": true,
+                    "detector_heartbeat_stale": false,
+                    "detector_progress_stale": false,
+                    "detector_confidence": 0.0,
+                    "detector_build_age_secs": 4,
+                    "detector_slots_owned": 3,
+                    "detector_last_evaluated_at": "2026-11-01T02:50:01.753149439+00:00"
+                  }
+                },
+                "new_dials_since_disable": 0,
+                "reload_response": {
+                  "added": 0,
+                  "removed": 0,
+                  "success": true,
+                  "updated": 1,
+                  "warnings": []
+                }
+              },
+              "disabled_restart": {
+                "observation": {
+                  "seconds": 3.2504883969959337,
+                  "dial_attempts": 0,
+                  "minimum_dial_spacing_seconds": null,
+                  "sampled_peak_live_transport_processes": 0,
+                  "daemon_cpu_seconds": 0.03,
+                  "peak_daemon_rss_bytes": 34177024,
+                  "daemon_log_lines": 7
+                },
+                "state": {
+                  "worker": {
+                    "id": "offline",
+                    "host": "offline",
+                    "user": "root",
+                    "status": "disabled",
+                    "circuit_state": "closed",
+                    "used_slots": 3,
+                    "total_slots": 0,
+                    "speed_score": 50.0,
+                    "last_error": null,
+                    "consecutive_failures": 0,
+                    "recovery_in_secs": null,
+                    "failure_history": [],
+                    "pressure_state": "telemetry_gap",
+                    "pressure_confidence": "low",
+                    "pressure_reason_code": "disk_metrics_unavailable",
+                    "pressure_policy_rule": "fail_open_missing_disk_metrics",
+                    "pressure_disk_free_gb": null,
+                    "pressure_disk_total_gb": null,
+                    "pressure_disk_free_ratio": null,
+                    "pressure_disk_io_util_pct": null,
+                    "pressure_memory_pressure": null,
+                    "pressure_telemetry_age_secs": null,
+                    "pressure_telemetry_fresh": false
+                  },
+                  "active_build": {
+                    "id": 30089960316993537,
+                    "project_id": "disabled-reload-owned-reservation",
+                    "worker_id": "offline",
+                    "command": "<unknown>",
+                    "started_at": "2026-11-01T02:49:57.340523166+00:00",
+                    "last_heartbeat_at": "2026-11-01T02:49:57.340523166+00:00",
+                    "heartbeat_age_secs": 9,
+                    "last_progress_at": "2026-11-01T02:49:57.340523166+00:00",
+                    "progress_age_secs": 9,
+                    "heartbeat_phase": "sync_up",
+                    "heartbeat_detail": "build_started",
+                    "heartbeat_counter": 0,
+                    "heartbeat_percent": null,
+                    "slots": 3,
+                    "detector_hook_alive": true,
+                    "detector_heartbeat_stale": false,
+                    "detector_progress_stale": false,
+                    "detector_confidence": 0.0,
+                    "detector_build_age_secs": 6,
+                    "detector_slots_owned": 3,
+                    "detector_last_evaluated_at": "2026-11-01T02:50:03.975164795+00:00"
+                  }
+                },
+                "new_dials_since_disable": 0
+              }
+            },
+            "dials_before_inventory_changes": 3,
+            "enable_refused_probe_dials": 2,
+            "recovery_latency_seconds": 3.492923341000278,
+            "reservation_slots_preserved_until_explicit_release": 3
+          },
+          "status": "passed"
+        }
+      },
+      "binary_after": {
+        "path": "/tmp/rch-target-candidate/debug/rchd",
+        "sha256": "16b2b0419e9402808c11839ab448b1e1ee0f275a00f2df53718e99c365c6d8b6"
+      },
+      "status": "passed"
+    }
+  },
+  "full_openssh_process_run": {
+    "result_file": {
+      "path": "/tmp/rch-continuation-openssh/results.json",
+      "sha256": "9d787c28006c5dbfd54a7291fc2590e6b2a27bc4329b8df3a31100ed5a124a7e",
+      "size_bytes": 12965
+    },
+    "runner_file": {
+      "path": "/tmp/rch-continuation-openssh/runner-provenance.json",
+      "sha256": "d1f8255222c38dc4b4d2cd203c1ded1b3c0df4c83362301ec70a8d26dd0a1544",
+      "size_bytes": 603
+    },
+    "diagnostic_log": {
+      "path": "/tmp/rch-continuation-openssh.log",
+      "sha256": "e79ad13908ff83fb3413659bdd9742f9b2a96572e5e95be9fb49b19a03c232e9",
+      "size_bytes": 13981
+    },
+    "raw_results": {
+      "transport": "local OpenSSH with deterministic worker protocol",
+      "binary": {
+        "path": "/tmp/rch-target-candidate/debug/rchd",
+        "sha256": "16b2b0419e9402808c11839ab448b1e1ee0f275a00f2df53718e99c365c6d8b6"
+      },
+      "configuration": {
+        "failure_threshold": 2,
+        "regression_health_interval_secs": 1,
+        "regression_recovery_probe_interval_secs": 3,
+        "idle_health_interval_secs": 30,
+        "idle_recovery_probe_interval_secs": 300,
+        "idle_open_cooldown_secs": 900
+      },
+      "regressions": {
+        "prolonged_outage": {
+          "seconds": 9.205702901999757,
+          "dial_attempts": 3,
+          "minimum_dial_spacing_seconds": 3.0583170289974078,
+          "sampled_peak_live_transport_processes": 1,
+          "daemon_cpu_seconds": 0.05000000000000002,
+          "peak_daemon_rss_bytes": 37179392,
+          "daemon_log_lines": 0
+        },
+        "mixed_fleet_selected": 24,
+        "selection_p95_seconds": 0.01792530900274869,
+        "concurrent_capability_refresh": {
+          "requests": 12,
+          "seconds": 0.25865458699990995,
+          "offline_dial_attempts": 0,
+          "minimum_dial_spacing_seconds": 3.0583170289974078
+        },
+        "recovery_latency_seconds": 3.093042954998964,
+        "disabled": {
+          "seconds": 4.011086049002188,
+          "dial_attempts": 0,
+          "minimum_dial_spacing_seconds": null,
+          "sampled_peak_live_transport_processes": 0,
+          "daemon_cpu_seconds": 0.020000000000000018,
+          "peak_daemon_rss_bytes": 41635840,
+          "daemon_log_lines": 2
+        },
+        "disabled_restart": {
+          "seconds": 4.017834958001913,
+          "dial_attempts": 0,
+          "minimum_dial_spacing_seconds": null,
+          "sampled_peak_live_transport_processes": 0,
+          "daemon_cpu_seconds": 0.03,
+          "peak_daemon_rss_bytes": 34074624,
+          "daemon_log_lines": 7
+        },
+        "established_connection_loss": {
+          "seconds": 6.222542788003921,
+          "dial_attempts": 2,
+          "minimum_dial_spacing_seconds": 3.090860190000967,
+          "sampled_peak_live_transport_processes": 0,
+          "daemon_cpu_seconds": 0.04000000000000001,
+          "peak_daemon_rss_bytes": 38801408,
+          "daemon_log_lines": 0
+        },
+        "vpn_blackhole": {
+          "seconds": 8.0123080340054,
+          "dial_attempts": 2,
+          "minimum_dial_spacing_seconds": 4.001973147998797,
+          "sampled_peak_live_transport_processes": 1,
+          "daemon_cpu_seconds": 0.07,
+          "peak_daemon_rss_bytes": 38285312,
+          "daemon_log_lines": 0
+        },
+        "unpooled": {
+          "seconds": 6.211899545996857,
+          "dial_attempts": 2,
+          "minimum_dial_spacing_seconds": 3.0695600179969915,
+          "sampled_peak_live_transport_processes": 0,
+          "daemon_cpu_seconds": 0.0,
+          "peak_daemon_rss_bytes": 36257792,
+          "daemon_log_lines": 0
+        },
+        "authenticated_transport_freeze": {
+          "frozen_authenticated_transports": 2,
+          "outage": {
+            "seconds": 6.231869016999553,
+            "dial_attempts": 1,
+            "minimum_dial_spacing_seconds": null,
+            "sampled_peak_live_transport_processes": 1,
+            "daemon_cpu_seconds": 0.05999999999999997,
+            "peak_daemon_rss_bytes": 39645184,
+            "daemon_log_lines": 0
+          },
+          "healthy_peer_admissions": 12,
+          "recovery_latency_seconds": 0.9137841770061641,
+          "disabled": {
+            "seconds": 3.249843295001483,
+            "dial_attempts": 0,
+            "minimum_dial_spacing_seconds": null,
+            "sampled_peak_live_transport_processes": 0,
+            "daemon_cpu_seconds": 0.030000000000000027,
+            "peak_daemon_rss_bytes": 40042496,
+            "daemon_log_lines": 2
+          },
+          "disabled_restart": {
+            "seconds": 3.203522855998017,
+            "dial_attempts": 0,
+            "minimum_dial_spacing_seconds": null,
+            "sampled_peak_live_transport_processes": 0,
+            "daemon_cpu_seconds": 0.019999999999999997,
+            "peak_daemon_rss_bytes": 33583104,
+            "daemon_log_lines": 7
+          },
+          "reservation_slots_preserved_until_explicit_release": 3
+        },
+        "disabled_worker_reload": {
+          "reservation_slots": 3,
+          "phases": {
+            "removed_with_owned_build": {
+              "observation": {
+                "seconds": 3.2344996219981113,
+                "dial_attempts": 0,
+                "minimum_dial_spacing_seconds": null,
+                "sampled_peak_live_transport_processes": 0,
+                "daemon_cpu_seconds": 0.020000000000000004,
+                "peak_daemon_rss_bytes": 38748160,
+                "daemon_log_lines": 2
+              },
+              "state": {
+                "worker": {
+                  "id": "offline",
+                  "host": "offline",
+                  "user": "root",
+                  "status": "disabled",
+                  "circuit_state": "closed",
+                  "used_slots": 3,
+                  "total_slots": 64,
+                  "speed_score": 50.0,
+                  "last_error": null,
+                  "consecutive_failures": 0,
+                  "recovery_in_secs": null,
+                  "failure_history": [
+                    true
+                  ],
+                  "pressure_state": "telemetry_gap",
+                  "pressure_confidence": "low",
+                  "pressure_reason_code": "telemetry_unavailable",
+                  "pressure_policy_rule": "fail_open_telemetry_gap",
+                  "pressure_disk_free_gb": 900.0,
+                  "pressure_disk_total_gb": 1000.0,
+                  "pressure_disk_free_ratio": 0.9,
+                  "pressure_build_disk_free_gb": 900.0,
+                  "pressure_build_disk_total_gb": 1000.0,
+                  "pressure_disk_io_util_pct": null,
+                  "pressure_memory_pressure": null,
+                  "pressure_telemetry_age_secs": null,
+                  "pressure_telemetry_fresh": false
+                },
+                "active_build": {
+                  "id": 30089962095378433,
+                  "project_id": "disabled-reload-owned-reservation",
+                  "worker_id": "offline",
+                  "command": "<unknown>",
+                  "started_at": "2026-11-01T02:51:43.119632164+00:00",
+                  "last_heartbeat_at": "2026-11-01T02:51:43.119632164+00:00",
+                  "heartbeat_age_secs": 3,
+                  "last_progress_at": "2026-11-01T02:51:43.119632164+00:00",
+                  "progress_age_secs": 3,
+                  "heartbeat_phase": "sync_up",
+                  "heartbeat_detail": "build_started",
+                  "heartbeat_counter": 0,
+                  "heartbeat_percent": null,
+                  "slots": 3,
+                  "detector_hook_alive": true,
+                  "detector_heartbeat_stale": false,
+                  "detector_progress_stale": false,
+                  "detector_confidence": 0.0,
+                  "detector_build_age_secs": 0,
+                  "detector_slots_owned": 3,
+                  "detector_last_evaluated_at": null
+                }
+              },
+              "new_dials_since_disable": 0,
+              "reload_response": {
+                "added": 0,
+                "removed": 0,
+                "success": true,
+                "updated": 0,
+                "warnings": [
+                  "Worker offline has active jobs, draining instead of removing"
+                ]
+              }
+            },
+            "identical_reintroduction": {
+              "observation": {
+                "seconds": 3.238185419002548,
+                "dial_attempts": 0,
+                "minimum_dial_spacing_seconds": null,
+                "sampled_peak_live_transport_processes": 0,
+                "daemon_cpu_seconds": 0.01999999999999999,
+                "peak_daemon_rss_bytes": 38748160,
+                "daemon_log_lines": 0
+              },
+              "state": {
+                "worker": {
+                  "id": "offline",
+                  "host": "offline",
+                  "user": "root",
+                  "status": "disabled",
+                  "circuit_state": "closed",
+                  "used_slots": 3,
+                  "total_slots": 64,
+                  "speed_score": 50.0,
+                  "last_error": null,
+                  "consecutive_failures": 0,
+                  "recovery_in_secs": null,
+                  "failure_history": [
+                    true
+                  ],
+                  "pressure_state": "telemetry_gap",
+                  "pressure_confidence": "low",
+                  "pressure_reason_code": "telemetry_unavailable",
+                  "pressure_policy_rule": "fail_open_telemetry_gap",
+                  "pressure_disk_free_gb": 900.0,
+                  "pressure_disk_total_gb": 1000.0,
+                  "pressure_disk_free_ratio": 0.9,
+                  "pressure_build_disk_free_gb": 900.0,
+                  "pressure_build_disk_total_gb": 1000.0,
+                  "pressure_disk_io_util_pct": null,
+                  "pressure_memory_pressure": null,
+                  "pressure_telemetry_age_secs": null,
+                  "pressure_telemetry_fresh": false
+                },
+                "active_build": {
+                  "id": 30089962095378433,
+                  "project_id": "disabled-reload-owned-reservation",
+                  "worker_id": "offline",
+                  "command": "<unknown>",
+                  "started_at": "2026-11-01T02:51:43.119632164+00:00",
+                  "last_heartbeat_at": "2026-11-01T02:51:43.119632164+00:00",
+                  "heartbeat_age_secs": 6,
+                  "last_progress_at": "2026-11-01T02:51:43.119632164+00:00",
+                  "progress_age_secs": 6,
+                  "heartbeat_phase": "sync_up",
+                  "heartbeat_detail": "build_started",
+                  "heartbeat_counter": 0,
+                  "heartbeat_percent": null,
+                  "slots": 3,
+                  "detector_hook_alive": true,
+                  "detector_heartbeat_stale": false,
+                  "detector_progress_stale": false,
+                  "detector_confidence": 0.0,
+                  "detector_build_age_secs": 4,
+                  "detector_slots_owned": 3,
+                  "detector_last_evaluated_at": "2026-11-01T02:51:47.363177449+00:00"
+                }
+              },
+              "new_dials_since_disable": 0,
+              "reload_response": {
+                "added": 0,
+                "removed": 0,
+                "success": true,
+                "updated": 1,
+                "warnings": []
+              }
+            },
+            "disabled_restart": {
+              "observation": {
+                "seconds": 3.24795538699982,
+                "dial_attempts": 0,
+                "minimum_dial_spacing_seconds": null,
+                "sampled_peak_live_transport_processes": 0,
+                "daemon_cpu_seconds": 0.03,
+                "peak_daemon_rss_bytes": 33693696,
+                "daemon_log_lines": 7
+              },
+              "state": {
+                "worker": {
+                  "id": "offline",
+                  "host": "offline",
+                  "user": "root",
+                  "status": "disabled",
+                  "circuit_state": "closed",
+                  "used_slots": 3,
+                  "total_slots": 0,
+                  "speed_score": 50.0,
+                  "last_error": null,
+                  "consecutive_failures": 0,
+                  "recovery_in_secs": null,
+                  "failure_history": [],
+                  "pressure_state": "telemetry_gap",
+                  "pressure_confidence": "low",
+                  "pressure_reason_code": "disk_metrics_unavailable",
+                  "pressure_policy_rule": "fail_open_missing_disk_metrics",
+                  "pressure_disk_free_gb": null,
+                  "pressure_disk_total_gb": null,
+                  "pressure_disk_free_ratio": null,
+                  "pressure_disk_io_util_pct": null,
+                  "pressure_memory_pressure": null,
+                  "pressure_telemetry_age_secs": null,
+                  "pressure_telemetry_fresh": false
+                },
+                "active_build": {
+                  "id": 30089962095378433,
+                  "project_id": "disabled-reload-owned-reservation",
+                  "worker_id": "offline",
+                  "command": "<unknown>",
+                  "started_at": "2026-11-01T02:51:43.119632164+00:00",
+                  "last_heartbeat_at": "2026-11-01T02:51:43.119632164+00:00",
+                  "heartbeat_age_secs": 9,
+                  "last_progress_at": "2026-11-01T02:51:43.119632164+00:00",
+                  "progress_age_secs": 9,
+                  "heartbeat_phase": "sync_up",
+                  "heartbeat_detail": "build_started",
+                  "heartbeat_counter": 0,
+                  "heartbeat_percent": null,
+                  "slots": 3,
+                  "detector_hook_alive": true,
+                  "detector_heartbeat_stale": false,
+                  "detector_progress_stale": false,
+                  "detector_confidence": 0.0,
+                  "detector_build_age_secs": 6,
+                  "detector_slots_owned": 3,
+                  "detector_last_evaluated_at": "2026-11-01T02:51:49.746614677+00:00"
+                }
+              },
+              "new_dials_since_disable": 0
+            }
+          },
+          "dials_before_inventory_changes": 3,
+          "enable_refused_probe_dials": 2,
+          "recovery_latency_seconds": 3.4957764860009775,
+          "reservation_slots_preserved_until_explicit_release": 3
+        },
+        "saturated_recovery_fleet": {
+          "blackhole_workers": 14,
+          "probe_deadline_seconds": 3,
+          "sampled_peak_blackhole_transports": 12,
+          "sampled_peak_all_transports": 13,
+          "blackhole_transports_before_admissions": 12,
+          "blackhole_transports_after_admissions": 12,
+          "healthy_admissions": 24,
+          "healthy_heartbeats_in_2_2_seconds": 2,
+          "selection_p95_seconds": 0.012483109996537678
+        }
+      }
+    },
+    "runner_provenance": {
+      "binary_before": {
+        "path": "/tmp/rch-target-candidate/debug/rchd",
+        "sha256": "16b2b0419e9402808c11839ab448b1e1ee0f275a00f2df53718e99c365c6d8b6"
+      },
+      "output_root": "/tmp/rch-continuation-openssh",
+      "argv": [
+        "scripts/test_offline_worker_recovery.py",
+        "--binary",
+        "/tmp/rch-target-candidate/debug/rchd",
+        "--openssh",
+        "--output",
+        "/tmp/rch-continuation-openssh"
+      ],
+      "binary_after": {
+        "path": "/tmp/rch-target-candidate/debug/rchd",
+        "sha256": "16b2b0419e9402808c11839ab448b1e1ee0f275a00f2df53718e99c365c6d8b6"
+      },
+      "exit_code": 0,
+      "status": "passed"
+    }
+  },
+  "candidate_process_cleanup": {
+    "method": "Verified /proc belongs to current PID namespace, then compared each recorded dial process PID and birth ticks; no process was signaled during this check.",
+    "runs": [
+      {
+        "file": {
+          "path": "/tmp/rch-disabled-reload-candidate-snhjke2m/cleanup-verification.json",
+          "sha256": "728be62473fba4288f2004210e3abb8489b8a9bd38efe57c1cef9a5b9d059df2",
+          "size_bytes": 161
+        },
+        "observations": {
+          "output_root": "/tmp/rch-disabled-reload-candidate-snhjke2m",
+          "dial_events_checked": 22,
+          "identity_matching_live_transports": [],
+          "status": "passed"
+        }
+      },
+      {
+        "file": {
+          "path": "/tmp/rch-continuation-openssh/cleanup-verification.json",
+          "sha256": "71defc3868b5b921b40e6dab3d9a8750b6daf940adadf290fcc9013a4fecf246",
+          "size_bytes": 147
+        },
+        "observations": {
+          "output_root": "/tmp/rch-continuation-openssh",
+          "dial_events_checked": 77,
+          "identity_matching_live_transports": [],
+          "status": "passed"
+        }
+      }
+    ]
+  },
+  "supporting_workspace_corrections": [
+    {
+      "area": "Corruption test",
+      "files": [
+        "rabsd/src/coord/live/metadata_replay/tests.rs"
+      ],
+      "behavior": "Keep the production store mutex held while a test-local RusqliteEngine opens the fixture database and corrupts the intended committed publication; assert exactly one affected row. Production SqlMetadataStore encapsulation remains intact."
+    },
+    {
+      "area": "Borrowed callbacks",
+      "files": [
+        "rabsd/src/coord/live/metadata_replay/tests.rs",
+        "rabsd/src/coord/live_dependency.rs",
+        "rabsd/src/coord/live_dependency/remote.rs"
+      ],
+      "behavior": "Name the existing borrowed mutable FnMut trait-object types with explicit lifetimes, retaining callback ownership and result types."
+    },
+    {
+      "area": "Private enum payload ownership",
+      "files": [
+        "rabsd/src/coord/remote_dependency_transport.rs",
+        "rabsd/src/coord/source_delivery.rs"
+      ],
+      "behavior": "Box large private SealedResult and PreparedToolchain variants, then move each payload into its original consuming operation. This preserves single ownership and existing control flow."
+    },
+    {
+      "area": "Assertion-only cleanup",
+      "files": [
+        "rabsd/src/coord/source_delivery/preparation/cargo/git.rs",
+        "rabs-cas/src/materialization/staged/metadata_pipeline_tests.rs"
+      ],
+      "behavior": "Use a mutable local member counter for the same archive-limit assertion; compare borrowed slices without cloning while retaining the same expected source-location assertions."
+    }
+  ]
+}
