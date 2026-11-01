@@ -3,8 +3,10 @@
 //! This is deliberately a transfer-boundary proof. Ordinary source selection
 //! uses the configured `TransferPipeline`'s rsync filters; clean overlays combine
 //! the immutable Git archive with exactly the selected live overlay. Uploads
-//! use checksum mode, the matching rsync barrier checks transferred bytes, and
-//! worker-side verification re-hashes selected entries before and after execution.
+//! use checksum mode. Under a source grant, rsync checks namespace and metadata,
+//! the worker independently re-hashes every selected entry with SHA-256, and
+//! local recapture checks the original manifest before proof succeeds. Without
+//! a source grant, the rsync barrier also retains its own checksum comparison.
 
 use super::dependency_closure::{
     SyncClosureMode, SyncClosurePlanEntry, source_content_coalescing_candidates,
@@ -1910,7 +1912,9 @@ async fn verify_remote_root(
     source_identity: Option<&str>,
     owned_timestamps: Option<bool>,
 ) -> anyhow::Result<()> {
-    if let Some(spec) = &root.clean_overlay {
+    use crate::transfer::SourceContentBarrier;
+
+    let barrier = if let Some(spec) = &root.clean_overlay {
         // The complete archive-plus-overlay namespace is a separate proof
         // obligation. In particular, a base-only receipt has no overlay rsync
         // barrier capable of noticing an extra Cargo manifest/configuration.
@@ -1921,19 +1925,47 @@ async fn verify_remote_root(
         // The archive baseline has no ambient working-tree comparison. The
         // overlay barrier checks only the uploaded patch, and cannot delete
         // or complain about baseline files excluded by its include policy.
-        if !spec.is_base_only() {
-            root.pipeline
-                .verify_clean_overlay_source_content_rsync_barrier(worker)
-                .await?;
-        }
+        (!spec.is_base_only()).then_some(SourceContentBarrier::CleanOverlay)
     } else if let Some(managed_timestamps) = owned_timestamps {
-        root.pipeline
-            .verify_owned_source_content_rsync_barrier(worker, managed_timestamps)
-            .await?;
+        Some(SourceContentBarrier::Owned { managed_timestamps })
     } else {
-        root.pipeline
-            .verify_source_content_rsync_barrier(worker)
-            .await?;
+        Some(SourceContentBarrier::Ordinary)
+    };
+    if let Some(barrier) = barrier {
+        if source_identity.is_some() {
+            // The grant fences this complete proof. Compare the namespace and
+            // metadata here, then require the exact remote SHA-256 manifest
+            // below and local recapture in verify_source_content_roots_with_policy.
+            // A quick-check success alone never authorizes a receipt or build.
+            root.pipeline
+                .verify_source_content_manifest_namespace(worker, barrier)
+                .await?;
+        } else {
+            // Ungranted/standalone checks retain the independent checksum
+            // barrier. They do not borrow the durable proof's optimization.
+            match barrier {
+                SourceContentBarrier::Ordinary => {
+                    root.pipeline
+                        .verify_source_content_rsync_barrier(worker)
+                        .await?;
+                }
+                SourceContentBarrier::Owned { managed_timestamps } => {
+                    root.pipeline
+                        .verify_owned_source_content_rsync_barrier(worker, managed_timestamps)
+                        .await?;
+                }
+                SourceContentBarrier::CleanOverlay => {
+                    root.pipeline
+                        .verify_clean_overlay_source_content_rsync_barrier(worker)
+                        .await?;
+                }
+                SourceContentBarrier::CleanOverlayNamespace => {
+                    root.pipeline
+                        .verify_clean_overlay_source_namespace(worker)
+                        .await?;
+                }
+            }
+        }
     }
     let payload = remote_manifest_payload(&root.manifest)?;
     let command = remote_verify_command(&root.manifest);
@@ -2246,6 +2278,419 @@ pub(super) fn reconcile_build_source_stamps(before: &str, after: &str) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    mod composed_receipt {
+        use super::*;
+        use crate::transfer::SourceContentBarrier;
+        use rch_common::ssh::OwnedProcessGroup;
+        use std::fs;
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        use tokio::io::AsyncReadExt;
+
+        const CHILD: &str = "RCH_SOURCE_PROOF_COMPOSITION_CHILD";
+
+        struct Fixture {
+            local: PathBuf,
+            remote: PathBuf,
+            identity: String,
+            worker: WorkerConfig,
+            prepared: PreparedSourceContentRoot,
+        }
+
+        impl Fixture {
+            async fn new(name: &str) -> Self {
+                let base =
+                    PathBuf::from(std::env::var_os("RCH_SOURCE_PROOF_ROOT").unwrap()).join(name);
+                let local = base.join("local source ' quoted");
+                let remote = base.join("remote source ' quoted");
+                fs::create_dir_all(local.join("empty/nested")).unwrap();
+                fs::create_dir_all(&remote).unwrap();
+                fs::write(local.join("input.txt"), b"selected\n").unwrap();
+                fs::write(local.join("peer.txt"), b"selected\n").unwrap();
+                fs::write(local.join("run.sh"), b"#!/bin/sh\nexit 0\n").unwrap();
+                fs::set_permissions(local.join("input.txt"), fs::Permissions::from_mode(0o644))
+                    .unwrap();
+                fs::set_permissions(local.join("run.sh"), fs::Permissions::from_mode(0o755))
+                    .unwrap();
+                symlink("input.txt", local.join("input-link")).unwrap();
+                let rsync = rch_common::rsync_flavor::resolve_rsync(Some(
+                    &std::env::var("RCH_SOURCE_PROOF_RSYNC").unwrap(),
+                ))
+                .unwrap();
+                let copied = tokio::process::Command::new(&rsync.path)
+                    .arg("-a")
+                    .arg("--")
+                    .arg(format!("{}/", local.display()))
+                    .arg(format!("{}/", remote.display()))
+                    .output()
+                    .await
+                    .unwrap();
+                assert!(copied.status.success(), "{copied:?}");
+                assert!(copied.stderr.is_empty(), "{copied:?}");
+                let identity = sha256_hex(base.as_os_str().as_encoded_bytes());
+                let claim = format!("{}\n", remote.display());
+                let registry =
+                    PathBuf::from(std::env::var_os("RCH_SOURCE_PROOF_REGISTRY").unwrap());
+                fs::write(
+                    registry.join(format!("{identity}.{}.claim", sha256_hex(claim.as_bytes()))),
+                    claim,
+                )
+                .unwrap();
+                let worker = WorkerConfig {
+                    id: WorkerId::new("source-proof-loopback"),
+                    host: "source-proof.invalid".into(),
+                    user: "worker".into(),
+                    identity_file: "/unused/source-proof-key".into(),
+                    ..WorkerConfig::default()
+                };
+                let entry = SyncClosurePlanEntry {
+                    local_root: local.clone(),
+                    remote_root: remote.to_str().unwrap().into(),
+                    project_id: name.into(),
+                    root_hash: identity.clone(),
+                    is_primary: true,
+                    mode: SyncClosureMode::Full,
+                };
+                let pipeline = TransferPipeline::new(
+                    local.clone(),
+                    entry.project_id.clone(),
+                    entry.root_hash.clone(),
+                    TransferConfig {
+                        max_transfer_time_ms: Some(10_000),
+                        ..Default::default()
+                    },
+                )
+                .with_rsync(rsync)
+                .with_remote_path_override(entry.remote_root.clone())
+                .with_sync_checksum(true)
+                .with_sync_delete(true)
+                .with_source_authority(identity.clone())
+                .unwrap();
+                let prepared = prepare_source_content_root(0, &entry, &pipeline)
+                    .await
+                    .unwrap();
+                Self {
+                    local,
+                    remote,
+                    identity,
+                    worker,
+                    prepared,
+                }
+            }
+
+            async fn receipt(&self) -> anyhow::Result<SourceContentReceipt> {
+                finalize_source_content_receipt(
+                    &self.worker,
+                    120,
+                    "cargo check",
+                    0,
+                    std::slice::from_ref(&self.prepared),
+                    Some(&self.identity),
+                )
+                .await
+            }
+
+            async fn owned(&self, managed_timestamps: bool) -> anyhow::Result<()> {
+                verify_owned_source_content_roots(
+                    &self.worker,
+                    std::slice::from_ref(&self.prepared),
+                    Some(&self.identity),
+                    managed_timestamps,
+                )
+                .await
+            }
+
+            fn corrupt_same_size_and_mtime(&self) {
+                let path = self.remote.join("input.txt");
+                let before = fs::metadata(&path).unwrap();
+                fs::write(&path, b"corrupt!\n").unwrap();
+                File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(before.modified().unwrap()))
+                    .unwrap();
+                let after = fs::metadata(&path).unwrap();
+                assert_eq!(before.len(), after.len());
+                assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+            }
+        }
+
+        // Only SSH transport is substituted. Real rsync receivers, the exact
+        // claim/activity checks, the production SHA-256 verifier and local
+        // recapture all run unchanged. A child process isolates PATH and the
+        // one deliberately injected post-verification edit from other tests.
+        #[tokio::test]
+        async fn granted_receipt_composes_namespace_hash_and_local_recapture() {
+            if std::env::var_os(CHILD).is_none() {
+                let fixture = tempfile::Builder::new()
+                    .prefix("rch-source-proof-composition-")
+                    .disable_cleanup(true)
+                    .tempdir()
+                    .unwrap();
+                let rsync = rch_common::rsync_flavor::resolve_rsync(None).unwrap();
+                let registry = fixture.path().join("registry");
+                fs::create_dir(&registry).unwrap();
+                let ssh = fixture.path().join("ssh");
+                fs::write(
+                    &ssh,
+                    r#"#!/usr/bin/env python3
+import json, os, subprocess, sys, tempfile
+for index, argument in enumerate(sys.argv[1:], 1):
+    if argument in ("source-proof.invalid", "worker@source-proof.invalid"):
+        command = " ".join(sys.argv[index + 1:])
+        original = "/var/tmp/rch-source-authority-locks/claims-v1"
+        registry = os.environ["RCH_SOURCE_PROOF_REGISTRY"]
+        command = command.replace(original, registry)
+        script = b""
+        if "sh -s" in command:
+            script = sys.stdin.buffer.read().replace(original.encode(), registry.encode())
+            payload = tempfile.TemporaryFile()
+            payload.write(script)
+            payload.seek(0)
+            os.dup2(payload.fileno(), 0)
+        verifying = "RCH_SOURCE_CONTENT_VERIFIED" in command or b"RCH_SOURCE_CONTENT_VERIFIED" in script
+        if not verifying:
+            os.execvp("sh", ["sh", "-c", command])
+        status = subprocess.call(["sh", "-c", command])
+        mutation = os.path.join(os.environ["RCH_SOURCE_PROOF_ROOT"], "mutate-after-verifier.json")
+        if status == 0 and os.path.isfile(mutation):
+            with open(mutation) as stream:
+                target = json.load(stream)
+            before = os.stat(target)
+            with open(target, "wb") as stream:
+                stream.write(b"changed!\n")
+            os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+            os.rename(mutation, mutation + ".applied")
+        sys.exit(status)
+sys.exit(99)
+"#,
+                )
+                .unwrap();
+                fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+                let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .arg("granted_receipt_composes_namespace_hash_and_local_recapture")
+                    .arg("--nocapture")
+                    .arg("--test-threads=1")
+                    .env(CHILD, "1")
+                    .env("RCH_MOCK_SSH", "0")
+                    .env("RCH_SOURCE_PROOF_ROOT", fixture.path())
+                    .env("RCH_SOURCE_PROOF_REGISTRY", &registry)
+                    .env("RCH_SOURCE_PROOF_RSYNC", &rsync.path)
+                    .env(
+                        "PATH",
+                        format!(
+                            "{}:{}",
+                            fixture.path().display(),
+                            std::env::var("PATH").unwrap()
+                        ),
+                    )
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                let mut child = OwnedProcessGroup::spawn(&mut command).unwrap();
+                let mut stdout = child.take_stdout().unwrap();
+                let mut stderr = child.take_stderr().unwrap();
+                let mut out = Vec::new();
+                let mut err = Vec::new();
+                let (status, output, error) =
+                    tokio::time::timeout(Duration::from_secs(90), async {
+                        tokio::join!(
+                            child.wait(),
+                            stdout.read_to_end(&mut out),
+                            stderr.read_to_end(&mut err)
+                        )
+                    })
+                    .await
+                    .expect("source proof composition fixture timed out");
+                output.unwrap();
+                error.unwrap();
+                assert!(
+                    status.unwrap().success(),
+                    "stdout: {}\nstderr: {}",
+                    String::from_utf8_lossy(&out),
+                    String::from_utf8_lossy(&err)
+                );
+                return;
+            }
+
+            let valid = Fixture::new("valid").await;
+            let receipt = valid.receipt().await.unwrap();
+            assert_eq!(receipt.roots, [valid.prepared.manifest.clone()]);
+            assert_eq!(receipt.root_count, 1);
+            let legacy = finalize_source_content_receipt(
+                &valid.worker,
+                120,
+                "cargo check",
+                0,
+                std::slice::from_ref(&valid.prepared),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(receipt, legacy);
+            assert_eq!(
+                receipt.canonical_json().unwrap(),
+                legacy.canonical_json().unwrap()
+            );
+
+            let corrupted = Fixture::new("equal-size-and-time-corruption").await;
+            corrupted.corrupt_same_size_and_mtime();
+            // The intended optimization really skips the redundant content
+            // comparison. Its success alone must never authorize a receipt.
+            corrupted
+                .prepared
+                .pipeline
+                .verify_source_content_manifest_namespace(
+                    &corrupted.worker,
+                    SourceContentBarrier::Ordinary,
+                )
+                .await
+                .unwrap();
+            let error = corrupted.receipt().await.unwrap_err();
+            assert!(error.to_string().contains("sha256:input.txt"), "{error:#}");
+            assert_eq!(
+                fs::read(corrupted.remote.join("input.txt")).unwrap(),
+                b"corrupt!\n"
+            );
+            // Ungranted callers retain their self-contained checksum barrier.
+            let error = verify_source_content_roots(
+                &corrupted.worker,
+                std::slice::from_ref(&corrupted.prepared),
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("rsync barrier detected"),
+                "{error:#}"
+            );
+
+            for change in [
+                "extra-file",
+                "extra-directory",
+                "missing-file",
+                "missing-directory",
+                "symlink",
+                "permissions",
+                "executable",
+            ] {
+                let fixture = Fixture::new(change).await;
+                match change {
+                    "extra-file" => {
+                        fs::write(fixture.remote.join("surplus.txt"), b"unselected").unwrap()
+                    }
+                    "extra-directory" => {
+                        fs::create_dir(fixture.remote.join("surplus-directory")).unwrap()
+                    }
+                    "missing-file" => fs::rename(
+                        fixture.remote.join("input.txt"),
+                        fixture.remote.parent().unwrap().join("preserved-input"),
+                    )
+                    .unwrap(),
+                    "missing-directory" => fs::rename(
+                        fixture.remote.join("empty/nested"),
+                        fixture.remote.parent().unwrap().join("preserved-directory"),
+                    )
+                    .unwrap(),
+                    "symlink" => {
+                        fs::rename(
+                            fixture.remote.join("input-link"),
+                            fixture.remote.parent().unwrap().join("preserved-link"),
+                        )
+                        .unwrap();
+                        symlink("peer.txt", fixture.remote.join("input-link")).unwrap();
+                    }
+                    "permissions" => fs::set_permissions(
+                        fixture.remote.join("input.txt"),
+                        fs::Permissions::from_mode(0o600),
+                    )
+                    .unwrap(),
+                    "executable" => fs::set_permissions(
+                        fixture.remote.join("run.sh"),
+                        fs::Permissions::from_mode(0o644),
+                    )
+                    .unwrap(),
+                    _ => unreachable!(),
+                }
+                // The manifest verifies listed files only. Namespace proof is
+                // independently necessary even when every listed hash matches.
+                if change.starts_with("extra-")
+                    || change == "permissions"
+                    || change == "missing-directory"
+                {
+                    let payload = remote_manifest_payload(&fixture.prepared.manifest).unwrap();
+                    let output =
+                        run_source_verifier(&fixture.prepared.manifest, &payload, None, true);
+                    assert!(output.status.success(), "{change}: {output:?}");
+                }
+                let error = fixture.receipt().await.unwrap_err();
+                assert!(
+                    error.to_string().contains("rsync barrier detected"),
+                    "{change}: {error:#}"
+                );
+            }
+
+            let timestamped = Fixture::new("managed-timestamps").await;
+            let path = timestamped.remote.join("input.txt");
+            let modified =
+                fs::metadata(&path).unwrap().modified().unwrap() + Duration::from_secs(60);
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+            assert!(
+                timestamped
+                    .owned(false)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("rsync barrier detected")
+            );
+            timestamped.owned(true).await.unwrap();
+            let receipt = finalize_owned_source_content_receipt(
+                &timestamped.worker,
+                120,
+                "cargo check",
+                0,
+                std::slice::from_ref(&timestamped.prepared),
+                Some(&timestamped.identity),
+            )
+            .await
+            .unwrap();
+            assert_eq!(receipt.roots, [timestamped.prepared.manifest.clone()]);
+            timestamped.corrupt_same_size_and_mtime();
+            let error = timestamped.owned(true).await.unwrap_err();
+            assert!(error.to_string().contains("sha256:input.txt"), "{error:#}");
+
+            let local_change = Fixture::new("local-recapture").await;
+            let root = PathBuf::from(std::env::var_os("RCH_SOURCE_PROOF_ROOT").unwrap());
+            let mutation = root.join("mutate-after-verifier.json");
+            fs::write(
+                &mutation,
+                serde_json::to_vec(&local_change.local.join("input.txt")).unwrap(),
+            )
+            .unwrap();
+            let error = local_change.receipt().await.unwrap_err();
+            assert!(
+                error.to_string().contains("local source-content changed"),
+                "{error:#}"
+            );
+            assert!(root.join("mutate-after-verifier.json.applied").is_file());
+            assert_eq!(
+                fs::read(local_change.local.join("input.txt")).unwrap(),
+                b"changed!\n"
+            );
+            assert_eq!(
+                fs::read(local_change.remote.join("input.txt")).unwrap(),
+                b"selected\n"
+            );
+        }
+    }
 
     #[cfg(unix)]
     mod coalescing {
