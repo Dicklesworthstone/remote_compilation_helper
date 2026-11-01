@@ -1205,6 +1205,13 @@ dependency closure, transfer delta, worker verification error, local lasting
 change, retry, or local fallback refuses the invocation instead of emitting a
 receipt. Receipt mode requires the Unix rsync transport.
 
+While holding the source grant, receipt verification uses rsync to check the
+selected namespace and metadata, then independently verifies every worker file
+against the captured SHA-256 manifest and recaptures the local inputs. This
+avoids a duplicate full-file rsync checksum pass during verification. Uploads
+still use checksum comparison, and verification without a source grant retains
+the checksum barrier. Equal size and timestamps never establish byte identity.
+
 Clean-overlay builds can request the same byte-level proof:
 
 ```bash

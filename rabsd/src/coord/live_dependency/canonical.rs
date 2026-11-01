@@ -239,6 +239,12 @@ impl CanonicalPaths {
         self.shared_toolchain.as_ref()
     }
 
+    /// Original operation identity retained by remote keying. This owner is
+    /// never reconstructed from a wrapper path or serialized into a key.
+    pub(super) fn operation_owner(&self) -> &Arc<tempfile::TempDir> {
+        &self._owner
+    }
+
     /// Bind actual Cargo-selected path-package units before the endpoint
     /// becomes visible to project code. A wrapper frame cannot extend this set.
     pub(crate) fn with_workspace_units(
@@ -442,6 +448,24 @@ impl CanonicalPaths {
         self.require_workspace_execution(plan)?;
         if self.closed_dependency_execution_required {
             return Err("committed workspace metadata caching requires a Cargo graph without project executors".into());
+        }
+        Ok(())
+    }
+
+    /// Mixed-producer caching preserves the same selected ordinary unit and
+    /// graph boundary. Its additional producer authority is checked separately
+    /// from exact physical installation witnesses and current durable lineage.
+    pub(crate) fn require_workspace_mixed_library(
+        &self,
+        plan: &DependencyActionPlan,
+    ) -> Result<(), String> {
+        rabs_key::live_dependency::workspace_dependency_cache::validate_mixed_workspace_library_plan(plan)
+            .map_err(|error| error.to_string())?;
+        self.require_workspace_execution(plan)?;
+        if self.closed_dependency_execution_required {
+            return Err(
+                "mixed workspace caching requires a Cargo graph without project executors".into(),
+            );
         }
         Ok(())
     }
@@ -1429,6 +1453,8 @@ mod tests {
             )
             .unwrap();
             assert!(paths.require_workspace_closed_library(&closed).is_err());
+            let mixed = rabs_key::live_dependency::workspace_dependency_cache::plan_mixed_workspace_library(&execution).unwrap();
+            assert!(paths.require_workspace_mixed_library(&mixed).is_err());
             let graph = serde_json::json!({"version":1,"roots":[0],"units":[{
                 "pkg_id":"path+file:///__rabs/workspace/app#project@0.1.0",
                 "target":{"kind":["lib"],"crate_types":["lib"],"name":"project-lib",
@@ -1442,6 +1468,9 @@ mod tests {
                 .with_workspace_units(graph.workspace_units(), None)
                 .unwrap();
             assert!(paths.require_workspace_closed_library(&closed).is_ok());
+            paths.require_workspace_mixed_library(&mixed).unwrap();
+            assert!(paths.require_workspace_mixed_library(&execution).is_err());
+            assert!(paths.require_workspace_mixed_library(&closed).is_err());
             assert!(
                 paths.require_workspace_closed_library(&execution).is_err(),
                 "the fresh profile must not gain cache authority"
@@ -1449,6 +1478,13 @@ mod tests {
             let mut unselected = closed.clone();
             unselected.invocation.crate_name = Some("unselected".into());
             assert!(paths.require_workspace_closed_library(&unselected).is_err());
+            let mut unselected_mixed = mixed.clone();
+            unselected_mixed.invocation.crate_name = Some("unselected".into());
+            assert!(
+                paths
+                    .require_workspace_mixed_library(&unselected_mixed)
+                    .is_err()
+            );
             let mut other_mode = execution.clone();
             if mode == "build" {
                 other_mode.invocation.emit.retain(|emit| emit != "link");
@@ -1460,6 +1496,8 @@ mod tests {
                 &other_mode.host_triple,
             )
             .unwrap();
+            let other_mixed = rabs_key::live_dependency::workspace_dependency_cache::plan_mixed_workspace_library(&other_mode).unwrap();
+            assert!(paths.require_workspace_mixed_library(&other_mixed).is_err());
             let other_mode =
                 rabs_key::live_dependency::workspace_cache::plan_closed_workspace_library(
                     &other_mode,
@@ -1471,6 +1509,7 @@ mod tests {
             );
             let guarded = paths.require_closed_dependency_execution().unwrap();
             assert!(guarded.require_workspace_closed_library(&closed).is_err());
+            assert!(guarded.require_workspace_mixed_library(&mixed).is_err());
             assert!(
                 guarded.require_workspace_execution(&execution).is_ok(),
                 "project executors retain fresh remote execution"

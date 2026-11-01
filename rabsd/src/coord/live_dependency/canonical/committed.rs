@@ -7,6 +7,7 @@
 
 use super::CanonicalPaths;
 use crate::coord::live::CoordLive;
+use crate::coord::live_dependency::remote::{QualifiedImmutableDependencyLeaf, RemoteValidation};
 use crate::coord::live_dependency::{
     KnownOutput, LiveDependencyRequest, committed_output, object_id,
 };
@@ -161,6 +162,8 @@ impl CanonicalPaths {
             consumer_kind,
             DependencySourceKind::WorkspaceCommittedRlib
                 | DependencySourceKind::WorkspaceCommittedMetadata
+                | DependencySourceKind::WorkspaceMixedRlib
+                | DependencySourceKind::WorkspaceMixedMetadata
         ) {
             return Err(
                 "committed dependency capture requires an exact committed consumer class".into(),
@@ -220,16 +223,28 @@ impl CanonicalPaths {
         manifest: &CanonicalActionResultManifest,
         manifest_key: &str,
         installed: &[KnownOutput],
+        remote: Option<&RemoteValidation>,
     ) -> Result<(), String> {
-        if !matches!(
-            request.plan.source_kind,
+        let qualification = match request.plan.source_kind {
             DependencySourceKind::WorkspaceClosedRlib
-                | DependencySourceKind::WorkspaceCommittedRlib
-                | DependencySourceKind::WorkspaceClosedMetadata
-                | DependencySourceKind::WorkspaceCommittedMetadata
-        ) {
-            return Ok(());
-        }
+            | DependencySourceKind::WorkspaceCommittedRlib
+            | DependencySourceKind::WorkspaceClosedMetadata
+            | DependencySourceKind::WorkspaceCommittedMetadata
+            | DependencySourceKind::WorkspaceMixedRlib
+            | DependencySourceKind::WorkspaceMixedMetadata => None,
+            DependencySourceKind::RegistryPackage
+            | DependencySourceKind::GitCheckout
+            | DependencySourceKind::DirectoryPackage => {
+                let Some(remote) = remote else {
+                    return Ok(());
+                };
+                let Some(qualified) = remote.immutable_dependency_leaf(request)? else {
+                    return Ok(());
+                };
+                Some(qualified)
+            }
+            DependencySourceKind::WorkspaceExecutionOnly => return Ok(()),
+        };
         if request
             .canonical_paths
             .as_ref()
@@ -245,6 +260,7 @@ impl CanonicalPaths {
             manifest_key,
             Path::new(&request.plan.out_dir),
             installed,
+            qualification.as_ref(),
         )
     }
 
@@ -257,6 +273,7 @@ impl CanonicalPaths {
         manifest_key: &str,
         output_directory: &Path,
         installed: &[KnownOutput],
+        qualification: Option<&QualifiedImmutableDependencyLeaf<'_>>,
     ) -> Result<(), String> {
         let manifest_id = object_id(&encode_manifest_v1(manifest))?;
         if digest_key(&manifest_id) != manifest_key {
@@ -305,15 +322,27 @@ impl CanonicalPaths {
         if pending.is_empty() {
             return Ok(());
         }
+        // Every actual installed Rust file was checked above. Qualification is
+        // not minted from a published-but-uninstalled manifest or a local claim.
+        if let Some(qualification) = qualification {
+            if qualification.action_key() != &manifest.action_key
+                || qualification.descriptor_digest() != &manifest.canonical_descriptor_digest
+            {
+                return Err(
+                    "immutable producer qualification belongs to another publication".into(),
+                );
+            }
+            coordinator.record_committed_immutable_leaf(qualification, manifest_key)?;
+        }
         coordinator.verify_committed_workspace_dependencies(
             &pending
                 .iter()
                 .map(|(_, _, dependency)| dependency.clone())
                 .collect::<Vec<_>>(),
-            // Registration retains either admitted producer family. Capture
+            // Registration retains every admitted producer family. Capture
             // and every later recheck separately enforce the consumer's kind;
             // archive consumers retain their original archive-only ancestry.
-            DependencySourceKind::WorkspaceCommittedMetadata,
+            DependencySourceKind::WorkspaceMixedMetadata,
         )?;
         if coordinator.authority().as_ref() != Some(&authority) {
             return Err("coordinator authority changed before committed registration".into());
@@ -453,7 +482,222 @@ mod tests {
             &digest_key(&offer.manifest_id.0),
             Path::new(OUTPUT),
             installed,
+            None,
         )
+    }
+
+    #[test]
+    fn immutable_metadata_installation_is_bound_to_mixed_metadata_owner_and_generation() {
+        let fixture = WorkspaceLineageFixture::new();
+        // Only qualification/class enrollment is synthetic. This exercises
+        // real publication, CAS bytes and physical installation witnesses;
+        // it does not mint the remote leaf capability used in production.
+        let offer = fixture.commit_immutable_leaf(
+            46,
+            &[(
+                "libupstream.rmeta",
+                OutputRole::ProvisionalMetadata,
+                METADATA,
+            )],
+            true,
+        );
+        let original = paths();
+        let installed = install_bytes(&original, &offer, "libupstream.rmeta", METADATA);
+        let path = installed.path.clone();
+        let generation = installed.sig;
+        let before = observed(&original, false);
+        assert!(
+            original
+                .capture_committed_workspace_inputs(
+                    &fixture.coord,
+                    Arc::clone(&before),
+                    DependencySourceKind::WorkspaceMixedMetadata,
+                )
+                .is_err(),
+            "committed-but-unregistered files have no installation capability"
+        );
+        register(&original, &fixture, &offer, &[installed]).unwrap();
+        let inputs = original
+            .capture_committed_workspace_inputs(
+                &fixture.coord,
+                Arc::clone(&before),
+                DependencySourceKind::WorkspaceMixedMetadata,
+            )
+            .unwrap();
+        inputs.verify_original().unwrap();
+        assert_eq!(inputs.ancestors().len(), 1);
+        assert_eq!(
+            inputs.ancestors()[0].producer_action_key,
+            offer.manifest.action_key
+        );
+        for other in [
+            DependencySourceKind::WorkspaceMixedRlib,
+            DependencySourceKind::WorkspaceCommittedRlib,
+            DependencySourceKind::WorkspaceCommittedMetadata,
+        ] {
+            assert!(inputs.verify_for_kind(other).is_err());
+            assert!(
+                original
+                    .capture_committed_workspace_inputs(&fixture.coord, Arc::clone(&before), other,)
+                    .is_err(),
+                "external metadata cannot lend authority to {other:?}"
+            );
+        }
+        let copied = paths();
+        let _installed = install_bytes(&copied, &offer, "libupstream.rmeta", METADATA);
+        assert!(
+            copied
+                .capture_committed_workspace_inputs(
+                    &fixture.coord,
+                    observed(&copied, false),
+                    DependencySourceKind::WorkspaceMixedMetadata,
+                )
+                .is_err()
+        );
+
+        let replacement = path.with_file_name("replacement.tmp");
+        std::fs::write(&replacement, METADATA).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        let (current, digest) = digest_stable(&path).unwrap();
+        assert_ne!(generation, current);
+        assert_eq!(digest, object_id(METADATA).unwrap());
+        assert!(inputs.verify_original().is_err());
+        assert!(
+            original
+                .capture_committed_workspace_inputs(
+                    &fixture.coord,
+                    observed(&original, false),
+                    DependencySourceKind::WorkspaceMixedMetadata,
+                )
+                .is_err()
+        );
+        register(
+            &original,
+            &fixture,
+            &offer,
+            &[known_installed_output(&path, &digest).unwrap()],
+        )
+        .unwrap();
+        let current = original
+            .capture_committed_workspace_inputs(
+                &fixture.coord,
+                observed(&original, false),
+                DependencySourceKind::WorkspaceMixedMetadata,
+            )
+            .unwrap();
+        current.verify_original().unwrap();
+        assert!(inputs.verify_original().is_err());
+        fixture.quarantine(&offer.manifest.action_key);
+        assert!(current.verify_original().is_err());
+    }
+
+    #[test]
+    fn immutable_archive_head_never_registers_an_uninstalled_tail_or_unknown_candidate() {
+        let fixture = WorkspaceLineageFixture::new();
+        let offer = fixture.commit_immutable_leaf(
+            47,
+            &[
+                (
+                    "libupstream.rmeta",
+                    OutputRole::ProvisionalMetadata,
+                    METADATA,
+                ),
+                ("libupstream.rlib", OutputRole::Materializable, ARCHIVE),
+            ],
+            false,
+        );
+        let paths = paths();
+        let metadata = install_bytes(&paths, &offer, "libupstream.rmeta", METADATA);
+        register(&paths, &fixture, &offer, &[metadata]).unwrap();
+        for consumer in [
+            DependencySourceKind::WorkspaceMixedRlib,
+            DependencySourceKind::WorkspaceMixedMetadata,
+        ] {
+            let captured = paths
+                .capture_committed_workspace_inputs(
+                    &fixture.coord,
+                    observed(&paths, false),
+                    consumer,
+                )
+                .unwrap();
+            assert_eq!(captured.dependencies().len(), 1);
+            assert_eq!(
+                captured.dependencies()[0].role,
+                OutputRole::ProvisionalMetadata
+            );
+        }
+        for consumer in [
+            DependencySourceKind::WorkspaceCommittedRlib,
+            DependencySourceKind::WorkspaceCommittedMetadata,
+        ] {
+            assert!(
+                paths
+                    .capture_committed_workspace_inputs(
+                        &fixture.coord,
+                        observed(&paths, false),
+                        consumer,
+                    )
+                    .is_err()
+            );
+        }
+        let archive = install_bytes(&paths, &offer, "libupstream.rlib", ARCHIVE);
+        assert!(
+            paths
+                .capture_committed_workspace_inputs(
+                    &fixture.coord,
+                    observed(&paths, true),
+                    DependencySourceKind::WorkspaceMixedRlib,
+                )
+                .is_err(),
+            "manifest membership and file presence do not register the tail"
+        );
+        // Existing metadata-shadowing projection remains unchanged: an unused
+        // sibling archive is not part of the retained candidate namespace.
+        assert_eq!(
+            paths
+                .capture_committed_workspace_inputs(
+                    &fixture.coord,
+                    observed(&paths, false),
+                    DependencySourceKind::WorkspaceMixedRlib,
+                )
+                .unwrap()
+                .dependencies()
+                .len(),
+            1
+        );
+        register(&paths, &fixture, &offer, &[archive]).unwrap();
+        let complete = paths
+            .capture_committed_workspace_inputs(
+                &fixture.coord,
+                observed(&paths, true),
+                DependencySourceKind::WorkspaceMixedRlib,
+            )
+            .unwrap();
+        assert_eq!(complete.dependencies().len(), 2);
+        assert!(
+            complete
+                .dependencies()
+                .iter()
+                .any(|input| input.role == OutputRole::Materializable
+                    && input.object.0 == object_id(ARCHIVE).unwrap())
+        );
+        std::fs::write(
+            paths
+                .physical(&Path::new(OUTPUT).join("libunknown.rmeta"))
+                .unwrap(),
+            b"unattributed alternative",
+        )
+        .unwrap();
+        assert!(complete.verify_original().is_err());
+        assert!(
+            paths
+                .capture_committed_workspace_inputs(
+                    &fixture.coord,
+                    observed(&paths, true),
+                    DependencySourceKind::WorkspaceMixedRlib,
+                )
+                .is_err()
+        );
     }
 
     #[test]

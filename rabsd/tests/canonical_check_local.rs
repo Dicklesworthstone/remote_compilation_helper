@@ -1148,6 +1148,232 @@ fn canonical_shared_service_keeps_worker_ready_between_real_cargo_requests() {
 }
 
 #[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; real authenticated two-endpoint placement and fresh remote Cargo check"]
+fn canonical_shared_service_selects_ready_worker_before_disconnected_first_endpoint() {
+    const ABSENT: &str = "placement-disconnected-first";
+    const READY: &str = "placement-ready-second";
+    const CRATE: &str = "ready_worker_app";
+
+    let (owner, mut profile) = native_fixture();
+    let root = owner.path();
+    let source = root.join("ready-worker-source");
+    write(
+        &source,
+        "Cargo.toml",
+        "[package]\nname='ready_worker_app'\nversion='0.1.0'\nedition='2021'\n",
+    );
+    write(
+        &source,
+        "Cargo.lock",
+        "version=4\n\n[[package]]\nname='ready_worker_app'\nversion='0.1.0'\n",
+    );
+    write(&source, "src/value.rs", "42\n");
+    write(
+        &source,
+        "src/main.rs",
+        "const VALUE: usize = include!(\"value.rs\");\nconst _: [(); 42] = [(); VALUE];\nfn main() { println!(\"{VALUE}\"); }\n",
+    );
+    profile["source_root"] = json!(source);
+    profile["vendor"] = Value::Null;
+    profile["command"] = json!("check");
+    profile["selection"] = json!({"bins":true});
+    let socket = root.join("canonical-service.sock");
+    profile["service_socket"] = json!(socket);
+    let service_profile = root.join("ready-worker-service.json");
+    fs::write(
+        &service_profile,
+        serde_json::to_vec(&json!({
+            "version":"canonical-compile-service-v1", "state_root":root.join("state"),
+            "socket":socket, "max_roots":1, "jobs_per_root":1,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let (coordinator, identities) = native_certificates(
+        &root.join("credentials"),
+        &["worker-absent", "worker-ready"],
+    );
+    let absent_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let absent_address = absent_listener.local_addr().unwrap().to_string();
+    let worker_root = root.join("worker-ready");
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&worker_root)
+        .unwrap();
+    let (mut worker, environment) =
+        NativeWorker::start_with_identity(&worker_root, READY, &coordinator, &identities[1]);
+    let configured = |name| {
+        environment
+            .iter()
+            .find(|(key, _)| key == name)
+            .unwrap()
+            .1
+            .clone()
+    };
+    let absent_pin = identities[0]
+        .local_identity()
+        .unwrap()
+        .fingerprint
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let pool = json!([
+        {"listen":absent_address, "worker_id":ABSENT, "worker_spki_sha256":absent_pin},
+        {"listen":configured("RABS_DEPENDENCY_WORKER_LISTEN"), "worker_id":READY,
+            "worker_spki_sha256":configured("RABS_DEPENDENCY_WORKER_SPKI_SHA256")},
+    ]);
+    assert_ne!(pool[0]["listen"], pool[1]["listen"]);
+    assert_ne!(pool[0]["worker_spki_sha256"], pool[1]["worker_spki_sha256"]);
+    let mut command = shared_service_command(root);
+    command
+        .envs(
+            environment
+                .iter()
+                .filter(|(name, _)| name.starts_with("RABS_COORD_TLS_"))
+                .map(|(name, value)| (name, value)),
+        )
+        .env("RABS_DEPENDENCY_WORKERS_JSON", pool.to_string())
+        .arg("--canonical-compile-service")
+        .arg(service_profile);
+    // Only the second configured worker is ever started. Both listener ports
+    // belong to the production service; the first can never receive its peer.
+    drop(absent_listener);
+    let mut service = SharedServiceChild::spawn(root, "ready-worker-service", command);
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let events = service.events();
+        if events
+            .iter()
+            .any(|event| event["kind"] == "canonical-service-listening")
+            && events.iter().any(|event| {
+                event["kind"] == "rabsd-worker-standby-ready" && event["worker"] == READY
+            })
+        {
+            break;
+        }
+        service.assert_running();
+        assert!(
+            worker
+                .process
+                .as_mut()
+                .unwrap()
+                .leader_try_wait()
+                .unwrap()
+                .is_none(),
+            "ready worker exited: {:?}",
+            worker.events()
+        );
+        assert!(Instant::now() < deadline, "{}", service.diagnostics());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // This event follows authenticated capability publication, rather than
+    // socket acceptance or the worker merely sending its hello.
+    let initial: Value =
+        serde_json::from_slice(&read_bounded(&worker.state.join("requests.json"))).unwrap();
+    assert!(initial.get("last").is_some_and(Value::is_null));
+    let admissions =
+        root.join("state/canonical-compile-v1/shadow/dependency-workers/worker-admission");
+    let absent_history = admissions.join(sha(ABSENT.as_bytes()));
+    let ready_history = admissions.join(sha(READY.as_bytes()));
+    assert!(!absent_history.exists());
+    assert!(!ready_history.exists());
+    let previous_events = service.events().len();
+    let mut client = shared_service_client(root, 5400, &profile);
+    let deadline = Instant::now() + Duration::from_secs(240);
+    let key = loop {
+        // The old order-first placement opens this durable store before its
+        // 60-second connection wait. Fail at that concrete allocation, leaving
+        // toolchain capture and Cargo startup a generous independent budget.
+        assert!(
+            !absent_history.exists(),
+            "the disconnected first endpoint consumed durable admission:\n{}",
+            service.diagnostics()
+        );
+        let events = service.events();
+        if let Some(admitted) = events[previous_events..]
+            .iter()
+            .find(|event| event["kind"] == "rabsd-remote-dependency-admitted")
+        {
+            assert_eq!(admitted["worker_id"], READY, "{events:?}");
+            assert_eq!(admitted["purpose"], "primary", "{events:?}");
+            break admitted["key"].as_str().unwrap().to_owned();
+        }
+        service.assert_running();
+        client.assert_running();
+        assert!(Instant::now() < deadline, "{}", service.diagnostics());
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let (code, client_events, output) = client.finish(Duration::from_secs(300), false);
+    assert_eq!(code, 0, "{output}\n{}", service.diagnostics());
+    assert!(
+        !client_events
+            .iter()
+            .any(|event| event["kind"] == "canonical-build-completed"),
+        "cargo check must not claim a retained build target: {output}"
+    );
+    let artifacts = output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| event["reason"] == "compiler-artifact" && event["target"]["name"] == CRATE)
+        .collect::<Vec<_>>();
+    assert_eq!(artifacts.len(), 1, "{output}");
+    assert_eq!(artifacts[0]["fresh"], false, "{output}");
+    let receipt = worker.completed_receipt();
+    let events = service.events();
+    let current = &events[previous_events..];
+    let handoffs = current
+        .iter()
+        .filter(|event| event["kind"] == "rabsd-worker-standby-dispatch")
+        .collect::<Vec<_>>();
+    assert_eq!(handoffs.len(), 1, "{current:?}");
+    assert_eq!(handoffs[0]["worker"], READY);
+    assert_eq!(handoffs[0]["request_id"], receipt["request_id"]);
+    for kind in [
+        "rabsd-remote-dependency-admitted",
+        "rabsd-remote-dependency-executed",
+    ] {
+        let matching = current
+            .iter()
+            .filter(|event| event["kind"] == kind)
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1, "{current:?}");
+        assert_eq!(matching[0]["key"], key, "{current:?}");
+    }
+    assert!(
+        current.iter().any(|event| {
+            event["kind"] == "rabsd-live-dependency"
+                && event["crate"] == CRATE
+                && event["key"] == key
+                && matches!(
+                    event["decision"].as_str(),
+                    Some("remote-offer" | "shared-remote-offer")
+                )
+        }),
+        "the real workspace unit was not offered remotely: {current:?}"
+    );
+    assert!(!decisions(current, "hit").contains_key(CRATE));
+    assert!(!decisions(current, "execute").contains_key(CRATE));
+    assert!(!absent_history.exists());
+    assert_eq!(
+        fs::read_dir(&admissions)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>(),
+        vec![ready_history],
+        "only the selected worker may own a request allocation"
+    );
+
+    let pid = service.process.as_ref().unwrap().pgid();
+    let pid = rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap();
+    rustix::process::kill_process(pid, rustix::process::Signal::TERM).unwrap();
+    let (code, _, output) = service.finish(Duration::from_secs(30), false);
+    assert_eq!(code, 0, "{output}");
+    worker.finish();
+    assert!(fs::read_dir(root.join("ops")).unwrap().next().is_none());
+}
+
+#[test]
 #[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual concurrent canonical Cargo clients, shared TLS compiler execution and origin cancellation"]
 fn canonical_shared_remote_flight_survives_origin_cancellation() {
     let (owner, mut first_profile) = native_fixture();
@@ -5008,6 +5234,495 @@ fn assert_closed_workspace_dag_ancestry(
                 "an uncommitted producer acquired durable consumer ancestry"
             );
         }
+    }
+}
+
+fn mixed_workspace_dag_source(root: &Path, denied_input: bool) {
+    write(
+        root,
+        "Cargo.toml",
+        "[workspace]\nmembers=['middle','top']\nresolver='2'\n",
+    );
+    write(
+        root,
+        ".cargo/config.toml",
+        "[source.crates-io]\nreplace-with='vendored-sources'\n[source.vendored-sources]\ndirectory='vendor'\n",
+    );
+    let mut leaf = "pub struct Payload { pub answer: usize }\npub const fn payload() -> Payload { Payload { answer: 42 } }\n".to_owned();
+    if denied_input {
+        leaf.push_str("pub const PROCESS: &str = include_str!(\"/proc/self/status\");\n");
+    }
+    let checksum = vendor(
+        root,
+        WORKSPACE_DAG_NAMES[0],
+        BTreeMap::from([
+            (
+                "Cargo.toml",
+                "[package]\nname='canonical_dag_leaf'\nversion='0.1.0'\nedition='2021'\n",
+            ),
+            ("src/lib.rs", leaf.as_str()),
+        ]),
+    );
+    write(
+        root,
+        "Cargo.lock",
+        format!(
+            "version=4\n\n[[package]]\nname='canonical_dag_leaf'\nversion='0.1.0'\nsource='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='{checksum}'\n\n[[package]]\nname='canonical_dag_middle'\nversion='0.1.0'\ndependencies=['canonical_dag_leaf']\n\n[[package]]\nname='canonical_dag_top'\nversion='0.1.0'\ndependencies=['canonical_dag_middle']\n"
+        ),
+    );
+    write(
+        root,
+        "middle/Cargo.toml",
+        "[package]\nname='canonical_dag_middle'\nversion='0.1.0'\nedition='2021'\n[dependencies]\ncanonical_dag_leaf='=0.1.0'\n",
+    );
+    write(
+        root,
+        "middle/src/lib.rs",
+        "pub use canonical_dag_leaf::Payload;\npub const SOURCE: &str = include_str!(\"../../shared/value.txt\");\npub const ENVIRONMENT: &str = env!(\"WORKSPACE_DAG_INPUT\");\npub const fn payload() -> Payload { canonical_dag_leaf::payload() }\n",
+    );
+    write(
+        root,
+        "top/Cargo.toml",
+        "[package]\nname='canonical_dag_top'\nversion='0.1.0'\nedition='2021'\nautobins=false\n[dependencies]\ncanonical_dag_middle={path='../middle'}\n[[bin]]\nname='canonical_dag_consumer'\npath='src/main.rs'\n",
+    );
+    // The workspace top has no direct external dependency. Its type lookup
+    // must consume the actual vendored crate through the middle library.
+    write(
+        root,
+        "top/src/lib.rs",
+        "pub const ANSWER: usize = canonical_dag_middle::payload().answer;\nconst _: [(); 42] = [(); ANSWER];\npub const SOURCE: &str = canonical_dag_middle::SOURCE;\npub const ENVIRONMENT: &str = canonical_dag_middle::ENVIRONMENT;\nfn retained_dag_warning() {}\n",
+    );
+    write(
+        root,
+        "top/src/main.rs",
+        r#"const _: [(); 42] = [(); canonical_dag_top::ANSWER];
+const _: [(); include_str!("../../shared/value.txt").len()] =
+    [(); canonical_dag_top::SOURCE.len()];
+const _: [(); env!("WORKSPACE_DAG_INPUT").len()] =
+    [(); canonical_dag_top::ENVIRONMENT.len()];
+fn main() { panic!("RABS_CHECK_TARGET_EXECUTED"); }
+"#,
+    );
+    write(
+        root,
+        "shared/value.txt",
+        "mixed retained workspace source\n",
+    );
+}
+
+fn mixed_workspace_dag_outputs(
+    root: &Path,
+    command: &str,
+    events: &[Value],
+    output: &str,
+    targets: &mut BTreeSet<PathBuf>,
+) -> (BTreeMap<String, Vec<u8>>, Vec<String>) {
+    if command == "check" {
+        let diagnostics = closed_workspace_metadata_dag_observations(events, output, "cold");
+        let new_targets = fs::read_dir(root.join("state/canonical-compile-v1/private-target-v2"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path().join("seed/target"))
+            .filter(|target| !targets.contains(target))
+            .collect::<Vec<_>>();
+        assert_eq!(new_targets.len(), 1, "check did not retain a fresh target");
+        let files = closed_workspace_metadata_dag_files(&new_targets[0], output);
+        assert!(targets.insert(new_targets[0].clone()));
+        (files, diagnostics)
+    } else {
+        let (target, files, diagnostics) = closed_workspace_dag_outputs(events, output);
+        assert!(targets.insert(target));
+        (files, diagnostics)
+    }
+}
+
+fn assert_qualified_immutable_leaf(root: &Path, key: &str, command: &str) {
+    use rabs_cas::metadata_store::{RabsMetadataStore, SqlValue, digest_key};
+
+    let cas =
+        rabsd::janitor::store::mount_and_reconcile(&root.join("state/canonical-compile-v1/cas"))
+            .unwrap();
+    let mut store = cas.store().lock().unwrap();
+    let manifest_key = store.published_manifest_key_str(key).unwrap().unwrap();
+    let manifest = rabsd::coord::live::load_manifest(&mut *store, &manifest_key).unwrap();
+    let mode = if command == "build" {
+        "rlib"
+    } else {
+        "metadata"
+    };
+    let expected = format!(
+        "{mode}:{}:{manifest_key}",
+        digest_key(&manifest.canonical_descriptor_digest)
+    );
+    assert_eq!(
+        store
+            .query(
+                "SELECT decision FROM decision_receipts WHERE kind = ?1 AND subject = ?2 AND seq = 0",
+                &[
+                    SqlValue::Text("rabs-committed-immutable-leaf-v1".into()),
+                    SqlValue::Text(key.to_owned()),
+                ],
+            )
+            .unwrap(),
+        vec![vec![SqlValue::Text(expected)]],
+        "ordinary dependency publication alone must not qualify a mixed workspace input"
+    );
+    assert!(store.list_provisional_ancestors(key).unwrap().is_empty());
+}
+
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual immutable external leaf and mixed workspace archive qualification, ancestry and relocated replay"]
+fn canonical_workspace_mixed_dependency_archives_earn_transitive_replay_across_worktrees() {
+    mixed_workspace_dag_replay("build");
+}
+
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual immutable external leaf and mixed workspace metadata qualification with a fresh downstream Cargo consumer"]
+fn canonical_workspace_mixed_dependency_metadata_earns_transitive_replay_across_worktrees() {
+    mixed_workspace_dag_replay("check");
+}
+
+fn mixed_workspace_dag_replay(command: &str) {
+    let (owner, mut profile) = native_fixture();
+    let root = owner.path();
+    let first = root.join("mixed-dag-a");
+    let second = root.join("mixed-dag-b");
+    mixed_workspace_dag_source(&first, false);
+    mixed_workspace_dag_source(&second, false);
+    profile["source_root"] = json!(first);
+    profile["command"] = json!(command);
+    profile["selection"] = json!({"workspace":true,"lib":true});
+    if command == "check" {
+        profile["selection"]["bins"] = json!(true);
+    }
+    profile["env"] = json!({"WORKSPACE_DAG_INPUT":"qualified external dependency environment"});
+    profile["jobs"] = json!(1);
+    assert_eq!(profile["vendor"], "vendor");
+    assert!(profile.get("target_cache").is_none());
+
+    let mut stock_profile = profile.clone();
+    if command == "check" {
+        stock_profile["target_cache"] =
+            json!({"runtime_epoch":"mixed-metadata-stock-v1", "max_bytes":268435456});
+    }
+    let (code, events, output) = run(root, 1100, &stock_profile);
+    assert_eq!(code, 0, "{output}");
+    assert!(decisions(&events, "remote-offer").is_empty(), "{output}");
+    assert!(decisions(&events, "hit").is_empty(), "{output}");
+    assert!(
+        decisions(&events, "execute")
+            .keys()
+            .all(|name| name == WORKSPACE_DAG_NAMES[0]),
+        "stock workspace units cannot acquire local cache authority: {output}"
+    );
+    if command == "check" {
+        use rabs_cas::metadata_store::{RabsMetadataStore, SqlValue};
+
+        let local = decisions(&events, "execute");
+        assert_eq!(
+            local.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+            BTreeSet::from([WORKSPACE_DAG_NAMES[0]]),
+            "the stock control must actually publish ordinary local dependency metadata: {output}"
+        );
+        let key = &local[WORKSPACE_DAG_NAMES[0]];
+        assert_closed_workspace_leaf_evidence(root, key, 1, "rustc-dependency-compile");
+        let cas = rabsd::janitor::store::mount_and_reconcile(
+            &root.join("state/canonical-compile-v1/cas"),
+        )
+        .unwrap();
+        assert!(
+            cas.store()
+                .lock()
+                .unwrap()
+                .query(
+                    "SELECT decision FROM decision_receipts WHERE kind = ?1 AND subject = ?2",
+                    &[
+                        SqlValue::Text("rabs-committed-immutable-leaf-v1".into()),
+                        SqlValue::Text(key.clone()),
+                    ],
+                )
+                .unwrap()
+                .is_empty(),
+            "local publication acquired remote immutable-leaf authority"
+        );
+    }
+    let mut targets = BTreeSet::new();
+    let stock = mixed_workspace_dag_outputs(root, command, &events, &output, &mut targets);
+
+    let (mut worker, environment) = NativeWorker::start(root);
+    let mut keys: Option<BTreeMap<String, String>> = None;
+    let mut private_attempts = BTreeMap::new();
+    let mut request_ids = BTreeSet::new();
+    let mut executions = 0;
+    for number in 1..=5 {
+        if number == 5 {
+            profile["source_root"] = json!(second);
+        }
+        if command == "check" {
+            // This changes only the private Cargo target family. Every check
+            // starts cold, while the exact action identities must stay equal.
+            profile["target_cache"] = json!({
+                "runtime_epoch":format!("mixed-metadata-dag-{number}-v1"),
+                "max_bytes":268435456,
+            });
+        }
+        let before_journal = (number > 3 && command == "build")
+            .then(|| read_bounded(&worker.state.join("requests.json")));
+        let (code, events, output) =
+            run_with_environment(root, 1100 + number, &profile, &environment);
+        assert_eq!(code, 0, "{output}\nworker: {:?}", worker.events());
+        assert!(decisions(&events, "execute").is_empty(), "{output}");
+        assert!(
+            !events.iter().any(|event| matches!(
+                event["kind"].as_str(),
+                Some("rabsd-remote-dependency-failed" | "rabsd-remote-dependency-install-failed")
+            )),
+            "mixed dependency qualification fell back locally: {output}"
+        );
+        let offered = decisions(&events, "remote-offer");
+        let hits = decisions(&events, "hit");
+        let hit = number > 3;
+        let actual = if hit {
+            assert_eq!(Some(&hits), keys.as_ref(), "{output}");
+            let expected = if command == "check" {
+                BTreeSet::from([WORKSPACE_METADATA_DAG_CONSUMER])
+            } else {
+                BTreeSet::new()
+            };
+            assert_eq!(
+                offered.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+                expected,
+                "a trained mixed library DAG dispatched compiler work: {output}"
+            );
+            hits
+        } else {
+            assert!(hits.is_empty(), "unearned mixed DAG hit: {output}");
+            let mut expected = BTreeSet::from(WORKSPACE_DAG_NAMES);
+            if command == "check" {
+                expected.insert(WORKSPACE_METADATA_DAG_CONSUMER);
+            }
+            assert_eq!(
+                offered.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+                expected,
+                "every qualifying unit must reach the real worker: {output}"
+            );
+            WORKSPACE_DAG_NAMES
+                .into_iter()
+                .map(|name| (name.to_owned(), offered[name].clone()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        if let Some(previous) = &keys {
+            assert_eq!(
+                &actual, previous,
+                "cold or relocated roots split mixed keys"
+            );
+        }
+        let expected = offered.values().cloned().collect::<BTreeSet<_>>();
+        for kind in [
+            "rabsd-remote-dependency-admitted",
+            "rabsd-remote-dependency-executed",
+        ] {
+            let actual = events
+                .iter()
+                .filter(|event| event["kind"] == kind)
+                .map(|event| event["key"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(actual.len(), expected.len(), "{kind}: {output}");
+            assert_eq!(
+                actual.into_iter().collect::<BTreeSet<_>>(),
+                expected,
+                "{output}"
+            );
+        }
+        for (index, name) in WORKSPACE_DAG_NAMES.iter().enumerate() {
+            if hit {
+                assert!(
+                    events.iter().any(|event| {
+                        event["decision"] == "served" && event["key"] == actual[*name]
+                    }),
+                    "a cached mixed output was not installed: {output}"
+                );
+            }
+            let class = if index == 0 {
+                "rustc-dependency-compile"
+            } else if command == "build" {
+                "rustc-workspace-committed-mixed-rlib-v1"
+            } else {
+                "rustc-workspace-committed-mixed-metadata-v1"
+            };
+            assert_closed_workspace_leaf_evidence(
+                root,
+                &actual[*name],
+                number.min(3) as usize,
+                class,
+            );
+        }
+        assert_qualified_immutable_leaf(root, &actual[WORKSPACE_DAG_NAMES[0]], command);
+        if command == "check" {
+            assert_fresh_workspace_execution(
+                root,
+                &events,
+                &output,
+                WORKSPACE_METADATA_DAG_CONSUMER,
+                &offered[WORKSPACE_METADATA_DAG_CONSUMER],
+                &mut private_attempts,
+            );
+        }
+        let (files, diagnostics) =
+            mixed_workspace_dag_outputs(root, command, &events, &output, &mut targets);
+        assert_closed_workspace_dag_ancestry(root, &actual, &files);
+        assert_eq!(
+            (files, diagnostics),
+            stock,
+            "stock/cold/hit mixed DAG bytes differ"
+        );
+        executions += offered.len();
+        if !offered.is_empty() {
+            assert!(request_ids.insert(worker.completed_receipt()["request_id"].as_u64().unwrap()));
+        }
+        assert_eq!(
+            worker
+                .events()
+                .iter()
+                .filter(|event| event["kind"] == "worker-toolchain-acquired")
+                .count(),
+            executions,
+            "only independently offered compiler requests may execute"
+        );
+        if let Some(before) = before_journal {
+            assert_eq!(
+                read_bounded(&worker.state.join("requests.json")),
+                before,
+                "a mixed archive hit reached the worker request journal"
+            );
+        }
+        keys = Some(actual);
+    }
+    if command == "check" {
+        assert!(fs::read_dir(root.join("ops")).unwrap().next().is_none());
+    }
+    worker.finish();
+}
+
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; denied external compiler input and real local fallback must not qualify either mixed workspace class"]
+fn canonical_workspace_mixed_dependency_dag_refuses_cache_authority_from_a_local_fallback_producer()
+{
+    use rabs_cas::metadata_store::{RabsMetadataStore, SqlValue};
+
+    for command in ["build", "check"] {
+        let (owner, mut profile) = native_fixture();
+        let root = owner.path();
+        let source = root.join("mixed-dag-fallback");
+        mixed_workspace_dag_source(&source, true);
+        profile["source_root"] = json!(source);
+        profile["command"] = json!(command);
+        profile["selection"] = json!({"workspace":true,"lib":true});
+        if command == "check" {
+            profile["selection"]["bins"] = json!(true);
+        }
+        profile["env"] = json!({"WORKSPACE_DAG_INPUT":"unqualified external dependency"});
+        profile["jobs"] = json!(1);
+        let (mut worker, environment) = NativeWorker::start(root);
+        let mut fresh_attempts = BTreeMap::new();
+        for number in 1..=2 {
+            let (code, events, output) =
+                run_with_environment(root, 1120 + number, &profile, &environment);
+            assert_eq!(
+                code, 0,
+                "fallback must preserve valid Cargo {command}: {output}"
+            );
+            assert!(decisions(&events, "hit").is_empty(), "{output}");
+            assert!(decisions(&events, "execute").is_empty(), "{output}");
+            assert!(
+                !output
+                    .contains("canonical-project-executors-require-isolated-dependency-execution"),
+                "the graph guard preempted the external provenance control: {output}"
+            );
+            let offered = decisions(&events, "remote-offer");
+            assert_eq!(
+                offered.len(),
+                if command == "check" { 4 } else { 3 },
+                "{output}"
+            );
+            let producer = &offered[WORKSPACE_DAG_NAMES[0]];
+            // Rlib execution denies procfs. Ordinary metadata may read it but
+            // must fail the existing dep-info closure check before publication.
+            // Both routes must settle and run Cargo's unobserved local fallback.
+            assert!(
+                events.iter().any(|event| {
+                    event["kind"] == "rabsd-remote-dependency-failed" && event["key"] == *producer
+                }),
+                "the unqualified external leaf did not take real fallback: {output}"
+            );
+            assert!(
+                !events.iter().any(|event| {
+                    event["kind"] == "rabsd-remote-dependency-executed" && event["key"] == *producer
+                }),
+                "an unqualified external leaf was accepted: {output}"
+            );
+            for name in &WORKSPACE_DAG_NAMES[1..] {
+                assert_fresh_workspace_execution(
+                    root,
+                    &events,
+                    &output,
+                    name,
+                    &offered[*name],
+                    &mut fresh_attempts,
+                );
+            }
+            if command == "check" {
+                closed_workspace_metadata_dag_observations(&events, &output, "disabled");
+                assert_fresh_workspace_execution(
+                    root,
+                    &events,
+                    &output,
+                    WORKSPACE_METADATA_DAG_CONSUMER,
+                    &offered[WORKSPACE_METADATA_DAG_CONSUMER],
+                    &mut fresh_attempts,
+                );
+            } else {
+                closed_workspace_dag_outputs(&events, &output);
+            }
+            worker.completed_receipt();
+            let cas = rabsd::janitor::store::mount_and_reconcile(
+                &root.join("state/canonical-compile-v1/cas"),
+            )
+            .unwrap();
+            let mut store = cas.store().lock().unwrap();
+            assert!(
+                store
+                    .published_manifest_key_str(producer)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(!store.has_evidence_key(producer).unwrap());
+            assert!(
+                store
+                    .query(
+                        "SELECT decision FROM decision_receipts WHERE kind = ?1 AND subject = ?2",
+                        &[
+                            SqlValue::Text("rabs-committed-immutable-leaf-v1".into()),
+                            SqlValue::Text(producer.clone()),
+                        ],
+                    )
+                    .unwrap()
+                    .is_empty()
+            );
+            for key in offered.values() {
+                assert!(store.list_provisional_ancestors(key).unwrap().is_empty());
+                assert!(
+                    store
+                        .query(
+                            "SELECT attempt_hex FROM verification_samples WHERE action_key = ?1",
+                            &[SqlValue::Text(key.clone())],
+                        )
+                        .unwrap()
+                        .is_empty(),
+                    "an unqualified external leaf authorized mixed replay"
+                );
+            }
+        }
+        worker.finish();
     }
 }
 

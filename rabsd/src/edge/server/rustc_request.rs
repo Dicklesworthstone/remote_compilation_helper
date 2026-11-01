@@ -697,6 +697,22 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
         plan = candidate;
         committed_workspace_inputs = Some(committed);
     }
+    // Preserve the existing workspace-only identities whenever their narrower
+    // provenance policy suffices. The independently versioned mixed class is
+    // considered only after those proofs refuse the retained candidate set.
+    if workspace_requested
+        && plan.source_kind == rabs_key::live_dependency::DependencySourceKind::WorkspaceExecutionOnly
+        && let Some(paths) = &live.canonical
+        && let Ok(candidate) = rabs_key::live_dependency::workspace_dependency_cache::plan_mixed_workspace_library(&plan)
+        && paths.require_workspace_mixed_library(&candidate).is_ok()
+        && let Ok(committed) = live.lane.committed_workspace_inputs(paths, Arc::clone(&dependencies), candidate.source_kind)
+        && rabs_key::live_dependency::workspace_dependency_cache::remote_mixed_workspace_library_shape(
+            &candidate, &key_directories, committed.dependencies(), rabs_sandbox::layout::TOOLCHAIN,
+        ).is_ok()
+    {
+        plan = candidate;
+        committed_workspace_inputs = Some(committed);
+    }
     let key_result = if workspace_requested {
         Err(rabs_key::live_dependency::LiveRefusal::Facts("workspace units require their independently isolated worker profile and cannot use local dependency cache authority".into()))
     } else if let Err(reason) = local_capture {

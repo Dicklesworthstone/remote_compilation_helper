@@ -561,6 +561,89 @@ fn request_owned_metadata_ack_rechecks_input_and_coordinator_ownership() {
 }
 
 #[test]
+fn request_owned_metadata_ack_cannot_accept_corrupted_or_displaced_head_outputs() {
+    for archive in [false, true] {
+        for name in ["lib.d", "lib.rmeta"] {
+            for displaced in [false, true] {
+                let fixture = Fixture::new();
+                let destination = fixture.root.path().join("changed-metadata-head");
+                let owner = fixture.capture_with_metadata(archive);
+                let mut calls = 0;
+                let result =
+                    fixture.install_with_metadata(owner, &destination, || Ok(()), &mut |files| {
+                        calls += 1;
+                        let path = destination.join("out").join(name);
+                        assert!(files.contains(&path));
+                        assert!(!destination.join("out/lib.rlib").exists());
+                        if displaced {
+                            // Preserve the original fixture bytes while making
+                            // the acknowledged destination disappear.
+                            std::fs::rename(&path, path.with_extension("displaced")).unwrap();
+                        } else {
+                            std::fs::write(&path, b"corrupted while metadata ACK was pending")
+                                .unwrap();
+                        }
+                        Ok(())
+                    });
+                assert_eq!(calls, 1);
+                assert!(
+                    matches!(&result, Err(RequestOwnedInstallError::MetadataExposed(_))),
+                    "archive={archive} name={name} displaced={displaced}: {result:?}",
+                );
+                assert!(!destination.join("out/lib.rlib").exists());
+                assert_eq!(fixture.active_capture_pins(), 0);
+                fixture.assert_unpublished();
+                // The terminal exposed failure releases this owner's complete
+                // reservation without allowing it to rerun or publish a result.
+                fixture
+                    .install_with_metadata(
+                        fixture.capture_with_metadata(archive),
+                        &destination,
+                        || Ok(()),
+                        &mut |_| Ok(()),
+                    )
+                    .unwrap();
+                assert_eq!(fixture.active_capture_pins(), 0);
+                fixture.assert_unpublished();
+            }
+        }
+    }
+}
+
+#[test]
+fn request_owned_metadata_head_is_rechecked_after_tail_preparation() {
+    let fixture = Fixture::new();
+    let destination = fixture
+        .root
+        .path()
+        .join("head-changed-during-tail-preparation");
+    let checks = Cell::new(0);
+    let result = fixture.install_with_metadata(
+        fixture.capture_with_metadata(true),
+        &destination,
+        || {
+            checks.set(checks.get() + 1);
+            if checks.get() == 4 {
+                // This is the original-request check after private tail
+                // preparation, before the archive may be renamed into place.
+                std::fs::write(destination.join("out/lib.d"), b"changed after tail staging")
+                    .unwrap();
+            }
+            Ok(())
+        },
+        &mut |_| Ok(()),
+    );
+    assert_eq!(checks.get(), 4);
+    assert!(matches!(
+        result,
+        Err(RequestOwnedInstallError::MetadataExposed(_))
+    ));
+    assert!(!destination.join("out/lib.rlib").exists());
+    assert_eq!(fixture.active_capture_pins(), 0);
+    fixture.assert_unpublished();
+}
+
+#[test]
 fn request_owned_metadata_tail_corruption_fails_after_head_exposure() {
     let fixture = Fixture::new();
     let destination = fixture.root.path().join("tail-corrupted-after-ack");

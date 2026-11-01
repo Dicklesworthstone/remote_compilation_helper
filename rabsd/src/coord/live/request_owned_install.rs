@@ -6,7 +6,7 @@
 //! input guards may authorize target writes; a publication pointer, serving
 //! record, verification sample or old recovery receipt cannot create this owner.
 
-use super::metadata_replay::MetadataCallback;
+use super::metadata_replay::{MetadataCallback, verify_installed_head};
 use super::{CoordLive, ExpectedOutputs, ServeError, output_install};
 use crate::coord::live_dependency::remote::RequestOwnedResult;
 use crate::edge::destination_arbiter::{BundleId, reserve_scoped};
@@ -154,8 +154,7 @@ impl CoordLive {
             // affine result owner, capture pins and full reservation stay on
             // this stack; no cache admission or publication is manufactured.
             let finish = || -> Result<Vec<PathBuf>, String> {
-                output_install::verify_installed_dep_info(&plan, &files)
-                    .map_err(|error| error.to_string())?;
+                verify_installed_head(&plan, &files).map_err(|error| error.to_string())?;
                 metadata_ready
                     .as_mut()
                     .ok_or("request-owned metadata callback ownership lost")?(
@@ -166,6 +165,7 @@ impl CoordLive {
                 // original request and coordinator before reading any tail
                 // payload, and again after potentially expensive staging.
                 verify_request()?;
+                verify_installed_head(&plan, &files).map_err(|error| error.to_string())?;
                 self.require_request_owner(coordinator)
                     .map_err(|error| error.to_string())?;
                 {
@@ -189,6 +189,7 @@ impl CoordLive {
                     }
                 };
                 verify_request()?;
+                verify_installed_head(&plan, &files).map_err(|error| error.to_string())?;
                 self.require_request_owner(coordinator)
                     .map_err(|error| error.to_string())?;
                 let mut store = cas
@@ -206,6 +207,14 @@ impl CoordLive {
                 ))
             })?;
             files.extend(tail_files);
+            // The head remains Cargo-visible throughout tail installation.
+            // Check the complete delivered frontier before reporting success;
+            // a changed dependency file cannot become Cargo freshness state.
+            verify_installed_head(&plan, &files).map_err(|error| {
+                RequestOwnedInstallError::MetadataExposed(format!(
+                    "request-owned metadata delivery: {error}"
+                ))
+            })?;
         }
         Ok(files)
     }

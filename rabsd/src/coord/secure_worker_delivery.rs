@@ -186,6 +186,47 @@ fn require(condition: bool, message: &str) -> io::Result<()> {
     }
 }
 
+/// Advisory compatibility for a TLS-authenticated idle worker. The caller must
+/// retain the original trusted hello; this pure check creates no session, lease
+/// or source authority. Actual execution repeats it before its challenge.
+pub(crate) fn validate_authenticated_worker_execution_capabilities(
+    hello: &Value,
+    request: &Value,
+) -> io::Result<()> {
+    super::worker_delivery::validate_worker_execution_capabilities(hello, request)?;
+    require(
+        hello
+            .get("slots")
+            .and_then(Value::as_u64)
+            .and_then(|slots| u32::try_from(slots).ok())
+            .is_some_and(|slots| slots > 0),
+        "invalid worker slots",
+    )?;
+    require(
+        hello["execution_leases"]
+            .as_array()
+            .is_some_and(|versions| {
+                versions.iter().any(|version| {
+                    version == rabs_protocol::lease_semantics::REQUEST_EXECUTION_LEASE_VERSION
+                })
+            }),
+        "authenticated execution requires renewable worker execution leases",
+    )?;
+    if request.get("source_manifest").is_some() {
+        require(
+            hello["source_transfers"]
+                .as_array()
+                .is_some_and(|versions| {
+                    versions
+                        .iter()
+                        .any(|version| version == rabs_sandbox::source_transfer::SOURCE_TRANSFER)
+                }),
+            "worker does not support source-files-v1",
+        )?;
+    }
+    Ok(())
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -385,6 +426,9 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
             hello["kind"] == "worker-hello" && hello["peer_id"].as_str() == Some(peer.as_str()),
             "worker hello does not name the authenticated peer",
         )?;
+        if self.mode == DeliveryMode::Execute {
+            validate_authenticated_worker_execution_capabilities(hello, &self.expected_operation)?;
+        }
         let slots = hello
             .get("slots")
             .and_then(Value::as_u64)
@@ -991,6 +1035,12 @@ impl StandbyState {
 }
 
 impl StandbyPeer {
+    /// Original TLS-pinned hello for advisory placement only. It does not confer
+    /// durable worker admission, a request id, a session or execution authority.
+    pub(crate) fn scheduling_hello(&self) -> &Value {
+        &self.state.hello
+    }
+
     /// Whether the hello explicitly selected the optional idle exchange.
     pub(crate) fn supported(&self) -> bool {
         self.state.supported
@@ -1946,6 +1996,8 @@ mod tests {
         json!({"kind":"worker-hello", "worker_id":"worker", "peer_id":hex(&[1; 32]), "canonical":true, "slots":4,
             "boot_generation":1, "incarnation":"00000000000000000000000000000001",
             "execution_leases":["request-renewal-v1"],
+            "recovery_protocols":["request-journal-v1"], "output_transfers":["ranges-v1"],
+            "artifact_transfers":["files-v1"],
             "transport":{"minimum_compatible":1,"current":1},
             "application":{"minimum_compatible":1,"current":1}})
     }
@@ -1988,6 +2040,53 @@ mod tests {
     }
     fn peer(hello: Value, response: Value) -> AdmittedPeer<Script> {
         peer_with_mode(hello, response, DeliveryMode::Execute)
+    }
+
+    #[test]
+    fn authenticated_capability_projection_requires_source_and_lease_protocols() {
+        let projection = json!({
+            "source_manifest":null,
+            "artifacts":{"files":["libdep.rmeta"]}
+        });
+        let mut offered = hello();
+        offered["source_transfers"] = json!([rabs_sandbox::source_transfer::SOURCE_TRANSFER]);
+        validate_authenticated_worker_execution_capabilities(&offered, &projection).unwrap();
+        for (field, incompatible) in [
+            ("execution_leases", json!(["request-renewal-v0"])),
+            ("execution_leases", Value::Null),
+            ("source_transfers", json!(["source-files-v0"])),
+            ("source_transfers", json!("source-files-v1")),
+            ("slots", json!(u64::from(u32::MAX) + 1)),
+        ] {
+            let mut alternative = offered.clone();
+            alternative[field] = incompatible;
+            assert!(
+                validate_authenticated_worker_execution_capabilities(&alternative, &projection)
+                    .is_err(),
+                "{field}"
+            );
+        }
+        // Only a source-backed execution requires source upload support.
+        offered.as_object_mut().unwrap().remove("source_transfers");
+        validate_authenticated_worker_execution_capabilities(&offered, &json!({})).unwrap();
+        assert!(
+            validate_authenticated_worker_execution_capabilities(&offered, &projection).is_err()
+        );
+    }
+
+    #[test]
+    fn authenticated_capability_match_does_not_complete_session_admission() {
+        let offered = hello();
+        validate_authenticated_worker_execution_capabilities(&offered, &request()).unwrap();
+        let mut wrong_response = response();
+        wrong_response["session_id"] = json!(999);
+        let mut candidate = peer(offered, wrong_response);
+        let offered = candidate.receive().unwrap();
+        assert!(candidate.negotiate(&offered, &grant()).is_err());
+        assert!(candidate.authentication().is_none());
+        assert_eq!(candidate.inner.sent.len(), 1);
+        assert_eq!(candidate.inner.sent[0]["kind"], "session-challenge");
+        assert!(candidate.send(&request()).is_err());
     }
 
     #[test]

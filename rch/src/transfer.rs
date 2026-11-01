@@ -2821,11 +2821,19 @@ pub(crate) fn configure_clean_git_command(command: &mut Command) {
 /// Clean overlays compare only the selected live overlay through rsync; their
 /// immutable baseline is checked by the complete source-content manifest.
 #[derive(Clone, Copy)]
-enum SourceContentBarrier {
+pub(crate) enum SourceContentBarrier {
     Ordinary,
     Owned { managed_timestamps: bool },
     CleanOverlay,
     CleanOverlayNamespace,
+}
+
+/// Only the composed manifest proof may delegate file bytes to its mandatory
+/// remote SHA-256 verifier. Standalone rsync barriers retain full checksums.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SourceContentByteCheck {
+    Checksum,
+    MetadataOnly,
 }
 
 /// One bounded slot per selected repository, inside the already-owned target.
@@ -4948,6 +4956,21 @@ impl TransferPipeline {
         effective_excludes: &[String],
         policy: SourceContentBarrier,
     ) -> Command {
+        self.build_source_content_rsync_barrier_with_byte_check(
+            worker,
+            effective_excludes,
+            policy,
+            SourceContentByteCheck::Checksum,
+        )
+    }
+
+    fn build_source_content_rsync_barrier_with_byte_check(
+        &self,
+        worker: &WorkerConfig,
+        effective_excludes: &[String],
+        policy: SourceContentBarrier,
+        byte_check: SourceContentByteCheck,
+    ) -> Command {
         let remote_path = self.remote_path();
         let escaped_remote_path = escape(Cow::from(&remote_path));
         let destination = self.rsync_remote_spec(worker, &remote_path);
@@ -4966,9 +4989,11 @@ impl TransferPipeline {
             }
         };
         self.append_source_rsync_io_timeout(&mut cmd);
-        cmd.arg("-azn")
-            .arg("--checksum")
-            .arg("--itemize-changes")
+        cmd.arg("-azn");
+        if byte_check == SourceContentByteCheck::Checksum {
+            cmd.arg("--checksum");
+        }
+        cmd.arg("--itemize-changes")
             .arg("--out-format=%i\t%n")
             .args(capabilities.no_motd_args())
             .arg("-e")
@@ -4991,6 +5016,14 @@ impl TransferPipeline {
                 | SourceContentBarrier::CleanOverlayNamespace
         ) {
             cmd.arg("--no-times");
+            if byte_check == SourceContentByteCheck::MetadataOnly {
+                // Managed source timestamps intentionally differ from the
+                // dispatcher's. Without --size-only, rsync's quick check
+                // would request file transfers for those known differences
+                // even with --no-times. SHA-256 remains a separate mandatory
+                // part of the composed proof; size alone proves no bytes.
+                cmd.arg("--size-only");
+            }
         }
         if matches!(policy, SourceContentBarrier::CleanOverlayNamespace) {
             // Zero-byte placeholders describe names only. Skip existing-file
@@ -5010,6 +5043,46 @@ impl TransferPipeline {
             .arg(destination);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         cmd
+    }
+
+    /// Check selected metadata and the receiver namespace within a complete
+    /// source-manifest proof, without hashing the same file bytes twice.
+    ///
+    /// Success is NOT a content proof: the caller must verify every remote
+    /// SHA-256 against its captured manifest and then recapture local inputs.
+    /// Only the durable receipt path, holding its source grant throughout
+    /// those steps, may use this comparison. Standalone barriers below retain
+    /// checksums and remain the fallback without explicit source authority.
+    pub(crate) async fn verify_source_content_manifest_namespace(
+        &self,
+        worker: &WorkerConfig,
+        policy: SourceContentBarrier,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !self.worker_platform.is_windows() && self.source_authority_prefix.is_some(),
+            "manifest namespace verification requires the Unix source grant"
+        );
+        if matches!(policy, SourceContentBarrier::CleanOverlay) {
+            anyhow::ensure!(
+                self.sync_include_patterns.is_some() && !self.sync_delete && self.sync_checksum,
+                "clean-overlay source verification requires a granted checksum overlay pipeline"
+            );
+        }
+        let effective_excludes = self.get_effective_excludes();
+        let command = self.build_source_content_rsync_barrier_with_byte_check(
+            worker,
+            &effective_excludes,
+            policy,
+            SourceContentByteCheck::MetadataOnly,
+        );
+        let output = run_source_content_rsync_capture(
+            command,
+            "source-content manifest metadata and namespace barrier",
+            self.source_sync_attempt_timeout(&effective_excludes),
+            None,
+        )
+        .await?;
+        source_content_barrier::verify_output(&output).map_err(anyhow::Error::msg)
     }
 
     /// Prove that a checksum-aware rsync would transfer no selected file and
@@ -15733,6 +15806,98 @@ Number of files transferred: 42
                 "{receiver}"
             );
         }
+    }
+
+    #[test]
+    fn manifest_namespace_barrier_changes_only_redundant_byte_comparison() {
+        let _guard = test_guard!();
+        let worker = flavour_test_worker();
+        let pipeline = flavour_test_pipeline(RsyncFlavor::Unknown, 0)
+            .with_source_authority("ab12".into())
+            .unwrap()
+            .with_sync_include_patterns(vec!["/src/***".into()])
+            .with_sync_checksum(true);
+        for (policy, managed_timestamps) in [
+            (SourceContentBarrier::Ordinary, false),
+            (
+                SourceContentBarrier::Owned {
+                    managed_timestamps: false,
+                },
+                false,
+            ),
+            (
+                SourceContentBarrier::Owned {
+                    managed_timestamps: true,
+                },
+                true,
+            ),
+            (SourceContentBarrier::CleanOverlay, true),
+            (SourceContentBarrier::CleanOverlayNamespace, true),
+        ] {
+            let standalone = command_args(&pipeline.build_source_content_rsync_barrier_command(
+                &worker,
+                &["/excluded/***".into()],
+                policy,
+            ));
+            let manifest = command_args(
+                &pipeline.build_source_content_rsync_barrier_with_byte_check(
+                    &worker,
+                    &["/excluded/***".into()],
+                    policy,
+                    SourceContentByteCheck::MetadataOnly,
+                ),
+            );
+            assert!(standalone.iter().any(|arg| arg == "--checksum"));
+            assert!(!standalone.iter().any(|arg| arg == "--size-only"));
+            assert!(!manifest.iter().any(|arg| arg == "--checksum"));
+            assert_eq!(
+                manifest.iter().any(|arg| arg == "--size-only"),
+                managed_timestamps
+            );
+            // Byte comparison is the only policy change. This preserves the
+            // dry-run, timeout, grant, stderr, deletion, filtering, permissions,
+            // timestamps and exact local/remote path arguments byte-for-byte.
+            assert_eq!(
+                standalone
+                    .iter()
+                    .filter(|arg| arg.as_str() != "--checksum")
+                    .collect::<Vec<_>>(),
+                manifest
+                    .iter()
+                    .filter(|arg| arg.as_str() != "--size-only")
+                    .collect::<Vec<_>>()
+            );
+        }
+        let remote = pipeline.remote_path();
+        let destination = pipeline.rsync_remote_spec(&worker, &remote);
+        for command in [
+            pipeline.build_sync_command(&worker, &destination, &remote, &[]),
+            pipeline.build_sync_streaming_command(&worker, &destination, &remote, &[]),
+        ] {
+            assert!(command_args(&command).iter().any(|arg| arg == "--checksum"));
+        }
+    }
+
+    #[tokio::test]
+    async fn manifest_namespace_barrier_requires_source_grant_and_overlay_policy() {
+        let _guard = test_guard!();
+        let worker = flavour_test_worker();
+        let ungranted = flavour_test_pipeline(RsyncFlavor::Unknown, 0);
+        let error = ungranted
+            .verify_source_content_manifest_namespace(&worker, SourceContentBarrier::Ordinary)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("requires the Unix source grant"));
+        let invalid_overlay = ungranted.with_source_authority("ab12".into()).unwrap();
+        let error = invalid_overlay
+            .verify_source_content_manifest_namespace(&worker, SourceContentBarrier::CleanOverlay)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires a granted checksum overlay pipeline")
+        );
     }
 
     #[cfg(unix)]

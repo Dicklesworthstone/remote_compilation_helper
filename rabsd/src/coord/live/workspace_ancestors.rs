@@ -14,15 +14,64 @@ use super::{
 use rabs_cas::metadata_store::ProvisionalAncestorRow;
 use rabs_cas::publication::ProvisionalAncestorRef;
 use rabs_key::live_dependency::DependencySourceKind;
+use rabs_key::live_dependency::remote::RemoteDependencyOutputClass;
 use rabs_key::live_dependency::workspace_dependency_cache::CommittedWorkspaceDependency;
 use rabs_protocol::generation::AttemptAuthority;
-use rabs_protocol::result_identity::{OutputRole, ResultKind};
+use rabs_protocol::result_identity::{CanonicalActionResultManifest, OutputRole, ResultKind};
 use std::collections::BTreeSet;
 use std::time::Instant;
 
 // Match the existing H028 admission work bound. Count every input edge, not
 // just unique producers; shared ancestors do not excuse unchecked references.
 const MAX_LINEAGE_EDGES: usize = 65_536;
+const IMMUTABLE_LEAF_RECEIPT: &str = "rabs-committed-immutable-leaf-v1";
+
+#[derive(Clone, Copy)]
+struct ProducerPolicy {
+    metadata_allowed: bool,
+    mixed_allowed: bool,
+}
+
+impl ProducerPolicy {
+    fn for_consumer(kind: DependencySourceKind) -> Result<Self, String> {
+        let (metadata_allowed, mixed_allowed) = match kind {
+            DependencySourceKind::WorkspaceCommittedRlib => (false, false),
+            DependencySourceKind::WorkspaceCommittedMetadata => (true, false),
+            DependencySourceKind::WorkspaceMixedRlib => (false, true),
+            DependencySourceKind::WorkspaceMixedMetadata => (true, true),
+            _ => return Err("unsupported committed workspace consumer class".into()),
+        };
+        Ok(Self {
+            metadata_allowed,
+            mixed_allowed,
+        })
+    }
+
+    const fn for_risk(risk: ActionClassRisk) -> Option<Self> {
+        let (metadata_allowed, mixed_allowed) = match risk {
+            ActionClassRisk::CommittedWorkspaceRlib => (false, false),
+            ActionClassRisk::CommittedWorkspaceMetadata => (true, false),
+            ActionClassRisk::MixedWorkspaceRlib => (false, true),
+            ActionClassRisk::MixedWorkspaceMetadata => (true, true),
+            _ => return None,
+        };
+        Some(Self {
+            metadata_allowed,
+            mixed_allowed,
+        })
+    }
+
+    const fn admits_workspace(self, risk: ActionClassRisk) -> bool {
+        match risk {
+            ActionClassRisk::ClosedWorkspaceRlib | ActionClassRisk::CommittedWorkspaceRlib => true,
+            ActionClassRisk::ClosedWorkspaceMetadata
+            | ActionClassRisk::CommittedWorkspaceMetadata => self.metadata_allowed,
+            ActionClassRisk::MixedWorkspaceRlib => self.mixed_allowed,
+            ActionClassRisk::MixedWorkspaceMetadata => self.mixed_allowed && self.metadata_allowed,
+            _ => false,
+        }
+    }
+}
 
 pub(super) fn now_micros() -> i64 {
     i64::try_from(
@@ -34,6 +83,93 @@ pub(super) fn now_micros() -> i64 {
 }
 
 impl CoordLive {
+    /// Qualify a published immutable dependency only from the retained remote
+    /// execution proof used by its verified installation owner. The durable
+    /// receipt describes that exact publication; it never supplies a physical
+    /// file witness or replaces current serving and ancestry checks.
+    pub(crate) fn record_committed_immutable_leaf(
+        &self,
+        proof: &crate::coord::live_dependency::QualifiedImmutableDependencyLeaf<'_>,
+        manifest_key: &str,
+    ) -> Result<(), String> {
+        // This can inspect retained input owners, so do it before the CAS lock.
+        proof.verify()?;
+        let held = self
+            .authority()
+            .ok_or("immutable leaf qualification has no coordinator authority")?;
+        let cas = self
+            .cas
+            .as_ref()
+            .ok_or("immutable leaf qualification has no store")?;
+        let mut store = cas
+            .store()
+            .lock()
+            .map_err(|_| "immutable leaf metadata lock is unavailable")?;
+        if !self.available()
+            || !store
+                .active_authority()
+                .map_err(store_error)?
+                .is_some_and(|active| active.digest == authority_digest(&held))
+        {
+            return Err("immutable leaf coordinator authority changed".into());
+        }
+        let action_key = digest_key(proof.action_key());
+        if store
+            .published_manifest_key_str(&action_key)
+            .map_err(store_error)?
+            .as_deref()
+            != Some(manifest_key)
+        {
+            return Err("immutable leaf has no exact committed publication".into());
+        }
+        let manifest = load_manifest(&mut *store, manifest_key)
+            .ok_or("immutable leaf publication manifest is unavailable")?;
+        if manifest.action_key != *proof.action_key()
+            || manifest.canonical_descriptor_digest != *proof.descriptor_digest()
+            || manifest.result_kind != ResultKind::Success
+            || recorded_action_risk(&mut *store, &manifest.action_key).map_err(store_error)?
+                != ActionClassRisk::LowRiskRegistry
+        {
+            return Err("immutable leaf differs from its retained remote action".into());
+        }
+        validate_immutable_leaf_manifest(&manifest, proof.output_class())?;
+        if !store
+            .list_provisional_ancestors(&action_key)
+            .map_err(store_error)?
+            .is_empty()
+        {
+            return Err("immutable dependency leaf has stored producer ancestry".into());
+        }
+        let standing =
+            serving_gate(&mut *store, &action_key, now_micros(), 0).map_err(store_error)?;
+        if standing != ServeDecision::Servable {
+            return Err(format!(
+                "immutable dependency leaf is not servable: {standing:?}"
+            ));
+        }
+        if let Some(refusal) =
+            live_producer_gate(&mut *store, &manifest.action_key).map_err(store_error)?
+        {
+            return Err(format!("immutable dependency leaf is unsafe: {refusal:?}"));
+        }
+        if let Some(existing) = recorded_immutable_leaf(&mut *store, &manifest, manifest_key)? {
+            return if existing == proof.output_class() {
+                Ok(())
+            } else {
+                Err("immutable leaf qualification changed execution class".into())
+            };
+        }
+        store
+            .record_decision_receipt(
+                IMMUTABLE_LEAF_RECEIPT,
+                &action_key,
+                0,
+                &immutable_leaf_decision(&manifest, manifest_key, proof.output_class()),
+                "verified canonical remote immutable dependency leaf",
+            )
+            .map_err(store_error)
+    }
+
     /// Check operation-owned installation witnesses against current durable
     /// producer authority. Callers still have to verify the exact physical
     /// candidate generation before and after this check.
@@ -42,11 +178,7 @@ impl CoordLive {
         dependencies: &[CommittedWorkspaceDependency],
         consumer_kind: DependencySourceKind,
     ) -> Result<(), String> {
-        let metadata_allowed = match consumer_kind {
-            DependencySourceKind::WorkspaceCommittedRlib => false,
-            DependencySourceKind::WorkspaceCommittedMetadata => true,
-            _ => return Err("unsupported committed workspace consumer class".into()),
-        };
+        let policy = ProducerPolicy::for_consumer(consumer_kind)?;
         if dependencies.is_empty() || dependencies.len() > MAX_LINEAGE_EDGES {
             return Err("committed workspace candidate count is outside its bound".into());
         }
@@ -85,15 +217,83 @@ impl CoordLive {
                 adopted: false,
             })
             .collect();
-        verify_graph(
-            &mut *store,
-            None,
-            direct,
-            now_micros(),
-            0,
-            None,
-            metadata_allowed,
+        verify_graph(&mut *store, None, direct, now_micros(), 0, None, policy)
+    }
+}
+
+fn immutable_leaf_decision(
+    manifest: &CanonicalActionResultManifest,
+    manifest_key: &str,
+    class: RemoteDependencyOutputClass,
+) -> String {
+    let mode = match class {
+        RemoteDependencyOutputClass::Rlib => "rlib",
+        RemoteDependencyOutputClass::Metadata => "metadata",
+    };
+    format!(
+        "{mode}:{}:{manifest_key}",
+        digest_key(&manifest.canonical_descriptor_digest)
+    )
+}
+
+fn recorded_immutable_leaf(
+    store: &mut dyn RabsMetadataStore,
+    manifest: &CanonicalActionResultManifest,
+    manifest_key: &str,
+) -> Result<Option<RemoteDependencyOutputClass>, String> {
+    let rows = store
+        .query(
+            "SELECT decision FROM decision_receipts WHERE kind = ?1 AND subject = ?2 AND seq = 0",
+            &[
+                SqlValue::Text(IMMUTABLE_LEAF_RECEIPT.to_owned()),
+                SqlValue::Text(digest_key(&manifest.action_key)),
+            ],
         )
+        .map_err(store_error)?;
+    match rows.as_slice() {
+        [] => Ok(None),
+        [row] => match row.as_slice() {
+            [SqlValue::Text(decision)] => {
+                for class in [
+                    RemoteDependencyOutputClass::Rlib,
+                    RemoteDependencyOutputClass::Metadata,
+                ] {
+                    if *decision == immutable_leaf_decision(manifest, manifest_key, class) {
+                        return Ok(Some(class));
+                    }
+                }
+                Err("immutable leaf qualification differs from its current publication".into())
+            }
+            _ => Err("invalid immutable leaf qualification receipt".into()),
+        },
+        _ => Err("ambiguous immutable leaf qualification receipt".into()),
+    }
+}
+
+fn validate_immutable_leaf_manifest(
+    manifest: &CanonicalActionResultManifest,
+    class: RemoteDependencyOutputClass,
+) -> Result<(), String> {
+    let mut has_primary = false;
+    for output in &manifest.logical_outputs {
+        let path = output.virtual_path.as_bytes();
+        match output.role {
+            OutputRole::ProvisionalMetadata if path.ends_with(b".rmeta") => {
+                has_primary |= class == RemoteDependencyOutputClass::Metadata;
+            }
+            OutputRole::Materializable
+                if class == RemoteDependencyOutputClass::Rlib && path.ends_with(b".rlib") =>
+            {
+                has_primary = true;
+            }
+            OutputRole::DepInfo if path.ends_with(b".d") => {}
+            _ => return Err("immutable leaf publication has an unsupported output".into()),
+        }
+    }
+    if has_primary {
+        Ok(())
+    } else {
+        Err("immutable leaf publication lacks its declared library output".into())
     }
 }
 
@@ -104,12 +304,11 @@ pub(super) fn check_offer(
     epoch: u64,
     lease_now: &dyn Fn() -> u64,
 ) -> Result<(), String> {
-    let metadata_allowed =
-        match recorded_action_risk(store, &offer.manifest.action_key).map_err(store_error)? {
-            ActionClassRisk::CommittedWorkspaceRlib => false,
-            ActionClassRisk::CommittedWorkspaceMetadata => true,
-            _ => return Ok(()),
-        };
+    let Some(policy) = ProducerPolicy::for_risk(
+        recorded_action_risk(store, &offer.manifest.action_key).map_err(store_error)?,
+    ) else {
+        return Ok(());
+    };
     if offer.provisional_ancestors.is_empty()
         || offer.provisional_ancestors.len() > MAX_LINEAGE_EDGES
     {
@@ -126,7 +325,7 @@ pub(super) fn check_offer(
         now,
         epoch,
         Some((&offer.authority, lease_now)),
-        metadata_allowed,
+        policy,
     )
 }
 
@@ -138,10 +337,10 @@ pub(super) fn check_serving(
     now: i64,
     epoch: u64,
 ) -> Result<(), String> {
-    let metadata_allowed = match recorded_action_risk(store, action).map_err(store_error)? {
-        ActionClassRisk::CommittedWorkspaceRlib => false,
-        ActionClassRisk::CommittedWorkspaceMetadata => true,
-        _ => return Ok(()),
+    let Some(policy) =
+        ProducerPolicy::for_risk(recorded_action_risk(store, action).map_err(store_error)?)
+    else {
+        return Ok(());
     };
     let ancestors = store
         .list_provisional_ancestors(&digest_key(action))
@@ -156,7 +355,7 @@ pub(super) fn check_serving(
         now,
         epoch,
         None,
-        metadata_allowed,
+        policy,
     )
 }
 
@@ -196,7 +395,7 @@ impl Ancestor {
 }
 
 enum Visit {
-    Input(Ancestor, bool),
+    Input(Ancestor, ProducerPolicy),
     Finished(String),
 }
 
@@ -221,7 +420,7 @@ fn verify_graph(
     now: i64,
     epoch: u64,
     lease: Option<LeaseCheck<'_>>,
-    metadata_allowed: bool,
+    policy: ProducerPolicy,
 ) -> Result<(), String> {
     let started = Instant::now();
     let mut edges = direct.len();
@@ -230,7 +429,7 @@ fn verify_graph(
     }
     let mut pending: Vec<_> = direct
         .into_iter()
-        .map(|ancestor| Visit::Input(ancestor, metadata_allowed))
+        .map(|ancestor| Visit::Input(ancestor, policy))
         .collect();
     let mut active = BTreeSet::new();
     if let Some(consumer) = consumer {
@@ -238,8 +437,8 @@ fn verify_graph(
     }
     let mut complete = BTreeSet::new();
     while let Some(visit) = pending.pop() {
-        let (check, metadata_allowed) = match visit {
-            Visit::Input(check, metadata_allowed) => (check, metadata_allowed),
+        let (check, policy) = match visit {
+            Visit::Input(check, policy) => (check, policy),
             Visit::Finished(key) => {
                 active.remove(&key);
                 complete.insert(key);
@@ -304,14 +503,29 @@ fn verify_graph(
             ));
         }
         let risk = recorded_action_risk(store, &manifest.action_key).map_err(store_error)?;
+        let immutable_leaf = if risk == ActionClassRisk::LowRiskRegistry && policy.mixed_allowed {
+            let class =
+                recorded_immutable_leaf(store, &manifest, &manifest_key)?.ok_or_else(|| {
+                    format!(
+                        "immutable producer {} has no qualified leaf publication",
+                        check.producer
+                    )
+                })?;
+            validate_immutable_leaf_manifest(&manifest, class)?;
+            Some(class)
+        } else {
+            None
+        };
         let metadata_producer = matches!(
             risk,
-            ActionClassRisk::ClosedWorkspaceMetadata | ActionClassRisk::CommittedWorkspaceMetadata
-        );
-        if !(matches!(
-            risk,
-            ActionClassRisk::ClosedWorkspaceRlib | ActionClassRisk::CommittedWorkspaceRlib
-        ) || (metadata_allowed && metadata_producer))
+            ActionClassRisk::ClosedWorkspaceMetadata
+                | ActionClassRisk::CommittedWorkspaceMetadata
+                | ActionClassRisk::MixedWorkspaceMetadata
+        ) || immutable_leaf == Some(RemoteDependencyOutputClass::Metadata);
+        if !(policy.admits_workspace(risk)
+            || immutable_leaf.is_some_and(|class| {
+                class == RemoteDependencyOutputClass::Rlib || policy.metadata_allowed
+            }))
             || (metadata_producer && check.role != "provisional-metadata")
         {
             return Err(format!(
@@ -351,12 +565,16 @@ fn verify_graph(
             .map_err(store_error)?;
         if (matches!(
             risk,
-            ActionClassRisk::ClosedWorkspaceRlib | ActionClassRisk::ClosedWorkspaceMetadata
+            ActionClassRisk::ClosedWorkspaceRlib
+                | ActionClassRisk::ClosedWorkspaceMetadata
+                | ActionClassRisk::LowRiskRegistry
         ) && !ancestors.is_empty())
             || (matches!(
                 risk,
                 ActionClassRisk::CommittedWorkspaceRlib
                     | ActionClassRisk::CommittedWorkspaceMetadata
+                    | ActionClassRisk::MixedWorkspaceRlib
+                    | ActionClassRisk::MixedWorkspaceMetadata
             ) && ancestors.is_empty())
         {
             return Err(format!(
@@ -370,19 +588,17 @@ fn verify_graph(
             .ok_or("committed workspace ancestry exceeds admission bound")?;
         active.insert(check.producer.clone());
         pending.push(Visit::Finished(check.producer));
-        // Each intermediate producer retains its own class boundary. A new
-        // metadata consumer cannot broaden an epoch-6 archive's ancestry.
-        pending.extend(
-            ancestors
-                .into_iter()
-                .map(Ancestor::from_row)
-                .map(|ancestor| {
-                    Visit::Input(
-                        ancestor,
-                        risk == ActionClassRisk::CommittedWorkspaceMetadata,
-                    )
-                }),
-        );
+        // Each intermediate producer retains its own class boundary. Neither
+        // metadata permission nor immutable-leaf permission flows through a
+        // narrower existing workspace producer.
+        if let Some(producer_policy) = ProducerPolicy::for_risk(risk) {
+            pending.extend(
+                ancestors
+                    .into_iter()
+                    .map(Ancestor::from_row)
+                    .map(|ancestor| Visit::Input(ancestor, producer_policy)),
+            );
+        }
     }
     verify_lease(store, lease)
 }
@@ -536,6 +752,26 @@ pub(crate) mod tests {
             self.prepare_class(tag, parents, outputs, class)
         }
 
+        pub(crate) fn prepare_mixed(
+            &self,
+            tag: u8,
+            parents: Vec<ProvisionalAncestorRef>,
+            outputs: &[(&str, OutputRole, &[u8])],
+            metadata: bool,
+        ) -> OfferPreparedActionResult {
+            assert!(!parents.is_empty());
+            self.prepare_class(
+                tag,
+                parents,
+                outputs,
+                if metadata {
+                    LIVE_MIXED_WORKSPACE_METADATA_CLASS
+                } else {
+                    LIVE_MIXED_WORKSPACE_RLIB_CLASS
+                },
+            )
+        }
+
         fn prepare_class(
             &self,
             tag: u8,
@@ -626,6 +862,42 @@ pub(crate) mod tests {
         ) -> OfferPreparedActionResult {
             let offer = self.prepare_metadata(tag, Vec::new(), outputs);
             self.commit(&offer);
+            offer
+        }
+
+        pub(crate) fn commit_immutable_leaf(
+            &self,
+            tag: u8,
+            outputs: &[(&str, OutputRole, &[u8])],
+            metadata: bool,
+        ) -> OfferPreparedActionResult {
+            let offer = self.prepare_class(tag, Vec::new(), outputs, LIVE_DEPENDENCY_CLASS);
+            let class = if metadata {
+                rabs_key::live_dependency::remote::RemoteDependencyOutputClass::Metadata
+            } else {
+                rabs_key::live_dependency::remote::RemoteDependencyOutputClass::Rlib
+            };
+            super::validate_immutable_leaf_manifest(&offer.manifest, class).unwrap();
+            self.commit(&offer);
+            // The input/execution qualification is explicitly synthetic here,
+            // like descriptor enrollment above. Publication, exact CAS bytes,
+            // current safety, ancestry and delivery exercise production code.
+            self.cas
+                .store()
+                .lock()
+                .unwrap()
+                .record_decision_receipt(
+                    super::IMMUTABLE_LEAF_RECEIPT,
+                    &digest_key(&offer.manifest.action_key),
+                    0,
+                    &super::immutable_leaf_decision(
+                        &offer.manifest,
+                        &digest_key(&offer.manifest_id.0),
+                        class,
+                    ),
+                    "explicit synthetic immutable leaf qualification for coordinator gate test",
+                )
+                .unwrap();
             offer
         }
 
@@ -882,6 +1154,288 @@ pub(crate) mod tests {
         fixture.assert_unpublished(&later);
     }
 
+    fn mixed_chain(
+        fixture: &WorkspaceLineageFixture,
+        metadata: bool,
+    ) -> [OfferPreparedActionResult; 3] {
+        let mut a_outputs: Vec<(&str, OutputRole, &[u8])> = vec![(
+            "liba.rmeta",
+            OutputRole::ProvisionalMetadata,
+            b"immutable leaf metadata A",
+        )];
+        let mut b_outputs: Vec<(&str, OutputRole, &[u8])> = vec![(
+            "libb.rmeta",
+            OutputRole::ProvisionalMetadata,
+            b"mixed metadata B",
+        )];
+        let mut c_outputs: Vec<(&str, OutputRole, &[u8])> =
+            vec![("libc.rmeta", OutputRole::ProvisionalMetadata, b"metadata C")];
+        if !metadata {
+            a_outputs.push((
+                "liba.rlib",
+                OutputRole::Materializable,
+                b"immutable archive A",
+            ));
+            b_outputs.push(("libb.rlib", OutputRole::Materializable, b"mixed archive B"));
+            c_outputs.push(("libc.rlib", OutputRole::Materializable, b"mixed archive C"));
+        }
+        let a = fixture.commit_immutable_leaf(71, &a_outputs, metadata);
+        let b = fixture.prepare_mixed(72, vec![consumes(&a)], &b_outputs, metadata);
+        fixture.commit(&b);
+        // A also remains visible in C's inventory. The traversal visits it
+        // before expanding B, exercising repeated edges under B's own policy.
+        let c = fixture.prepare_mixed(73, vec![consumes(&b), consumes(&a)], &c_outputs, metadata);
+        fixture.commit(&c);
+        [a, b, c]
+    }
+
+    #[test]
+    fn mixed_workspace_chains_require_own_samples_and_current_immutable_leaf_safety() {
+        for metadata in [false, true] {
+            let fixture = WorkspaceLineageFixture::new();
+            let [a, b, c] = mixed_chain(&fixture, metadata);
+            let consumer = if metadata {
+                DependencySourceKind::WorkspaceMixedMetadata
+            } else {
+                DependencySourceKind::WorkspaceMixedRlib
+            };
+            fixture
+                .coord
+                .verify_committed_workspace_dependencies(&[witness(&c)], consumer)
+                .unwrap();
+            for legacy in [
+                DependencySourceKind::WorkspaceCommittedRlib,
+                DependencySourceKind::WorkspaceCommittedMetadata,
+            ] {
+                for offer in [&a, &b, &c] {
+                    assert!(
+                        fixture
+                            .coord
+                            .verify_committed_workspace_dependencies(&[witness(offer)], legacy)
+                            .is_err()
+                    );
+                }
+            }
+            let unsampled = fixture.root.path().join("mixed-unsampled");
+            assert!(matches!(
+                fixture.replay(&c, &unsampled, None).unwrap(),
+                ServeOutcome::ExecutePrivately(ReplayRefusal::Sampling(
+                    PrivateExecutionReason::InsufficientVerificationSamples {
+                        observed: 0,
+                        required: 2
+                    }
+                ))
+            ));
+            assert!(!unsampled.exists());
+            fixture.compare_twice(&c);
+            let destination = fixture.root.path().join("mixed-served");
+            assert!(matches!(fixture.replay(&c, &destination, None).unwrap(),
+                ServeOutcome::Served { files } if files.len() == if metadata { 1 } else { 2 }));
+            assert_eq!(
+                std::fs::read(destination.join("libc.rmeta")).unwrap(),
+                b"metadata C"
+            );
+            if !metadata {
+                assert_eq!(
+                    std::fs::read(destination.join("libc.rlib")).unwrap(),
+                    b"mixed archive C"
+                );
+            }
+            fixture.assert_unsampled(&a);
+            fixture.assert_unsampled(&b);
+
+            fixture.quarantine(&a.manifest.action_key);
+            let refused = fixture.root.path().join("mixed-revoked");
+            assert!(matches!(fixture.replay(&c, &refused, None).unwrap(),
+                ServeOutcome::ExecutePrivately(ReplayRefusal::CommittedDependency(reason))
+                    if reason.contains(&digest_key(&a.manifest.action_key))));
+            assert!(!refused.exists());
+            let outputs: &[(&str, OutputRole, &[u8])] = if metadata {
+                &[(
+                    "libd.rmeta",
+                    OutputRole::ProvisionalMetadata,
+                    b"mixed metadata D",
+                )]
+            } else {
+                &[("libd.rlib", OutputRole::Materializable, b"mixed archive D")]
+            };
+            let d = fixture.prepare_mixed(74, vec![consumes(&c)], outputs, metadata);
+            assert!(
+                matches!(fixture.coord.commit_offer(&d, &sample_expected_descriptor()),
+                Err(CommitRefusal::CommittedDependency(reason)) if reason.contains(&digest_key(&a.manifest.action_key)))
+            );
+            fixture.assert_unpublished(&d);
+        }
+    }
+
+    #[test]
+    fn immutable_leaf_qualification_is_bound_to_publication_and_execution_class() {
+        let fixture = WorkspaceLineageFixture::new();
+        let outputs: &[(&str, OutputRole, &[u8])] = &[(
+            "liba.rmeta",
+            OutputRole::ProvisionalMetadata,
+            b"same external metadata bytes",
+        )];
+        let unqualified = fixture.prepare_class(81, Vec::new(), outputs, LIVE_DEPENDENCY_CLASS);
+        fixture.commit(&unqualified);
+        assert!(
+            fixture
+                .coord
+                .verify_committed_workspace_dependencies(
+                    &[witness(&unqualified)],
+                    DependencySourceKind::WorkspaceMixedMetadata,
+                )
+                .unwrap_err()
+                .contains("no qualified leaf publication")
+        );
+
+        let metadata = fixture.commit_immutable_leaf(82, outputs, true);
+        fixture
+            .coord
+            .verify_committed_workspace_dependencies(
+                &[witness(&metadata)],
+                DependencySourceKind::WorkspaceMixedMetadata,
+            )
+            .unwrap();
+        assert!(
+            fixture
+                .coord
+                .verify_committed_workspace_dependencies(
+                    &[witness(&metadata)],
+                    DependencySourceKind::WorkspaceMixedRlib,
+                )
+                .unwrap_err()
+                .contains("closed class allowed")
+        );
+        let archive = fixture.commit_immutable_leaf(
+            83,
+            &[
+                (
+                    "liba.rmeta",
+                    OutputRole::ProvisionalMetadata,
+                    b"same external metadata bytes",
+                ),
+                (
+                    "liba.rlib",
+                    OutputRole::Materializable,
+                    b"whole external archive",
+                ),
+            ],
+            false,
+        );
+        assert_eq!(
+            consumes(&metadata).consumed_object,
+            consumes(&archive).consumed_object
+        );
+        for consumer in [
+            DependencySourceKind::WorkspaceMixedMetadata,
+            DependencySourceKind::WorkspaceMixedRlib,
+        ] {
+            fixture
+                .coord
+                .verify_committed_workspace_dependencies(&[witness(&archive)], consumer)
+                .unwrap();
+        }
+
+        // Qualification is immutable publication evidence, not an action-only
+        // flag. A valid receipt copied from a different manifest must refuse.
+        let mut engine = RusqliteEngine::open(&fixture.cas.cas_root().join("meta.sqlite")).unwrap();
+        assert_eq!(engine.execute(
+            "UPDATE decision_receipts SET decision = ?1 WHERE kind = ?2 AND subject = ?3 AND seq = 0",
+            &[
+                SqlValue::Text(super::immutable_leaf_decision(&archive.manifest, &digest_key(&archive.manifest_id.0), rabs_key::live_dependency::remote::RemoteDependencyOutputClass::Rlib)),
+                SqlValue::Text(super::IMMUTABLE_LEAF_RECEIPT.to_owned()),
+                SqlValue::Text(digest_key(&metadata.manifest.action_key)),
+            ],
+        ).unwrap(), 1);
+        assert!(
+            fixture
+                .coord
+                .verify_committed_workspace_dependencies(
+                    &[witness(&metadata)],
+                    DependencySourceKind::WorkspaceMixedMetadata,
+                )
+                .unwrap_err()
+                .contains("qualification differs")
+        );
+    }
+
+    #[test]
+    fn mixed_consumers_cannot_broaden_intermediate_legacy_workspace_producers() {
+        for metadata in [false, true] {
+            let fixture = WorkspaceLineageFixture::new();
+            let [a, b, c] = mixed_chain(&fixture, metadata);
+            fixture.compare_twice(&c);
+            let held = fixture.cas.store().lock().unwrap();
+            let mut engine =
+                RusqliteEngine::open(&fixture.cas.cas_root().join("meta.sqlite")).unwrap();
+            assert_eq!(engine.execute(
+                "UPDATE decision_receipts SET decision = ?1 WHERE kind = ?2 AND subject = ?3 AND seq = 0",
+                &[
+                    SqlValue::Text(if metadata { LIVE_COMMITTED_WORKSPACE_METADATA_CLASS } else { LIVE_COMMITTED_WORKSPACE_RLIB_CLASS }.to_owned()),
+                    SqlValue::Text(LIVE_CLASS_RECEIPT.to_owned()),
+                    SqlValue::Text(digest_key(&b.manifest.action_key)),
+                ],
+            ).unwrap(), 1);
+            drop(engine);
+            drop(held);
+            let consumer = if metadata {
+                DependencySourceKind::WorkspaceMixedMetadata
+            } else {
+                DependencySourceKind::WorkspaceMixedRlib
+            };
+            let reason = fixture
+                .coord
+                .verify_committed_workspace_dependencies(&[witness(&c)], consumer)
+                .unwrap_err();
+            assert!(reason.contains("allowed by its consumer"), "{reason}");
+            assert!(
+                reason.contains(&digest_key(&a.manifest.action_key)),
+                "{reason}"
+            );
+            let destination = fixture.root.path().join("mixed-narrow-intermediate");
+            assert!(matches!(fixture.replay(&c, &destination, None).unwrap(),
+                ServeOutcome::ExecutePrivately(ReplayRefusal::CommittedDependency(reason))
+                    if reason.contains(&digest_key(&a.manifest.action_key))));
+            assert!(!destination.exists());
+        }
+    }
+
+    #[test]
+    fn qualified_immutable_leaf_never_hides_nonempty_producer_ancestry() {
+        let fixture = WorkspaceLineageFixture::new();
+        let [a, b, c] = mixed_chain(&fixture, true);
+        fixture.compare_twice(&c);
+        let parent = consumes(&b);
+        let held = fixture.cas.store().lock().unwrap();
+        let mut engine = RusqliteEngine::open(&fixture.cas.cas_root().join("meta.sqlite")).unwrap();
+        assert_eq!(engine.execute(
+            "INSERT INTO provisional_ancestry (consumer_action_key, producer_action_key, role, virtual_path, object_key, adopted) VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+            &[
+                SqlValue::Text(digest_key(&a.manifest.action_key)),
+                SqlValue::Text(digest_key(&parent.producer_action_key)),
+                SqlValue::Text("provisional-metadata".to_owned()),
+                SqlValue::Blob(parent.virtual_path.as_bytes().to_vec()),
+                SqlValue::Text(digest_key(&parent.consumed_object.0)),
+            ],
+        ).unwrap(), 1);
+        drop(engine);
+        drop(held);
+        let reason = fixture
+            .coord
+            .verify_committed_workspace_dependencies(
+                &[witness(&a)],
+                DependencySourceKind::WorkspaceMixedMetadata,
+            )
+            .unwrap_err();
+        assert!(reason.contains("inconsistent class ancestry"), "{reason}");
+        let destination = fixture.root.path().join("nonleaf-external-refused");
+        assert!(matches!(fixture.replay(&c, &destination, None).unwrap(),
+            ServeOutcome::ExecutePrivately(ReplayRefusal::CommittedDependency(reason))
+                if reason.contains("inconsistent class ancestry")));
+        assert!(!destination.exists());
+    }
+
     fn metadata_chain(fixture: &WorkspaceLineageFixture) -> [OfferPreparedActionResult; 3] {
         let a = fixture.commit_metadata_leaf(
             41,
@@ -904,9 +1458,13 @@ pub(crate) mod tests {
 
     #[test]
     fn metadata_only_revocation_after_delivery_is_terminal_with_an_empty_archive_tail() {
-        for producer in [false, true] {
+        for (producer, mixed) in [(false, false), (true, false), (false, true), (true, true)] {
             let fixture = WorkspaceLineageFixture::new();
-            let [a, b, c] = metadata_chain(&fixture);
+            let [a, b, c] = if mixed {
+                mixed_chain(&fixture, true)
+            } else {
+                metadata_chain(&fixture)
+            };
             if !producer {
                 fixture.compare_twice(&c);
             }

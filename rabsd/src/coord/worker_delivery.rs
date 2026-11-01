@@ -195,6 +195,82 @@ pub(crate) fn negotiated_dependency_context(
     }))
 }
 
+/// Check an execution's required protocols against one immutable worker hello.
+/// Placement may supply the request's capability-bearing fields before it owns
+/// a request id, captured source or artifact unit. This grants no admission and
+/// does not replace full request, transport or durable high-water validation.
+pub(crate) fn validate_worker_execution_capabilities(
+    hello: &Value,
+    request: &Value,
+) -> io::Result<()> {
+    execution_capabilities(hello, request).map(|_| ())
+}
+
+fn supports(hello: &Value, field: &str, version: &str) -> bool {
+    hello
+        .get(field)
+        .and_then(Value::as_array)
+        .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(version)))
+}
+
+fn delivery_capabilities(hello: &Value, require_canonical: bool) -> io::Result<()> {
+    require(
+        (!require_canonical || hello.get("canonical").and_then(Value::as_bool) == Some(true))
+            && number(hello, "slots")? > 0
+            && number(hello, "boot_generation")? > 0
+            && supports(hello, "recovery_protocols", "request-journal-v1")
+            && supports(hello, "output_transfers", "ranges-v1"),
+        "worker lacks required delivery/recovery capabilities",
+    )?;
+    let incarnation = text(hello, "incarnation")?;
+    require(
+        is_hex(incarnation, 32) && incarnation.bytes().any(|byte| byte != b'0'),
+        "invalid worker incarnation",
+    )
+}
+
+fn execution_capabilities(
+    hello: &Value,
+    request: &Value,
+) -> io::Result<Option<NegotiatedDependencyContext>> {
+    let context = negotiated_dependency_context(hello, request, DeliveryMode::Execute)?;
+    delivery_capabilities(
+        hello,
+        context.is_none_or(|selected| selected.mode.requires_canonical_namespace()),
+    )?;
+    // Presence selects the protocol requirement; only the later request and
+    // upload owners validate the complete payload and its execution authority.
+    if request.get("command_context").is_some() {
+        require(
+            supports(hello, "command_contexts", COMMAND_CONTEXT_VERSION),
+            "worker lacks required env-cwd-v1 command context capability",
+        )?;
+    }
+    if request.get("toolchain_identity").is_some() {
+        require(
+            supports(hello, "toolchain_datasets", TOOLCHAIN_DATASET_VERSION),
+            "worker lacks required toolchain-dataset-v1 execution binding",
+        )?;
+    }
+    if toolchain_transfer(request)? {
+        require(
+            supports(
+                hello,
+                "toolchain_transfers",
+                rabs_sandbox::toolchain_transfer::TOOLCHAIN_TRANSFER_VERSION,
+            ),
+            "worker lacks required toolchain-tree-v1 transfer capability",
+        )?;
+    }
+    if request.get("artifacts").is_some() {
+        require(
+            supports(hello, "artifact_transfers", "files-v1"),
+            "worker lacks files-v1",
+        )?;
+    }
+    Ok(context)
+}
+
 const RESULT_RETENTION: &str = "durable-result-v1";
 
 /// Evidence supplied by a trusted transport adapter AFTER session admission.
@@ -980,55 +1056,17 @@ pub fn receive_operation(
                 && text(&hello, "worker_id")? == expected_worker,
             "unexpected worker (claimed identity is not authentication)",
         )?;
-        let supports = |field: &str, value: &str| {
-            hello
-                .get(field)
-                .and_then(Value::as_array)
-                .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(value)))
+        // Placement uses these same checks as an advisory filter. Recheck the
+        // actual hello before disk creation, authentication grants or upload.
+        // Recovery retrieves a sealed result without requiring new execution.
+        let dependency_context = match mode {
+            DeliveryMode::Execute => execution_capabilities(&hello, request)?,
+            DeliveryMode::Resume => {
+                delivery_capabilities(&hello, false)?;
+                None
+            }
         };
-        let dependency_context = negotiated_dependency_context(&hello, request, mode)?;
-        let require_canonical = mode == DeliveryMode::Execute
-            && dependency_context
-                .is_none_or(|selected| selected.mode.requires_canonical_namespace());
-        require(
-            (!require_canonical || hello.get("canonical").and_then(Value::as_bool) == Some(true))
-                && number(&hello, "slots")? > 0
-                && number(&hello, "boot_generation")? > 0
-                && supports("recovery_protocols", "request-journal-v1")
-                && supports("output_transfers", "ranges-v1"),
-            "worker lacks required delivery/recovery capabilities",
-        )?;
-        // A context changes execution semantics. Older workers accept unknown
-        // request fields, so silently forwarding it could run a different build.
-        // Refuse before disk creation, authentication grants or source upload.
-        // Resume only retrieves a sealed exact-request result; it must not require
-        // the restarted worker to retain the capability to execute that request.
-        if mode == DeliveryMode::Execute && request.get("command_context").is_some() {
-            require(
-                supports("command_contexts", COMMAND_CONTEXT_VERSION),
-                "worker lacks required env-cwd-v1 command context capability",
-            )?;
-        }
-        if mode == DeliveryMode::Execute && request.get("toolchain_identity").is_some() {
-            require(
-                supports("toolchain_datasets", TOOLCHAIN_DATASET_VERSION),
-                "worker lacks required toolchain-dataset-v1 execution binding",
-            )?;
-        }
-        if mode == DeliveryMode::Execute && toolchain_transfer(request)? {
-            require(
-                supports(
-                    "toolchain_transfers",
-                    rabs_sandbox::toolchain_transfer::TOOLCHAIN_TRANSFER_VERSION,
-                ),
-                "worker lacks required toolchain-tree-v1 transfer capability",
-            )?;
-        }
         let incarnation = text(&hello, "incarnation")?;
-        require(
-            is_hex(incarnation, 32) && incarnation.bytes().any(|b| b != b'0'),
-            "invalid worker incarnation",
-        )?;
         if mode == DeliveryMode::Resume {
             require(
                 hello.get("request_high_water").and_then(Value::as_u64) == Some(id),
@@ -1044,19 +1082,20 @@ pub fn receive_operation(
                 None => return Err(invalid("missing durable request high-water")),
             }
         }
-        let retention = supports("result_retentions", RESULT_RETENTION);
+        let retention = supports(&hello, "result_retentions", RESULT_RETENTION);
         require(
             mode != DeliveryMode::Resume || retention,
             "worker lacks durable result recovery",
         )?;
         if expected.is_some() {
             require(
-                supports("artifact_transfers", "files-v1"),
+                supports(&hello, "artifact_transfers", "files-v1"),
                 "worker lacks files-v1",
             )?;
         }
         let prefetch_name = if mode == DeliveryMode::Execute
             && supports(
+                &hello,
                 "metadata_prefetches",
                 rabs_protocol::metadata_prefetch::VERSION,
             ) {
@@ -1446,6 +1485,101 @@ mod tests {
             .sent
             .iter()
             .any(|v| matches!(v["kind"].as_str(), Some("output-ack" | "artifact-ack")))
+    }
+
+    #[test]
+    fn execution_capability_projection_requires_exact_profile_and_toolchain_protocols() {
+        let mut offered = fixture(Path::new("/unused-capability-projection")).replies[0].clone();
+        offered["dependency_contexts"] =
+            json!([CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION]);
+        offered["dependency_execution_modes"] = json!(["closed-metadata"]);
+        offered["toolchain_datasets"] = json!([TOOLCHAIN_DATASET_VERSION]);
+        offered["toolchain_transfers"] =
+            json!([rabs_sandbox::toolchain_transfer::TOOLCHAIN_TRANSFER_VERSION]);
+        let projection = json!({
+            "program":"rustc", "args":["lib.rs"],
+            "dependency_context":{
+                "version":CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION,
+                "execution_mode":"closed-metadata"
+            },
+            "toolchain_identity":null,
+            "toolchain_transfer":rabs_sandbox::toolchain_transfer::TOOLCHAIN_TRANSFER_VERSION,
+            "artifacts":{"files":["libdep.rmeta"]}
+        });
+        validate_worker_execution_capabilities(&offered, &projection).unwrap();
+        // The closed metadata profile deliberately omits the broader procfs
+        // and device namespace. Its measured mode is sufficient on this host.
+        let mut restricted = offered.clone();
+        restricted["canonical"] = json!(false);
+        validate_worker_execution_capabilities(&restricted, &projection).unwrap();
+        for (field, incompatible) in [
+            (
+                "dependency_contexts",
+                json!([CANONICAL_WORKSPACE_CONTEXT_VERSION]),
+            ),
+            ("dependency_execution_modes", json!(["metadata", "rlib"])),
+            ("toolchain_datasets", json!(["toolchain-dataset-v0"])),
+            ("toolchain_transfers", json!(["toolchain-tree-v0"])),
+            ("slots", json!(0)),
+            ("boot_generation", json!(0)),
+            ("incarnation", json!("0".repeat(32))),
+            ("artifact_transfers", json!([])),
+        ] {
+            let mut alternative = offered.clone();
+            alternative[field] = incompatible;
+            assert!(
+                validate_worker_execution_capabilities(&alternative, &projection).is_err(),
+                "{field} must not substitute for the exact execution requirement"
+            );
+        }
+        let mut wrong_mode = projection.clone();
+        wrong_mode["dependency_context"]["execution_mode"] = json!("metadata");
+        offered["dependency_execution_modes"] = json!(["metadata", "closed-metadata"]);
+        assert!(validate_worker_execution_capabilities(&offered, &wrong_mode).is_err());
+    }
+
+    #[test]
+    fn execution_capability_projection_keeps_native_input_requirements() {
+        let mut offered = fixture(Path::new("/unused-native-projection")).replies[0].clone();
+        offered["dependency_contexts"] = json!([CANONICAL_WORKSPACE_CONTEXT_VERSION]);
+        offered["dependency_execution_modes"] = json!(["metadata"]);
+        let projection = json!({
+            "program":"rustc",
+            "args":["-Lnative=/__rabs/out/cargo/debug/build/provider/out", "-lstatic=provider", "lib.rs"],
+            "dependency_context":{
+                "version":CANONICAL_WORKSPACE_CONTEXT_VERSION, "execution_mode":"metadata",
+                "native_roots":[{"path":"/__rabs/out/cargo/debug/build/provider/out", "prefix":"native/0000", "directories":[]}]
+            }
+        });
+        for capabilities in [
+            json!([]),
+            json!([CANONICAL_NATIVE_METADATA_CAPABILITY]),
+            json!([CANONICAL_NATIVE_ROOTS_CAPABILITY]),
+        ] {
+            offered["dependency_native_inputs"] = capabilities;
+            assert!(validate_worker_execution_capabilities(&offered, &projection).is_err());
+        }
+        offered["dependency_native_inputs"] = json!([
+            CANONICAL_NATIVE_METADATA_CAPABILITY,
+            CANONICAL_NATIVE_ROOTS_CAPABILITY
+        ]);
+        validate_worker_execution_capabilities(&offered, &projection).unwrap();
+    }
+
+    #[test]
+    fn capability_match_cannot_reexecute_a_retired_request() {
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("retired-after-placement");
+        let mut peer = fixture(&destination);
+        validate_worker_execution_capabilities(&peer.replies[0], &request()).unwrap();
+        // The same compatible worker has consumed this request before actual
+        // delivery. Placement evidence never replaces the durable admission.
+        peer.replies[0]["request_high_water"] = request()["request_id"].clone();
+        let failure = receive_execution(&mut peer, &request(), "worker", &destination).unwrap_err();
+        assert!(!failure.execution_may_have_run);
+        assert!(failure.detail.contains("already admitted or retired"));
+        assert!(peer.sent.is_empty());
+        assert!(!destination.exists());
     }
 
     #[test]

@@ -76,6 +76,12 @@ pub enum ActionClassRisk {
     /// set comes from exact committed workspace producers. This class earns
     /// its own samples and retains the same transitive producer safety gates.
     CommittedWorkspaceMetadata,
+    /// Workspace archives that additionally admit exact qualified immutable
+    /// dependency leaves. Their broader producer contract has its own evidence.
+    MixedWorkspaceRlib,
+    /// Workspace checks with qualified immutable leaves and committed workspace
+    /// producers, independently sampled from both dependency and archive classes.
+    MixedWorkspaceMetadata,
     /// Anything else: general workspace outputs, tool-generated code, unknown
     /// classes. Never sampled.
     Elevated,

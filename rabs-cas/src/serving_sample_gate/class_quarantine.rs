@@ -23,6 +23,8 @@ const WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-closed-rlib-v1";
 const WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-closed-metadata-v1";
 const WORKSPACE_COMMITTED_RLIB_CLASS: &str = "rustc-workspace-committed-rlib-v1";
 const WORKSPACE_COMMITTED_METADATA_CLASS: &str = "rustc-workspace-committed-metadata-v1";
+const WORKSPACE_MIXED_RLIB_CLASS: &str = "rustc-workspace-committed-mixed-rlib-v1";
+const WORKSPACE_MIXED_METADATA_CLASS: &str = "rustc-workspace-committed-mixed-metadata-v1";
 
 const CLASS_SQL: &str = r#"
 SELECT decision FROM decision_receipts
@@ -95,6 +97,12 @@ pub(super) fn refusal(
             }
             [SqlValue::Text(class)] if class == WORKSPACE_COMMITTED_METADATA_CLASS => {
                 WORKSPACE_COMMITTED_METADATA_CLASS
+            }
+            [SqlValue::Text(class)] if class == WORKSPACE_MIXED_RLIB_CLASS => {
+                WORKSPACE_MIXED_RLIB_CLASS
+            }
+            [SqlValue::Text(class)] if class == WORKSPACE_MIXED_METADATA_CLASS => {
+                WORKSPACE_MIXED_METADATA_CLASS
             }
             // A caller's LowRiskRegistry flag cannot overrule a recorded
             // private/unknown class, even if its per-action evidence passes.
@@ -516,16 +524,22 @@ mod tests {
 
     #[test]
     fn committed_workspace_classes_keep_independent_samples_and_holds() {
-        for (class, risk, other_committed_class) in [
+        for (class, risk) in [
             (
                 WORKSPACE_COMMITTED_RLIB_CLASS,
                 ActionClassRisk::CommittedWorkspaceRlib,
-                WORKSPACE_COMMITTED_METADATA_CLASS,
             ),
             (
                 WORKSPACE_COMMITTED_METADATA_CLASS,
                 ActionClassRisk::CommittedWorkspaceMetadata,
-                WORKSPACE_COMMITTED_RLIB_CLASS,
+            ),
+            (
+                WORKSPACE_MIXED_RLIB_CLASS,
+                ActionClassRisk::MixedWorkspaceRlib,
+            ),
+            (
+                WORKSPACE_MIXED_METADATA_CLASS,
+                ActionClassRisk::MixedWorkspaceMetadata,
             ),
         ] {
             let mut store =
@@ -538,10 +552,14 @@ mod tests {
                 WORKSPACE_RLIB_CLASS,
                 WORKSPACE_METADATA_CLASS,
                 DEPENDENCY_CLASS,
-                other_committed_class,
+                WORKSPACE_COMMITTED_RLIB_CLASS,
+                WORKSPACE_COMMITTED_METADATA_CLASS,
+                WORKSPACE_MIXED_RLIB_CLASS,
+                WORKSPACE_MIXED_METADATA_CLASS,
             ]
             .into_iter()
-            .zip(3..=6)
+            .filter(|other_class| *other_class != class)
+            .zip(3..)
             .map(|(other_class, tag)| {
                 let generation = u128::from(tag) + 10;
                 let key = published(&mut store, tag, generation);
