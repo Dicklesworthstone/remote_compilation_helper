@@ -45,6 +45,7 @@ pub(super) struct CommittedOutputs(Mutex<BTreeMap<PathBuf, InstalledProducer>>);
 pub struct CommittedWorkspaceInputs {
     paths: Arc<CanonicalPaths>,
     observed: Arc<DependencyFacts>,
+    consumer_kind: DependencySourceKind,
     coordinator: Weak<CoordLive>,
     authority: CoordinatorAuthority,
     generations: Vec<(PathBuf, FileSig)>,
@@ -57,7 +58,7 @@ impl CommittedWorkspaceInputs {
     }
 
     pub(crate) fn verify(&self, request: &LiveDependencyRequest) -> Result<(), String> {
-        if request.plan.source_kind != DependencySourceKind::WorkspaceCommittedRlib
+        if request.plan.source_kind != self.consumer_kind
             || !Arc::ptr_eq(&self.observed, &request.dependencies)
             || request
                 .canonical_paths
@@ -65,6 +66,18 @@ impl CommittedWorkspaceInputs {
                 .is_none_or(|paths| !Arc::ptr_eq(paths, &self.paths))
         {
             return Err("committed dependency capability belongs to another request owner".into());
+        }
+        self.verify_original()
+    }
+
+    /// A broader metadata producer profile cannot lend its capability to the
+    /// independently keyed archive class, even for the same observed files.
+    pub(crate) fn verify_for_kind(
+        &self,
+        consumer_kind: DependencySourceKind,
+    ) -> Result<(), String> {
+        if consumer_kind != self.consumer_kind {
+            return Err("committed dependency capability belongs to another consumer class".into());
         }
         self.verify_original()
     }
@@ -98,7 +111,8 @@ impl CommittedWorkspaceInputs {
                 return Err("committed dependency generation changed after capture".into());
             }
         }
-        coordinator.verify_committed_workspace_dependencies(&self.dependencies)?;
+        coordinator
+            .verify_committed_workspace_dependencies(&self.dependencies, self.consumer_kind)?;
         self.observed.verify_unchanged()
     }
 
@@ -135,13 +149,23 @@ impl CommittedWorkspaceInputs {
 
 impl CanonicalPaths {
     /// Every retained candidate, including unreferenced alternatives, must be an
-    /// exact current generation installed by this operation from a closed Rlib
-    /// producer. Leaf metadata publications are deliberately not admitted yet.
+    /// exact current generation installed by this operation from an admitted
+    /// producer. The consumer class retains its own producer-policy boundary.
     pub(crate) fn capture_committed_workspace_inputs(
         self: &Arc<Self>,
         coordinator: &Arc<CoordLive>,
         observed: Arc<DependencyFacts>,
+        consumer_kind: DependencySourceKind,
     ) -> Result<Arc<CommittedWorkspaceInputs>, String> {
+        if !matches!(
+            consumer_kind,
+            DependencySourceKind::WorkspaceCommittedRlib
+                | DependencySourceKind::WorkspaceCommittedMetadata
+        ) {
+            return Err(
+                "committed dependency capture requires an exact committed consumer class".into(),
+            );
+        }
         let authority = coordinator.authority().ok_or("no coordinator authority")?;
         let candidates = observed.candidate_generations()?;
         let mut dependencies = Vec::with_capacity(candidates.len());
@@ -177,6 +201,7 @@ impl CanonicalPaths {
         let result = Arc::new(CommittedWorkspaceInputs {
             paths: Arc::clone(self),
             observed,
+            consumer_kind,
             coordinator: Arc::downgrade(coordinator),
             authority,
             generations,
@@ -200,6 +225,8 @@ impl CanonicalPaths {
             request.plan.source_kind,
             DependencySourceKind::WorkspaceClosedRlib
                 | DependencySourceKind::WorkspaceCommittedRlib
+                | DependencySourceKind::WorkspaceClosedMetadata
+                | DependencySourceKind::WorkspaceCommittedMetadata
         ) {
             return Ok(());
         }
@@ -283,6 +310,10 @@ impl CanonicalPaths {
                 .iter()
                 .map(|(_, _, dependency)| dependency.clone())
                 .collect::<Vec<_>>(),
+            // Registration retains either admitted producer family. Capture
+            // and every later recheck separately enforce the consumer's kind;
+            // archive consumers retain their original archive-only ancestry.
+            DependencySourceKind::WorkspaceCommittedMetadata,
         )?;
         if coordinator.authority().as_ref() != Some(&authority) {
             return Err("coordinator authority changed before committed registration".into());
@@ -426,6 +457,102 @@ mod tests {
     }
 
     #[test]
+    fn committed_capability_cannot_cross_the_archive_and_metadata_consumer_classes() {
+        let fixture = WorkspaceLineageFixture::new();
+        let offer = fixture.commit_leaf(
+            44,
+            &[(
+                "libupstream.rmeta",
+                OutputRole::ProvisionalMetadata,
+                METADATA,
+            )],
+        );
+        let paths = paths();
+        let metadata = install_bytes(&paths, &offer, "libupstream.rmeta", METADATA);
+        register(&paths, &fixture, &offer, &[metadata]).unwrap();
+        let candidates = observed(&paths, false);
+        for (kind, other) in [
+            (
+                DependencySourceKind::WorkspaceCommittedRlib,
+                DependencySourceKind::WorkspaceCommittedMetadata,
+            ),
+            (
+                DependencySourceKind::WorkspaceCommittedMetadata,
+                DependencySourceKind::WorkspaceCommittedRlib,
+            ),
+        ] {
+            let captured = paths
+                .capture_committed_workspace_inputs(&fixture.coord, Arc::clone(&candidates), kind)
+                .unwrap();
+            captured.verify_for_kind(kind).unwrap();
+            assert!(captured.verify_for_kind(other).is_err());
+        }
+        for kind in [
+            DependencySourceKind::WorkspaceExecutionOnly,
+            DependencySourceKind::WorkspaceClosedRlib,
+            DependencySourceKind::WorkspaceClosedMetadata,
+            DependencySourceKind::RegistryPackage,
+        ] {
+            assert!(
+                paths
+                    .capture_committed_workspace_inputs(
+                        &fixture.coord,
+                        Arc::clone(&candidates),
+                        kind
+                    )
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn committed_metadata_installation_cannot_authorize_archive_consumers() {
+        let fixture = WorkspaceLineageFixture::new();
+        let offer = fixture.prepare_metadata(
+            45,
+            Vec::new(),
+            &[(
+                "libupstream.rmeta",
+                OutputRole::ProvisionalMetadata,
+                METADATA,
+            )],
+        );
+        let paths = paths();
+        let installed = install_bytes(&paths, &offer, "libupstream.rmeta", METADATA);
+        assert!(register(&paths, &fixture, &offer, std::slice::from_ref(&installed)).is_err());
+        assert!(paths.committed_outputs.0.lock().unwrap().is_empty());
+        fixture.commit(&offer);
+        register(&paths, &fixture, &offer, &[installed]).unwrap();
+        let candidates = observed(&paths, false);
+        let metadata = paths
+            .capture_committed_workspace_inputs(
+                &fixture.coord,
+                Arc::clone(&candidates),
+                DependencySourceKind::WorkspaceCommittedMetadata,
+            )
+            .unwrap();
+        metadata
+            .verify_for_kind(DependencySourceKind::WorkspaceCommittedMetadata)
+            .unwrap();
+        assert!(
+            metadata
+                .verify_for_kind(DependencySourceKind::WorkspaceCommittedRlib)
+                .is_err()
+        );
+        assert!(
+            paths
+                .capture_committed_workspace_inputs(
+                    &fixture.coord,
+                    candidates,
+                    DependencySourceKind::WorkspaceCommittedRlib,
+                )
+                .is_err()
+        );
+        fixture.quarantine(&offer.manifest.action_key);
+        assert!(metadata.verify_original().is_err());
+    }
+
+    #[test]
     fn committed_head_does_not_lend_authority_to_an_uninstalled_archive_or_unknown_sibling() {
         let fixture = WorkspaceLineageFixture::new();
         let offer = fixture.commit_leaf(
@@ -443,7 +570,11 @@ mod tests {
         let metadata = install_bytes(&paths, &offer, "libupstream.rmeta", METADATA);
         register(&paths, &fixture, &offer, &[metadata]).unwrap();
         let head = paths
-            .capture_committed_workspace_inputs(&fixture.coord, observed(&paths, false))
+            .capture_committed_workspace_inputs(
+                &fixture.coord,
+                observed(&paths, false),
+                DependencySourceKind::WorkspaceCommittedRlib,
+            )
             .unwrap();
         assert_eq!(head.dependencies().len(), 1);
         assert_eq!(
@@ -458,13 +589,21 @@ mod tests {
         let archive = install_bytes(&paths, &offer, "libupstream.rlib", ARCHIVE);
         assert!(
             paths
-                .capture_committed_workspace_inputs(&fixture.coord, observed(&paths, true))
+                .capture_committed_workspace_inputs(
+                    &fixture.coord,
+                    observed(&paths, true),
+                    DependencySourceKind::WorkspaceCommittedRlib,
+                )
                 .is_err()
         );
         // Existing projection omits the non-explicit shadowed archive entirely.
         assert_eq!(
             paths
-                .capture_committed_workspace_inputs(&fixture.coord, observed(&paths, false))
+                .capture_committed_workspace_inputs(
+                    &fixture.coord,
+                    observed(&paths, false),
+                    DependencySourceKind::WorkspaceCommittedRlib,
+                )
                 .unwrap()
                 .dependencies()
                 .len(),
@@ -472,7 +611,11 @@ mod tests {
         );
         register(&paths, &fixture, &offer, &[archive]).unwrap();
         let complete = paths
-            .capture_committed_workspace_inputs(&fixture.coord, observed(&paths, true))
+            .capture_committed_workspace_inputs(
+                &fixture.coord,
+                observed(&paths, true),
+                DependencySourceKind::WorkspaceCommittedRlib,
+            )
             .unwrap();
         assert_eq!(complete.dependencies().len(), 2);
         assert_eq!(complete.ancestors().len(), 2);
@@ -485,7 +628,11 @@ mod tests {
         .unwrap();
         assert!(
             paths
-                .capture_committed_workspace_inputs(&fixture.coord, observed(&paths, false))
+                .capture_committed_workspace_inputs(
+                    &fixture.coord,
+                    observed(&paths, false),
+                    DependencySourceKind::WorkspaceCommittedRlib,
+                )
                 .is_err()
         );
         assert!(complete.verify_original().is_err());
@@ -508,7 +655,11 @@ mod tests {
         let old_generation = metadata.sig;
         register(&paths, &fixture, &offer, &[metadata]).unwrap();
         let inputs = paths
-            .capture_committed_workspace_inputs(&fixture.coord, observed(&paths, false))
+            .capture_committed_workspace_inputs(
+                &fixture.coord,
+                observed(&paths, false),
+                DependencySourceKind::WorkspaceCommittedRlib,
+            )
             .unwrap();
         inputs.verify_original().unwrap();
         let replacement = path.with_file_name("replacement.tmp");
@@ -520,7 +671,11 @@ mod tests {
         assert!(inputs.verify_original().is_err());
         assert!(
             paths
-                .capture_committed_workspace_inputs(&fixture.coord, observed(&paths, false))
+                .capture_committed_workspace_inputs(
+                    &fixture.coord,
+                    observed(&paths, false),
+                    DependencySourceKind::WorkspaceCommittedRlib,
+                )
                 .is_err()
         );
         // A verified reinstall may mint the new generation; old observations
@@ -528,7 +683,11 @@ mod tests {
         let verified = known_installed_output(&path, &same_object).unwrap();
         register(&paths, &fixture, &offer, &[verified]).unwrap();
         paths
-            .capture_committed_workspace_inputs(&fixture.coord, observed(&paths, false))
+            .capture_committed_workspace_inputs(
+                &fixture.coord,
+                observed(&paths, false),
+                DependencySourceKind::WorkspaceCommittedRlib,
+            )
             .unwrap()
             .verify_original()
             .unwrap();
@@ -550,13 +709,21 @@ mod tests {
         let metadata = install_bytes(&original, &offer, "libupstream.rmeta", METADATA);
         register(&original, &fixture, &offer, &[metadata]).unwrap();
         original
-            .capture_committed_workspace_inputs(&fixture.coord, observed(&original, false))
+            .capture_committed_workspace_inputs(
+                &fixture.coord,
+                observed(&original, false),
+                DependencySourceKind::WorkspaceCommittedRlib,
+            )
             .unwrap();
         let other = paths();
         let _copied = install_bytes(&other, &offer, "libupstream.rmeta", METADATA);
         assert!(
             other
-                .capture_committed_workspace_inputs(&fixture.coord, observed(&other, false))
+                .capture_committed_workspace_inputs(
+                    &fixture.coord,
+                    observed(&other, false),
+                    DependencySourceKind::WorkspaceCommittedRlib,
+                )
                 .is_err()
         );
     }
@@ -584,13 +751,21 @@ mod tests {
         let metadata = known_installed_output(&path, &object_id(METADATA).unwrap()).unwrap();
         register(&paths, &fixture, &offer, &[metadata]).unwrap();
         let inputs = paths
-            .capture_committed_workspace_inputs(&fixture.coord, observed(&paths, false))
+            .capture_committed_workspace_inputs(
+                &fixture.coord,
+                observed(&paths, false),
+                DependencySourceKind::WorkspaceCommittedRlib,
+            )
             .unwrap();
         fixture.quarantine(&offer.manifest.action_key);
         assert!(inputs.verify_original().is_err());
         assert!(
             paths
-                .capture_committed_workspace_inputs(&fixture.coord, observed(&paths, false))
+                .capture_committed_workspace_inputs(
+                    &fixture.coord,
+                    observed(&paths, false),
+                    DependencySourceKind::WorkspaceCommittedRlib,
+                )
                 .is_err()
         );
         let metadata = known_installed_output(&path, &object_id(METADATA).unwrap()).unwrap();

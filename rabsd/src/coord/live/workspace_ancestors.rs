@@ -13,6 +13,7 @@ use super::{
 };
 use rabs_cas::metadata_store::ProvisionalAncestorRow;
 use rabs_cas::publication::ProvisionalAncestorRef;
+use rabs_key::live_dependency::DependencySourceKind;
 use rabs_key::live_dependency::workspace_dependency_cache::CommittedWorkspaceDependency;
 use rabs_protocol::generation::AttemptAuthority;
 use rabs_protocol::result_identity::{OutputRole, ResultKind};
@@ -39,7 +40,13 @@ impl CoordLive {
     pub(crate) fn verify_committed_workspace_dependencies(
         &self,
         dependencies: &[CommittedWorkspaceDependency],
+        consumer_kind: DependencySourceKind,
     ) -> Result<(), String> {
+        let metadata_allowed = match consumer_kind {
+            DependencySourceKind::WorkspaceCommittedRlib => false,
+            DependencySourceKind::WorkspaceCommittedMetadata => true,
+            _ => return Err("unsupported committed workspace consumer class".into()),
+        };
         if dependencies.is_empty() || dependencies.len() > MAX_LINEAGE_EDGES {
             return Err("committed workspace candidate count is outside its bound".into());
         }
@@ -78,7 +85,15 @@ impl CoordLive {
                 adopted: false,
             })
             .collect();
-        verify_graph(&mut *store, None, direct, now_micros(), 0, None)
+        verify_graph(
+            &mut *store,
+            None,
+            direct,
+            now_micros(),
+            0,
+            None,
+            metadata_allowed,
+        )
     }
 }
 
@@ -89,11 +104,12 @@ pub(super) fn check_offer(
     epoch: u64,
     lease_now: &dyn Fn() -> u64,
 ) -> Result<(), String> {
-    if recorded_action_risk(store, &offer.manifest.action_key).map_err(store_error)?
-        != ActionClassRisk::CommittedWorkspaceRlib
-    {
-        return Ok(());
-    }
+    let metadata_allowed =
+        match recorded_action_risk(store, &offer.manifest.action_key).map_err(store_error)? {
+            ActionClassRisk::CommittedWorkspaceRlib => false,
+            ActionClassRisk::CommittedWorkspaceMetadata => true,
+            _ => return Ok(()),
+        };
     if offer.provisional_ancestors.is_empty()
         || offer.provisional_ancestors.len() > MAX_LINEAGE_EDGES
     {
@@ -110,6 +126,7 @@ pub(super) fn check_offer(
         now,
         epoch,
         Some((&offer.authority, lease_now)),
+        metadata_allowed,
     )
 }
 
@@ -121,11 +138,11 @@ pub(super) fn check_serving(
     now: i64,
     epoch: u64,
 ) -> Result<(), String> {
-    if recorded_action_risk(store, action).map_err(store_error)?
-        != ActionClassRisk::CommittedWorkspaceRlib
-    {
-        return Ok(());
-    }
+    let metadata_allowed = match recorded_action_risk(store, action).map_err(store_error)? {
+        ActionClassRisk::CommittedWorkspaceRlib => false,
+        ActionClassRisk::CommittedWorkspaceMetadata => true,
+        _ => return Ok(()),
+    };
     let ancestors = store
         .list_provisional_ancestors(&digest_key(action))
         .map_err(store_error)?;
@@ -139,6 +156,7 @@ pub(super) fn check_serving(
         now,
         epoch,
         None,
+        metadata_allowed,
     )
 }
 
@@ -178,7 +196,7 @@ impl Ancestor {
 }
 
 enum Visit {
-    Input(Ancestor),
+    Input(Ancestor, bool),
     Finished(String),
 }
 
@@ -203,21 +221,25 @@ fn verify_graph(
     now: i64,
     epoch: u64,
     lease: Option<LeaseCheck<'_>>,
+    metadata_allowed: bool,
 ) -> Result<(), String> {
     let started = Instant::now();
     let mut edges = direct.len();
     if edges > MAX_LINEAGE_EDGES {
         return Err("committed workspace ancestry exceeds admission bound".into());
     }
-    let mut pending: Vec<_> = direct.into_iter().map(Visit::Input).collect();
+    let mut pending: Vec<_> = direct
+        .into_iter()
+        .map(|ancestor| Visit::Input(ancestor, metadata_allowed))
+        .collect();
     let mut active = BTreeSet::new();
     if let Some(consumer) = consumer {
         active.insert(digest_key(consumer));
     }
     let mut complete = BTreeSet::new();
     while let Some(visit) = pending.pop() {
-        let check = match visit {
-            Visit::Input(check) => check,
+        let (check, metadata_allowed) = match visit {
+            Visit::Input(check, metadata_allowed) => (check, metadata_allowed),
             Visit::Finished(key) => {
                 active.remove(&key);
                 complete.insert(key);
@@ -282,12 +304,18 @@ fn verify_graph(
             ));
         }
         let risk = recorded_action_risk(store, &manifest.action_key).map_err(store_error)?;
-        if !matches!(
+        let metadata_producer = matches!(
+            risk,
+            ActionClassRisk::ClosedWorkspaceMetadata | ActionClassRisk::CommittedWorkspaceMetadata
+        );
+        if !(matches!(
             risk,
             ActionClassRisk::ClosedWorkspaceRlib | ActionClassRisk::CommittedWorkspaceRlib
-        ) {
+        ) || (metadata_allowed && metadata_producer))
+            || (metadata_producer && check.role != "provisional-metadata")
+        {
             return Err(format!(
-                "workspace producer {} lacks a closed workspace class",
+                "workspace producer {} lacks a closed class allowed by its consumer",
                 check.producer
             ));
         }
@@ -321,8 +349,15 @@ fn verify_graph(
         let ancestors = store
             .list_provisional_ancestors(&check.producer)
             .map_err(store_error)?;
-        if (risk == ActionClassRisk::ClosedWorkspaceRlib && !ancestors.is_empty())
-            || (risk == ActionClassRisk::CommittedWorkspaceRlib && ancestors.is_empty())
+        if (matches!(
+            risk,
+            ActionClassRisk::ClosedWorkspaceRlib | ActionClassRisk::ClosedWorkspaceMetadata
+        ) && !ancestors.is_empty())
+            || (matches!(
+                risk,
+                ActionClassRisk::CommittedWorkspaceRlib
+                    | ActionClassRisk::CommittedWorkspaceMetadata
+            ) && ancestors.is_empty())
         {
             return Err(format!(
                 "workspace producer {} has inconsistent class ancestry",
@@ -335,11 +370,18 @@ fn verify_graph(
             .ok_or("committed workspace ancestry exceeds admission bound")?;
         active.insert(check.producer.clone());
         pending.push(Visit::Finished(check.producer));
+        // Each intermediate producer retains its own class boundary. A new
+        // metadata consumer cannot broaden an epoch-6 archive's ancestry.
         pending.extend(
             ancestors
                 .into_iter()
                 .map(Ancestor::from_row)
-                .map(Visit::Input),
+                .map(|ancestor| {
+                    Visit::Input(
+                        ancestor,
+                        risk == ActionClassRisk::CommittedWorkspaceMetadata,
+                    )
+                }),
         );
     }
     verify_lease(store, lease)
@@ -376,6 +418,7 @@ pub(crate) mod tests {
         install_offer_closure, offer_serving_object, sample_evidence, sample_expected_descriptor,
         tagged_digest,
     };
+    use rabs_key::live_dependency::DependencySourceKind;
     use rabs_key::live_dependency::workspace_dependency_cache::CommittedWorkspaceDependency;
     use rabs_protocol::generation::{ActionGenerationId, WorkerBootGeneration};
     use rabs_protocol::raw_bytes::RawBytes;
@@ -471,6 +514,35 @@ pub(crate) mod tests {
             parents: Vec<ProvisionalAncestorRef>,
             outputs: &[(&str, OutputRole, &[u8])],
         ) -> OfferPreparedActionResult {
+            let class = if parents.is_empty() {
+                LIVE_WORKSPACE_RLIB_CLASS
+            } else {
+                LIVE_COMMITTED_WORKSPACE_RLIB_CLASS
+            };
+            self.prepare_class(tag, parents, outputs, class)
+        }
+
+        pub(crate) fn prepare_metadata(
+            &self,
+            tag: u8,
+            parents: Vec<ProvisionalAncestorRef>,
+            outputs: &[(&str, OutputRole, &[u8])],
+        ) -> OfferPreparedActionResult {
+            let class = if parents.is_empty() {
+                LIVE_WORKSPACE_METADATA_CLASS
+            } else {
+                LIVE_COMMITTED_WORKSPACE_METADATA_CLASS
+            };
+            self.prepare_class(tag, parents, outputs, class)
+        }
+
+        fn prepare_class(
+            &self,
+            tag: u8,
+            parents: Vec<ProvisionalAncestorRef>,
+            outputs: &[(&str, OutputRole, &[u8])],
+            class: &str,
+        ) -> OfferPreparedActionResult {
             assert!(!outputs.is_empty());
             let logical_outputs: Vec<_> = outputs
                 .iter()
@@ -518,11 +590,7 @@ pub(crate) mod tests {
                     LIVE_CLASS_RECEIPT,
                     &digest_key(&offer.manifest.action_key),
                     0,
-                    if parents.is_empty() {
-                        LIVE_WORKSPACE_RLIB_CLASS
-                    } else {
-                        LIVE_COMMITTED_WORKSPACE_RLIB_CLASS
-                    },
+                    class,
                     "explicit synthetic workspace descriptor class for coordinator gate test",
                 )
                 .unwrap();
@@ -547,6 +615,16 @@ pub(crate) mod tests {
             outputs: &[(&str, OutputRole, &[u8])],
         ) -> OfferPreparedActionResult {
             let offer = self.prepare(tag, Vec::new(), outputs);
+            self.commit(&offer);
+            offer
+        }
+
+        pub(crate) fn commit_metadata_leaf(
+            &self,
+            tag: u8,
+            outputs: &[(&str, OutputRole, &[u8])],
+        ) -> OfferPreparedActionResult {
+            let offer = self.prepare_metadata(tag, Vec::new(), outputs);
             self.commit(&offer);
             offer
         }
@@ -729,6 +807,146 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn committed_metadata_chain_keeps_archive_scope_and_rechecks_transitive_quarantine() {
+        let fixture = WorkspaceLineageFixture::new();
+        let [a, b, c] = metadata_chain(&fixture);
+        fixture.compare_twice(&c);
+        for offer in [&a, &b, &c] {
+            fixture
+                .coord
+                .verify_committed_workspace_dependencies(
+                    &[witness(offer)],
+                    DependencySourceKind::WorkspaceCommittedMetadata,
+                )
+                .unwrap();
+            assert!(
+                fixture
+                    .coord
+                    .verify_committed_workspace_dependencies(
+                        &[witness(offer)],
+                        DependencySourceKind::WorkspaceCommittedRlib,
+                    )
+                    .is_err()
+            );
+        }
+        let archive = fixture.prepare(
+            44,
+            vec![consumes(&b)],
+            &[(
+                "libarchive.rlib",
+                OutputRole::Materializable,
+                b"archive bytes",
+            )],
+        );
+        assert!(matches!(
+            fixture.coord.commit_offer(&archive, &sample_expected_descriptor()),
+            Err(CommitRefusal::CommittedDependency(reason)) if reason.contains("allowed by its consumer")
+        ));
+        fixture.assert_unpublished(&archive);
+
+        // The consumer's positive comparisons cannot outvote a leaf producer's
+        // later quarantine, including across the intermediate metadata unit.
+        fixture.quarantine(&a.manifest.action_key);
+        let reason = fixture
+            .coord
+            .verify_committed_workspace_dependencies(
+                &[witness(&c)],
+                DependencySourceKind::WorkspaceCommittedMetadata,
+            )
+            .unwrap_err();
+        assert!(
+            reason.contains(&digest_key(&a.manifest.action_key)),
+            "{reason}"
+        );
+        let destination = fixture.root.path().join("blocked-metadata-chain");
+        assert!(matches!(
+            fixture.replay(&c, &destination, None).unwrap(),
+            ServeOutcome::ExecutePrivately(ReplayRefusal::CommittedDependency(reason))
+                if reason.contains(&digest_key(&a.manifest.action_key))
+        ));
+        assert!(!destination.exists());
+        let later = fixture.prepare_metadata(
+            45,
+            vec![consumes(&c)],
+            &[(
+                "liblater.rmeta",
+                OutputRole::ProvisionalMetadata,
+                b"later metadata",
+            )],
+        );
+        assert!(matches!(
+            fixture.coord.commit_offer(&later, &sample_expected_descriptor()),
+            Err(CommitRefusal::CommittedDependency(reason))
+                if reason.contains(&digest_key(&a.manifest.action_key))
+        ));
+        fixture.assert_unpublished(&later);
+    }
+
+    fn metadata_chain(fixture: &WorkspaceLineageFixture) -> [OfferPreparedActionResult; 3] {
+        let a = fixture.commit_metadata_leaf(
+            41,
+            &[("liba.rmeta", OutputRole::ProvisionalMetadata, b"metadata A")],
+        );
+        let b = fixture.prepare_metadata(
+            42,
+            vec![consumes(&a)],
+            &[("libb.rmeta", OutputRole::ProvisionalMetadata, b"metadata B")],
+        );
+        fixture.commit(&b);
+        let c = fixture.prepare_metadata(
+            43,
+            vec![consumes(&b)],
+            &[("libc.rmeta", OutputRole::ProvisionalMetadata, b"metadata C")],
+        );
+        fixture.commit(&c);
+        [a, b, c]
+    }
+
+    #[test]
+    fn metadata_consumer_cannot_broaden_an_archive_ancestors_producer_class() {
+        let fixture = WorkspaceLineageFixture::new();
+        let [a, b, c] = metadata_chain(&fixture);
+        fixture.compare_twice(&c);
+        // Explicit persisted-state fault: B now claims the old archive class
+        // while retaining its metadata producer A. A metadata root must apply
+        // B's narrower policy at that edge instead of its own broader policy.
+        let held = fixture.cas.store().lock().unwrap();
+        let mut engine = RusqliteEngine::open(&fixture.cas.cas_root().join("meta.sqlite")).unwrap();
+        assert_eq!(
+            engine.execute(
+                "UPDATE decision_receipts SET decision = ?1 WHERE kind = ?2 AND subject = ?3 AND seq = 0",
+                &[
+                    SqlValue::Text(LIVE_COMMITTED_WORKSPACE_RLIB_CLASS.into()),
+                    SqlValue::Text(LIVE_CLASS_RECEIPT.into()),
+                    SqlValue::Text(digest_key(&b.manifest.action_key)),
+                ],
+            ).unwrap(),
+            1,
+        );
+        drop(engine);
+        drop(held);
+        let reason = fixture
+            .coord
+            .verify_committed_workspace_dependencies(
+                &[witness(&c)],
+                DependencySourceKind::WorkspaceCommittedMetadata,
+            )
+            .unwrap_err();
+        assert!(reason.contains("allowed by its consumer"), "{reason}");
+        assert!(
+            reason.contains(&digest_key(&a.manifest.action_key)),
+            "{reason}"
+        );
+        let destination = fixture.root.path().join("blocked-archive-ancestry");
+        assert!(matches!(
+            fixture.replay(&c, &destination, None).unwrap(),
+            ServeOutcome::ExecutePrivately(ReplayRefusal::CommittedDependency(reason))
+                if reason.contains("allowed by its consumer")
+        ));
+        assert!(!destination.exists());
+    }
+
+    #[test]
     fn committed_workspace_chain_accepts_unsampled_parents_but_preserves_consumer_sampling() {
         let fixture = WorkspaceLineageFixture::new();
         let [a, b, c] = chain(&fixture);
@@ -736,7 +954,10 @@ pub(crate) mod tests {
             fixture.assert_unsampled(offer);
             fixture
                 .coord
-                .verify_committed_workspace_dependencies(&[witness(offer)])
+                .verify_committed_workspace_dependencies(
+                    &[witness(offer)],
+                    DependencySourceKind::WorkspaceCommittedRlib,
+                )
                 .unwrap();
         }
         let direct = fixture
@@ -819,7 +1040,10 @@ pub(crate) mod tests {
         assert!(
             fixture
                 .coord
-                .verify_committed_workspace_dependencies(&[witness(&c)])
+                .verify_committed_workspace_dependencies(
+                    &[witness(&c)],
+                    DependencySourceKind::WorkspaceCommittedRlib,
+                )
                 .is_err()
         );
         fixture.assert_unsampled(&a);
@@ -858,7 +1082,10 @@ pub(crate) mod tests {
         let exact = witness(&a);
         fixture
             .coord
-            .verify_committed_workspace_dependencies(std::slice::from_ref(&exact))
+            .verify_committed_workspace_dependencies(
+                std::slice::from_ref(&exact),
+                DependencySourceKind::WorkspaceCommittedRlib,
+            )
             .unwrap();
         for change in ["object", "manifest", "descriptor"] {
             let mut different = exact.clone();
@@ -872,7 +1099,10 @@ pub(crate) mod tests {
             }
             let reason = fixture
                 .coord
-                .verify_committed_workspace_dependencies(&[different])
+                .verify_committed_workspace_dependencies(
+                    &[different],
+                    DependencySourceKind::WorkspaceCommittedRlib,
+                )
                 .unwrap_err();
             assert!(
                 reason.contains("does not commit the exact input"),
@@ -904,7 +1134,10 @@ pub(crate) mod tests {
         fixture.compare_twice(&c);
         fixture
             .coord
-            .verify_committed_workspace_dependencies(&[witness(&c)])
+            .verify_committed_workspace_dependencies(
+                &[witness(&c)],
+                DependencySourceKind::WorkspaceCommittedRlib,
+            )
             .unwrap();
         let d = fixture.prepare(
             4,
@@ -938,7 +1171,10 @@ pub(crate) mod tests {
         drop(store);
         let reason = fixture
             .coord
-            .verify_committed_workspace_dependencies(&[witness(&c)])
+            .verify_committed_workspace_dependencies(
+                &[witness(&c)],
+                DependencySourceKind::WorkspaceCommittedRlib,
+            )
             .unwrap_err();
         assert!(reason.contains("provisional adoption"), "{reason}");
         assert!(

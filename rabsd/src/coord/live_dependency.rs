@@ -335,7 +335,7 @@ fn verify_metadata_head(
 }
 
 /// Register only the physically installed nonempty metadata of a published
-/// archive result. The operation owner rechecks current durable provenance.
+/// workspace result. The operation owner rechecks current durable provenance.
 fn remember_committed_metadata(
     coord: &Arc<CoordLive>,
     request: &LiveDependencyRequest,
@@ -345,7 +345,10 @@ fn remember_committed_metadata(
 ) -> Result<(), String> {
     if !matches!(
         request.plan.source_kind,
-        DependencySourceKind::WorkspaceClosedRlib | DependencySourceKind::WorkspaceCommittedRlib
+        DependencySourceKind::WorkspaceClosedRlib
+            | DependencySourceKind::WorkspaceCommittedRlib
+            | DependencySourceKind::WorkspaceClosedMetadata
+            | DependencySourceKind::WorkspaceCommittedMetadata
     ) {
         return Ok(());
     }
@@ -981,8 +984,9 @@ impl LiveDependencyLane {
         &self,
         paths: &Arc<canonical::CanonicalPaths>,
         dependencies: Arc<DependencyFacts>,
+        consumer_kind: DependencySourceKind,
     ) -> Result<Arc<canonical::CommittedWorkspaceInputs>, String> {
-        paths.capture_committed_workspace_inputs(&self.coord, dependencies)
+        paths.capture_committed_workspace_inputs(&self.coord, dependencies, consumer_kind)
     }
 
     /// The lane over a live coordinator.
@@ -1456,7 +1460,12 @@ impl ExecutionAttempt {
         self.request.dependencies.verify_unchanged()?;
         let committed_ancestors = match &self.remote_validation {
             Some(validation) => validation.committed_ancestors(&self.request)?,
-            None if plan.source_kind == DependencySourceKind::WorkspaceCommittedRlib => {
+            None if matches!(
+                plan.source_kind,
+                DependencySourceKind::WorkspaceCommittedRlib
+                    | DependencySourceKind::WorkspaceCommittedMetadata
+            ) =>
+            {
                 return Err("committed workspace capture has no remote producer capability".into());
             }
             None => Vec::new(),

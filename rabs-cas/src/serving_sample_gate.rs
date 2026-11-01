@@ -72,6 +72,10 @@ pub enum ActionClassRisk {
     /// comes from exact committed workspace producers. Separate class evidence
     /// and transitive producer safety are required; dependency SPRT stays closed.
     CommittedWorkspaceRlib,
+    /// Complete-workspace metadata checks whose entire retained Rust candidate
+    /// set comes from exact committed workspace producers. This class earns
+    /// its own samples and retains the same transitive producer safety gates.
+    CommittedWorkspaceMetadata,
     /// Anything else: general workspace outputs, tool-generated code, unknown
     /// classes. Never sampled.
     Elevated,

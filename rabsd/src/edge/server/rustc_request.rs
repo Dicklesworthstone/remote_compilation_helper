@@ -676,8 +676,21 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
         && let Some(paths) = &live.canonical
         && let Ok(candidate) = rabs_key::live_dependency::workspace_dependency_cache::plan_committed_workspace_rlib(&plan)
         && paths.require_workspace_committed_rlib(&candidate).is_ok()
-        && let Ok(committed) = live.lane.committed_workspace_inputs(paths, Arc::clone(&dependencies))
+        && let Ok(committed) = live.lane.committed_workspace_inputs(paths, Arc::clone(&dependencies), candidate.source_kind)
         && rabs_key::live_dependency::workspace_dependency_cache::remote_committed_workspace_rlib_shape(
+            &candidate, &key_directories, committed.dependencies(), rabs_sandbox::layout::TOOLCHAIN,
+        ).is_ok()
+    {
+        plan = candidate;
+        committed_workspace_inputs = Some(committed);
+    }
+    if workspace_requested
+        && plan.source_kind == rabs_key::live_dependency::DependencySourceKind::WorkspaceExecutionOnly
+        && let Some(paths) = &live.canonical
+        && let Ok(candidate) = rabs_key::live_dependency::workspace_dependency_cache::plan_committed_workspace_metadata(&plan)
+        && paths.require_workspace_committed_metadata(&candidate).is_ok()
+        && let Ok(committed) = live.lane.committed_workspace_inputs(paths, Arc::clone(&dependencies), candidate.source_kind)
+        && rabs_key::live_dependency::workspace_dependency_cache::remote_committed_workspace_metadata_shape(
             &candidate, &key_directories, committed.dependencies(), rabs_sandbox::layout::TOOLCHAIN,
         ).is_ok()
     {

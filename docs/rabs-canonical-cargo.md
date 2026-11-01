@@ -1426,14 +1426,14 @@ reuse described below has its existing independent rules and limits.
 
 ### Cache closed workspace leaf-library builds and checks
 
-Workspace action caching admits selected ordinary Rust `lib` or `rlib` units in
+Workspace leaf action caching admits selected ordinary Rust `lib` or `rlib` units in
 two independently qualified classes: builds with archive output, and checks with
 metadata and dep-info output only. Both require a retained Cargo unit graph with
 no project executors, no explicit external crates or implicit Rust artifact
 candidates, no generated inputs or native libraries, and no incremental state.
 The captured Rust standard library remains available through the retained
 toolchain. Libraries consuming other workspace artifacts may qualify for the
-separate committed-producer build class below. Test harnesses, binaries,
+separate committed-producer build and check classes below. Test harnesses, binaries,
 procedural macros, external dependency consumers and generated/native workspace
 units retain their existing fresh-execution or ordinary Cargo paths.
 
@@ -1537,6 +1537,40 @@ refuse reuse. A consumer must still earn its own independent comparisons and
 pass release, class and replay gates; its producers' samples do not count for it.
 After metadata exposure, a later revocation or delivery failure remains a
 terminal delivery error and cannot authorize local fallback.
+
+### Cache workspace library checks with committed dependencies
+
+Pure Rust workspace `lib`/`rlib` checks can qualify through the independent
+`canonical-workspace-committed-metadata-v1` class, using key epoch 7:
+
+```sh
+cargo rabs --rabs-canonical-local ./canonical-compile.json -- check --workspace --lib
+```
+
+The class requires the strict `closed-metadata` worker context and retains the
+complete captured workspace, directory listings, exact compiler environment,
+arguments, toolchain and runtime. It keys every explicit extern and every
+implicit retained candidate, together with the exact committed producer action,
+descriptor, manifest, logical output and entire artifact identity. Producers
+must be closed workspace metadata or archive actions whose outputs were
+verified and installed by the same retained Cargo operation. External dependency
+producers, unknown target seeds, local fallback and uncommitted metadata cannot
+supply this authority; those consumers keep their existing fresh execution.
+
+The operation-owned input capability binds its consumer class as well as the
+original files and generations. A metadata capability cannot qualify an archive
+consumer. Recursive lineage checks also retain each intermediate producer's own
+policy, preserving the archive class's existing producer scope and epoch-6
+identity. Changed or quarantined transitive producers block both new publication
+and replay even when the consumer already has passing comparisons.
+
+Metadata results earn their own independent samples and persistent class
+quarantine. A qualified hit restores `.rmeta`, dep-info and diagnostics through
+the existing verified installer. A chain of ordinary library checks can therefore
+reuse committed metadata while the final binary or test check retains its
+existing execution policy. Generated/native inputs, project executors, harness
+outputs, incremental state and archive output remain outside this metadata
+class. The selected Cargo graph must still contain no project executors.
 
 ### Local Clippy with reusable dependency compilation
 

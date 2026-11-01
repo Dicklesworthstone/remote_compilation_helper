@@ -35,8 +35,11 @@ use rabs_key::live_dependency::workspace_cache::{
     remote_closed_workspace_library_shape, validate_closed_workspace_library_plan,
 };
 use rabs_key::live_dependency::workspace_dependency_cache::{
-    is_committed_workspace_rlib_descriptor, remote_committed_workspace_rlib_isolation_policy,
+    is_committed_workspace_metadata_descriptor, is_committed_workspace_rlib_descriptor,
+    remote_committed_workspace_metadata_isolation_policy, remote_committed_workspace_metadata_key,
+    remote_committed_workspace_metadata_shape, remote_committed_workspace_rlib_isolation_policy,
     remote_committed_workspace_rlib_key, remote_committed_workspace_rlib_shape,
+    validate_committed_workspace_metadata_plan,
 };
 use rabs_key::live_dependency::{
     DependencyDirectoryFact, DependencySourceKind, ToolchainFacts, native_input_directories,
@@ -621,9 +624,22 @@ impl RemoteValidation {
                 .as_ref()
                 .ok_or("committed workspace archive lost its producer capability")?
                 .verify(request)?;
+        } else if request.plan.source_kind == DependencySourceKind::WorkspaceCommittedMetadata {
+            request
+                .canonical_paths
+                .as_ref()
+                .ok_or("committed workspace metadata lost its retained Cargo graph")?
+                .require_workspace_committed_metadata(&request.plan)?;
+            self.committed_workspace_inputs
+                .as_ref()
+                .ok_or("committed workspace metadata lost its producer capability")?
+                .verify(request)?;
         }
-        if request.plan.source_kind != DependencySourceKind::WorkspaceCommittedRlib
-            && self.committed_workspace_inputs.is_some()
+        if !matches!(
+            request.plan.source_kind,
+            DependencySourceKind::WorkspaceCommittedRlib
+                | DependencySourceKind::WorkspaceCommittedMetadata
+        ) && self.committed_workspace_inputs.is_some()
         {
             return Err("committed producer capability belongs to a different class".into());
         }
@@ -644,6 +660,17 @@ impl RemoteValidation {
                     .dependencies(),
                 &toolchain,
             ),
+            DependencySourceKind::WorkspaceCommittedMetadata => {
+                remote_committed_workspace_metadata_shape(
+                    &request.plan,
+                    &directories,
+                    self.committed_workspace_inputs
+                        .as_ref()
+                        .ok_or("missing committed workspace input capability")?
+                        .dependencies(),
+                    &toolchain,
+                )
+            }
             _ => remote_dependency_shape(&request.plan, &directories, &toolchain),
         };
         shape.map_err(|error| error.to_string())?;
@@ -679,23 +706,31 @@ impl RemoteValidation {
         &self,
         request: &LiveDependencyRequest,
     ) -> Result<Vec<rabs_cas::publication::ProvisionalAncestorRef>, String> {
-        if request.plan.source_kind != DependencySourceKind::WorkspaceCommittedRlib {
+        if !matches!(
+            request.plan.source_kind,
+            DependencySourceKind::WorkspaceCommittedRlib
+                | DependencySourceKind::WorkspaceCommittedMetadata
+        ) {
             return Ok(Vec::new());
         }
         let inputs = self
             .committed_workspace_inputs
             .as_ref()
-            .ok_or("committed workspace archive lost its producer capability")?;
+            .ok_or("committed workspace library lost its producer capability")?;
         inputs.verify(request)?;
         let ancestors = inputs.ancestors();
         if ancestors.is_empty() {
-            return Err("committed workspace archive has no producer ancestry".into());
+            return Err("committed workspace library has no producer ancestry".into());
         }
         Ok(ancestors)
     }
 }
 
 fn execution_mode(plan: &DependencyActionPlan) -> Result<DependencyExecutionMode, String> {
+    if plan.source_kind == DependencySourceKind::WorkspaceCommittedMetadata {
+        validate_committed_workspace_metadata_plan(plan).map_err(|error| error.to_string())?;
+        return Ok(DependencyExecutionMode::ClosedMetadata);
+    }
     if matches!(
         plan.source_kind,
         DependencySourceKind::WorkspaceClosedRlib | DependencySourceKind::WorkspaceClosedMetadata
@@ -748,6 +783,14 @@ fn verify_execution_policy(
                 );
             }
             remote_committed_workspace_rlib_isolation_policy(plan)
+        }
+        DependencySourceKind::WorkspaceCommittedMetadata => {
+            if !is_committed_workspace_metadata_descriptor(&key.descriptor) {
+                return Err(
+                    "remote workspace descriptor differs from its committed metadata class".into(),
+                );
+            }
+            remote_committed_workspace_metadata_isolation_policy(plan)
         }
         _ => remote_dependency_isolation_policy(plan),
     }
@@ -891,14 +934,25 @@ impl RemoteDependencies {
             committed_workspace_inputs
                 .as_ref()
                 .ok_or("committed workspace key requires its exact producer capability")?
-                .verify_original()?;
+                .verify_for_kind(plan.source_kind)?;
+        } else if plan.source_kind == DependencySourceKind::WorkspaceCommittedMetadata {
+            canonical
+                .ok_or("committed workspace metadata requires its retained Cargo graph")?
+                .require_workspace_committed_metadata(plan)?;
+            committed_workspace_inputs
+                .as_ref()
+                .ok_or("committed workspace key requires its exact producer capability")?
+                .verify_for_kind(plan.source_kind)?;
         } else if workspace {
             canonical
                 .ok_or("workspace execution requires its retained Cargo graph")?
                 .require_workspace_execution(plan)?;
         }
-        if plan.source_kind != DependencySourceKind::WorkspaceCommittedRlib
-            && committed_workspace_inputs.is_some()
+        if !matches!(
+            plan.source_kind,
+            DependencySourceKind::WorkspaceCommittedRlib
+                | DependencySourceKind::WorkspaceCommittedMetadata
+        ) && committed_workspace_inputs.is_some()
         {
             return Err("committed producer capability cannot qualify a different class".into());
         }
@@ -929,6 +983,17 @@ impl RemoteDependencies {
                     .dependencies(),
                 &visible_root,
             ),
+            DependencySourceKind::WorkspaceCommittedMetadata => {
+                remote_committed_workspace_metadata_shape(
+                    plan,
+                    directories,
+                    committed_workspace_inputs
+                        .as_ref()
+                        .ok_or("missing committed workspace input capability")?
+                        .dependencies(),
+                    &visible_root,
+                )
+            }
             _ => remote_dependency_shape(plan, directories, &visible_root),
         };
         shape.map_err(|error| error.to_string())?;
@@ -956,8 +1021,17 @@ impl RemoteDependencies {
             Path::new(&physical.out_dir),
         )
         .map_err(|error| format!("edge runtime cohort: {error}"))?;
-        let key = if plan.source_kind == DependencySourceKind::WorkspaceCommittedRlib {
-            remote_committed_workspace_rlib_key(
+        let key = if matches!(
+            plan.source_kind,
+            DependencySourceKind::WorkspaceCommittedRlib
+                | DependencySourceKind::WorkspaceCommittedMetadata
+        ) {
+            let key_builder = if plan.source_kind == DependencySourceKind::WorkspaceCommittedRlib {
+                remote_committed_workspace_rlib_key
+            } else {
+                remote_committed_workspace_metadata_key
+            };
+            key_builder(
                 plan,
                 toolchain,
                 directories,
@@ -3311,50 +3385,15 @@ mod execution_resource_tests {
         }
     }
 
-    #[test]
-    fn closed_workspace_metadata_requires_its_own_context_and_complete_cache_descriptor() {
-        use rabs_key::live_dependency::workspace_cache::plan_closed_workspace_library;
+    fn workspace_metadata_key_facts(
+        plan: &DependencyActionPlan,
+    ) -> (ActionInputManifest, ToolchainFacts) {
         use rabs_protocol::input_evidence::{
             DirectoryEnumeration, INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType, PositiveInput,
         };
         use rabs_protocol::raw_bytes::RawBytes;
         use rabs_protocol::result_identity::ObjectId;
 
-        let mut fixture = Fixture::workspace_metadata(Some("lib"), false);
-        let fresh = fixture.plan.clone();
-        fixture.plan = plan_closed_workspace_library(&fresh).unwrap();
-        assert!(
-            fixture.request().is_err(),
-            "the existing workspace metadata namespace cannot authorize closed metadata caching"
-        );
-        fixture.context = fixture
-            .context
-            .with_execution_mode(DependencyExecutionMode::ClosedMetadata);
-        let request = fixture.request().unwrap();
-        assert_eq!(request["args"], json!(fixture.argv[1..]));
-        assert_eq!(request["jobserver_grant"], 3);
-        assert_eq!(
-            request["dependency_context"]["execution_mode"],
-            "closed-metadata"
-        );
-        assert_eq!(
-            request["dependency_context"]["version"],
-            rabs_sandbox::dependency_context::CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION
-        );
-        assert_eq!(
-            request["artifacts"]["files"],
-            json!(["libworkspace_app.rmeta", "workspace_app.d"])
-        );
-
-        let plan = &fixture.plan;
-        let directories = plan
-            .dependency_dirs
-            .iter()
-            .map(|path| DependencyDirectoryFact {
-                path: path.clone(),
-                artifacts: Vec::new(),
-            })
-            .collect::<Vec<_>>();
         let input = "member/src/main.rs";
         let inputs = ActionInputManifest {
             schema_version: INPUT_EVIDENCE_SCHEMA_VERSION,
@@ -3391,6 +3430,49 @@ mod execution_resource_tests {
             sysroot_root_digest: rabs_key::typed_digest::compute("rabs.test.v1", b"sysroot"),
             runtime_libraries: Vec::new(),
         };
+        (inputs, toolchain)
+    }
+
+    #[test]
+    fn closed_workspace_metadata_requires_its_own_context_and_complete_cache_descriptor() {
+        use rabs_key::live_dependency::workspace_cache::plan_closed_workspace_library;
+
+        let mut fixture = Fixture::workspace_metadata(Some("lib"), false);
+        let fresh = fixture.plan.clone();
+        fixture.plan = plan_closed_workspace_library(&fresh).unwrap();
+        assert!(
+            fixture.request().is_err(),
+            "the existing workspace metadata namespace cannot authorize closed metadata caching"
+        );
+        fixture.context = fixture
+            .context
+            .with_execution_mode(DependencyExecutionMode::ClosedMetadata);
+        let request = fixture.request().unwrap();
+        assert_eq!(request["args"], json!(fixture.argv[1..]));
+        assert_eq!(request["jobserver_grant"], 3);
+        assert_eq!(
+            request["dependency_context"]["execution_mode"],
+            "closed-metadata"
+        );
+        assert_eq!(
+            request["dependency_context"]["version"],
+            rabs_sandbox::dependency_context::CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION
+        );
+        assert_eq!(
+            request["artifacts"]["files"],
+            json!(["libworkspace_app.rmeta", "workspace_app.d"])
+        );
+
+        let plan = &fixture.plan;
+        let directories = plan
+            .dependency_dirs
+            .iter()
+            .map(|path| DependencyDirectoryFact {
+                path: path.clone(),
+                artifacts: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let (inputs, toolchain) = workspace_metadata_key_facts(plan);
         let key = remote_closed_workspace_library_key(
             plan,
             &toolchain,
@@ -3437,6 +3519,210 @@ mod execution_resource_tests {
             assert!(
                 verify_execution_policy(plan, &changed, DependencyExecutionMode::ClosedMetadata)
                     .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn committed_workspace_metadata_requires_closed_mode_and_its_exact_provenance_descriptor() {
+        use rabs_key::live_dependency::workspace_cache::plan_closed_workspace_library;
+        use rabs_key::live_dependency::workspace_dependency_cache::{
+            CommittedWorkspaceDependency, plan_committed_workspace_metadata,
+            plan_committed_workspace_rlib,
+        };
+        use rabs_key::live_dependency::{ExternFact, plan_canonical_workspace_execution};
+        use rabs_protocol::raw_bytes::RawBytes;
+        use rabs_protocol::result_identity::ObjectId;
+
+        // These facts exercise the actual key, mode and request assemblers.
+        // They supply no installed-producer, TLS or live execution authority.
+        let mut fixture = Fixture::workspace_metadata(Some("lib"), false);
+        let leaf_fresh = fixture.plan.clone();
+        let path = format!("{}/libupstream.rmeta", fixture.plan.out_dir);
+        fixture.argv.push(format!("--extern=upstream={path}"));
+        let fresh = plan_canonical_workspace_execution(
+            LiveRustcRequest {
+                argv: &fixture.argv,
+                cwd: &leaf_fresh.cwd,
+                env: &leaf_fresh.execution_env,
+            },
+            &leaf_fresh.host_triple,
+        )
+        .unwrap();
+        fixture.plan = plan_committed_workspace_metadata(&fresh).unwrap();
+        assert_eq!(
+            execution_mode(&fixture.plan).unwrap(),
+            DependencyExecutionMode::ClosedMetadata
+        );
+        assert!(
+            fixture.request().is_err(),
+            "ordinary Metadata cannot authorize committed metadata"
+        );
+        let strict = DependencyExecContext::new_canonical_workspace_execution(
+            DependencyExecutionMode::ClosedMetadata,
+            fixture.plan.cwd.clone(),
+            fixture.plan.out_dir.clone(),
+            fixture.plan.dependency_dirs.clone(),
+            Vec::new(),
+            vec![DependencyArtifactRoot {
+                path: fixture.plan.out_dir.clone(),
+                prefix: "dependencies/0000".into(),
+            }],
+            None,
+            fixture.context.source_directories().to_vec(),
+            Vec::new(),
+            fixture.plan.execution_env.clone(),
+            [0x11; 32],
+        )
+        .unwrap();
+        for mode in [
+            DependencyExecutionMode::Metadata,
+            DependencyExecutionMode::Rlib,
+        ] {
+            fixture.context = strict.clone().with_execution_mode(mode);
+            assert!(fixture.request().is_err(), "{mode:?}");
+        }
+        fixture.context = strict;
+        let request = fixture.request().unwrap();
+        assert_eq!(request["args"], json!(fixture.argv[1..]));
+        assert_eq!(request["jobserver_grant"], 3);
+        assert_eq!(
+            request["dependency_context"]["execution_mode"],
+            "closed-metadata"
+        );
+        assert_eq!(
+            request["dependency_context"]["version"],
+            rabs_sandbox::dependency_context::CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION
+        );
+        assert_eq!(
+            request["dependency_context"]["artifact_roots"],
+            json!([
+                {"path":fixture.plan.out_dir,"prefix":"dependencies/0000"}
+            ])
+        );
+
+        let digest =
+            |bytes: &[u8]| rabs_key::typed_digest::compute("rabs.test.committed-mode.v1", bytes);
+        let dependency = CommittedWorkspaceDependency {
+            path: path.clone(),
+            producer_action: digest(b"producer action"),
+            producer_descriptor: digest(b"producer descriptor"),
+            producer_manifest: digest(b"producer manifest"),
+            role: OutputRole::ProvisionalMetadata,
+            virtual_path: RawBytes::from("libupstream.rmeta"),
+            object: ObjectId(digest(b"exact metadata")),
+        };
+        let directories = vec![DependencyDirectoryFact {
+            path: fixture.plan.out_dir.clone(),
+            artifacts: vec![ExternFact {
+                path,
+                content_digest: dependency.object.0.clone(),
+            }],
+        }];
+        let dependencies = vec![dependency];
+        let (inputs, toolchain) = workspace_metadata_key_facts(&fixture.plan);
+        let runtime = rabs_key::typed_digest::compute(
+            rabs_key::live_dependency::remote::RUNTIME_COHORT_DOMAIN,
+            b"runtime",
+        );
+        let key = remote_committed_workspace_metadata_key(
+            &fixture.plan,
+            &toolchain,
+            &directories,
+            &dependencies,
+            &inputs,
+            None,
+            "/__rabs/toolchain",
+            &fixture.toolchain.sha256,
+            &runtime,
+        )
+        .unwrap();
+        assert_eq!(key.descriptor.key_epoch, 7);
+        assert!(
+            verify_execution_policy(&fixture.plan, &key, DependencyExecutionMode::ClosedMetadata)
+                .is_ok()
+        );
+        for mode in [
+            DependencyExecutionMode::Metadata,
+            DependencyExecutionMode::Rlib,
+        ] {
+            assert!(verify_execution_policy(&fixture.plan, &key, mode).is_err());
+        }
+        let leaf = plan_closed_workspace_library(&leaf_fresh).unwrap();
+        let leaf_key = remote_closed_workspace_library_key(
+            &leaf,
+            &toolchain,
+            &[DependencyDirectoryFact {
+                path: leaf.out_dir.clone(),
+                artifacts: Vec::new(),
+            }],
+            &inputs,
+            None,
+            "/__rabs/toolchain",
+            &fixture.toolchain.sha256,
+            &runtime,
+        )
+        .unwrap();
+        let mut archive_fresh = fresh.clone();
+        archive_fresh.invocation.emit.push("link".into());
+        archive_fresh.outputs = rabs_key::output_derivation::derive_workspace_output_declarations(
+            &archive_fresh.invocation,
+            &archive_fresh.host_triple,
+        )
+        .unwrap();
+        let archive = plan_committed_workspace_rlib(&archive_fresh).unwrap();
+        let archive_key = remote_committed_workspace_rlib_key(
+            &archive,
+            &toolchain,
+            &directories,
+            &dependencies,
+            &inputs,
+            None,
+            "/__rabs/toolchain",
+            &fixture.toolchain.sha256,
+            &runtime,
+        )
+        .unwrap();
+        for other in [&leaf_key, &archive_key] {
+            assert!(
+                verify_execution_policy(
+                    &fixture.plan,
+                    other,
+                    DependencyExecutionMode::ClosedMetadata
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            verify_execution_policy(&leaf, &key, DependencyExecutionMode::ClosedMetadata).is_err()
+        );
+        assert!(verify_execution_policy(&archive, &key, DependencyExecutionMode::Rlib).is_err());
+        for mutation in 0..4 {
+            let mut changed = key.clone();
+            match mutation {
+                0 => changed.descriptor.key_epoch = 6,
+                1 => changed.descriptor.projection_epoch += 1,
+                2 => {
+                    changed.descriptor.sandbox_semantic_policy =
+                        leaf_key.descriptor.sandbox_semantic_policy.clone()
+                }
+                _ => {
+                    changed.descriptor.execution_semantics =
+                        archive_key.descriptor.execution_semantics.clone()
+                }
+            }
+            changed.action_key =
+                rabs_key::action_key::compute_action_key(&changed.descriptor).final_key;
+            changed.descriptor_digest = rabs_key::hit_verification::descriptor_digest(
+                &rabs_key::hit_verification::descriptor_canonical_bytes(&changed.descriptor),
+            );
+            assert!(
+                verify_execution_policy(
+                    &fixture.plan,
+                    &changed,
+                    DependencyExecutionMode::ClosedMetadata
+                )
+                .is_err()
             );
         }
     }

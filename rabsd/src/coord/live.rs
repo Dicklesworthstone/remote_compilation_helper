@@ -471,6 +471,7 @@ const LIVE_DEPENDENCY_CLASS: &str = "rustc-dependency-compile";
 const LIVE_WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-closed-rlib-v1";
 const LIVE_WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-closed-metadata-v1";
 const LIVE_COMMITTED_WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-committed-rlib-v1";
+const LIVE_COMMITTED_WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-committed-metadata-v1";
 const LIVE_PRIVATE_CLASS: &str = "private-only";
 
 // This is an additional floor, not a replacement for the stored serving policy.
@@ -502,6 +503,10 @@ fn record_descriptor_class(
         descriptor,
     ) {
         LIVE_COMMITTED_WORKSPACE_RLIB_CLASS
+    } else if rabs_key::live_dependency::workspace_dependency_cache::is_committed_workspace_metadata_descriptor(
+        descriptor,
+    ) {
+        LIVE_COMMITTED_WORKSPACE_METADATA_CLASS
     } else {
         match closed_workspace_library_descriptor_class(descriptor) {
             Some(ClosedWorkspaceLibraryClass::Rlib) => LIVE_WORKSPACE_RLIB_CLASS,
@@ -546,6 +551,9 @@ fn recorded_action_risk(
             }
             [SqlValue::Text(class)] if class == LIVE_COMMITTED_WORKSPACE_RLIB_CLASS => {
                 Ok(ActionClassRisk::CommittedWorkspaceRlib)
+            }
+            [SqlValue::Text(class)] if class == LIVE_COMMITTED_WORKSPACE_METADATA_CLASS => {
+                Ok(ActionClassRisk::CommittedWorkspaceMetadata)
             }
             [SqlValue::Text(_)] => Ok(ActionClassRisk::Elevated),
             _ => Err(StoreError::Backend(
@@ -5306,14 +5314,21 @@ mod tests {
         use rabs_key::live_dependency::workspace_cache::{
             plan_closed_workspace_library, remote_closed_workspace_library_key,
         };
-        use rabs_key::live_dependency::{
-            LiveRustcRequest, ToolchainFacts, plan_canonical_workspace_execution,
+        use rabs_key::live_dependency::workspace_dependency_cache::{
+            CommittedWorkspaceDependency, plan_committed_workspace_metadata,
+            plan_committed_workspace_rlib, remote_committed_workspace_metadata_key,
+            remote_committed_workspace_rlib_key,
         };
+        use rabs_key::live_dependency::{
+            DependencyDirectoryFact, DependencySourceKind, ExternFact, LiveRustcRequest,
+            ToolchainFacts, plan_canonical_workspace_execution,
+        };
+        use rabs_protocol::result_identity::OutputRole;
 
         // Exercise the real pure key builder and the production durable receipt
         // writer. Compiler execution is covered by the canonical Cargo fixture.
-        let descriptor = |emit: &str| {
-            let argv = [
+        let descriptor = |emit: &str, committed: bool| {
+            let mut argv = [
                 "/__rabs/toolchain/bin/rustc",
                 "--crate-name=leaf",
                 "--crate-type=lib",
@@ -5323,7 +5338,14 @@ mod tests {
                 "--json=artifacts",
                 "--out-dir=/__rabs/out/cargo/debug/deps",
             ]
-            .map(str::to_owned);
+            .map(str::to_owned)
+            .to_vec();
+            if committed {
+                argv.push("-Ldependency=/__rabs/out/cargo/debug/deps".into());
+                argv.push(
+                    "--extern=upstream=/__rabs/out/cargo/debug/deps/libupstream.rmeta".into(),
+                );
+            }
             let env = [
                 ("CARGO_MANIFEST_DIR", "/__rabs/workspace"),
                 ("CARGO_PKG_NAME", "leaf"),
@@ -5341,7 +5363,14 @@ mod tests {
                 "x86_64-unknown-linux-gnu",
             )
             .unwrap();
-            let plan = plan_closed_workspace_library(&execution).unwrap();
+            let plan = if !committed {
+                plan_closed_workspace_library(&execution)
+            } else if execution.invocation.emit.iter().any(|kind| kind == "link") {
+                plan_committed_workspace_rlib(&execution)
+            } else {
+                plan_committed_workspace_metadata(&execution)
+            }
+            .unwrap();
             let identity =
                 rabs_key::typed_digest::compute("rabs.closed-workspace-class-test.v1", b"fixture");
             let inputs = ActionInputManifest {
@@ -5366,36 +5395,110 @@ mod tests {
                 sysroot_root_digest: identity,
                 runtime_libraries: Vec::new(),
             };
-            remote_closed_workspace_library_key(
-                &plan,
-                &toolchain,
-                &[],
-                &inputs,
-                None,
-                "/__rabs/toolchain",
-                &[39; 32],
-                &rabs_key::typed_digest::compute(
-                    rabs_key::live_dependency::remote::RUNTIME_COHORT_DOMAIN,
-                    b"runtime",
+            let runtime = rabs_key::typed_digest::compute(
+                rabs_key::live_dependency::remote::RUNTIME_COHORT_DOMAIN,
+                b"runtime",
+            );
+            // Pure descriptor facts do not establish a physical installation
+            // witness. The live boundary tests cover that separate authority.
+            let binding = CommittedWorkspaceDependency {
+                path: "/__rabs/out/cargo/debug/deps/libupstream.rmeta".into(),
+                producer_action: rabs_key::typed_digest::compute(
+                    "rabs.closed-workspace-class-test.v1",
+                    b"producer action",
                 ),
-            )
+                producer_descriptor: rabs_key::typed_digest::compute(
+                    "rabs.closed-workspace-class-test.v1",
+                    b"producer descriptor",
+                ),
+                producer_manifest: rabs_key::typed_digest::compute(
+                    "rabs.closed-workspace-class-test.v1",
+                    b"producer manifest",
+                ),
+                role: OutputRole::ProvisionalMetadata,
+                virtual_path: RawBytes::from("libupstream.rmeta"),
+                object: ObjectId(rabs_key::typed_digest::compute(
+                    "rabs.closed-workspace-class-test.v1",
+                    b"exact metadata",
+                )),
+            };
+            let directories = [DependencyDirectoryFact {
+                path: plan.out_dir.clone(),
+                artifacts: vec![ExternFact {
+                    path: binding.path.clone(),
+                    content_digest: binding.object.0.clone(),
+                }],
+            }];
+            let dependencies = [binding];
+            match plan.source_kind {
+                DependencySourceKind::WorkspaceCommittedMetadata => {
+                    remote_committed_workspace_metadata_key(
+                        &plan,
+                        &toolchain,
+                        &directories,
+                        &dependencies,
+                        &inputs,
+                        None,
+                        "/__rabs/toolchain",
+                        &[39; 32],
+                        &runtime,
+                    )
+                }
+                DependencySourceKind::WorkspaceCommittedRlib => {
+                    remote_committed_workspace_rlib_key(
+                        &plan,
+                        &toolchain,
+                        &directories,
+                        &dependencies,
+                        &inputs,
+                        None,
+                        "/__rabs/toolchain",
+                        &[39; 32],
+                        &runtime,
+                    )
+                }
+                _ => remote_closed_workspace_library_key(
+                    &plan,
+                    &toolchain,
+                    &[],
+                    &inputs,
+                    None,
+                    "/__rabs/toolchain",
+                    &[39; 32],
+                    &runtime,
+                ),
+            }
             .unwrap()
             .descriptor
         };
         let descriptors = [
             (
-                descriptor("--emit=dep-info,metadata,link"),
+                descriptor("--emit=dep-info,metadata,link", false),
                 ActionClassRisk::ClosedWorkspaceRlib,
             ),
             (
-                descriptor("--emit=dep-info,metadata"),
+                descriptor("--emit=dep-info,metadata", false),
                 ActionClassRisk::ClosedWorkspaceMetadata,
             ),
+            (
+                descriptor("--emit=dep-info,metadata,link", true),
+                ActionClassRisk::CommittedWorkspaceRlib,
+            ),
+            (
+                descriptor("--emit=dep-info,metadata", true),
+                ActionClassRisk::CommittedWorkspaceMetadata,
+            ),
         ];
-        assert_ne!(
-            compute_action_key(&descriptors[0].0).final_key,
-            compute_action_key(&descriptors[1].0).final_key,
-        );
+        assert_eq!(descriptors[2].0.key_epoch, 6);
+        assert_eq!(descriptors[3].0.key_epoch, 7);
+        for (index, (descriptor, _)) in descriptors.iter().enumerate() {
+            for (other, _) in &descriptors[index + 1..] {
+                assert_ne!(
+                    compute_action_key(descriptor).final_key,
+                    compute_action_key(other).final_key,
+                );
+            }
+        }
         let (state, coord) = submission_coordinator();
         let mut private = Vec::new();
         {

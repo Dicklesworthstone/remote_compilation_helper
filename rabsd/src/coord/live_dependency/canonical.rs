@@ -431,6 +431,21 @@ impl CanonicalPaths {
         Ok(())
     }
 
+    /// Committed metadata caching requires its independently qualified check
+    /// invocation, retained Cargo-selected unit, and executor-free graph.
+    pub(crate) fn require_workspace_committed_metadata(
+        &self,
+        plan: &DependencyActionPlan,
+    ) -> Result<(), String> {
+        rabs_key::live_dependency::workspace_dependency_cache::validate_committed_workspace_metadata_plan(plan)
+            .map_err(|error| error.to_string())?;
+        self.require_workspace_execution(plan)?;
+        if self.closed_dependency_execution_required {
+            return Err("committed workspace metadata caching requires a Cargo graph without project executors".into());
+        }
+        Ok(())
+    }
+
     /// Bind the selected Cargo graph's execution policy before sharing this
     /// capability with the rustc endpoint. Build scripts and procedural macros
     /// can access that endpoint, so wrapper-supplied local completion claims
@@ -1461,6 +1476,70 @@ mod tests {
                 "project executors retain fresh remote execution"
             );
         }
+    }
+
+    #[test]
+    fn committed_workspace_metadata_requires_selected_check_and_executor_free_graph() {
+        use rabs_key::live_dependency::workspace_dependency_cache::{
+            plan_committed_workspace_metadata, plan_committed_workspace_rlib,
+        };
+
+        let (owner, paths) = fixture();
+        std::fs::create_dir_all(owner.path().join("0/app/src")).unwrap();
+        std::fs::write(
+            owner.path().join("0/app/src/lib.rs"),
+            b"pub fn value() {}\n",
+        )
+        .unwrap();
+        let execution = workspace_plan();
+        let metadata = plan_committed_workspace_metadata(&execution).unwrap();
+        assert!(
+            paths
+                .require_workspace_committed_metadata(&metadata)
+                .is_err()
+        );
+        let graph = workspace_graph("path+file:///__rabs/workspace/app#project@0.1.0");
+        let paths = paths
+            .with_workspace_units(graph.workspace_units(), None)
+            .unwrap();
+        paths
+            .require_workspace_committed_metadata(&metadata)
+            .unwrap();
+        assert!(
+            paths
+                .require_workspace_committed_metadata(&execution)
+                .is_err()
+        );
+        assert!(paths.require_workspace_committed_rlib(&metadata).is_err());
+        let mut archive = execution.clone();
+        archive.invocation.emit.push("link".into());
+        archive.outputs = rabs_key::output_derivation::derive_workspace_output_declarations(
+            &archive.invocation,
+            &archive.host_triple,
+        )
+        .unwrap();
+        let archive = plan_committed_workspace_rlib(&archive).unwrap();
+        assert!(
+            paths
+                .require_workspace_committed_metadata(&archive)
+                .is_err()
+        );
+        for mutation in 0..3 {
+            let mut other = metadata.clone();
+            match mutation {
+                0 => other.invocation.crate_name = Some("unselected".into()),
+                1 => other.invocation.features.clear(),
+                _ => other.target_triple = "aarch64-unknown-linux-gnu".into(),
+            }
+            assert!(paths.require_workspace_committed_metadata(&other).is_err());
+        }
+        let guarded = paths.require_closed_dependency_execution().unwrap();
+        assert!(
+            guarded
+                .require_workspace_committed_metadata(&metadata)
+                .is_err()
+        );
+        guarded.require_workspace_execution(&execution).unwrap();
     }
 
     #[test]
