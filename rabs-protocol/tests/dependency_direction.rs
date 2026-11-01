@@ -13,12 +13,12 @@
 //!   (currently: `rabs-protocol`), keeping them runnable in the
 //!   deterministic lab and plain unit tests with zero runtime.
 //!
-//! Implementation note: this reads `[dependencies]` sections of the crate
-//! manifests textually rather than shelling out to `cargo metadata`, so the
-//! check stays hermetic (no process effects, no network) and needs no extra
-//! dependencies. `[dev-dependencies]` are exempt: test-only tooling does
+//! Implementation note: a test-only TOML parser reads ordinary and all
+//! target-specific runtime dependencies, resolving renamed packages without
+//! invoking Cargo or the network. `[dev-dependencies]` are exempt: test-only tooling does
 //! not ship in the crates' dependency cones.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -66,35 +66,53 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Extract the dependency names declared in the `[dependencies]` section of
-/// a manifest (not `[dev-dependencies]`, not `[build-dependencies]`).
-fn runtime_dependency_names(manifest: &str) -> Vec<String> {
-    let mut deps = Vec::new();
-    let mut in_runtime_deps = false;
-    for raw in manifest.lines() {
-        let line = raw.trim();
-        if line.starts_with('[') {
-            in_runtime_deps = line == "[dependencies]";
-            continue;
-        }
-        if !in_runtime_deps || line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some(name) = line.split('=').next() {
-            let name = name.trim().trim_matches('"');
-            if !name.is_empty() {
-                deps.push(name.to_string());
+/// Extract actual package names from ordinary and target-specific runtime
+/// declarations, including renamed and table-form dependencies.
+fn runtime_dependency_names(manifest: &str, workspace: &toml::Value) -> Vec<String> {
+    let manifest: toml::Value = toml::from_str(manifest).expect("valid Cargo manifest");
+    let mut deps = BTreeSet::new();
+    let mut tables = vec![&manifest];
+    if let Some(targets) = manifest.get("target").and_then(toml::Value::as_table) {
+        tables.extend(targets.values());
+    }
+    for table in tables {
+        if let Some(declarations) = table.get("dependencies").and_then(toml::Value::as_table) {
+            for (name, specification) in declarations {
+                let specification = if specification
+                    .get("workspace")
+                    .and_then(toml::Value::as_bool)
+                    == Some(true)
+                {
+                    workspace
+                        .get("workspace")
+                        .and_then(|workspace| workspace.get("dependencies"))
+                        .and_then(|deps| deps.get(name))
+                        .expect("inherited dependency must exist in the workspace")
+                } else {
+                    specification
+                };
+                deps.insert(
+                    specification
+                        .get("package")
+                        .and_then(toml::Value::as_str)
+                        .unwrap_or(name)
+                        .to_owned(),
+                );
             }
         }
     }
-    deps
+    deps.into_iter().collect()
 }
 
 fn load_deps(crate_name: &str) -> Vec<String> {
     let path = workspace_root().join(crate_name).join("Cargo.toml");
     let manifest =
         fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
-    runtime_dependency_names(&manifest)
+    let workspace: toml::Value = toml::from_str(
+        &fs::read_to_string(workspace_root().join("Cargo.toml")).expect("read workspace manifest"),
+    )
+    .expect("valid workspace manifest");
+    runtime_dependency_names(&manifest, &workspace)
 }
 
 #[test]
@@ -160,6 +178,38 @@ rabs-protocol = { path = "../rabs-protocol" }
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 "#;
-    let deps = runtime_dependency_names(sample);
+    let deps = runtime_dependency_names(sample, &toml::Table::new().into());
     assert_eq!(deps, vec!["rabs-protocol".to_string()]);
+}
+
+#[test]
+fn platform_and_renamed_runtime_dependencies_cannot_hide_from_direction_checks() {
+    let sample = r#"
+[dependencies]
+pure-alias = { package = "rabs-protocol", version = "1" }
+[target.'cfg(unix)'.dependencies]
+hidden-runtime = { package = "tokio", version = "1", features = [
+    "full",
+] }
+inherited-runtime = { workspace = true }
+[target.'cfg(windows)'.dependencies.server]
+package = "hyper"
+version = "1"
+[target.'cfg(unix)'.dev-dependencies]
+reqwest = "1"
+[build-dependencies]
+ureq = "1"
+"#;
+    let workspace = toml::from_str(
+        "[workspace.dependencies]\ninherited-runtime = { package = 'asupersync', version = '1' }",
+    )
+    .unwrap();
+    let deps = runtime_dependency_names(sample, &workspace);
+    assert_eq!(deps, ["asupersync", "hyper", "rabs-protocol", "tokio"]);
+    assert_eq!(
+        deps.iter()
+            .filter(|dep| FORBIDDEN_IN_DOMAIN.contains(&dep.as_str()))
+            .count(),
+        3,
+    );
 }

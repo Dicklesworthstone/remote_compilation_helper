@@ -13,11 +13,15 @@
 //! plain-MIT metadata (risk R72).
 //!
 //! Scope note (honest boundary): these are DIRECT-dependency budgets from
-//! textual manifest scans. The transitive-cone inventory (cargo-tree based,
+//! parsed manifests, including all target-specific declarations. The union
+//! counts a dependency name once across platforms, but distinct renamed
+//! packages remain separate edges. Dev/build dependencies do not count.
+//! The transitive-cone inventory (cargo-tree based,
 //! per critical binary) needs CI plumbing and lands when the rabs CI job is
 //! wired; until then the A002 direction gate + these budgets bound what a
 //! direct edge can pull in.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -91,35 +95,87 @@ fn manifest_of(krate: &str) -> String {
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-fn runtime_dep_count(manifest: &str) -> usize {
-    let mut n = 0;
-    let mut in_deps = false;
-    for raw in manifest.lines() {
-        let line = raw.trim();
-        if line.starts_with('[') {
-            in_deps = line == "[dependencies]";
-            continue;
-        }
-        if in_deps && !line.is_empty() && !line.starts_with('#') {
-            n += 1;
+fn runtime_dep_count(manifest: &str, workspace: &toml::Value) -> usize {
+    let manifest: toml::Value = toml::from_str(manifest).expect("valid Cargo manifest");
+    let mut edges = BTreeSet::new();
+    let mut tables = vec![&manifest];
+    if let Some(targets) = manifest.get("target").and_then(toml::Value::as_table) {
+        tables.extend(targets.values());
+    }
+    for table in tables {
+        if let Some(deps) = table.get("dependencies").and_then(toml::Value::as_table) {
+            for (name, specification) in deps {
+                let specification = if specification
+                    .get("workspace")
+                    .and_then(toml::Value::as_bool)
+                    == Some(true)
+                {
+                    workspace
+                        .get("workspace")
+                        .and_then(|workspace| workspace.get("dependencies"))
+                        .and_then(|deps| deps.get(name))
+                        .expect("inherited dependency must exist in the workspace")
+                } else {
+                    specification
+                };
+                let package = specification
+                    .get("package")
+                    .and_then(toml::Value::as_str)
+                    .unwrap_or(name);
+                edges.insert((name.clone(), package.to_owned()));
+            }
         }
     }
-    n
+    edges.len()
 }
 
 #[test]
 fn direct_dependency_budgets_hold() {
+    let workspace: toml::Value = toml::from_str(
+        &fs::read_to_string(workspace_root().join("Cargo.toml")).expect("read workspace manifest"),
+    )
+    .expect("valid workspace manifest");
+    let mut violations = Vec::new();
     for (krate, budget, rationale) in BUDGETS {
-        let count = runtime_dep_count(&manifest_of(krate));
-        assert!(
-            count <= *budget,
-            "dependency budget exceeded for `{krate}`: {count} direct \
-             runtime deps > budget {budget} ({rationale}). If the new \
-             dependency is genuinely required, review it and raise the \
-             budget in rabs-protocol/tests/dependency_budget.rs in the \
-             SAME change, stating why (bead A012)"
-        );
+        let count = runtime_dep_count(&manifest_of(krate), &workspace);
+        if count > *budget {
+            violations.push(format!(
+                "`{krate}`: {count} direct runtime deps > budget {budget} ({rationale})"
+            ));
+        }
     }
+    assert!(
+        violations.is_empty(),
+        "dependency budgets exceeded (A012; changes require review):\n{}",
+        violations.join("\n"),
+    );
+}
+
+#[test]
+fn budgets_include_platform_edges_without_counting_development_or_multiline_fields() {
+    let sample = r#"
+[dependencies]
+shared = { version = "1", features = [
+    "one",
+    "two",
+] }
+[target.'cfg(unix)'.dependencies]
+shared = { workspace = true }
+[target.'cfg(windows)'.dependencies.hidden]
+package = "platform-runtime"
+version = "1"
+[target.'cfg(unix)'.dependencies.hidden]
+package = "other-runtime"
+version = "1"
+[dev-dependencies]
+test-only = "1"
+[build-dependencies]
+build-only = "1"
+[target.'cfg(unix)'.dev-dependencies]
+platform-test-only = "1"
+"#;
+    let workspace = toml::from_str("[workspace.dependencies]\nshared = '1'").unwrap();
+    assert_eq!(runtime_dep_count(sample, &workspace), 3);
 }
 
 #[test]

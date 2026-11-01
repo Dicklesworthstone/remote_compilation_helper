@@ -5,6 +5,9 @@
 //! on a Linux host permitting bubblewrap's full canonical namespace.
 //! The remote test additionally needs matching `RABS_TEST_WORKER_BIN=/abs/rabs-wkr`
 //! and OpenSSL; it creates real mutual TLS credentials and a loopback worker.
+//! `RABS_CANONICAL_TEST_DAEMON` explicitly selects an already built daemon;
+//! otherwise Cargo's companion is used. The invoking runner must bind selected
+//! tools to their source and hashes; the harness profile is reported separately.
 #![cfg(target_os = "linux")]
 
 use rabs_asupersync::process_groups::ManagedProcessGroup;
@@ -23,6 +26,41 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+fn selected_daemon(explicit: Option<PathBuf>) -> PathBuf {
+    let binary = explicit.unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_rabsd")));
+    assert!(
+        binary.is_absolute(),
+        "canonical test daemon must be absolute"
+    );
+    let metadata = fs::metadata(&binary).expect("canonical test daemon must exist");
+    assert!(
+        metadata.is_file() && metadata.mode() & 0o111 != 0,
+        "canonical test daemon must be an executable file"
+    );
+    binary
+}
+
+fn daemon_binary() -> PathBuf {
+    selected_daemon(std::env::var_os("RABS_CANONICAL_TEST_DAEMON").map(PathBuf::from))
+}
+
+#[test]
+fn canonical_daemon_selection_is_explicit_and_refuses_unusable_paths() {
+    assert_eq!(
+        selected_daemon(None),
+        PathBuf::from(env!("CARGO_BIN_EXE_rabsd"))
+    );
+    let executable = std::env::current_exe().unwrap();
+    assert_eq!(selected_daemon(Some(executable.clone())), executable);
+    let directory = tempfile::tempdir().unwrap();
+    for path in [
+        PathBuf::from("relative-daemon"),
+        directory.path().to_owned(),
+    ] {
+        assert!(std::panic::catch_unwind(|| selected_daemon(Some(path))).is_err());
+    }
+}
 
 fn write(root: &Path, relative: &str, bytes: impl AsRef<[u8]>) {
     let path = root.join(relative);
@@ -347,7 +385,7 @@ fn run_with_stdin(
 ) -> (i32, Vec<Value>, String) {
     let path = root.join(format!("profile-{number}.json"));
     fs::write(&path, serde_json::to_vec(profile).unwrap()).unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_rabsd"));
+    let mut command = Command::new(daemon_binary());
     command
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
@@ -703,7 +741,7 @@ fn shared_service_shutdown_allows_cleanup_and_rejects_escalation_or_nonzero_exit
 }
 
 fn shared_service_command(root: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_rabsd"));
+    let mut command = Command::new(daemon_binary());
     command
         .env_clear()
         .env("PATH", "/usr/bin:/bin")

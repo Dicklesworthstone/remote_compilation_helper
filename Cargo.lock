@@ -5227,6 +5227,9 @@ dependencies = [
 [[package]]
 name = "rabs-protocol"
 version = "2.1.34"
+dependencies = [
+ "toml",
+]
 
 [[package]]
 name = "rabs-replay"

@@ -18,5 +18,10 @@ doctest = false
 # Dependency-direction CI (bead A002) enforces this.
 [dependencies]
 
+[dev-dependencies]
+# Hermetic manifest guards must parse platform sections and renamed packages.
+# Test-only: the protocol's shipped runtime cone remains empty.
+toml = { workspace = true }
+
 [lints.rust]
 unsafe_code = "forbid"
