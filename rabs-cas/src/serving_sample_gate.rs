@@ -54,13 +54,17 @@ use crate::trust_evidence::{
 /// authoritative stock during sampled serving.
 pub const SERVING_SAMPLE_QUARANTINE_REASON: &str = "k008-served-divergence";
 
-/// Risk tier of an action CLASS (plan §113). Only low-risk registry
-/// classes are eligible for sampled serving at all.
+/// Risk tier of an action CLASS (plan §113). Only explicitly bounded classes
+/// are eligible for sampled serving; unknown workspace actions remain private.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionClassRisk {
     /// Registry/git dependency actions (first served class, M4).
     LowRiskRegistry,
-    /// Anything else: workspace outputs, tool-generated code, unknown
+    /// Complete-workspace pure Rust leaf-library archives, qualified by the
+    /// retained Cargo graph and closed remote execution profile. This does not
+    /// inherit the dependency class's optional SPRT promotion evidence.
+    ClosedWorkspaceRlib,
+    /// Anything else: general workspace outputs, tool-generated code, unknown
     /// classes. Never sampled.
     Elevated,
 }

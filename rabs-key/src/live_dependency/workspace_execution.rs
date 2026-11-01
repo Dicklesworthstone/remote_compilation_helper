@@ -80,10 +80,7 @@ pub(super) fn resolved_workspace_source(cwd: &str, source: &str) -> Option<Strin
 /// # Errors
 /// A nonworkspace plan, stdin, or a source outside the complete retained tree.
 pub fn workspace_source_path(plan: &DependencyActionPlan) -> Result<String, LiveRefusal> {
-    if !plan.canonical_cargo
-        || plan.source_kind != DependencySourceKind::WorkspaceExecutionOnly
-        || plan.source_root != WORKSPACE
-    {
+    if !plan.canonical_cargo || !plan.source_kind.is_workspace() || plan.source_root != WORKSPACE {
         return Err(LiveRefusal::Facts(
             "workspace source resolution requires its retained canonical execution class".into(),
         ));
@@ -115,7 +112,7 @@ pub(super) fn workspace_layout(plan: &DependencyActionPlan) -> Result<(), LiveRe
         ));
     }
     if !plan.canonical_cargo
-        || plan.source_kind != DependencySourceKind::WorkspaceExecutionOnly
+        || !plan.source_kind.is_workspace()
         || plan.source_root != WORKSPACE
         || plan.source_dir_name != "workspace"
         || plan.directory_source_manifest.is_some()
@@ -214,6 +211,7 @@ pub fn remote_workspace_execution_shape(
     directories: &[DependencyDirectoryFact],
     toolchain_root: &str,
 ) -> Result<(), RemoteDependencyRefusal> {
+    require_execution_only(plan)?;
     workspace_layout(plan)?;
     remote::remote_execution_shape(plan, directories, toolchain_root)
 }
@@ -223,6 +221,7 @@ pub fn remote_workspace_execution_shape(
 pub fn remote_workspace_execution_isolation_policy(
     plan: &DependencyActionPlan,
 ) -> Result<TypedDigest, RemoteDependencyRefusal> {
+    require_execution_only(plan)?;
     workspace_layout(plan)?;
     let output_class = remote::remote_dependency_output_class(&plan.invocation)?;
     let mode = match output_class {
@@ -243,6 +242,15 @@ pub fn remote_workspace_execution_isolation_policy(
         policy.str(remote::CANONICAL_FOREIGN_NATIVE_ISOLATION_EXTENSION);
     }
     Ok(compute(POLICY_DOMAIN, &policy.finish()))
+}
+
+fn require_execution_only(plan: &DependencyActionPlan) -> Result<(), LiveRefusal> {
+    if plan.source_kind != DependencySourceKind::WorkspaceExecutionOnly {
+        return Err(LiveRefusal::Facts(
+            "fresh workspace execution requires its distinct execution-only source class".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Bind one canonical workspace request's complete retained execution inputs.

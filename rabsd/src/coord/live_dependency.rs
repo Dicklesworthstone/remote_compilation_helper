@@ -123,8 +123,10 @@ impl LiveDependencyRequest {
     }
 
     fn verify_read_closure(&self) -> Result<(), String> {
-        if self.is_execution_only() {
-            return Err("workspace execution requires a fresh isolated remote compiler".into());
+        if self.plan.source_kind.is_workspace() {
+            return Err(
+                "workspace actions require an independently isolated remote compiler".into(),
+            );
         }
         if self.plan.canonical_cargo != self.canonical_paths.is_some() {
             return Err("canonical compiler plan lacks its retained driver capability".into());
@@ -166,7 +168,7 @@ impl LiveDependencyRequest {
     }
 
     fn verify_output_contract(&self) -> Result<(), String> {
-        let expected = if self.is_execution_only() {
+        let expected = if self.plan.source_kind.is_workspace() {
             rabs_key::output_derivation::derive_workspace_output_declarations(
                 &self.plan.invocation,
                 &self.plan.host_triple,
@@ -1359,12 +1361,10 @@ impl ExecutionAttempt {
         physical_outputs: &Path,
         remote_receipt: Option<&serde_json::Value>,
     ) -> Result<CapturedLocalResult, String> {
-        if self.request.is_execution_only()
+        if self.request.plan.source_kind.is_workspace()
             && (remote_receipt.is_none() || self.remote_validation.is_none())
         {
-            return Err(
-                "workspace execution-only results require authenticated remote capture".into(),
-            );
+            return Err("workspace results require authenticated remote capture".into());
         }
         self.request
             .verify_enforced_read_closure(self.remote_validation.as_ref())?;

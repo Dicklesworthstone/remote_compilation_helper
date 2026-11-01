@@ -360,7 +360,7 @@ impl PackageFacts {
         &self,
         plan: &DependencyActionPlan,
     ) -> Result<Vec<DirectoryEnumeration>, String> {
-        if self.source_kind != DependencySourceKind::WorkspaceExecutionOnly
+        if !self.source_kind.is_workspace()
             || plan.source_kind != self.source_kind
             || !plan.canonical_cargo
             || plan.source_root != rabs_sandbox::layout::WORKSPACE

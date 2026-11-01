@@ -19,9 +19,8 @@ use rabs_protocol::input_evidence::ActionInputManifest;
 use rabs_protocol::result_identity::TypedDigest;
 
 use super::{
-    DependencyActionPlan, DependencyDirectoryFact, DependencySourceKind, ExternFact,
-    LiveDependencyKey, LiveRefusal, PlannedExtern, ToolchainFacts, live_dependency_key,
-    plain_path_in_profile, within,
+    DependencyActionPlan, DependencyDirectoryFact, ExternFact, LiveDependencyKey, LiveRefusal,
+    PlannedExtern, ToolchainFacts, live_dependency_key, plain_path_in_profile, within,
 };
 use crate::action_key::compute_action_key;
 use crate::canonical::CanonicalEncoder;
@@ -712,9 +711,9 @@ pub fn remote_dependency_shape(
 fn reject_workspace_cache_authority(
     plan: &DependencyActionPlan,
 ) -> Result<(), RemoteDependencyRefusal> {
-    if plan.source_kind == DependencySourceKind::WorkspaceExecutionOnly {
+    if plan.source_kind.is_workspace() {
         return Err(LiveRefusal::Facts(
-            "workspace execution-only plans have no remote dependency-cache authority".into(),
+            "workspace plans have no remote dependency-cache authority".into(),
         )
         .into());
     }
@@ -752,7 +751,7 @@ pub(super) fn remote_execution_shape(
         return Err(RemoteDependencyRefusal::NativeInputs);
     }
     remote_dependency_output_class(&plan.invocation)?;
-    let derived = if plan.source_kind == DependencySourceKind::WorkspaceExecutionOnly {
+    let derived = if plan.source_kind.is_workspace() {
         derive_workspace_output_declarations(&plan.invocation, &plan.host_triple)
     } else {
         derive_dependency_output_declarations(&plan.invocation, &plan.host_triple)

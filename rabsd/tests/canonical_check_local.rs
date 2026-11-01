@@ -4160,6 +4160,499 @@ fn canonical_cargo_build_offloads_archives_replays_and_delivers_a_working_binary
     remote_dependency_replay("build", GeneratedDependency::None);
 }
 
+fn closed_workspace_leaf_source(root: &Path) {
+    write(
+        root,
+        "Cargo.toml",
+        "[workspace]\nmembers=['member']\nresolver='2'\n",
+    );
+    write(
+        root,
+        "Cargo.lock",
+        "version=4\n\n[[package]]\nname='canonical_workspace_leaf'\nversion='0.1.0'\n",
+    );
+    write(
+        root,
+        "member/Cargo.toml",
+        "[package]\nname='canonical_workspace_leaf'\nversion='0.1.0'\nedition='2021'\n",
+    );
+    write(
+        root,
+        "member/src/lib.rs",
+        r#"pub const INPUT: &str = include_str!("../../shared/value.txt");
+pub const ENVIRONMENT: &str = env!("WORKSPACE_LEAF_INPUT");
+pub const PRIMARY: &str = env!("CARGO_PRIMARY_PACKAGE");
+core::arch::global_asm!(
+    ".section .rodata",
+    ".global canonical_workspace_untracked",
+    "canonical_workspace_untracked:",
+    ".incbin \"/__rabs/workspace/shared/untracked.bin\"",
+);
+fn retained_workspace_warning() {}
+"#,
+    );
+    write(root, "shared/value.txt", "first source input\n");
+    write(root, "shared/untracked.bin", b"first assembler input\0");
+    write(
+        root,
+        "directory-observations/existing/marker",
+        "retained directory\n",
+    );
+}
+
+/// Read only user-delivered artifacts and the exact Cargo compiler-message
+/// lines. Each call must have a fresh target; Cargo freshness cannot satisfy
+/// this action-cache acceptance test.
+fn closed_workspace_leaf_outputs(
+    events: &[Value],
+    output: &str,
+) -> (PathBuf, BTreeMap<String, Vec<u8>>, Vec<String>) {
+    const NAME: &str = "canonical_workspace_leaf";
+    let completed = events
+        .iter()
+        .filter(|event| event["kind"] == "canonical-build-completed")
+        .collect::<Vec<_>>();
+    assert_eq!(completed.len(), 1, "{output}");
+    let target = PathBuf::from(completed[0]["target_directory"].as_str().unwrap());
+    let artifacts = output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| event["reason"] == "compiler-artifact" && event["target"]["name"] == NAME)
+        .collect::<Vec<_>>();
+    assert_eq!(artifacts.len(), 1, "{output}");
+    assert_eq!(
+        artifacts[0]["fresh"], false,
+        "private Cargo freshness must not replace a compiler request: {output}"
+    );
+    let delivered = delivered_cargo_outputs(&target, output, NAME, "rlib");
+    assert_eq!(delivered.len(), 1, "{output}");
+    let mut files = BTreeMap::new();
+    for entry in fs::read_dir(target.join("debug/deps")).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().into_string().unwrap();
+        if !(name.starts_with(&format!("{NAME}-")) || name.starts_with(&format!("lib{NAME}-"))) {
+            continue;
+        }
+        let extension = entry
+            .path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            matches!(extension.as_str(), "rlib" | "rmeta" | "d"),
+            "unexpected leaf compiler output {name}"
+        );
+        assert!(entry.file_type().unwrap().is_file());
+        let bytes = read_bounded(&entry.path());
+        assert!(!bytes.is_empty(), "empty compiler output {name}");
+        if extension == "rlib" {
+            assert!(bytes.starts_with(b"!<arch>\n"));
+            assert_eq!(bytes, read_bounded(&delivered[0]));
+        }
+        if extension == "d" {
+            assert!(
+                !String::from_utf8_lossy(&bytes).contains("shared/untracked.bin"),
+                "this fixture must exercise an assembler input absent from dep-info"
+            );
+        }
+        files.insert(name, bytes);
+    }
+    for extension in ["rlib", "d"] {
+        assert_eq!(
+            files
+                .keys()
+                .filter(|name| name.ends_with(&format!(".{extension}")))
+                .count(),
+            1,
+            "expected exactly one required {extension} output"
+        );
+    }
+    assert!(
+        matches!(files.len(), 2 | 3),
+        "only Cargo's optional detached metadata may accompany the archive and dep-info"
+    );
+    let diagnostics = output
+        .lines()
+        .filter(|line| {
+            serde_json::from_str::<Value>(line).is_ok_and(|event| {
+                event["reason"] == "compiler-message" && event["target"]["name"] == NAME
+            })
+        })
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|line| line.contains("retained_workspace_warning")),
+        "the acceptance fixture must exercise diagnostic replay: {output}"
+    );
+    (target, files, diagnostics)
+}
+
+/// Inspect the real store only after its producing CLI has exited. Initial
+/// publication is not a comparison; only later independently admitted matching
+/// attempts may supply the two samples required by the unchanged serving gate.
+fn assert_closed_workspace_leaf_evidence(root: &Path, key: &str, executions: usize) {
+    use rabs_cas::metadata_store::{RabsMetadataStore, SqlValue};
+
+    let cas =
+        rabsd::janitor::store::mount_and_reconcile(&root.join("state/canonical-compile-v1/cas"))
+            .unwrap();
+    let mut store = cas.store().lock().unwrap();
+    assert!(store.published_manifest_key_str(key).unwrap().is_some());
+    assert!(store.has_serving_state_key(key).unwrap());
+    assert!(store.has_evidence_key(key).unwrap());
+    assert_eq!(
+        store.query(
+            "SELECT decision FROM decision_receipts WHERE kind = ?1 AND subject = ?2 AND seq = 0",
+            &[
+                SqlValue::Text("rabs-live-action-class-v1".into()),
+                SqlValue::Text(key.to_owned()),
+            ],
+        ).unwrap(),
+        vec![vec![SqlValue::Text("rustc-workspace-closed-rlib-v1".into())]],
+        "workspace publication must derive its own class from the submitted descriptor"
+    );
+    let attempts = store
+        .query(
+            "SELECT a.id_hex FROM action_attempts a JOIN action_generations g \
+             ON a.generation_hex = g.id_hex WHERE g.action_key = ?1",
+            &[SqlValue::Text(key.to_owned())],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|row| match row.as_slice() {
+            [SqlValue::Text(attempt)] => attempt.clone(),
+            _ => panic!("invalid actual workspace attempt: {row:?}"),
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(attempts.len(), executions);
+    let samples = store
+        .query(
+            "SELECT attempt_hex, passed FROM verification_samples WHERE action_key = ?1",
+            &[SqlValue::Text(key.to_owned())],
+        )
+        .unwrap();
+    let compared = samples
+        .iter()
+        .map(|row| match row.as_slice() {
+            [SqlValue::Text(attempt), SqlValue::Int(1)] => {
+                assert!(attempts.contains(attempt));
+                attempt.clone()
+            }
+            _ => panic!("workspace comparison did not pass: {row:?}"),
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(compared.len(), samples.len());
+    assert_eq!(compared.len(), executions - 1);
+}
+
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual complete-workspace leaf archive sampling, replay, invalidation and settled fallback"]
+fn canonical_cargo_workspace_leaf_archives_earn_hits_with_complete_source_closure() {
+    const NAME: &str = "canonical_workspace_leaf";
+    let (owner, mut profile) = native_fixture();
+    let root = owner.path();
+    let first = root.join("leaf-a");
+    let second = root.join("leaf-b");
+    closed_workspace_leaf_source(&first);
+    closed_workspace_leaf_source(&second);
+    profile["source_root"] = json!(first);
+    profile["vendor"] = Value::Null;
+    profile["command"] = json!("build");
+    profile["selection"] = json!({"lib":true});
+    profile["env"] = json!({"WORKSPACE_LEAF_INPUT":"first environment"});
+    assert!(profile.get("target_cache").is_none());
+    let (mut worker, environment) = NativeWorker::start(root);
+    let mut baseline = None;
+    let mut key = None;
+    let mut request_ids = BTreeSet::new();
+    let mut targets = BTreeSet::new();
+
+    for number in 1..=3 {
+        let (code, events, output) =
+            run_with_environment(root, 700 + number, &profile, &environment);
+        assert_eq!(code, 0, "{output}\nworker: {:?}", worker.events());
+        let offered = decisions(&events, "remote-offer");
+        assert_eq!(offered.len(), 1, "{output}");
+        let actual = &offered[NAME];
+        assert!(decisions(&events, "execute").is_empty(), "{output}");
+        assert!(
+            decisions(&events, "hit").is_empty(),
+            "unearned hit: {output}"
+        );
+        assert!(
+            events.iter().any(|event| {
+                event["kind"] == "rabsd-remote-dependency-executed" && event["key"] == *actual
+            }),
+            "a qualifying sample did not execute on the worker: {output}"
+        );
+        let (target, files, diagnostics) = closed_workspace_leaf_outputs(&events, &output);
+        assert!(targets.insert(target));
+        if let Some(expected) = &baseline {
+            assert_eq!(
+                &(files, diagnostics),
+                expected,
+                "independent native results differ"
+            );
+            assert_eq!(
+                key.as_ref(),
+                Some(actual),
+                "fresh Cargo roots split the action identity"
+            );
+        } else {
+            baseline = Some((files, diagnostics));
+            key = Some(actual.clone());
+        }
+        let receipt = worker.completed_receipt();
+        assert!(request_ids.insert(receipt["request_id"].as_u64().unwrap()));
+        assert_closed_workspace_leaf_evidence(root, actual, number as usize);
+    }
+    let key = key.unwrap();
+    let baseline = baseline.unwrap();
+    let journal = read_bounded(&worker.state.join("requests.json"));
+    let executions = worker
+        .events()
+        .into_iter()
+        .filter(|event| event["kind"] == "worker-toolchain-acquired")
+        .count();
+    assert_eq!(executions, 3);
+
+    for (number, source) in [(4, &first), (5, &second)] {
+        profile["source_root"] = json!(source);
+        let (code, events, output) =
+            run_with_environment(root, 700 + number, &profile, &environment);
+        assert_eq!(code, 0, "{output}");
+        assert_eq!(
+            decisions(&events, "hit"),
+            BTreeMap::from([(NAME.to_owned(), key.clone())]),
+            "{output}"
+        );
+        assert!(decisions(&events, "remote-offer").is_empty(), "{output}");
+        assert!(decisions(&events, "execute").is_empty(), "{output}");
+        assert!(
+            !events.iter().any(|event| matches!(
+                event["kind"].as_str(),
+                Some("rabsd-remote-dependency-admitted" | "rabsd-remote-dependency-executed")
+            )),
+            "a trained hit admitted or executed a remote action: {output}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event["decision"] == "served" && event["key"] == key),
+            "{output}"
+        );
+        let (target, files, diagnostics) = closed_workspace_leaf_outputs(&events, &output);
+        assert!(targets.insert(target));
+        assert_eq!(
+            (files, diagnostics),
+            baseline,
+            "cache replay changed native output bytes"
+        );
+        assert_eq!(
+            read_bounded(&worker.state.join("requests.json")),
+            journal,
+            "a cache hit reached the worker execution journal"
+        );
+        assert_eq!(
+            worker
+                .events()
+                .into_iter()
+                .filter(|event| event["kind"] == "worker-toolchain-acquired")
+                .count(),
+            executions
+        );
+        assert_closed_workspace_leaf_evidence(root, &key, 3);
+    }
+
+    let mut previous_key = key;
+    let mut previous_files = baseline.0;
+    for number in 6..=9 {
+        match number {
+            6 => write(
+                &second,
+                "shared/value.txt",
+                "changed source outside the member\n",
+            ),
+            7 => write(
+                &second,
+                "shared/untracked.bin",
+                b"changed assembler-only input\0",
+            ),
+            8 => profile["env"]["WORKSPACE_LEAF_INPUT"] = json!("changed environment"),
+            // The public source transfer preserves file-containing directories.
+            // Original empty directories are not part of that initial contract;
+            // action-key unit tests separately cover retained empty directories.
+            9 => write(
+                &second,
+                "directory-observations/newly-present/marker",
+                "new directory member\n",
+            ),
+            _ => unreachable!(),
+        }
+        let (code, events, output) =
+            run_with_environment(root, 700 + number, &profile, &environment);
+        assert_eq!(code, 0, "{output}");
+        let offered = decisions(&events, "remote-offer");
+        assert_eq!(
+            offered.len(),
+            1,
+            "changed input did not reach the worker: {output}"
+        );
+        assert!(
+            decisions(&events, "hit").is_empty(),
+            "changed input replayed: {output}"
+        );
+        assert!(decisions(&events, "execute").is_empty(), "{output}");
+        assert_ne!(
+            offered[NAME], previous_key,
+            "input change retained the action identity"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event["kind"] == "rabsd-remote-dependency-executed"
+                    && event["key"] == offered[NAME]),
+            "{output}"
+        );
+        let (target, files, _) = closed_workspace_leaf_outputs(&events, &output);
+        assert!(targets.insert(target));
+        if number == 9 {
+            assert_eq!(
+                files, previous_files,
+                "an unconsumed directory member changed compiler bytes"
+            );
+        } else {
+            assert_ne!(
+                files, previous_files,
+                "changed semantic input reused prior compiler bytes"
+            );
+        }
+        assert!(request_ids.insert(worker.completed_receipt()["request_id"].as_u64().unwrap()));
+        assert_closed_workspace_leaf_evidence(root, &offered[NAME], 1);
+        previous_key = offered[NAME].clone();
+        previous_files = files;
+    }
+
+    // The same ordinary library remains supported for fresh worker execution
+    // when its selected graph adds project code. It must lose all replay and
+    // publication authority, even after the closed leaf class has earned hits.
+    write(
+        &second,
+        "member/build.rs",
+        "fn main() { println!(\"cargo:warning=WORKSPACE_EXECUTOR_RAN\"); }\n",
+    );
+    let mut private_attempts = BTreeMap::new();
+    for number in 10..=11 {
+        let (code, events, output) =
+            run_with_environment(root, 700 + number, &profile, &environment);
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("WORKSPACE_EXECUTOR_RAN"), "{output}");
+        let offered = decisions(&events, "remote-offer");
+        assert_eq!(offered.len(), 1, "{output}");
+        assert_fresh_workspace_execution(
+            root,
+            &events,
+            &output,
+            NAME,
+            &offered[NAME],
+            &mut private_attempts,
+        );
+        assert!(request_ids.insert(worker.completed_receipt()["request_id"].as_u64().unwrap()));
+    }
+    worker.finish();
+}
+
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; denied archive input must drain the real worker before stock Cargo fallback and never publish"]
+fn canonical_workspace_leaf_denied_input_falls_back_only_after_worker_settlement() {
+    use rabs_cas::metadata_store::{RabsMetadataStore, SqlValue};
+
+    const NAME: &str = "canonical_workspace_leaf";
+    let (owner, mut profile) = native_fixture();
+    let root = owner.path();
+    let source = root.join("leaf-denied-input");
+    closed_workspace_leaf_source(&source);
+    // Canonical Cargo has its own procfs. The stricter archive worker does not,
+    // so this actual compiler read must fail privately rather than acquire a
+    // successful result or turn a local completion into remote cache evidence.
+    write(
+        &source,
+        "member/src/lib.rs",
+        "pub const PROCESS: &str = include_str!(\"/proc/self/status\");\n",
+    );
+    profile["source_root"] = json!(source);
+    profile["vendor"] = Value::Null;
+    profile["command"] = json!("build");
+    profile["selection"] = json!({"lib":true});
+    let (worker, environment) = NativeWorker::start(root);
+    let mut requests = BTreeSet::new();
+    for number in 1..=2 {
+        let (code, events, output) =
+            run_with_environment(root, 800 + number, &profile, &environment);
+        assert_eq!(
+            code, 0,
+            "stock canonical Cargo must compile after settled refusal: {output}"
+        );
+        let offered = decisions(&events, "remote-offer");
+        assert_eq!(offered.len(), 1, "{output}");
+        let key = &offered[NAME];
+        assert!(
+            events
+                .iter()
+                .any(|event| event["kind"] == "rabsd-remote-dependency-failed"
+                    && event["key"] == *key),
+            "the denied read did not run in the strict worker: {output}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["kind"] == "rabsd-remote-dependency-executed"
+                    && event["key"] == *key),
+            "failed private output became an accepted result: {output}"
+        );
+        assert!(decisions(&events, "hit").is_empty(), "{output}");
+        assert!(
+            decisions(&events, "execute").is_empty(),
+            "local fallback acquired capture authority: {output}"
+        );
+        let journal: Value =
+            serde_json::from_slice(&read_bounded(&worker.state.join("requests.json"))).unwrap();
+        let last = &journal["last"];
+        assert!(requests.insert(last["request_id"].as_u64().unwrap()));
+        assert_eq!(
+            last["resolved"], true,
+            "fallback preceded worker resolution: {journal}"
+        );
+        assert_eq!(last["receipt"]["executed"], true, "{journal}");
+        assert_ne!(last["receipt"]["exit_code"], 0, "{journal}");
+        assert_eq!(last["receipt"]["residual_group_members"], 0, "{journal}");
+        assert_eq!(
+            last["receipt"]["retained_result_released"], true,
+            "fallback left worker-owned result custody: {journal}"
+        );
+        let cas = rabsd::janitor::store::mount_and_reconcile(
+            &root.join("state/canonical-compile-v1/cas"),
+        )
+        .unwrap();
+        let mut store = cas.store().lock().unwrap();
+        assert!(store.published_manifest_key_str(key).unwrap().is_none());
+        assert!(!store.has_evidence_key(key).unwrap());
+        assert!(
+            store
+                .query(
+                    "SELECT attempt_hex FROM verification_samples WHERE action_key = ?1",
+                    &[SqlValue::Text(key.clone())]
+                )
+                .unwrap()
+                .is_empty()
+        );
+    }
+    worker.finish();
+}
+
 #[test]
 #[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual generated-input Cargo/TLS worker/cache execution"]
 fn canonical_cargo_offloads_generated_metadata_replays_and_invalidates_changed_out_dir() {

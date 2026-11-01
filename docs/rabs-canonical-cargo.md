@@ -975,8 +975,9 @@ The earlier source preparation still captures the complete approved anchor and
 uses locked all-features metadata to validate its dependency closure. Selecting
 fewer compilation units does not reduce the authorized upload/capture scope or make
 missing locked dependencies available offline.
-Workspace members, primary packages and unsupported compiler requests compile
-normally inside the namespace. Their results do not enter the dependency cache.
+Workspace members and primary packages use the separately qualified workspace
+worker profiles described below; unsupported requests compile normally inside
+the namespace. Their results never enter the external-dependency cache class.
 External dependency `metadata` plus `dep-info` may execute locally or on an
 explicitly configured authenticated dependency worker. Pure Rust `lib`/`rlib`
 archive actions with `dep-info` and `link`, optionally also `metadata`, require
@@ -991,9 +992,10 @@ therefore blocks local lookup, capture and publication even when a worker is
 missing, busy or refuses the action. Without a suitable worker the current
 compilation proceeds through Cargo with no local action-cache authority.
 
-Build-script producers, proc-macro producers/consumers, workspace/primary packages
-and native-link inputs retain their per-action cache restrictions and compile
-normally. Eligible external libraries that consume a completed build script's
+Build-script producers, proc-macro producers/consumers and native-link inputs
+retain their per-action cache restrictions and compile normally. Workspace and
+primary packages have a separate, narrow closed-library cache class; other
+accepted workspace units remain fresh executions. Eligible external libraries that consume a completed build script's
 `OUT_DIR` can use the isolated worker metadata or archive cache with the complete
 generated tree captured as an input. The build script itself still runs under
 Cargo. Eligible independent pure dependencies may also use the isolated worker
@@ -1030,9 +1032,10 @@ after metadata exposure fails the build; it cannot start a second local rustc
 over the partially delivered outputs. The socket exchange and stderr-prefix
 delivery use bounded waits, including when Cargo stops reading its pipe.
 
-This delivery path uses already committed, qualified dependency results.
-Unfinished worker output does not gain publication or replay authority, and
-workspace compilation retains its existing execution-only policy. Native
+This delivery path uses already committed, qualified results.
+Unfinished worker output does not gain publication or replay authority. Workspace
+results require their own closed-library qualification described below; the
+broader workspace execution profile remains private. Native
 Cargo qualification and build-time measurements remain necessary to establish
 the effect on a particular workload.
 
@@ -1370,7 +1373,8 @@ Inputs cannot be acquired by spelling an unretained host path in rustc argv.
 Workspace native results remain request-owned and are never published or
 replayed through the dependency action cache.
 
-Each accepted workspace request executes afresh. Its identity binds the entire
+The general workspace execution profile executes each accepted request afresh.
+Its identity binds the entire
 retained workspace, including sibling files and empty directories, generated
 `OUT_DIR` contents and Cargo run records, exact Rust dependency artifacts,
 toolchain, runtime and original compiler environment. Relative source arguments,
@@ -1406,11 +1410,54 @@ This permits downstream Cargo work to overlap archive installation after the
 workspace compiler has completed. It does not grant cache authority or expose
 an unfinished producer's metadata.
 
-Workspace results do not create an action-cache publication, serving entry,
-differential sample or replayable transcript index. This adds remote execution
-for eligible workspace compilations without granting workspace action-cache reuse.
+These execution-only workspace results do not create an action-cache publication,
+serving entry, differential sample or replayable transcript index. A separate
+closed-library class can qualify for reuse under the narrower rules below.
 Cargo still owns command execution and freshness; the optional private target
 reuse described below has its existing independent rules and limits.
+
+### Cache closed workspace leaf-library builds
+
+The first workspace action-cache class admits selected ordinary Rust `lib` or
+`rlib` builds with archive output. It requires a retained Cargo unit graph with
+no project executors, no explicit external crates or implicit Rust artifact
+candidates, no generated inputs or native libraries, and no incremental state.
+The captured Rust standard library remains available through the retained
+toolchain. Metadata-only checks, test harnesses, binaries, procedural macros,
+libraries consuming other project or dependency artifacts, and generated/native
+workspace units retain their existing fresh-execution or ordinary Cargo paths.
+
+This class keys the **complete captured workspace**, including sibling files,
+every directory listing and empty directories. It also binds the exact compiler
+arguments, working directory, environment, toolchain and measured runtime. An
+unrelated workspace edit can therefore invalidate the result. This is an initial
+complete-input class, not a discovered minimal source closure or a cache for
+arbitrary workspace compilations.
+
+The coordinator independently matches the request to the driver's retained
+selected library unit and graph. It then requires the worker's existing
+`canonical-workspace-exec-v3` namespace in closed `rlib` mode, with no process
+filesystem or entropy devices. The distinct
+`canonical-workspace-closed-rlib-v1` policy and versioned action identity keep
+these results separate from execution-only workspace results and external
+dependency results. A workspace descriptor, canonical-looking path or local
+wrapper completion cannot confer this authority.
+
+Eligible cold results still require authenticated remote execution, compiler and
+descendant drain, complete output/transcript capture, unchanged retained inputs,
+and the wrapper's exact manifest acknowledgment before private installation.
+Publication and subsequent reuse pass the existing independent differential
+sampling, release authorization and serving gates. A divergent closed-workspace
+result quarantines its own cache class. Execution-only workspace results cannot
+train these gates or become replayable by changing a profile flag.
+The initial class uses the existing fixed sampling policy; the optional
+dependency-only SPRT promotion policy does not authorize workspace replay.
+
+Once qualified, a hit restores the declared archive, metadata when emitted,
+dep-info and compiler diagnostics through the verified installer. Source or
+environment changes require a different action identity. Missing, unsupported or
+changed evidence preserves the existing refusal and fallback rules, including
+the prohibition on a second compilation while a remote execution is uncertain.
 
 ### Local Clippy with reusable dependency compilation
 
@@ -1939,6 +1986,34 @@ execution after restore. The ordinary unignored CLI tests also use a real PTY to
 verify terminal refusal happens before profile-root access. These tests must
 actually execute on a supported host; an
 ignored fixture or a namespace-capability refusal is not passing evidence.
+
+The closed workspace leaf-library cache has a separate native acceptance fixture:
+
+```sh
+RABS_CANONICAL_TEST_WRAPPER="$PWD/target/debug/rabs-wrap" \
+RABS_TEST_WORKER_BIN="$PWD/target/debug/rabs-wkr" \
+  cargo test -p rabsd --test canonical_check_local --locked \
+    canonical_cargo_workspace_leaf_archives_earn_hits_with_complete_source_closure \
+    -- --ignored --exact --nocapture
+
+RABS_CANONICAL_TEST_WRAPPER="$PWD/target/debug/rabs-wrap" \
+RABS_TEST_WORKER_BIN="$PWD/target/debug/rabs-wkr" \
+  cargo test -p rabsd --test canonical_check_local --locked \
+    canonical_workspace_leaf_denied_input_falls_back_only_after_worker_settlement \
+    -- --ignored --exact --nocapture
+```
+
+The first fixture requires an actual publication and two independent remote
+comparisons before a hit. It compares delivered archive, metadata, dep-info and
+diagnostic bytes; the hit must leave the worker journal unchanged. It then
+changes source outside the member, an assembler input absent from dep-info,
+the compiler environment and a directory member, and requires new execution
+identities. Adding a build script must restore the private execution-only path.
+The second fixture checks that a denied process-filesystem read completes and
+drains on the worker before ordinary Cargo fallback, without earning publication
+or verification evidence. These fixtures require the same full native namespace
+capabilities as the dependency fixtures; adding them does not establish that they
+have passed on a deployment host.
 
 The full compiler-skip test is explicitly opt-in because it needs the complete
 Linux namespace capability and an installed native wrapper. Build the binaries

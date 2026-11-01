@@ -121,6 +121,7 @@ pub use canonical_cargo::{
     plan_canonical_remote_dependency_action,
 };
 pub use metadata_replay::metadata_replay_prefix_len;
+pub mod workspace_cache;
 mod workspace_execution;
 pub use workspace_execution::{
     plan_canonical_workspace_execution, remote_workspace_execution_isolation_policy,
@@ -401,6 +402,10 @@ pub enum DependencySourceKind {
     /// The complete retained canonical workspace for one fresh worker execution.
     /// This source class never grants dependency-cache publication or serving.
     WorkspaceExecutionOnly,
+    /// A complete canonical workspace for a separately qualified, closed pure
+    /// Rust leaf-library archive. Its worker receipt and cache policy remain
+    /// distinct from the unrestricted fresh workspace execution class.
+    WorkspaceClosedRlib,
 }
 
 impl DependencySourceKind {
@@ -412,7 +417,18 @@ impl DependencySourceKind {
             Self::GitCheckout => "git-checkout",
             Self::DirectoryPackage => "directory-package",
             Self::WorkspaceExecutionOnly => "canonical-workspace-execution-only",
+            Self::WorkspaceClosedRlib => "canonical-workspace-closed-rlib-v1",
         }
+    }
+
+    /// These profiles capture the same complete workspace files and directory
+    /// topology. This describes source scope only, never cache authority.
+    #[must_use]
+    pub const fn is_workspace(self) -> bool {
+        matches!(
+            self,
+            Self::WorkspaceExecutionOnly | Self::WorkspaceClosedRlib
+        )
     }
 }
 
@@ -1360,9 +1376,9 @@ fn dependency_key(
     build_script_output: Option<&[u8]>,
     inputs: &ActionInputManifest,
 ) -> Result<LiveDependencyKey, LiveRefusal> {
-    if plan.source_kind == DependencySourceKind::WorkspaceExecutionOnly {
+    if plan.source_kind.is_workspace() {
         return Err(LiveRefusal::Facts(
-            "workspace execution-only plans have no dependency-cache authority".into(),
+            "workspace plans require their separate execution or cache authority".into(),
         ));
     }
     captured_action_key(
@@ -1393,7 +1409,7 @@ fn captured_action_key(
     }
     validate_build_script_output(plan, build_script_output)?;
     validate_directory_source_manifest(plan, inputs)?;
-    if plan.source_kind == DependencySourceKind::WorkspaceExecutionOnly {
+    if plan.source_kind.is_workspace() {
         workspace_input_directories(plan, inputs)?;
     }
     generated_input_directories(plan, inputs)?;
@@ -1453,6 +1469,7 @@ fn captured_action_key(
                         DependencySourceKind::GitCheckout
                             | DependencySourceKind::DirectoryPackage
                             | DependencySourceKind::WorkspaceExecutionOnly
+                            | DependencySourceKind::WorkspaceClosedRlib
                     )
                     && input.virtual_path.as_bytes()[root.len()..]
                         .split(|byte| *byte == b'/')
@@ -1464,7 +1481,7 @@ fn captured_action_key(
                 .into(),
         ));
     }
-    let workspace_source = if plan.source_kind == DependencySourceKind::WorkspaceExecutionOnly {
+    let workspace_source = if plan.source_kind.is_workspace() {
         Some(workspace_source_path(plan)?)
     } else {
         None
@@ -1513,7 +1530,8 @@ fn captured_action_key(
                     .str(&plan.source_root)
                     .str(&plan.source_virtual_root());
             }
-            DependencySourceKind::WorkspaceExecutionOnly => {
+            DependencySourceKind::WorkspaceExecutionOnly
+            | DependencySourceKind::WorkspaceClosedRlib => {
                 enc.str("complete-canonical-workspace-execution-tree-v1")
                     .str(plan.source_kind.as_str())
                     .str(&plan.source_root)
@@ -1565,7 +1583,7 @@ fn captured_action_key(
     let descriptor = ActionDescriptor {
         key_epoch: LIVE_DEPENDENCY_KEY_EPOCH,
         projection_epoch: LIVE_DEPENDENCY_PROJECTION_EPOCH,
-        action_class: if plan.source_kind == DependencySourceKind::WorkspaceExecutionOnly {
+        action_class: if plan.source_kind.is_workspace() {
             ActionClass::RustcWorkspaceCompile
         } else {
             ActionClass::RustcDependencyCompile
@@ -1597,6 +1615,7 @@ fn captured_action_key(
                 DependencySourceKind::WorkspaceExecutionOnly => {
                     workspace_execution::WORKSPACE_EXECUTION_PROFILE
                 }
+                DependencySourceKind::WorkspaceClosedRlib => workspace_cache::ISOLATION_PROFILE,
             }
             .as_bytes(),
         ),
@@ -1641,7 +1660,7 @@ pub fn generated_input_directories(
     let mut other_roots = (0..plan.native_roots.len())
         .map(|index| plan.native_input_virtual_root(index))
         .collect::<Vec<_>>();
-    if plan.source_kind == DependencySourceKind::WorkspaceExecutionOnly {
+    if plan.source_kind.is_workspace() {
         other_roots.push(plan.source_virtual_root());
     }
     if plan.generated_root.is_none() {
@@ -1663,7 +1682,7 @@ pub fn generated_input_directories(
 }
 
 /// Validate the complete retained workspace directory closure for an
-/// execution-only plan, returning sorted relative subdirectories without the
+/// workspace plan, returning sorted relative subdirectories without the
 /// root. Generated-directory listings may accompany it only at their separate
 /// declared virtual root and are independently checked by the key builder.
 ///
@@ -1675,11 +1694,11 @@ pub fn workspace_input_directories(
     inputs: &ActionInputManifest,
 ) -> Result<Vec<String>, LiveRefusal> {
     if !plan.canonical_cargo
-        || plan.source_kind != DependencySourceKind::WorkspaceExecutionOnly
+        || !plan.source_kind.is_workspace()
         || plan.source_root != workspace_execution::WORKSPACE
     {
         return Err(LiveRefusal::Facts(
-            "workspace directory evidence requires a canonical execution-only plan".into(),
+            "workspace directory evidence requires a canonical workspace plan".into(),
         ));
     }
     let mut other_roots = plan
@@ -1718,7 +1737,7 @@ pub fn native_input_directories(
         .filter(|other| *other != index)
         .map(|other| plan.native_input_virtual_root(other))
         .collect::<Vec<_>>();
-    if plan.source_kind == DependencySourceKind::WorkspaceExecutionOnly {
+    if plan.source_kind.is_workspace() {
         other_roots.push(plan.source_virtual_root());
     }
     if plan.generated_root.is_some() {
@@ -1987,7 +2006,7 @@ pub fn canonicalize_placements(
     plan: &DependencyActionPlan,
 ) -> Result<Vec<u8>, &'static str> {
     if plan.canonical_cargo {
-        if plan.source_kind == DependencySourceKind::WorkspaceExecutionOnly {
+        if plan.source_kind.is_workspace() {
             workspace_execution::workspace_layout(plan)
         } else {
             canonical_cargo::canonical_layout(plan)
@@ -2059,7 +2078,7 @@ pub fn canonicalize_compiler_transcript(
     plan: &DependencyActionPlan,
 ) -> Result<Vec<u8>, &'static str> {
     if plan.canonical_cargo {
-        if plan.source_kind == DependencySourceKind::WorkspaceExecutionOnly {
+        if plan.source_kind.is_workspace() {
             workspace_execution::workspace_layout(plan)
         } else {
             canonical_cargo::canonical_layout(plan)

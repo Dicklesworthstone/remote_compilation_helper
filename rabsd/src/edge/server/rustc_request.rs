@@ -652,8 +652,26 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
     } else {
         dependencies.directories.clone()
     };
+    // Qualification happens only after complete source and candidate capture.
+    // A refusal keeps the original fresh workspace plan, before any action or
+    // worker attempt exists. The captured full-workspace image is identical for
+    // both profiles; its class label never supplies cache authority by itself.
+    if workspace_requested
+        && let Some(paths) = &live.canonical
+        && let Ok(candidate) =
+            rabs_key::live_dependency::workspace_cache::plan_closed_workspace_rlib(&plan)
+        && paths.require_workspace_closed_rlib(&candidate).is_ok()
+        && rabs_key::live_dependency::workspace_cache::remote_closed_workspace_rlib_shape(
+            &candidate,
+            &key_directories,
+            rabs_sandbox::layout::TOOLCHAIN,
+        )
+        .is_ok()
+    {
+        plan = candidate;
+    }
     let key_result = if workspace_requested {
-        Err(rabs_key::live_dependency::LiveRefusal::Facts("workspace units require a fresh isolated execution and cannot use dependency cache authority".into()))
+        Err(rabs_key::live_dependency::LiveRefusal::Facts("workspace units require their independently isolated worker profile and cannot use local dependency cache authority".into()))
     } else if let Err(reason) = local_capture {
         // Keep a refusal, not a usable local key, across every remote warming,
         // keying, worker-unavailable and execution-refusal fallback below.

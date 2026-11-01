@@ -29,6 +29,10 @@ use rabs_key::live_dependency::remote::{
     RemoteDependencyOutputClass, remote_dependency_isolation_policy, remote_dependency_key,
     remote_dependency_output_class, remote_dependency_shape, remote_empty_loader_directories,
 };
+use rabs_key::live_dependency::workspace_cache::{
+    remote_closed_workspace_rlib_isolation_policy, remote_closed_workspace_rlib_key,
+    remote_closed_workspace_rlib_shape,
+};
 use rabs_key::live_dependency::{
     DependencyDirectoryFact, DependencySourceKind, ToolchainFacts, native_input_directories,
     remote_workspace_execution_isolation_policy, remote_workspace_execution_key,
@@ -562,11 +566,21 @@ impl RemoteValidation {
                 .as_ref()
                 .ok_or("workspace execution lost its retained Cargo graph")?
                 .require_workspace_execution(&request.plan)?;
+        } else if request.plan.source_kind == DependencySourceKind::WorkspaceClosedRlib {
+            request
+                .canonical_paths
+                .as_ref()
+                .ok_or("closed workspace archive lost its retained Cargo graph")?
+                .require_workspace_closed_rlib(&request.plan)?;
         }
-        let shape = if request.is_execution_only() {
-            remote_workspace_execution_shape(&request.plan, &directories, &toolchain)
-        } else {
-            remote_dependency_shape(&request.plan, &directories, &toolchain)
+        let shape = match request.plan.source_kind {
+            DependencySourceKind::WorkspaceExecutionOnly => {
+                remote_workspace_execution_shape(&request.plan, &directories, &toolchain)
+            }
+            DependencySourceKind::WorkspaceClosedRlib => {
+                remote_closed_workspace_rlib_shape(&request.plan, &directories, &toolchain)
+            }
+            _ => remote_dependency_shape(&request.plan, &directories, &toolchain),
         };
         shape.map_err(|error| error.to_string())?;
         verify_execution_policy(&request.plan, &request.key, self.execution_mode)
@@ -616,10 +630,14 @@ fn verify_execution_policy(
     if execution_mode(plan)? != mode {
         return Err("remote output class differs from the enforced execution mode".into());
     }
-    let policy = if plan.source_kind == DependencySourceKind::WorkspaceExecutionOnly {
-        remote_workspace_execution_isolation_policy(plan)
-    } else {
-        remote_dependency_isolation_policy(plan)
+    let policy = match plan.source_kind {
+        DependencySourceKind::WorkspaceExecutionOnly => {
+            remote_workspace_execution_isolation_policy(plan)
+        }
+        DependencySourceKind::WorkspaceClosedRlib => {
+            remote_closed_workspace_rlib_isolation_policy(plan)
+        }
+        _ => remote_dependency_isolation_policy(plan),
     }
     .map_err(|error| error.to_string())?;
     if key.descriptor.sandbox_semantic_policy != policy {
@@ -734,8 +752,12 @@ impl RemoteDependencies {
         if plan.canonical_cargo != canonical.is_some() {
             return Err("remote canonical key requires its retained driver capability".into());
         }
-        let workspace = plan.source_kind == DependencySourceKind::WorkspaceExecutionOnly;
-        if workspace {
+        let workspace = plan.source_kind.is_workspace();
+        if plan.source_kind == DependencySourceKind::WorkspaceClosedRlib {
+            canonical
+                .ok_or("closed workspace archive requires its retained Cargo graph")?
+                .require_workspace_closed_rlib(plan)?;
+        } else if workspace {
             canonical
                 .ok_or("workspace execution requires its retained Cargo graph")?
                 .require_workspace_execution(plan)?;
@@ -750,10 +772,14 @@ impl RemoteDependencies {
         guard.verify_unchanged(Path::new(&physical.compiler))?;
         let root = guard.sysroot();
         let visible_root = visible_toolchain_root(guard, canonical)?;
-        let shape = if workspace {
-            remote_workspace_execution_shape(plan, directories, &visible_root)
-        } else {
-            remote_dependency_shape(plan, directories, &visible_root)
+        let shape = match plan.source_kind {
+            DependencySourceKind::WorkspaceExecutionOnly => {
+                remote_workspace_execution_shape(plan, directories, &visible_root)
+            }
+            DependencySourceKind::WorkspaceClosedRlib => {
+                remote_closed_workspace_rlib_shape(plan, directories, &visible_root)
+            }
+            _ => remote_dependency_shape(plan, directories, &visible_root),
         };
         shape.map_err(|error| error.to_string())?;
         // Derive resource intent before copying a complete compiler tree. An
@@ -780,10 +806,10 @@ impl RemoteDependencies {
             Path::new(&physical.out_dir),
         )
         .map_err(|error| format!("edge runtime cohort: {error}"))?;
-        let key_builder = if workspace {
-            remote_workspace_execution_key
-        } else {
-            remote_dependency_key
+        let key_builder = match plan.source_kind {
+            DependencySourceKind::WorkspaceExecutionOnly => remote_workspace_execution_key,
+            DependencySourceKind::WorkspaceClosedRlib => remote_closed_workspace_rlib_key,
+            _ => remote_dependency_key,
         };
         let key = key_builder(
             plan,
@@ -1361,7 +1387,7 @@ impl PendingRemote {
 /// resources; implicit host thread counts still require another policy.
 fn dependency_execution_grant(plan: &DependencyActionPlan, argv: &[String]) -> Result<u32, String> {
     execution_mode(plan)?;
-    let options = if plan.source_kind == DependencySourceKind::WorkspaceExecutionOnly {
+    let options = if plan.source_kind.is_workspace() {
         rabs_key::output_derivation::check_workspace_output_options(&plan.invocation)
     } else {
         rabs_key::output_derivation::check_dependency_output_options(&plan.invocation)
@@ -1404,8 +1430,7 @@ fn dependency_execution_request(
     let grant = dependency_execution_grant(plan, argv)?;
     if context.execution_mode() != execution_mode(plan)?
         || context.canonical_cargo() != plan.canonical_cargo
-        || context.workspace_execution_only()
-            != (plan.source_kind == DependencySourceKind::WorkspaceExecutionOnly)
+        || context.workspace_execution_only() != plan.source_kind.is_workspace()
         || context.generated_root() != plan.generated_root.as_deref()
         || context
             .native_roots()
