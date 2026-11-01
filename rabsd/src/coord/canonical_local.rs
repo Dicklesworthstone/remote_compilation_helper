@@ -1627,11 +1627,15 @@ fn run_operation(
     };
     let retain_target = target_state.is_some()
         && result.as_ref().is_ok_and(|compiled| {
-            compiled.status.success()
-                || (matches!(
-                    profile.command,
-                    CompilationCommand::Test | CompilationCommand::Run | CompilationCommand::Bench
-                ) && compiled.status.code().is_some())
+            // An ordinary Cargo failure can leave many successfully compiled
+            // dependencies. Cargo must rerun the failed unit, but its private
+            // fingerprints may reuse those completed dependencies next time.
+            // Bubblewrap can encode an inner signal as an ordinary 128+signal
+            // exit, so reject that range as well as direct signal statuses.
+            compiled
+                .status
+                .code()
+                .is_some_and(|code| (0..128).contains(&code))
         });
     // Export after the last publication. The coordinator remains live through
     // capture and completion; this historical seed inventory is not a final
@@ -1667,9 +1671,10 @@ fn run_operation(
         }
         if let (Some(cache), Some(provenance)) = (&target_state, target_provenance) {
             // Compiler, session and publication writers are gone. The separate
-            // coordinator remains live only for current safety checks. A normal
-            // program/harness failure can retain compiled artifacts too; Cargo
-            // and the requested bodies execute again, with no saved outcome.
+            // coordinator remains live only for current safety checks. Normal
+            // compiler, lint, program and harness failures can retain completed
+            // artifacts too. Cargo and the requested bodies execute again;
+            // no outcome is saved or promoted to successful delivery.
             let capture = || -> io::Result<()> {
                 // An export failure must preserve the old seed. Capturing with
                 // an empty inventory would erase known Fresh provenance.

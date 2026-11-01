@@ -3507,6 +3507,137 @@ fn canonical_private_targets_reuse_relocated_builds_and_preserve_current_outputs
     assert_eq!(families().len(), 2);
 }
 
+/// A compiler error must preserve useful completed dependencies without ever
+/// becoming a successful command, a cached failure, or a delivered build.
+#[test]
+#[ignore = "requires real bubblewrap namespaces, native toolchain and RABS_CANONICAL_TEST_WRAPPER; failed Cargo commands must retain only quiescent private target state"]
+fn canonical_private_targets_preserve_dependencies_after_compile_errors() {
+    for command in ["check", "build"] {
+        let (owner, mut profile) = native_fixture();
+        let first = owner.path().join("source-a");
+        let second = owner.path().join("source-b");
+        let broken = "compile_error!(\"current workspace error must remain visible\");\npub fn answer()->u32 { canonical_dep::answer() }\n";
+        for source in [&first, &second] {
+            write(source, "src/lib.rs", broken);
+        }
+        profile["command"] = json!(command);
+        profile["selection"] = json!({"lib":true});
+        profile["target_cache"] = json!({"runtime_epoch":"native-compile-error-v1",
+            "max_bytes":268435456});
+
+        let assert_state = |events: &[Value], expected: &str| {
+            let started = events
+                .iter()
+                .filter(|event| event["kind"] == "canonical-compilation-started")
+                .collect::<Vec<_>>();
+            assert_eq!(started.len(), 1, "{events:?}");
+            assert_eq!(started[0]["command"], command);
+            assert_eq!(started[0]["private_target_state"], expected);
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| event["kind"] == "canonical-target-state-unavailable"),
+                "private target retention was refused: {events:?}"
+            );
+        };
+        let assert_dependencies = |output: &str, fresh: bool| {
+            for name in ["canonical_leaf", "canonical_dep"] {
+                let artifacts = output
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .filter(|event| {
+                        event["reason"] == "compiler-artifact" && event["target"]["name"] == name
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(artifacts.len(), 1, "missing {name} artifact: {output}");
+                assert_eq!(artifacts[0]["fresh"], fresh, "{name}: {output}");
+            }
+        };
+
+        for (number, source, expected) in [
+            (116, &first, "cold"),
+            (117, &second, "restored"),
+            (118, &first, "restored"),
+        ] {
+            // run() starts a new daemon process every time. Neither the caller's
+            // worktree path nor a prior process supplies the retained state.
+            profile["source_root"] = json!(source);
+            let (code, events, output) = run(owner.path(), number, &profile);
+            assert_eq!(code, 101, "{command}: {output}");
+            assert!(
+                output.contains("current workspace error must remain visible"),
+                "the present compiler diagnostic was suppressed: {output}"
+            );
+            assert_state(&events, expected);
+            assert_dependencies(&output, number != 116);
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| event["kind"] == "canonical-build-completed"),
+                "failed command delivered successful build outputs: {output}"
+            );
+            assert!(output.lines().any(|line| {
+                serde_json::from_str::<Value>(line).is_ok_and(|event| {
+                    event["reason"] == "build-finished" && event["success"] == false
+                })
+            }));
+            assert!(!output.lines().any(|line| {
+                serde_json::from_str::<Value>(line).is_ok_and(|event| {
+                    event["reason"] == "compiler-artifact"
+                        && event["target"]["name"] == "canonical_app"
+                })
+            }));
+        }
+
+        write(
+            &first,
+            "src/lib.rs",
+            "pub fn answer()->u32 { canonical_dep::answer()+1 }\n",
+        );
+        let (code, events, output) = run(owner.path(), 119, &profile);
+        assert_eq!(code, 0, "repair did not compile: {output}");
+        assert!(
+            !output.contains("current workspace error must remain visible"),
+            "a prior compiler error was replayed after its source was fixed: {output}"
+        );
+        // Only pure metadata checks have source-edit compatibility. Codegen
+        // remains source-exact even when the old target ended in a failure.
+        assert_state(
+            &events,
+            if command == "check" {
+                "restored"
+            } else {
+                "cold"
+            },
+        );
+        assert_dependencies(&output, command == "check");
+        let app = output
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|event| {
+                event["reason"] == "compiler-artifact" && event["target"]["name"] == "canonical_app"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            app.len(),
+            1,
+            "missing repaired workspace artifact: {output}"
+        );
+        assert_eq!(app[0]["fresh"], false, "repair never executed: {output}");
+        let (code, events, output) = run(owner.path(), 120, &profile);
+        assert_eq!(code, 0, "{output}");
+        assert_state(&events, "restored");
+        assert_dependencies(&output, true);
+        assert!(output.lines().any(|line| {
+            serde_json::from_str::<Value>(line).is_ok_and(|event| {
+                event["reason"] == "compiler-artifact"
+                    && event["target"]["name"] == "canonical_app"
+                    && event["fresh"] == true
+            })
+        }));
+    }
+}
+
 fn assert_test_execution(events: &[Value], state: &str, executed: bool) {
     let started = events
         .iter()
@@ -8839,7 +8970,9 @@ pub fn configured_lint(project_marker: u32) -> u32 { project_marker }
         "changed lint levels must report the current failure: {output}"
     );
     assert!(output.contains("clippy::needless_return"), "{output}");
-    assert_lint_run(&events, "cold");
+    // The earlier failed invocation retained this exact lint/source family's
+    // successful dependencies. Its current lint failure must still execute.
+    assert_lint_run(&events, "restored");
 
     profile["selection"]["lint_args"] =
         json!(["-Aclippy::needless_return", "-Dclippy::disallowed_names"]);

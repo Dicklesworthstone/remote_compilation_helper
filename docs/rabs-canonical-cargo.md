@@ -2106,17 +2106,20 @@ for this operation. A failed optional snapshot restore keeps its partial copy
 unmounted and runs the current command cold, unless the operation was cancelled;
 an optional storage failure during save preserves Cargo's actual result. Both
 report a `canonical-target-state-unavailable` diagnostic. A new seed is saved only after
-complete compiler/session/coordinator drain and either successful Cargo execution
-or a normally exited Test, Run or Bench command. A failing test, program or
-benchmark may therefore retain its compiled artifacts for the next invocation;
-its body still executes again, and the previous success or failure is never
-served as the current command's result.
+complete compiler/session/coordinator drain and a normal Cargo exit below 128.
+An ordinary compiler or lint error can therefore retain successfully compiled
+dependencies, and a failing test, program or benchmark can retain its compiled
+artifacts. The next invocation still runs Cargo and reports the current outcome;
+failed units and requested program or test bodies execute again. No command
+failure becomes a cache result or successful build delivery. Retained committed
+producers still require current valid publication authority before saving and
+before a later Cargo invocation can use them as fresh inputs.
 That same successful cold command can replace a seed after a failed restore.
 An ineligible source edit or a failed private destination preserves a healthy
 committed seed until that replacement succeeds.
-Failed check/build commands, cancelled commands and incomplete process-group
-cleanup cannot replace a successful seed. Checks can also
-retain reusable state too. Successful build delivery still owns separate files,
+Cancelled commands, direct signal termination, exits of 128 or higher, and
+incomplete process-group cleanup cannot replace a seed. A failed optional
+capture preserves the previous healthy generation. Successful build delivery still owns separate files,
 so editing or running a previously delivered binary cannot alter the seed or
 another invocation's outputs.
 
