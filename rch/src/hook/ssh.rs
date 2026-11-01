@@ -1147,11 +1147,218 @@ fn source_authority_activity_prefix_for_mode(
 /// Prefix an actual remote process, including rsync's server or `sh -s`, while
 /// preserving stdin for its command/input protocol. A HUP-resistant flock
 /// supervisor retains the lease even when the actual tool closes inherited FDs.
-/// Activities within one grant serialize: a surviving writer cannot overlap a
-/// later verifier or compiler. Preparation failures still cancel the token;
-/// flock ordering is not permission to retry an uncertain mutator in place.
+/// Activities using this prefix serialize with every upload: a surviving
+/// writer cannot overlap a later verifier or compiler. Preparation failures
+/// still cancel the token; flock ordering is not permission to retry an
+/// uncertain mutator in place.
 pub(crate) fn source_authority_activity_prefix(identity: &str) -> anyhow::Result<String> {
     source_authority_activity_prefix_at(REMOTE_SOURCE_CLAIM_REGISTRY, identity)
+}
+
+// Ordinary source receivers may share an activity lease only while their
+// destination trees are disjoint. The supervisor retains every descriptor
+// even when rsync closes its inherited FDs. All other source activity keeps
+// the existing exclusive lease, including verification and cancellation.
+const SOURCE_UPLOAD_ACTIVITY: &str = r#"
+import fcntl
+import hashlib
+import os
+import stat
+import subprocess
+import sys
+
+LIMIT = 32 * 1024 * 1024
+
+def canonical(path):
+    return (path.startswith("/") and not any(c in path for c in ("\0", "\n", "\r"))
+            and (path == "/" or (not path.endswith("/")
+                 and all(part not in ("", ".", "..") for part in path.split("/")[1:]))))
+
+def ancestors(path):
+    result = [path]
+    while path != "/":
+        path = os.path.dirname(path)
+        result.append(path)
+    return result
+
+def checked_lock(directory, name, mode):
+    fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                 0o600, dir_fd=directory)
+    try:
+        fcntl.flock(fd, mode)
+        opened = os.fstat(fd)
+        named = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        if not stat.S_ISREG(opened.st_mode) or not os.path.samestat(opened, named):
+            raise ValueError("upload lock changed")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+def checked_namespace(directory, registry, activity, token):
+    if not os.path.samestat(os.fstat(directory), os.stat(registry, follow_symlinks=False)):
+        raise ValueError("source registry changed")
+    if not os.path.samestat(os.fstat(activity), os.stat(
+            token + ".activity.lock", dir_fd=directory, follow_symlinks=False)):
+        raise ValueError("source activity lock changed")
+
+def active_roots(directory, token, root):
+    names = [name for name in os.listdir(directory)
+             if name.startswith(token + ".") and name.endswith(".claim")]
+    if len(names) != 1:
+        raise ValueError("source grant is absent or duplicated")
+    name = names[0]
+    digest = name[len(token) + 1:-6]
+    if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+        raise ValueError("invalid source grant identity")
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= LIMIT:
+            raise ValueError("invalid source grant record")
+        with os.fdopen(fd, "rb", closefd=False) as source:
+            content = source.read(LIMIT + 1)
+        after = os.fstat(fd)
+        named = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        if (not os.path.samestat(before, after) or not os.path.samestat(after, named)
+                or (before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                != (after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+                or len(content) != before.st_size or not content.endswith(b"\n")
+                or hashlib.sha256(content).hexdigest() != digest):
+            raise ValueError("source grant content changed")
+    finally:
+        os.close(fd)
+    try:
+        os.stat(token + "." + digest + ".cancelling", dir_fd=directory,
+                follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
+        raise ValueError("source grant is cancelling")
+    roots = content[:-1].decode("utf-8").split("\n")
+    if not all(canonical(candidate) for candidate in roots):
+        raise ValueError("invalid source grant roots")
+    if not any(candidate == "/" or root == candidate or root.startswith(candidate + "/")
+               for candidate in roots):
+        raise ValueError("upload destination is outside its source grant")
+    return roots
+
+def direct_topology(roots, root):
+    # Inspect each directory prefix once, not the contents of any source tree.
+    # Distinct names for one directory also catch static bind-mount aliases,
+    # including an absent destination below an existing alias. Unsupported
+    # aliases use the original exclusive activity protocol on this connection.
+    selected_roots = {*roots, root}
+    paths = {path for selected in selected_roots for path in ancestors(selected)}
+    stamps = set()
+    for selected in selected_roots:
+        try:
+            selected_metadata = os.lstat(selected)
+        except FileNotFoundError:
+            selected_metadata = None
+        if selected_metadata is None or not stat.S_ISREG(selected_metadata.st_mode):
+            # The ordinary receiver also owns its guarded scratch sweep. An
+            # aliased scratch directory or stamp must not write outside that
+            # root while a sibling receiver runs under the shared activity.
+            scratch = os.path.join(selected, ".rch-tmp")
+            stamp = os.path.join(scratch, ".rch-prune-stamp")
+            paths.update((scratch, stamp))
+            stamps.add(stamp)
+    identities = {}
+    for path in sorted(paths):
+        try:
+            metadata = os.lstat(path)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(metadata.st_mode):
+            return False
+        if not stat.S_ISDIR(metadata.st_mode):
+            # A grant can additionally own a freshness-control file. Only its
+            # final component may be a regular file; it cannot be an upload root.
+            if (path == root or (path not in roots and path not in stamps)
+                    or not stat.S_ISREG(metadata.st_mode)):
+                raise ValueError("source topology is not a directory")
+            continue
+        identity = (metadata.st_dev, metadata.st_ino)
+        if identity in identities and identities[identity] != path:
+            return False
+        identities[identity] = path
+    return True
+
+def run():
+    registry, token, root = sys.argv[1:4]
+    command = sys.argv[4:]
+    if not canonical(root) or root == "/" or not command:
+        raise ValueError("invalid upload destination or command")
+    directory = os.open(registry, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    activity = None
+    locks = []
+    try:
+        activity = checked_lock(directory, token + ".activity.lock", fcntl.LOCK_SH)
+        # A separate, stable upload-lock namespace avoids both reacquiring the
+        # durable holder's source locks and accumulating new files per attempt.
+        for path in sorted(ancestors(root)):
+            digest = hashlib.sha256(b"rch.source-upload-lock.v1\0" + path.encode("utf-8")).hexdigest()
+            locks.append(checked_lock(directory, "upload." + digest + ".lock",
+                                      fcntl.LOCK_EX if path == root else fcntl.LOCK_SH))
+        # Validate only after every potentially queued lock. No receiver,
+        # destination setup or stdin read happens before this boundary.
+        checked_namespace(directory, registry, activity, token)
+        roots = active_roots(directory, token, root)
+        if not direct_topology(roots, root):
+            for fd in reversed(locks):
+                os.close(fd)
+            locks.clear()
+            # Never upgrade a shared lock in place: two alias uploads could
+            # otherwise deadlock. Cancellation may win this gap; recheck it.
+            fcntl.flock(activity, fcntl.LOCK_UN)
+            fcntl.flock(activity, fcntl.LOCK_EX)
+            checked_namespace(directory, registry, activity, token)
+            active_roots(directory, token, root)
+        # Keep both supervisor-held locks and inherited descriptors. The
+        # foreground receiver can sanitize FDs without opening a writer race;
+        # normal descendants retain the lease if their supervisor disappears.
+        checked_namespace(directory, registry, activity, token)
+        status = subprocess.call(command, pass_fds=(activity, *locks))
+        return status if status >= 0 else 128 - status
+    finally:
+        for fd in reversed(locks):
+            os.close(fd)
+        if activity is not None:
+            os.close(activity)
+        os.close(directory)
+
+try:
+    sys.exit(run())
+except (OSError, ValueError) as error:
+    print("RCH: source upload authority: " + str(error), file=sys.stderr)
+    sys.exit(73)
+"#;
+
+fn source_authority_upload_prefix_at(
+    registry: &str,
+    identity: &str,
+    root: &str,
+) -> anyhow::Result<String> {
+    validate_source_identity(identity)?;
+    source_authority_lock_plan(&[root.to_owned()], false)?;
+    anyhow::ensure!(root != "/", "cannot upload the filesystem root");
+    let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
+    Ok(format!(
+        "nohup python3 -I -S -c {script} {registry} {identity} {root}",
+        script = quote(SOURCE_UPLOAD_ACTIVITY),
+        registry = quote(registry),
+        identity = quote(identity),
+        root = quote(root),
+    ))
+}
+
+/// Admit only an ordinary source receiver to concurrent, disjoint root upload.
+/// Verification, execution, retrieval and cleanup must retain the exclusive
+/// [`source_authority_activity_prefix`]. The remote check binds the destination
+/// to the active grant and falls back to exclusive activity for path aliases.
+pub(crate) fn source_authority_upload_prefix(identity: &str, root: &str) -> anyhow::Result<String> {
+    source_authority_upload_prefix_at(REMOTE_SOURCE_CLAIM_REGISTRY, identity, root)
 }
 
 pub(crate) fn wrap_remote_source_activity(command: &str, identity: &str) -> anyhow::Result<String> {
@@ -3359,6 +3566,457 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
             .output()
             .await
             .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn source_upload_test_receiver(
+        registry: &Path,
+        identity: &str,
+        root: &Path,
+    ) -> tokio::process::Child {
+        let prefix = source_authority_upload_prefix_at(
+            registry.to_str().unwrap(),
+            identity,
+            root.to_str().unwrap(),
+        )
+        .unwrap();
+        // A receiver may sanitize inherited FDs. The upload supervisor, not
+        // this test shell's descriptor convention, must retain the locks.
+        let receiver = "exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&-; printf ready; IFS= read -r payload || exit 79; printf '%s' \"$payload\" > \"$1/uploaded\"";
+        Command::new("sh")
+            .args([
+                "-c",
+                &format!(
+                    "exec {prefix} sh -c {} upload-test {}",
+                    shell_escape::escape(receiver.into()),
+                    shell_escape::escape(root.to_string_lossy()),
+                ),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn source_upload_test_ready(child: &mut tokio::process::Child) {
+        use tokio::io::AsyncReadExt as _;
+        let mut ready = [0; 5];
+        timeout(
+            Duration::from_secs(10),
+            child.stdout.as_mut().unwrap().read_exact(&mut ready),
+        )
+        .await
+        .expect("source upload did not start")
+        .expect("source upload readiness stream closed");
+        assert_eq!(&ready, b"ready");
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn source_upload_test_finish(mut child: tokio::process::Child, payload: &str) {
+        use tokio::io::AsyncWriteExt as _;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(format!("{payload}\n").as_bytes())
+            .await
+            .unwrap();
+        drop(child.stdin.take());
+        let output = timeout(Duration::from_secs(10), child.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn source_uploads_overlap_disjoint_roots_and_fence_exclusive_activity() {
+        let directory = source_lock_test_dir();
+        let registry = directory.join("registry");
+        let first_root = directory.join("first ' quoted");
+        let second_root = directory.join("second $literal");
+        std::fs::create_dir_all(&first_root).unwrap();
+        std::fs::create_dir_all(&second_root).unwrap();
+        let roots = vec![
+            first_root.display().to_string(),
+            second_root.display().to_string(),
+        ];
+        let owner = claim_test_durable_source_closure(&registry, &roots, "c001", "acquire")
+            .await
+            .unwrap();
+        let mut first = source_upload_test_receiver(&registry, "c001", &first_root);
+        let mut second = source_upload_test_receiver(&registry, "c001", &second_root);
+        source_upload_test_ready(&mut first).await;
+        source_upload_test_ready(&mut second).await;
+        // Both receivers reached their held point before either was released.
+        // HUP and sanitized child FDs must not let verification pass them.
+        assert!(
+            Command::new("kill")
+                .args(["-HUP", &first.id().unwrap().to_string()])
+                .status()
+                .await
+                .unwrap()
+                .success()
+        );
+        let prefix =
+            source_authority_activity_prefix_at(registry.to_str().unwrap(), "c001").unwrap();
+        let artifact = directory.join("verified");
+        let mut verifier = Command::new("sh")
+            .args([
+                "-c",
+                &format!(
+                    "exec {prefix} sh -c 'cat -- \"$1/uploaded\" \"$2/uploaded\" > \"$3\"' verify {} {} {}",
+                    shell_escape::escape(first_root.to_string_lossy()),
+                    shell_escape::escape(second_root.to_string_lossy()),
+                    shell_escape::escape(artifact.to_string_lossy()),
+                ),
+            ])
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        assert!(
+            timeout(Duration::from_millis(150), verifier.wait())
+                .await
+                .is_err()
+        );
+        source_upload_test_finish(first, "first").await;
+        assert!(
+            timeout(Duration::from_millis(150), verifier.wait())
+                .await
+                .is_err()
+        );
+        assert!(!artifact.exists());
+        source_upload_test_finish(second, "second").await;
+        assert!(
+            timeout(Duration::from_secs(10), verifier.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(std::fs::read_to_string(artifact).unwrap(), "firstsecond");
+        owner.release().await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn source_uploads_serialize_same_and_nested_roots() {
+        use tokio::io::AsyncReadExt as _;
+        let directory = source_lock_test_dir();
+        let registry = directory.join("registry");
+        let root = directory.join("source");
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let owner = claim_test_durable_source_closure(
+            &registry,
+            &[root.display().to_string()],
+            "c002",
+            "acquire",
+        )
+        .await
+        .unwrap();
+        for second_root in [&root, &nested] {
+            let mut first = source_upload_test_receiver(&registry, "c002", &root);
+            source_upload_test_ready(&mut first).await;
+            let mut second = source_upload_test_receiver(&registry, "c002", second_root);
+            let mut ready = [0; 5];
+            assert!(
+                timeout(
+                    Duration::from_millis(150),
+                    second.stdout.as_mut().unwrap().read_exact(&mut ready)
+                )
+                .await
+                .is_err()
+            );
+            source_upload_test_finish(first, "parent").await;
+            source_upload_test_ready(&mut second).await;
+            source_upload_test_finish(second, "child").await;
+            assert_eq!(
+                std::fs::read_to_string(second_root.join("uploaded")).unwrap(),
+                "child"
+            );
+        }
+        owner.release().await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn source_upload_cancellation_drains_every_receiver_and_fences_late_uploads() {
+        let directory = source_lock_test_dir();
+        let registry = directory.join("registry");
+        let first_root = directory.join("first");
+        let second_root = directory.join("second");
+        std::fs::create_dir_all(&first_root).unwrap();
+        std::fs::create_dir_all(&second_root).unwrap();
+        let roots = vec![
+            first_root.display().to_string(),
+            second_root.display().to_string(),
+        ];
+        let owner = claim_test_durable_source_closure(&registry, &roots, "c003", "acquire")
+            .await
+            .unwrap();
+        let mut first = source_upload_test_receiver(&registry, "c003", &first_root);
+        let mut second = source_upload_test_receiver(&registry, "c003", &second_root);
+        source_upload_test_ready(&mut first).await;
+        source_upload_test_ready(&mut second).await;
+        let mut cancellation = Box::pin(test_source_intent(&registry, &roots, "c003", "cancel"));
+        assert!(
+            timeout(Duration::from_millis(150), &mut cancellation)
+                .await
+                .is_err()
+        );
+        source_upload_test_finish(first, "one").await;
+        assert!(
+            timeout(Duration::from_millis(150), &mut cancellation)
+                .await
+                .is_err()
+        );
+        source_upload_test_finish(second, "two").await;
+        let cancelled = timeout(Duration::from_secs(10), cancellation)
+            .await
+            .unwrap();
+        assert!(cancelled.status.success());
+        assert_eq!(cancelled.stdout, b"owned");
+        let late = source_upload_test_receiver(&registry, "c003", &first_root);
+        let output = timeout(Duration::from_secs(10), late.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(73));
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("source grant is cancelling"));
+        assert_eq!(
+            std::fs::read_to_string(first_root.join("uploaded")).unwrap(),
+            "one"
+        );
+        let finished = test_source_intent(&registry, &roots, "c003", "finish-cancel").await;
+        assert!(finished.status.success());
+        drop(owner);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn source_upload_checks_claim_coverage_and_content_before_receiver() {
+        let directory = source_lock_test_dir();
+        let registry = directory.join("registry");
+        let root = directory.join("source");
+        let outside = directory.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let roots = vec![root.display().to_string()];
+        let owner = claim_test_durable_source_closure(&registry, &roots, "c005", "acquire")
+            .await
+            .unwrap();
+        let outside_upload = source_upload_test_receiver(&registry, "c005", &outside);
+        let output = timeout(Duration::from_secs(10), outside_upload.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(73));
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("outside its source grant"));
+        assert!(!outside.join("uploaded").exists());
+
+        let (contents, digest) = source_claim_roots(&roots).unwrap();
+        let claim = registry.join(format!("c005.{digest}.claim"));
+        std::fs::write(&claim, format!("{}\n", outside.display())).unwrap();
+        let changed = source_upload_test_receiver(&registry, "c005", &root);
+        let output = timeout(Duration::from_secs(10), changed.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(73));
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("source grant content changed"));
+        assert!(!root.join("uploaded").exists());
+        std::fs::write(&claim, contents).unwrap();
+        owner.release().await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn source_upload_queued_before_cancellation_rechecks_after_activity_lock() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let directory = source_lock_test_dir();
+        let registry = directory.join("registry");
+        let root = directory.join("source");
+        std::fs::create_dir_all(&root).unwrap();
+        let roots = vec![root.display().to_string()];
+        let owner = claim_test_durable_source_closure(&registry, &roots, "c006", "acquire")
+            .await
+            .unwrap();
+        let (contents, digest) = source_claim_roots(&roots).unwrap();
+        let cancel =
+            source_registry_invocation(registry.to_str().unwrap(), "c006", &digest, "cancel");
+        // Hold the real exclusive activity lock before the queued upload.
+        // Publish the production cancellation transaction under that lock,
+        // making the ordering deterministic without relying on flock fairness.
+        let terminal = format!(
+            "printf ready; IFS= read -r proceed || exit 79; {cancel} <<'RCH_TEST_CANCEL_ROOTS'\n{contents}RCH_TEST_CANCEL_ROOTS\n"
+        );
+        let command = format!(
+            "exec flock -x -- {} sh -c {}",
+            shell_escape::escape(registry.join("c006.activity.lock").to_string_lossy()),
+            shell_escape::escape(terminal.into()),
+        );
+        let mut cancellation = Command::new("sh")
+            .args(["-c", &command])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        source_upload_test_ready(&mut cancellation).await;
+        let mut queued = source_upload_test_receiver(&registry, "c006", &root);
+        let mut ready = [0; 5];
+        assert!(
+            timeout(
+                Duration::from_millis(150),
+                queued.stdout.as_mut().unwrap().read_exact(&mut ready)
+            )
+            .await
+            .is_err()
+        );
+        cancellation
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"cancel\n")
+            .await
+            .unwrap();
+        drop(cancellation.stdin.take());
+        let output = timeout(Duration::from_secs(10), cancellation.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"owned");
+        let output = timeout(Duration::from_secs(10), queued.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(73));
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("source grant is cancelling"));
+        assert!(!root.join("uploaded").exists());
+        assert!(
+            test_source_intent(&registry, &roots, "c006", "finish-cancel")
+                .await
+                .status
+                .success()
+        );
+        drop(owner);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn source_upload_aliases_use_exclusive_activity_without_consuming_stdin() {
+        use tokio::io::AsyncReadExt as _;
+        for alias_kind in ["root", "scratch", "stamp"] {
+            let directory = source_lock_test_dir();
+            let registry = directory.join("registry");
+            let first_root = directory.join("first");
+            let second_root = directory.join("second");
+            let alias = directory.join("alias");
+            std::fs::create_dir_all(&first_root).unwrap();
+            std::fs::create_dir_all(&second_root).unwrap();
+            let selected = match alias_kind {
+                "root" => {
+                    std::os::unix::fs::symlink(&first_root, &alias).unwrap();
+                    &alias
+                }
+                "scratch" => {
+                    std::os::unix::fs::symlink(&second_root, first_root.join(".rch-tmp")).unwrap();
+                    &first_root
+                }
+                "stamp" => {
+                    std::fs::create_dir_all(first_root.join(".rch-tmp")).unwrap();
+                    let target = directory.join("stamp-target");
+                    std::fs::write(&target, "untouched").unwrap();
+                    std::os::unix::fs::symlink(
+                        target,
+                        first_root.join(".rch-tmp/.rch-prune-stamp"),
+                    )
+                    .unwrap();
+                    &first_root
+                }
+                _ => unreachable!(),
+            };
+            let roots = vec![
+                selected.display().to_string(),
+                second_root.display().to_string(),
+            ];
+            let owner = claim_test_durable_source_closure(&registry, &roots, "c004", "acquire")
+                .await
+                .unwrap();
+            let mut first = source_upload_test_receiver(&registry, "c004", selected);
+            source_upload_test_ready(&mut first).await;
+            let mut second = source_upload_test_receiver(&registry, "c004", &second_root);
+            let mut ready = [0; 5];
+            assert!(
+                timeout(
+                    Duration::from_millis(150),
+                    second.stdout.as_mut().unwrap().read_exact(&mut ready)
+                )
+                .await
+                .is_err(),
+                "{alias_kind} alias did not retain exclusive activity"
+            );
+            source_upload_test_finish(first, "literal ' $ payload").await;
+            source_upload_test_ready(&mut second).await;
+            source_upload_test_finish(second, "second").await;
+            assert_eq!(
+                std::fs::read_to_string(first_root.join("uploaded")).unwrap(),
+                "literal ' $ payload"
+            );
+            owner.release().await.unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_upload_topology_detects_directory_identity_aliases_in_missing_prefixes() {
+        // This is a unit test of the topology decision, not a privileged bind
+        // mount experiment. Actual symlink fallback runs in the test above.
+        let check = r#"
+import os, stat, sys, types
+namespace = {}
+exec(sys.argv[1].rsplit('\ntry:\n    sys.exit(run())', 1)[0], namespace)
+identities = {'/': 1, '/first': 2, '/alias': 2}
+def inspect(path):
+    if path not in identities:
+        raise FileNotFoundError(path)
+    return types.SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_dev=3,
+                                 st_ino=identities[path])
+namespace['os'] = types.SimpleNamespace(path=os.path, lstat=inspect)
+assert not namespace['direct_topology'](['/first/missing', '/alias/other'], '/first/missing')
+assert namespace['direct_topology'](['/first/missing', '/first/other'], '/first/missing')
+identities.update({'/alias': 3, '/first/.rch-tmp': 4, '/alias/.rch-tmp': 4})
+assert not namespace['direct_topology'](['/first', '/alias'], '/first')
+"#;
+        let output = std::process::Command::new("python3")
+            .args(["-I", "-S", "-c", check, SOURCE_UPLOAD_ACTIVITY])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[cfg(target_os = "linux")]

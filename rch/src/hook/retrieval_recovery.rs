@@ -4304,6 +4304,7 @@ mod tests {
             base_commit: "a".repeat(40),
             tree_object: "b".repeat(40),
             overlay_paths: Vec::new(),
+            overlay_deletions: Vec::new(),
             overlay_fingerprint: "c".repeat(64),
             submodules: Vec::new(),
             dependencies: Vec::new(),

@@ -38,6 +38,9 @@ pub(super) struct SourceContentFilterPolicy {
     schema: &'static str,
     include_patterns: Option<Vec<String>>,
     exclude_patterns: Vec<String>,
+    /// Literal tombstone exclusions applied before every directory include.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pre_include_exclude_patterns: Vec<String>,
     delete_extraneous: bool,
     checksum_transfer: bool,
     /// This policy's rsync filters apply only to the overlay. The complete
@@ -53,6 +56,8 @@ struct SourceContentCleanOverlay {
     working_directory: PathBuf,
     overlay_fingerprint: String,
     overlay_paths: Vec<PathBuf>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    overlay_deletions: Vec<PathBuf>,
     submodules: Vec<SourceContentSubmodule>,
 }
 
@@ -445,6 +450,7 @@ async fn capture_manifest(
         schema: "rch.source_content_filter.v1",
         include_patterns,
         exclude_patterns,
+        pre_include_exclude_patterns: pipeline.source_content_priority_excludes().to_vec(),
         delete_extraneous,
         checksum_transfer,
         clean_overlay: None,
@@ -769,6 +775,12 @@ async fn capture_clean_overlay_manifest(
         checksum_transfer && !delete_extraneous,
         "clean-overlay proof requires checksum transfer without deletion"
     );
+    let priority_excludes = pipeline.source_content_priority_excludes().to_vec();
+    anyhow::ensure!(
+        priority_excludes
+            == crate::transfer::clean_overlay_deletion_exclude_patterns(&spec.overlay_deletions)?,
+        "clean-overlay upload exclusions differ from its admitted deletions"
+    );
     let (paths, overlay_directories) = if spec.is_base_only() {
         (Vec::new(), Vec::new())
     } else {
@@ -780,9 +792,11 @@ async fn capture_clean_overlay_manifest(
     };
     for path in &paths {
         anyhow::ensure!(
-            spec.overlay_paths()
-                .iter()
-                .any(|overlay| path.starts_with(overlay)),
+            !spec.is_deleted(path)
+                && spec
+                    .overlay_paths()
+                    .iter()
+                    .any(|overlay| path.starts_with(overlay)),
             "rsync selected an unrequested clean-overlay path: {}",
             path.display()
         );
@@ -796,6 +810,7 @@ async fn capture_clean_overlay_manifest(
         Path::new(&local_root),
         spec.base_commit(),
         &selected_submodules,
+        &spec.overlay_deletions,
     )
     .await?;
     let hash_root = PathBuf::from(&local_root);
@@ -808,9 +823,14 @@ async fn capture_clean_overlay_manifest(
     spec.verify_archive_attributes(Path::new(&local_root))
         .await?;
     let filter_policy = SourceContentFilterPolicy {
-        schema: "rch.source_content_clean_overlay_filter.v1",
+        schema: if spec.overlay_deletions.is_empty() {
+            "rch.source_content_clean_overlay_filter.v1"
+        } else {
+            "rch.source_content_clean_overlay_filter.v2"
+        },
         include_patterns,
         exclude_patterns,
+        pre_include_exclude_patterns: priority_excludes,
         delete_extraneous,
         checksum_transfer,
         clean_overlay: Some(SourceContentCleanOverlay {
@@ -819,6 +839,7 @@ async fn capture_clean_overlay_manifest(
             working_directory: spec.invocation_directory.clone(),
             overlay_fingerprint: spec.overlay_fingerprint.clone(),
             overlay_paths: spec.overlay_paths.clone(),
+            overlay_deletions: spec.overlay_deletions.clone(),
             submodules: spec
                 .submodules
                 .iter()
@@ -3513,6 +3534,7 @@ sys.exit(99)
             schema: "rch.source_content_filter.v1",
             include_patterns: None,
             exclude_patterns: vec!["target/".to_string()],
+            pre_include_exclude_patterns: Vec::new(),
             delete_extraneous: true,
             checksum_transfer: true,
             clean_overlay: None,
@@ -3595,6 +3617,7 @@ sys.exit(99)
                 schema: "rch.source_content_filter.v1",
                 include_patterns: None,
                 exclude_patterns: vec![],
+                pre_include_exclude_patterns: Vec::new(),
                 delete_extraneous: true,
                 checksum_transfer: true,
                 clean_overlay: None,
@@ -3810,6 +3833,7 @@ sys.exit(99)
                 schema: "rch.source_content_filter.v1",
                 include_patterns: None,
                 exclude_patterns: vec![],
+                pre_include_exclude_patterns: Vec::new(),
                 delete_extraneous: true,
                 checksum_transfer: true,
                 clean_overlay: None,
@@ -4226,8 +4250,11 @@ sys.exit(99)
         )
         .with_remote_path_override(entry.remote_root.clone())
         .with_sync_include_patterns(
-            clean_overlay_include_patterns(&spec.repository_root, spec.overlay_paths()).unwrap(),
+            clean_overlay_include_patterns(&spec.repository_root, &spec.live_overlay_paths())
+                .unwrap(),
         )
+        .with_clean_overlay_deletions(&spec.overlay_deletions)
+        .unwrap()
         .with_sync_delete(false)
         .with_sync_checksum(true);
         (entry, pipeline)
@@ -4328,11 +4355,18 @@ sys.exit(99)
         assert_eq!(policy.overlay_fingerprint, spec.overlay_fingerprint);
         assert!(!prepared.manifest.filter_policy.delete_extraneous);
         assert_eq!(prepared.manifest.file_count, files.len());
+        assert!(
+            serde_json::to_value(&prepared.manifest.filter_policy)
+                .unwrap()
+                .get("pre_include_exclude_patterns")
+                .is_none()
+        );
 
         let archive = TransferPipeline::create_selected_git_archive(
             &spec.repository_root,
             spec.base_commit(),
             &[],
+            &spec.overlay_deletions,
         )
         .await
         .unwrap();
@@ -4371,6 +4405,340 @@ sys.exit(99)
             "pub fn changed_after_admission() {}\n",
         )
         .unwrap();
+        assert!(
+            verify_local_source_content_manifest(&prepared)
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clean_overlay_deleted_archive_hash_and_namespace_are_exact() {
+        let (root, _) = build_source_stamp_fixture_repo();
+        for (name, bytes) in [
+            ("README.md", "immutable unselected readme\n"),
+            ("src/old/module.rs", "renamed module\n"),
+            ("src/only/gone.rs", "removed leaf\n"),
+        ] {
+            let path = root.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        build_source_stamp_git(&root, &["add", "-f", "."]);
+        build_source_stamp_git_commit(&root, "hash and namespace deletion base");
+        let head = build_source_stamp_git(&root, &["rev-parse", "HEAD"]);
+        let tree = build_source_stamp_git(&root, &["rev-parse", "HEAD^{tree}"]);
+        std::fs::rename(root.join("src/old"), root.join("src/new")).unwrap();
+        std::fs::rename(root.join("src/only/gone.rs"), root.join("saved-gone.rs")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn selected() {}\n").unwrap();
+        std::fs::write(root.join("README.md"), "unselected ambient dirt\n").unwrap();
+        let deletions = vec![PathBuf::from("src/old"), PathBuf::from("src/only/gone.rs")];
+        let archive = TransferPipeline::create_selected_git_archive(&root, &head, &[], &deletions)
+            .await
+            .unwrap();
+        let (files, directories, byte_count) = hash_clean_overlay_selection(
+            archive,
+            &root,
+            &[
+                PathBuf::from("src/lib.rs"),
+                PathBuf::from("src/new/module.rs"),
+            ],
+            &[
+                PathBuf::from("src"),
+                PathBuf::from("src/new"),
+                PathBuf::from("src/only"),
+            ],
+        )
+        .unwrap();
+        let indexed: std::collections::BTreeMap<_, _> = files
+            .iter()
+            .map(|file| (file.path.as_str(), file))
+            .collect();
+        assert_eq!(
+            indexed["README.md"].sha256,
+            sha256_hex(b"immutable unselected readme\n")
+        );
+        assert_eq!(
+            indexed["src/lib.rs"].sha256,
+            sha256_hex(b"pub fn selected() {}\n")
+        );
+        assert_eq!(
+            indexed["src/new/module.rs"].sha256,
+            sha256_hex(b"renamed module\n")
+        );
+        assert!(!indexed.contains_key("src/old/module.rs"));
+        assert!(!indexed.contains_key("src/only/gone.rs"));
+        assert!(!indexed.contains_key("saved-gone.rs"));
+        assert_eq!(
+            byte_count,
+            files.iter().map(|file| file.byte_count).sum::<u64>()
+        );
+        assert!(!directories.contains(&PathBuf::from("src/old")));
+        assert!(directories.contains(&PathBuf::from("src/only")));
+        let namespace = create_clean_overlay_source_namespace(
+            &files
+                .iter()
+                .map(|file| PathBuf::from(&file.path))
+                .collect::<Vec<_>>(),
+            &directories,
+        )
+        .unwrap();
+        assert!(namespace.path().join("src/new/module.rs").is_file());
+        assert!(namespace.path().join("src/only").is_dir());
+        assert!(!namespace.path().join("src/old").exists());
+        assert!(!namespace.path().join("src/only/gone.rs").exists());
+
+        let paths = vec![PathBuf::from("src")];
+        let fingerprint =
+            super::super::clean_overlay_fingerprint(&root, &paths, &deletions).unwrap();
+        let mut policy = SourceContentCleanOverlay {
+            base_commit: head,
+            tree_object: tree,
+            working_directory: PathBuf::new(),
+            overlay_fingerprint: fingerprint,
+            overlay_paths: paths.clone(),
+            overlay_deletions: deletions.clone(),
+            submodules: Vec::new(),
+        };
+        assert_eq!(
+            serde_json::to_value(&policy).unwrap()["overlay_deletions"],
+            serde_json::json!(["src/old", "src/only/gone.rs"])
+        );
+        policy.overlay_deletions.clear();
+        assert!(
+            serde_json::to_value(&policy)
+                .unwrap()
+                .get("overlay_deletions")
+                .is_none()
+        );
+        std::fs::write(root.join("src/only/gone.rs"), "reappeared\n").unwrap();
+        assert!(super::super::clean_overlay_fingerprint(&root, &paths, &deletions).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clean_overlay_deleted_sources_match_receipt_and_namespace() {
+        let (root, _) = build_source_stamp_fixture_repo();
+        for (name, bytes) in [
+            ("README.md", "immutable unselected readme\n"),
+            ("src/removed.rs", "removed leaf\n"),
+            ("src/old/module.rs", "renamed module\n"),
+            (
+                "src/.venv/removed.txt",
+                "tracked file under upload exclusion\n",
+            ),
+        ] {
+            let path = root.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        build_source_stamp_git(&root, &["add", "-f", "."]);
+        build_source_stamp_git_commit(&root, "deletion receipt base");
+        std::fs::rename(root.join("src/removed.rs"), root.join("saved-removed.rs")).unwrap();
+        std::fs::rename(root.join("src/old"), root.join("src/new")).unwrap();
+        std::fs::rename(root.join("src/.venv"), root.join("saved-excluded")).unwrap();
+        std::fs::write(root.join("README.md"), "ambient dirty readme\n").unwrap();
+        let spec = prepare_clean_overlay_spec(
+            &root,
+            Some("HEAD".into()),
+            true,
+            vec![PathBuf::from("src")],
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            spec.overlay_deletions,
+            [
+                PathBuf::from("src/.venv"),
+                PathBuf::from("src/old"),
+                PathBuf::from("src/removed.rs"),
+            ]
+        );
+        let remote = tempfile::tempdir().unwrap().keep();
+        let (entry, pipeline) = clean_overlay_receipt_pipeline(&spec, &remote);
+        let prepared = prepare_clean_overlay_source_content_root(0, &entry, &pipeline, &spec)
+            .await
+            .unwrap();
+        let files: std::collections::BTreeMap<_, _> = prepared
+            .manifest
+            .files
+            .iter()
+            .map(|file| (file.path.as_str(), file))
+            .collect();
+        assert_eq!(
+            files["README.md"].sha256,
+            sha256_hex(b"immutable unselected readme\n")
+        );
+        assert_eq!(
+            files["src/new/module.rs"].sha256,
+            sha256_hex(b"renamed module\n")
+        );
+        for removed in [
+            "src/removed.rs",
+            "src/old/module.rs",
+            "src/.venv/removed.txt",
+        ] {
+            assert!(!files.contains_key(removed));
+        }
+        assert!(!files.contains_key("saved-removed.rs"));
+        assert!(!files.contains_key("saved-excluded/removed.txt"));
+        let policy = &prepared.manifest.filter_policy;
+        assert_eq!(policy.schema, "rch.source_content_clean_overlay_filter.v2");
+        assert!(!policy.delete_extraneous);
+        assert!(policy.checksum_transfer);
+        assert_eq!(
+            policy.clean_overlay.as_ref().unwrap().overlay_deletions,
+            spec.overlay_deletions
+        );
+        assert_eq!(
+            policy.pre_include_exclude_patterns,
+            crate::transfer::clean_overlay_deletion_exclude_patterns(&spec.overlay_deletions)
+                .unwrap()
+        );
+        let unbound = pipeline.clone().with_clean_overlay_deletions(&[]).unwrap();
+        assert!(
+            prepare_clean_overlay_source_content_root(0, &entry, &unbound, &spec)
+                .await
+                .is_err(),
+            "a receipt cannot omit its sealed upload exclusions"
+        );
+        let encoded = serde_json::to_value(policy).unwrap();
+        assert_eq!(
+            encoded["clean_overlay"]["overlay_deletions"],
+            serde_json::json!(["src/.venv", "src/old", "src/removed.rs"])
+        );
+
+        let archive = TransferPipeline::create_selected_git_archive(
+            &root,
+            spec.base_commit(),
+            &[],
+            &spec.overlay_deletions,
+        )
+        .await
+        .unwrap();
+        tar::Archive::new(archive.reopen().unwrap())
+            .unpack(&remote)
+            .unwrap();
+        for path in pipeline
+            .enumerate_source_content_selection()
+            .await
+            .unwrap()
+            .0
+        {
+            let destination = remote.join(&path);
+            std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            std::fs::copy(root.join(path), destination).unwrap();
+        }
+        for removed in &spec.overlay_deletions {
+            assert!(
+                !remote.join(removed).exists(),
+                "deleted worker path {removed:?}"
+            );
+        }
+        let namespace = prepared.clean_overlay_namespace.as_ref().unwrap();
+        assert!(namespace.path().join("src/new/module.rs").is_file());
+        for removed in &spec.overlay_deletions {
+            assert!(!namespace.path().join(removed).exists());
+        }
+        clean_overlay_namespace_pipeline(&prepared).await.unwrap();
+        let payload = remote_manifest_payload(&prepared.manifest).unwrap();
+        let verified = run_source_verifier(&prepared.manifest, &payload, None, true);
+        assert!(verified.status.success(), "{verified:?}");
+        assert!(verified.stderr.is_empty());
+        verify_local_source_content_manifest(&prepared)
+            .await
+            .unwrap();
+
+        // The namespace proof cannot silently grow a name that the archive
+        // removed. This is a local skeleton boundary, not an SSH execution.
+        std::fs::write(namespace.path().join("src/removed.rs"), b"").unwrap();
+        assert!(clean_overlay_namespace_pipeline(&prepared).await.is_err());
+        // Reappearance of a deleted caller input also invalidates the receipt.
+        std::fs::write(root.join("src/removed.rs"), "reappeared\n").unwrap();
+        assert!(
+            verify_local_source_content_manifest(&prepared)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(root.join("saved-removed.rs")).unwrap(),
+            b"removed leaf\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clean_overlay_deletion_only_receipt_keeps_empty_upload_selection() {
+        let (root, _) = build_source_stamp_fixture_repo();
+        std::fs::rename(root.join("src/lib.rs"), root.join("saved-lib.rs")).unwrap();
+        std::fs::write(root.join("unselected.txt"), "do not upload\n").unwrap();
+        let spec = prepare_clean_overlay_spec(
+            &root,
+            Some("HEAD".into()),
+            true,
+            vec![PathBuf::from("src/lib.rs")],
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!spec.is_base_only());
+        assert!(spec.live_overlay_paths().is_empty());
+        let remote = tempfile::tempdir().unwrap().keep();
+        let (entry, pipeline) = clean_overlay_receipt_pipeline(&spec, &remote);
+        let (includes, _, delete, checksum) = pipeline.source_content_filter_policy();
+        assert_eq!(includes, Some(Vec::new()));
+        assert!(!delete);
+        assert!(checksum);
+        assert_eq!(
+            pipeline.enumerate_source_content_selection().await.unwrap(),
+            (Vec::new(), Vec::new())
+        );
+        let prepared = prepare_clean_overlay_source_content_root(0, &entry, &pipeline, &spec)
+            .await
+            .unwrap();
+        assert_eq!(
+            prepared
+                .manifest
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            ["Cargo.toml"]
+        );
+        assert!(
+            prepared
+                .clean_overlay_namespace
+                .as_ref()
+                .unwrap()
+                .path()
+                .join("src")
+                .is_dir()
+        );
+        let archive = TransferPipeline::create_selected_git_archive(
+            &root,
+            spec.base_commit(),
+            &[],
+            &spec.overlay_deletions,
+        )
+        .await
+        .unwrap();
+        tar::Archive::new(archive.reopen().unwrap())
+            .unpack(&remote)
+            .unwrap();
+        assert!(remote.join("src").is_dir());
+        assert!(!remote.join("src/lib.rs").exists());
+        assert!(!remote.join("unselected.txt").exists());
+        let payload = remote_manifest_payload(&prepared.manifest).unwrap();
+        let verified = run_source_verifier(&prepared.manifest, &payload, None, true);
+        assert!(verified.status.success(), "{verified:?}");
+        verify_local_source_content_manifest(&prepared)
+            .await
+            .unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn reappeared() {}\n").unwrap();
         assert!(
             verify_local_source_content_manifest(&prepared)
                 .await
@@ -4616,6 +4984,7 @@ sys.exit(99)
             &spec.repository_root,
             spec.base_commit(),
             &selected,
+            &spec.overlay_deletions,
         )
         .await
         .unwrap();
@@ -4756,6 +5125,7 @@ sys.exit(99)
             base_commit: base_commit.to_owned(),
             tree_object: tree_object.to_owned(),
             overlay_paths,
+            overlay_deletions: Vec::new(),
             overlay_fingerprint: overlay_fingerprint.to_owned(),
             submodules: Vec::new(),
             dependencies,

@@ -626,7 +626,7 @@ USAGE:
         /// Transfer a clean Git baseline plus only explicit overlay paths
         #[arg(long, requires = "base")]
         clean_overlay: bool,
-        /// Repository-relative file or directory to overlay (repeatable)
+        /// Repository-relative file or directory to overlay, including tracked deletions (repeatable)
         #[arg(
             long,
             short = 'o',

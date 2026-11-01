@@ -154,6 +154,10 @@ pub(super) struct CleanOverlaySpec {
     base_commit: String,
     tree_object: String,
     overlay_paths: Vec<PathBuf>,
+    /// Absent tracked files or absent subtrees within an explicitly selected
+    /// directory. Admission seals this inventory; later missing files cannot
+    /// acquire deletion authority.
+    overlay_deletions: Vec<PathBuf>,
     overlay_fingerprint: String,
     submodules: Vec<CleanOverlaySubmodule>,
     dependencies: Vec<(PathBuf, CleanOverlaySpec)>,
@@ -192,6 +196,18 @@ impl CleanOverlaySpec {
 
     pub(super) fn overlay_paths(&self) -> &[PathBuf] {
         &self.overlay_paths
+    }
+
+    pub(super) fn is_deleted(&self, path: &Path) -> bool {
+        crate::transfer::clean_overlay_path_is_deleted(&self.overlay_deletions, path)
+    }
+
+    pub(super) fn live_overlay_paths(&self) -> Vec<PathBuf> {
+        self.overlay_paths
+            .iter()
+            .filter(|path| !self.is_deleted(path))
+            .cloned()
+            .collect()
     }
 
     pub(super) fn is_base_only(&self) -> bool {
@@ -259,6 +275,7 @@ impl CleanOverlaySpec {
         let current = clean_overlay_selected_fingerprint(
             project_root,
             &self.overlay_paths,
+            &self.overlay_deletions,
             &self.submodules,
         )?;
         if current != self.overlay_fingerprint {
@@ -3222,7 +3239,7 @@ fn validate_clean_overlay_live_path(project_root: &Path, relative: &Path) -> any
         absolute.push(component.as_os_str());
         let metadata = std::fs::symlink_metadata(&absolute).with_context(|| {
             format!(
-                "clean-overlay path does not exist and deletions are unsupported: {}",
+                "clean-overlay live input is missing and was not an admitted deletion: {}",
                 relative.display()
             )
         })?;
@@ -3236,11 +3253,61 @@ fn validate_clean_overlay_live_path(project_root: &Path, relative: &Path) -> any
     Ok(())
 }
 
+/// Prove absence without following a symlink or treating a case-only rename as
+/// a deletion. The first missing component also identifies removed directories
+/// inside a selected directory overlay.
+fn clean_overlay_missing_prefix(
+    project_root: &Path,
+    relative: &Path,
+) -> anyhow::Result<Option<PathBuf>> {
+    let mut parent = project_root.to_path_buf();
+    let mut prefix = PathBuf::new();
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        let requested = component.as_os_str();
+        prefix.push(requested);
+        let mut exact = false;
+        let mut alias = false;
+        for entry in std::fs::read_dir(&parent)
+            .with_context(|| format!("read clean-overlay path parent {}", parent.display()))?
+        {
+            let name = entry?.file_name();
+            exact |= name == requested;
+            alias |= name
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&requested.to_string_lossy());
+        }
+        if !exact {
+            anyhow::ensure!(
+                !alias,
+                "clean-overlay path spelling does not exactly match the filesystem entry; case-only overlays are unsupported: {}",
+                relative.display()
+            );
+            return Ok(Some(prefix));
+        }
+        parent.push(requested);
+        let metadata = std::fs::symlink_metadata(&parent)
+            .with_context(|| format!("inspect clean-overlay path {}", relative.display()))?;
+        anyhow::ensure!(
+            !metadata.file_type().is_symlink(),
+            "clean-overlay overlays do not support symlinks: {}",
+            relative.display()
+        );
+        anyhow::ensure!(
+            components.peek().is_none() || metadata.is_dir(),
+            "clean-overlay parent changes a base directory into a file: {}",
+            prefix.display()
+        );
+    }
+    Ok(None)
+}
+
 fn validate_clean_overlay_against_base(
     project_root: &Path,
     overlay_paths: &[PathBuf],
     base_entries: &[CleanBaseTreeEntry],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<PathBuf>> {
+    let mut deletions = BTreeSet::new();
     for overlay in overlay_paths {
         let overlay_label = overlay
             .to_str()
@@ -3267,8 +3334,6 @@ fn validate_clean_overlay_against_base(
             }
         }
         let overlay_prefix = format!("{overlay_label}/");
-        let metadata = std::fs::symlink_metadata(project_root.join(overlay))
-            .with_context(|| format!("inspect clean-overlay path {}", overlay.display()))?;
         let exact = base_entries
             .iter()
             .find(|entry| entry.path == overlay.as_path());
@@ -3282,6 +3347,28 @@ fn validate_clean_overlay_against_base(
             })
             .collect::<Vec<_>>();
 
+        if clean_overlay_missing_prefix(project_root, overlay)?.is_some() {
+            anyhow::ensure!(
+                exact.is_some_and(|entry| matches!(entry.mode, 0o100644 | 0o100755))
+                    || (exact.is_none()
+                        && !descendants.is_empty()
+                        && descendants
+                            .iter()
+                            .all(|entry| matches!(entry.mode, 0o100644 | 0o100755))),
+                "missing clean-overlay path must select a tracked regular file or directory of regular files in the base: {}",
+                overlay.display()
+            );
+            // A selected file does not grant authority over its absent parent
+            // or over unselected siblings within that directory.
+            deletions.insert(overlay.clone());
+            anyhow::ensure!(
+                deletions.len() <= crate::transfer::MAX_CLEAN_OVERLAY_DELETIONS,
+                "clean-overlay deletion inventory exceeds its admission bound"
+            );
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(project_root.join(overlay))
+            .with_context(|| format!("inspect clean-overlay path {}", overlay.display()))?;
         if metadata.is_dir() {
             if exact.is_some() {
                 anyhow::bail!(
@@ -3290,11 +3377,24 @@ fn validate_clean_overlay_against_base(
                 );
             }
             for entry in descendants {
-                if !clean_overlay_path_has_exact_spelling(project_root, &entry.path)? {
-                    anyhow::bail!(
-                        "clean-overlay directory omits or renames base path {}; selected deletions are unsupported",
+                if let Some(missing) = clean_overlay_missing_prefix(project_root, &entry.path)? {
+                    anyhow::ensure!(
+                        matches!(entry.mode, 0o100644 | 0o100755),
+                        "clean-overlay deletion cannot remove a base symlink or submodule: {}",
                         entry.path.display()
                     );
+                    anyhow::ensure!(
+                        missing.starts_with(overlay) && missing != *overlay,
+                        "clean-overlay selected directory disappeared during admission"
+                    );
+                    // All base descendants are visited, so a removed subtree
+                    // containing a symlink cannot hide behind a regular file.
+                    deletions.insert(missing);
+                    anyhow::ensure!(
+                        deletions.len() <= crate::transfer::MAX_CLEAN_OVERLAY_DELETIONS,
+                        "clean-overlay deletion inventory exceeds its admission bound"
+                    );
+                    continue;
                 }
                 let local = std::fs::symlink_metadata(project_root.join(&entry.path))
                     .with_context(|| {
@@ -3330,12 +3430,24 @@ fn validate_clean_overlay_against_base(
             }
         }
     }
-    Ok(())
+    let mut minimal = BTreeSet::new();
+    for deletion in deletions {
+        normalize_clean_overlay_path(&deletion)?;
+        if !deletion
+            .ancestors()
+            .skip(1)
+            .any(|parent| minimal.contains(parent))
+        {
+            minimal.insert(deletion);
+        }
+    }
+    Ok(minimal.into_iter().collect())
 }
 
 fn hash_clean_overlay_path(
     project_root: &Path,
     relative: &Path,
+    deletions: &[PathBuf],
     hasher: &mut blake3::Hasher,
 ) -> anyhow::Result<()> {
     let relative_label = relative.to_str().ok_or_else(|| {
@@ -3386,14 +3498,14 @@ fn hash_clean_overlay_path(
             .map(|entry| entry.map(|entry| relative.join(entry.file_name())))
             .collect::<Result<Vec<_>, _>>()?;
         children.sort();
-        if children.is_empty() {
+        if children.is_empty() && !deletions.iter().any(|path| path.starts_with(relative)) {
             anyhow::bail!(
                 "clean-overlay overlays do not support empty directories: {}",
                 relative.display()
             );
         }
         for child in children {
-            hash_clean_overlay_path(project_root, &child, hasher)?;
+            hash_clean_overlay_path(project_root, &child, deletions, hasher)?;
         }
     } else if metadata.is_file() {
         hasher.update(b"file\0");
@@ -3422,13 +3534,34 @@ fn hash_clean_overlay_path(
 fn clean_overlay_fingerprint(
     project_root: &Path,
     overlay_paths: &[PathBuf],
+    deletions: &[PathBuf],
 ) -> anyhow::Result<String> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"rch-clean-overlay-input-v1\0");
     for path in overlay_paths {
+        if crate::transfer::clean_overlay_path_is_deleted(deletions, path) {
+            continue;
+        }
         validate_clean_overlay_live_path(project_root, path)?;
-        hash_clean_overlay_path(project_root, path, &mut hasher)?;
+        hash_clean_overlay_path(project_root, path, deletions, &mut hasher)?;
         validate_clean_overlay_live_path(project_root, path)?;
+    }
+    let overlay = hasher.finalize().to_hex().to_string();
+    if deletions.is_empty() {
+        return Ok(overlay);
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"rch-clean-overlay-deletions-v1\0");
+    hasher.update(overlay.as_bytes());
+    for deletion in deletions {
+        anyhow::ensure!(
+            clean_overlay_missing_prefix(project_root, deletion)?.is_some(),
+            "clean-overlay deleted input reappeared after admission: {}",
+            deletion.display()
+        );
+        let bytes = deletion.as_os_str().as_encoded_bytes();
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
     }
     Ok(hasher.finalize().to_hex().to_string())
 }
@@ -3436,9 +3569,10 @@ fn clean_overlay_fingerprint(
 fn clean_overlay_selected_fingerprint(
     project_root: &Path,
     overlay_paths: &[PathBuf],
+    deletions: &[PathBuf],
     submodules: &[CleanOverlaySubmodule],
 ) -> anyhow::Result<String> {
-    let overlay = clean_overlay_fingerprint(project_root, overlay_paths)?;
+    let overlay = clean_overlay_fingerprint(project_root, overlay_paths, deletions)?;
     if submodules.is_empty() {
         return Ok(overlay);
     }
@@ -3740,8 +3874,12 @@ async fn selected_clean_overlay_cargo_tree(
     fn add_overlay(
         root: &Path,
         relative: &Path,
+        deletions: &[PathBuf],
         entries: &mut BTreeMap<PathBuf, SelectedCargoEntry>,
     ) -> anyhow::Result<()> {
+        if crate::transfer::clean_overlay_path_is_deleted(deletions, relative) {
+            return Ok(());
+        }
         let metadata = std::fs::symlink_metadata(root.join(relative))?;
         if metadata.file_type().is_symlink() {
             anyhow::bail!(
@@ -3751,7 +3889,7 @@ async fn selected_clean_overlay_cargo_tree(
         }
         if metadata.is_dir() {
             for child in std::fs::read_dir(root.join(relative))? {
-                add_overlay(root, &relative.join(child?.file_name()), entries)?;
+                add_overlay(root, &relative.join(child?.file_name()), deletions, entries)?;
             }
         } else if metadata.is_file() {
             entries.insert(relative.to_path_buf(), SelectedCargoEntry::File(None));
@@ -3781,6 +3919,9 @@ async fn selected_clean_overlay_cargo_tree(
         let tree = git_output_bytes(&root, &["ls-tree", "-rz", "--full-tree", commit]).await?;
         for entry in parse_clean_base_tree(&tree)? {
             let path = prefix.join(&entry.path);
+            if spec.is_deleted(&path) {
+                continue;
+            }
             if entry.mode == 0o160000 {
                 anyhow::ensure!(
                     spec.submodules.iter().any(|submodule| {
@@ -3810,7 +3951,9 @@ async fn selected_clean_overlay_cargo_tree(
         }
     }
     for overlay in spec.overlay_paths() {
-        add_overlay(project_root, overlay, &mut entries)?;
+        if !spec.is_deleted(overlay) {
+            add_overlay(project_root, overlay, &spec.overlay_deletions, &mut entries)?;
+        }
     }
     if !retain_cargo_metadata {
         spec.verify_overlay_unchanged(project_root)?;
@@ -4173,14 +4316,21 @@ async fn prepare_clean_overlay_spec(
                 submodule.path.display()
             );
         }
-        validate_clean_overlay_live_path(&canonical_project_root, &normalized)?;
         normalized_paths.insert(normalized);
     }
 
     let overlay_paths = normalized_paths.into_iter().collect::<Vec<_>>();
-    validate_clean_overlay_against_base(&canonical_project_root, &overlay_paths, &base_entries)?;
-    let overlay_fingerprint =
-        clean_overlay_selected_fingerprint(&canonical_project_root, &overlay_paths, &submodules)?;
+    let overlay_deletions = validate_clean_overlay_against_base(
+        &canonical_project_root,
+        &overlay_paths,
+        &base_entries,
+    )?;
+    let overlay_fingerprint = clean_overlay_selected_fingerprint(
+        &canonical_project_root,
+        &overlay_paths,
+        &overlay_deletions,
+        &submodules,
+    )?;
     validate_clean_overlay_invocation_directory(
         &canonical_project_root,
         &invocation_directory,
@@ -4194,6 +4344,7 @@ async fn prepare_clean_overlay_spec(
         base_commit,
         tree_object,
         overlay_paths,
+        overlay_deletions,
         overlay_fingerprint,
         submodules,
         dependencies: Vec::new(),
