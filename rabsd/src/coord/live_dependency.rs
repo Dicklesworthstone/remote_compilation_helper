@@ -90,6 +90,8 @@ const MAX_OUTPUT_BYTES: u64 = 1024 * 1024 * 1024;
 /// Largest stderr transcript the lane publishes (registry dependencies run
 /// with capped lints; a large transcript is not this class).
 pub const MAX_TRANSCRIPT_BYTES: usize = 1024 * 1024;
+/// Borrowed acknowledgment of metadata bytes forwarded during installation.
+type MetadataReadyCallback<'a> = &'a mut dyn FnMut(&[u8]) -> Result<(), String>;
 /// Encoding tag of the persisted bundle-root bytes. Not `raw`: the file's
 /// content id is the derived bundle-root digest, not an ATP object id.
 const BUNDLE_ROOT_ENCODING: &str = "artifact-bundle-root-v1";
@@ -472,10 +474,7 @@ impl PendingServe {
         self.install_inner(Some(&mut metadata_ready))
     }
 
-    fn install_inner(
-        self,
-        mut metadata_ready: Option<&mut dyn FnMut(&[u8]) -> Result<(), String>>,
-    ) -> InstallResult {
+    fn install_inner(self, mut metadata_ready: Option<MetadataReadyCallback<'_>>) -> InstallResult {
         if let Err(reason) = self.verify_inputs() {
             return InstallResult::Declined(reason);
         }

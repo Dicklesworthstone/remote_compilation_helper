@@ -5,6 +5,7 @@
 use super::super::*;
 use crate::janitor::store::mount_and_reconcile;
 use rabs_cas::blob_store::{DurabilityPolicy, PutLimits, put_if_absent};
+use rabs_cas::metadata_store::{RusqliteEngine, SqlEngine};
 use rabs_cas::test_support::{
     FixtureAttemptIds, install_admission_world, install_admission_world_with_ids,
     install_offer_closure, offer_serving_object, sample_action_key, sample_evidence,
@@ -18,6 +19,8 @@ use std::os::unix::ffi::OsStrExt;
 const HEAD: &[u8] = b"verified committed metadata fixture";
 const TAIL: &[u8] = b"verified committed archive fixture";
 const DEP_INFO: &[u8] = b"/__rabs/out/libfixture.rmeta:\n";
+
+type MetadataReadyCallback<'a> = &'a mut dyn FnMut(&[PathBuf]) -> Result<(), String>;
 
 struct Fixture {
     root: tempfile::TempDir,
@@ -161,7 +164,7 @@ impl Fixture {
     fn install(
         &self,
         destination: &Path,
-        callback: Option<&mut dyn FnMut(&[PathBuf]) -> Result<(), String>>,
+        callback: Option<MetadataReadyCallback<'_>>,
     ) -> Result<ServeOutcome, ServeError> {
         self.coord.serve_cached_result(
             &self.offer.manifest.action_key,
@@ -176,7 +179,7 @@ impl Fixture {
     fn produce(
         &self,
         destination: &Path,
-        callback: Option<&mut dyn FnMut(&[PathBuf]) -> Result<(), String>>,
+        callback: Option<MetadataReadyCallback<'_>>,
     ) -> Result<ServeOutcome, ServeError> {
         self.coord.serve_produced_result_with_metadata(
             &self.offer.manifest.action_key,
@@ -319,10 +322,22 @@ fn assert_delivery_faults(producer: bool) {
                 "receiver" => return Err("metadata receiver disconnected".into()),
                 "authority" => fixture.coord.mark_down(),
                 "manifest" => {
-                    fixture.cas.store().lock().unwrap().execute(
-                        "UPDATE action_publications SET manifest_bytes = ?1 WHERE action_key = ?2",
-                        &[SqlValue::Blob(vec![0; 32]), SqlValue::Text(digest_key(&fixture.offer.manifest.action_key))],
-                    ).unwrap();
+                    let _store = fixture.cas.store().lock().unwrap();
+                    let mut engine =
+                        RusqliteEngine::open(&fixture.cas.cas_root().join("meta.sqlite")).unwrap();
+                    assert_eq!(
+                        engine
+                            .execute(
+                                "UPDATE action_publications SET manifest_bytes = ?1 WHERE action_key = ?2",
+                                &[
+                                    SqlValue::Blob(vec![0; 32]),
+                                    SqlValue::Text(digest_key(&fixture.offer.manifest.action_key)),
+                                ],
+                            )
+                            .unwrap(),
+                        1,
+                        "the manifest fault must corrupt exactly the committed publication"
+                    );
                 }
                 "evidence" => {
                     fixture

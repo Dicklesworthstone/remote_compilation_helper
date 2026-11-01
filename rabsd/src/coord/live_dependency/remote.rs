@@ -11,11 +11,11 @@ use super::canonical::CanonicalPaths;
 use super::{
     CanonicalActionResultManifest, CapturedLocalResult, CompletionOutcome, CompletionReport,
     CoordLive, DependencyActionPlan, ExecutionAttempt, InstallResult, LiveDecision,
-    LiveDependencyKey, LiveDependencyLane, LiveDependencyRequest, MAX_TRANSCRIPT_BYTES, Path,
-    PathBuf, ServeError, ServeOutcome, ToolchainGuard, TypedDigest, WorkerSessionOffer,
-    canonicalize_compiler_transcript, committed_output, install_fault, known_installed_output,
-    metadata_replay_prefix_len, now_micros, read_stable, render_compiler_transcript,
-    verify_metadata_head,
+    LiveDependencyKey, LiveDependencyLane, LiveDependencyRequest, MAX_TRANSCRIPT_BYTES,
+    MetadataReadyCallback, Path, PathBuf, ServeError, ServeOutcome, ToolchainGuard, TypedDigest,
+    WorkerSessionOffer, canonicalize_compiler_transcript, committed_output, install_fault,
+    known_installed_output, metadata_replay_prefix_len, now_micros, read_stable,
+    render_compiler_transcript, verify_metadata_head,
 };
 use crate::coord::live::RequestOwnedInstallError;
 use crate::coord::remote_dependency_transport::{
@@ -2012,10 +2012,7 @@ impl PendingRemoteInstall {
         self.install_inner(Some(&mut metadata_ready))
     }
 
-    fn install_inner(
-        self,
-        mut metadata_ready: Option<&mut dyn FnMut(&[u8]) -> Result<(), String>>,
-    ) -> InstallResult {
+    fn install_inner(self, mut metadata_ready: Option<MetadataReadyCallback<'_>>) -> InstallResult {
         let request = &self.request;
         if let Err(reason) = self
             .output

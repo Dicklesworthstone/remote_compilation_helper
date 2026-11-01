@@ -1574,13 +1574,14 @@ mod tests {
         assert!(
             flatten_commit(&root, &commits, &mut Vec::new(), &mut 16, &mut 0, &control).is_err()
         );
+        let mut exhausted_members = MAX_ARCHIVE_MEMBERS;
         assert!(
             flatten_commit(
                 &root,
                 &commits,
                 &mut Vec::new(),
                 &mut 17,
-                &mut MAX_ARCHIVE_MEMBERS,
+                &mut exhausted_members,
                 &control
             )
             .is_err()

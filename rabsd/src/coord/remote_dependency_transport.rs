@@ -104,7 +104,7 @@ enum ReservedOperation<'a> {
         upload: &'a SourceUpload,
         on_admitted: WorkerAdmissionHook,
     },
-    Continue(SealedResult),
+    Continue(Box<SealedResult>),
 }
 
 /// Explicit worker selection, with no worker-supplied name or learned key pin.
@@ -435,7 +435,7 @@ impl RemoteDependencyTransport {
                 destination,
                 None,
                 cancellation,
-                sealed,
+                *sealed,
             ),
         }
     }
@@ -616,7 +616,7 @@ impl RemoteDependencyReservation {
             request,
             destination,
             cancellation.clone(),
-            ReservedOperation::Continue(sealed),
+            ReservedOperation::Continue(Box::new(sealed)),
         );
         self.transport
             .observe_delivery(&outcome, cancellation.is_cancelled(), Instant::now());

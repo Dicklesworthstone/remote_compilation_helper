@@ -41,7 +41,7 @@ use std::sync::Arc;
 use control::PreparationControl;
 
 enum PreparationToolchain {
-    Captured(PreparedToolchain),
+    Captured(Box<PreparedToolchain>),
     Retained(Arc<RetainedToolchain>),
 }
 
@@ -59,7 +59,7 @@ impl PreparationToolchain {
 
     fn attach(self, upload: SourceUpload, request: &Value) -> io::Result<SourceUpload> {
         match self {
-            Self::Captured(image) => upload.with_toolchain(image, request),
+            Self::Captured(image) => upload.with_toolchain(*image, request),
             Self::Retained(owner) => upload.with_retained_toolchain(owner, request),
         }
     }
@@ -306,7 +306,7 @@ fn prepare_source_bundle_inner(
                 rabs_cas::materialization::try_verified_reflink,
             )?;
             prepared.sync(|| control.is_cancelled())?;
-            Some(PreparationToolchain::Captured(prepared))
+            Some(PreparationToolchain::Captured(Box::new(prepared)))
         }
     } else {
         None
@@ -365,7 +365,7 @@ fn prepare_source_bundle_inner(
                     rabs_cas::materialization::try_verified_reflink,
                 )?;
                 prepared.sync(|| control.is_cancelled())?;
-                Ok::<_, io::Error>(PreparationToolchain::Captured(prepared))
+                Ok::<_, io::Error>(PreparationToolchain::Captured(Box::new(prepared)))
             })
             .transpose()?
     };

@@ -103,14 +103,20 @@ fn metadata_and_dep_info_are_installed_while_the_exact_bulk_tail_remains_unstage
     assert_eq!(selected_head.mode, MaterializationMode::PrivateCopy);
     assert_eq!(selected_head.freshness, fixture.freshness);
     assert_eq!(selected_head.selected.len(), 2);
-    assert_eq!(selected_head.selected[0].locations, [head_source.clone()]);
     assert_eq!(
-        selected_head.selected[1].locations,
-        [dep_info_source.clone()]
+        selected_head.selected[0].locations.as_slice(),
+        std::slice::from_ref(&head_source)
+    );
+    assert_eq!(
+        selected_head.selected[1].locations.as_slice(),
+        std::slice::from_ref(&dep_info_source)
     );
     assert_eq!(tail_selection.mode, MaterializationMode::PrivateCopy);
     assert_eq!(tail_selection.freshness, fixture.freshness);
-    assert_eq!(tail_selection.selected[0].locations, [tail_source.clone()]);
+    assert_eq!(
+        tail_selection.selected[0].locations.as_slice(),
+        std::slice::from_ref(&tail_source)
+    );
     let prepared_head = selected_head.stage(&|_, _| Ok(())).unwrap();
     assert_eq!(fixture.stages(), 2);
     assert!(!head.destination.exists());
