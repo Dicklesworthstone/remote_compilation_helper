@@ -472,6 +472,8 @@ const LIVE_WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-closed-rlib-v1";
 const LIVE_WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-closed-metadata-v1";
 const LIVE_COMMITTED_WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-committed-rlib-v1";
 const LIVE_COMMITTED_WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-committed-metadata-v1";
+const LIVE_MIXED_WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-committed-mixed-rlib-v1";
+const LIVE_MIXED_WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-committed-mixed-metadata-v1";
 const LIVE_PRIVATE_CLASS: &str = "private-only";
 
 // This is an additional floor, not a replacement for the stored serving policy.
@@ -507,6 +509,14 @@ fn record_descriptor_class(
         descriptor,
     ) {
         LIVE_COMMITTED_WORKSPACE_METADATA_CLASS
+    } else if rabs_key::live_dependency::workspace_dependency_cache::is_mixed_workspace_rlib_descriptor(
+        descriptor,
+    ) {
+        LIVE_MIXED_WORKSPACE_RLIB_CLASS
+    } else if rabs_key::live_dependency::workspace_dependency_cache::is_mixed_workspace_metadata_descriptor(
+        descriptor,
+    ) {
+        LIVE_MIXED_WORKSPACE_METADATA_CLASS
     } else {
         match closed_workspace_library_descriptor_class(descriptor) {
             Some(ClosedWorkspaceLibraryClass::Rlib) => LIVE_WORKSPACE_RLIB_CLASS,
@@ -554,6 +564,12 @@ fn recorded_action_risk(
             }
             [SqlValue::Text(class)] if class == LIVE_COMMITTED_WORKSPACE_METADATA_CLASS => {
                 Ok(ActionClassRisk::CommittedWorkspaceMetadata)
+            }
+            [SqlValue::Text(class)] if class == LIVE_MIXED_WORKSPACE_RLIB_CLASS => {
+                Ok(ActionClassRisk::MixedWorkspaceRlib)
+            }
+            [SqlValue::Text(class)] if class == LIVE_MIXED_WORKSPACE_METADATA_CLASS => {
+                Ok(ActionClassRisk::MixedWorkspaceMetadata)
             }
             [SqlValue::Text(_)] => Ok(ActionClassRisk::Elevated),
             _ => Err(StoreError::Backend(

@@ -323,6 +323,9 @@ jobs:
           cargo test --release -p rabsd --test canonical_check_local --locked \
             canonical_workspace_metadata_dag_refuses_cache_authority_from_a_local_fallback_producer \
             -- --ignored --exact --nocapture
+          cargo test --release -p rabsd --test canonical_check_local --locked \
+            canonical_workspace_mixed_dependency_metadata_earns_transitive_replay_across_worktrees \
+            -- --ignored --exact --nocapture
       - name: Canonical Cargo offloads archives, replays them and delivers a working binary
         timeout-minutes: 30
         env:
@@ -337,6 +340,12 @@ jobs:
             -- --ignored --exact --nocapture
           cargo test --release -p rabsd --test canonical_check_local --locked \
             canonical_workspace_dag_refuses_cache_authority_from_a_local_fallback_producer \
+            -- --ignored --exact --nocapture
+          cargo test --release -p rabsd --test canonical_check_local --locked \
+            canonical_workspace_mixed_dependency_archives_earn_transitive_replay_across_worktrees \
+            -- --ignored --exact --nocapture
+          cargo test --release -p rabsd --test canonical_check_local --locked \
+            canonical_workspace_mixed_dependency_dag_refuses_cache_authority_from_a_local_fallback_producer \
             -- --ignored --exact --nocapture
       - name: Canonical Cargo captures generated metadata inputs and invalidates changed OUT_DIR
         timeout-minutes: 30

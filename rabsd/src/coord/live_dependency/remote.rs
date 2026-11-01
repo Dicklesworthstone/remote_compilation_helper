@@ -36,10 +36,13 @@ use rabs_key::live_dependency::workspace_cache::{
 };
 use rabs_key::live_dependency::workspace_dependency_cache::{
     is_committed_workspace_metadata_descriptor, is_committed_workspace_rlib_descriptor,
+    is_mixed_workspace_metadata_descriptor, is_mixed_workspace_rlib_descriptor,
     remote_committed_workspace_metadata_isolation_policy, remote_committed_workspace_metadata_key,
     remote_committed_workspace_metadata_shape, remote_committed_workspace_rlib_isolation_policy,
     remote_committed_workspace_rlib_key, remote_committed_workspace_rlib_shape,
-    validate_committed_workspace_metadata_plan,
+    remote_mixed_workspace_library_isolation_policy, remote_mixed_workspace_library_key,
+    remote_mixed_workspace_library_shape, validate_committed_workspace_metadata_plan,
+    validate_mixed_workspace_library_plan,
 };
 use rabs_key::live_dependency::{
     DependencyDirectoryFact, DependencySourceKind, ToolchainFacts, native_input_directories,
@@ -631,11 +634,142 @@ pub(super) struct RemoteValidation {
     loader: LoaderDirectoryWitness,
     execution_mode: DependencyExecutionMode,
     canonical_cargo: bool,
+    canonical_owner: Option<Arc<tempfile::TempDir>>,
     action_key: TypedDigest,
     committed_workspace_inputs: Option<Arc<CommittedWorkspaceInputs>>,
 }
 
+/// A retained canonical remote leaf request, not a class label or a digest memo.
+/// Only the verified installation path can construct this proof. Publication
+/// and output installation are independently checked before durable qualification.
+#[derive(Debug)]
+pub(crate) struct QualifiedImmutableDependencyLeaf<'a> {
+    validation: &'a RemoteValidation,
+    request: &'a LiveDependencyRequest,
+    output: RemoteDependencyOutputClass,
+}
+
+impl QualifiedImmutableDependencyLeaf<'_> {
+    pub(crate) fn action_key(&self) -> &TypedDigest {
+        &self.request.key.action_key
+    }
+
+    pub(crate) fn descriptor_digest(&self) -> &TypedDigest {
+        &self.request.key.descriptor_digest
+    }
+
+    pub(crate) fn output_class(&self) -> RemoteDependencyOutputClass {
+        self.output
+    }
+
+    /// Recheck original observations and remote policy without refreshing any
+    /// memo. Callers perform this before taking the coordinator metadata lock.
+    pub(crate) fn verify(&self) -> Result<(), String> {
+        if immutable_dependency_leaf_shape(
+            &self.request.plan,
+            &self.request.dependencies.directories,
+        ) != Some(self.output)
+            || self.request.package.build_script_output.is_some()
+            || !self.request.package.generated_files.is_empty()
+            || !self.request.package.native.is_empty()
+        {
+            return Err(
+                "immutable dependency qualification requires a pure canonical remote leaf".into(),
+            );
+        }
+        verify_request(self.request)?;
+        self.validation.verify(self.request)?;
+        self.request.dependencies.verify_unchanged()
+    }
+}
+
+fn immutable_dependency_leaf_shape(
+    plan: &DependencyActionPlan,
+    directories: &[DependencyDirectoryFact],
+) -> Option<RemoteDependencyOutputClass> {
+    let immutable = match plan.source_kind {
+        DependencySourceKind::RegistryPackage | DependencySourceKind::GitCheckout => {
+            plan.directory_source_manifest.is_none()
+        }
+        DependencySourceKind::DirectoryPackage => plan.directory_source_manifest.is_some(),
+        _ => false,
+    };
+    if !immutable
+        || !plan.canonical_cargo
+        || !plan.externs.is_empty()
+        || !plan.invocation.externs.is_empty()
+        || directories
+            .iter()
+            .any(|directory| !directory.artifacts.is_empty())
+        || plan.generated_root.is_some()
+        || !plan.native_roots.is_empty()
+        || !plan.invocation.native_libs.is_empty()
+        || !matches!(plan.invocation.crate_types.as_slice(), [kind] if matches!(kind.as_str(), "lib" | "rlib"))
+        || plan
+            .invocation
+            .passthrough
+            .iter()
+            .any(|argument| argument == "--test")
+    {
+        return None;
+    }
+    let output = remote_dependency_output_class(&plan.invocation).ok()?;
+    use rabs_key::output_declarations::OutputClass;
+    let permitted_outputs = plan.outputs.declarations.iter().all(|declaration| {
+        !declaration.optional
+            && match declaration.class {
+                OutputClass::ProvisionalMetadata => declaration.virtual_path.ends_with(".rmeta"),
+                OutputClass::DepInfo => declaration.virtual_path.ends_with(".d"),
+                OutputClass::File => {
+                    output == RemoteDependencyOutputClass::Rlib
+                        && declaration.virtual_path.ends_with(".rlib")
+                }
+                _ => false,
+            }
+    });
+    let required_output = plan
+        .outputs
+        .declarations
+        .iter()
+        .any(|declaration| match output {
+            RemoteDependencyOutputClass::Metadata => {
+                declaration.class == OutputClass::ProvisionalMetadata
+            }
+            RemoteDependencyOutputClass::Rlib => {
+                declaration.class == OutputClass::File
+                    && declaration.virtual_path.ends_with(".rlib")
+            }
+        });
+    (permitted_outputs && required_output).then_some(output)
+}
+
 impl RemoteValidation {
+    /// Unsupported dependency shapes remain ordinary successful installations;
+    /// only an eligible leaf attempts to mint the narrower producer capability.
+    pub(super) fn immutable_dependency_leaf<'a>(
+        &'a self,
+        request: &'a LiveDependencyRequest,
+    ) -> Result<Option<QualifiedImmutableDependencyLeaf<'a>>, String> {
+        if request.package.build_script_output.is_some()
+            || !request.package.generated_files.is_empty()
+            || !request.package.native.is_empty()
+        {
+            return Ok(None);
+        }
+        let Some(output) =
+            immutable_dependency_leaf_shape(&request.plan, &request.dependencies.directories)
+        else {
+            return Ok(None);
+        };
+        let proof = QualifiedImmutableDependencyLeaf {
+            validation: self,
+            request,
+            output,
+        };
+        proof.verify()?;
+        Ok(Some(proof))
+    }
+
     pub(super) fn verify_read_closure(
         &self,
         request: &LiveDependencyRequest,
@@ -647,6 +781,11 @@ impl RemoteValidation {
             || self.canonical_cargo != request.canonical_paths.is_some()
         {
             return Err("remote context differs from the retained Cargo namespace".into());
+        }
+        match (&self.canonical_owner, &request.canonical_paths) {
+            (Some(owner), Some(paths)) if Arc::ptr_eq(owner, paths.operation_owner()) => {}
+            (None, None) => {}
+            _ => return Err("remote context belongs to another canonical operation".into()),
         }
         request.verify_output_contract()?;
         let toolchain =
@@ -691,11 +830,26 @@ impl RemoteValidation {
                 .as_ref()
                 .ok_or("committed workspace metadata lost its producer capability")?
                 .verify(request)?;
+        } else if matches!(
+            request.plan.source_kind,
+            DependencySourceKind::WorkspaceMixedRlib | DependencySourceKind::WorkspaceMixedMetadata
+        ) {
+            request
+                .canonical_paths
+                .as_ref()
+                .ok_or("mixed workspace library lost its retained Cargo graph")?
+                .require_workspace_mixed_library(&request.plan)?;
+            self.committed_workspace_inputs
+                .as_ref()
+                .ok_or("mixed workspace library lost its producer capability")?
+                .verify(request)?;
         }
         if !matches!(
             request.plan.source_kind,
             DependencySourceKind::WorkspaceCommittedRlib
                 | DependencySourceKind::WorkspaceCommittedMetadata
+                | DependencySourceKind::WorkspaceMixedRlib
+                | DependencySourceKind::WorkspaceMixedMetadata
         ) && self.committed_workspace_inputs.is_some()
         {
             return Err("committed producer capability belongs to a different class".into());
@@ -728,6 +882,16 @@ impl RemoteValidation {
                     &toolchain,
                 )
             }
+            DependencySourceKind::WorkspaceMixedRlib
+            | DependencySourceKind::WorkspaceMixedMetadata => remote_mixed_workspace_library_shape(
+                &request.plan,
+                &directories,
+                self.committed_workspace_inputs
+                    .as_ref()
+                    .ok_or("missing mixed workspace input capability")?
+                    .dependencies(),
+                &toolchain,
+            ),
             _ => remote_dependency_shape(&request.plan, &directories, &toolchain),
         };
         shape.map_err(|error| error.to_string())?;
@@ -767,6 +931,8 @@ impl RemoteValidation {
             request.plan.source_kind,
             DependencySourceKind::WorkspaceCommittedRlib
                 | DependencySourceKind::WorkspaceCommittedMetadata
+                | DependencySourceKind::WorkspaceMixedRlib
+                | DependencySourceKind::WorkspaceMixedMetadata
         ) {
             return Ok(Vec::new());
         }
@@ -784,6 +950,17 @@ impl RemoteValidation {
 }
 
 fn execution_mode(plan: &DependencyActionPlan) -> Result<DependencyExecutionMode, String> {
+    if matches!(
+        plan.source_kind,
+        DependencySourceKind::WorkspaceMixedRlib | DependencySourceKind::WorkspaceMixedMetadata
+    ) {
+        return validate_mixed_workspace_library_plan(plan)
+            .map(|output| match output {
+                RemoteDependencyOutputClass::Rlib => DependencyExecutionMode::Rlib,
+                RemoteDependencyOutputClass::Metadata => DependencyExecutionMode::ClosedMetadata,
+            })
+            .map_err(|error| error.to_string());
+    }
     if plan.source_kind == DependencySourceKind::WorkspaceCommittedMetadata {
         validate_committed_workspace_metadata_plan(plan).map_err(|error| error.to_string())?;
         return Ok(DependencyExecutionMode::ClosedMetadata);
@@ -848,6 +1025,24 @@ fn verify_execution_policy(
                 );
             }
             remote_committed_workspace_metadata_isolation_policy(plan)
+        }
+        DependencySourceKind::WorkspaceMixedRlib | DependencySourceKind::WorkspaceMixedMetadata => {
+            let output =
+                validate_mixed_workspace_library_plan(plan).map_err(|error| error.to_string())?;
+            let matches = match output {
+                RemoteDependencyOutputClass::Rlib => {
+                    is_mixed_workspace_rlib_descriptor(&key.descriptor)
+                }
+                RemoteDependencyOutputClass::Metadata => {
+                    is_mixed_workspace_metadata_descriptor(&key.descriptor)
+                }
+            };
+            if !matches {
+                return Err(
+                    "remote workspace descriptor differs from its mixed producer class".into(),
+                );
+            }
+            remote_mixed_workspace_library_isolation_policy(plan)
         }
         _ => remote_dependency_isolation_policy(plan),
     }
@@ -1000,6 +1195,17 @@ impl RemoteDependencies {
                 .as_ref()
                 .ok_or("committed workspace key requires its exact producer capability")?
                 .verify_for_kind(plan.source_kind)?;
+        } else if matches!(
+            plan.source_kind,
+            DependencySourceKind::WorkspaceMixedRlib | DependencySourceKind::WorkspaceMixedMetadata
+        ) {
+            canonical
+                .ok_or("mixed workspace library requires its retained Cargo graph")?
+                .require_workspace_mixed_library(plan)?;
+            committed_workspace_inputs
+                .as_ref()
+                .ok_or("mixed workspace key requires its exact producer capability")?
+                .verify_for_kind(plan.source_kind)?;
         } else if workspace {
             canonical
                 .ok_or("workspace execution requires its retained Cargo graph")?
@@ -1009,6 +1215,8 @@ impl RemoteDependencies {
             plan.source_kind,
             DependencySourceKind::WorkspaceCommittedRlib
                 | DependencySourceKind::WorkspaceCommittedMetadata
+                | DependencySourceKind::WorkspaceMixedRlib
+                | DependencySourceKind::WorkspaceMixedMetadata
         ) && committed_workspace_inputs.is_some()
         {
             return Err("committed producer capability cannot qualify a different class".into());
@@ -1051,6 +1259,16 @@ impl RemoteDependencies {
                     &visible_root,
                 )
             }
+            DependencySourceKind::WorkspaceMixedRlib
+            | DependencySourceKind::WorkspaceMixedMetadata => remote_mixed_workspace_library_shape(
+                plan,
+                directories,
+                committed_workspace_inputs
+                    .as_ref()
+                    .ok_or("missing mixed workspace input capability")?
+                    .dependencies(),
+                &visible_root,
+            ),
             _ => remote_dependency_shape(plan, directories, &visible_root),
         };
         shape.map_err(|error| error.to_string())?;
@@ -1082,11 +1300,15 @@ impl RemoteDependencies {
             plan.source_kind,
             DependencySourceKind::WorkspaceCommittedRlib
                 | DependencySourceKind::WorkspaceCommittedMetadata
+                | DependencySourceKind::WorkspaceMixedRlib
+                | DependencySourceKind::WorkspaceMixedMetadata
         ) {
-            let key_builder = if plan.source_kind == DependencySourceKind::WorkspaceCommittedRlib {
-                remote_committed_workspace_rlib_key
-            } else {
-                remote_committed_workspace_metadata_key
+            let key_builder = match plan.source_kind {
+                DependencySourceKind::WorkspaceCommittedRlib => remote_committed_workspace_rlib_key,
+                DependencySourceKind::WorkspaceCommittedMetadata => {
+                    remote_committed_workspace_metadata_key
+                }
+                _ => remote_mixed_workspace_library_key,
             };
             key_builder(
                 plan,
@@ -1217,6 +1439,7 @@ impl RemoteDependencies {
             loader: loader_witness,
             execution_mode: context.execution_mode(),
             canonical_cargo: context.canonical_cargo(),
+            canonical_owner: canonical.map(|paths| Arc::clone(paths.operation_owner())),
             action_key: key.action_key.clone(),
             committed_workspace_inputs,
         };
@@ -2344,6 +2567,7 @@ impl PendingRemoteInstall {
                     &self.output.manifest,
                     &self.output.manifest_key,
                     files,
+                    Some(&self.validation),
                 )?;
             }
             let callback = metadata_ready.as_mut().ok_or("missing metadata receiver")?;
@@ -2440,6 +2664,7 @@ impl PendingRemoteInstall {
                         &self.output.manifest,
                         &self.output.manifest_key,
                         &result,
+                        Some(&self.validation),
                     )
                 {
                     return install_fault(reason, metadata_exposed);
@@ -3650,6 +3875,499 @@ mod execution_resource_tests {
             runtime_libraries: Vec::new(),
         };
         (inputs, toolchain)
+    }
+
+    #[test]
+    fn immutable_leaf_eligibility_requires_canonical_purity_and_every_retained_candidate() {
+        use rabs_key::extern_resolution::DependencyArtifactKind;
+        use rabs_key::live_dependency::{ExternFact, PlannedExtern};
+        use rabs_key::output_declarations::{OutputClass, OutputDeclaration};
+
+        for (emit, output) in [
+            ("dep-info,metadata", RemoteDependencyOutputClass::Metadata),
+            ("dep-info,metadata,link", RemoteDependencyOutputClass::Rlib),
+        ] {
+            let fixture = Fixture::canonical_with_outputs(emit);
+            let plan = &fixture.plan;
+            let empty = vec![DependencyDirectoryFact {
+                path: plan.out_dir.clone(),
+                artifacts: Vec::new(),
+            }];
+            assert_eq!(immutable_dependency_leaf_shape(plan, &empty), Some(output));
+            for source in [
+                DependencySourceKind::RegistryPackage,
+                DependencySourceKind::GitCheckout,
+            ] {
+                let mut immutable = plan.clone();
+                immutable.source_kind = source;
+                assert_eq!(
+                    immutable_dependency_leaf_shape(&immutable, &empty),
+                    Some(output)
+                );
+            }
+            let mut directory_source = plan.clone();
+            directory_source.source_kind = DependencySourceKind::DirectoryPackage;
+            assert_eq!(
+                immutable_dependency_leaf_shape(&directory_source, &empty),
+                None
+            );
+            directory_source.directory_source_manifest = Some(rabs_key::typed_digest::compute(
+                "rabs.test.v1",
+                b"verified directory checksum manifest",
+            ));
+            assert_eq!(
+                immutable_dependency_leaf_shape(&directory_source, &empty),
+                Some(output)
+            );
+
+            let artifact = ExternFact {
+                path: format!("{}/libimplicit.rmeta", plan.out_dir),
+                content_digest: rabs_key::typed_digest::compute(
+                    "rabs.test.v1",
+                    b"implicit candidate",
+                ),
+            };
+            let mut implicit = empty.clone();
+            implicit[0].artifacts.push(artifact.clone());
+            assert!(plan.externs.is_empty());
+            assert!(plan.invocation.externs.is_empty());
+            assert_eq!(immutable_dependency_leaf_shape(plan, &implicit), None);
+            for mutation in 0..12 {
+                let mut changed = plan.clone();
+                match mutation {
+                    0 => changed.canonical_cargo = false,
+                    1 => changed.externs.push(PlannedExtern::File {
+                        name: "implicit".into(),
+                        path: artifact.path.clone(),
+                        kind: DependencyArtifactKind::Rmeta,
+                    }),
+                    2 => {
+                        changed.generated_root =
+                            Some("/__rabs/out/cargo/debug/build/leaf/out".into())
+                    }
+                    3 => changed
+                        .native_roots
+                        .push("/__rabs/out/cargo/debug/build/native/out".into()),
+                    4 => changed.invocation.crate_types = vec!["proc-macro".into()],
+                    5 => changed.invocation.passthrough.push("--test".into()),
+                    6 => changed.source_kind = DependencySourceKind::WorkspaceExecutionOnly,
+                    7 => changed.outputs.declarations.push(OutputDeclaration {
+                        virtual_path: "extra.s".into(),
+                        class: OutputClass::File,
+                        optional: false,
+                    }),
+                    8 => changed.outputs.declarations[0].optional = true,
+                    9 => changed.outputs.declarations.clear(),
+                    10 => changed
+                        .invocation
+                        .externs
+                        .push(("implicit".into(), Some(artifact.path.clone()))),
+                    _ => changed
+                        .invocation
+                        .native_libs
+                        .push("static=unmodeled".into()),
+                }
+                assert_eq!(
+                    immutable_dependency_leaf_shape(&changed, &empty),
+                    None,
+                    "{emit}: {mutation}"
+                );
+            }
+            assert_eq!(
+                immutable_dependency_leaf_shape(&Fixture::with_outputs(&[], emit).plan, &[]),
+                None,
+                "ordinary path-preserving dependency authority cannot qualify a canonical producer",
+            );
+            assert_eq!(
+                immutable_dependency_leaf_shape(
+                    &Fixture::canonical_with_generated(
+                        emit,
+                        Some("/__rabs/out/cargo/debug/build/leaf/out")
+                    )
+                    .plan,
+                    &empty,
+                ),
+                None,
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn immutable_leaf_constructor_refuses_unverified_runtime_wrong_owner_and_changed_inputs() {
+        use crate::edge::live_facts::{FactsMiss, LiveFacts};
+        use rabs_protocol::input_evidence::{
+            INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType, PositiveInput,
+        };
+        use rabs_protocol::raw_bytes::RawBytes;
+        use rabs_protocol::result_identity::ObjectId;
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        use std::time::Duration;
+
+        // The filesystem snapshots, dependency observations and compiler
+        // identity probes are real. The tiny probe script is not a compiler
+        // or a measured ELF runtime, and must never mint a leaf capability.
+        let owner = Arc::new(crate::test_util::private_tempdir());
+        let mappings = [
+            "/__rabs/workspace",
+            "/__rabs/cargo-home",
+            "/__rabs/toolchain",
+            "/__rabs/out/cargo",
+            "/__rabs/home",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, root)| {
+            let backing = owner.path().join(index.to_string());
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&backing)
+                .unwrap();
+            (PathBuf::from(root), backing)
+        })
+        .collect();
+        let paths = CanonicalPaths::new(Arc::clone(&owner), mappings).unwrap();
+        let fixture = Fixture::canonical();
+        let physical = paths.project_plan(&fixture.plan).unwrap();
+        let source = Path::new(&physical.source_root);
+        let toolchain = owner.path().join("2");
+        let compiler = toolchain.join("bin/rustc");
+        for directory in [
+            source.join("src"),
+            PathBuf::from(&physical.out_dir),
+            toolchain.join("bin"),
+            toolchain.join("lib/rustlib/x86_64-unknown-linux-gnu/lib"),
+        ] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        std::fs::write(source.join("src/lib.rs"), b"pub const VALUE:u32=42;\n").unwrap();
+        std::fs::write(
+            toolchain.join("lib/libdriver.so"),
+            b"identity-probe runtime fixture",
+        )
+        .unwrap();
+        std::fs::write(
+            toolchain.join("lib/rustlib/x86_64-unknown-linux-gnu/lib/libcore.rlib"),
+            b"identity-probe sysroot fixture",
+        )
+        .unwrap();
+        std::fs::write(
+            &compiler,
+            concat!(
+                "#!/bin/sh\ncase \"$*\" in\n",
+                "'-vV') printf 'rustc fixture\\nhost: x86_64-unknown-linux-gnu\\n';;\n",
+                "'--print sysroot') printf '%s\\n' \"${0%/bin/rustc}\";;\n",
+                "*) exit 64;;\nesac\n",
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let facts = LiveFacts::new();
+        let package = facts
+            .package(source, fixture.plan.source_kind, None)
+            .unwrap();
+        let dependencies = facts.dependencies(&physical).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let toolchain_facts = loop {
+            match facts.toolchain(&compiler, &[]) {
+                Ok(facts) => break facts,
+                Err(FactsMiss::Pending) => {
+                    assert!(Instant::now() < deadline, "identity probe did not settle");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("identity-probe toolchain: {error}"),
+            }
+        };
+        let guard = facts.toolchain_guard(&compiler, &toolchain_facts).unwrap();
+        let inputs = ActionInputManifest {
+            schema_version: INPUT_EVIDENCE_SCHEMA_VERSION,
+            inputs: package
+                .files
+                .iter()
+                .map(|(relative, digest, executable)| PositiveInput {
+                    virtual_path: RawBytes::new(
+                        fixture.plan.input_virtual_path(relative).into_bytes(),
+                    ),
+                    object: ObjectId(digest.clone()),
+                    file_type: InputFileType::Regular,
+                    executable: *executable,
+                    symlink_resolution: Vec::new(),
+                })
+                .collect(),
+            ..ActionInputManifest::default()
+        };
+        let retained_directory = toolchain_staging_directory(owner.path()).unwrap();
+        let image = Arc::new(
+            capture_toolchain(
+                &toolchain,
+                &retained_directory.path().join("tree"),
+                None,
+                &ToolchainLimits::default(),
+                || false,
+            )
+            .unwrap(),
+        );
+        let runtime = rabs_key::typed_digest::compute(
+            rabs_key::live_dependency::remote::RUNTIME_COHORT_DOMAIN,
+            b"deliberately unmeasured runtime",
+        );
+        let key_directories = paths.dependency_facts(&dependencies.directories).unwrap();
+        let key = remote_dependency_key(
+            &fixture.plan,
+            &toolchain_facts,
+            &key_directories,
+            &inputs,
+            None,
+            "/__rabs/toolchain",
+            &image.identity().sha256,
+            &runtime,
+        )
+        .unwrap();
+        let validation = RemoteValidation {
+            retained: Arc::new(RetainedToolchain {
+                guard: guard.clone(),
+                backing: RetainedToolchainBacking::Captured {
+                    image,
+                    _directory: retained_directory,
+                },
+            }),
+            runtime,
+            loader: observe_loader_directories(
+                &physical_paths(
+                    &remote_empty_loader_directories(&fixture.plan, "/__rabs/toolchain").unwrap(),
+                    Some(&paths),
+                )
+                .unwrap(),
+                || false,
+            )
+            .unwrap(),
+            execution_mode: DependencyExecutionMode::Metadata,
+            canonical_cargo: true,
+            canonical_owner: Some(Arc::clone(paths.operation_owner())),
+            action_key: key.action_key.clone(),
+            committed_workspace_inputs: None,
+        };
+        let request = LiveDependencyRequest {
+            key,
+            plan: fixture.plan,
+            inputs,
+            package,
+            dependencies,
+            toolchain: guard,
+            externs: Vec::new(),
+            canonical_paths: Some(Arc::clone(&paths)),
+        };
+        validation.verify_read_closure(&request).unwrap();
+        let error = validation.immutable_dependency_leaf(&request).unwrap_err();
+        assert!(error.starts_with("edge runtime revalidation:"), "{error}");
+
+        let mut other_action = request.clone();
+        other_action.key.action_key.bytes[0] ^= 1;
+        assert_eq!(
+            validation
+                .immutable_dependency_leaf(&other_action)
+                .unwrap_err(),
+            "remote closure witness belongs to another action"
+        );
+        for other_owner in [None, Some(Arc::new(crate::test_util::private_tempdir()))] {
+            let mut other = validation.clone();
+            other.canonical_owner = other_owner;
+            assert_eq!(
+                other.immutable_dependency_leaf(&request).unwrap_err(),
+                "remote context belongs to another canonical operation"
+            );
+        }
+        let mut local = request.clone();
+        local.key = rabs_key::live_dependency::canonical_cargo_dependency_key(
+            &local.plan,
+            &toolchain_facts,
+            &[],
+            &key_directories,
+            None,
+            &local.inputs,
+        )
+        .unwrap();
+        let mut local_claim = validation.clone();
+        local_claim.action_key = local.key.action_key.clone();
+        assert_eq!(
+            local_claim.immutable_dependency_leaf(&local).unwrap_err(),
+            "remote descriptor does not bind the enforced read-closure policy"
+        );
+        let mut unsupported = request.clone();
+        unsupported.plan.canonical_cargo = false;
+        assert!(
+            validation
+                .immutable_dependency_leaf(&unsupported)
+                .unwrap()
+                .is_none()
+        );
+        let implicit = Path::new(&physical.out_dir).join("libimplicit.rmeta");
+        std::fs::write(&implicit, b"unreferenced but visible candidate").unwrap();
+        let mut captured_candidate = request.clone();
+        captured_candidate.dependencies = facts.dependencies(&physical).unwrap();
+        assert!(
+            validation
+                .immutable_dependency_leaf(&captured_candidate)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            validation.immutable_dependency_leaf(&request).is_err(),
+            "the original empty candidate observation must not refresh itself"
+        );
+        std::fs::rename(&implicit, owner.path().join("retired-candidate")).unwrap();
+        let source_file = source.join("src/lib.rs");
+        let replacement = owner.path().join("same-byte-source");
+        std::fs::write(&replacement, std::fs::read(&source_file).unwrap()).unwrap();
+        std::fs::rename(&replacement, &source_file).unwrap();
+        let error = validation.immutable_dependency_leaf(&request).unwrap_err();
+        assert!(
+            error.starts_with("captured dependency inputs changed:"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn mixed_workspace_modes_require_distinct_policy_and_preserve_exact_worker_context() {
+        use rabs_key::live_dependency::workspace_dependency_cache::{
+            CommittedWorkspaceDependency, plan_committed_workspace_metadata,
+            plan_committed_workspace_rlib, plan_mixed_workspace_library,
+        };
+        use rabs_key::live_dependency::{ExternFact, plan_canonical_workspace_execution};
+        use rabs_protocol::raw_bytes::RawBytes;
+        use rabs_protocol::result_identity::ObjectId;
+
+        for (emit, mode, epoch) in [
+            (
+                "dep-info,metadata",
+                DependencyExecutionMode::ClosedMetadata,
+                9,
+            ),
+            ("dep-info,metadata,link", DependencyExecutionMode::Rlib, 8),
+        ] {
+            let mut fixture = Fixture::workspace_metadata(Some("lib"), false);
+            let path = format!("{}/libupstream.rmeta", fixture.plan.out_dir);
+            fixture
+                .argv
+                .retain(|argument| !argument.starts_with("--emit="));
+            fixture.argv.extend([
+                format!("--emit={emit}"),
+                format!("--extern=upstream={path}"),
+            ]);
+            let fresh = plan_canonical_workspace_execution(
+                LiveRustcRequest {
+                    argv: &fixture.argv,
+                    env: &fixture.plan.execution_env,
+                    cwd: &fixture.plan.cwd,
+                },
+                &fixture.plan.host_triple,
+            )
+            .unwrap();
+            fixture.plan = plan_mixed_workspace_library(&fresh).unwrap();
+            assert_eq!(execution_mode(&fixture.plan).unwrap(), mode);
+            fixture.context = DependencyExecContext::new_canonical_workspace_execution(
+                mode,
+                fixture.plan.cwd.clone(),
+                fixture.plan.out_dir.clone(),
+                fixture.plan.dependency_dirs.clone(),
+                Vec::new(),
+                vec![DependencyArtifactRoot {
+                    path: fixture.plan.out_dir.clone(),
+                    prefix: "dependencies/0000".into(),
+                }],
+                None,
+                fixture.context.source_directories().to_vec(),
+                Vec::new(),
+                fixture.plan.execution_env.clone(),
+                [0x11; 32],
+            )
+            .unwrap();
+            assert_eq!(fixture.request().unwrap()["args"], json!(fixture.argv[1..]));
+            let digest =
+                |bytes: &[u8]| rabs_key::typed_digest::compute("rabs.test.mixed-mode.v1", bytes);
+            let dependencies = vec![CommittedWorkspaceDependency {
+                path: path.clone(),
+                producer_action: digest(b"action"),
+                producer_descriptor: digest(b"descriptor"),
+                producer_manifest: digest(b"manifest"),
+                role: OutputRole::ProvisionalMetadata,
+                virtual_path: RawBytes::from("libupstream.rmeta"),
+                object: ObjectId(digest(b"complete metadata")),
+            }];
+            let directories = vec![DependencyDirectoryFact {
+                path: fixture.plan.out_dir.clone(),
+                artifacts: vec![ExternFact {
+                    path,
+                    content_digest: dependencies[0].object.0.clone(),
+                }],
+            }];
+            let (inputs, toolchain) = workspace_metadata_key_facts(&fixture.plan);
+            let runtime = rabs_key::typed_digest::compute(
+                rabs_key::live_dependency::remote::RUNTIME_COHORT_DOMAIN,
+                b"runtime",
+            );
+            let key = remote_mixed_workspace_library_key(
+                &fixture.plan,
+                &toolchain,
+                &directories,
+                &dependencies,
+                &inputs,
+                None,
+                "/__rabs/toolchain",
+                &fixture.toolchain.sha256,
+                &runtime,
+            )
+            .unwrap();
+            assert_eq!(key.descriptor.key_epoch, epoch);
+            verify_execution_policy(&fixture.plan, &key, mode).unwrap();
+            for other in [
+                DependencyExecutionMode::Metadata,
+                DependencyExecutionMode::ClosedMetadata,
+                DependencyExecutionMode::Rlib,
+            ] {
+                if other != mode {
+                    assert!(verify_execution_policy(&fixture.plan, &key, other).is_err());
+                    let context = fixture.context.clone();
+                    fixture.context = context.clone().with_execution_mode(other);
+                    assert!(fixture.request().is_err());
+                    fixture.context = context;
+                }
+            }
+            let (old, old_key) = if mode == DependencyExecutionMode::Rlib {
+                let old = plan_committed_workspace_rlib(&fresh).unwrap();
+                let key = remote_committed_workspace_rlib_key(
+                    &old,
+                    &toolchain,
+                    &directories,
+                    &dependencies,
+                    &inputs,
+                    None,
+                    "/__rabs/toolchain",
+                    &fixture.toolchain.sha256,
+                    &runtime,
+                )
+                .unwrap();
+                (old, key)
+            } else {
+                let old = plan_committed_workspace_metadata(&fresh).unwrap();
+                let key = remote_committed_workspace_metadata_key(
+                    &old,
+                    &toolchain,
+                    &directories,
+                    &dependencies,
+                    &inputs,
+                    None,
+                    "/__rabs/toolchain",
+                    &fixture.toolchain.sha256,
+                    &runtime,
+                )
+                .unwrap();
+                (old, key)
+            };
+            assert!(verify_execution_policy(&fixture.plan, &old_key, mode).is_err());
+            assert!(verify_execution_policy(&old, &key, mode).is_err());
+            assert!(verify_execution_policy(&fresh, &key, mode).is_err());
+        }
     }
 
     #[test]

@@ -1572,6 +1572,53 @@ existing execution policy. Generated/native inputs, project executors, harness
 outputs, incremental state and archive output remain outside this metadata
 class. The selected Cargo graph must still contain no project executors.
 
+### Cache workspace libraries using qualified immutable dependency leaves
+
+The canonical driver can also cache an ordinary workspace library whose retained
+inputs include a verified immutable registry, Git or checksummed directory-source
+dependency leaf. This supports a plain external dependency feeding one or more
+workspace libraries with the same commands:
+
+```sh
+cargo rabs --rabs-canonical-local ./canonical-compile.json -- build --workspace --lib
+cargo rabs --rabs-canonical-local ./canonical-compile.json -- check --workspace --lib
+```
+
+The external producer must have run through the canonical remote lane, have a
+successful committed result, and have its actual output verified and installed
+by this Cargo operation. It must have no explicit externs, no retained Rust
+candidates (including unnamed alternatives), no generated or native inputs, and
+no recorded producer ancestry. An ordinary dependency-cache entry, a local
+compiler result, a copied artifact, a raw fallback or a request-owned result
+cannot establish this qualification.
+
+Qualification binds the producer's action, descriptor, published manifest and
+execution mode. The operation separately retains each installed file generation.
+Every later publication and delivery rechecks the exact objects, qualification,
+current serving validity, quarantine and transitive ancestry. An external leaf
+with newly discovered ancestry is refused. Each intermediate workspace producer
+keeps its own producer restrictions, even when its consumer permits a broader
+input class. Revocation after metadata delivery remains a terminal delivery
+error, including metadata-only results with no archive tail.
+
+The existing workspace-only classes remain the first choice. When their narrower
+producer policy cannot admit the inputs, eligible requests use separate
+`canonical-workspace-committed-mixed-rlib-v1` (epoch 8) or
+`canonical-workspace-committed-mixed-metadata-v1` (epoch 9) identities. They earn
+their own comparison evidence and class safety holds. Archive consumers require
+archive-class producers; metadata consumers can use metadata or archive
+producers, with complete explicit archive bytes retained. Metadata producers
+authorize only `.rmeta` outputs. Checks still explicitly negotiate
+`ClosedMetadata`; builds retain the existing closed archive worker context.
+
+This first external-producer expansion deliberately admits leaves only. An
+external crate with its own Rust dependencies, an unqualified candidate in the
+retained directory, or a Cargo graph containing build scripts or procedural
+macros keeps workspace consumers on their existing fresh-execution path. The
+complete workspace, directory inventories, environment, invocation, toolchain
+and runtime remain keyed. Minimal observed read closures and general external
+dependency DAG qualification remain separate work.
+
 ### Local Clippy with reusable dependency compilation
 
 The same local profile can lint its selected Cargo units:

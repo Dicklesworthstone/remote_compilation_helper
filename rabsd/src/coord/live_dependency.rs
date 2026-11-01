@@ -72,6 +72,7 @@ use std::sync::{Arc, Mutex};
 
 pub mod canonical;
 pub mod remote;
+pub(crate) use remote::QualifiedImmutableDependencyLeaf;
 
 mod capture_pins;
 mod output_capture;
@@ -334,28 +335,26 @@ fn verify_metadata_head(
     Ok(())
 }
 
-/// Register only the physically installed nonempty metadata of a published
-/// workspace result. The operation owner rechecks current durable provenance.
+/// Register only physically installed nonempty metadata of an eligible
+/// published producer. External leaves also require retained remote proof.
 fn remember_committed_metadata(
     coord: &Arc<CoordLive>,
     request: &LiveDependencyRequest,
     manifest: &CanonicalActionResultManifest,
     manifest_key: &str,
     files: &[PathBuf],
+    remote: Option<&remote::RemoteValidation>,
 ) -> Result<(), String> {
-    if !matches!(
-        request.plan.source_kind,
-        DependencySourceKind::WorkspaceClosedRlib
-            | DependencySourceKind::WorkspaceCommittedRlib
-            | DependencySourceKind::WorkspaceClosedMetadata
-            | DependencySourceKind::WorkspaceCommittedMetadata
-    ) {
+    if !request.plan.source_kind.is_workspace() && remote.is_none() {
         return Ok(());
     }
-    let paths = request
-        .canonical_paths
-        .as_ref()
-        .ok_or("missing canonical installation owner")?;
+    let Some(paths) = &request.canonical_paths else {
+        return if request.plan.source_kind.is_workspace() {
+            Err("missing canonical installation owner".into())
+        } else {
+            Ok(())
+        };
+    };
     let mut installed = Vec::new();
     for path in files {
         let output = committed_output(manifest, path)?;
@@ -363,7 +362,7 @@ fn remember_committed_metadata(
             installed.push(known_installed_output(path, &output.object.0)?);
         }
     }
-    paths.remember_committed_outputs(coord, request, manifest, manifest_key, &installed)
+    paths.remember_committed_outputs(coord, request, manifest, manifest_key, &installed, remote)
 }
 
 fn remember_committed_installation(
@@ -372,11 +371,19 @@ fn remember_committed_installation(
     manifest: &CanonicalActionResultManifest,
     manifest_key: &str,
     result: &InstallResult,
+    remote: Option<&remote::RemoteValidation>,
 ) -> Result<(), String> {
     if let InstallResult::Served { installed, .. } = result
         && let Some(paths) = &request.canonical_paths
     {
-        paths.remember_committed_outputs(coord, request, manifest, manifest_key, installed)?;
+        paths.remember_committed_outputs(
+            coord,
+            request,
+            manifest,
+            manifest_key,
+            installed,
+            remote,
+        )?;
     }
     Ok(())
 }
@@ -559,6 +566,7 @@ impl PendingServe {
                     &self.manifest,
                     &self.manifest_key,
                     files,
+                    self.remote_validation.as_ref(),
                 )?;
                 let callback = metadata_ready.as_mut().ok_or("missing metadata receiver")?;
                 callback(&transcript[..prefix_len.ok_or("missing metadata prefix")?])
@@ -621,6 +629,7 @@ impl PendingServe {
                     &self.manifest,
                     &self.manifest_key,
                     &result,
+                    self.remote_validation.as_ref(),
                 ) {
                     return install_fault(reason, metadata_exposed);
                 }
@@ -1464,6 +1473,8 @@ impl ExecutionAttempt {
                 plan.source_kind,
                 DependencySourceKind::WorkspaceCommittedRlib
                     | DependencySourceKind::WorkspaceCommittedMetadata
+                    | DependencySourceKind::WorkspaceMixedRlib
+                    | DependencySourceKind::WorkspaceMixedMetadata
             ) =>
             {
                 return Err("committed workspace capture has no remote producer capability".into());

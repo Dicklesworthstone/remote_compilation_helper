@@ -268,7 +268,7 @@ impl RemoteDependencyTransport {
     }
 
     #[cfg(test)]
-    pub(crate) fn advertise_for_test(&self, hello: &Value) -> impl Drop {
+    pub(crate) fn advertise_for_test(&self, hello: &Value) -> impl Drop + use<> {
         self.readiness.publish_for_test(hello)
     }
 
