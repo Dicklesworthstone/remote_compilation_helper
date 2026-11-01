@@ -29,6 +29,16 @@ MARKER = "RCH_TEST_ATTEMPT_DISK_BUDGET:"
 
 
 class DiskMonitorTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin process census")
+    def test_darwin_census_omits_reaped_probe_but_keeps_live_child(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.processes.append(child)
+        snapshot = monitor.process_snapshot()
+        self.assertIn(child.pid, snapshot)
+        direct_children = {record["pid"] for record in snapshot.values()
+                           if record["parent"] == os.getpid()}
+        self.assertEqual(direct_children, {child.pid})
+
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="rch-disk-test-"))
         self.target = self.root / "target"
@@ -492,6 +502,8 @@ m.filesystem_sample=sample"""
         inject = f"""original_popen=m.subprocess.Popen
 def interrupted_spawn(*args, **kwargs):
     child=original_popen(*args, **kwargs)
+    if os.path.realpath(args[0][0]) != os.path.realpath(sys.executable):
+        return child
     deadline=time.monotonic()+5
     while not pathlib.Path({str(ready)!r}).exists():
         if child.poll() is not None or time.monotonic() >= deadline:
@@ -582,9 +594,18 @@ else:
     time.sleep(0.15)
     print('foreground-ok')
 """
-        process, _ = self.spawn(payload)
+        process, receipt = self.spawn(payload)
         status, stdout, stderr = self.complete(process)
-        self.assertEqual(status, 0, stderr)
+        usage = json.loads(receipt.read_text().split("_DISK_USAGE:", 1)[1])
+        if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
+            self.assertEqual(status, 0, stderr)
+            self.assertTrue(usage["complete"])
+        else:
+            # Without a pinned process handle, the existing safety contract
+            # cancels the owned group rather than risk a recycled PID.
+            self.assertEqual(status, -signal.SIGKILL, stderr)
+            self.assertEqual(self.failure(receipt)["reason"], "monitor_unavailable")
+            self.assertFalse(usage["complete"])
         self.assertIn("foreground-ok", stdout)
         record = monitor.process_snapshot().get(int(ready.read_text()))
         self.assertTrue(record is None or record["state"] in ("Z", "X"))

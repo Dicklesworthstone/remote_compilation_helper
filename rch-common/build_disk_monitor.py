@@ -108,12 +108,24 @@ def process_snapshot(heartbeat=lambda: None):
                 except FileNotFoundError:
                     pass
     elif sys.platform == "darwin":
-        output = subprocess.check_output(
-            ["ps", "-axo", "pid=,ppid=,pgid=,stat="], timeout=1, text=True
+        census = subprocess.Popen(
+            ["ps", "-axo", "pid=,ppid=,pgid=,stat="], stdout=subprocess.PIPE, text=True
         )
+        try:
+            output, _ = census.communicate(timeout=1)
+        except BaseException:
+            census.kill()
+            census.communicate()
+            raise
+        if census.returncode:
+            raise subprocess.CalledProcessError(census.returncode, census.args, output)
         for line in output.splitlines():
             heartbeat()
             pid, parent, group, state = line.split()
+            # This exact child has been reaped above. Its census entry is not
+            # an outstanding build writer, even though ps observed itself.
+            if int(pid) == census.pid:
+                continue
             result[int(pid)] = {
                 "pid": int(pid), "parent": int(parent), "group": int(group),
                 "state": state[0], "start": None,
