@@ -316,3 +316,176 @@ rch_group_state
 fn process_state_observation_is_conservative_and_handles_parentheses() {
     run_case(PROCESS_STATES);
 }
+
+const OBSERVATION_BUDGET: &str = r#"
+# Inject only the inexpensive kernel load hints. Observation/proof logic is
+# never substituted in these budget calculations.
+read() {
+    rch_load_one=$test_load
+    rch_load_tasks=$test_tasks
+    return "$test_read_status"
+}
+test_read_status=0
+test_load=2.60; test_tasks=2/830
+rch_observation_budget
+[ "$rch_observation_seconds" = 3 ] || exit 1
+test_load=47.10; test_tasks=32/4800
+rch_observation_budget
+[ "$rch_observation_seconds" = 7 ] || exit 2
+test_load=999999999.00; test_tasks=1/999999999
+rch_observation_budget
+[ "$rch_observation_seconds" = 8 ] || exit 3
+for test_load in malformed 47.bad 47..10 047.10 9999999999.00; do
+    rch_observation_budget
+    [ "$rch_observation_seconds" = 5 ] || exit 4
+done
+test_load=47.10
+for test_tasks in malformed 32/nope nope/4800 32/04800 32/9999999999; do
+    rch_observation_budget
+    [ "$rch_observation_seconds" = 5 ] || exit 5
+done
+test_tasks=32/4800; test_read_status=1
+rch_observation_budget
+[ "$rch_observation_seconds" = 5 ] || exit 6
+"#;
+
+#[test]
+fn observation_budget_scales_without_scanning_and_bounds_malformed_hints() {
+    run_case(OBSERVATION_BUDGET);
+}
+
+const CAPTURE_SHARED_DEADLINE: &str = r#"
+rch_test_dir=$1
+rch_observation_clock() { rch_observation_now=100; }
+rch_group_timeout() {
+    printf '%s\n' "$2" >> "$rch_test_dir/durations"
+    shift 2
+    "$@"
+}
+rch_observation_deadline=350
+output=$(rch_control_capture 8s printf 'RCH_TEST_CAPTURE\n') || exit 1
+[ "$output" = RCH_TEST_CAPTURE ] || exit 2
+[ "$(cat "$rch_test_dir/durations")" = 2s ] || exit 3
+# Expired budgets cannot start another exchange or accept its output.
+rch_observation_deadline=100
+output=$(rch_control_capture 8s printf 'UNSAFE\n')
+[ "$?" = 125 ] && [ -z "$output" ] || exit 4
+[ "$(cat "$rch_test_dir/durations")" = 2s ] || exit 5
+# Byte/metadata validation happens after the helper. If that consumes the
+# rest of the deadline, a successful helper is still an unavailable read.
+rch_observation_deadline=350
+rch_clock_reads=0
+rch_observation_clock() {
+    rch_clock_reads=$((rch_clock_reads + 1))
+    if [ "$rch_clock_reads" = 1 ]; then rch_observation_now=100
+    else rch_observation_now=350; fi
+}
+output=$(rch_control_capture 8s printf 'LATE\n')
+[ "$?" = 125 ] && [ -z "$output" ] || exit 6
+"#;
+
+#[test]
+fn every_control_capture_consumes_the_same_absolute_deadline() {
+    run_case(CAPTURE_SHARED_DEADLINE);
+}
+
+const CENSUS_RETRY_BUDGET: &str = r#"
+rch_test_dir=$1
+rch_read_record() { rch_identified=1; rch_scope_bound=0; }
+rch_recovery_boot_state() { return 0; }
+rch_observation_clock() { rch_observation_now=100; }
+rch_posix_signal_authorized() { return 0; }
+rch_signal_group() { printf '%s\n' "$1" >> "$rch_test_dir/signals"; }
+sleep() { :; }
+rch_group_state() {
+    test_census_calls=$((test_census_calls + 1))
+    printf '%s\n' "$test_census_calls" > "$rch_test_dir/calls"
+    [ "$test_census_calls" != "$test_settled_after" ] || return 0
+    return 2
+}
+test_census_calls=0; test_settled_after=3
+rch_remote_cancel /unused regression kill || exit 1
+[ "$(cat "$rch_test_dir/calls")" = 3 ] || exit 2
+[ "$(cat "$rch_test_dir/signals")" = KILL ] || exit 3
+# One initial observation plus at most three post-kill unknown observations.
+# Even an authenticated successful signal never becomes a completion proof.
+: > "$rch_test_dir/signals"
+test_settled_after=99
+rch_remote_cancel /unused regression kill
+[ "$?" = 44 ] || exit 4
+[ "$(cat "$rch_test_dir/calls")" = 4 ] || exit 5
+[ "$(cat "$rch_test_dir/signals")" = KILL ] || exit 6
+# An inherited setup cap can only tighten cancellation. Do not reset it.
+rch_observation_deadline=100
+rch_remote_cancel /unused regression kill
+[ "$?" = 44 ] || exit 7
+[ "$rch_observation_deadline" = 100 ] || exit 8
+"#;
+
+#[test]
+fn unavailable_census_retries_are_bounded_and_never_prove_completion() {
+    run_case(CENSUS_RETRY_BUDGET);
+}
+
+const SCOPE_BIND_OBSERVATION_RETRIES: &str = r#"
+rch_test_dir=$1
+rch_boot=01234567-89ab-cdef-0123-456789abcdef
+rch_pgid=6000000; rch_start=100
+rch_policy_manager=user
+rch_policy_scope="rch-$rch_boot-$rch_pgid-$rch_start.scope"
+rch_policy_expected_cgroup="/jobs.slice/$rch_policy_scope"
+mkdir -p "$rch_test_dir$rch_policy_expected_cgroup" || exit 1
+rch_scope_root() { printf '%s\n' "$rch_test_dir"; }
+rch_policy_systemctl() {
+    [ "$*" = "show --value --property=InvocationID -- $rch_policy_scope" ] || return 99
+    printf 'invocation\n' >> "$rch_test_dir/manager-reads"
+    printf '1234567890abcdef1234567890abcdef\n'
+}
+rch_observation_clock() { rch_observation_now=100; }
+sleep() { :; }
+# Only the independently observed scope state is injected. Binding syntax,
+# captured inode/UID/namespace fields, the retry loop and its budget are real.
+rch_scope_operation() {
+    [ "$1" = probe ] &&
+        [ "$rch_scope_invocation" = 1234567890abcdef1234567890abcdef ] &&
+        [ "$rch_scope_cgroup" = "$rch_policy_expected_cgroup" ] &&
+        [ "$rch_observation_deadline" = "$test_expected_deadline" ] || return 99
+    test_probe_calls=$((test_probe_calls + 1))
+    printf '%s\n' "$test_probe_calls" > "$rch_test_dir/probe-calls"
+    case "$test_mode" in
+        transient) [ "$test_probe_calls" -ge 3 ] && return 0; return 2;;
+        unavailable) return 2;;
+        changed) return 3;;
+        *) return 99;;
+    esac
+}
+for test_mode in transient unavailable changed; do
+    : > "$rch_test_dir/manager-reads"
+    test_probe_calls=0; rch_scope_bound=0; test_expected_deadline=3100
+    rch_scope_bind_created
+    test_status=$?
+    [ "$(cat "$rch_test_dir/manager-reads")" = invocation ] || exit 2
+    case "$test_mode" in
+        transient)
+            [ "$test_status" = 0 ] && [ "$rch_scope_bound" = 1 ] &&
+                [ "$(cat "$rch_test_dir/probe-calls")" = 3 ] || exit 3;;
+        unavailable)
+            [ "$test_status" = 1 ] && [ "$rch_scope_bound" = 0 ] &&
+                [ "$(cat "$rch_test_dir/probe-calls")" = 3 ] || exit 4;;
+        changed)
+            [ "$test_status" = 1 ] && [ "$rch_scope_bound" = 0 ] &&
+                [ "$(cat "$rch_test_dir/probe-calls")" = 1 ] || exit 5;;
+    esac
+done
+# Pre-publication policy setup can supply a stricter shared deadline. Retrying
+# the same binding must preserve that cap and not leak its private budget.
+rch_observation_deadline=1200; test_expected_deadline=1200
+test_mode=transient; test_probe_calls=0; rch_scope_bound=0
+rch_scope_bind_created || exit 6
+[ "$rch_scope_bound" = 1 ] && [ "$rch_observation_deadline" = 1200 ] || exit 7
+"#;
+
+#[test]
+fn scope_binding_retries_only_unknown_evidence_before_record_publication() {
+    run_case(SCOPE_BIND_OBSERVATION_RETRIES);
+}

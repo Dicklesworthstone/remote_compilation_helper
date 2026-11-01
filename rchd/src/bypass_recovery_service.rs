@@ -68,6 +68,57 @@ fn now_unix_ms() -> u64 {
 }
 
 const RECOVERY_ENDPOINT: &str = "recovery_endpoint_v1";
+const PROCESS_OBSERVATION_REQUIRED: &str = "process_observation_required";
+
+// The scoped control path has bounded admission and process-census retries.
+// A 10s capability/SSH probe cannot enclose that lifecycle on a loaded host.
+// This separate allowance is used only for recovery of an observation failure;
+// ordinary reachability checks keep their existing short budgets.
+// 60s launcher admission + bounded cancellation/census + the 5s no-op payload
+// cap, with room for SSH and control-output draining. No sub-budget restarts
+// this total wall clock.
+const PROCESS_OBSERVATION_PROBE_TIMEOUT: Duration = Duration::from_secs(120);
+// Match ordinary background capability probes: rustc/rustup/df and SSH setup
+// were measured at 6--16s on busy workers. The old recovery default of 10s is
+// inappropriate when recovering precisely this host-pressure failure.
+const BUSY_WORKER_CONTROL_TIMEOUT: Duration = Duration::from_secs(25);
+
+fn process_observation_required(record: &BypassRecord) -> bool {
+    record.failure_class == BypassFailureClass::ProcessObservation
+        || record.details.contains_key(PROCESS_OBSERVATION_REQUIRED)
+}
+
+fn recovery_capability_timeout(config: &BypassRecoveryConfig, record: &BypassRecord) -> Duration {
+    if process_observation_required(record) {
+        config.probe_timeout.max(BUSY_WORKER_CONTROL_TIMEOUT)
+    } else {
+        config.probe_timeout
+    }
+}
+
+fn recovery_canary_timeout(config: &BypassRecoveryConfig) -> Duration {
+    config.probe_timeout.max(BUSY_WORKER_CONTROL_TIMEOUT)
+}
+
+fn recovery_probe_deadline(config: &BypassRecoveryConfig, record: &BypassRecord) -> Duration {
+    let capability = recovery_capability_timeout(config, record).saturating_mul(2);
+    if process_observation_required(record) {
+        capability.saturating_add(PROCESS_OBSERVATION_PROBE_TIMEOUT)
+    } else {
+        capability
+    }
+}
+
+fn process_observation_probe_command() -> String {
+    format!(
+        "{}\nrch_process_health_probe",
+        rch_common::REMOTE_PROCESS_IDENTITY_SCRIPT,
+    )
+}
+
+fn process_observation_probe_passed(result: &rch_common::CommandResult) -> bool {
+    result.success() && result.stdout.trim() == "RCH_PROCESS_HEALTH_V1"
+}
 
 fn recovery_endpoint(config: &WorkerConfig) -> String {
     serde_json::json!([
@@ -275,21 +326,52 @@ impl SshRecoveryProber {
     }
 
     fn ssh_options(&self) -> SshOptions {
+        let budget = recovery_canary_timeout(&self.config);
         SshOptions {
-            command_timeout: self.config.probe_timeout,
-            connect_timeout: self.config.probe_timeout,
+            command_timeout: budget,
+            connect_timeout: budget,
             ..Default::default()
         }
     }
 
     /// Run a command on the worker over SSH, returning its stdout, or `None` if
     /// the worker is unreachable (connect/exec failed).
-    async fn ssh_run(&self, config: &WorkerConfig, command: &str) -> Option<String> {
-        let mut client = SshClient::new(config.clone(), self.ssh_options());
+    async fn ssh_run(
+        &self,
+        config: &WorkerConfig,
+        command: &str,
+        budget: Duration,
+    ) -> Option<String> {
+        let options = SshOptions {
+            connect_timeout: budget,
+            command_timeout: budget,
+            ..Default::default()
+        };
+        let mut client = SshClient::new(config.clone(), options);
         if client.connect().await.is_err() {
             return None;
         }
         client.execute(command).await.ok().map(|r| r.stdout)
+    }
+
+    async fn process_observation_probe(&self, config: &WorkerConfig) -> bool {
+        let probe = async {
+            let options = SshOptions {
+                connect_timeout: self.config.probe_timeout.max(BUSY_WORKER_CONTROL_TIMEOUT),
+                command_timeout: PROCESS_OBSERVATION_PROBE_TIMEOUT,
+                ..Default::default()
+            };
+            let mut client = SshClient::new(config.clone(), options);
+            if client.connect().await.is_err() {
+                return false;
+            }
+            let result = client.execute(&process_observation_probe_command()).await;
+            let _ = client.disconnect().await;
+            result.is_ok_and(|result| process_observation_probe_passed(&result))
+        };
+        tokio::time::timeout(PROCESS_OBSERVATION_PROBE_TIMEOUT, probe)
+            .await
+            .unwrap_or(false)
     }
 
     /// Whether the worker's most recent telemetry sample is within tolerance.
@@ -354,6 +436,7 @@ fn assess_probe_facts(
             disk_ok: false,
             load_ok: false,
             telemetry_ok: false,
+            process_observation_ok: false,
         };
     }
 
@@ -399,6 +482,9 @@ fn assess_probe_facts(
         disk_ok,
         load_ok,
         telemetry_ok,
+        // Ordinary capability recovery has no process-failure obligation.
+        // assess_recovery_probe_facts fails this dimension closed when it does.
+        process_observation_ok: true,
     }
 }
 
@@ -447,6 +533,7 @@ fn assess_recovery_probe_facts(
     if record.failure_class == BypassFailureClass::DiskInodePressure {
         probe.disk_ok &= has_complete_disk_evidence(facts, &config);
     }
+    probe.process_observation_ok = !process_observation_required(record);
     probe
 }
 
@@ -476,7 +563,8 @@ impl RecoveryProber for SshRecoveryProber {
         let mut script = build_capability_probe_script(&spec);
         script.push_str(LOAD_PROBE_SCRIPT);
 
-        let Some(stdout) = self.ssh_run(config, &script).await else {
+        let capability_budget = recovery_capability_timeout(&self.config, &record);
+        let Some(stdout) = self.ssh_run(config, &script, capability_budget).await else {
             // SSH/shell never ran -> unreachable; every dimension fails.
             return RecoveryProbe {
                 ssh_ok: false,
@@ -486,13 +574,25 @@ impl RecoveryProber for SshRecoveryProber {
                 disk_ok: false,
                 load_ok: false,
                 telemetry_ok: false,
+                process_observation_ok: false,
             };
         };
 
         let facts = parse_capability_probe(&stdout);
         let load_per_core = Self::parse_load_per_core(&stdout);
-        let telemetry_ok = recovery_telemetry_ok(config, self.telemetry_fresh(&endpoint));
-        assess_recovery_probe_facts(&facts, load_per_core, telemetry_ok, &self.config, &record)
+        let mut probe =
+            assess_recovery_probe_facts(&facts, load_per_core, false, &self.config, &record);
+        if process_observation_required(&record) {
+            // A successful no-op through the actual scoped launcher proves the
+            // same admission and completion machinery needed by new jobs. It
+            // says nothing about the old job: its ownership remains retained.
+            probe.process_observation_ok = self.process_observation_probe(config).await;
+        }
+        // A bounded lifecycle probe can take two minutes. Evidence fresh at
+        // its start may have expired before publication, so sample the latest
+        // telemetry again only after the slow stage has finished.
+        probe.telemetry_ok = recovery_telemetry_ok(config, self.telemetry_fresh(&endpoint));
+        probe
     }
 
     async fn canary(&self, worker: Arc<WorkerState>) -> CanaryOutcome {
@@ -589,6 +689,89 @@ async fn record_worker_bypass_locked(
     if let Err(e) = store.upsert(record) {
         warn!(error = %e, "failed to persist bypass record");
     }
+}
+
+/// Quarantine an observation failure independently of build completion. The
+/// caller has checked the exact active owner and holds history's release lock;
+/// this endpoint fence also rejects a late report after retargeting (even ABA).
+/// No slots, ownership, command exit status or administrator intent are changed.
+pub(crate) async fn record_process_observation_failure(
+    store: &Arc<Mutex<BypassRecordStore>>,
+    worker: &Arc<WorkerState>,
+    endpoint: &WorkerEndpointSnapshot,
+    incident: &str,
+    now_ms: u64,
+) -> anyhow::Result<()> {
+    let mut store = store.lock().await;
+    let Some(config) = worker.lock_current_endpoint(endpoint).await else {
+        anyhow::bail!("process observation belongs to a replaced worker endpoint");
+    };
+    let id = config.id.as_str();
+    const INCIDENTS: &str = "process_observation_incidents";
+    let previous = store.get(id);
+    let mut incidents: Vec<String> = previous
+        .and_then(|record| record.details.get(INCIDENTS))
+        .map(|json| serde_json::from_str(json))
+        .transpose()?
+        .unwrap_or_default();
+    let already_recorded = incidents.iter().any(|existing| existing == incident);
+    if already_recorded {
+        // Retry a failed persistence operation without changing a canary's
+        // evidence, even if a later SSH/disk incident changed its headline.
+        let existing = previous.expect("record owns incident history").clone();
+        store.upsert(existing)?;
+        return Ok(());
+    }
+    let class = if previous
+        .is_some_and(|record| record.failure_class == BypassFailureClass::DiskInodePressure)
+    {
+        BypassFailureClass::DiskInodePressure
+    } else {
+        BypassFailureClass::ProcessObservation
+    };
+    let mut record = if let Some(previous) = previous {
+        let mut record = previous.clone();
+        let retargeted = rebind_recovery(&mut record, &config, now_ms);
+        if retargeted {
+            record.last_failure_unix_ms = now_ms;
+            record.consecutive_failures = 1;
+            record = record.with_diagnostic("remote process completion unconfirmed");
+        } else {
+            record.record_failure(now_ms, "remote process completion unconfirmed");
+        }
+        record.failure_class = class;
+        record.reason_code = class.incident_reason_code();
+        record
+    } else {
+        BypassRecord::new(id, &config.host, &config.user, class, now_ms)
+            .with_diagnostic("remote process completion unconfirmed")
+    };
+    record.local_fallback_allowed = false;
+    record.details.insert(
+        PROCESS_OBSERVATION_REQUIRED.into(),
+        "scoped_lifecycle_v1".into(),
+    );
+    record
+        .details
+        .insert(RECOVERY_ENDPOINT.into(), recovery_endpoint(&config));
+    // Keep bounded retry deduplication without refusing fresh failures.
+    // A long-lived retained owner may produce many distinct cancellation
+    // attempts. An ancient duplicate may conservatively count again once
+    // evicted; a new failure must always interrupt a pending canary.
+    if incidents.len() >= 4096 {
+        drop(incidents.drain(..incidents.len() - 4095));
+    }
+    incidents.push(incident.into());
+    record
+        .details
+        .insert(INCIDENTS.into(), serde_json::to_string(&incidents)?);
+    // Even persistence failure must stop new admissions in this daemon. The
+    // caller receives an error and can retry; no successful ack is fabricated.
+    worker.enter_bypass(class).await;
+    store.upsert(record)?;
+    remediation::record_bypass_transition(BypassTransition::Bypassed);
+    remediation::record_worker_ineligible(BypassFailureClass::ProcessObservation);
+    Ok(())
 }
 
 /// Validate remote paths without interpreting them on the dispatcher's
@@ -1160,7 +1343,7 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
         // A prober has a connect budget and a command budget. Enforce their
         // total here as well, so a stalled adapter cannot retain a fleet
         // concurrency permit indefinitely.
-        let deadline = self.config.probe_timeout.saturating_mul(2);
+        let deadline = recovery_probe_deadline(&self.config, &record);
         let probe = admission
             .run(tokio::time::timeout(
                 deadline,
@@ -1180,6 +1363,7 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
             disk_ok: false,
             load_ok: false,
             telemetry_ok: false,
+            process_observation_ok: false,
         });
         let mut store = self.store.lock().await;
         let Some(endpoint) = worker.lock_current_endpoint(&snapshot).await else {
@@ -1241,7 +1425,7 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
                 drop(store);
                 let outcome = admission
                     .run(tokio::time::timeout(
-                        deadline,
+                        recovery_canary_timeout(&self.config).saturating_mul(2),
                         self.prober.canary(worker.clone()),
                     ))
                     .await;
@@ -1460,6 +1644,7 @@ mod tests {
             "disk" => p.disk_ok = false,
             "load" => p.load_ok = false,
             "telemetry" => p.telemetry_ok = false,
+            "process_observation" => p.process_observation_ok = false,
             _ => unreachable!(),
         }
         p
@@ -1484,6 +1669,260 @@ mod tests {
     }
 
     const T0: u64 = 1_700_000_000_000;
+
+    #[test]
+    fn process_observation_probe_requires_a_complete_successful_receipt() {
+        for (exit_code, stdout, expected) in [
+            (0, "RCH_PROCESS_HEALTH_V1\n", true),
+            (255, "RCH_PROCESS_HEALTH_V1\n", false),
+            (0, "health_check\n", false),
+            (0, "RCH_PROCESS_HEALTH_V1\nRCH_PROCESS_HEALTH_V1\n", false),
+            (0, "", false),
+        ] {
+            assert_eq!(
+                process_observation_probe_passed(&rch_common::CommandResult {
+                    exit_code,
+                    stdout: stdout.into(),
+                    stderr: String::new(),
+                    duration_ms: 1,
+                }),
+                expected,
+                "exit={exit_code}, stdout={stdout:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn capability_success_never_satisfies_process_observation_recovery() {
+        let config = BypassRecoveryConfig::default();
+        let facts = facts_all_good();
+        for class in [
+            BypassFailureClass::ProcessObservation,
+            BypassFailureClass::Ssh,
+        ] {
+            let record = BypassRecord::new("css", "h", "u", class, T0)
+                .with_detail(PROCESS_OBSERVATION_REQUIRED, "scoped_lifecycle_v1");
+            let probe = assess_recovery_probe_facts(&facts, Some(1.0), true, &config, &record);
+            assert!(probe.ssh_ok && probe.worker_binary_ok && probe.telemetry_ok);
+            assert!(!probe.fully_healthy());
+            assert_eq!(probe.first_failure(), Some("process_observation"));
+            assert_eq!(
+                recovery_probe_deadline(&config, &record),
+                BUSY_WORKER_CONTROL_TIMEOUT.saturating_mul(2) + PROCESS_OBSERVATION_PROBE_TIMEOUT,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn census_quarantine_survives_restart_and_heartbeat_until_lifecycle_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bypass.json");
+        let pool = pool_with(&["css"]).await;
+        let worker = pool.get(&WorkerId::new("css")).await.unwrap();
+        assert!(worker.reserve_slots(1).await);
+        let store = Arc::new(Mutex::new(BypassRecordStore::with_path(&path)));
+        let endpoint = worker.endpoint_snapshot().await;
+        for (incident, now) in [("job-1", T0), ("job-1", T0 + 1), ("job-2", T0 + 2)] {
+            record_process_observation_failure(&store, &worker, &endpoint, incident, now)
+                .await
+                .unwrap();
+        }
+        let record = store.lock().await.get("css").cloned().unwrap();
+        assert_eq!(
+            record.consecutive_failures, 2,
+            "report retries are idempotent"
+        );
+        assert!(!record.local_fallback_allowed);
+        assert!(process_observation_required(&record));
+        let circuit = rch_common::CircuitBreakerConfig::default();
+        for _ in 0..3 {
+            worker.record_command_outcome(true, &circuit).await;
+            worker
+                .apply_health_status(rch_common::WorkerStatus::Healthy)
+                .await;
+        }
+        assert!(!worker.lifecycle().await.is_schedulable());
+        assert!(!worker.reserve_slots(1).await);
+        assert_eq!(worker.used_slots(), 1, "uncertain owner keeps its slot");
+
+        let restarted_pool = pool_with(&["css"]).await;
+        let restarted = restarted_pool.get(&WorkerId::new("css")).await.unwrap();
+        assert!(restarted.reserve_slots(1).await);
+        let restored = Arc::new(Mutex::new(BypassRecordStore::load(&path)));
+        let svc = BypassRecoveryService::new(
+            restarted_pool,
+            restored.clone(),
+            FakeProber::new(
+                vec![
+                    probe_failing("process_observation"),
+                    RecoveryProbe::all_ok(),
+                    probe_failing("process_observation"),
+                    RecoveryProbe::all_ok(),
+                    RecoveryProbe::all_ok(),
+                ],
+                probe_failing("process_observation"),
+                CanaryOutcome::Passed,
+            ),
+            BypassRecoveryConfig::default(),
+        );
+        svc.reconcile_on_start().await;
+        assert!(!restarted.lifecycle().await.is_schedulable());
+        for round in 0..5 {
+            let due = restored.lock().await.get("css").unwrap().next_probe_unix_ms;
+            svc.evaluate_once(due).await;
+            assert_eq!(restarted.lifecycle().await.is_schedulable(), round == 4);
+            assert_eq!(
+                restarted.used_slots(),
+                1,
+                "recovery never retires an old owner"
+            );
+        }
+        assert!(!restored.lock().await.contains("css"));
+        assert!(restarted.reserve_slots(1).await);
+    }
+
+    #[tokio::test]
+    async fn later_disk_and_ssh_faults_preserve_process_observation_requirement() {
+        let pool = pool_with(&["css"]).await;
+        let worker = pool.get(&WorkerId::new("css")).await.unwrap();
+        let store = store();
+        record_process_observation_failure(
+            &store,
+            &worker,
+            &worker.endpoint_snapshot().await,
+            "job-1",
+            T0,
+        )
+        .await
+        .unwrap();
+        for class in [
+            BypassFailureClass::Ssh,
+            BypassFailureClass::DiskInodePressure,
+        ] {
+            record_worker_bypass(&store, &worker, class, "another failure", T0 + 1).await;
+            let record = store.lock().await.get("css").cloned().unwrap();
+            assert!(process_observation_required(&record));
+            assert!(!record.local_fallback_allowed);
+            assert!(
+                !assess_recovery_probe_facts(
+                    &facts_all_good(),
+                    Some(1.0),
+                    true,
+                    &BypassRecoveryConfig::default(),
+                    &record,
+                )
+                .process_observation_ok
+            );
+        }
+    }
+
+    struct ObservationDuringCanary {
+        store: Arc<Mutex<BypassRecordStore>>,
+        new_incident: bool,
+    }
+
+    impl RecoveryProber for ObservationDuringCanary {
+        async fn probe(&self, _worker: Arc<WorkerState>, _record: BypassRecord) -> RecoveryProbe {
+            RecoveryProbe::all_ok()
+        }
+
+        async fn canary(&self, worker: Arc<WorkerState>) -> CanaryOutcome {
+            record_process_observation_failure(
+                &self.store,
+                &worker,
+                &worker.endpoint_snapshot().await,
+                if self.new_incident { "job-2" } else { "job-1" },
+                T0 + 10_000_000,
+            )
+            .await
+            .unwrap();
+            CanaryOutcome::Passed
+        }
+    }
+
+    #[tokio::test]
+    async fn full_observation_incident_cache_never_ignores_a_fresh_failure() {
+        let pool = pool_with(&["css"]).await;
+        let worker = pool.get(&WorkerId::new("css")).await.unwrap();
+        let endpoint = worker.endpoint_snapshot().await;
+        let store = store();
+        record_process_observation_failure(&store, &worker, &endpoint, "initial", T0)
+            .await
+            .unwrap();
+        let mut record = store.lock().await.get("css").cloned().unwrap();
+        let incidents: Vec<_> = (0..4096).map(|id| format!("old:{id}")).collect();
+        record.details.insert(
+            "process_observation_incidents".into(),
+            serde_json::to_string(&incidents).unwrap(),
+        );
+        record.state = BypassState::RecoveredPendingCanary;
+        store.lock().await.upsert(record).unwrap();
+        worker.recover_to_canary().await.unwrap();
+        record_process_observation_failure(&store, &worker, &endpoint, "fresh", T0 + 1)
+            .await
+            .unwrap();
+        let record = store.lock().await.get("css").cloned().unwrap();
+        let incidents: Vec<String> =
+            serde_json::from_str(&record.details["process_observation_incidents"]).unwrap();
+        assert_eq!(incidents.len(), 4096);
+        assert_eq!(incidents.first().map(String::as_str), Some("old:1"));
+        assert_eq!(incidents.last().map(String::as_str), Some("fresh"));
+        assert_eq!(record.state, BypassState::TemporaryBypass);
+        assert_eq!(
+            worker.eligibility().await,
+            EligibilityState::TemporaryBypass
+        );
+        assert_eq!(record.consecutive_failures, 2);
+    }
+
+    #[tokio::test]
+    async fn only_a_new_observation_failure_invalidates_an_inflight_canary() {
+        for new_incident in [false, true] {
+            let pool = pool_with(&["css"]).await;
+            let worker = pool.get(&WorkerId::new("css")).await.unwrap();
+            assert!(worker.reserve_slots(1).await);
+            let store = store();
+            record_process_observation_failure(
+                &store,
+                &worker,
+                &worker.endpoint_snapshot().await,
+                "job-1",
+                T0,
+            )
+            .await
+            .unwrap();
+            record_worker_bypass(
+                &store,
+                &worker,
+                BypassFailureClass::Ssh,
+                "later SSH fault",
+                T0 + 1,
+            )
+            .await;
+            let service = BypassRecoveryService::new(
+                pool,
+                store.clone(),
+                ObservationDuringCanary {
+                    store: store.clone(),
+                    new_incident,
+                },
+                BypassRecoveryConfig::default(),
+            );
+            for _ in 0..2 {
+                let due = store.lock().await.get("css").unwrap().next_probe_unix_ms;
+                service.evaluate_once(due).await;
+            }
+            assert_eq!(store.lock().await.contains("css"), new_incident);
+            assert_eq!(worker.lifecycle().await.is_schedulable(), !new_incident);
+            assert_eq!(worker.used_slots(), 1);
+            if new_incident {
+                let current = store.lock().await.get("css").cloned().unwrap();
+                assert_eq!(current.consecutive_failures, 1);
+                assert_eq!(current.consecutive_passes, 0);
+                assert_eq!(current.state, BypassState::TemporaryBypass);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn two_healthy_probes_then_passing_canary_rejoins() {
@@ -2879,6 +3318,60 @@ mod tests {
         let blocked = records.get("blocked").unwrap();
         assert!(blocked.next_probe_unix_ms > T0 + 60_000);
         assert_eq!(blocked.consecutive_passes, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn process_observation_canary_has_its_own_bounded_busy_worker_budget() {
+        let pool = pool_with(&["blocked"]).await;
+        let worker = pool.get(&WorkerId::new("blocked")).await.unwrap();
+        assert!(worker.reserve_slots(1).await);
+        let store = store();
+        let endpoint = worker.endpoint_snapshot().await;
+        record_process_observation_failure(&store, &worker, &endpoint, "job:1", T0)
+            .await
+            .unwrap();
+        let mut record = store.lock().await.get("blocked").cloned().unwrap();
+        record.auto_rejoin.required_consecutive_passes = 1;
+        record.auto_rejoin.canary_required = true;
+        store.lock().await.upsert(record).unwrap();
+        let canceled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let config = BypassRecoveryConfig::default();
+        let prober = SshRecoveryProber::new(
+            Arc::new(TelemetryStore::new(Duration::from_secs(300), None)),
+            config.clone(),
+        );
+        let options = prober.ssh_options();
+        assert_eq!(options.connect_timeout, BUSY_WORKER_CONTROL_TIMEOUT);
+        assert_eq!(options.command_timeout, BUSY_WORKER_CONTROL_TIMEOUT);
+        let service = BypassRecoveryService::new(
+            pool,
+            Arc::clone(&store),
+            BlockingEndpointProber {
+                started: Arc::new(tokio::sync::Notify::new()),
+                canceled: Arc::clone(&canceled),
+                during_canary: true,
+            },
+            config,
+        );
+        let started = tokio::time::Instant::now();
+        service.evaluate_once(T0 + 60_000).await;
+        let budget = BUSY_WORKER_CONTROL_TIMEOUT.saturating_mul(2);
+        assert!((budget..=budget + Duration::from_secs(1)).contains(&started.elapsed()));
+        assert!(canceled.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            worker.eligibility().await,
+            EligibilityState::TemporaryBypass
+        );
+        assert_eq!(
+            worker.used_slots(),
+            1,
+            "health work cannot retire the old owner"
+        );
+        assert!(!worker.reserve_slots(1).await);
+        assert_eq!(
+            service.probe_limit.available_permits(),
+            MAX_CONCURRENT_RECOVERY_PROBES
+        );
     }
 
     #[tokio::test]

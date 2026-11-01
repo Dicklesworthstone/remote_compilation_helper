@@ -143,6 +143,7 @@ pub const WORKER_INELIGIBLE_LABELS: &[&str] = &[
     "artifact_retrieval",
     "circuit_breaker",
     "os_arch_mismatch",
+    "process_observation",
 ];
 
 /// Temporary-bypass lifecycle transitions ([`BypassTransition`]).

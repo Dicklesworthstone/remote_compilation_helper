@@ -257,12 +257,14 @@ def run(protocol):
                 )
                 assert result.returncode == expected, (shell, name, result.returncode, result.stderr)
                 count += 1
-            # A parent can fork an unselected child and exit between passes.
-            # Even terminal selected threads cannot then establish absence.
+            # Multithreaded groups need the second pass. A parent can fork an
+            # unselected child and exit between those passes; terminal selected
+            # threads still cannot establish absence. Single-threaded groups
+            # use their first complete snapshot and have no between-pass gap.
             transitions = [
-                ("exited-parent", "6000001 6000001 6000000 S 1", ""),
+                ("exited-parent", "6000001 6000001 6000000 S 2", ""),
                 ("exited-sibling", "6000001 6000001 6000000 Z 2", ""),
-                ("became-terminal", "6000001 6000001 6000000 S 1",
+                ("became-terminal", "6000001 6000001 6000000 S 2",
                  "6000001 6000001 6000000 Z 1"),
             ]
             for name, leaders, snapshot in transitions:

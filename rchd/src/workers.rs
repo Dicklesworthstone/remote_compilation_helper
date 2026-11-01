@@ -5116,17 +5116,7 @@ mod tests {
     // =========================================================================
 
     /// Every concrete failure class, for exhaustive bypass-attribution tests.
-    const ALL_FAILURE_CLASSES: &[BypassFailureClass] = &[
-        BypassFailureClass::Ssh,
-        BypassFailureClass::WorkerBinary,
-        BypassFailureClass::RuntimeToolchain,
-        BypassFailureClass::DiskInodePressure,
-        BypassFailureClass::StaleTelemetry,
-        BypassFailureClass::PathSync,
-        BypassFailureClass::ArtifactRetrieval,
-        BypassFailureClass::CircuitBreaker,
-        BypassFailureClass::OsArchMismatch,
-    ];
+    const ALL_FAILURE_CLASSES: &[BypassFailureClass] = BypassFailureClass::ALL;
 
     #[test]
     fn lifecycle_new_is_active_healthy_and_schedulable() {

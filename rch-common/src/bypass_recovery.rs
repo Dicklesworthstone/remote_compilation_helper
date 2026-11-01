@@ -50,6 +50,10 @@ pub struct RecoveryProbe {
     pub load_ok: bool,
     /// Telemetry is fresh (age within tolerance).
     pub telemetry_ok: bool,
+    /// The process lifecycle probe completed with affirmative admission and
+    /// completion evidence when required by this worker's quarantine.
+    #[serde(default)]
+    pub process_observation_ok: bool,
 }
 
 impl RecoveryProbe {
@@ -64,6 +68,7 @@ impl RecoveryProbe {
             disk_ok: true,
             load_ok: true,
             telemetry_ok: true,
+            process_observation_ok: true,
         }
     }
 
@@ -77,6 +82,7 @@ impl RecoveryProbe {
             && self.disk_ok
             && self.load_ok
             && self.telemetry_ok
+            && self.process_observation_ok
     }
 
     /// The first failing dimension, in a stable check order, for diagnostics.
@@ -96,6 +102,8 @@ impl RecoveryProbe {
             Some("load")
         } else if !self.telemetry_ok {
             Some("telemetry")
+        } else if !self.process_observation_ok {
+            Some("process_observation")
         } else {
             None
         }
@@ -244,6 +252,7 @@ mod tests {
             "disk" => p.disk_ok = false,
             "load" => p.load_ok = false,
             "telemetry" => p.telemetry_ok = false,
+            "process_observation" => p.process_observation_ok = false,
             _ => unreachable!(),
         }
         p
@@ -260,11 +269,28 @@ mod tests {
             "disk",
             "load",
             "telemetry",
+            "process_observation",
         ] {
             let p = probe_failing(dim);
             assert!(!p.fully_healthy(), "{dim} failure should not be healthy");
             assert_eq!(p.first_failure(), Some(dim));
         }
+    }
+
+    #[test]
+    fn missing_process_observation_evidence_fails_closed() {
+        let mut value = serde_json::to_value(RecoveryProbe::all_ok()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("process_observation_ok");
+        let probe: RecoveryProbe = serde_json::from_value(value).unwrap();
+        assert!(!probe.fully_healthy());
+        assert_eq!(probe.first_failure(), Some("process_observation"));
+        assert!(matches!(
+            decide_probe(record(), &probe, TS + 1),
+            ProbeDecision::StayBypassed { .. }
+        ));
     }
 
     #[test]

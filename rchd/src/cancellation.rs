@@ -102,6 +102,9 @@ pub struct CancellationRecord {
     pub completed_at: Option<Instant>,
     pub escalation_count: u32,
     pub remote_kill_attempted: bool,
+    /// An authenticated remote receipt, independent of local wrapper cleanup.
+    /// A local failure after this proof must not quarantine a healthy worker.
+    pub remote_kill_confirmed: bool,
     pub cleanup_ok: bool,
     /// Slots originally held by the build (captured at cancel time).
     pub slots: u32,
@@ -333,10 +336,11 @@ impl Default for CancellationConfig {
         Self {
             grace_period: Duration::from_secs(5),
             kill_timeout: Duration::from_secs(3),
+            // Remote observation/cleanup owns one 30-second monotonic budget.
             // Match the fresh-channel recovery budget in the transfer path.
-            // A loaded worker's bounded census and authenticated escalation
-            // can legitimately outlast ten seconds; cutting off its receipt
-            // retains a reservation even after the owned workload has stopped.
+            // Leave room for SSH setup and draining the authenticated receipt:
+            // the old 10s cap retained reservations after valid busy-worker
+            // cleanup because it cut off the completion proof.
             remote_kill_timeout: Duration::from_secs(45),
             max_escalations: 3,
             // Include local TERM grace, the complete remote attempt, and local
@@ -467,6 +471,7 @@ impl CancellationOrchestrator {
                 completed_at: None,
                 escalation_count: 0,
                 remote_kill_attempted: false,
+                remote_kill_confirmed: false,
                 cleanup_ok: true,
                 slots: build.slots,
                 slots_released: 0,
@@ -884,6 +889,7 @@ impl CancellationOrchestrator {
     /// Attempt to kill the remote process on the worker via SSH.
     async fn try_remote_kill(&self, record: &mut CancellationRecord) -> bool {
         record.remote_kill_attempted = true;
+        record.remote_kill_confirmed = false;
 
         // The answer is known without asking: see `remote_answer_can_confirm`.
         // A build fenced by a lease that still owns worker source is
@@ -927,6 +933,7 @@ impl CancellationOrchestrator {
                 let success = remote_kill_confirmed(&output, record.build_id)
                     || (record.abandoned_unlaunched
                         && remote_record_absent(&output, record.build_id));
+                record.remote_kill_confirmed = success;
                 debug!(
                     "Remote kill for build {} on {}: success={}",
                     record.build_id, record.worker_id, success
@@ -984,6 +991,7 @@ impl CancellationOrchestrator {
             record.slots_released = 0;
             None
         };
+        self.record_unconfirmed_remote_health(ctx, record).await;
         let mut history_ok = false;
 
         // 3. Build cancellation metadata and write finalized cancelled record.
@@ -1098,6 +1106,7 @@ impl CancellationOrchestrator {
                 "escalation_stage": escalation_stage,
                 "escalation_count": record.escalation_count,
                 "remote_kill_attempted": record.remote_kill_attempted,
+                "remote_kill_confirmed": record.remote_kill_confirmed,
                 "slots_released": record.slots_released,
                 "elapsed_ms": duration_millis_u64(elapsed),
                 "cleanup_ok": record.cleanup_ok,
@@ -1113,6 +1122,83 @@ impl CancellationOrchestrator {
             debug!(
                 "Build {} was not in active history during cleanup (may have already completed)",
                 record.build_id
+            );
+        }
+    }
+
+    /// A failed remote observation excludes new work without claiming that the
+    /// old job stopped. Missing admission evidence and purely local failures
+    /// cannot accuse today's worker, even when they retain the same build.
+    async fn record_unconfirmed_remote_health(
+        &self,
+        ctx: &DaemonContext,
+        record: &CancellationRecord,
+    ) {
+        if record.state != CancellationState::Failed
+            || !record.remote_kill_attempted
+            || record.remote_kill_confirmed
+            || !remote_answer_can_confirm(record)
+        {
+            return;
+        }
+        let _release = ctx.history.lock_releases().await;
+        let Some(owner) = ctx.history.active_build(record.build_id) else {
+            return;
+        };
+        if owner.worker_id != record.worker_id
+            || owner.location != rch_common::BuildLocation::Remote
+            || owner.remote_pgid_file != record.remote_pgid_file
+        {
+            return;
+        }
+        let (Some(endpoint), Some(owned_endpoint)) = (
+            record.worker_endpoint.as_ref(),
+            owner.worker_endpoint.as_ref(),
+        ) else {
+            return;
+        };
+        if endpoint.generation != owned_endpoint.generation
+            || !crate::workers::WorkerEndpointIdentity::from_config(&endpoint.config)
+                .matches_config(&owned_endpoint.config)
+            || rch_common::declared_os(&endpoint.config.tags)
+                .is_some_and(|os| os.eq_ignore_ascii_case("windows"))
+        {
+            return;
+        }
+        let Some(worker) = ctx.pool.get(&WorkerId::new(&record.worker_id)).await else {
+            return;
+        };
+        let Some(store) = &ctx.bypass_store else {
+            if let Some(_endpoint) = worker.lock_current_endpoint(endpoint).await {
+                worker
+                    .enter_bypass(rch_common::BypassFailureClass::ProcessObservation)
+                    .await;
+                warn!(
+                    build_id = record.build_id,
+                    "Remote cancellation unconfirmed; worker excluded but durable bypass storage unavailable"
+                );
+            }
+            return;
+        };
+        if let Err(error) = crate::bypass_recovery_service::record_process_observation_failure(
+            store,
+            &worker,
+            endpoint,
+            // Retransmitting this attempt's cleanup is idempotent. A fresh
+            // cancellation attempt is new observation evidence, even when it
+            // targets the same retained build that caused the first bypass.
+            &format!(
+                "cancel:{}:{}:{:?}",
+                owner.id, owner.started_at, record.requested_at
+            ),
+            u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
+        )
+        .await
+        {
+            warn!(
+                build_id = record.build_id,
+                %error,
+                "Unable to persist remote cancellation process-observation failure"
             );
         }
     }
@@ -1640,6 +1726,7 @@ wait
             completed_at: None,
             escalation_count,
             remote_kill_attempted,
+            remote_kill_confirmed: false,
             cleanup_ok: true,
             slots: 1,
             slots_released: 1,
@@ -2473,6 +2560,148 @@ wait
     }
 
     #[tokio::test]
+    async fn cancellation_health_requires_unconfirmed_remote_proof_on_current_endpoint() {
+        for case in [
+            "unknown",
+            "confirmed_remote_local_failed",
+            "not_attempted",
+            "missing_record",
+            "missing_endpoint",
+            "retarget",
+            "aba",
+            "windows",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let pool = WorkerPool::new();
+            let mut config = rch_common::WorkerConfig {
+                id: WorkerId::new("busy-worker"),
+                total_slots: 8,
+                ..Default::default()
+            };
+            if case == "windows" {
+                config.tags.push("os:windows".into());
+            }
+            pool.add_worker(config.clone()).await;
+            let worker = pool.get(&config.id).await.unwrap();
+            let history = Arc::new(
+                BuildHistory::new(100).with_persistence(directory.path().join("history.jsonl")),
+            );
+            let owner = history
+                .try_start_active_build_with_waiter(
+                    "cancelled-project".into(),
+                    config.id.to_string(),
+                    "cargo test".into(),
+                    0,
+                    None,
+                    2,
+                    rch_common::BuildLocation::Remote,
+                    None,
+                    crate::disk_pressure::DiskHeadroomAdmission::default(),
+                    Some(worker.endpoint_snapshot().await),
+                )
+                .unwrap()
+                .unwrap();
+            history
+                .record_build_heartbeat(rch_common::BuildHeartbeatRequest {
+                    build_id: owner.id,
+                    worker_id: config.id.clone(),
+                    hook_pid: None,
+                    local_wrapper_id: None,
+                    remote_pgid_file: Some("/admitted/owned-group.pgid".into()),
+                    phase: rch_common::BuildHeartbeatPhase::Execute,
+                    detail: None,
+                    progress_counter: Some(1),
+                    progress_percent: None,
+                })
+                .unwrap();
+            let other = history.start_active_build(
+                "other-project".into(),
+                config.id.to_string(),
+                "cargo check".into(),
+                0,
+                1,
+                rch_common::BuildLocation::Remote,
+            );
+            assert!(worker.reserve_slots(3).await);
+            let owner = history.active_build(owner.id).unwrap();
+            let mut record = test_record(CancellationState::Failed, 1, true);
+            record.build_id = owner.id;
+            record.worker_id.clone_from(&owner.worker_id);
+            record.worker_endpoint = owner.worker_endpoint.clone();
+            record.remote_pgid_file = owner.remote_pgid_file.clone();
+            record.slots = owner.slots;
+            record.slots_released = 0;
+            record.remote_kill_confirmed = case == "confirmed_remote_local_failed";
+            record.remote_kill_attempted = case != "not_attempted";
+            if case == "missing_record" {
+                record.remote_pgid_file = None;
+            }
+            if case == "missing_endpoint" {
+                record.worker_endpoint = None;
+            }
+            if matches!(case, "retarget" | "aba") {
+                let mut replacement = config.clone();
+                replacement.host = "replacement.example".into();
+                worker.update_config(replacement).await;
+                if case == "aba" {
+                    worker.update_config(config.clone()).await;
+                }
+            }
+            let mut ctx = make_test_context(pool, Arc::clone(&history));
+            ctx.bypass_store = Some(Arc::new(tokio::sync::Mutex::new(
+                rch_common::BypassRecordStore::with_path(directory.path().join("bypass.json")),
+            )));
+            let orch = CancellationOrchestrator::new(test_config(), test_events());
+            for _ in 0..2 {
+                orch.run_cleanup(&ctx, &mut record).await;
+            }
+            assert_eq!(record.state, CancellationState::Failed, "{case}");
+            assert_eq!(record.slots_released, 0, "{case}");
+            assert_eq!(worker.used_slots(), 3, "{case}");
+            assert!(history.active_build(owner.id).is_some(), "{case}");
+            assert!(history.active_build(other.id).is_some(), "{case}");
+            assert!(!history.has_terminal_build(owner.id), "{case}");
+            assert_eq!(
+                worker.eligibility().await == crate::workers::EligibilityState::TemporaryBypass,
+                case == "unknown",
+                "{case}"
+            );
+            let persisted =
+                rch_common::BypassRecordStore::load(directory.path().join("bypass.json"));
+            assert_eq!(
+                persisted.contains(config.id.as_str()),
+                case == "unknown",
+                "{case}"
+            );
+            if case == "unknown" {
+                assert_eq!(
+                    persisted
+                        .get(config.id.as_str())
+                        .unwrap()
+                        .consecutive_failures,
+                    1,
+                    "a duplicate cleanup is the same unresolved incident"
+                );
+                assert!(!worker.reserve_slots(1).await);
+                let mut retry = record.clone();
+                retry.requested_at += Duration::from_millis(1);
+                orch.run_cleanup(&ctx, &mut retry).await;
+                assert_eq!(
+                    rch_common::BypassRecordStore::load(directory.path().join("bypass.json"))
+                        .get(config.id.as_str())
+                        .unwrap()
+                        .consecutive_failures,
+                    2,
+                    "a fresh failed cancellation attempt is new health evidence"
+                );
+                assert_eq!(worker.used_slots(), 3);
+            } else if !matches!(case, "retarget" | "aba") {
+                assert!(worker.reserve_slots(1).await, "{case}");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_cancellation_attempts_remote_kill_when_local_hook_exits_with_pgid_file() {
         let orch = CancellationOrchestrator::new(test_config(), test_events());
         let mut record = CancellationRecord {
@@ -2485,6 +2714,7 @@ wait
             completed_at: None,
             escalation_count: 0,
             remote_kill_attempted: false,
+            remote_kill_confirmed: false,
             cleanup_ok: true,
             slots: 1,
             slots_released: 0,
@@ -2520,6 +2750,7 @@ wait
             completed_at: None,
             escalation_count: 0,
             remote_kill_attempted: false,
+            remote_kill_confirmed: false,
             cleanup_ok: true,
             slots: 0,
             slots_released: 0,
@@ -3562,6 +3793,7 @@ exec /bin/sh -c "$payload"
                 "wrong-id",
                 "duplicate",
                 "failed",
+                "absent",
                 "hang",
                 "confirmed",
             ] {
@@ -3591,6 +3823,7 @@ exec /bin/sh -c "$payload"
                 } else {
                     orch.execute_cancellation(&mut record, true).await;
                 }
+                assert_eq!(record.remote_kill_confirmed, mode == "confirmed", "{mode}");
                 let argv = std::fs::read_to_string(root.join("ssh-argv")).unwrap();
                 let argv: Vec<_> = argv.lines().collect();
                 assert!(
@@ -3626,6 +3859,17 @@ exec /bin/sh -c "$payload"
                     assert!(history.recent(10).is_empty());
                 }
             }
+            // Record absence is affirmative only for an independently
+            // authenticated abandoned, unlaunched owner.
+            std::fs::write(root.join("mode"), "absent").unwrap();
+            let mut abandoned = test_record(CancellationState::Requested, 0, false);
+            abandoned.build_id = active.id;
+            abandoned.worker_id = id.to_string();
+            abandoned.worker_endpoint = active.worker_endpoint.clone();
+            abandoned.remote_pgid_file = Some("/test/owned-group.pgid".into());
+            abandoned.abandoned_unlaunched = true;
+            assert!(orch.try_remote_kill(&mut abandoned).await);
+            assert!(abandoned.remote_kill_confirmed);
             std::fs::write(root.join("child-completed"), "ok").unwrap();
             return;
         }
@@ -3654,6 +3898,7 @@ case "$mode" in
   wrong-id) printf 'RCH_REMOTE_CANCELLED_V1:0\n';;
   duplicate) printf 'RCH_REMOTE_CANCELLED_V1:%s\n' "$id" "$id";;
   failed) printf 'RCH_REMOTE_CANCELLED_V1:%s\n' "$id"; exit 255;;
+  absent) printf 'RCH_REMOTE_RECORD_ABSENT_V1:%s\n' "$id"; exit 42;;
   hang) exec /bin/sleep 60;;
   confirmed) /bin/sleep 11; printf 'RCH_REMOTE_CANCELLED_V1:%s\n' "$id";;
   *) exit 99;;
