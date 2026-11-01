@@ -724,6 +724,39 @@ fn clean_overlay_execution_pipeline(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn admitted_execution_disk_budget(
+    returned: Option<rch_common::BuildDiskBudget>,
+    command: &str,
+    admitted_headroom_gib: u32,
+    min_free_gib: Option<f64>,
+) -> anyhow::Result<Option<rch_common::BuildDiskBudget>> {
+    use rch_common::BuildDiskBudget;
+    let floor = min_free_gib.unwrap_or(10.0);
+    anyhow::ensure!(
+        floor.is_finite() && floor >= 0.0,
+        "invalid execution disk floor"
+    );
+    // Older daemons admit the explicit disk-budget route but omit the budget
+    // from SelectedWorker. Enforce that admitted reservation, not the smaller
+    // cold estimate. Never enlarge a budget actually returned by the daemon.
+    let mut budget = returned.or_else(|| {
+        if admitted_headroom_gib > 0 {
+            Some(BuildDiskBudget {
+                max_growth_bytes: u64::from(admitted_headroom_gib) * BuildDiskBudget::GIB,
+                min_free_bytes: 0,
+            })
+        } else {
+            BuildDiskBudget::cold_for_command(command)
+        }
+    });
+    if let Some(budget) = budget.as_mut() {
+        budget.min_free_bytes = budget
+            .min_free_bytes
+            .max((floor * BuildDiskBudget::GIB as f64).ceil() as u64);
+    }
+    Ok(budget)
+}
+
 async fn execute_remote_compilation_inner(
     worker: &SelectedWorker,
     command: &str,
@@ -749,6 +782,12 @@ async fn execute_remote_compilation_inner(
     pooled_target_store_base: Option<&str>,
 ) -> anyhow::Result<RemoteExecutionResult> {
     let worker_config = selected_worker_to_config(worker);
+    let execution_disk_budget = admitted_execution_disk_budget(
+        worker.disk_budget,
+        command,
+        compilation_config.disk_headroom_gib,
+        crate::config::load_config()?.selection.min_free_gb,
+    )?;
     let caller_command = command;
     // The build is already registered. Source validation and fingerprinting can
     // outlast the stuck detector's deadline before any remote transfer begins.
@@ -1737,11 +1776,7 @@ async fn execute_remote_compilation_inner(
             root_pipeline = root_pipeline
                 .with_env_allowlist(effective_env_allowlist.clone())
                 .with_cargo_profile_forwarding(forward_cargo_profile_settings)
-                .with_disk_budget(
-                    worker
-                        .disk_budget
-                        .or_else(|| rch_common::BuildDiskBudget::cold_for_command(command)),
-                );
+                .with_disk_budget(execution_disk_budget);
             // The primary root's pipeline runs the command, so the Layer 0
             // pack belongs here. Until bd-hoxgn it rode only on
             // workspace-metadata roots, which never execute anything.
@@ -3619,6 +3654,53 @@ async fn execute_remote_compilation_inner(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn admitted_execution_disk_budget_preserves_reservation_and_floor() {
+        use rch_common::BuildDiskBudget;
+        let gib = BuildDiskBudget::GIB;
+        let legacy =
+            super::admitted_execution_disk_budget(None, "cargo test --workspace", 100, Some(20.0))
+                .unwrap()
+                .unwrap();
+        assert_eq!(legacy.max_growth_bytes, 100 * gib);
+        assert_eq!(legacy.min_free_bytes, 20 * gib);
+        let returned = super::admitted_execution_disk_budget(
+            Some(BuildDiskBudget {
+                max_growth_bytes: 80 * gib,
+                min_free_bytes: 30 * gib,
+            }),
+            "cargo test --workspace",
+            100,
+            Some(20.0),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(returned.max_growth_bytes, 80 * gib);
+        assert_eq!(returned.min_free_bytes, 30 * gib);
+        let cold =
+            super::admitted_execution_disk_budget(None, "cargo test --workspace", 0, Some(20.0))
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            cold.max_growth_bytes,
+            BuildDiskBudget::cold_for_command("cargo test --workspace")
+                .unwrap()
+                .max_growth_bytes
+        );
+        assert_eq!(cold.min_free_bytes, 20 * gib);
+        assert!(
+            super::admitted_execution_disk_budget(None, "echo hello", 0, Some(20.0))
+                .unwrap()
+                .is_none()
+        );
+        for invalid in [f64::NAN, f64::INFINITY, -1.0] {
+            assert!(
+                super::admitted_execution_disk_budget(None, "cargo test", 100, Some(invalid))
+                    .is_err()
+            );
+        }
+    }
+
     use super::clean_overlay_remote_project_hash;
     use super::clean_overlay_source_pair_pool_name;
     use super::foreign_artifact_gate_disabled_from_value;
