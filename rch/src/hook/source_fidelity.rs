@@ -126,6 +126,9 @@ pub(super) struct PreparedSourceContentRoot {
     manifest: SourceContentRootManifest,
     directories: Vec<PathBuf>,
     clean_overlay: Option<CleanOverlaySpec>,
+    // Names only, never source bytes or authority. Keep this private bounded
+    // skeleton alive through both namespace barriers and source retirement.
+    clean_overlay_namespace: Option<Arc<tempfile::TempDir>>,
     // Absorbed selections remain live proof obligations, not extra transfers.
     coalesced: Vec<PreparedSourceContentRoot>,
 }
@@ -499,6 +502,7 @@ pub(super) async fn prepare_source_content_root(
         manifest,
         directories,
         clean_overlay: None,
+        clean_overlay_namespace: None,
         coalesced: Vec::new(),
     })
 }
@@ -836,13 +840,107 @@ pub(super) async fn prepare_clean_overlay_source_content_root(
 ) -> anyhow::Result<PreparedSourceContentRoot> {
     let (manifest, directories) =
         capture_clean_overlay_manifest(ordinal, entry, pipeline, spec).await?;
-    Ok(PreparedSourceContentRoot {
+    anyhow::ensure!(
+        manifest.files.len() <= MAX_SOURCE_CONTENT_FILES
+            && directories.len() <= MAX_SOURCE_CONTENT_FILES,
+        "clean-overlay source namespace cap exceeded"
+    );
+    let files = manifest
+        .files
+        .iter()
+        .map(|file| PathBuf::from(&file.path))
+        .collect::<Vec<_>>();
+    let namespace_directories = directories.clone();
+    let namespace = tokio::task::spawn_blocking(move || {
+        create_clean_overlay_source_namespace(&files, &namespace_directories)
+    })
+    .await
+    .context("join clean-overlay source namespace preparation")??;
+    let prepared = PreparedSourceContentRoot {
         pipeline: pipeline.clone(),
         manifest,
         directories,
         clean_overlay: Some(spec.clone()),
+        clean_overlay_namespace: Some(Arc::new(namespace)),
         coalesced: Vec::new(),
-    })
+    };
+    // Runtime-owned exclusions must not silently hide a selected source path.
+    // Run the very same rsync filter policy instead of reimplementing its globs.
+    clean_overlay_namespace_pipeline(&prepared).await?;
+    Ok(prepared)
+}
+
+fn create_clean_overlay_source_namespace(
+    files: &[PathBuf],
+    directories: &[PathBuf],
+) -> anyhow::Result<tempfile::TempDir> {
+    anyhow::ensure!(
+        files.len() <= MAX_SOURCE_CONTENT_FILES && directories.len() <= MAX_SOURCE_CONTENT_FILES,
+        "clean-overlay source namespace cap exceeded"
+    );
+    let namespace = tempfile::Builder::new()
+        .prefix("rch-source-namespace-")
+        .tempdir()
+        .context("create private clean-overlay namespace skeleton")?;
+    for directory in directories {
+        let relative = selected_source_path(
+            directory
+                .to_str()
+                .context("source namespace directory is not UTF-8")?,
+        )?;
+        let path = namespace.path().join(relative);
+        anyhow::ensure!(
+            path.parent().is_some_and(Path::is_dir),
+            "source namespace directory has an unlisted parent directory"
+        );
+        // Every created directory has its own bounded manifest entry. Do not
+        // let create_dir_all invent an unbounded chain of implicit ancestors.
+        std::fs::create_dir(path)?;
+    }
+    for file in files {
+        let relative = selected_source_path(
+            file.to_str()
+                .context("source namespace file is not UTF-8")?,
+        )?;
+        let path = namespace.path().join(relative);
+        anyhow::ensure!(
+            path.parent().is_some_and(Path::is_dir),
+            "source namespace file has an unlisted parent directory"
+        );
+        // Symlinks also get regular, empty placeholders. Rsync skips every
+        // existing file and never follows a placeholder to another namespace;
+        // the actual selected entry type is checked by the SHA-256 verifier.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+    }
+    Ok(namespace)
+}
+
+async fn clean_overlay_namespace_pipeline(
+    root: &PreparedSourceContentRoot,
+) -> anyhow::Result<TransferPipeline> {
+    let namespace = root
+        .clean_overlay_namespace
+        .as_ref()
+        .context("clean-overlay receipt has no complete source namespace")?;
+    let pipeline = root
+        .pipeline
+        .clone()
+        .with_local_root(namespace.path().to_owned());
+    let (files, directories) = pipeline.enumerate_clean_overlay_source_namespace().await?;
+    let expected_files = root
+        .manifest
+        .files
+        .iter()
+        .map(|file| PathBuf::from(&file.path))
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        files == expected_files && directories == root.directories,
+        "selected source collides with an owned RCH runtime namespace or its namespace skeleton changed"
+    );
+    Ok(pipeline)
 }
 
 fn ensure_coalesced_selection(
@@ -1813,6 +1911,13 @@ async fn verify_remote_root(
     owned_timestamps: Option<bool>,
 ) -> anyhow::Result<()> {
     if let Some(spec) = &root.clean_overlay {
+        // The complete archive-plus-overlay namespace is a separate proof
+        // obligation. In particular, a base-only receipt has no overlay rsync
+        // barrier capable of noticing an extra Cargo manifest/configuration.
+        clean_overlay_namespace_pipeline(root)
+            .await?
+            .verify_clean_overlay_source_namespace(worker)
+            .await?;
         // The archive baseline has no ambient working-tree comparison. The
         // overlay barrier checks only the uploaded patch, and cannot delete
         // or complain about baseline files excluded by its include policy.
@@ -3691,7 +3796,7 @@ mod tests {
             ("README.md", "immutable readme\n"),
             ("overlay-dir/changed.txt", "base version\n"),
             (
-                "overlay-dir/.rch-tmp/retained.txt",
+                "overlay-dir/.venv/retained.txt",
                 "excluded overlay keeps base\n",
             ),
             ("run.sh", "#!/bin/sh\nexit 0\n"),
@@ -3718,7 +3823,7 @@ mod tests {
         .unwrap();
         std::fs::write(root.join("overlay-dir/added.txt"), "new selected file\n").unwrap();
         std::fs::write(
-            root.join("overlay-dir/.rch-tmp/retained.txt"),
+            root.join("overlay-dir/.venv/retained.txt"),
             "excluded ambient change\n",
         )
         .unwrap();
@@ -3757,7 +3862,7 @@ mod tests {
             sha256_hex(b"new selected file\n")
         );
         assert_eq!(
-            files["overlay-dir/.rch-tmp/retained.txt"].sha256,
+            files["overlay-dir/.venv/retained.txt"].sha256,
             sha256_hex(b"excluded overlay keeps base\n")
         );
         assert_eq!(
@@ -3826,6 +3931,119 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clean_overlay_receipt_namespace_refuses_owned_runtime_and_transport_collisions() {
+        for selected_path in [".rch-tmp/selected.txt", ".rch-clean-overlay-base.tar"] {
+            let (root, _) = build_source_stamp_fixture_repo();
+            let path = root.join(selected_path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"selected input conflicts with an owned namespace\n").unwrap();
+            build_source_stamp_git(&root, &["add", "-f", "."]);
+            build_source_stamp_git_commit(&root, "selected runtime collision");
+            let spec = prepare_clean_overlay_spec(&root, Some("HEAD".into()), true, vec![], true)
+                .await
+                .unwrap()
+                .unwrap();
+            let remote = tempfile::tempdir().unwrap();
+            let (entry, pipeline) = clean_overlay_receipt_pipeline(&spec, remote.path());
+            let error = prepare_clean_overlay_source_content_root(0, &entry, &pipeline, &spec)
+                .await
+                .err()
+                .expect("selected runtime collision must refuse before upload");
+            assert!(
+                error.to_string().contains("owned RCH runtime namespace"),
+                "{error:#}"
+            );
+            assert_eq!(std::fs::read_dir(remote.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clean_overlay_receipt_namespace_tracks_the_complete_base_and_rejects_local_drift() {
+        let (root, _) = build_source_stamp_fixture_repo();
+        std::fs::create_dir_all(root.join("node_modules")).unwrap();
+        std::fs::write(
+            root.join("node_modules/pinned.txt"),
+            b"committed vendored source\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("src/lib.rs", root.join("SOURCE_LINK")).unwrap();
+        build_source_stamp_git(&root, &["add", "-f", "."]);
+        build_source_stamp_git_commit(&root, "complete namespace inputs");
+        let spec = prepare_clean_overlay_spec(&root, Some("HEAD".into()), true, vec![], true)
+            .await
+            .unwrap()
+            .unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        let (entry, pipeline) = clean_overlay_receipt_pipeline(&spec, remote.path());
+        let prepared = prepare_clean_overlay_source_content_root(0, &entry, &pipeline, &spec)
+            .await
+            .unwrap();
+        let namespace = prepared.clean_overlay_namespace.as_ref().unwrap();
+        for path in [
+            "Cargo.toml",
+            "src/lib.rs",
+            "node_modules/pinned.txt",
+            "SOURCE_LINK",
+        ] {
+            let metadata = std::fs::symlink_metadata(namespace.path().join(path)).unwrap();
+            assert!(metadata.is_file());
+            assert_eq!(metadata.len(), 0);
+        }
+        assert_eq!(
+            prepared.manifest.local_root,
+            root.canonicalize().unwrap().to_str().unwrap()
+        );
+        clean_overlay_namespace_pipeline(&prepared).await.unwrap();
+        // The private skeleton contributes names only and must not acquire
+        // an additional expected path between the two worker barriers.
+        std::fs::write(namespace.path().join("foreign.txt"), b"").unwrap();
+        assert!(clean_overlay_namespace_pipeline(&prepared).await.is_err());
+    }
+
+    #[test]
+    fn clean_overlay_namespace_skeleton_enforces_caps_and_literal_listed_parents() {
+        let excessive = vec![PathBuf::from("entry"); MAX_SOURCE_CONTENT_FILES + 1];
+        assert!(create_clean_overlay_source_namespace(&excessive, &[]).is_err());
+        assert!(create_clean_overlay_source_namespace(&[], &excessive).is_err());
+        for invalid in [
+            "../outside",
+            "/absolute",
+            "a/../outside",
+            "a//b",
+            "a/./b",
+            "a\nb",
+        ] {
+            assert!(create_clean_overlay_source_namespace(&[PathBuf::from(invalid)], &[]).is_err());
+        }
+        assert!(
+            create_clean_overlay_source_namespace(&[PathBuf::from("unlisted/file")], &[]).is_err()
+        );
+        assert!(
+            create_clean_overlay_source_namespace(&[], &[PathBuf::from("unlisted/directory")])
+                .is_err()
+        );
+        assert!(
+            create_clean_overlay_source_namespace(
+                &[PathBuf::from("file"), PathBuf::from("file")],
+                &[]
+            )
+            .is_err()
+        );
+        let complete = create_clean_overlay_source_namespace(
+            &[
+                PathBuf::from("src/file"),
+                PathBuf::from("symlink-placeholder"),
+            ],
+            &[PathBuf::from("src")],
+        )
+        .unwrap();
+        assert!(complete.path().join("src/file").is_file());
+        assert!(complete.path().join("symlink-placeholder").is_file());
     }
 
     #[cfg(unix)]

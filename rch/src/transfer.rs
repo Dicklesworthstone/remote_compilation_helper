@@ -2823,6 +2823,7 @@ enum SourceContentBarrier {
     Ordinary,
     Owned { managed_timestamps: bool },
     CleanOverlay,
+    CleanOverlayNamespace,
 }
 
 /// Transfer pipeline for remote compilation.
@@ -4647,21 +4648,42 @@ impl TransferPipeline {
         if self.worker_platform.is_windows() {
             anyhow::bail!("source-content receipts require the rsync transport");
         }
-        self.enumerate_source_upload_selection(true).await
+        self.enumerate_source_upload_selection(true, false).await
+    }
+
+    /// Enumerate a manifest-only skeleton with the same exclusions as the
+    /// complete worker namespace barrier. Ordinary overlay/config filters
+    /// must never hide a selected input from this comparison.
+    pub(crate) async fn enumerate_clean_overlay_source_namespace(
+        &self,
+    ) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+        anyhow::ensure!(
+            !self.worker_platform.is_windows(),
+            "source-content receipts require the rsync transport"
+        );
+        self.enumerate_source_upload_selection(true, true).await
     }
 
     // Selection runs entirely locally. Windows include-only tar uploads must
     // use the same rsync filters as POSIX uploads, without enabling the separate
     // remote source-content receipt protocol or symlinks on Windows.
     async fn enumerate_source_upload_files(&self) -> Result<Vec<PathBuf>> {
-        Ok(self.enumerate_source_upload_selection(false).await?.0)
+        Ok(self
+            .enumerate_source_upload_selection(false, false)
+            .await?
+            .0)
     }
 
     async fn enumerate_source_upload_selection(
         &self,
         collect_directories: bool,
+        namespace_only: bool,
     ) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
-        let effective_excludes = self.get_effective_excludes();
+        let effective_excludes = if namespace_only {
+            Self::clean_overlay_namespace_excludes()
+        } else {
+            self.get_effective_excludes()
+        };
         let nonexistent_destination = std::env::temp_dir().join(format!(
             "rch-source-content-enumeration-{}",
             uuid::Uuid::new_v4()
@@ -4671,7 +4693,13 @@ impl TransferPipeline {
             .arg("--out-format=%i\t%n")
             .args(capabilities.no_motd_args());
         add_portable_rsync_archive_args(&mut cmd);
-        self.append_sync_filter_args(&mut cmd, &effective_excludes);
+        if namespace_only {
+            for pattern in &effective_excludes {
+                cmd.arg("--exclude").arg(pattern);
+            }
+        } else {
+            self.append_sync_filter_args(&mut cmd, &effective_excludes);
+        }
         cmd.arg(format!("{}/", self.project_root.display()))
             .arg(format!("{}/", nonexistent_destination.display()));
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -4769,7 +4797,9 @@ impl TransferPipeline {
             SourceContentBarrier::Ordinary => {
                 self.source_rsync_path(format!("mkdir -p {} && rsync", escaped_remote_path))
             }
-            SourceContentBarrier::Owned { .. } | SourceContentBarrier::CleanOverlay => {
+            SourceContentBarrier::Owned { .. }
+            | SourceContentBarrier::CleanOverlay
+            | SourceContentBarrier::CleanOverlayNamespace => {
                 self.source_rsync_path("rsync".to_owned())
             }
         };
@@ -4784,8 +4814,10 @@ impl TransferPipeline {
             .arg("--rsync-path")
             .arg(receiver);
         add_portable_rsync_archive_args(&mut cmd);
-        if matches!(policy, SourceContentBarrier::Owned { .. })
-            || (matches!(policy, SourceContentBarrier::Ordinary) && self.sync_delete)
+        if matches!(
+            policy,
+            SourceContentBarrier::Owned { .. } | SourceContentBarrier::CleanOverlayNamespace
+        ) || (matches!(policy, SourceContentBarrier::Ordinary) && self.sync_delete)
         {
             cmd.arg("--delete");
         }
@@ -4794,10 +4826,24 @@ impl TransferPipeline {
             SourceContentBarrier::Owned {
                 managed_timestamps: true
             } | SourceContentBarrier::CleanOverlay
+                | SourceContentBarrier::CleanOverlayNamespace
         ) {
             cmd.arg("--no-times");
         }
-        self.append_sync_filter_args(&mut cmd, effective_excludes);
+        if matches!(policy, SourceContentBarrier::CleanOverlayNamespace) {
+            // Zero-byte placeholders describe names only. Skip existing-file
+            // updates, while this dry-run reports missing selected paths and
+            // --delete reports every unselected receiver entry. The private
+            // skeleton's directory permissions are not selected source modes.
+            // Byte/type/mode verification remains the complete manifest
+            // verifier's obligation.
+            cmd.arg("--ignore-existing").arg("--no-perms");
+            for pattern in Self::clean_overlay_namespace_excludes() {
+                cmd.arg("--exclude").arg(pattern);
+            }
+        } else {
+            self.append_sync_filter_args(&mut cmd, effective_excludes);
+        }
         cmd.arg(format!("{}/", self.project_root.display()))
             .arg(destination);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -4886,6 +4932,44 @@ impl TransferPipeline {
         let output = run_source_content_rsync_capture(
             cmd,
             "clean-overlay source-content rsync no-delta barrier",
+            self.source_sync_attempt_timeout(&effective_excludes),
+            None,
+        )
+        .await?;
+        source_content_barrier::verify_output(&output).map_err(anyhow::Error::msg)
+    }
+
+    fn clean_overlay_namespace_excludes() -> Vec<String> {
+        REMOTE_RUNTIME_EXCLUDE_PATTERNS
+            .iter()
+            .copied()
+            // The resumable archive transport owns only this exact root
+            // filename. A similarly named file elsewhere is still source.
+            .chain(std::iter::once("/.rch-clean-overlay-base.tar"))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Reject surplus worker paths against a bounded manifest-only skeleton.
+    /// No receiver mutation is possible: the command is always a dry-run, the
+    /// source grant is checked, and the receiver never creates a directory.
+    pub(crate) async fn verify_clean_overlay_source_namespace(
+        &self,
+        worker: &WorkerConfig,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !self.worker_platform.is_windows() && self.source_authority_prefix.is_some(),
+            "clean-overlay namespace verification requires the Unix source grant"
+        );
+        let effective_excludes = Self::clean_overlay_namespace_excludes();
+        let command = self.build_source_content_rsync_barrier_command(
+            worker,
+            &effective_excludes,
+            SourceContentBarrier::CleanOverlayNamespace,
+        );
+        let output = run_source_content_rsync_capture(
+            command,
+            "clean-overlay complete source namespace barrier",
             self.source_sync_attempt_timeout(&effective_excludes),
             None,
         )
@@ -13483,6 +13567,11 @@ Number of files transferred: 42
                     &[],
                     SourceContentBarrier::CleanOverlay,
                 ),
+                pipeline.build_source_content_rsync_barrier_command(
+                    &worker,
+                    &[],
+                    SourceContentBarrier::CleanOverlayNamespace,
+                ),
             ] {
                 assert_eq!(timeout_args(command), expected_source);
             }
@@ -15318,6 +15407,166 @@ Number of files transferred: 42
             b"committed baseline\n"
         );
         assert!(remote.join("base-only.rs").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clean_overlay_namespace_barrier_rejects_surplus_without_changing_worker_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = test_guard!();
+        let directory = tempfile::tempdir().unwrap();
+        let skeleton = directory.path().join("expected");
+        std::fs::create_dir_all(skeleton.join("src")).unwrap();
+        std::fs::create_dir(skeleton.join("selected-empty")).unwrap();
+        for relative in ["", "src", "selected-empty"] {
+            std::fs::set_permissions(
+                skeleton.join(relative),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+        }
+        for file in ["Cargo.toml", "src/lib.rs", "README_LINK"] {
+            std::fs::write(skeleton.join(file), b"").unwrap();
+        }
+        let worker = flavour_test_worker();
+        for (index, extra) in [
+            None,
+            Some((".cargo/config.toml", "file")),
+            Some(("unselected.rs", "file")),
+            Some(("unselected-empty", "directory")),
+            Some(("unselected-link", "symlink")),
+            Some(("node_modules/unselected.js", "file")),
+            Some(("src/.rch-clean-overlay-base.tar", "file")),
+            Some(("selected-empty", "missing-directory")),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let remote = directory.path().join(format!("worker-{index}"));
+            std::fs::create_dir_all(remote.join("src/.rch-tmp")).unwrap();
+            if !matches!(extra, Some((_, "missing-directory"))) {
+                std::fs::create_dir(remote.join("selected-empty")).unwrap();
+                std::fs::set_permissions(
+                    remote.join("selected-empty"),
+                    std::fs::Permissions::from_mode(0o755),
+                )
+                .unwrap();
+            }
+            for relative in ["", "src"] {
+                std::fs::set_permissions(
+                    remote.join(relative),
+                    std::fs::Permissions::from_mode(0o755),
+                )
+                .unwrap();
+            }
+            std::fs::write(remote.join("Cargo.toml"), b"selected manifest\n").unwrap();
+            std::fs::write(remote.join("src/lib.rs"), b"selected source\n").unwrap();
+            std::os::unix::fs::symlink("src/lib.rs", remote.join("README_LINK")).unwrap();
+            std::fs::write(remote.join("src/.rch-tmp/runtime"), b"owned runtime\n").unwrap();
+            std::fs::write(
+                remote.join(".rch-clean-overlay-base.tar"),
+                b"transport archive\n",
+            )
+            .unwrap();
+            if let Some((name, kind)) = extra {
+                let path = remote.join(name);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                match kind {
+                    "directory" => std::fs::create_dir(&path).unwrap(),
+                    "symlink" => std::os::unix::fs::symlink("src/lib.rs", &path).unwrap(),
+                    "missing-directory" => {}
+                    _ => std::fs::write(&path, b"unselected input\n").unwrap(),
+                }
+            }
+            let pipeline = TransferPipeline::new(
+                skeleton.clone(),
+                "namespace-proof".into(),
+                "abcdef".into(),
+                TransferConfig {
+                    exclude_patterns: vec!["*".into()],
+                    ..TransferConfig::default()
+                },
+            )
+            .with_sync_include_patterns(vec!["/only-overlay.rs".into()])
+            .with_sync_delete(false)
+            .with_sync_checksum(true)
+            .with_remote_path_override(remote.to_str().unwrap());
+            let command = pipeline.build_source_content_rsync_barrier_command(
+                &worker,
+                &pipeline.get_effective_excludes(),
+                SourceContentBarrier::CleanOverlayNamespace,
+            );
+            let args = command_args(&command);
+            for required in [
+                "-azn",
+                "--delete",
+                "--ignore-existing",
+                "--no-times",
+                "--no-perms",
+            ] {
+                assert!(args.iter().any(|arg| arg == required), "{args:?}");
+            }
+            assert!(!args.iter().any(|arg| arg == "--include" || arg == "*"));
+            let receiver = &args
+                .windows(2)
+                .find(|pair| pair[0] == "--rsync-path")
+                .unwrap()[1];
+            assert!(!receiver.contains("mkdir"));
+            assert!(receiver.contains("RCH_SYNC_LIVE_CHECKOUT_REFUSED"));
+            // Run the production namespace argv, replacing only SSH and the
+            // destination transport with private local directories.
+            let mut local = std::process::Command::new("rsync");
+            local.env("LC_ALL", "C");
+            let mut offset = 0;
+            while offset + 1 < args.len() {
+                if matches!(args[offset].as_str(), "-e" | "--rsync-path") {
+                    offset += 2;
+                } else {
+                    local.arg(&args[offset]);
+                    offset += 1;
+                }
+            }
+            let output = local
+                .arg(format!("{}/", remote.display()))
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(output.stderr.is_empty(), "{output:?}");
+            let verified = source_content_barrier::verify_output(&output);
+            assert_eq!(verified.is_ok(), extra.is_none(), "{output:?}");
+            if let Some((name, kind)) = extra {
+                if kind == "missing-directory" {
+                    assert!(!remote.join(name).exists());
+                    assert!(String::from_utf8_lossy(&output.stdout).contains("cd+++++++++"));
+                } else {
+                    assert!(std::fs::symlink_metadata(remote.join(name)).is_ok());
+                    assert!(String::from_utf8_lossy(&output.stdout).contains("*deleting"));
+                }
+            }
+            assert_eq!(
+                std::fs::read(remote.join("src/lib.rs")).unwrap(),
+                b"selected source\n"
+            );
+            assert!(
+                std::fs::symlink_metadata(remote.join("README_LINK"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(
+                std::fs::read(remote.join("src/.rch-tmp/runtime")).unwrap(),
+                b"owned runtime\n"
+            );
+            assert_eq!(
+                std::fs::read(remote.join(".rch-clean-overlay-base.tar")).unwrap(),
+                b"transport archive\n"
+            );
+            assert_eq!(
+                std::fs::metadata(&remote).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+        }
     }
 
     #[test]

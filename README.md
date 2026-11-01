@@ -1215,6 +1215,12 @@ because those rules select only the live overlay. Every selected
 file is checked on the worker before and after execution, including committed
 files that are absent or dirty in the local checkout. Receipt mode preserves
 the clean-overlay source/target pair's stable paths and warm compiler cache.
+An additional read-only namespace check rejects extra worker files, symlinks,
+or directories, including in base-only runs. Only RCH-owned runtime paths and
+the exact root archive transport file are exempt; selected source inputs that
+overlap those exclusions refuse before upload. Missing selected paths also
+refuse. Commands that leave source changes or outputs outside the owned runtime
+paths therefore cannot produce a successful source-content receipt.
 
 On Linux with target reuse enabled, supported Cargo commands use an owned
 source/target pair. The source layout preserves sibling dependencies, selected
