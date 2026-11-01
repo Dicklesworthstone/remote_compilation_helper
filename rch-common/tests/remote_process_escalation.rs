@@ -354,6 +354,38 @@ fn observation_budget_scales_without_scanning_and_bounds_malformed_hints() {
     run_case(OBSERVATION_BUDGET);
 }
 
+const WITNESS_OBSERVATION_BUDGET: &str = r#"
+rch_test_dir=$1
+# Exercise the two witness-only capture call sites without granting signal or
+# completion authority. A busy-host budget must reach both exactly as it does
+# the main census; the enclosing deadline can still tighten it in production.
+rch_observation_budget() { rch_observation_seconds=7; }
+rch_control_capture() {
+    printf '%s\\n' "$1" >> "$rch_test_dir/witness-budgets"
+    return 125
+}
+rch_identified=1
+rch_boot=boot
+rch_pgid=300
+rch_start=100
+rch_snapshot='301 300 S'
+rch_launch_source=':'
+rch_remote_leader_matches() { return 0; }
+rch_capture_group_witnesses
+[ "$?" = 46 ] || exit 1
+rch_witness_identity=boot:300:100
+rch_witnesses='301:200'
+rch_remote_witness_matches
+[ "$?" = 1 ] || exit 2
+[ "$(cat "$rch_test_dir/witness-budgets")" = "7s
+7s" ] || exit 3
+"#;
+
+#[test]
+fn busy_worker_witness_capture_and_revalidation_share_adaptive_budget() {
+    run_case(WITNESS_OBSERVATION_BUDGET);
+}
+
 const CAPTURE_SHARED_DEADLINE: &str = r#"
 rch_test_dir=$1
 rch_observation_clock() { rch_observation_now=100; }

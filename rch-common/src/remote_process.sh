@@ -319,7 +319,8 @@ rch_capture_group_witnesses() {
     # One timed exchange bounds ALL witnesses using the same protocol. Partial
     # output grants no authority: 46 permits freshly authenticated KILL, not TERM.
     [ -n "${rch_launch_source:-}" ] || return 46
-    rch_collected=$(rch_control_capture 5s /bin/sh -c '
+    rch_observation_budget
+    rch_collected=$(rch_control_capture "${rch_observation_seconds}s" /bin/sh -c '
         command eval "$1" || exit 44
         rch_boot=$2; rch_pgid=$3; rch_start=$4; shift 4
         rch_remote_leader_matches || exit 43
@@ -351,7 +352,8 @@ rch_remote_witness_matches() {
     [ -n "${rch_launch_source:-}" ] || return 1
     # TERM can change a previously fast observer into a stalled one. Bound
     # revalidation too; a failed exchange is NOT permission to signal an orphan.
-    rch_matched=$(rch_control_capture 5s /bin/sh -c '
+    rch_observation_budget
+    rch_matched=$(rch_control_capture "${rch_observation_seconds}s" /bin/sh -c '
         command eval "$1" || exit 44
         rch_boot=$2; rch_pgid=$3; shift 3
         for witness in "$@"; do
