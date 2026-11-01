@@ -551,25 +551,31 @@ impl BypassRecordStore {
         self.records.is_empty()
     }
 
-    /// Insert or replace a worker's record and persist the store.
+    /// Insert or replace a worker's record and persist the store. The live
+    /// quarantine remains present on a write failure so recovery can retry it.
     pub fn upsert(&mut self, record: BypassRecord) -> std::io::Result<()> {
         self.records.insert(record.worker_id.clone(), record);
-        self.persist()
+        self.persist(&self.records)
     }
 
     /// Remove a worker's record (e.g. after full rejoin) and persist. Returns
-    /// the removed record, if any.
+    /// the removed record, if any. Retirement is published to the live map
+    /// only after durable persistence succeeds; a failed clear must retain the
+    /// quarantine and remain discoverable by the recovery scanner.
     pub fn remove(&mut self, worker_id: &str) -> std::io::Result<Option<BypassRecord>> {
-        let removed = self.records.remove(worker_id);
-        if removed.is_some() {
-            self.persist()?;
-        }
-        Ok(removed)
+        let Some(removed) = self.records.get(worker_id).cloned() else {
+            return Ok(None);
+        };
+        let mut proposed = self.records.clone();
+        proposed.remove(worker_id);
+        self.persist(&proposed)?;
+        self.records = proposed;
+        Ok(Some(removed))
     }
 
     /// Atomically and durably publish the records. The file and directory
     /// must reach storage before an owner-bound failure receipt is acknowledged.
-    fn persist(&self) -> std::io::Result<()> {
+    fn persist(&self, records: &BTreeMap<String, BypassRecord>) -> std::io::Result<()> {
         if let Some(parent) = self.path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -577,7 +583,7 @@ impl BypassRecordStore {
         }
         let doc = BypassRecordFile {
             schema_version: bypass_record_schema_version().to_string(),
-            records: self.records.values().cloned().collect(),
+            records: records.values().cloned().collect(),
         };
         let body = serde_json::to_vec_pretty(&doc)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -1289,6 +1295,34 @@ mod tests {
         let r = reopened.get("css").unwrap();
         assert_eq!(r.failure_class, BypassFailureClass::CircuitBreaker);
         assert_eq!(r.last_diagnostic, "circuit churn");
+    }
+
+    #[test]
+    fn bypass_failed_retirement_keeps_live_record_until_durable_clear() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bypass.json");
+        let saved = directory.path().join("saved-bypass.json");
+        let mut store = BypassRecordStore::with_path(&path);
+        let expected =
+            record(BypassFailureClass::DiskInodePressure).with_diagnostic("worker filesystem full");
+        let peer = BypassRecord::new("peer", "peer.example", "u", BypassFailureClass::Ssh, TS);
+        store.upsert(expected.clone()).unwrap();
+        store.upsert(peer.clone()).unwrap();
+        std::fs::rename(&path, &saved).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        for _ in 0..3 {
+            assert!(store.remove("css").is_err());
+            assert_eq!(store.get("css"), Some(&expected));
+            assert_eq!(store.get("peer"), Some(&peer));
+            assert_eq!(BypassRecordStore::load(&saved).get("css"), Some(&expected));
+        }
+        std::fs::rename(&path, directory.path().join("obstruction")).unwrap();
+        std::fs::rename(&saved, &path).unwrap();
+        assert_eq!(store.remove("css").unwrap(), Some(expected));
+        assert!(store.remove("css").unwrap().is_none());
+        let restarted = BypassRecordStore::load(&path);
+        assert!(!restarted.contains("css"));
+        assert_eq!(restarted.get("peer"), Some(&peer));
     }
 
     #[test]

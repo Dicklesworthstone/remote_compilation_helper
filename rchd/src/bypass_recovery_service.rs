@@ -1321,10 +1321,9 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
         }) {
             return false;
         }
-        // Keep admission closed if durable retirement fails. `remove` updates
-        // the in-memory map before writing, so restore that map on an error.
+        // Keep admission closed if durable retirement fails. The store retains
+        // its live record on failure so the next recovery pass can retry.
         if let Err(error) = store.remove(&expected.worker_id) {
-            let _ = store.upsert(expected.clone());
             warn!(%error, "failed to retire bypass record; worker remains quarantined");
             return false;
         }
@@ -1530,6 +1529,121 @@ mod tests {
         );
         assert_eq!(worker.status().await, rch_common::WorkerStatus::Healthy);
         assert!(worker.lifecycle().await.is_schedulable());
+    }
+
+    #[tokio::test]
+    async fn failed_manual_enable_retains_recovery_and_active_reservations() {
+        for recovery in ["automatic", "manual", "restart"] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("bypass.json");
+            let saved = directory.path().join("saved-bypass.json");
+            let history_path = directory.path().join("history.jsonl");
+            let pool = pool_with(&["css"]).await;
+            let mut worker = pool.get(&WorkerId::new("css")).await.unwrap();
+            assert!(worker.reserve_slots(3).await);
+            let mut store = Arc::new(Mutex::new(BypassRecordStore::with_path(&path)));
+            let mut context = crate::test_daemon_context(pool.clone());
+            context.history =
+                Arc::new(BuildHistory::new(10).with_persistence(history_path.clone()));
+            context.bypass_store = Some(store.clone());
+            let active = context.history.start_active_build(
+                "owned-project".into(),
+                "css".into(),
+                "cargo test".into(),
+                0,
+                3,
+                rch_common::BuildLocation::Remote,
+            );
+            record_worker_bypass(
+                &store,
+                &worker,
+                BypassFailureClass::DiskInodePressure,
+                "worker filesystem full",
+                T0,
+            )
+            .await;
+            let expected = store.lock().await.get("css").cloned().unwrap();
+            std::fs::rename(&path, &saved).unwrap();
+            std::fs::create_dir(&path).unwrap();
+            for _ in 0..2 {
+                let response =
+                    crate::workers::handle_worker_enable(&context, &WorkerId::new("css")).await;
+                assert_eq!(
+                    response.status, "error",
+                    "{recovery}: failed clear must not be acknowledged"
+                );
+                assert_eq!(store.lock().await.get("css"), Some(&expected));
+                assert_eq!(
+                    worker.eligibility().await,
+                    EligibilityState::TemporaryBypass
+                );
+                assert_eq!(worker.used_slots(), 3);
+                assert!(context.history.active_build(active.id).is_some());
+            }
+            std::fs::rename(&path, directory.path().join("obstruction")).unwrap();
+            std::fs::rename(&saved, &path).unwrap();
+
+            if recovery == "restart" {
+                store = Arc::new(Mutex::new(BypassRecordStore::load(&path)));
+                let pool = pool_with(&["css"]).await;
+                context = crate::test_daemon_context(pool);
+                context.bypass_store = Some(store.clone());
+                context.history =
+                    Arc::new(BuildHistory::load_from_file(&history_path, 10).unwrap());
+                for owned in context.history.active_builds() {
+                    context
+                        .pool
+                        .restore_recovered_slots(&WorkerId::new(&owned.worker_id), owned.slots)
+                        .await
+                        .unwrap();
+                }
+                worker = context.pool.get(&WorkerId::new("css")).await.unwrap();
+            }
+            let service = BypassRecoveryService::new(
+                context.pool.clone(),
+                store.clone(),
+                FakeProber::new(
+                    vec![RecoveryProbe::all_ok(), RecoveryProbe::all_ok()],
+                    RecoveryProbe::all_ok(),
+                    CanaryOutcome::Passed,
+                ),
+                BypassRecoveryConfig::default(),
+            )
+            .with_history(context.history.clone());
+            if recovery == "restart" {
+                service.reconcile_on_start().await;
+                assert_eq!(
+                    worker.eligibility().await,
+                    EligibilityState::TemporaryBypass
+                );
+            }
+            if recovery == "manual" {
+                let response =
+                    crate::workers::handle_worker_enable(&context, &WorkerId::new("css")).await;
+                assert_eq!(response.status, "ok");
+            } else {
+                // The actual recovery scanner must retain a row to discover.
+                // A deleted live record strands TemporaryBypass indefinitely:
+                // detect_new_bypasses intentionally ignores existing quarantine.
+                service.detect_new_bypasses(T0 + 60_000).await;
+                service.evaluate_once(T0 + 60_000).await;
+                assert!(store.lock().await.contains("css"));
+                service.evaluate_once(T0 + 1_000_000).await;
+                assert!(service.prober.probes.lock().await.is_empty());
+            }
+            assert!(worker.lifecycle().await.is_schedulable(), "{recovery}");
+            assert_eq!(
+                worker.used_slots(),
+                3,
+                "{recovery}: enable/rejoin cannot release owned builds"
+            );
+            assert!(context.history.active_build(active.id).is_some());
+            assert!(store.lock().await.get("css").is_none());
+            assert!(
+                BypassRecordStore::load(&path).get("css").is_none(),
+                "{recovery}: restart must not restore a retired quarantine"
+            );
+        }
     }
 
     #[tokio::test]
