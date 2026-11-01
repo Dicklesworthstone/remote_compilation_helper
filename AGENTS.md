@@ -152,6 +152,10 @@ We do not care about backwards compatibility—we're in early development with n
 
 ## Compiler Checks (CRITICAL)
 
+**CI and releases use DSR exclusively (user directive, November 1, 2026).**
+Never enable or dispatch GitHub Actions, including as a fallback for unavailable
+build capacity. This overrides the historical workflow and automerge descriptions below.
+
 **After any substantive code changes, you MUST verify no errors were introduced:**
 
 ```bash
