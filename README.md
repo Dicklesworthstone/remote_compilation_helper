@@ -1311,10 +1311,29 @@ RCH_REQUIRE_REMOTE=1 rch exec \
 The client resolves `--base` to a commit object, streams that Git archive into
 a fresh isolated worker path, and then uploads only the literal repository-
 relative `--overlay-path` selections. Modified and untracked files are
-supported; selected deletions, absolute/traversing paths, Git metadata,
-non-ASCII/backslash/control-character paths, case-only or otherwise ambiguous
-filesystem spellings, overlay symlinks, empty overlay directories,
-and Git archive `export-ignore`/`export-subst` attributes fail closed. Exactly
+supported, together with selected deletions of tracked regular files and
+directories containing only regular files. A directory selection also includes
+tracked files and subdirectories removed within that directory. Deleted entries
+are omitted from the composed archive and source receipt; no deleting rsync is
+used, and cached source bases remain intact. Their absence is rechecked before
+execution, so a deleted input that reappears invalidates the admitted selection.
+
+For a rename, select both the old and new paths, or select their containing
+directory. Selecting only the destination keeps the unselected original from
+the base. For example, after renaming `src/old.rs` to `src/new.rs`:
+
+```bash
+rch exec --base HEAD --clean-overlay \
+  --overlay-path src/old.rs --overlay-path src/new.rs \
+  -- cargo check
+```
+
+Missing paths that were not present in the base, absolute/traversing paths,
+Git metadata, non-ASCII/backslash/control-character paths, case-only or otherwise
+ambiguous filesystem spellings, overlay symlinks, and Git archive
+`export-ignore`/`export-subst` attributes fail closed. A selected directory may
+become empty through admitted deletions; newly selected empty directories remain
+unsupported. Exactly
 one of one-or-more `--overlay-path` options or `--no-overlay` is required.
 Clean-overlay mode also implies remote-only execution even when
 `RCH_REQUIRE_REMOTE` was omitted, so a worker or transfer failure never falls

@@ -1917,8 +1917,9 @@ async fn execute_remote_compilation_inner(
             root_pipeline = root_pipeline
                 .with_sync_include_patterns(clean_overlay_include_patterns(
                     &entry.local_root,
-                    spec.overlay_paths(),
+                    &spec.live_overlay_paths(),
                 )?)
+                .with_clean_overlay_deletions(&spec.overlay_deletions)?
                 .with_sync_delete(false)
                 .with_sync_checksum(true);
             if let Some(stable_pool) = pooled_target_dir_override.as_ref() {
@@ -2054,6 +2055,7 @@ async fn execute_remote_compilation_inner(
                     &entry.local_root,
                     spec.base_commit(),
                     &submodule_archives,
+                    &spec.overlay_deletions,
                 )
                 .await
             {
@@ -4115,10 +4117,14 @@ mod tests {
             .iter()
             .map(|module| (module.path.clone(), module.base_commit.clone()))
             .collect::<Vec<_>>();
-        let archive =
-            TransferPipeline::create_selected_git_archive(&app, spec.base_commit(), &selected)
-                .await
-                .unwrap();
+        let archive = TransferPipeline::create_selected_git_archive(
+            &app,
+            spec.base_commit(),
+            &selected,
+            &spec.overlay_deletions,
+        )
+        .await
+        .unwrap();
         let delivered = tempfile::tempdir().unwrap().keep();
         tar::Archive::new(archive.reopen().unwrap())
             .unpack(&delivered)
@@ -4233,6 +4239,7 @@ mod tests {
                 root,
                 selected_spec.base_commit(),
                 &selected,
+                &selected_spec.overlay_deletions,
             )
             .await
             .unwrap();
@@ -4806,6 +4813,7 @@ sys.exit(99)
             base_commit: "a".repeat(40),
             tree_object: "b".repeat(40),
             overlay_paths: Vec::new(),
+            overlay_deletions: Vec::new(),
             overlay_fingerprint: "c".repeat(64),
             submodules: Vec::new(),
             dependencies: Vec::new(),

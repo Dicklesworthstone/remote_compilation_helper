@@ -2316,7 +2316,100 @@ fn escape_rsync_filter_literal_component(name: &str) -> Cow<'_, str> {
     Cow::Owned(escaped)
 }
 
-/// Build anchored, literal rsync include filters for clean-overlay paths.
+/// Match the source-content inventory's maximum entry count.
+pub(crate) const MAX_CLEAN_OVERLAY_DELETIONS: usize = 100_000;
+
+fn clean_overlay_deletion_index(deletions: &[PathBuf], path: &Path) -> Option<usize> {
+    path.ancestors().find_map(|ancestor| {
+        deletions
+            .binary_search_by(|deleted| deleted.as_path().cmp(ancestor))
+            .ok()
+    })
+}
+
+/// Deletion lists are sorted and prefix-minimal at admission. Looking up each
+/// ancestor avoids scanning a potentially large deletion inventory per file.
+pub(crate) fn clean_overlay_path_is_deleted(deletions: &[PathBuf], path: &Path) -> bool {
+    clean_overlay_deletion_index(deletions, path).is_some()
+}
+
+fn validate_clean_overlay_deletions(deletions: &[PathBuf]) -> Result<()> {
+    anyhow::ensure!(
+        deletions.len() <= MAX_CLEAN_OVERLAY_DELETIONS,
+        "clean-overlay deletion inventory exceeds its admission bound"
+    );
+    for (index, deletion) in deletions.iter().enumerate() {
+        let text = deletion
+            .to_str()
+            .context("non-UTF-8 clean-overlay deletion")?;
+        anyhow::ensure!(
+            !text.is_empty()
+                && text.is_ascii()
+                && !text.contains('\\')
+                && !text.chars().any(char::is_control)
+                && deletion.components().all(|part| {
+                    matches!(part, Component::Normal(name) if !name.to_string_lossy().eq_ignore_ascii_case(".git"))
+                })
+                && (index == 0 || deletions[index - 1] < *deletion)
+                && !deletion.ancestors().skip(1).any(|parent| {
+                    deletions[..index]
+                        .binary_search_by(|prior| prior.as_path().cmp(parent))
+                        .is_ok()
+                }),
+            "clean-overlay deletion inventory is not sorted, minimal and repository-relative"
+        );
+    }
+    Ok(())
+}
+
+/// Literal, root-anchored sender exclusions sealed by clean-overlay admission.
+/// Both files and directories are excluded even if a removed path reappears
+/// while rsync is enumerating a selected parent directory.
+pub(crate) fn clean_overlay_deletion_exclude_patterns(
+    deletions: &[PathBuf],
+) -> Result<Vec<String>> {
+    validate_clean_overlay_deletions(deletions)?;
+    let mut patterns = Vec::with_capacity(deletions.len() * 2);
+    for deletion in deletions {
+        let components = deletion
+            .components()
+            .map(|component| {
+                let name = component
+                    .as_os_str()
+                    .to_str()
+                    .context("non-UTF-8 clean-overlay deletion")?;
+                Ok(escape_rsync_filter_literal_component(name).into_owned())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let path = components.join("/");
+        patterns.push(format!("/{path}"));
+        patterns.push(format!("/{path}/***"));
+    }
+    Ok(patterns)
+}
+
+fn append_clean_overlay_sync_filters(
+    command: &mut Command,
+    include_patterns: &[String],
+    priority_excludes: &[String],
+) {
+    for pattern in priority_excludes {
+        command.arg("--exclude").arg(pattern);
+    }
+    for pattern in REMOTE_RUNTIME_EXCLUDE_PATTERNS
+        .iter()
+        .chain(SOURCE_EPHEMERAL_EXCLUDE_PATTERNS)
+    {
+        command.arg("--exclude").arg(pattern);
+    }
+    command.arg("--prune-empty-dirs");
+    for pattern in include_patterns {
+        command.arg("--include").arg(pattern);
+    }
+    command.arg("--exclude").arg("*");
+}
+
+/// Build anchored, literal rsync include filters for live clean-overlay paths.
 ///
 /// Every ancestor directory is included so rsync can descend through the final
 /// catch-all exclude. Glob metacharacters in real file names are escaped, which
@@ -2982,6 +3075,9 @@ pub struct TransferPipeline {
     clean_overlay_archive_cache: Option<GitArchiveCache>,
     /// Optional include-only patterns for sync-to-remote uploads.
     sync_include_patterns: Option<Vec<String>>,
+    /// Exact clean-overlay tombstones, excluded before any live directory
+    /// include. Complete namespace verification deliberately ignores these.
+    sync_priority_exclude_patterns: Vec<String>,
     /// Whether sync-to-remote should delete extraneous files remotely.
     sync_delete: bool,
     /// Whether uploads must compare file contents instead of size and mtime.
@@ -3121,6 +3217,7 @@ impl TransferPipeline {
             remote_cargo_target_dir_override: None,
             clean_overlay_archive_cache: None,
             sync_include_patterns: None,
+            sync_priority_exclude_patterns: Vec::new(),
             sync_delete: true,
             sync_checksum: false,
             owned_source_materialization: false,
@@ -3895,6 +3992,15 @@ impl TransferPipeline {
     pub fn with_sync_include_patterns(mut self, patterns: Vec<String>) -> Self {
         self.sync_include_patterns = Some(patterns);
         self
+    }
+
+    pub(crate) fn with_clean_overlay_deletions(mut self, deletions: &[PathBuf]) -> Result<Self> {
+        anyhow::ensure!(
+            self.sync_include_patterns.is_some(),
+            "clean-overlay deletions require explicit live-upload selection"
+        );
+        self.sync_priority_exclude_patterns = clean_overlay_deletion_exclude_patterns(deletions)?;
+        Ok(self)
     }
 
     /// Control whether sync-to-remote deletes extraneous remote files.
@@ -4784,19 +4890,17 @@ impl TransferPipeline {
         )
     }
 
+    pub(crate) fn source_content_priority_excludes(&self) -> &[String] {
+        &self.sync_priority_exclude_patterns
+    }
+
     fn append_sync_filter_args(&self, cmd: &mut Command, effective_excludes: &[String]) {
         if let Some(include_patterns) = &self.sync_include_patterns {
-            for pattern in REMOTE_RUNTIME_EXCLUDE_PATTERNS
-                .iter()
-                .chain(SOURCE_EPHEMERAL_EXCLUDE_PATTERNS)
-            {
-                cmd.arg("--exclude").arg(pattern);
-            }
-            cmd.arg("--prune-empty-dirs");
-            for pattern in include_patterns {
-                cmd.arg("--include").arg(pattern);
-            }
-            cmd.arg("--exclude").arg("*");
+            append_clean_overlay_sync_filters(
+                cmd,
+                include_patterns,
+                &self.sync_priority_exclude_patterns,
+            );
         } else {
             // rsync is first-match-wins. Carve tracked inputs out of the
             // build-output excludes before those are emitted (#113), but only
@@ -6431,11 +6535,22 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         git_root: &Path,
         base_commit: &str,
         submodules: &[(PathBuf, String)],
+        deletions: &[PathBuf],
     ) -> Result<tempfile::NamedTempFile> {
+        validate_clean_overlay_deletions(deletions)?;
+        for deletion in deletions {
+            anyhow::ensure!(
+                submodules.iter().all(|(path, _)| {
+                    !deletion.starts_with(path) && !path.starts_with(deletion)
+                }),
+                "clean-overlay deletion overlaps a selected submodule"
+            );
+        }
         let base = Self::create_git_archive(git_root, base_commit).await?;
-        if submodules.is_empty() {
+        if submodules.is_empty() && deletions.is_empty() {
             return Ok(base);
         }
+        let deletions = deletions.to_vec();
         let mut archives = vec![(PathBuf::new(), base)];
         for (path, commit) in submodules {
             anyhow::ensure!(
@@ -6463,6 +6578,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                     tar::Builder::new(std::io::BufWriter::new(combined.as_file_mut()));
                 let mut prefixes = std::collections::BTreeMap::new();
                 let mut entry_kinds = std::collections::BTreeMap::new();
+                let mut deleted_files = std::collections::BTreeSet::new();
                 for (prefix, source) in archives {
                     let mut archive = tar::Archive::new(source.reopen()?);
                     for entry in archive.entries()? {
@@ -6508,6 +6624,16 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                                 "selected Git archives contain overlapping files"
                             );
                         }
+                        if let Some(index) = clean_overlay_deletion_index(&deletions, &path) {
+                            anyhow::ensure!(
+                                entry_type.is_file() || entry_type.is_dir(),
+                                "clean-overlay deletion cannot remove a selected symlink"
+                            );
+                            if entry_type.is_file() {
+                                deleted_files.insert(index);
+                            }
+                            continue;
+                        }
                         let mut header = entry.header().clone();
                         header.set_size(entry.size());
                         if entry_type.is_symlink() {
@@ -6521,6 +6647,10 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                         }
                     }
                 }
+                anyhow::ensure!(
+                    deleted_files.len() == deletions.len(),
+                    "clean-overlay deletion does not name a tracked file or subtree in its selected archive"
+                );
                 builder.finish()?;
                 builder.get_mut().flush()?;
             }
@@ -6541,6 +6671,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         git_root: &Path,
         base_commit: &str,
         submodules: &[(PathBuf, String)],
+        deletions: &[PathBuf],
     ) -> Result<CleanOverlayMaterialization> {
         if use_mock_transport(worker) {
             return Ok(CleanOverlayMaterialization {
@@ -6559,7 +6690,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             });
         }
         let archive_file =
-            Self::create_selected_git_archive(git_root, base_commit, submodules).await?;
+            Self::create_selected_git_archive(git_root, base_commit, submodules, deletions).await?;
         let archive_path = archive_file.path().to_path_buf();
         let payload_bytes = archive_file
             .as_file()
@@ -15112,6 +15243,317 @@ Number of files transferred: 42
     }
 
     #[cfg(unix)]
+    fn clean_overlay_reappeared_upload_fixture() -> (PathBuf, Vec<PathBuf>, Vec<String>) {
+        let root = tempfile::tempdir().unwrap().keep();
+        for (path, bytes) in [
+            ("src/deleted-dir/nested.rs", "reappeared directory\n"),
+            ("src/removed*.rs", "reappeared literal glob\n"),
+            ("src/removedX.rs", "retained near match\n"),
+            ("src/keep.rs", "retained source\n"),
+            ("other/unselected.rs", "unselected source\n"),
+        ] {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        let deletions = vec![
+            PathBuf::from("src/deleted-dir"),
+            PathBuf::from("src/removed*.rs"),
+        ];
+        let includes = clean_overlay_include_patterns(&root, &[PathBuf::from("src")]).unwrap();
+        (root, deletions, includes)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clean_overlay_deletion_filters_precede_live_directory_uploads() {
+        let _guard = test_guard!();
+        let (root, deletions, includes) = clean_overlay_reappeared_upload_fixture();
+        // These names model reappearance after admission. Even a transient
+        // name must never enter the upload, independently of the final local
+        // absence check or the receipt-only complete namespace barrier.
+        let excludes = clean_overlay_deletion_exclude_patterns(&deletions).unwrap();
+        let admitted = tempfile::tempdir().unwrap().keep();
+        let control = tempfile::tempdir().unwrap().keep();
+        for (destination, filters) in [(&admitted, excludes.as_slice()), (&control, &[][..])] {
+            let mut command = Command::new("rsync");
+            command.arg("-a").arg("--no-owner").arg("--no-group");
+            append_clean_overlay_sync_filters(&mut command, &includes, filters);
+            let output = command
+                .arg(format!("{}/", root.display()))
+                .arg(format!("{}/", destination.display()))
+                .output()
+                .await
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(output.stderr.is_empty(), "{output:?}");
+        }
+        assert!(!admitted.join("src/deleted-dir").exists());
+        assert!(!admitted.join("src/removed*.rs").exists());
+        assert_eq!(
+            std::fs::read(admitted.join("src/removedX.rs")).unwrap(),
+            b"retained near match\n"
+        );
+        assert_eq!(
+            std::fs::read(admitted.join("src/keep.rs")).unwrap(),
+            b"retained source\n"
+        );
+        assert!(!admitted.join("other").exists());
+        assert!(control.join("src/deleted-dir/nested.rs").is_file());
+        assert!(control.join("src/removed*.rs").is_file());
+        assert!(
+            root.join("src/removed*.rs").is_file(),
+            "sender input was mutated"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clean_overlay_deletion_filters_cover_posix_and_windows_selection() {
+        let _guard = test_guard!();
+        let (root, deletions, includes) = clean_overlay_reappeared_upload_fixture();
+        let pipeline = TransferPipeline::new(
+            root.clone(),
+            "deletion-selection".into(),
+            "fixture".into(),
+            TransferConfig::default(),
+        )
+        .with_sync_include_patterns(includes)
+        .with_clean_overlay_deletions(&deletions)
+        .unwrap()
+        .with_sync_delete(false)
+        .with_sync_checksum(true);
+        let expected = vec![
+            PathBuf::from("src/keep.rs"),
+            PathBuf::from("src/removedX.rs"),
+        ];
+        assert_eq!(
+            pipeline
+                .enumerate_source_content_selection()
+                .await
+                .unwrap()
+                .0,
+            expected
+        );
+        assert_eq!(
+            pipeline.source_content_priority_excludes(),
+            clean_overlay_deletion_exclude_patterns(&deletions).unwrap()
+        );
+        // Complete namespaces must still expose surplus deleted names. They
+        // deliberately bypass these sender-side overlay exclusions.
+        let complete = pipeline
+            .enumerate_clean_overlay_source_namespace()
+            .await
+            .unwrap()
+            .0;
+        assert!(complete.contains(&PathBuf::from("src/removed*.rs")));
+        assert!(complete.contains(&PathBuf::from("src/deleted-dir/nested.rs")));
+        let (archive, count) = pipeline
+            .with_worker_platform(WorkerPlatform::Windows)
+            .selected_source_archive()
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+        let mut reader = tar::Archive::new(archive.reopen().unwrap());
+        let mut selected: Vec<_> = reader
+            .entries()
+            .unwrap()
+            .map(|entry| entry.unwrap().path().unwrap().into_owned())
+            .collect();
+        selected.sort();
+        assert_eq!(selected, expected);
+    }
+
+    #[cfg(unix)]
+    async fn clean_overlay_deletion_archive_fixture() -> (PathBuf, String) {
+        let root = tempfile::tempdir().unwrap().keep();
+        for (path, bytes) in [
+            ("keep.txt", "immutable keep\n"),
+            ("src/keep.rs", "pub fn retained() {}\n"),
+            ("src/gone.rs", "removed file\n"),
+            ("src/old/deep.rs", "removed directory\n"),
+            ("src/only/gone.rs", "individually removed\n"),
+        ] {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        std::os::unix::fs::symlink("keep.txt", root.join("source-link")).unwrap();
+        for args in [
+            vec!["init", "--quiet"],
+            vec!["add", "--all"],
+            vec![
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "deletion base",
+            ],
+        ] {
+            let mut command = Command::new("git");
+            configure_clean_git_command(&mut command);
+            let output = command
+                .current_dir(&root)
+                .args(args)
+                .output()
+                .await
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+        }
+        let mut command = Command::new("git");
+        configure_clean_git_command(&mut command);
+        let output = command
+            .current_dir(&root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let head = String::from_utf8(output.stdout).unwrap().trim().to_owned();
+        (root, head)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clean_overlay_selected_archive_filters_deletions_without_mutating_sources() {
+        let _guard = test_guard!();
+        let (root, head) = clean_overlay_deletion_archive_fixture().await;
+        std::fs::rename(root.join("src/gone.rs"), root.join("saved-gone.rs")).unwrap();
+        std::fs::rename(root.join("src/old"), root.join("saved-old")).unwrap();
+        std::fs::write(root.join("keep.txt"), "unselected ambient dirt\n").unwrap();
+        let deletions = vec![PathBuf::from("src/gone.rs"), PathBuf::from("src/old")];
+        let archive = TransferPipeline::create_selected_git_archive(&root, &head, &[], &deletions)
+            .await
+            .unwrap();
+        let destination = tempfile::tempdir().unwrap().keep();
+        tar::Archive::new(archive.reopen().unwrap())
+            .unpack(&destination)
+            .unwrap();
+        assert!(!destination.join("src/gone.rs").exists());
+        assert!(
+            !destination.join("src/old").exists(),
+            "removed directory header survived"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("keep.txt")).unwrap(),
+            b"immutable keep\n"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("src/keep.rs")).unwrap(),
+            b"pub fn retained() {}\n"
+        );
+        assert_eq!(
+            std::fs::read_link(destination.join("source-link")).unwrap(),
+            Path::new("keep.txt")
+        );
+        assert!(!destination.join("saved-gone.rs").exists());
+        assert!(!destination.join("saved-old").exists());
+        assert_eq!(
+            std::fs::read(root.join("saved-old/deep.rs")).unwrap(),
+            b"removed directory\n"
+        );
+        assert_eq!(
+            std::fs::read(root.join("keep.txt")).unwrap(),
+            b"unselected ambient dirt\n"
+        );
+
+        // The same commit with a different deletion set must not address the
+        // archive-cache object from the first selection. An individual leaf
+        // deletion retains its unselected parent directory.
+        let leaf = TransferPipeline::create_selected_git_archive(
+            &root,
+            &head,
+            &[],
+            &[PathBuf::from("src/only/gone.rs")],
+        )
+        .await
+        .unwrap();
+        let leaf_destination = tempfile::tempdir().unwrap().keep();
+        tar::Archive::new(leaf.reopen().unwrap())
+            .unpack(&leaf_destination)
+            .unwrap();
+        assert!(leaf_destination.join("src/only").is_dir());
+        assert!(!leaf_destination.join("src/only/gone.rs").exists());
+        assert!(leaf_destination.join("src/old/deep.rs").is_file());
+        let first_digest = TransferPipeline::git_archive_sha256(archive.path())
+            .await
+            .unwrap();
+        assert_ne!(
+            first_digest,
+            TransferPipeline::git_archive_sha256(leaf.path())
+                .await
+                .unwrap()
+        );
+        let repeated = TransferPipeline::create_selected_git_archive(&root, &head, &[], &deletions)
+            .await
+            .unwrap();
+        assert_eq!(
+            first_digest,
+            TransferPipeline::git_archive_sha256(repeated.path())
+                .await
+                .unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clean_overlay_selected_archive_rejects_invalid_or_unbacked_deletions() {
+        let _guard = test_guard!();
+        let (root, head) = clean_overlay_deletion_archive_fixture().await;
+        for paths in [
+            vec![""],
+            vec!["../keep.txt"],
+            vec!["/keep.txt"],
+            vec![".git/config"],
+            vec!["src/back\\slash"],
+            vec!["src/non\u{e9}ascii"],
+            vec!["src/line\nbreak"],
+            vec!["src/old", "src/gone.rs"],
+            vec!["src/old", "src/old"],
+            vec!["src/old", "src/old/deep.rs"],
+            vec!["missing.rs"],
+            vec!["source-link"],
+        ] {
+            let deletions: Vec<_> = paths.into_iter().map(PathBuf::from).collect();
+            assert!(
+                TransferPipeline::create_selected_git_archive(&root, &head, &[], &deletions)
+                    .await
+                    .is_err(),
+                "accepted {deletions:?}"
+            );
+        }
+        assert!(
+            TransferPipeline::create_selected_git_archive(
+                &root,
+                &head,
+                &[(PathBuf::from("src/old"), head.clone())],
+                &[PathBuf::from("src/old")],
+            )
+            .await
+            .is_err()
+        );
+        let excessive = vec![PathBuf::from("src/gone.rs"); MAX_CLEAN_OVERLAY_DELETIONS + 1];
+        assert!(
+            TransferPipeline::create_selected_git_archive(&root, &head, &[], &excessive)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(root.join("src/gone.rs")).unwrap(),
+            b"removed file\n"
+        );
+        assert_eq!(
+            std::fs::read_link(root.join("source-link")).unwrap(),
+            Path::new("keep.txt")
+        );
+    }
+
+    #[cfg(unix)]
     async fn archive_upload_disk_git_fixture(root: &Path) -> String {
         std::fs::write(root.join("source.txt"), "committed source\n").unwrap();
         for args in [
@@ -15169,7 +15611,7 @@ Number of files transferred: 42
         );
         let worker = estimate_test_worker();
         let error = pipeline
-            .materialize_git_archive(&worker, directory.path(), &base, &[])
+            .materialize_git_archive(&worker, directory.path(), &base, &[], &[])
             .await
             .unwrap_err()
             .context("materialize the immutable source base");
@@ -15208,7 +15650,7 @@ Number of files transferred: 42
                 ),
             );
             let error = pipeline
-                .materialize_git_archive(&worker, directory.path(), &base, &[])
+                .materialize_git_archive(&worker, directory.path(), &base, &[], &[])
                 .await
                 .unwrap_err();
             assert!(error.downcast_ref::<TransferAttemptsExhausted>().is_some());
@@ -15223,7 +15665,7 @@ Number of files transferred: 42
             ),
         );
         let error = pipeline
-            .materialize_git_archive(&worker, directory.path(), &"0".repeat(40), &[])
+            .materialize_git_archive(&worker, directory.path(), &"0".repeat(40), &[], &[])
             .await
             .unwrap_err();
         assert!(
@@ -15254,7 +15696,7 @@ Number of files transferred: 42
         );
         pipeline.transfer_config.sync_timeout_ms = Some(1_000);
         let error = pipeline
-            .materialize_git_archive(&estimate_test_worker(), directory.path(), &base, &[])
+            .materialize_git_archive(&estimate_test_worker(), directory.path(), &base, &[], &[])
             .await
             .unwrap_err();
         assert!(started.exists(), "controlled child emitted its diagnostic");

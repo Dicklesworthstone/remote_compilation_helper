@@ -991,9 +991,10 @@ async fn clean_overlay_subdirectory_real_git_archive_and_cargo_preserve_selected
     .await
     .unwrap()
     .unwrap();
-    let archive = TransferPipeline::create_selected_git_archive(&root, spec.base_commit(), &[])
-        .await
-        .unwrap();
+    let archive =
+        TransferPipeline::create_selected_git_archive(&root, spec.base_commit(), &[], &[])
+            .await
+            .unwrap();
     let storage = tempfile::tempdir().unwrap().keep();
     let selected_root = storage.join("selected source");
     std::fs::create_dir(&selected_root).unwrap();
@@ -1199,6 +1200,7 @@ fn clean_overlay_selection_identity_is_source_bound_and_per_job() {
         base_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
         tree_object: "0123456789abcdef0123456789abcdef01234567".to_string(),
         overlay_paths: vec![PathBuf::from("src/lib.rs")],
+        overlay_deletions: Vec::new(),
         overlay_fingerprint: "first-overlay-fingerprint".to_string(),
         submodules: Vec::new(),
         dependencies: Vec::new(),
@@ -1427,7 +1429,7 @@ fn clean_overlay_exact_spelling_check_rejects_case_drift() {
 }
 
 #[tokio::test]
-async fn clean_overlay_directory_rejects_base_path_rename() {
+async fn clean_overlay_directory_accepts_base_path_rename() {
     let _guard = test_guard!();
     let repo = init_clean_overlay_test_repo();
     std::fs::rename(
@@ -1436,7 +1438,45 @@ async fn clean_overlay_directory_rejects_base_path_rename() {
     )
     .expect("rename tracked fixture path");
 
-    let error = prepare_clean_overlay_spec(
+    let destination_only = prepare_clean_overlay_spec(
+        repo.path(),
+        Some("HEAD".into()),
+        true,
+        vec!["src/renamed.rs".into()],
+        false,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(destination_only.overlay_deletions.is_empty());
+    let selected = selected_clean_overlay_cargo_tree(repo.path(), &destination_only, false)
+        .await
+        .unwrap();
+    assert!(selected.contains_key(Path::new("src/lib.rs")));
+    assert!(selected.contains_key(Path::new("src/renamed.rs")));
+
+    let both_paths = prepare_clean_overlay_spec(
+        repo.path(),
+        Some("HEAD".into()),
+        true,
+        vec!["src/renamed.rs".into(), "src/lib.rs".into()],
+        false,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(both_paths.overlay_deletions, [PathBuf::from("src/lib.rs")]);
+    assert_eq!(
+        both_paths.live_overlay_paths(),
+        [PathBuf::from("src/renamed.rs")]
+    );
+    let selected = selected_clean_overlay_cargo_tree(repo.path(), &both_paths, false)
+        .await
+        .unwrap();
+    assert!(!selected.contains_key(Path::new("src/lib.rs")));
+    assert!(selected.contains_key(Path::new("src/renamed.rs")));
+
+    let spec = prepare_clean_overlay_spec(
         repo.path(),
         Some("HEAD".to_string()),
         true,
@@ -1444,12 +1484,398 @@ async fn clean_overlay_directory_rejects_base_path_rename() {
         false,
     )
     .await
-    .expect_err("directory overlay with base rename must fail closed");
+    .expect("admit the selected source rename")
+    .unwrap();
+    assert_eq!(spec.overlay_deletions, [PathBuf::from("src/lib.rs")]);
+    let selected = selected_clean_overlay_cargo_tree(repo.path(), &spec, false)
+        .await
+        .unwrap();
+    assert!(!selected.contains_key(Path::new("src/lib.rs")));
+    assert!(selected.contains_key(Path::new("src/renamed.rs")));
+    spec.verify_overlay_unchanged(repo.path()).unwrap();
+    std::fs::write(repo.path().join("src/lib.rs"), "pub fn reappeared() {}\n").unwrap();
+    assert!(spec.verify_overlay_unchanged(repo.path()).is_err());
+}
+
+#[tokio::test]
+async fn clean_overlay_selected_deletion_keeps_unselected_base_inputs_and_binds_absence() {
+    let _guard = test_guard!();
+    let repo = init_clean_overlay_test_repo();
+    let retained = tempfile::tempdir().unwrap().keep();
+    for name in ["removed", "unselected"] {
+        std::fs::write(
+            repo.path().join(format!("src/{name}.rs")),
+            "pub fn base() {}\n",
+        )
+        .unwrap();
+    }
+    commit_clean_overlay_submodule_fixture(repo.path()).await;
+    for name in ["removed", "unselected"] {
+        std::fs::rename(
+            repo.path().join(format!("src/{name}.rs")),
+            retained.join(format!("{name}.rs")),
+        )
+        .unwrap();
+    }
+    let spec = prepare_clean_overlay_spec(
+        repo.path(),
+        Some("HEAD".into()),
+        true,
+        vec!["src/removed.rs".into()],
+        false,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!spec.is_base_only());
+    assert!(spec.live_overlay_paths().is_empty());
+    assert_eq!(spec.overlay_deletions, [PathBuf::from("src/removed.rs")]);
+    let selected = selected_clean_overlay_cargo_tree(repo.path(), &spec, true)
+        .await
+        .unwrap();
+    assert!(!selected.contains_key(Path::new("src/removed.rs")));
+    assert!(selected.contains_key(Path::new("src/unselected.rs")));
+    assert!(selected.contains_key(Path::new("src/lib.rs")));
+    let base = prepare_clean_overlay_spec(repo.path(), Some("HEAD".into()), true, vec![], true)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(spec.overlay_fingerprint, base.overlay_fingerprint);
+    spec.verify_overlay_unchanged(repo.path()).unwrap();
+    std::fs::write(repo.path().join("src/REMOVED.rs"), "case alias\n").unwrap();
+    assert!(spec.verify_overlay_unchanged(repo.path()).is_err());
+}
+
+#[tokio::test]
+async fn clean_overlay_selected_deletion_covers_removed_directories_without_stale_namespaces() {
+    let _guard = test_guard!();
+    let repo = init_clean_overlay_test_repo();
+    let retained = tempfile::tempdir().unwrap().keep();
+    std::fs::create_dir_all(repo.path().join("src/old/nested")).unwrap();
+    std::fs::write(repo.path().join("src/old/nested/one.rs"), "old one\n").unwrap();
+    std::fs::write(repo.path().join("src/old/two.rs"), "old two\n").unwrap();
+    commit_clean_overlay_submodule_fixture(repo.path()).await;
+    std::fs::rename(repo.path().join("src/old"), retained.join("old")).unwrap();
+    for overlays in [vec!["src"], vec!["src/old", "src/old/nested/one.rs"]] {
+        let spec = prepare_clean_overlay_spec(
+            repo.path(),
+            Some("HEAD".into()),
+            true,
+            overlays.into_iter().map(PathBuf::from).collect(),
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(spec.overlay_deletions, [PathBuf::from("src/old")]);
+        let archive = TransferPipeline::create_selected_git_archive(
+            repo.path(),
+            spec.base_commit(),
+            &[],
+            &spec.overlay_deletions,
+        )
+        .await
+        .unwrap();
+        let mut archive = tar::Archive::new(archive.reopen().unwrap());
+        let paths = archive
+            .entries()
+            .unwrap()
+            .map(|entry| entry.unwrap().path().unwrap().into_owned())
+            .collect::<Vec<_>>();
+        assert!(!paths.iter().any(|path| path.starts_with("src/old")));
+        assert!(paths.iter().any(|path| path == Path::new("src/lib.rs")));
+        spec.verify_overlay_unchanged(repo.path()).unwrap();
+        std::fs::create_dir(repo.path().join("src/old")).unwrap();
+        assert!(spec.verify_overlay_unchanged(repo.path()).is_err());
+        std::fs::rename(
+            repo.path().join("src/old"),
+            retained.join(format!("reappeared-{}", spec.overlay_paths.len())),
+        )
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn clean_overlay_selected_deletion_can_leave_a_selected_directory_empty() {
+    let _guard = test_guard!();
+    let repo = init_clean_overlay_test_repo();
+    let retained = tempfile::tempdir().unwrap().keep();
+    std::fs::rename(repo.path().join("src/lib.rs"), retained.join("lib.rs")).unwrap();
+    let spec = prepare_clean_overlay_spec(
+        repo.path(),
+        Some("HEAD".into()),
+        true,
+        vec!["src".into()],
+        false,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(spec.overlay_deletions, [PathBuf::from("src/lib.rs")]);
+    spec.verify_overlay_unchanged(repo.path()).unwrap();
+    let selected = selected_clean_overlay_cargo_tree(repo.path(), &spec, false)
+        .await
+        .unwrap();
+    assert!(!selected.contains_key(Path::new("src/lib.rs")));
+    assert!(selected.contains_key(Path::new("Cargo.toml")));
+}
+
+#[tokio::test]
+async fn clean_overlay_selected_deletion_removes_selected_cargo_config_and_toolchain() {
+    let _guard = test_guard!();
+    let repo = init_clean_overlay_test_repo();
+    let retained = tempfile::tempdir().unwrap().keep();
+    std::fs::create_dir(repo.path().join(".cargo")).unwrap();
+    std::fs::write(
+        repo.path().join(".cargo/config.toml"),
+        "paths=['../unpublished-dependency']\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.path().join("rust-toolchain.toml"),
+        "[toolchain]\nchannel='beta'\n",
+    )
+    .unwrap();
+    commit_clean_overlay_submodule_fixture(repo.path()).await;
+    std::fs::rename(repo.path().join(".cargo"), retained.join("cargo-config")).unwrap();
+    std::fs::rename(
+        repo.path().join("rust-toolchain.toml"),
+        retained.join("rust-toolchain.toml"),
+    )
+    .unwrap();
+    let base = prepare_clean_overlay_spec(repo.path(), Some("HEAD".into()), true, vec![], true)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(
-        error
-            .to_string()
-            .contains("selected deletions are unsupported")
+        validate_clean_overlay_cargo_sources(repo.path(), &base, "cargo check")
+            .await
+            .is_err()
     );
+    assert!(
+        detect_clean_overlay_toolchain(repo.path(), &base)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let selected = prepare_clean_overlay_spec(
+        repo.path(),
+        Some("HEAD".into()),
+        true,
+        vec![".cargo".into(), "rust-toolchain.toml".into()],
+        false,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    validate_clean_overlay_cargo_sources(repo.path(), &selected, "cargo check")
+        .await
+        .unwrap();
+    assert!(
+        detect_clean_overlay_toolchain(repo.path(), &selected)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let entries = selected_clean_overlay_cargo_tree(repo.path(), &selected, true)
+        .await
+        .unwrap();
+    assert!(!entries.contains_key(Path::new(".cargo/config.toml")));
+    assert!(!entries.contains_key(Path::new("rust-toolchain.toml")));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn clean_overlay_selected_deletion_refuses_unknown_symlink_and_case_aliased_inputs() {
+    let _guard = test_guard!();
+    let repo = init_clean_overlay_test_repo();
+    let retained = tempfile::tempdir().unwrap().keep();
+    std::os::unix::fs::symlink("lib.rs", repo.path().join("src/link.rs")).unwrap();
+    commit_clean_overlay_submodule_fixture(repo.path()).await;
+    std::fs::rename(repo.path().join("src/link.rs"), retained.join("link.rs")).unwrap();
+    for selector in ["src/link.rs", "src/unknown.rs", "unknown-directory"] {
+        assert!(
+            prepare_clean_overlay_spec(
+                repo.path(),
+                Some("HEAD".into()),
+                true,
+                vec![selector.into()],
+                false,
+            )
+            .await
+            .is_err(),
+            "{selector} must not acquire deletion authority"
+        );
+    }
+    std::fs::rename(
+        repo.path().join("src/lib.rs"),
+        repo.path().join("src/LIB.rs"),
+    )
+    .unwrap();
+    assert!(
+        prepare_clean_overlay_spec(
+            repo.path(),
+            Some("HEAD".into()),
+            true,
+            vec!["src/lib.rs".into()],
+            false,
+        )
+        .await
+        .is_err()
+    );
+    std::fs::rename(repo.path().join("src"), retained.join("src")).unwrap();
+    std::os::unix::fs::symlink(retained.join("src"), repo.path().join("src")).unwrap();
+    assert!(
+        prepare_clean_overlay_spec(
+            repo.path(),
+            Some("HEAD".into()),
+            true,
+            vec!["src/lib.rs".into()],
+            false,
+        )
+        .await
+        .is_err()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn clean_overlay_selected_rename_and_deletion_build_from_exact_archive() {
+    use std::io::Read as _;
+
+    let _guard = test_guard!();
+    let repo = init_clean_overlay_test_repo();
+    let storage = tempfile::tempdir().unwrap().keep();
+    std::fs::create_dir_all(repo.path().join("src/obsolete/nested")).unwrap();
+    std::fs::write(
+        repo.path().join("src/obsolete/nested/old.rs"),
+        "old source\n",
+    )
+    .unwrap();
+    std::fs::write(repo.path().join("kept.txt"), "committed\n").unwrap();
+    commit_clean_overlay_submodule_fixture(repo.path()).await;
+    std::fs::rename(
+        repo.path().join("src/obsolete"),
+        storage.join("retained-obsolete"),
+    )
+    .unwrap();
+    std::fs::rename(
+        repo.path().join("src/lib.rs"),
+        repo.path().join("src/renamed.rs"),
+    )
+    .unwrap();
+    std::fs::write(
+        repo.path().join("Cargo.toml"),
+        "[package]\nname='selected-deletions'\nversion='0.1.0'\nedition='2024'\n[workspace]\n[lib]\npath='src/renamed.rs'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.path().join("src/renamed.rs"),
+        r#"#[test]
+fn selected_source_namespace() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    assert!(!root.join("src/lib.rs").exists(), "deleted input returned");
+    assert!(!root.join("src/obsolete").exists(), "removed directory returned");
+    assert_eq!(include_str!("../kept.txt"), "committed\n");
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(repo.path().join("kept.txt"), "unselected dirty content\n").unwrap();
+    let spec = prepare_clean_overlay_spec(
+        repo.path(),
+        Some("HEAD".into()),
+        true,
+        vec!["Cargo.toml".into(), "src".into()],
+        false,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        spec.overlay_deletions,
+        [PathBuf::from("src/lib.rs"), PathBuf::from("src/obsolete")]
+    );
+    validate_clean_overlay_cargo_sources(repo.path(), &spec, "cargo test --lib --offline")
+        .await
+        .unwrap();
+
+    let mut cargo = PathBuf::from(env!("CARGO"));
+    if std::fs::metadata(&cargo).unwrap().len() <= 8 * 1024
+        && std::fs::read_to_string(&cargo)
+            .unwrap()
+            .lines()
+            .any(|line| line.starts_with("# rch-toolchain-wrap-version:"))
+    {
+        cargo.set_file_name("cargo-rch-real");
+    }
+    let mut magic = [0; 4];
+    std::fs::File::open(&cargo)
+        .unwrap()
+        .read_exact(&mut magic)
+        .unwrap();
+    assert_eq!(&magic, b"\x7fELF", "fixture requires native Cargo");
+    let cargo_bin = cargo.parent().unwrap();
+    let path = std::env::join_paths([
+        cargo_bin.to_path_buf(),
+        PathBuf::from("/usr/bin"),
+        PathBuf::from("/bin"),
+    ])
+    .unwrap();
+    for filtered in [true, false] {
+        let destination = storage.join(if filtered { "filtered" } else { "base-control" });
+        std::fs::create_dir(&destination).unwrap();
+        let archive = TransferPipeline::create_selected_git_archive(
+            repo.path(),
+            spec.base_commit(),
+            &[],
+            if filtered {
+                &spec.overlay_deletions
+            } else {
+                &[]
+            },
+        )
+        .await
+        .unwrap();
+        tar::Archive::new(archive.reopen().unwrap())
+            .unpack(&destination)
+            .unwrap();
+        for relative in ["Cargo.toml", "src/renamed.rs"] {
+            std::fs::copy(repo.path().join(relative), destination.join(relative)).unwrap();
+        }
+        let output = std::process::Command::new("/usr/bin/timeout")
+            .args(["--kill-after=5", "120"])
+            .arg(&cargo)
+            .args(["test", "--offline", "--lib", "--target-dir"])
+            .arg(destination.join("target"))
+            .current_dir(&destination)
+            .env_clear()
+            .env("PATH", &path)
+            .env("HOME", &storage)
+            .env("CARGO_HOME", storage.join("cargo-home"))
+            .env("CARGO_BUILD_JOBS", "1")
+            .env("RUSTC", cargo_bin.join("rustc"))
+            .env("RUSTUP_AUTO_INSTALL", "0")
+            .env("RCH_CARGO_WRAPPER_BYPASS", "1")
+            .env("RCH_CARGO_WRAPPER_ORIGIN", "rch")
+            .output()
+            .unwrap();
+        std::fs::write(destination.join("cargo.stdout"), &output.stdout).unwrap();
+        std::fs::write(destination.join("cargo.stderr"), &output.stderr).unwrap();
+        assert_eq!(
+            output.status.success(),
+            filtered,
+            "{output:?}; retained {}",
+            storage.display()
+        );
+        if filtered {
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        } else {
+            assert_eq!(output.status.code(), Some(101));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("deleted input returned"));
+        }
+    }
+    spec.verify_overlay_unchanged(repo.path()).unwrap();
 }
 
 #[tokio::test]
@@ -1469,6 +1895,27 @@ async fn clean_overlay_rejects_case_only_base_directory_alias() {
     .await
     .expect_err("case-only base alias must fail closed");
     assert!(error.to_string().contains("case-only overlays"));
+}
+
+#[tokio::test]
+async fn clean_overlay_selected_deletion_refuses_case_only_rename_inside_a_directory() {
+    let _guard = test_guard!();
+    let repo = init_clean_overlay_test_repo();
+    std::fs::rename(
+        repo.path().join("src/lib.rs"),
+        repo.path().join("src/LIB.rs"),
+    )
+    .unwrap();
+    let error = prepare_clean_overlay_spec(
+        repo.path(),
+        Some("HEAD".into()),
+        true,
+        vec!["src".into()],
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("case-only"), "{error:#}");
 }
 
 #[tokio::test]
@@ -1644,7 +2091,7 @@ async fn clean_overlay_submodule_archive_and_cargo_inventory_use_pin_not_dirty_o
         .map(|module| (module.path.clone(), module.base_commit.clone()))
         .collect::<Vec<_>>();
     let archive =
-        TransferPipeline::create_selected_git_archive(&app, spec.base_commit(), &selected)
+        TransferPipeline::create_selected_git_archive(&app, spec.base_commit(), &selected, &[])
             .await
             .unwrap();
     let destination = tempfile::tempdir().unwrap().keep();
@@ -1985,7 +2432,7 @@ async fn clean_overlay_submodule_recursion_preserves_nested_pins_and_rejects_rep
         .map(|entry| (entry.path.clone(), entry.base_commit.clone()))
         .collect::<Vec<_>>();
     let archive =
-        TransferPipeline::create_selected_git_archive(&app, spec.base_commit(), &selected)
+        TransferPipeline::create_selected_git_archive(&app, spec.base_commit(), &selected, &[])
             .await
             .unwrap();
     let destination = tempfile::tempdir().unwrap().keep();
@@ -2144,10 +2591,14 @@ async fn clean_overlay_nested_pins_invalidate_warm_archives_and_cargo_artifacts(
                 .iter()
                 .map(|module| (module.path.clone(), module.base_commit.clone()))
                 .collect::<Vec<_>>();
-            let archive =
-                TransferPipeline::create_selected_git_archive(&app, spec.base_commit(), &selected)
-                    .await
-                    .unwrap();
+            let archive = TransferPipeline::create_selected_git_archive(
+                &app,
+                spec.base_commit(),
+                &selected,
+                &[],
+            )
+            .await
+            .unwrap();
             let bytes = std::fs::read(archive.path()).unwrap();
             let digest = Sha256::digest(&bytes)
                 .iter()
@@ -2356,9 +2807,10 @@ async fn clean_overlay_submodule_archive_refuses_case_aliased_parent_directories
         .iter()
         .map(|entry| (entry.path.clone(), entry.base_commit.clone()))
         .collect::<Vec<_>>();
-    let error = TransferPipeline::create_selected_git_archive(&app, spec.base_commit(), &selected)
-        .await
-        .unwrap_err();
+    let error =
+        TransferPipeline::create_selected_git_archive(&app, spec.base_commit(), &selected, &[])
+            .await
+            .unwrap_err();
     assert!(
         error.to_string().contains("case-aliased paths"),
         "{error:#}"
