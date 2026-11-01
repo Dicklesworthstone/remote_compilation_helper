@@ -988,6 +988,55 @@ pub(crate) async fn record_build(
     Ok(())
 }
 
+/// Report loss of process observability without releasing the admitted owner.
+/// This health-only route never treats the report/ack as completion evidence.
+/// The daemon binds it to the active build's wrapper and admitted endpoint,
+/// persists temporary bypass, and deduplicates retries of the same incident.
+pub(super) async fn report_process_observation_failure(
+    socket_path: &str,
+    worker_id: &WorkerId,
+    build_id: u64,
+    local_wrapper_id: Option<&str>,
+) -> anyhow::Result<()> {
+    #[derive(Deserialize)]
+    struct Acknowledgement {
+        status: String,
+        build_id: u64,
+        ownership_retained: bool,
+        slots_released: u32,
+    }
+
+    // One wall clock covers connect, write and the durable response. A missing
+    // or saturated daemon cannot strand the hook after a remote failure.
+    let budget = daemon_io_timeout().min(Duration::from_secs(10));
+    timeout(budget, async {
+        let stream = UnixStream::connect(socket_path).await?;
+        let (reader, mut writer) = stream.into_split();
+        let mut request = format!(
+            "POST /workers/{}/process-observation-failure?build_id={build_id}",
+            urlencoding_encode(worker_id.as_str()),
+        );
+        if let Some(wrapper) = local_wrapper_id {
+            request.push_str("&local_wrapper_id=");
+            request.push_str(&urlencoding_encode(wrapper));
+        }
+        request.push('\n');
+        write_daemon_request(&mut writer, request.as_bytes(), budget).await?;
+        let body = read_daemon_body(reader, budget, false).await?;
+        let ack: Acknowledgement = serde_json::from_str(&body)?;
+        anyhow::ensure!(
+            ack.status == "ok"
+                && ack.build_id == build_id
+                && ack.ownership_retained
+                && ack.slots_released == 0,
+            "daemon did not acknowledge process-observation quarantine with retained ownership"
+        );
+        Ok(())
+    })
+    .await
+    .context("process-observation quarantine report timed out")?
+}
+
 /// Quarantine a worker by reporting a fault to the daemon (bd-68hon):
 /// `POST /workers/{id}/disable?reason=…`. Fire-and-forget with the same
 /// fail-open discipline as `record_build` — a missing/busy daemon never
@@ -1451,6 +1500,69 @@ mod bounded_ipc_tests {
             let result =
                 caller_fixture(response.into_bytes(), "GET /restart-admission", true).await;
             assert_eq!(result.is_ok(), success, "{status}: {result:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn process_observation_report_requires_exact_retained_owner_ack() {
+        let valid = serde_json::json!({
+            "status": "ok",
+            "build_id": 42,
+            "ownership_retained": true,
+            "slots_released": 0,
+        });
+        for case in [
+            "valid",
+            "error",
+            "wrong_build",
+            "released",
+            "not_retained",
+            "header_only",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("process-health.sock");
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let mut body = valid.clone();
+            match case {
+                "error" => body["status"] = "error".into(),
+                "wrong_build" => body["build_id"] = 43.into(),
+                "released" => body["slots_released"] = 1.into(),
+                "not_retained" => body["ownership_retained"] = false.into(),
+                _ => {}
+            }
+            let response = if case == "header_only" {
+                "HTTP/1.0 200 OK\r\n\r\n".to_owned()
+            } else {
+                format!("HTTP/1.0 200 OK\r\n\r\n{body}\n")
+            };
+            let server = async {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut request = String::new();
+                BufReader::new(reader)
+                    .read_line(&mut request)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    request,
+                    "POST /workers/worker%2Fone/process-observation-failure?build_id=42&local_wrapper_id=owner%26one\n"
+                );
+                assert!(!request.contains("release-worker"));
+                writer.write_all(response.as_bytes()).await.unwrap();
+            };
+            let worker_id = WorkerId::new("worker/one");
+            let client = report_process_observation_failure(
+                path.to_str().unwrap(),
+                &worker_id,
+                42,
+                Some("owner&one"),
+            );
+            let (result, ()) = timeout(Duration::from_secs(2), async {
+                tokio::join!(client, server)
+            })
+            .await
+            .expect("process-observation reporting must terminate");
+            assert_eq!(result.is_ok(), case == "valid", "{case}: {result:?}");
         }
     }
 

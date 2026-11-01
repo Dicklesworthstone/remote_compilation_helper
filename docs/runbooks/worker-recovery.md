@@ -201,6 +201,100 @@ Windows jobs and unsupported worker launch capabilities do not gain that
 guarantee. Do not remove the retained ownership record to make capacity appear
 free while execution remains uncertain.
 
+### Busy Linux worker: process observation unavailable (issue #129)
+
+`RCH_SCOPED_COMPLETION_UNCONFIRMED` / SSH exit 255 means the dispatcher cannot
+prove that the owned remote execution stopped. This can happen **before the
+payload starts**, during scope admission, as well as during final cleanup.
+Payload output, an SSH heartbeat, free slots, or a successful compiler exit do
+not replace the completion proof. The job retains its source ownership and
+reservation; automatic local execution or another remote attempt remains unsafe.
+
+Linux census cost now scales with process leaders and the threads of the target
+group. It reads one validated leader snapshot and skips the second `ps` call
+when every target process has one thread. Multithreaded targets, including a
+zombie leader with live sibling threads, still require a targeted LWP snapshot.
+It never enumerates unrelated threads. Invalid output, an inaccessible PID
+namespace, incomplete terminal thread counts, or a live-to-terminal race between
+snapshots remains unknown. Positive liveness does not require a stable thread
+count. Census output is bounded at 1 MiB, with byte validation before parsing.
+
+The observer uses the task count and one-minute load from `/proc/loadavg` as
+cheap scheduling hints. Its budget is
+`min(8, 3 + floor(tasks / 2048) + floor(load / 16))` seconds, or five seconds
+when those hints are unavailable or malformed. These hints affect waiting time
+only; they never establish process presence, absence, identity, or health.
+For the reported approximately 4,800 tasks and load 47 this gives seven seconds,
+providing headroom above the reported 0.7–1.2-second census and helper startup.
+There is no host-wide process enumeration merely to choose a timeout.
+
+The relevant deadline hierarchy is:
+
+| Operation | Budget and retry rule |
+| --- | --- |
+| Linux process identity before admission | Targeted `/proc/<pid>/stat` reads with namespace, boot and start-time fencing; no full census |
+| Census and scope manager snapshots | 3–8 seconds on Linux; five-second fallback; clipped to the enclosing monotonic deadline |
+| Priority enforcement before admission | Five seconds for `renice`, adaptive observation budget for priority verification; both consume the setup deadline |
+| Policy slice checks and scope creation | Five seconds per control exchange; scope creation is not automatically replayed |
+| Scope binding before receipt publication | At most three unavailable observations within 30 seconds and the overall setup deadline |
+| Supervisor admission | At most three unavailable scope observations within the same 60-second setup deadline; gate stays closed and child/receipt identity is rechecked |
+| Cancellation and completion verification | One 30-second monotonic observer budget shared by census, witnesses, scope operations and retries; stop after three consecutive unknown post-kill observations |
+| Fresh SSH cleanup | 45 seconds including connection and response draining |
+| Daemon cancellation | 60 seconds for all termination stages; default remote command allowance is 45 seconds |
+| Cancellation CLI response | 75 seconds; large bulk cancellations may continue in their daemon-owned task after client timeout |
+| Process-observation recovery | Dedicated supervised no-op: 60-second setup, five-second payload, shared cleanup budget, 120-second total SSH allowance |
+| Recovery capability inventory | At least 25 seconds each for connection and inventory when process-observation recovery is required; the enclosing recovery deadline includes both plus the 120-second lifecycle allowance |
+| Final recovery canary | At least 25 seconds each for connection and command, within a separate 50-second default allowance; telemetry freshness is checked after the lifecycle probe |
+| Diagnostic/deadline marker delivery | One second, best effort; delivery never grants completion authority |
+
+These are bounded control and transport budgets, not a promise that an
+unresponsive kernel schedules a shell at an exact instant. Expiry retains
+unknown state. Retrying an observation does not restart its enclosing deadline,
+relaunch the payload, or reissue a side-effecting scope-creation request.
+
+An unconfirmed Linux/macOS execution now reports a separate, owner-bound
+`process_observation` failure to the daemon. The daemon immediately excludes
+that endpoint from scheduling and persists temporary bypass, without changing
+administrator intent, marking the build complete, or releasing its slots.
+Reports for the same incident are deduplicated; new failures retain recovery
+backoff. A late report for a replaced worker endpoint is rejected.
+
+A verified refusal before payload admission also reports process-observation
+failure before releasing its proven unstarted job. That safe release does not
+clear the worker bypass. Failed standalone cancellation reports the same health
+condition when remote termination is unconfirmed; a local wrapper-cleanup error
+after authenticated remote termination does not misclassify the worker.
+
+Ordinary heartbeat, storage and telemetry success cannot clear this bypass.
+Recovery must run a real supervised no-op using the current receiver policy,
+pass admission and the full census/cleanup proof, and then satisfy the existing
+recovery/canary policy. The process-observation requirement survives daemon
+restart and later SSH or disk-failure classifications. Recovery of worker
+eligibility does **not** settle previously retained jobs: inspect and recover
+each original job identity separately. Failed recovery probes retain their
+private `rch-process-health.*` receipt directories for diagnosis.
+
+Regression commands (Linux, with procfs mounted in the active PID namespace):
+
+```bash
+python3 rch-common/tests/remote_scoped_launch.py -v
+python3 rch-common/tests/remote_process_platform.py -v
+python3 rch-common/tests/control_deadlines.py -v
+cargo test -p rch-common --test remote_process_threads --test remote_process_escalation
+cargo test -p rchd process_observation
+cargo test -p rchd census_quarantine
+```
+
+The platform suite includes deterministic large-census fixtures and injected
+timeout failures. Its opt-in native stress fixture creates 2,350 sleeping
+processes with approximately 4,800 threads; run it only where that process and
+memory headroom is available:
+
+```bash
+RCH_TEST_PROCESS_STRESS=1 RCH_TEST_STRESS_PROCESSES=2350 \
+  python3 rch-common/tests/remote_process_platform.py NativeProcessStress -v
+```
+
 **CPU overloaded:** drain the worker so it stops taking new work; it rejoins on
 `enable`. Do not kill processes blindly.
 ```bash

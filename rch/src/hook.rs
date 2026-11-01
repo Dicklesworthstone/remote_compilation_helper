@@ -448,6 +448,14 @@ fn is_remote_execution_unconfirmed(error: &anyhow::Error) -> bool {
         .is_some()
 }
 
+fn is_remote_process_observation_failure(error: &anyhow::Error) -> bool {
+    // A verified setup refusal proves this workload never started, but still
+    // demonstrates that the worker cannot safely admit another workload.
+    // Health eligibility must not change its independent release/replay proof.
+    is_remote_execution_unconfirmed(error)
+        || error.is::<crate::transfer::RemoteProcessSetupUnavailable>()
+}
+
 fn remote_failure_exit_code(error: &anyhow::Error) -> i32 {
     if is_remote_execution_unconfirmed(error) {
         return EXIT_BUILD_ERROR;
@@ -5555,6 +5563,28 @@ pub async fn run_exec(
         // A worker-caused failure must not warm that worker's cache for the
         // project (review of GH #81), or the next build is routed back to it.
         let release_faults = remote_release_faults(&result, &worker.id);
+        // Report while this build still authenticates the worker association.
+        // A proven, gated setup refusal can then release normally; its worker
+        // remains ineligible until an actual lifecycle probe succeeds.
+        // Windows has native Job Object ownership and no POSIX recovery probe.
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(is_remote_process_observation_failure)
+            && !worker
+                .declared_os
+                .as_deref()
+                .is_some_and(|os| os.eq_ignore_ascii_case("windows"))
+            && let Err(error) = daemon_ipc::report_process_observation_failure(
+                &config.general.socket_path,
+                &worker.id,
+                remote_build_id,
+                Some(&wrapper_id),
+            )
+            .await
+        {
+            warn!(worker = %worker.id, %error, "Could not persist process-observation bypass");
+        }
         let release_acknowledged = if retain_unconfirmed_ownership {
             warn!(
                 "Remote completion unconfirmed; retaining build {} ownership",
@@ -6979,6 +7009,27 @@ async fn handle_selection_response(
         timing
     });
     let release_faults = remote_release_faults(&result, &worker.id);
+    // Keep the active owner available to authenticate this health report even
+    // when a verified pre-execution refusal permits the following release.
+    if result
+        .as_ref()
+        .err()
+        .is_some_and(is_remote_process_observation_failure)
+        && !worker
+            .declared_os
+            .as_deref()
+            .is_some_and(|os| os.eq_ignore_ascii_case("windows"))
+        && let Some(build_id) = response.build_id
+        && let Err(error) = daemon_ipc::report_process_observation_failure(
+            &config.general.socket_path,
+            &worker.id,
+            build_id,
+            None,
+        )
+        .await
+    {
+        warn!(worker = %worker.id, %error, "Could not persist process-observation bypass");
+    }
     if retain_unconfirmed_ownership {
         warn!(
             "Remote completion unconfirmed; retaining worker {} ownership",

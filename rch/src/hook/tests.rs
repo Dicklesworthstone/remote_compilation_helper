@@ -8511,6 +8511,7 @@ fn test_unconfirmed_remote_execution_retains_ownership_and_never_falls_back() {
         .context(crate::transfer::RemoteExecutionUnconfirmed),
     ] {
         assert!(is_remote_execution_unconfirmed(&error));
+        assert!(is_remote_process_observation_failure(&error));
         assert_eq!(
             classify_remote_pipeline_failure(&error),
             RemotePipelineFailurePolicy::FailClosedNoLocalFallback
@@ -8526,6 +8527,47 @@ fn test_unconfirmed_remote_execution_retains_ownership_and_never_falls_back() {
         classify_remote_pipeline_failure(&setup),
         RemotePipelineFailurePolicy::AllowLocalFallback,
         "verified setup refusal can release ownership and run locally"
+    );
+}
+
+#[test]
+fn process_setup_refusal_changes_health_without_changing_release_or_replay_proof() {
+    let _guard = test_guard!();
+    for error in [
+        anyhow::Error::new(crate::transfer::RemoteProcessSetupUnavailable),
+        anyhow::Error::new(crate::transfer::RemoteProcessSetupUnavailable)
+            .context("verified pre-workload refusal")
+            .context("remote pipeline failed"),
+    ] {
+        assert!(is_remote_process_observation_failure(&error));
+        assert!(!is_remote_execution_unconfirmed(&error));
+        assert_eq!(
+            classify_remote_pipeline_failure(&error),
+            RemotePipelineFailurePolicy::AllowLocalFallback,
+            "a health report must not retain a proven unstarted workload"
+        );
+    }
+
+    for error in [
+        anyhow::anyhow!("RCH_WORKER_POLICY_REFUSED:scope_cleanup_prerequisites"),
+        anyhow::anyhow!("attempt_IDENTITY_UNAVAILABLE"),
+        anyhow::anyhow!(crate::transfer::RemoteProcessSetupUnavailable.to_string()),
+        anyhow::anyhow!("Command timed out after 10s"),
+    ] {
+        assert!(
+            !is_remote_process_observation_failure(&error),
+            "text alone must not authenticate a worker lifecycle failure: {error}"
+        );
+    }
+
+    let unconfirmed = anyhow::Error::new(crate::transfer::RemoteProcessSetupUnavailable)
+        .context(crate::transfer::RemoteExecutionUnconfirmed);
+    assert!(is_remote_process_observation_failure(&unconfirmed));
+    assert!(is_remote_execution_unconfirmed(&unconfirmed));
+    assert_eq!(
+        classify_remote_pipeline_failure(&unconfirmed),
+        RemotePipelineFailurePolicy::FailClosedNoLocalFallback,
+        "ownership uncertainty always overrides a setup refusal"
     );
 }
 

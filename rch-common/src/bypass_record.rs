@@ -87,6 +87,9 @@ pub enum BypassFailureClass {
     CircuitBreaker,
     /// Worker OS/architecture does not match the build target.
     OsArchMismatch,
+    /// Remote process admission/completion could not be observed reliably.
+    /// SSH reachability alone cannot clear this failure (issue #129).
+    ProcessObservation,
 }
 
 impl BypassFailureClass {
@@ -102,6 +105,7 @@ impl BypassFailureClass {
         Self::ArtifactRetrieval,
         Self::CircuitBreaker,
         Self::OsArchMismatch,
+        Self::ProcessObservation,
     ];
 
     /// Stable `snake_case` wire identifier (matches the serde form).
@@ -117,6 +121,7 @@ impl BypassFailureClass {
             Self::ArtifactRetrieval => "artifact_retrieval",
             Self::CircuitBreaker => "circuit_breaker",
             Self::OsArchMismatch => "os_arch_mismatch",
+            Self::ProcessObservation => "process_observation",
         }
     }
 
@@ -133,6 +138,7 @@ impl BypassFailureClass {
             Self::ArtifactRetrieval => "artifact retrieval failure",
             Self::CircuitBreaker => "circuit breaker open",
             Self::OsArchMismatch => "OS/arch mismatch",
+            Self::ProcessObservation => "process admission/completion unconfirmed",
         }
     }
 
@@ -155,6 +161,7 @@ impl BypassFailureClass {
             Self::ArtifactRetrieval => IncidentReasonCode::ArtifactMiss,
             Self::CircuitBreaker => IncidentReasonCode::CircuitOpen,
             Self::OsArchMismatch => IncidentReasonCode::OsArchMismatch,
+            Self::ProcessObservation => IncidentReasonCode::HardPreflight,
         }
     }
 
