@@ -653,7 +653,7 @@ pub(super) fn managed_clean_overlay_cargo_build_dir(
     let standalone_xwin = matches!(executable, Some("cargo-xwin" | "cargo-xwin.exe"));
     anyhow::ensure!(
         standalone_xwin || matches!(executable, Some("cargo" | "cargo.exe")),
-        "managed clean-overlay build directory requires Cargo or an exact xwin build"
+        "managed clean-overlay build directory requires Cargo or an exact xwin compilation"
     );
     let mut index = cargo_index + 1;
     if !standalone_xwin
@@ -693,9 +693,12 @@ pub(super) fn managed_clean_overlay_cargo_build_dir(
         .ok_or_else(|| anyhow::anyhow!("missing Cargo subcommand"))?;
     let xwin = standalone_xwin || subcommand == "xwin";
     if xwin {
+        // Match the exact plugin entry points used by classification and
+        // worker admission. Check and Clippy need the same managed cache
+        // binding as build, including placement before compiler arguments.
         anyhow::ensure!(
-            rch_common::patterns::is_cargo_xwin_build(command),
-            "managed xwin requires an exact classified xwin build"
+            rch_common::patterns::cargo_xwin_compilation_kind(command).is_some(),
+            "managed xwin requires an exact classified build, check, or clippy command"
         );
         if subcommand == "xwin" {
             index += 1;
@@ -2779,36 +2782,92 @@ mod managed_build_dir_tests {
     }
 
     #[test]
-    fn managed_xwin_build_preserves_plugin_argv_and_original_output_policy() {
-        for command in [
-            "cargo xwin build --release --target=x86_64-pc-windows-msvc --bin cli",
-            "cargo +nightly xwin build --release '--target=aarch64-pc-windows-msvc' --bin cli",
-            "cargo-xwin build --release --target=x86_64-pc-windows-msvc --bin cli",
-            "cargo-xwin xwin build --release --target=x86_64-pc-windows-msvc --bin cli",
+    fn managed_xwin_compilations_preserve_plugin_argv_and_original_output_policy() {
+        use rch_common::CompilationKind;
+
+        for (subcommand, kind, arguments) in [
+            (
+                "build",
+                CompilationKind::CargoBuild,
+                "--release --target=x86_64-pc-windows-msvc --bin cli",
+            ),
+            (
+                "check",
+                CompilationKind::CargoCheck,
+                "--locked --all-targets '--target=aarch64-pc-windows-msvc'",
+            ),
+            (
+                "clippy",
+                CompilationKind::CargoClippy,
+                "--locked --all-targets --target=x86_64-pc-windows-msvc -- -D warnings",
+            ),
         ] {
-            let managed = super::ManagedCargoCommand::new(command, Some("/managed/cache")).unwrap();
-            let original = shell_words::split(command).unwrap();
-            let actual = shell_words::split(managed.execution_command()).unwrap();
-            assert_eq!(&actual[..original.len()], original.as_slice(), "{command}");
-            assert_eq!(actual[original.len()], "--config");
-            assert_eq!(
-                actual[original.len() + 1],
-                "build.build-dir=\"/managed/cache\""
-            );
-            assert_eq!(actual.len(), original.len() + 2);
-            assert_eq!(managed.policy_command(), command);
-            assert!(rch_common::patterns::is_cargo_xwin_build(
-                managed.policy_command()
-            ));
+            for prefix in [
+                "cargo xwin",
+                "cargo +nightly xwin",
+                "cargo --color never --config build.jobs=2 xwin",
+                "env -- CARGO_HOME=/selected/cargo-home cargo xwin",
+                "cargo-xwin",
+                "cargo-xwin xwin",
+                "/home/ubuntu/.local/bin/cargo-xwin xwin",
+            ] {
+                let command = format!("{prefix} {subcommand} {arguments}");
+                let classification = rch_common::patterns::classify_command(&command);
+                assert!(classification.is_compilation, "{command}");
+                assert_eq!(classification.kind, Some(kind), "{command}");
+                let managed =
+                    super::ManagedCargoCommand::new(&command, Some("/managed/cache")).unwrap();
+                let original = shell_words::split(&command).unwrap();
+                let actual = shell_words::split(managed.execution_command()).unwrap();
+                let (_, cargo_index) = managed_clean_overlay_cargo_tokens(&command).unwrap();
+                let separator = original[cargo_index + 1..]
+                    .iter()
+                    .position(|token| token == "--")
+                    .map_or(original.len(), |offset| cargo_index + 1 + offset);
+                assert_eq!(&actual[..separator], &original[..separator], "{command}");
+                assert_eq!(actual[separator], "--config", "{command}");
+                assert_eq!(
+                    actual[separator + 1],
+                    "build.build-dir=\"/managed/cache\"",
+                    "{command}"
+                );
+                assert_eq!(
+                    &actual[separator + 2..],
+                    &original[separator..],
+                    "{command}"
+                );
+                assert_eq!(actual.len(), original.len() + 2, "{command}");
+                assert_eq!(managed.policy_command(), command);
+                assert_eq!(
+                    rch_common::patterns::cargo_xwin_compilation_kind(managed.policy_command()),
+                    Some(kind),
+                    "{command}"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn managed_xwin_compilations_preserve_refusals() {
         for command in [
-            "cargo xwin check --bin cli",
             "cargo xwin build --help",
+            "cargo xwin check --help",
+            "cargo xwin clippy --version",
+            "cargo-xwin xwin check -h",
+            "cargo-xwin clippy -V",
             "cargo xwin install cli",
+            "cargo xwin cache clear",
+            "cargo xwin publish --dry-run",
+            "cargo xwin check-extra --bin cli",
+            "cargo xwin 'check' --bin cli",
             "cargo-xwin +nightly build --bin cli",
             "cargo-xwin xwin test --bin cli",
             "cargo xwin build --build-dir=/unmanaged",
+            "cargo xwin check --build-dir /unmanaged",
+            "cargo-xwin clippy --build-dir=/unmanaged -- -D warnings",
             "cargo xwin build --bin cli; echo surprise",
+            "cargo xwin check && cargo check",
+            "cargo xwin clippy | cat",
         ] {
             assert!(
                 super::ManagedCargoCommand::new(command, Some("/managed/cache")).is_err(),
