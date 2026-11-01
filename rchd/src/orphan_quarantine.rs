@@ -13,9 +13,11 @@
 //! once its group is gone, a build's own completion and a reboot remove it
 //! too, and without a record nothing can ever re-probe (bd-sh0tr: vmi1156319
 //! sat disabled on csd for 41 h with no record left). Still-alive and channel
-//! failures keep it, and legacy or operator-reasoned disables are never
-//! touched.
+//! failures keep it. Process evidence is bound to its original SSH endpoint;
+//! old reasons require that endpoint to be proven from durable active-build
+//! ownership. Unproven legacy and operator-reasoned disables stay untouched.
 
+use crate::history::BuildHistory;
 use crate::workers::WorkerPool;
 use rch_common::bypass_record::{AdminDisableRecord, AdminDisableStore};
 use rch_common::orphan_quarantine::{
@@ -23,7 +25,7 @@ use rch_common::orphan_quarantine::{
     probe_verified_dead,
 };
 use rch_common::ssh::{SshClient, SshOptions};
-use rch_common::{WorkerConfig, WorkerId};
+use rch_common::{BuildLocation, WorkerConfig, WorkerId};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -73,6 +75,7 @@ impl OrphanProber for SshOrphanProber {
 pub struct OrphanQuarantineService<P: OrphanProber> {
     pool: WorkerPool,
     store: Arc<Mutex<AdminDisableStore>>,
+    history: Option<Arc<BuildHistory>>,
     prober: P,
     interval: Duration,
     evaluation: Mutex<()>,
@@ -88,10 +91,39 @@ impl<P: OrphanProber + 'static> OrphanQuarantineService<P> {
         Self {
             pool,
             store,
+            history: None,
             prober,
             interval,
             evaluation: Mutex::new(()),
         }
+    }
+
+    /// Older clients recorded only a build ID and process-record path. The
+    /// admitted endpoint in durable ownership can supply their missing proof;
+    /// today's worker configuration cannot. Recovery never completes the build
+    /// or releases its retained slot reservation.
+    pub fn with_history(mut self, history: Arc<BuildHistory>) -> Self {
+        self.history = Some(history);
+        self
+    }
+
+    fn proven_probe_target(
+        &self,
+        worker_id: &str,
+        evidence: &QuarantineEvidence,
+    ) -> Option<WorkerConfig> {
+        if let Some(endpoint) = evidence.endpoint.as_ref() {
+            return (endpoint.id.as_str() == worker_id).then(|| endpoint.worker_config());
+        }
+        let active = self.history.as_ref()?.active_build(evidence.build_id)?;
+        if active.worker_id != worker_id
+            || active.location != BuildLocation::Remote
+            || active.remote_pgid_file.as_deref() != Some(evidence.pgid_file.as_str())
+        {
+            return None;
+        }
+        let endpoint = active.worker_endpoint?;
+        (endpoint.config.id.as_str() == worker_id).then_some(endpoint.config)
     }
 
     pub fn start(self) -> JoinHandle<()> {
@@ -132,6 +164,14 @@ impl<P: OrphanProber + 'static> OrphanQuarantineService<P> {
         let mut cleared = 0;
         for (record, evidence) in candidates {
             let worker_id = &record.worker_id;
+            // This is the probe's target authority. The current inventory
+            // snapshot below fences administrative changes and publication;
+            // it cannot prove where a historical process was launched.
+            let Some(config) = self.proven_probe_target(worker_id, &evidence) else {
+                debug!(worker = %worker_id, build_id = evidence.build_id,
+                    "orphan quarantine has no proven execution endpoint; keeping");
+                continue;
+            };
             let Some(worker) = self.pool.get(&WorkerId::new(worker_id)).await else {
                 continue;
             };
@@ -156,7 +196,6 @@ impl<P: OrphanProber + 'static> OrphanQuarantineService<P> {
             if !revision.is_current() {
                 continue;
             }
-            let config = endpoint.config.clone();
             drop(endpoint_guard);
             drop(store);
             if rch_common::declared_os(&config.tags).as_deref() == Some("windows") {
@@ -216,8 +255,10 @@ impl<P: OrphanProber + 'static> OrphanQuarantineService<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::disk_pressure::DiskHeadroomAdmission;
     use rch_common::bypass_record::AdminDisableRecord;
-    use rch_common::orphan_quarantine::quarantine_reason;
+    use rch_common::orphan_quarantine::{QuarantineEndpoint, quarantine_reason};
+    use rch_common::{BuildHeartbeatPhase, BuildHeartbeatRequest};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct FakeProber {
@@ -253,6 +294,13 @@ mod tests {
         QuarantineEvidence {
             build_id: 42,
             pgid_file: "/data/projects/app/.rch-run/42.pgid".into(),
+            endpoint: Some(QuarantineEndpoint {
+                id: WorkerId::new("w1"),
+                host: "w1.invalid".into(),
+                user: "u".into(),
+                identity_file: "/dev/null".into(),
+                declared_os: None,
+            }),
         }
     }
 
@@ -294,6 +342,307 @@ mod tests {
             calls: AtomicUsize::new(0),
             overwrite: None,
         }
+    }
+
+    struct RecordingProber {
+        observed: Arc<Mutex<Vec<(QuarantineEndpoint, QuarantineEvidence)>>>,
+        stdout: Option<&'static str>,
+    }
+
+    impl OrphanProber for RecordingProber {
+        async fn probe(
+            &self,
+            worker: WorkerConfig,
+            evidence: QuarantineEvidence,
+        ) -> Option<String> {
+            self.observed
+                .lock()
+                .await
+                .push((QuarantineEndpoint::from_config(&worker), evidence));
+            self.stdout.map(str::to_owned)
+        }
+    }
+
+    async fn legacy_owned_fixture(
+        include_endpoint: bool,
+    ) -> (
+        tempfile::TempDir,
+        WorkerPool,
+        Arc<Mutex<AdminDisableStore>>,
+        Arc<BuildHistory>,
+        QuarantineEvidence,
+    ) {
+        let (dir, pool, store) = fixture(quarantine_reason(None)).await;
+        let worker = pool.get(&WorkerId::new("w1")).await.unwrap();
+        let history =
+            Arc::new(BuildHistory::new(10).with_persistence(dir.path().join("history.jsonl")));
+        let endpoint = worker.endpoint_snapshot().await;
+        let active = history
+            .try_start_active_build_with_waiter(
+                "quarantined-project".into(),
+                "w1".into(),
+                "cargo build".into(),
+                std::process::id(),
+                Some("quarantined-wrapper".into()),
+                2,
+                BuildLocation::Remote,
+                None,
+                DiskHeadroomAdmission::default(),
+                include_endpoint.then_some(endpoint),
+            )
+            .unwrap()
+            .unwrap();
+        let evidence = QuarantineEvidence {
+            build_id: active.id,
+            pgid_file: format!("/tmp/rch-run/quarantined-project/{}.pgid", active.id),
+            endpoint: None,
+        };
+        history
+            .record_build_heartbeat(BuildHeartbeatRequest {
+                build_id: active.id,
+                worker_id: WorkerId::new("w1"),
+                hook_pid: Some(std::process::id()),
+                local_wrapper_id: Some("quarantined-wrapper".into()),
+                remote_pgid_file: Some(evidence.pgid_file.clone()),
+                phase: BuildHeartbeatPhase::Execute,
+                detail: None,
+                progress_counter: Some(1),
+                progress_percent: None,
+            })
+            .unwrap();
+        assert!(!history.ownership_failed());
+        worker.restore_slots(active.slots).unwrap();
+        let reason = quarantine_reason(Some(&evidence));
+        store
+            .lock()
+            .await
+            .upsert(AdminDisableRecord {
+                worker_id: "w1".into(),
+                reason: Some(reason.clone()),
+                disabled_unix_ms: 1,
+            })
+            .unwrap();
+        worker.disable(Some(reason)).await;
+        (dir, pool, store, history, evidence)
+    }
+
+    #[tokio::test]
+    async fn captured_endpoint_survives_retarget_and_durable_restart() {
+        let original = evidence();
+        let (dir, pool, store) = fixture(quarantine_reason(Some(&original))).await;
+        let id = WorkerId::new("w1");
+        let mut replacement = pool.get(&id).await.unwrap().config.read().await.clone();
+        replacement.host = "replacement.invalid".into();
+        replacement.user = "replacement-user".into();
+        replacement.identity_file = "/keys/replacement".into();
+        replacement.tags = vec!["os:windows".into()];
+        pool.add_worker(replacement.clone()).await;
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let service = OrphanQuarantineService::new(
+            pool,
+            store,
+            RecordingProber {
+                observed: observed.clone(),
+                stdout: None,
+            },
+            ORPHAN_QUARANTINE_CHECK_INTERVAL,
+        );
+        assert_eq!(service.evaluate_once().await, 0);
+        assert_eq!(
+            observed.lock().await.as_slice(),
+            &[(original.endpoint.clone().unwrap(), original.clone())]
+        );
+
+        let store = Arc::new(Mutex::new(AdminDisableStore::load(
+            dir.path().join("admin_disables.json"),
+        )));
+        let pool = WorkerPool::new().with_admin_disable_store(store.clone());
+        pool.add_worker(replacement).await;
+        let service = OrphanQuarantineService::new(
+            pool.clone(),
+            store.clone(),
+            RecordingProber {
+                observed: observed.clone(),
+                stdout: Some("RCH_E104_KILL=verified_dead"),
+            },
+            ORPHAN_QUARANTINE_CHECK_INTERVAL,
+        );
+        assert_eq!(service.evaluate_once().await, 1);
+        assert_eq!(
+            observed.lock().await.as_slice(),
+            &[
+                (original.endpoint.clone().unwrap(), original.clone()),
+                (original.endpoint.clone().unwrap(), original),
+            ]
+        );
+        assert!(!pool.get(&id).await.unwrap().is_disabled().await);
+        assert!(store.lock().await.get("w1").is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_quarantine_uses_exact_durable_owner_without_releasing_build_slots() {
+        for (retarget, restart) in [(false, false), (true, false), (true, true)] {
+            let (dir, pool, store, history, evidence) = legacy_owned_fixture(true).await;
+            let id = WorkerId::new("w1");
+            let original = history.active_build(evidence.build_id).unwrap();
+            let expected_endpoint =
+                QuarantineEndpoint::from_config(&original.worker_endpoint.as_ref().unwrap().config);
+            let mut config = pool.get(&id).await.unwrap().config.read().await.clone();
+            if retarget {
+                config.host = "replacement.invalid".into();
+                config.identity_file = "/keys/replacement".into();
+                pool.add_worker(config.clone()).await;
+            }
+            let (pool, store, history) = if restart {
+                let history = Arc::new(
+                    BuildHistory::load_from_file(&dir.path().join("history.jsonl"), 10).unwrap(),
+                );
+                assert!(
+                    !history
+                        .active_build(evidence.build_id)
+                        .unwrap()
+                        .worker_endpoint
+                        .as_ref()
+                        .unwrap()
+                        .has_runtime_identity()
+                );
+                let store = Arc::new(Mutex::new(AdminDisableStore::load(
+                    dir.path().join("admin_disables.json"),
+                )));
+                let pool = WorkerPool::new().with_admin_disable_store(store.clone());
+                pool.add_worker(config).await;
+                pool.restore_recovered_slots(&id, original.slots)
+                    .await
+                    .unwrap();
+                (pool, store, history)
+            } else {
+                (pool, store, history)
+            };
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let service = OrphanQuarantineService::new(
+                pool.clone(),
+                store.clone(),
+                RecordingProber {
+                    observed: observed.clone(),
+                    stdout: Some("RCH_E104_KILL=verified_dead"),
+                },
+                ORPHAN_QUARANTINE_CHECK_INTERVAL,
+            )
+            .with_history(history.clone());
+            assert_eq!(service.evaluate_once().await, 1);
+            assert_eq!(
+                observed.lock().await.as_slice(),
+                &[(expected_endpoint.clone(), evidence.clone())]
+            );
+            let retained = history.active_build(evidence.build_id).unwrap();
+            assert_eq!(retained.remote_pgid_file, original.remote_pgid_file);
+            assert_eq!(retained.slots, original.slots);
+            assert!(expected_endpoint.matches_config(&retained.worker_endpoint.unwrap().config));
+            let worker = pool.get(&id).await.unwrap();
+            assert_eq!(worker.used_slots(), original.slots);
+            assert!(!worker.is_disabled().await);
+            assert!(store.lock().await.get("w1").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn mismatched_legacy_ownership_and_foreign_endpoint_never_authorize_a_probe() {
+        for mismatch in 0..4 {
+            let (_dir, pool, store, history, mut evidence) =
+                legacy_owned_fixture(mismatch != 0).await;
+            match mismatch {
+                0 => {}
+                1 => evidence.build_id += 1,
+                2 => evidence.pgid_file.push_str(".other"),
+                3 => {
+                    let mut foreign = QuarantineEndpoint::from_config(
+                        &*pool
+                            .get(&WorkerId::new("w1"))
+                            .await
+                            .unwrap()
+                            .config
+                            .read()
+                            .await,
+                    );
+                    foreign.id = WorkerId::new("another-worker");
+                    evidence.endpoint = Some(foreign);
+                }
+                _ => unreachable!(),
+            }
+            let reason = quarantine_reason(Some(&evidence));
+            store
+                .lock()
+                .await
+                .upsert(AdminDisableRecord {
+                    worker_id: "w1".into(),
+                    reason: Some(reason.clone()),
+                    disabled_unix_ms: 1,
+                })
+                .unwrap();
+            let worker = pool.get(&WorkerId::new("w1")).await.unwrap();
+            worker.disable(Some(reason)).await;
+            let service = OrphanQuarantineService::new(
+                pool,
+                store.clone(),
+                prober(Some("RCH_E104_KILL=verified_dead")),
+                ORPHAN_QUARANTINE_CHECK_INTERVAL,
+            )
+            .with_history(history);
+            assert_eq!(service.evaluate_once().await, 0, "mismatch {mismatch}");
+            assert_eq!(service.prober.calls.load(Ordering::SeqCst), 0);
+            assert!(worker.is_disabled().await);
+            assert_eq!(worker.used_slots(), 2);
+            assert!(store.lock().await.get("w1").is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_quarantine_never_probes_an_unproven_replacement_after_retarget_or_restart() {
+        // Old records identify a process, but contain no proof of which SSH
+        // endpoint owned it. The replacement having no such record does not
+        // prove that the original process is gone, regardless of record age.
+        let reason = "e104-timeout-orphan-unverified[build=42]: old client timeout \
+                      (pgid_file=/data/projects/app/.rch-run/42.pgid)"
+            .to_owned();
+        let (dir, pool, store) = fixture(reason.clone()).await;
+        let id = WorkerId::new("w1");
+        let mut replacement = pool.get(&id).await.unwrap().config.read().await.clone();
+        replacement.host = "replacement.invalid".into();
+        pool.add_worker(replacement.clone()).await;
+        let service = OrphanQuarantineService::new(
+            pool.clone(),
+            store.clone(),
+            prober(Some("RCH_E104_KILL=record_absent")),
+            ORPHAN_QUARANTINE_CHECK_INTERVAL,
+        );
+        assert_eq!(service.evaluate_once().await, 0);
+        assert_eq!(service.prober.calls.load(Ordering::SeqCst), 0);
+        assert!(pool.get(&id).await.unwrap().is_disabled().await);
+
+        let restarted_store = Arc::new(Mutex::new(AdminDisableStore::load(
+            dir.path().join("admin_disables.json"),
+        )));
+        let restarted_pool = WorkerPool::new().with_admin_disable_store(restarted_store.clone());
+        restarted_pool.add_worker(replacement).await;
+        let service = OrphanQuarantineService::new(
+            restarted_pool.clone(),
+            restarted_store.clone(),
+            prober(Some("RCH_E104_KILL=verified_dead")),
+            ORPHAN_QUARANTINE_CHECK_INTERVAL,
+        );
+        assert_eq!(service.evaluate_once().await, 0);
+        assert_eq!(service.prober.calls.load(Ordering::SeqCst), 0);
+        assert!(restarted_pool.get(&id).await.unwrap().is_disabled().await);
+        assert_eq!(
+            restarted_store
+                .lock()
+                .await
+                .get("w1")
+                .unwrap()
+                .reason
+                .as_deref(),
+            Some(reason.as_str())
+        );
     }
 
     #[tokio::test]
@@ -511,6 +860,63 @@ mod tests {
             self.started.notify_one();
             std::future::pending().await
         }
+    }
+
+    #[tokio::test]
+    async fn retarget_cancels_inflight_probe_and_next_scan_keeps_original_target() {
+        let original = evidence();
+        let (dir, pool, store) = fixture(quarantine_reason(Some(&original))).await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let canceled = Arc::new(AtomicBool::new(false));
+        let service = Arc::new(OrphanQuarantineService::new(
+            pool.clone(),
+            store.clone(),
+            BlockingProber {
+                started: started.clone(),
+                canceled: canceled.clone(),
+            },
+            ORPHAN_QUARANTINE_CHECK_INTERVAL,
+        ));
+        let task = {
+            let service = service.clone();
+            tokio::spawn(async move { service.evaluate_once().await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("bound quarantine must begin its evidence probe");
+        let worker = pool.get(&WorkerId::new("w1")).await.unwrap();
+        let mut replacement = worker.config.read().await.clone();
+        replacement.host = "replacement.invalid".into();
+        pool.add_worker(replacement).await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect("retarget must revoke the in-flight publication permit")
+                .unwrap(),
+            0
+        );
+        assert!(canceled.load(Ordering::SeqCst));
+        assert!(worker.is_disabled().await);
+        assert!(
+            AdminDisableStore::load(dir.path().join("admin_disables.json"))
+                .get("w1")
+                .is_some()
+        );
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let next = OrphanQuarantineService::new(
+            pool,
+            store,
+            RecordingProber {
+                observed: observed.clone(),
+                stdout: Some("RCH_E104_KILL=verified_dead"),
+            },
+            ORPHAN_QUARANTINE_CHECK_INTERVAL,
+        );
+        assert_eq!(next.evaluate_once().await, 1);
+        assert_eq!(
+            observed.lock().await.as_slice(),
+            &[(original.endpoint.clone().unwrap(), original)]
+        );
     }
 
     #[tokio::test]

@@ -12,6 +12,8 @@
 //! the worker-side record has stayed absent past a grace period (see rchd's
 //! `orphan_quarantine`). Still alive and channel failures keep it.
 
+use crate::{WorkerConfig, WorkerId, declared_os, os_tag};
+use serde::{Deserialize, Serialize};
 use shell_escape::escape;
 use std::borrow::Cow;
 
@@ -19,13 +21,68 @@ use std::borrow::Cow;
 pub const E104_QUARANTINE_TAG: &str = "e104-timeout-orphan-unverified";
 
 const EVIDENCE_MARKER: &str = " (pgid_file=";
+const BOUND_EVIDENCE_MARKER: &str = " (evidence_v1=";
+
+/// Immutable SSH coordinates of the endpoint that owned the timed-out build.
+/// Capacity and descriptive tags are not endpoint identity; these fields use
+/// the same identity semantics as the SSH pool and daemon admission snapshots.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuarantineEndpoint {
+    pub id: WorkerId,
+    pub host: String,
+    pub user: String,
+    pub identity_file: String,
+    pub declared_os: Option<String>,
+}
+
+impl QuarantineEndpoint {
+    pub fn from_config(config: &WorkerConfig) -> Self {
+        Self {
+            id: config.id.clone(),
+            host: config.host.clone(),
+            user: config.user.clone(),
+            identity_file: config.identity_file.clone(),
+            declared_os: declared_os(&config.tags),
+        }
+    }
+
+    pub fn matches_config(&self, config: &WorkerConfig) -> bool {
+        self == &Self::from_config(config)
+    }
+
+    /// Build a transport-only configuration. This must never be inserted into
+    /// scheduling inventory: it deliberately carries no capacity or tools.
+    pub fn worker_config(&self) -> WorkerConfig {
+        WorkerConfig {
+            id: self.id.clone(),
+            host: self.host.clone(),
+            user: self.user.clone(),
+            identity_file: self.identity_file.clone(),
+            total_slots: 0,
+            priority: 0,
+            tags: self
+                .declared_os
+                .as_deref()
+                .map(os_tag)
+                .into_iter()
+                .collect(),
+            tools: Vec::new(),
+        }
+    }
+}
 
 /// What the daemon needs to re-probe a quarantined build's process group.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QuarantineEvidence {
     pub build_id: u64,
     /// Absolute path of the worker-side `RCH_REMOTE_PROCESS_V1` record.
     pub pgid_file: String,
+    /// The admitted execution endpoint. Older reasons have no coordinates;
+    /// their target must be proven from durable build ownership before dialing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<QuarantineEndpoint>,
 }
 
 /// POSIX `sh` script that SIGKILLs the process group recorded in `pgid_file`
@@ -74,6 +131,16 @@ pub fn quarantine_reason(evidence: Option<&QuarantineEvidence>) -> String {
     const HUMAN: &str = "remote build process group not verified dead after client timeout; \
                          possible orphan holding the project's Cargo target lock";
     match evidence {
+        Some(evidence) if evidence.endpoint.is_some() => {
+            // A separate version prefix keeps old daemons from interpreting
+            // this as legacy evidence and choosing today's worker endpoint.
+            let json = serde_json::to_string(evidence)
+                .expect("quarantine evidence contains only strings and integers");
+            format!(
+                "{E104_QUARANTINE_TAG}[v1]: {HUMAN}; rchd clears this once the group is \
+                 verified dead{BOUND_EVIDENCE_MARKER}{json})"
+            )
+        }
         Some(evidence) => format!(
             "{E104_QUARANTINE_TAG}[build={}]: {HUMAN}; rchd clears this once the group is \
              verified dead{EVIDENCE_MARKER}{})",
@@ -84,19 +151,33 @@ pub fn quarantine_reason(evidence: Option<&QuarantineEvidence>) -> String {
 }
 
 /// Recover the evidence from a reason written by [`quarantine_reason`].
-/// Legacy reasons (no evidence) and unrelated reasons return `None`.
+/// Legacy process evidence has no endpoint and must not authorize a probe on
+/// its own. Reasons without process evidence and unrelated reasons return
+/// `None`; malformed versioned reasons never fall back to legacy parsing.
 pub fn parse_quarantine_reason(reason: &str) -> Option<QuarantineEvidence> {
-    let rest = reason
-        .strip_prefix(E104_QUARANTINE_TAG)?
-        .strip_prefix("[build=")?;
+    let rest = reason.strip_prefix(E104_QUARANTINE_TAG)?;
+    if let Some(rest) = rest.strip_prefix("[v1]:") {
+        let (_, json) = rest.split_once(BOUND_EVIDENCE_MARKER)?;
+        let evidence: QuarantineEvidence = serde_json::from_str(json.strip_suffix(')')?).ok()?;
+        let endpoint = evidence.endpoint.as_ref()?;
+        return (valid_record_path(&evidence.pgid_file)
+            && endpoint.matches_config(&endpoint.worker_config()))
+        .then_some(evidence);
+    }
+    let rest = rest.strip_prefix("[build=")?;
     let (build, rest) = rest.split_once("]:")?;
     let build_id = build.parse().ok()?;
     let (_, file) = rest.rsplit_once(EVIDENCE_MARKER)?;
     let pgid_file = file.strip_suffix(')')?;
-    (pgid_file.starts_with('/') && !pgid_file.contains('\n')).then(|| QuarantineEvidence {
+    valid_record_path(pgid_file).then(|| QuarantineEvidence {
         build_id,
         pgid_file: pgid_file.to_owned(),
+        endpoint: None,
     })
+}
+
+fn valid_record_path(path: &str) -> bool {
+    path.starts_with('/') && !path.contains(['\n', '\r', '\0'])
 }
 
 #[cfg(test)]
@@ -123,17 +204,87 @@ mod tests {
 
     #[test]
     fn reason_round_trips_evidence_including_awkward_paths() {
+        let worker = WorkerConfig {
+            id: WorkerId::new("worker-a"),
+            host: "original.invalid".into(),
+            user: "build-user".into(),
+            identity_file: "/keys/one (evidence_v1=\"quoted\") key".into(),
+            tags: vec!["fast".into(), "os:Linux".into()],
+            ..WorkerConfig::default()
+        };
         for path in [
             "/data/projects/app/.rch-run/42.pgid",
             "/data/tmp/rch/we ird (x)]: y/42.pgid",
+            "/data/tmp/rch/embedded (evidence_v1=\"x\")/42.pgid",
         ] {
-            let evidence = QuarantineEvidence {
-                build_id: 42,
-                pgid_file: path.to_owned(),
+            for endpoint in [None, Some(QuarantineEndpoint::from_config(&worker))] {
+                let evidence = QuarantineEvidence {
+                    build_id: 42,
+                    pgid_file: path.to_owned(),
+                    endpoint,
+                };
+                let reason = quarantine_reason(Some(&evidence));
+                assert!(reason.starts_with(E104_QUARANTINE_TAG), "{reason}");
+                assert_eq!(parse_quarantine_reason(&reason), Some(evidence));
+            }
+        }
+    }
+
+    #[test]
+    fn endpoint_identity_uses_only_admitted_ssh_coordinates() {
+        let mut worker = WorkerConfig {
+            tags: vec!["os:LINUX".into(), "fast".into()],
+            ..WorkerConfig::default()
+        };
+        let endpoint = QuarantineEndpoint::from_config(&worker);
+        worker.total_slots += 8;
+        worker.priority += 10;
+        worker.tags = vec!["os:linux".into(), "other-description".into()];
+        assert!(endpoint.matches_config(&worker));
+        assert!(endpoint.matches_config(&endpoint.worker_config()));
+        assert_eq!(endpoint.worker_config().total_slots, 0);
+        for field in 0..5 {
+            let mut replacement = worker.clone();
+            match field {
+                0 => replacement.id = WorkerId::new("replacement"),
+                1 => replacement.host = "replacement.invalid".into(),
+                2 => replacement.user = "replacement".into(),
+                3 => replacement.identity_file = "/keys/replacement".into(),
+                4 => replacement.tags = vec!["os:windows".into()],
+                _ => unreachable!(),
+            }
+            assert!(!endpoint.matches_config(&replacement), "field {field}");
+        }
+    }
+
+    #[test]
+    fn malformed_versioned_evidence_never_falls_back_to_an_unbound_probe() {
+        let evidence = QuarantineEvidence {
+            build_id: 42,
+            pgid_file: "/tmp/rch-run/42.pgid".into(),
+            endpoint: Some(QuarantineEndpoint::from_config(&WorkerConfig::default())),
+        };
+        let reason = quarantine_reason(Some(&evidence));
+        assert!(reason.starts_with(&format!("{E104_QUARANTINE_TAG}[v1]:")));
+        assert!(parse_quarantine_reason(&reason.replace("[v1]:", "[v2]:")).is_none());
+        let encoded = serde_json::to_value(&evidence).unwrap();
+        for field in 0..5 {
+            let mut malformed = encoded.clone();
+            match field {
+                0 => {
+                    malformed.as_object_mut().unwrap().remove("endpoint");
+                }
+                1 => malformed["pgid_file"] = serde_json::json!("relative/42.pgid"),
+                2 => malformed["endpoint"]["declared_os"] = serde_json::json!(" WINDOWS "),
+                3 => {
+                    malformed["pgid_file"] =
+                        serde_json::json!("/tmp/rch-run/42.pgid\n (pgid_file=/replacement)");
+                }
+                4 => malformed["unknown_authority"] = serde_json::json!("replacement"),
+                _ => unreachable!(),
             };
-            let reason = quarantine_reason(Some(&evidence));
-            assert!(reason.starts_with(E104_QUARANTINE_TAG), "{reason}");
-            assert_eq!(parse_quarantine_reason(&reason), Some(evidence));
+            let reason = format!("{E104_QUARANTINE_TAG}[v1]: x{BOUND_EVIDENCE_MARKER}{malformed})");
+            assert!(parse_quarantine_reason(&reason).is_none(), "{reason}");
         }
     }
 

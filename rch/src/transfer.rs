@@ -7806,6 +7806,11 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                                 &self.remote_path(),
                                 build_id,
                             ),
+                            endpoint: Some(
+                                rch_common::orphan_quarantine::QuarantineEndpoint::from_config(
+                                    worker,
+                                ),
+                            ),
                         }
                     })
                 })

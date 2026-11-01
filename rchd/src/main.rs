@@ -1596,6 +1596,7 @@ async fn main() -> Result<()> {
         orphan_quarantine::SshOrphanProber,
         orphan_quarantine::ORPHAN_QUARANTINE_CHECK_INTERVAL,
     )
+    .with_history(context.history.clone())
     .start();
 
     let metrics_pool = worker_pool.clone();
