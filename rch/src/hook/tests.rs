@@ -2009,6 +2009,204 @@ async fn commit_clean_overlay_submodule_fixture(root: &Path) -> String {
     git_output(root, &["rev-parse", "HEAD"]).await.unwrap()
 }
 
+#[tokio::test]
+async fn clean_overlay_git_blob_batch_protocol_preserves_binary_bytes_and_bounds() {
+    let first = "a".repeat(40);
+    let second = "b".repeat(64);
+    let first_bytes = b"\0\nraw\xff\n";
+    let second_bytes = b"tail\0";
+    let mut wire = format!("{first} blob {}\n", first_bytes.len()).into_bytes();
+    wire.extend_from_slice(first_bytes);
+    wire.extend_from_slice(format!("\n{second} blob {}\n", second_bytes.len()).as_bytes());
+    wire.extend_from_slice(second_bytes);
+    wire.push(b'\n');
+    let ids = vec![first.clone(), second.clone()];
+    let limit = (first_bytes.len() + second_bytes.len()) as u64;
+    let blobs = read_git_blob_batch(wire.as_slice(), &ids, limit)
+        .await
+        .unwrap();
+    assert_eq!(blobs[&first], first_bytes);
+    assert_eq!(blobs[&second], second_bytes);
+    assert!(
+        read_git_blob_batch(wire.as_slice(), &ids, limit - 1)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("source-content bound")
+    );
+    assert!(
+        read_git_blob_batch(&b""[..], &[], 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(read_git_blob_batch(&b"extra"[..], &[], 0).await.is_err());
+    let empty = format!("{first} blob 0\n\n");
+    assert!(
+        read_git_blob_batch(empty.as_bytes(), &[first.clone()], 0)
+            .await
+            .unwrap()[&first]
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn clean_overlay_git_blob_batch_protocol_refuses_ambiguous_or_incomplete_frames() {
+    let id = "a".repeat(40);
+    let other = "b".repeat(40);
+    let frames = [
+        format!("{other} blob 1\nx\n"),
+        format!("{id} tree 1\nx\n"),
+        format!("{id} missing\n"),
+        format!("{id} blob -1\n"),
+        format!("{id} blob +1\nx\n"),
+        format!("{id} blob 01\nx\n"),
+        format!("{id} blob 18446744073709551616\n"),
+        format!("{id} blob 1 extra\nx\n"),
+        format!("{id}  blob 1\nx\n"),
+        format!("{id} blob 1\r\nx\n"),
+        format!("{id} blob 1"),
+        format!("{id} blob 2\nx"),
+        format!("{id} blob 1\nx"),
+        format!("{id} blob 1\nx!"),
+        format!("{id} blob 1\nx\nextra"),
+        format!("{id} blob 1\nx\n{other} blob 1\ny\n"),
+        "x".repeat(129),
+    ];
+    for frame in frames {
+        assert!(
+            read_git_blob_batch(frame.as_bytes(), &[id.clone()], 16)
+                .await
+                .is_err(),
+            "accepted malformed frame {frame:?}"
+        );
+    }
+    let non_utf8 = [0xff, b'\n'];
+    assert!(
+        read_git_blob_batch(non_utf8.as_slice(), &[id], 16)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn clean_overlay_git_blob_batch_real_git_deduplicates_and_refuses_nonblobs() {
+    let _guard = test_guard!();
+    let root = init_clean_overlay_test_repo().keep();
+    let bytes = b"raw Git blob\0with newline\n\xff";
+    std::fs::write(root.join("binary.data"), bytes).unwrap();
+    commit_clean_overlay_submodule_fixture(&root).await;
+    let id = git_output(&root, &["rev-parse", "HEAD:binary.data"])
+        .await
+        .unwrap();
+    let blobs = git_blob_batch(&root, &[id.clone(), id.clone()])
+        .await
+        .unwrap();
+    assert_eq!(blobs.len(), 1);
+    assert_eq!(blobs[&id], bytes);
+    for revision in ["HEAD", "HEAD^{tree}"] {
+        let id = git_output(&root, &["rev-parse", revision]).await.unwrap();
+        let error = git_blob_batch(&root, &[id]).await.unwrap_err();
+        assert!(format!("{error:#}").contains("requested blob"), "{error:#}");
+    }
+    let error = git_blob_batch(&root, &["0".repeat(40)]).await.unwrap_err();
+    assert!(format!("{error:#}").contains("missing"), "{error:#}");
+
+    // These requests must be decided before opening a repository.
+    let absent = root.join("not-a-repository");
+    assert!(git_blob_batch(&absent, &[]).await.unwrap().is_empty());
+    for invalid in [
+        "HEAD".to_owned(),
+        format!("{id}\n{id}"),
+        "g".repeat(40),
+        "A".repeat(40),
+    ] {
+        let error = git_blob_batch(&absent, &[invalid]).await.unwrap_err();
+        assert!(
+            error.to_string().contains("canonical hexadecimal"),
+            "{error:#}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn clean_overlay_git_blob_batch_large_inventory_drains_both_pipes() {
+    use rch_common::cargo_path_deps::SelectedCargoEntry;
+
+    let _guard = test_guard!();
+    let root = init_clean_overlay_test_repo().keep();
+    // Distinct blobs overflow both ordinary pipe buffers.
+    let mut expected = Vec::new();
+    for index in 0..4096 {
+        let directory = root.join(format!("fixtures/{index:04}"));
+        std::fs::create_dir_all(&directory).unwrap();
+        let text = format!(
+            "[package]\nname='fixture-{index:04}'\nversion='0.1.0'\n# {}\n",
+            "fixture payload ".repeat(20)
+        );
+        std::fs::write(directory.join("Cargo.toml"), &text).unwrap();
+        expected.push((
+            PathBuf::from(format!("fixtures/{index:04}/Cargo.toml")),
+            text,
+        ));
+    }
+    std::fs::create_dir(root.join("configuration")).unwrap();
+    std::fs::write(root.join("configuration/config.toml"), "[build]\njobs=2\n").unwrap();
+    std::os::unix::fs::symlink("configuration", root.join(".cargo")).unwrap();
+    commit_clean_overlay_submodule_fixture(&root).await;
+    let spec = prepare_clean_overlay_spec(&root, Some("HEAD".into()), true, vec![], true)
+        .await
+        .unwrap()
+        .unwrap();
+    let tree = timeout(
+        Duration::from_secs(30),
+        selected_clean_overlay_cargo_tree(&root, &spec, true),
+    )
+    .await
+    .expect("Git request/response pipes must make progress concurrently")
+    .unwrap();
+    for (path, text) in expected {
+        assert_eq!(tree[&path], SelectedCargoEntry::File(Some(text)));
+    }
+    assert_eq!(
+        tree[Path::new("configuration/config.toml")],
+        SelectedCargoEntry::File(Some("[build]\njobs=2\n".to_owned()))
+    );
+    // External process tracing must find exactly two cat-file --batch children.
+}
+
+#[test]
+fn clean_overlay_git_blob_batch_resolver_preserves_namespace_policy() {
+    use rch_common::cargo_path_deps::{SelectedCargoEntry, SelectedCargoPathResolver};
+    let entries = std::collections::BTreeMap::from([
+        (PathBuf::from("dir/input"), SelectedCargoEntry::File(None)),
+        (
+            PathBuf::from("alias"),
+            SelectedCargoEntry::Symlink("dir/input".into()),
+        ),
+    ]);
+    let resolver = SelectedCargoPathResolver::new(&entries).unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            resolver.resolve(Path::new("alias")).unwrap(),
+            Path::new("dir/input")
+        );
+        for path in ["../foreign", "missing", "dir/input/child", "Dir/input"] {
+            assert!(resolver.resolve(Path::new(path)).is_err(), "{path}");
+        }
+    }
+    for (path, entry) in [
+        ("escape", SelectedCargoEntry::Symlink("../foreign".into())),
+        ("cycle", SelectedCargoEntry::Symlink("cycle".into())),
+        ("dir/input/child", SelectedCargoEntry::File(None)),
+    ] {
+        let mut invalid = entries.clone();
+        invalid.insert(PathBuf::from(path), entry);
+        assert!(SelectedCargoPathResolver::new(&invalid).is_err(), "{path}");
+    }
+}
+
 #[cfg(unix)]
 async fn retained_clean_overlay_submodule_fixture() -> (PathBuf, PathBuf, String) {
     use std::os::unix::fs::PermissionsExt;
@@ -2054,6 +2252,195 @@ async fn retained_clean_overlay_submodule_fixture() -> (PathBuf, PathBuf, String
     commit_clean_overlay_submodule_fixture(&app).await;
     let pin = git_output(&module, &["rev-parse", "HEAD"]).await.unwrap();
     (app, module, pin)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn clean_overlay_git_blob_batch_nested_pins_resolve_metadata_without_live_checkout() {
+    use rch_common::cargo_path_deps::SelectedCargoEntry;
+
+    let _guard = test_guard!();
+    let (app, module, _) = retained_clean_overlay_submodule_fixture().await;
+    let leaf_source = init_clean_overlay_test_repo().keep();
+    let manifest_a = "[package]\nname='leaf-a'\nversion='0.1.0'\n[workspace]\n";
+    let manifest_b = "[package]\nname='leaf-b'\nversion='0.2.0'\n[workspace]\n";
+    std::fs::rename(
+        leaf_source.join("Cargo.toml"),
+        leaf_source.join("manifest.payload"),
+    )
+    .unwrap();
+    std::fs::write(leaf_source.join("manifest.payload"), manifest_a).unwrap();
+    std::os::unix::fs::symlink("manifest.payload", leaf_source.join("Cargo.toml")).unwrap();
+    std::fs::create_dir(leaf_source.join("configuration")).unwrap();
+    std::fs::write(
+        leaf_source.join("configuration/config.toml"),
+        "[build]\njobs=2\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("configuration", leaf_source.join(".cargo")).unwrap();
+    std::fs::write(
+        leaf_source.join("toolchain.payload"),
+        "[toolchain]\nchannel='stable'\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("toolchain.payload", leaf_source.join("rust-toolchain.toml"))
+        .unwrap();
+    std::fs::create_dir(leaf_source.join("opaque")).unwrap();
+    std::fs::write(leaf_source.join("opaque/Cargo.toml"), [0xff, 0, b'\n']).unwrap();
+    std::fs::write(leaf_source.join(".gitattributes"), "*.rs text\n").unwrap();
+    std::fs::write(
+        leaf_source.join("opaque/.gitattributes"),
+        "# pinned policy\n",
+    )
+    .unwrap();
+    let pin_a = commit_clean_overlay_submodule_fixture(&leaf_source).await;
+    git_output(
+        &module,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            leaf_source.to_str().unwrap(),
+            "nested/leaf",
+        ],
+    )
+    .await
+    .unwrap();
+    commit_clean_overlay_submodule_fixture(&module).await;
+    let base_a = commit_clean_overlay_submodule_fixture(&app).await;
+    let leaf = module.join("nested/leaf");
+    for (key, value) in [
+        ("user.name", "RCH Test"),
+        ("user.email", "rch-test@example.invalid"),
+        ("core.hooksPath", "/dev/null"),
+    ] {
+        git_output(&leaf, &["config", key, value]).await.unwrap();
+    }
+    std::fs::write(leaf.join("manifest.payload"), manifest_b).unwrap();
+    std::fs::write(leaf.join("configuration/config.toml"), "[build]\njobs=3\n").unwrap();
+    let pin_b = commit_clean_overlay_submodule_fixture(&leaf).await;
+    commit_clean_overlay_submodule_fixture(&module).await;
+    let base_b = commit_clean_overlay_submodule_fixture(&app).await;
+    std::fs::write(
+        leaf.join("manifest.payload"),
+        "dirty manifest must not enter selection\n",
+    )
+    .unwrap();
+    std::fs::write(
+        leaf.join("configuration/config.toml"),
+        "dirty configuration\n",
+    )
+    .unwrap();
+    std::fs::write(leaf.join(".gitattributes"), "* export-ignore\n").unwrap();
+    std::fs::create_dir(leaf.join("ambient")).unwrap();
+    std::fs::write(leaf.join("ambient/Cargo.toml"), "untracked metadata\n").unwrap();
+
+    let first = prepare_clean_overlay_spec(&app, Some(base_a), true, vec![], true)
+        .await
+        .unwrap()
+        .unwrap();
+    let second = prepare_clean_overlay_spec(&app, Some(base_b), true, vec![], true)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.submodules[1].base_commit, pin_a);
+    assert_eq!(second.submodules[1].base_commit, pin_b);
+    assert_ne!(first.overlay_fingerprint(), second.overlay_fingerprint());
+    assert_ne!(first.execution_receipt(), second.execution_receipt());
+    for (spec, manifest, jobs) in [(&first, manifest_a, 2), (&second, manifest_b, 3)] {
+        let tree = selected_clean_overlay_cargo_tree(&app, spec, true)
+            .await
+            .unwrap();
+        let prefix = Path::new("vendor/dep/nested/leaf");
+        assert_eq!(
+            tree[&prefix.join("manifest.payload")],
+            SelectedCargoEntry::File(Some(manifest.to_owned()))
+        );
+        assert_eq!(
+            tree[&prefix.join("configuration/config.toml")],
+            SelectedCargoEntry::File(Some(format!("[build]\njobs={jobs}\n")))
+        );
+        assert_eq!(
+            tree[&prefix.join("toolchain.payload")],
+            SelectedCargoEntry::File(Some("[toolchain]\nchannel='stable'\n".to_owned()))
+        );
+        assert_eq!(
+            tree[&prefix.join("Cargo.toml")],
+            SelectedCargoEntry::Symlink("manifest.payload".to_owned())
+        );
+        assert_eq!(
+            tree[&prefix.join("opaque/Cargo.toml")],
+            SelectedCargoEntry::File(None)
+        );
+        assert!(!tree.contains_key(&prefix.join("ambient/Cargo.toml")));
+        spec.verify_archive_attributes(&app).await.unwrap();
+    }
+    let namespace = selected_clean_overlay_cargo_tree(&app, &first, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        namespace[Path::new("vendor/dep/nested/leaf/manifest.payload")],
+        SelectedCargoEntry::File(None)
+    );
+    assert_eq!(
+        std::fs::read_to_string(leaf.join("manifest.payload")).unwrap(),
+        "dirty manifest must not enter selection\n"
+    );
+    assert_eq!(
+        git_output(&leaf, &["rev-parse", "HEAD"]).await.unwrap(),
+        pin_b
+    );
+
+    let attributes = git_output(&leaf, &["rev-parse", "--git-path", "info/attributes"])
+        .await
+        .unwrap();
+    let attributes = if Path::new(&attributes).is_absolute() {
+        PathBuf::from(attributes)
+    } else {
+        leaf.join(attributes)
+    };
+    std::fs::write(&attributes, b"* export-subst\0hidden\n").unwrap();
+    let error = first.verify_archive_attributes(&app).await.unwrap_err();
+    assert!(error.to_string().contains("info/attributes"), "{error:#}");
+    std::fs::write(attributes, "").unwrap();
+    std::fs::write(leaf.join(".gitattributes"), b"* export-ignore\0hidden\n").unwrap();
+    commit_clean_overlay_submodule_fixture(&leaf).await;
+    commit_clean_overlay_submodule_fixture(&module).await;
+    commit_clean_overlay_submodule_fixture(&app).await;
+    let error = prepare_clean_overlay_spec(&app, Some("HEAD".into()), true, vec![], true)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("non-checkout-equivalent"),
+        "{error:#}"
+    );
+    git_output(
+        &module,
+        &[
+            "update-index",
+            "--cacheinfo",
+            &format!("160000,{},nested/leaf", "0".repeat(39) + "1"),
+        ],
+    )
+    .await
+    .unwrap();
+    // Preserve the planted index pin instead of adding the live checkout.
+    git_output(
+        &module,
+        &["commit", "-q", "--no-gpg-sign", "-m", "missing nested pin"],
+    )
+    .await
+    .unwrap();
+    commit_clean_overlay_submodule_fixture(&app).await;
+    let error = prepare_clean_overlay_spec(&app, Some("HEAD".into()), true, vec![], true)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("missing pinned commit"),
+        "{error:#}"
+    );
 }
 
 #[cfg(unix)]

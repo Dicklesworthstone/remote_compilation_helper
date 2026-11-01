@@ -262,19 +262,39 @@ pub fn validate_selected_cargo_path(
     entries: &BTreeMap<PathBuf, SelectedCargoEntry>,
     path: &Path,
 ) -> Result<PathBuf, CargoPathDependencyError> {
-    let tree = SelectedCargoTree::from_inventory(entries);
-    tree.check_inventory()?;
-    let raw = path.to_str().ok_or_else(|| {
-        CargoPathDependencyError::new(
-            CargoPathDependencyErrorKind::PathPolicyViolation,
-            "selected Cargo path is not UTF-8",
-        )
-        .with_dependency_path(path)
-    })?;
-    tree.resolve(Path::new(""), raw).map_err(|detail| {
-        CargoPathDependencyError::new(CargoPathDependencyErrorKind::PathPolicyViolation, detail)
+    SelectedCargoPathResolver::new(entries)?.resolve(path)
+}
+
+/// Resolve many paths against one checked inventory. The borrow prevents
+/// namespace mutation while the prepared directory and symlink facts are used.
+pub struct SelectedCargoPathResolver<'a> {
+    tree: SelectedCargoTree<'a>,
+}
+
+impl<'a> SelectedCargoPathResolver<'a> {
+    /// Validate the complete namespace, including every selected symlink.
+    pub fn new(
+        entries: &'a BTreeMap<PathBuf, SelectedCargoEntry>,
+    ) -> Result<Self, CargoPathDependencyError> {
+        let tree = SelectedCargoTree::from_inventory(entries);
+        tree.check_inventory()?;
+        Ok(Self { tree })
+    }
+
+    /// Resolve one path with the same policy as [`validate_selected_cargo_path`].
+    pub fn resolve(&self, path: &Path) -> Result<PathBuf, CargoPathDependencyError> {
+        let raw = path.to_str().ok_or_else(|| {
+            CargoPathDependencyError::new(
+                CargoPathDependencyErrorKind::PathPolicyViolation,
+                "selected Cargo path is not UTF-8",
+            )
             .with_dependency_path(path)
-    })
+        })?;
+        self.tree.resolve(Path::new(""), raw).map_err(|detail| {
+            CargoPathDependencyError::new(CargoPathDependencyErrorKind::PathPolicyViolation, detail)
+                .with_dependency_path(path)
+        })
+    }
 }
 
 /// Check an inline Cargo configuration override against selected source bytes.

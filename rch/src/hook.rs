@@ -3740,6 +3740,171 @@ async fn git_output(project_root: &Path, args: &[&str]) -> anyhow::Result<String
     )
 }
 
+// Match source_fidelity's 8 GiB bound without a smaller per-manifest limit.
+const MAX_CLEAN_OVERLAY_GIT_BLOB_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const CLEAN_OVERLAY_GIT_BATCH_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Validate ordinary --batch framing and exact object identities; preserve raw bytes.
+async fn read_git_blob_batch<R>(
+    stdout: R,
+    object_ids: &[String],
+    max_bytes: u64,
+) -> anyhow::Result<std::collections::BTreeMap<String, Vec<u8>>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut reader = BufReader::new(stdout);
+    let mut blobs = std::collections::BTreeMap::new();
+    let mut remaining = max_bytes;
+    for object_id in object_ids {
+        // Bound the header before reading any declared payload.
+        let mut header = Vec::with_capacity(128);
+        loop {
+            let byte = reader
+                .read_u8()
+                .await
+                .with_context(|| format!("read Git batch header for {object_id}"))?;
+            anyhow::ensure!(header.len() < 128, "oversized Git batch header");
+            if byte == b'\n' {
+                break;
+            }
+            header.push(byte);
+        }
+        let header = std::str::from_utf8(&header).context("non-UTF-8 Git batch header")?;
+        let mut fields = header.split(' ');
+        anyhow::ensure!(
+            fields.next() == Some(object_id.as_str()) && fields.next() == Some("blob"),
+            "Git batch did not return requested blob {object_id}: {header:?}"
+        );
+        let declared = fields.next().context("Git batch blob has no byte length")?;
+        let size = declared
+            .parse::<u64>()
+            .context("invalid Git batch blob byte length")?;
+        anyhow::ensure!(
+            fields.next().is_none() && declared == size.to_string(),
+            "noncanonical Git batch header: {header:?}"
+        );
+        anyhow::ensure!(
+            size <= remaining,
+            "selected Git blobs exceed the {max_bytes}-byte source-content bound"
+        );
+        usize::try_from(size).context("Git batch blob does not fit address space")?;
+        let mut bytes = Vec::new();
+        // Allocate only as bytes arrive, never from an untrusted declaration.
+        (&mut reader)
+            .take(size)
+            .read_to_end(&mut bytes)
+            .await
+            .with_context(|| format!("read Git batch blob {object_id}"))?;
+        anyhow::ensure!(
+            bytes.len() as u64 == size,
+            "truncated Git batch blob {object_id}"
+        );
+        anyhow::ensure!(
+            reader
+                .read_u8()
+                .await
+                .context("read Git batch blob delimiter")?
+                == b'\n',
+            "invalid Git batch blob delimiter"
+        );
+        remaining -= size;
+        anyhow::ensure!(
+            blobs.insert(object_id.clone(), bytes).is_none(),
+            "duplicate requested Git batch blob"
+        );
+    }
+    let mut extra = [0_u8; 1];
+    anyhow::ensure!(
+        reader.read(&mut extra).await? == 0,
+        "unexpected trailing Git batch output"
+    );
+    Ok(blobs)
+}
+
+/// Batch pinned ls-tree object IDs within one repository and selection phase.
+async fn git_blob_batch(
+    project_root: &Path,
+    object_ids: &[String],
+) -> anyhow::Result<std::collections::BTreeMap<String, Vec<u8>>> {
+    for object_id in object_ids {
+        anyhow::ensure!(
+            matches!(object_id.len(), 40 | 64)
+                && object_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "Git batch request must be a full canonical hexadecimal object ID"
+        );
+    }
+    let object_ids = object_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if object_ids.is_empty() {
+        return Ok(std::collections::BTreeMap::new());
+    }
+    let mut command = Command::new("git");
+    configure_clean_git_command(&mut command);
+    let mut child = command
+        .current_dir(project_root)
+        .args(["cat-file", "--batch"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("start pinned Git blob batch in {}", project_root.display()))?;
+    let mut stdin =
+        tokio::io::BufWriter::new(child.stdin.take().context("Git batch stdin is not piped")?);
+    let stdout = child
+        .stdout
+        .take()
+        .context("Git batch stdout is not piped")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("Git batch stderr is not piped")?;
+    let result = timeout(CLEAN_OVERLAY_GIT_BATCH_TIMEOUT, async {
+        // Drain both outputs while writing to avoid pipe-buffer deadlocks.
+        let (_, blobs, stderr, status) = tokio::try_join!(
+            async {
+                for object_id in &object_ids {
+                    stdin.write_all(object_id.as_bytes()).await?;
+                    stdin.write_all(b"\n").await?;
+                }
+                stdin.shutdown().await?;
+                drop(stdin);
+                Ok::<_, anyhow::Error>(())
+            },
+            read_git_blob_batch(stdout, &object_ids, MAX_CLEAN_OVERLAY_GIT_BLOB_BYTES),
+            async {
+                crate::transfer::read_bounded_output_stream(stderr, 64 * 1024)
+                    .await
+                    .context("read bounded Git batch diagnostics")
+            },
+            async { child.wait().await.context("wait for Git blob batch") },
+        )?;
+        anyhow::ensure!(
+            status.success(),
+            "Git blob batch failed: {}",
+            String::from_utf8_lossy(&stderr).trim()
+        );
+        Ok::<_, anyhow::Error>(blobs)
+    })
+    .await;
+    let error = match result {
+        Ok(Ok(blobs)) => return Ok(blobs),
+        Ok(Err(error)) => error.context("read selected pinned Git blobs"),
+        Err(error) => anyhow::Error::new(error).context("pinned Git blob batch timed out"),
+    };
+    // Pipe futures are dropped; reap this exact child. Cancellation kills on drop.
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    Err(error)
+}
+
 fn git_archive_attributes_require_refusal(contents: &str) -> bool {
     // Git parses attribute lines as C strings. A NUL can terminate an active
     // attribute name before suffix bytes that this text scanner would retain,
@@ -3767,28 +3932,32 @@ async fn validate_clean_overlay_archive_attributes(
     project_root: &Path,
     commit: &str,
 ) -> anyhow::Result<()> {
-    let paths = git_output_bytes(
-        project_root,
-        &["ls-tree", "-rz", "--full-tree", "--name-only", commit],
-    )
-    .await?;
-    for path in paths
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-    {
-        let path = std::str::from_utf8(path)
-            .context("clean-overlay base contains a non-UTF-8 Git path")?;
-        if path != ".gitattributes" && !path.ends_with("/.gitattributes") {
-            continue;
-        }
-        let contents = git_show_optional(project_root, commit, path)
-            .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "failed to read known .gitattributes path {path} from clean-overlay base {commit}"
-                )
-            })?;
-        if git_archive_attributes_require_refusal(&contents) {
+    let tree = git_output_bytes(project_root, &["ls-tree", "-rz", "--full-tree", commit]).await?;
+    // Parse the complete inventory, retaining the existing non-UTF-8-path
+    // refusal even when the offending path is not an attributes file.
+    let attributes = parse_clean_base_tree(&tree)?
+        .into_iter()
+        .filter(|entry| {
+            entry
+                .path
+                .file_name()
+                .is_some_and(|name| name == ".gitattributes")
+        })
+        .collect::<Vec<_>>();
+    let object_ids = attributes
+        .iter()
+        .map(|entry| entry.object_id.clone())
+        .collect::<Vec<_>>();
+    let blobs = git_blob_batch(project_root, &object_ids).await?;
+    for entry in attributes {
+        let path = entry.path.display();
+        let contents = std::str::from_utf8(
+            blobs
+                .get(&entry.object_id)
+                .context("selected attributes blob is missing")?,
+        )
+        .with_context(|| format!("{path} in clean-overlay base is not UTF-8"))?;
+        if git_archive_attributes_require_refusal(contents) {
             anyhow::bail!(
                 "clean-overlay base has NUL bytes or export-ignore/export-subst in {path}; refusing a non-checkout-equivalent Git archive"
             );
@@ -3825,6 +3994,7 @@ async fn validate_clean_overlay_archive_attributes(
     Ok(())
 }
 
+#[cfg(test)]
 async fn git_show_optional(
     project_root: &Path,
     commit: &str,
@@ -3868,7 +4038,7 @@ async fn selected_clean_overlay_cargo_tree(
 ) -> anyhow::Result<
     std::collections::BTreeMap<PathBuf, rch_common::cargo_path_deps::SelectedCargoEntry>,
 > {
-    use rch_common::cargo_path_deps::{SelectedCargoEntry, validate_selected_cargo_path};
+    use rch_common::cargo_path_deps::{SelectedCargoEntry, SelectedCargoPathResolver};
     use std::collections::BTreeMap;
 
     fn add_overlay(
@@ -3917,7 +4087,14 @@ async fn selected_clean_overlay_cargo_tree(
             clean_overlay_submodule_root(project_root, prefix).await?
         };
         let tree = git_output_bytes(&root, &["ls-tree", "-rz", "--full-tree", commit]).await?;
-        for entry in parse_clean_base_tree(&tree)? {
+        let tree = parse_clean_base_tree(&tree)?;
+        let symlink_ids = tree
+            .iter()
+            .filter(|entry| entry.mode == 0o120000)
+            .map(|entry| entry.object_id.clone())
+            .collect::<Vec<_>>();
+        let symlinks = git_blob_batch(&root, &symlink_ids).await?;
+        for entry in tree {
             let path = prefix.join(&entry.path);
             if spec.is_deleted(&path) {
                 continue;
@@ -3936,7 +4113,10 @@ async fn selected_clean_overlay_cargo_tree(
                 0o100644 | 0o100755 => SelectedCargoEntry::File(None),
                 0o120000 => SelectedCargoEntry::Symlink(
                     String::from_utf8(
-                        git_output_bytes(&root, &["cat-file", "blob", &entry.object_id]).await?,
+                        symlinks
+                            .get(&entry.object_id)
+                            .context("selected symlink blob is missing")?
+                            .clone(),
                     )
                     .with_context(|| format!("non-UTF-8 selected symlink {}", path.display()))?,
                 ),
@@ -3959,32 +4139,44 @@ async fn selected_clean_overlay_cargo_tree(
         spec.verify_overlay_unchanged(project_root)?;
         return Ok(entries);
     }
-    let mut metadata_paths: Vec<_> = entries
-        .keys()
-        .filter(|path| is_selected_cargo_metadata(path))
-        .cloned()
-        .collect();
-    for (path, entry) in &entries {
-        if path.file_name().is_some_and(|name| name == ".cargo")
-            && matches!(entry, SelectedCargoEntry::Symlink(_))
-        {
-            for name in ["config", "config.toml"] {
-                let candidate = path.join(name);
-                if validate_selected_cargo_path(&entries, &candidate).is_ok() {
-                    metadata_paths.push(candidate);
+    let metadata_paths = {
+        let resolver = SelectedCargoPathResolver::new(&entries)?;
+        let mut paths: Vec<_> = entries
+            .keys()
+            .filter(|path| is_selected_cargo_metadata(path))
+            .cloned()
+            .collect();
+        for (path, entry) in &entries {
+            if path.file_name().is_some_and(|name| name == ".cargo")
+                && matches!(entry, SelectedCargoEntry::Symlink(_))
+            {
+                for name in ["config", "config.toml"] {
+                    let candidate = path.join(name);
+                    if resolver.resolve(&candidate).is_ok() {
+                        paths.push(candidate);
+                    }
                 }
             }
         }
-    }
-    for path in metadata_paths {
-        let target = validate_selected_cargo_path(&entries, &path)?;
-        let bytes = if spec
+        paths
+            .iter()
+            .map(|path| resolver.resolve(path))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let mut selected_objects: BTreeMap<PathBuf, BTreeMap<String, BTreeSet<PathBuf>>> =
+        BTreeMap::new();
+    for target in metadata_paths {
+        if spec
             .overlay_paths()
             .iter()
             .any(|overlay| target.starts_with(overlay))
         {
-            std::fs::read(project_root.join(&target))
-                .with_context(|| format!("read selected Cargo metadata {}", target.display()))?
+            let bytes = std::fs::read(project_root.join(&target))
+                .with_context(|| format!("read selected Cargo metadata {}", target.display()))?;
+            entries.insert(
+                target,
+                SelectedCargoEntry::File(String::from_utf8(bytes).ok()),
+            );
         } else {
             let (root, object_id) = base_objects.get(&target).ok_or_else(|| {
                 anyhow::anyhow!(
@@ -3992,15 +4184,38 @@ async fn selected_clean_overlay_cargo_tree(
                     target.display()
                 )
             })?;
-            git_output_bytes(root, &["cat-file", "blob", object_id]).await?
-        };
-        entries.insert(
-            target.clone(),
+            selected_objects
+                .entry(root.clone())
+                .or_default()
+                .entry(object_id.clone())
+                .or_default()
+                .insert(target);
+        }
+    }
+    // Resolve metadata symlinks only after the complete selected namespace is
+    // known. A Cargo.toml or .cargo/config link may target an arbitrary blob
+    // name in another selected repository; paths alone cannot select this batch.
+    for (root, objects) in selected_objects {
+        let object_ids = objects.keys().cloned().collect::<Vec<_>>();
+        let mut blobs = git_blob_batch(&root, &object_ids).await?;
+        for (object_id, mut targets) in objects {
+            let bytes = blobs
+                .remove(&object_id)
+                .context("selected Cargo metadata blob is missing")?;
             // Unreferenced Cargo.toml files may be arbitrary fixture bytes.
             // Reachable manifests and all selected configs still require text
-            // when the inventory-only semantic traversal admits them.
-            SelectedCargoEntry::File(String::from_utf8(bytes).ok()),
-        );
+            // when the inventory-only semantic traversal admits them. Consume
+            // each unique blob without duplicating its potentially large bytes;
+            // only distinct selected paths sharing one object require clones.
+            let text = String::from_utf8(bytes).ok();
+            let last = targets
+                .pop_last()
+                .context("selected metadata blob has no path")?;
+            for target in targets {
+                entries.insert(target, SelectedCargoEntry::File(text.clone()));
+            }
+            entries.insert(last, SelectedCargoEntry::File(text));
+        }
     }
     spec.verify_overlay_unchanged(project_root)?;
     Ok(entries)

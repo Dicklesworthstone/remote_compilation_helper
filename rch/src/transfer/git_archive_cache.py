@@ -354,10 +354,16 @@ def restore(source_path, target_path, slot, digest, size, minimum, stack):
         return "MISS"
     inventory(cache)
     name = slot + ".sealed"
-    found = verify_sealed(cache, name, slot, stack)
-    if found is None:
+    opened = open_regular(cache, name, stack)
+    if opened is None:
         return "MISS"
-    descriptor, before, header, offset = found
+    descriptor, before = opened
+    header, _ = read_header(descriptor, slot, before.st_size)
+    unchanged(cache, name, descriptor, before)
+    # A canonical declaration for another caller-selected archive is only a
+    # miss, not a claim that its payload is intact. Do not read unrelated bytes
+    # or touch source. For a matching declaration, hash while making the private
+    # copy below: the caller's independently generated digest remains authority.
     if header["sha256"] != digest or header["size"] != size:
         return "MISS"
     source = open_directory(source_path, stack, create=True)
@@ -380,7 +386,6 @@ def restore(source_path, target_path, slot, digest, size, minimum, stack):
         require(os.fstat(private_archive).st_size == 0, "private archive invalidation failed")
 
     try:
-        os.lseek(descriptor, offset, os.SEEK_SET)
         copied = hash_payload(descriptor, size, private_archive)
         unchanged(cache, name, descriptor, before)
         if copied != digest:
