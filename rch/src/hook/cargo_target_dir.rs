@@ -651,9 +651,10 @@ pub(super) fn managed_clean_overlay_cargo_build_dir(
         .file_name()
         .and_then(|name| name.to_str());
     let standalone_xwin = matches!(executable, Some("cargo-xwin" | "cargo-xwin.exe"));
+    let standalone_zigbuild = matches!(executable, Some("cargo-zigbuild" | "cargo-zigbuild.exe"));
     anyhow::ensure!(
-        standalone_xwin || matches!(executable, Some("cargo" | "cargo.exe")),
-        "managed clean-overlay build directory requires Cargo or an exact xwin compilation"
+        standalone_xwin || standalone_zigbuild || matches!(executable, Some("cargo" | "cargo.exe")),
+        "managed clean-overlay build directory requires Cargo or an exact supported Cargo plugin"
     );
     let mut index = cargo_index + 1;
     if !standalone_xwin
@@ -692,6 +693,8 @@ pub(super) fn managed_clean_overlay_cargo_build_dir(
         .get(index)
         .ok_or_else(|| anyhow::anyhow!("missing Cargo subcommand"))?;
     let xwin = standalone_xwin || subcommand == "xwin";
+    let zigbuild = standalone_zigbuild || subcommand == "zigbuild";
+    let nextest = !standalone_xwin && !standalone_zigbuild && subcommand == "nextest";
     if xwin {
         // Match the exact plugin entry points used by classification and
         // worker admission. Check and Clippy need the same managed cache
@@ -701,6 +704,20 @@ pub(super) fn managed_clean_overlay_cargo_build_dir(
             "managed xwin requires an exact classified build, check, or clippy command"
         );
         if subcommand == "xwin" {
+            index += 1;
+        }
+    } else if zigbuild || nextest {
+        let expected = if zigbuild {
+            CompilationKind::CargoZigbuild
+        } else {
+            CompilationKind::CargoNextest
+        };
+        let classified = rch_common::patterns::classify_command(command);
+        anyhow::ensure!(
+            classified.is_compilation && classified.kind == Some(expected),
+            "managed Cargo plugin requires an exact classified zigbuild build or nextest run"
+        );
+        if nextest {
             index += 1;
         }
     }
@@ -722,6 +739,7 @@ pub(super) fn managed_clean_overlay_cargo_build_dir(
     }
     anyhow::ensure!(
         packaging
+            || zigbuild
             || matches!(
                 subcommand.as_str(),
                 "build"
@@ -746,6 +764,42 @@ pub(super) fn managed_clean_overlay_cargo_build_dir(
         .iter()
         .position(|token| token == "--")
         .map_or(tokens.len(), |offset| index + 1 + offset);
+    if zigbuild || nextest {
+        anyhow::ensure!(
+            !tokens[index + 1..end]
+                .iter()
+                .any(|token| matches!(token.as_str(), "--help" | "-h" | "--version" | "-V")),
+            "managed Cargo plugin requires compilation rather than help or version output"
+        );
+    }
+    if nextest {
+        // Archive reuse and metadata/remap modes can execute binaries outside
+        // this invocation's selected source and managed build directory.
+        // They remain available on ordinary routes, but cannot acquire this
+        // fresh-source binding merely by carrying the `run` subcommand.
+        const REUSE_OPTIONS: &[&str] = &[
+            "--archive-file",
+            "--archive-format",
+            "--extract-to",
+            "--extract-overwrite",
+            "--persist-extract-tempdir",
+            "--cargo-metadata",
+            "--workspace-remap",
+            "--binaries-metadata",
+            "--target-dir-remap",
+            "--build-dir-remap",
+        ];
+        anyhow::ensure!(
+            !tokens[index + 1..end].iter().any(|token| {
+                REUSE_OPTIONS.contains(
+                    &token
+                        .split_once('=')
+                        .map_or(token.as_str(), |(flag, _)| flag),
+                )
+            }),
+            "managed nextest requires a fresh build without archive reuse or path remapping"
+        );
+    }
     anyhow::ensure!(
         !tokens[index + 1..end]
             .iter()
@@ -2436,60 +2490,144 @@ mod managed_build_dir_tests {
         }
     }
 
-    /// The bound command must run under real cargo-nextest, which rejected the
-    /// former `--config env.RCH_BUILD_SOURCE.force=true` with exit 96 (bd-k90ud).
-    #[test]
-    fn build_source_stamp_real_nextest_accepts_bound_command() {
+    fn real_cargo_plugin_path(plugin: &str) -> (std::path::PathBuf, std::ffi::OsString) {
         let cargo = std::path::PathBuf::from(env!("CARGO"));
         let cargo_bin = cargo.parent().unwrap().to_path_buf();
-        let path = std::env::join_paths(std::iter::once(cargo_bin.clone()).chain(
-            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
-        ))
-        .unwrap();
         let cargo_home_bin = std::env::var_os("CARGO_HOME")
             .map(std::path::PathBuf::from)
             .or_else(|| {
                 std::env::var_os("HOME").map(|home| std::path::Path::new(&home).join(".cargo"))
             })
             .map(|home| home.join("bin"));
-        let has_nextest = std::env::split_paths(&path)
-            .chain(cargo_home_bin)
-            .any(|directory| directory.join("cargo-nextest").is_file());
-        if !has_nextest {
-            eprintln!("skipping: cargo-nextest is not installed");
-            return;
+        let path = std::env::join_paths(
+            std::iter::once(cargo_bin.clone())
+                .chain(std::env::split_paths(
+                    &std::env::var_os("PATH").unwrap_or_default(),
+                ))
+                .chain(cargo_home_bin),
+        )
+        .unwrap();
+        assert!(
+            std::env::split_paths(&path).any(|directory| directory.join(plugin).is_file()),
+            "this explicit integration test requires the real {plugin} executable"
+        );
+        (cargo_bin, path)
+    }
+
+    /// Exercise the actual plugin, including Cargo's intermediate-directory
+    /// override and source stamp. Nextest rejected the former force=true stamp
+    /// config with exit 96 (bd-k90ud); a test failure must instead retain 100.
+    #[test]
+    #[ignore = "requires real cargo-nextest; run explicitly with --ignored"]
+    fn build_source_stamp_real_nextest_accepts_bound_command() {
+        let (cargo_bin, path) = real_cargo_plugin_path("cargo-nextest");
+        let root = tempfile::tempdir().unwrap().keep();
+        for directory in ["src", ".cargo", "cargo-home"] {
+            std::fs::create_dir(root.join(directory)).unwrap();
         }
-        let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir(root.path().join("src")).unwrap();
+        eprintln!("real Nextest evidence retained at {}", root.display());
+        let pool = root.join("managed pool");
+        let outside: Vec<_> = ["outside-file", "outside-env", "outside-cli"]
+            .into_iter()
+            .map(|name| root.join(name))
+            .collect();
         std::fs::write(
-            root.path().join("Cargo.toml"),
+            root.join("Cargo.toml"),
             "[package]\nname='nextest_stamp_fixture'\nversion='0.1.0'\nedition='2021'\n[workspace]\n",
         )
         .unwrap();
         std::fs::write(
-            root.path().join("src/lib.rs"),
-            "#[test]\nfn stamp() {\n    assert_eq!(env!(\"RCH_BUILD_SOURCE\"), \"bound\");\n    \
-             assert_eq!(std::env::var(\"RCH_BUILD_SOURCE\").unwrap(), \"bound\");\n}\n",
+            root.join(".cargo/config.toml"),
+            format!(
+                "[build]\nbuild-dir={}\n",
+                toml::Value::String(outside[0].to_str().unwrap().to_owned())
+            ),
         )
         .unwrap();
-        let bound = super::bind_build_source_stamp("cargo nextest run", "bound").unwrap();
-        let output = std::process::Command::new("/bin/sh")
-            .args(["-c", &bound])
-            .current_dir(root.path())
-            .env("PATH", &path)
-            .env("CARGO_TARGET_DIR", root.path().join("target"))
-            .env("RCH_BUILD_SOURCE", "ambient")
-            .env("RCH_CARGO_WRAPPER_BYPASS", "1")
-            .env("RCH_CARGO_WRAPPER_ORIGIN", "rch")
-            .env_remove("CARGO_BUILD_TARGET_DIR")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{bound}: {:?}\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        );
+        std::fs::write(
+            root.join("src/lib.rs"),
+            r#"#[test]
+fn stamp() {
+    assert_eq!(env!("RCH_BUILD_SOURCE"), "bound");
+    assert_eq!(std::env::var("RCH_BUILD_SOURCE").unwrap(), "bound");
+    let executable = std::env::current_exe().unwrap();
+    let pool = std::path::PathBuf::from(std::env::var_os("CARGO_TARGET_DIR").unwrap());
+    assert!(executable.starts_with(pool), "test executable outside managed pool: {executable:?}");
+    println!("RCH_MANAGED_NEXTEST_EXECUTED:{}", executable.display());
+    assert_ne!(std::env::var("RCH_TEST_EXPECT_FAIL").as_deref(), Ok("1"), "intentional failure");
+}
+"#,
+        )
+        .unwrap();
+        for (label, subcommand, managed, fail, expected_exit) in [
+            ("run", "run", true, false, 0),
+            ("alias", "r", true, false, 0),
+            ("test-failure", "run", true, true, 100),
+            ("unmanaged-control", "run", false, false, 100),
+        ] {
+            let command = format!(
+                "cargo nextest {subcommand} --offline --no-capture --config {} -- --exact stamp",
+                shell_words::quote(&format!(
+                    "build.build-dir={}",
+                    toml::Value::String(outside[2].to_str().unwrap().to_owned())
+                ))
+            );
+            let managed =
+                super::ManagedCargoCommand::new(&command, managed.then(|| pool.to_str().unwrap()))
+                    .unwrap();
+            assert_eq!(managed.policy_command(), command);
+            let bound =
+                super::bind_build_source_stamp(managed.execution_command(), "bound").unwrap();
+            let output = std::process::Command::new("/bin/sh") // ubs:ignore — executes the production binding with the actual plugin in an owned fixture.
+                .args(["-c", &bound])
+                .current_dir(&root)
+                .env("PATH", &path)
+                .env("CARGO_HOME", root.join("cargo-home"))
+                .env("CARGO_TARGET_DIR", &pool)
+                .env("CARGO_BUILD_BUILD_DIR", &outside[1])
+                .env("CARGO_BUILD_JOBS", "1")
+                .env("CARGO_INCREMENTAL", "0")
+                .env("RUSTC", cargo_bin.join("rustc"))
+                .env("RCH_BUILD_SOURCE", "ambient")
+                .env("RCH_TEST_EXPECT_FAIL", if fail { "1" } else { "0" })
+                .env("RCH_CARGO_WRAPPER_BYPASS", "1")
+                .env("RCH_CARGO_WRAPPER_ORIGIN", "rch")
+                .env_remove("RUSTUP_TOOLCHAIN")
+                .env_remove("CARGO_BUILD_TARGET")
+                .env_remove("CARGO_BUILD_TARGET_DIR")
+                .env_remove("CARGO_BUILD_RUSTC")
+                .env_remove("RUSTC_WRAPPER")
+                .env_remove("RUSTC_WORKSPACE_WRAPPER")
+                .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+                .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
+                .output()
+                .unwrap();
+            let evidence = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            std::fs::write(root.join(format!("{label}.log")), &evidence).unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(expected_exit),
+                "{bound}\n{evidence}"
+            );
+            if label == "unmanaged-control" {
+                assert!(
+                    evidence.contains("test executable outside managed pool"),
+                    "{evidence}"
+                );
+                assert!(outside[2].is_dir());
+            } else {
+                assert!(
+                    evidence.contains("RCH_MANAGED_NEXTEST_EXECUTED:"),
+                    "{evidence}"
+                );
+                assert!(outside.iter().all(|directory| !directory.exists()));
+            }
+            assert!(pool.is_dir());
+        }
     }
 
     #[test]
@@ -2877,6 +3015,270 @@ mod managed_build_dir_tests {
     }
 
     #[test]
+    fn managed_nextest_and_zigbuild_preserve_plugin_argv_and_policy() {
+        use rch_common::CompilationKind;
+
+        for (command, kind) in [
+            (
+                "cargo nextest run --workspace",
+                CompilationKind::CargoNextest,
+            ),
+            (
+                "cargo +nightly nextest r --no-capture -- --exact fixture",
+                CompilationKind::CargoNextest,
+            ),
+            (
+                "cargo --color never --config build.jobs=2 nextest run --locked -- --skip slow",
+                CompilationKind::CargoNextest,
+            ),
+            (
+                "env -- CARGO_HOME=/selected/cargo-home cargo nextest run -- --nocapture",
+                CompilationKind::CargoNextest,
+            ),
+            (
+                "cargo nextest run --config 'build.build-dir=\"/caller/cache\"'",
+                CompilationKind::CargoNextest,
+            ),
+            (
+                "cargo zigbuild --release --target=aarch64-unknown-linux-gnu",
+                CompilationKind::CargoZigbuild,
+            ),
+            (
+                "cargo +nightly zigbuild --locked --bin cli",
+                CompilationKind::CargoZigbuild,
+            ),
+            (
+                "env -- cargo-zigbuild build --target x86_64-unknown-linux-musl",
+                CompilationKind::CargoZigbuild,
+            ),
+            (
+                "/opt/bin/cargo-zigbuild b --config 'build.build-dir=\"/caller/cache\"'",
+                CompilationKind::CargoZigbuild,
+            ),
+            (
+                "/usr/bin/time -p cargo-zigbuild zigbuild --locked",
+                CompilationKind::CargoZigbuild,
+            ),
+            (
+                "cargo-zigbuild +nightly --color never zigbuild --release",
+                CompilationKind::CargoZigbuild,
+            ),
+        ] {
+            let classified = rch_common::patterns::classify_command(command);
+            assert!(classified.is_compilation, "{command}");
+            assert_eq!(classified.kind, Some(kind), "{command}");
+            let managed =
+                super::ManagedCargoCommand::new(command, Some("/managed/cache pool")).unwrap();
+            let (original, cargo_index) = managed_clean_overlay_cargo_tokens(command).unwrap();
+            let actual = shell_words::split(managed.execution_command()).unwrap();
+            let separator = original[cargo_index + 1..]
+                .iter()
+                .position(|token| token == "--")
+                .map_or(original.len(), |offset| cargo_index + 1 + offset);
+            let mut expected = original;
+            expected.splice(
+                separator..separator,
+                [
+                    "--config".to_owned(),
+                    "build.build-dir=\"/managed/cache pool\"".to_owned(),
+                ],
+            );
+            assert_eq!(actual, expected, "{command}");
+            assert_eq!(managed.policy_command(), command);
+            assert_eq!(
+                rch_common::patterns::classify_command(managed.policy_command()).kind,
+                Some(kind)
+            );
+        }
+    }
+
+    #[test]
+    fn managed_nextest_refuses_reuse_before_test_separator() {
+        for flag in [
+            "--archive-file",
+            "--archive-format",
+            "--extract-to",
+            "--extract-overwrite",
+            "--persist-extract-tempdir",
+            "--cargo-metadata",
+            "--workspace-remap",
+            "--binaries-metadata",
+            "--target-dir-remap",
+            "--build-dir-remap",
+        ] {
+            for spelling in [format!("{flag} /outside"), format!("{flag}=/outside")] {
+                let command = format!("cargo nextest run {spelling}");
+                assert!(
+                    super::ManagedCargoCommand::new(&command, Some("/managed")).is_err(),
+                    "{command}"
+                );
+                assert_eq!(
+                    super::ManagedCargoCommand::new(&command, None)
+                        .unwrap()
+                        .execution_command(),
+                    command,
+                    "the ordinary route retains the caller's plugin policy"
+                );
+                let tail = format!("cargo nextest run -- {spelling}");
+                let managed = super::ManagedCargoCommand::new(&tail, Some("/managed")).unwrap();
+                let tokens = shell_words::split(managed.execution_command()).unwrap();
+                let separator = tokens.iter().position(|token| token == "--").unwrap();
+                assert_eq!(
+                    tokens[separator + 1..],
+                    shell_words::split(&spelling).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn managed_nextest_and_zigbuild_preserve_refusals() {
+        for command in [
+            "cargo nextest",
+            "cargo nextest list",
+            "cargo nextest archive --archive-file /archive",
+            "cargo nextest show-config",
+            "cargo nextest run-extra",
+            "cargo-nextest nextest run",
+            "cargo nextest run --help",
+            "cargo nextest r -V",
+            "cargo nextest run --build-dir /outside",
+            "cargo nextest run --build-dir=/outside",
+            "cargo nextest run && echo surprise",
+            "cargo nextest r $FILTER",
+            "rustup run nightly cargo nextest run",
+            "cargo-zigbuild",
+            "cargo-zigbuild check",
+            "cargo-zigbuild test",
+            "cargo-zigbuild install cli",
+            "cargo-zigbuild run",
+            "cargo-zigbuild build-extra",
+            "cargo-zigbuild build --help",
+            "cargo zigbuild --version",
+            "cargo zigbuild --build-dir /outside",
+            "cargo-zigbuild build --build-dir=/outside",
+            "cargo zigbuild; echo surprise",
+            "cargo-zigbuild build $(echo flags)",
+            "rustup run nightly cargo-zigbuild build",
+        ] {
+            assert!(
+                super::ManagedCargoCommand::new(command, Some("/managed")).is_err(),
+                "{command}"
+            );
+        }
+        // A plugin's compilation classification does not expand the separate
+        // owned-source-content route's narrower Cargo output contract.
+        for command in [
+            "cargo nextest run",
+            "cargo zigbuild",
+            "cargo-zigbuild build",
+        ] {
+            assert!(
+                super::bind_owned_cargo_target_dir(command, "/owned/pool").is_err(),
+                "{command}"
+            );
+        }
+    }
+
+    /// Without --target, the real plugin delegates to Cargo without requiring
+    /// Zig. This verifies plugin argv/config/output binding, not cross linking.
+    #[test]
+    #[ignore = "requires real cargo-zigbuild; run explicitly with --ignored"]
+    fn managed_zigbuild_real_plugin_uses_managed_pool() {
+        let (cargo_bin, path) = real_cargo_plugin_path("cargo-zigbuild");
+        let root = tempfile::tempdir().unwrap().keep();
+        for directory in ["src", ".cargo", "cargo-home"] {
+            std::fs::create_dir(root.join(directory)).unwrap();
+        }
+        eprintln!("real Zigbuild evidence retained at {}", root.display());
+        let pool = root.join("managed pool");
+        let outside = root.join("outside-build");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='zigbuild_managed_fixture'\nversion='0.1.0'\nedition='2021'\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".cargo/config.toml"),
+            format!(
+                "[build]\nbuild-dir={}\n",
+                toml::Value::String(outside.to_str().unwrap().to_owned())
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/main.rs"),
+            "fn main() { assert_eq!(env!(\"RCH_BUILD_SOURCE\"), \"bound\"); println!(\"RCH_MANAGED_ZIGBUILD_EXECUTED\"); }\n",
+        )
+        .unwrap();
+        for (index, prefix) in [
+            "cargo zigbuild",
+            "cargo-zigbuild build",
+            "cargo-zigbuild b",
+            "cargo-zigbuild zigbuild",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let command = format!(
+                "{prefix} --offline --jobs 1 --config {}",
+                shell_words::quote(&format!(
+                    "build.build-dir={}",
+                    toml::Value::String(outside.to_str().unwrap().to_owned())
+                ))
+            );
+            let managed =
+                super::ManagedCargoCommand::new(&command, Some(pool.to_str().unwrap())).unwrap();
+            assert_eq!(managed.policy_command(), command);
+            let bound =
+                super::bind_build_source_stamp(managed.execution_command(), "bound").unwrap();
+            let output = std::process::Command::new("/bin/sh") // ubs:ignore — executes the production binding with the actual plugin in an owned fixture.
+                .args(["-c", &bound])
+                .current_dir(&root)
+                .env("PATH", &path)
+                .env("CARGO_HOME", root.join("cargo-home"))
+                .env("CARGO_TARGET_DIR", &pool)
+                .env("CARGO_BUILD_BUILD_DIR", &outside)
+                .env("CARGO_BUILD_JOBS", "1")
+                .env("CARGO_INCREMENTAL", "0")
+                .env("RUSTC", cargo_bin.join("rustc"))
+                .env("RCH_BUILD_SOURCE", "ambient")
+                .env("RCH_CARGO_WRAPPER_BYPASS", "1")
+                .env("RCH_CARGO_WRAPPER_ORIGIN", "rch")
+                .env_remove("RUSTUP_TOOLCHAIN")
+                .env_remove("CARGO_BUILD_TARGET")
+                .env_remove("CARGO_BUILD_TARGET_DIR")
+                .env_remove("CARGO_BUILD_RUSTC")
+                .env_remove("RUSTC_WRAPPER")
+                .env_remove("RUSTC_WORKSPACE_WRAPPER")
+                .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+                .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
+                .output()
+                .unwrap();
+            let evidence = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            std::fs::write(root.join(format!("plugin-{index}.log")), &evidence).unwrap();
+            assert!(
+                output.status.success(),
+                "{bound}: {:?}\n{evidence}",
+                output.status
+            );
+            assert!(!outside.exists());
+            let output = std::process::Command::new(pool.join("debug/zigbuild_managed_fixture"))
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap().trim(),
+                "RCH_MANAGED_ZIGBUILD_EXECUTED"
+            );
+        }
+    }
+
+    #[test]
     fn source_pair_build_dir_preserves_format_and_refuses_ambiguous_commands() {
         let fmt = "env RUSTUP_TOOLCHAIN=nightly cargo fmt --check";
         assert_eq!(
@@ -2886,7 +3288,7 @@ mod managed_build_dir_tests {
         for command in [
             "",
             "cargo",
-            "cargo-zigbuild build --release",
+            "cargo-zigbuild check --release",
             "nice -n 5 cargo build",
             "env --debug cargo build",
             "cargo --config",
