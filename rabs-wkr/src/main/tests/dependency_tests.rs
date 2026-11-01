@@ -29,6 +29,9 @@ fn context() -> Value {
 
 fn dependency_request() -> Value {
     use rabs_sandbox::source_transfer::{SourceFile, SourceManifest};
+    // Unsupported platforms still construct historical x86 request bytes for
+    // recovery and refusal tests. This fallback never claims a native ISA.
+    let host = DependencyExecutionHost::native().unwrap_or(DependencyExecutionHost::LinuxX86_64);
     let manifest = SourceManifest::new(vec![SourceFile {
         path: "package/src/lib.rs".to_owned(),
         len: 1,
@@ -38,6 +41,7 @@ fn dependency_request() -> Value {
     .unwrap();
     json!({
         "kind":"canonical-exec", "request_id":712,
+        "dependency_execution_host":host.as_str(),
         "program":"/home/user/toolchains/pinned/bin/rustc",
         "args":["--crate-name","leaf","--crate-type","lib","--emit=dep-info,metadata","src/lib.rs"],
         "source_manifest":{"files":[{"path":"package/src/lib.rs","bytes":1,"sha256":"01".repeat(32),"executable":false}],
@@ -48,6 +52,29 @@ fn dependency_request() -> Value {
         "artifacts":{"unit":"leaf","files":["leaf.d","libleaf.rmeta"]},
         "dependency_context":context(),
     })
+}
+
+fn original_metadata_context_after_host_check(
+    request: &Value,
+) -> rabs_sandbox::dependency_context::DependencyExecContext {
+    // Context parsing remains portable; only new execution requires a native
+    // worker ISA. Keep checking both boundaries on unsupported platforms.
+    let context = parse_dependency_context(request).unwrap().unwrap();
+    assert!(!context.canonical_cargo());
+    assert_eq!(context.execution_mode(), DependencyExecutionMode::Metadata);
+    let execution = parse_exec_request(request);
+    if DependencyExecutionHost::native().is_some() {
+        assert_eq!(
+            execution.unwrap().dependency_context.as_ref(),
+            Some(&context)
+        );
+    } else {
+        assert_eq!(
+            execution.unwrap_err(),
+            "worker cannot execute the required compiler host ISA"
+        );
+    }
+    context
 }
 
 fn canonical_dependency_request() -> Value {
@@ -1090,9 +1117,13 @@ fn canonical_dependency_compiler_must_match_retained_inputs_and_complete_metadat
 #[test]
 fn complete_dependency_decode_preserves_paths_values_and_input_owner_slots() {
     let original = dependency_request();
-    let parsed = parse_exec_request(&original).unwrap();
-    let context = parsed.dependency_context.as_ref().unwrap();
-    assert_eq!(parsed.program, context.compiler());
+    let context = original_metadata_context_after_host_check(&original);
+    if DependencyExecutionHost::native().is_some() {
+        let parsed = parse_exec_request(&original).unwrap();
+        assert_eq!(parsed.program, context.compiler());
+        assert!(parsed.toolchain_backing.is_empty() && parsed.workspace_backing.is_empty());
+        assert!(parsed.toolchain_identity.is_some());
+    }
     assert_eq!(context.cwd(), "/home/user/registry/package");
     assert_eq!(context.out_dir(), "/work/target/debug/deps");
     assert_eq!(
@@ -1106,8 +1137,6 @@ fn complete_dependency_decode_preserves_paths_values_and_input_owner_slots() {
         ]
     );
     assert!(!context.env().iter().any(|(name, _)| name == "NUM_JOBS"));
-    assert!(parsed.toolchain_backing.is_empty() && parsed.workspace_backing.is_empty());
-    assert!(parsed.toolchain_identity.is_some());
     assert_eq!(
         original,
         dependency_request(),
@@ -1256,8 +1285,7 @@ fn cargo_loader_parent_is_explicit_and_old_context_versions_cannot_ignore_it() {
         .as_array_mut()
         .unwrap()
         .push(json!(["LD_LIBRARY_PATH", value]));
-    let parsed = parse_exec_request(&request).unwrap();
-    let context = parsed.dependency_context.unwrap();
+    let context = original_metadata_context_after_host_check(&request);
     assert_eq!(
         context.loader_dirs(),
         &[
@@ -1298,19 +1326,13 @@ fn cargo_loader_parent_is_explicit_and_old_context_versions_cannot_ignore_it() {
 fn generated_out_dir_requires_an_exact_optional_root_and_environment() {
     let mut request = dependency_request();
     assert!(
-        parse_exec_request(&request)
-            .unwrap()
-            .dependency_context
-            .unwrap()
+        original_metadata_context_after_host_check(&request)
             .generated_root()
             .is_none()
     );
     request["dependency_context"]["generated_root"] = Value::Null;
     assert!(
-        parse_exec_request(&request)
-            .unwrap()
-            .dependency_context
-            .unwrap()
+        original_metadata_context_after_host_check(&request)
             .generated_root()
             .is_none()
     );
@@ -1324,8 +1346,7 @@ fn generated_out_dir_requires_an_exact_optional_root_and_environment() {
     // No generated files is meaningful: the worker owns a private empty
     // read-only directory even when the build script produced no files.
     let original = request.clone();
-    let decoded = parse_exec_request(&request).unwrap();
-    let context = decoded.dependency_context.unwrap();
+    let context = original_metadata_context_after_host_check(&request);
     assert_eq!(context.generated_root(), Some(generated));
     assert!(
         context
@@ -1487,8 +1508,7 @@ fn dependency_dag_request() -> Value {
 #[test]
 fn dependency_artifact_roots_preserve_first_use_mapping_when_paths_sort_differently() {
     let request = dependency_dag_request();
-    let parsed = parse_exec_request(&request).unwrap();
-    let context = parsed.dependency_context.unwrap();
+    let context = original_metadata_context_after_host_check(&request);
     assert_eq!(
         context.dependency_dirs(),
         &[
@@ -1518,8 +1538,7 @@ fn dependency_artifact_root_parser_admits_shared_output_only_under_current_contr
     // Keep the exact sealed manifest and first-use prefixes. This populated
     // root now also receives the worker-owned writable output directory.
     request["dependency_context"]["out_dir"] = json!("/work/inputs/z-first");
-    let parsed = parse_exec_request(&request).unwrap();
-    let context = parsed.dependency_context.unwrap();
+    let context = original_metadata_context_after_host_check(&request);
     let shared = context
         .artifact_roots()
         .iter()
@@ -2087,6 +2106,281 @@ fn dependency_decoder_refuses_unowned_inputs_ambiguous_context_and_unmodeled_loa
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn dependency_host_requirement_preserves_native_mode_and_context_admission() {
+    let native = DependencyExecutionHost::native().unwrap();
+    let mut report = report();
+    report.dependency_modes = vec![
+        DependencyExecutionMode::Metadata,
+        DependencyExecutionMode::Rlib,
+        DependencyExecutionMode::ClosedMetadata,
+    ];
+    for original in [
+        dependency_request(),
+        archive_request(true),
+        canonical_dependency_request(),
+        canonical_archive_request(true),
+        canonical_workspace_request(false),
+        canonical_workspace_request(true),
+        closed_workspace_metadata_request(),
+    ] {
+        assert_eq!(original["dependency_execution_host"], native.as_str());
+        let parsed = parse_exec_request(&original).unwrap();
+        let context = parsed.dependency_context.as_ref().unwrap();
+        let selected = DependencySelection {
+            version: context.version(),
+            mode: context.execution_mode(),
+        };
+        assert!(validate_execution_selection(&parsed, &report, Some(selected)).is_ok());
+    }
+    let root = private_root();
+    let journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
+    let hello: Value = serde_json::from_str(&worker_hello(&report, &journal)).unwrap();
+    assert_eq!(
+        hello["dependency_execution_hosts"],
+        json!([native.as_str()])
+    );
+    assert!(parse_exec_request(&request(19)).is_ok());
+    let mut unrelated = request(19);
+    unrelated["dependency_execution_host"] = json!(native.as_str());
+    assert_eq!(
+        parse_exec_request(&unrelated).unwrap_err(),
+        "compiler host capability requires a dependency execution context"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn dependency_host_refusals_leave_inputs_and_durable_admission_unclaimed() {
+    let native = DependencyExecutionHost::native().unwrap();
+    let foreign = match native {
+        DependencyExecutionHost::LinuxX86_64 => DependencyExecutionHost::LinuxAarch64,
+        DependencyExecutionHost::LinuxAarch64 => DependencyExecutionHost::LinuxX86_64,
+    };
+    let root = private_root();
+    let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
+    let before = std::fs::read(root.path().join("requests.json")).unwrap();
+    let mut report = report();
+    report.dependency_modes = vec![DependencyExecutionMode::Metadata];
+    let mut wire = Wire::default();
+    let peer = wire.clone();
+    let unsupported = "dependency execution requires a supported compiler host capability";
+    let cases = [
+        (None, unsupported),
+        (Some(Value::Null), unsupported),
+        (Some(json!(true)), unsupported),
+        (Some(json!(64)), unsupported),
+        (Some(json!([native.as_str()])), unsupported),
+        (Some(json!({"native":native.as_str()})), unsupported),
+        (Some(json!("x86_64-unknown-linux-gnu")), unsupported),
+        (Some(json!("linux-x86_64-v999")), unsupported),
+        (
+            Some(json!(native.as_str().to_ascii_uppercase())),
+            unsupported,
+        ),
+        (
+            Some(json!(foreign.as_str())),
+            "worker cannot execute the required compiler host ISA",
+        ),
+    ];
+    for (host, _) in &cases {
+        let mut original = dependency_request();
+        match host {
+            Some(host) => original["dependency_execution_host"] = host.clone(),
+            None => {
+                original
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("dependency_execution_host");
+            }
+        }
+        peer.frame(original);
+    }
+    peer.frame(json!({"kind":"request-status","request_id":712}));
+    peer.frame(json!({"kind":"ping"}));
+    peer.close();
+    wait(drive_session_with_inputs(
+        &mut wire,
+        &report,
+        false,
+        Some(&mut journal),
+        true,
+        true,
+        true,
+        false,
+        &ExecutionLeaseSelection::default(),
+        false,
+        Some(original_selection(DependencyExecutionMode::Metadata)),
+        |_, _, _, _, _, _| panic!("incompatible compiler host reached the launcher"),
+        pressure,
+    ))
+    .unwrap();
+    let replies = peer.replies();
+    assert_eq!(replies.len(), cases.len() + 2);
+    for ((_, reason), reply) in cases.iter().zip(&replies) {
+        assert_eq!(reply["kind"], "error");
+        assert_eq!(reply["request_id"], 712);
+        assert_eq!(reply["reason"], *reason);
+    }
+    assert_eq!(replies[cases.len()]["status"], "unknown");
+    assert_eq!(replies[cases.len()]["replay_authorized"], false);
+    let heartbeat = &replies[cases.len() + 1];
+    assert_eq!(heartbeat["kind"], "heartbeat");
+    assert!(heartbeat["active_request_id"].is_null());
+    assert!(heartbeat["pending_source_request_id"].is_null());
+    assert!(heartbeat["pending_toolchain_request_id"].is_null());
+    assert_eq!(journal.high_water(), None);
+    assert_eq!(
+        std::fs::read(root.path().join("requests.json")).unwrap(),
+        before,
+        "host refusal must not create durable execution ownership"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_dependency_host_reaches_durable_admission_after_verified_input_transfer() {
+    use rabs_sandbox::source_transfer::{SourceFile, SourceManifest};
+    use rabs_sandbox::toolchain_dataset::{ToolchainLimits, fingerprint_toolchain};
+    use rabs_sandbox::toolchain_transfer::MAX_TOOLCHAIN_CHUNK;
+    use sha2::Digest;
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = private_root();
+    // A real native ELF supplies upload bytes only. This fixture stops at the
+    // launcher boundary and makes no claim of compiler or namespace execution.
+    let compiler = std::fs::read("/usr/bin/true").unwrap();
+    let toolchain_root = root.path().join("input-toolchain");
+    std::fs::create_dir_all(toolchain_root.join("bin")).unwrap();
+    std::fs::write(toolchain_root.join("bin/rustc"), &compiler).unwrap();
+    std::fs::set_permissions(
+        toolchain_root.join("bin/rustc"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let identity =
+        fingerprint_toolchain(&toolchain_root, &ToolchainLimits::default(), || false).unwrap();
+    let source: &[u8] = b"pub fn fixture() {}\n";
+    let source_digest = rabs_wkr::session::sha256_hex(source);
+    let manifest = SourceManifest::new(vec![SourceFile {
+        path: "package/src/lib.rs".into(),
+        len: source.len() as u64,
+        sha256: sha2::Sha256::digest(source).into(),
+        executable: false,
+    }])
+    .unwrap();
+    let mut original = dependency_request();
+    original["source_manifest"] = json!({
+        "manifest_sha256":rabs_wkr::source_transfer::hex(&manifest.digest()),
+        "files":[{"path":"package/src/lib.rs","bytes":source.len(),
+            "sha256":source_digest,"executable":false}],
+    });
+    let toolchain_digest = rabs_wkr::source_transfer::hex(&identity.sha256);
+    original["toolchain_identity"] = json!({
+        "version":rabs_sandbox::toolchain_dataset::TOOLCHAIN_DATASET_VERSION,
+        "sha256":toolchain_digest,"files":identity.files,"bytes":identity.bytes,
+    });
+    let expected_fingerprint =
+        rabs_wkr::request_journal::request_fingerprint(&original, DEFAULT_EXECUTION_TIMEOUT);
+    let mut frames = vec![
+        json!({"kind":"source-begin","request_id":712,"manifest":original["source_manifest"]}),
+        json!({"kind":"source-chunk","request_id":712,
+            "manifest_sha256":original["source_manifest"]["manifest_sha256"],
+            "path":"package/src/lib.rs","offset":0,
+            "data_hex":rabs_wkr::source_transfer::hex(source),"chunk_sha256":source_digest}),
+        json!({"kind":"source-seal","request_id":712,
+            "manifest_sha256":original["source_manifest"]["manifest_sha256"]}),
+        json!({"kind":"toolchain-begin","request_id":712,
+            "identity":original["toolchain_identity"],"entries":3}),
+        json!({"kind":"toolchain-entry","request_id":712,"sha256":toolchain_digest,
+            "path":"","entry":{"kind":"directory"}}),
+        json!({"kind":"toolchain-entry","request_id":712,"sha256":toolchain_digest,
+            "path":"bin","entry":{"kind":"directory"}}),
+        json!({"kind":"toolchain-entry","request_id":712,"sha256":toolchain_digest,
+            "path":"bin/rustc","entry":{"kind":"file","bytes":compiler.len(),"executable":true}}),
+    ];
+    for (index, bytes) in compiler.chunks(MAX_TOOLCHAIN_CHUNK).enumerate() {
+        frames.push(
+            json!({"kind":"toolchain-chunk","request_id":712,"sha256":toolchain_digest,
+            "path":"bin/rustc","offset":index * MAX_TOOLCHAIN_CHUNK,
+            "data_hex":rabs_wkr::source_transfer::hex(bytes),
+            "chunk_sha256":rabs_wkr::session::sha256_hex(bytes)}),
+        );
+    }
+    frames.push(json!({"kind":"toolchain-seal","request_id":712,"sha256":toolchain_digest}));
+    let input_replies = frames.len();
+    let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
+    let mut report = report();
+    report.dependency_modes = vec![DependencyExecutionMode::Metadata];
+    let mut wire = Wire::default();
+    let peer = wire.clone();
+    let launches = AtomicUsize::new(0);
+    let lease = ExecutionLeaseSelection::default();
+    let mut driver = Box::pin(drive_session_with_inputs(
+        &mut wire,
+        &report,
+        false,
+        Some(&mut journal),
+        true,
+        true,
+        true,
+        false,
+        &lease,
+        false,
+        Some(original_selection(DependencyExecutionMode::Metadata)),
+        |request, _, artifacts, source_owner, toolchain_owner, execution_lease| {
+            launches.fetch_add(1, Ordering::SeqCst);
+            assert!(artifacts.is_some() && source_owner.is_some() && toolchain_owner.is_some());
+            assert!(execution_lease.is_none());
+            assert_eq!(
+                std::fs::read(PathBuf::from(&request.workspace_backing).join("package/src/lib.rs"))
+                    .unwrap(),
+                source
+            );
+            assert_eq!(
+                std::fs::read(PathBuf::from(&request.toolchain_backing).join("bin/rustc")).unwrap(),
+                compiler
+            );
+            let admitted: Value =
+                serde_json::from_slice(&std::fs::read(root.path().join("requests.json")).unwrap())
+                    .unwrap();
+            assert_eq!(admitted["last"]["request_id"], 712);
+            assert_eq!(admitted["last"]["fingerprint"], expected_fingerprint);
+            assert_eq!(admitted["last"]["resolved"], false);
+            Err(io::Error::other(
+                "host admission fixture stops before compiler launch",
+            ))
+        },
+        pressure,
+    ));
+    for (index, frame) in frames.into_iter().enumerate() {
+        peer.frame(frame);
+        pump(driver.as_mut(), &peer, index + 1);
+        let reply = &peer.replies()[index];
+        assert_ne!(
+            reply["kind"], "error",
+            "verified input was refused: {reply}"
+        );
+        assert_eq!(reply["request_id"], 712);
+    }
+    assert_eq!(peer.replies().last().unwrap()["sealed"], true);
+    peer.frame(original);
+    peer.frame(json!({"kind":"request-status","request_id":712}));
+    peer.close();
+    wait(driver).unwrap();
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
+    assert_eq!(journal.high_water(), Some(712));
+    let replies = peer.replies();
+    assert_eq!(replies.len(), input_replies + 2);
+    assert_eq!(
+        replies[input_replies]["reason"],
+        "execution start: host admission fixture stops before compiler launch"
+    );
+    assert_eq!(replies[input_replies + 1]["status"], "execution-uncertain");
+    assert_eq!(replies[input_replies + 1]["replay_authorized"], false);
+}
+
 #[cfg(unix)]
 #[test]
 fn unnegotiated_dependency_request_never_burns_durable_admission() {
@@ -2109,7 +2403,14 @@ fn unnegotiated_dependency_request_never_burns_durable_admission() {
     .unwrap();
     let replies = peer.replies();
     assert_eq!(replies[0]["kind"], "error");
-    assert_eq!(replies[0]["reason"], "dependency context not negotiated");
+    assert_eq!(
+        replies[0]["reason"],
+        if DependencyExecutionHost::native().is_some() {
+            "dependency context not negotiated"
+        } else {
+            "worker cannot execute the required compiler host ISA"
+        }
+    );
     assert_eq!(replies[1]["status"], "unknown");
     assert_eq!(journal.high_water(), None);
     let hello: Value = serde_json::from_str(&worker_hello(&report(), &journal)).unwrap();
@@ -2123,6 +2424,15 @@ fn unnegotiated_dependency_request_never_burns_durable_admission() {
         ])
     );
     assert_eq!(hello["dependency_execution_modes"], json!([]));
+    assert_eq!(
+        hello["dependency_execution_hosts"],
+        json!(
+            DependencyExecutionHost::native()
+                .into_iter()
+                .map(DependencyExecutionHost::as_str)
+                .collect::<Vec<_>>()
+        )
+    );
     assert_eq!(
         hello["dependency_native_inputs"],
         json!([
@@ -2169,7 +2479,11 @@ fn archive_mode_mismatch_refuses_before_input_or_durable_admission() {
     let replies = peer.replies();
     assert_eq!(
         replies[0]["reason"],
-        "dependency execution mode does not match negotiation"
+        if DependencyExecutionHost::native().is_some() {
+            "dependency execution mode does not match negotiation"
+        } else {
+            "worker cannot execute the required compiler host ISA"
+        }
     );
     assert_eq!(
         replies[1]["reason"],
@@ -2182,47 +2496,57 @@ fn archive_mode_mismatch_refuses_before_input_or_durable_admission() {
 #[cfg(unix)]
 #[test]
 fn retained_dependency_result_resumes_without_execution_or_input_grants() {
-    assert_retained_dependency_resume(DEPENDENCY_CONTEXT_VERSION);
+    assert_retained_dependency_resume(DEPENDENCY_CONTEXT_VERSION, true);
+}
+
+#[cfg(unix)]
+#[test]
+fn retained_dependency_result_without_execution_host_remains_recoverable() {
+    assert_retained_dependency_resume(DEPENDENCY_CONTEXT_VERSION, false);
 }
 
 #[cfg(unix)]
 #[test]
 fn retained_v1_dependency_result_remains_recoverable_after_context_upgrade() {
-    assert_retained_dependency_resume("dependency-exec-v1");
+    assert_retained_dependency_resume("dependency-exec-v1", true);
 }
 
 #[cfg(unix)]
 #[test]
 fn retained_v2_dependency_result_remains_recoverable_after_context_upgrade() {
-    assert_retained_dependency_resume("dependency-exec-v2");
+    assert_retained_dependency_resume("dependency-exec-v2", true);
 }
 
 #[cfg(unix)]
 #[test]
 fn retained_v3_dependency_result_remains_recoverable_after_context_upgrade() {
-    assert_retained_dependency_resume("dependency-exec-v3");
+    assert_retained_dependency_resume("dependency-exec-v3", true);
 }
 
 #[cfg(unix)]
 #[test]
 fn retained_v4_dependency_result_remains_recoverable_after_context_upgrade() {
-    assert_retained_dependency_resume("dependency-exec-v4");
+    assert_retained_dependency_resume("dependency-exec-v4", true);
 }
 
 #[cfg(unix)]
 #[test]
 fn retained_v7_dependency_result_remains_recoverable_after_directory_contract_upgrade() {
-    assert_retained_dependency_resume("dependency-exec-v7");
+    assert_retained_dependency_resume("dependency-exec-v7", true);
 }
 
 #[cfg(unix)]
-fn assert_retained_dependency_resume(version: &str) {
+fn assert_retained_dependency_resume(version: &str, include_execution_host: bool) {
     let root = private_root();
     let mut original = dependency_request();
+    let id = original["request_id"].as_u64().unwrap();
+    let recorded_host = original["dependency_execution_host"].clone();
     // This fixture seals known bytes to exercise result recovery only. It does
-    // not claim rustc execution; the real compiler oracle is separate.
+    // not claim rustc execution; the real compiler oracle is separate. Its
+    // generic task scaffold needs only the ID, while the journal and recovery
+    // retain the complete historical dependency request unchanged.
     original["artifacts"] = json!({"unit":"leaf","files":["lib.rlib"]});
-    let execution = parse_exec_request(&original).unwrap();
+    let execution = parse_exec_request(&request(id)).unwrap();
     // Simulate bytes durably retained under the older accepted execution
     // context. The current worker must reject it for new execution, while the
     // exact saved fingerprint still authorizes retrieval-only recovery.
@@ -2240,7 +2564,23 @@ fn assert_retained_dependency_resume(version: &str) {
         }
         assert!(parse_exec_request(&original).is_err());
     }
-    let id = original["request_id"].as_u64().unwrap();
+    if !include_execution_host {
+        original
+            .as_object_mut()
+            .unwrap()
+            .remove("dependency_execution_host");
+        assert_eq!(
+            parse_exec_request(&original).unwrap_err(),
+            "dependency execution requires a supported compiler host capability",
+            "old retained bytes must not become a newly executable request"
+        );
+    } else if version == DEPENDENCY_CONTEXT_VERSION && DependencyExecutionHost::native().is_none() {
+        assert_eq!(
+            parse_exec_request(&original).unwrap_err(),
+            "worker cannot execute the required compiler host ISA",
+            "historical payload construction must not grant native execution"
+        );
+    }
     {
         let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
         assert_eq!(
@@ -2275,6 +2615,16 @@ fn assert_retained_dependency_resume(version: &str) {
     let mut changed_tree = original.clone();
     changed_tree["dependency_context"]["generated_directories"] = json!(["empty"]);
     peer.frame(json!({"kind":"result-resume","request_id":id,"request":changed_tree}));
+    let mut changed_host = original.clone();
+    if include_execution_host {
+        changed_host
+            .as_object_mut()
+            .unwrap()
+            .remove("dependency_execution_host");
+    } else {
+        changed_host["dependency_execution_host"] = recorded_host;
+    }
+    peer.frame(json!({"kind":"result-resume","request_id":id,"request":changed_host}));
     peer.frame(json!({"kind":"result-resume","request_id":id,"request":original}));
     let mut report = report();
     // Retained bytes remain recoverable even if the host can no longer create
@@ -2293,19 +2643,20 @@ fn assert_retained_dependency_resume(version: &str) {
         |_, _, _| panic!("retained dependency recovery invoked execution"),
         pressure,
     ));
-    pump(driver.as_mut(), &peer, 3);
+    pump(driver.as_mut(), &peer, 4);
     assert_eq!(peer.replies()[0]["kind"], "error");
     assert_eq!(peer.replies()[1]["kind"], "error");
-    let resumed = peer.replies()[2].clone();
+    assert_eq!(peer.replies()[2]["kind"], "error");
+    let resumed = peer.replies()[3].clone();
     assert_eq!(resumed["kind"], "exec-result");
     assert_eq!(resumed["resumed"], true);
     peer.frame(output_read(id, "stdout", 1, 3));
     peer.frame(
         json!({"kind":"artifact-read","request_id":id,"name":"lib.rlib","offset":0,"max_bytes":64}),
     );
-    pump(driver.as_mut(), &peer, 5);
-    assert_eq!(peer.replies()[3]["data_hex"], "00ff42");
-    assert_eq!(peer.replies()[4]["data_hex"], "6172636869766500ff");
+    pump(driver.as_mut(), &peer, 6);
+    assert_eq!(peer.replies()[4]["data_hex"], "00ff42");
+    assert_eq!(peer.replies()[5]["data_hex"], "6172636869766500ff");
     peer.frame(output_ack(id));
     peer.frame(json!({"kind":"artifact-ack","request_id":id,
         "manifest_sha256":resumed["artifact_manifest"]["manifest_sha256"],
@@ -2315,4 +2666,5 @@ fn assert_retained_dependency_resume(version: &str) {
         journal.status(id)["receipt"]["retained_result_released"],
         true
     );
+    assert_eq!(journal.high_water(), Some(id));
 }

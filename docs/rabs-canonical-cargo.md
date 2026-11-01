@@ -1210,6 +1210,16 @@ shared service described below keeps them available between Cargo commands.
 Workers can therefore reconnect and become ready while the coordinator has no
 compiler request waiting.
 
+Dependency placement also checks the compiler's execution host before granting
+work or transferring inputs. Workers advertise their native Linux ISA in
+`dependency_execution_hosts` (`linux-x86_64-v1` or `linux-aarch64-v1`); the
+coordinator selects it from the captured compiler's host triple, independently
+of the compilation's output `--target`. A missing or incompatible advertisement
+cannot admit a new dependency execution. GNU and musl compiler hosts use the
+same ISA eligibility check; the existing exact runtime-cohort verification
+still checks the retained loader and libraries. The worker independently
+rechecks the selected host before acquiring durable execution ownership.
+
 The worker must explicitly advertise `canonical-dependency-exec-v4` and support
 the selected `metadata` or `rlib` execution mode. Both peers retain that exact version and mode through
 authenticated admission. An older worker cannot silently reinterpret the request

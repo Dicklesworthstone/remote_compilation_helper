@@ -30,7 +30,8 @@ use rabs_sandbox::cargo_artifacts::{self, CargoArtifactReport};
 use rabs_sandbox::dependency_context::{
     CANONICAL_DEPENDENCY_CONTEXT_VERSION, CANONICAL_NATIVE_METADATA_CAPABILITY,
     CANONICAL_NATIVE_ROOTS_CAPABILITY, CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION,
-    CANONICAL_WORKSPACE_CONTEXT_VERSION, DEPENDENCY_CONTEXT_VERSION, DependencyExecutionMode,
+    CANONICAL_WORKSPACE_CONTEXT_VERSION, DEPENDENCY_CONTEXT_VERSION, DependencyExecutionHost,
+    DependencyExecutionMode,
 };
 use rabs_sandbox::process_context::{
     COMMAND_CONTEXT_VERSION, CommandContext, MAX_COMMAND_ENV_ENTRIES,
@@ -238,6 +239,24 @@ fn execution_capabilities(
         hello,
         context.is_none_or(|selected| selected.mode.requires_canonical_namespace()),
     )?;
+    if context.is_some() {
+        let host = request
+            .get("dependency_execution_host")
+            .and_then(Value::as_str)
+            .and_then(DependencyExecutionHost::parse)
+            .ok_or_else(|| {
+                invalid("dependency execution requires a supported compiler host capability")
+            })?;
+        require(
+            supports(hello, "dependency_execution_hosts", host.as_str()),
+            "worker cannot execute the required compiler host ISA",
+        )?;
+    } else {
+        require(
+            request.get("dependency_execution_host").is_none(),
+            "compiler host capability requires a dependency execution context",
+        )?;
+    }
     // Presence selects the protocol requirement; only the later request and
     // upload owners validate the complete payload and its execution authority.
     if request.get("command_context").is_some() {
@@ -1465,6 +1484,7 @@ mod tests {
             replies: VecDeque::from([
                 json!({"kind":"worker-hello","worker_id":"worker","canonical":true,"slots":4,
                 "boot_generation":1,"incarnation":"00000000000000000000000000000001","request_high_water":null,
+                "dependency_execution_hosts":[DependencyExecutionHost::LinuxX86_64.as_str()],
                 "recovery_protocols":["request-journal-v1"],"output_transfers":["ranges-v1"],"artifact_transfers":["files-v1"]}),
                 json!({"kind":"exec-result","request_id":7,"executed":true,"exit_code":0,
                 "residual_group_members":0,"stop_reason":null,"output_transfer":"ranges-v1","output_ack_required":true,
@@ -1493,11 +1513,13 @@ mod tests {
         offered["dependency_contexts"] =
             json!([CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION]);
         offered["dependency_execution_modes"] = json!(["closed-metadata"]);
+        offered["dependency_execution_hosts"] = json!(["linux-x86_64-v1"]);
         offered["toolchain_datasets"] = json!([TOOLCHAIN_DATASET_VERSION]);
         offered["toolchain_transfers"] =
             json!([rabs_sandbox::toolchain_transfer::TOOLCHAIN_TRANSFER_VERSION]);
         let projection = json!({
             "program":"rustc", "args":["lib.rs"],
+            "dependency_execution_host":"linux-x86_64-v1",
             "dependency_context":{
                 "version":CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION,
                 "execution_mode":"closed-metadata"
@@ -1543,9 +1565,11 @@ mod tests {
         let mut offered = fixture(Path::new("/unused-native-projection")).replies[0].clone();
         offered["dependency_contexts"] = json!([CANONICAL_WORKSPACE_CONTEXT_VERSION]);
         offered["dependency_execution_modes"] = json!(["metadata"]);
+        offered["dependency_execution_hosts"] = json!(["linux-x86_64-v1"]);
         let projection = json!({
             "program":"rustc",
             "args":["-Lnative=/__rabs/out/cargo/debug/build/provider/out", "-lstatic=provider", "lib.rs"],
+            "dependency_execution_host":"linux-x86_64-v1",
             "dependency_context":{
                 "version":CANONICAL_WORKSPACE_CONTEXT_VERSION, "execution_mode":"metadata",
                 "native_roots":[{"path":"/__rabs/out/cargo/debug/build/provider/out", "prefix":"native/0000", "directories":[]}]
@@ -1564,6 +1588,53 @@ mod tests {
             CANONICAL_NATIVE_ROOTS_CAPABILITY
         ]);
         validate_worker_execution_capabilities(&offered, &projection).unwrap();
+    }
+
+    #[test]
+    fn execution_capability_projection_requires_a_known_compiler_host_requirement() {
+        let mut offered = fixture(Path::new("/unused-host-projection")).replies[0].clone();
+        offered["dependency_contexts"] = json!([DEPENDENCY_CONTEXT_VERSION]);
+        offered["dependency_execution_modes"] = json!(["metadata"]);
+        offered["dependency_execution_hosts"] = json!(["linux-x86_64-v1"]);
+        let mut projection = json!({
+            "program":"rustc", "args":["lib.rs"],
+            "dependency_context":{
+                "version":DEPENDENCY_CONTEXT_VERSION, "execution_mode":"metadata"
+            }
+        });
+        assert!(
+            validate_worker_execution_capabilities(&offered, &projection)
+                .unwrap_err()
+                .to_string()
+                .contains("supported compiler host capability")
+        );
+        for host in [
+            Value::Null,
+            json!(1),
+            json!(["linux-x86_64-v1"]),
+            json!({"arch":"x86_64"}),
+            json!("linux-x86_64-v2"),
+            json!("x86_64-unknown-linux-gnu"),
+        ] {
+            projection["dependency_execution_host"] = host;
+            assert!(
+                validate_worker_execution_capabilities(&offered, &projection)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("supported compiler host capability")
+            );
+        }
+        projection["dependency_execution_host"] = json!("linux-x86_64-v1");
+        validate_worker_execution_capabilities(&offered, &projection).unwrap();
+        assert!(
+            validate_worker_execution_capabilities(
+                &offered,
+                &json!({"dependency_execution_host":"linux-x86_64-v1"}),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("requires a dependency execution context")
+        );
     }
 
     #[test]
@@ -2359,6 +2430,7 @@ mod tests {
         request["dependency_context"] = json!({
             "version":DEPENDENCY_CONTEXT_VERSION, "execution_mode":"rlib"
         });
+        request["dependency_execution_host"] = json!(DependencyExecutionHost::LinuxX86_64.as_str());
         let mut peer = fixture(&destination);
         peer.replies[0]["canonical"] = json!(false);
         peer.replies[0]["dependency_contexts"] = json!([DEPENDENCY_CONTEXT_VERSION]);
@@ -2434,6 +2506,8 @@ mod tests {
             request["dependency_context"] = json!({
                 "version":requested_version, "execution_mode":requested_mode,
             });
+            request["dependency_execution_host"] =
+                json!(DependencyExecutionHost::LinuxX86_64.as_str());
             let mut peer = fixture(&destination);
             peer.replies[0]["canonical"] = json!(false);
             peer.replies[0]["dependency_contexts"] = offered_versions;
@@ -2522,6 +2596,8 @@ mod tests {
             let mut request = request();
             request["dependency_context"] =
                 json!({"version":version,"execution_mode":execution_mode});
+            request["dependency_execution_host"] =
+                json!(DependencyExecutionHost::LinuxX86_64.as_str());
             let mut peer = fixture(&destination);
             peer.replies[0]["dependency_contexts"] = offered;
             peer.replies[0]["dependency_execution_modes"] = json!(["metadata", "rlib"]);
@@ -2555,6 +2631,145 @@ mod tests {
             assert!(
                 negotiated_dependency_context(&no_execution, &request, DeliveryMode::Execute)
                     .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn compiler_host_delivery_matches_the_compiler_without_rewriting_cross_target_args() {
+        for (host, target) in [
+            (
+                DependencyExecutionHost::LinuxX86_64,
+                "aarch64-unknown-linux-gnu",
+            ),
+            (
+                DependencyExecutionHost::LinuxAarch64,
+                "x86_64-unknown-linux-gnu",
+            ),
+        ] {
+            let parent = tempfile::tempdir().unwrap();
+            let destination = parent.path().join("cross-target");
+            let mut request = request();
+            request["dependency_context"] = json!({
+                "version":DEPENDENCY_CONTEXT_VERSION, "execution_mode":"metadata"
+            });
+            request["dependency_execution_host"] = json!(host.as_str());
+            request["args"] = json!([format!("--target={target}"), "lib.rs"]);
+            let mut peer = fixture(&destination);
+            peer.replies[0]["dependency_contexts"] = json!([DEPENDENCY_CONTEXT_VERSION]);
+            peer.replies[0]["dependency_execution_modes"] = json!(["metadata"]);
+            peer.replies[0]["dependency_execution_hosts"] = json!([host.as_str()]);
+            let delivery = receive_execution(&mut peer, &request, "worker", &destination).unwrap();
+            assert!(delivery.acknowledgments_confirmed);
+            assert_eq!(peer.sent[1], request);
+            assert_eq!(
+                std::fs::read(destination.join("artifacts/a")).unwrap(),
+                b"A\0\xffB"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_foreign_or_malformed_compiler_host_refuses_before_any_delivery_effect() {
+        for advertised in [
+            None,
+            Some(Value::Null),
+            Some(json!(DependencyExecutionHost::LinuxX86_64.as_str())),
+            Some(json!([])),
+            Some(json!([DependencyExecutionHost::LinuxAarch64.as_str()])),
+            Some(json!(["linux-x86_64-v0"])),
+            Some(json!([{"host":DependencyExecutionHost::LinuxX86_64.as_str()}])),
+            Some(json!([17])),
+        ] {
+            let parent = tempfile::tempdir().unwrap();
+            let destination = parent.path().join("host-refused");
+            let mut request = request();
+            request["dependency_context"] = json!({
+                "version":DEPENDENCY_CONTEXT_VERSION, "execution_mode":"metadata"
+            });
+            request["dependency_execution_host"] =
+                json!(DependencyExecutionHost::LinuxX86_64.as_str());
+            request["args"] = json!(["--target=aarch64-unknown-linux-gnu", "lib.rs"]);
+            let mut peer = fixture(&destination);
+            peer.replies[0]["dependency_contexts"] = json!([DEPENDENCY_CONTEXT_VERSION]);
+            peer.replies[0]["dependency_execution_modes"] = json!(["metadata"]);
+            if let Some(advertised) = advertised {
+                peer.replies[0]["dependency_execution_hosts"] = advertised;
+            } else {
+                peer.replies[0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("dependency_execution_hosts");
+            }
+            let failure =
+                receive_execution(&mut peer, &request, "worker", &destination).unwrap_err();
+            assert!(!failure.execution_may_have_run);
+            assert!(
+                failure.detail.contains("required compiler host ISA"),
+                "{failure:?}"
+            );
+            assert!(
+                peer.sent.is_empty(),
+                "host refusal must precede grants, input upload and execution"
+            );
+            assert_eq!(
+                peer.replies.len(),
+                6,
+                "only the worker hello may be consumed"
+            );
+            assert!(!destination.exists());
+        }
+    }
+
+    #[test]
+    fn retained_dependency_recovery_does_not_require_current_compiler_host_compatibility() {
+        use super::super::delivery_recovery::{DeliveryTrust, recover_existing_delivery};
+
+        for declared in [false, true] {
+            let parent = tempfile::tempdir().unwrap();
+            let destination = parent.path().join("host-independent-resume");
+            let mut request = request();
+            request["dependency_context"] = json!({
+                "version":DEPENDENCY_CONTEXT_VERSION, "execution_mode":"metadata"
+            });
+            if declared {
+                request["dependency_execution_host"] =
+                    json!(DependencyExecutionHost::LinuxX86_64.as_str());
+            }
+            let mut peer = resumable(&destination);
+            peer.replies[0]["canonical"] = json!(false);
+            peer.replies[0]["dependency_execution_hosts"] =
+                json!([DependencyExecutionHost::LinuxAarch64.as_str()]);
+            let delivery = receive_operation(
+                &mut peer,
+                &request,
+                "worker",
+                &destination,
+                DeliveryMode::Resume,
+            )
+            .unwrap();
+            assert!(delivery.acknowledgments_confirmed);
+            assert_eq!(peer.sent[1], DeliveryMode::Resume.frame(&request));
+            assert!(
+                !peer
+                    .sent
+                    .iter()
+                    .any(|frame| frame["kind"] == "canonical-exec")
+            );
+            recover_existing_delivery(&request, "worker", &destination, DeliveryTrust::Loopback)
+                .unwrap()
+                .unwrap();
+            request["dependency_execution_host"] =
+                json!(DependencyExecutionHost::LinuxAarch64.as_str());
+            assert!(
+                recover_existing_delivery(
+                    &request,
+                    "worker",
+                    &destination,
+                    DeliveryTrust::Loopback,
+                )
+                .is_err(),
+                "recovery must preserve the originally dispatched host identity"
             );
         }
     }
@@ -2634,6 +2849,8 @@ mod tests {
                     "version":version, "execution_mode":mode,
                     "native_roots":[{"path":"/__rabs/out/cargo/debug/build/provider/out", "prefix":"native/0000", "directories":[]}]
                 });
+                request["dependency_execution_host"] =
+                    json!(DependencyExecutionHost::LinuxX86_64.as_str());
                 request["args"] = json!([
                     "-Lnative=/__rabs/out/cargo/debug/build/provider/out",
                     "lib.rs"
@@ -2689,6 +2906,8 @@ mod tests {
                 let mut request = request();
                 request["dependency_context"] =
                     json!({"version":version,"execution_mode":"metadata"});
+                request["dependency_execution_host"] =
+                    json!(DependencyExecutionHost::LinuxX86_64.as_str());
                 request["args"] = json!([
                     "-Lnative=/__rabs/out/cargo/debug/build/leaf/out",
                     "-lstatic=leaf",
@@ -2754,6 +2973,8 @@ mod tests {
             request["dependency_context"] = json!({
                 "version":DEPENDENCY_CONTEXT_VERSION, "execution_mode":"rlib"
             });
+            request["dependency_execution_host"] =
+                json!(DependencyExecutionHost::LinuxX86_64.as_str());
             let mut peer = fixture(&destination);
             peer.replies[0]["dependency_contexts"] = json!([DEPENDENCY_CONTEXT_VERSION]);
             if let Some(value) = advertised {
@@ -2782,6 +3003,8 @@ mod tests {
                 request["dependency_context"] = json!({
                     "version":DEPENDENCY_CONTEXT_VERSION, "execution_mode":"metadata"
                 });
+                request["dependency_execution_host"] =
+                    json!(DependencyExecutionHost::LinuxX86_64.as_str());
             }
             let mut peer = fixture(&destination);
             peer.replies[0]["canonical"] = json!(false);

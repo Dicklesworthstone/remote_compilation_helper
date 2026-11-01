@@ -24,7 +24,8 @@ use rabs_protocol::worker_standby::{self, WorkerStandby};
 use rabs_sandbox::dependency_context::{
     CANONICAL_DEPENDENCY_CONTEXT_VERSION, CANONICAL_NATIVE_METADATA_CAPABILITY,
     CANONICAL_NATIVE_ROOTS_CAPABILITY, CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION,
-    CANONICAL_WORKSPACE_CONTEXT_VERSION, DEPENDENCY_CONTEXT_VERSION, DependencyExecutionMode,
+    CANONICAL_WORKSPACE_CONTEXT_VERSION, DEPENDENCY_CONTEXT_VERSION, DependencyExecutionHost,
+    DependencyExecutionMode,
 };
 use rabs_sandbox::source_transfer::SOURCE_TRANSFER;
 use rabs_sandbox::toolchain_transfer::{TOOLCHAIN_REUSE_VERSION, TOOLCHAIN_TRANSFER_VERSION};
@@ -2018,6 +2019,8 @@ fn worker_hello(report: &rabs_wkr::session::CapabilityReport, journal: &WorkerJo
         "dependency_native_inputs": [CANONICAL_NATIVE_METADATA_CAPABILITY, CANONICAL_NATIVE_ROOTS_CAPABILITY],
         "dependency_execution_modes": report.dependency_modes.iter()
             .map(|mode| mode.as_str()).collect::<Vec<_>>(),
+        "dependency_execution_hosts": DependencyExecutionHost::native().into_iter()
+            .map(DependencyExecutionHost::as_str).collect::<Vec<_>>(),
         "toolchain_datasets": [rabs_sandbox::toolchain_dataset::TOOLCHAIN_DATASET_VERSION],
         "recovery_protocols": [RECOVERY_PROTOCOL],
         "result_retentions": [RESULT_RETENTION],
@@ -2577,6 +2580,21 @@ fn parse_exec_request(value: &serde_json::Value) -> Result<CanonicalExecRequest,
         ),
     };
     let dependency_context = parse_dependency_context(value)?;
+    // Validate new executions before staged-input adoption or durable journal
+    // admission. Sealed-result recovery keeps its original opaque request and
+    // does not pass through this decoder or require this newer capability.
+    if dependency_context.is_some() {
+        let required = value
+            .get("dependency_execution_host")
+            .and_then(serde_json::Value::as_str)
+            .and_then(DependencyExecutionHost::parse)
+            .ok_or("dependency execution requires a supported compiler host capability")?;
+        if Some(required) != DependencyExecutionHost::native() {
+            return Err("worker cannot execute the required compiler host ISA".to_owned());
+        }
+    } else if value.get("dependency_execution_host").is_some() {
+        return Err("compiler host capability requires a dependency execution context".to_owned());
+    }
     let program = text("program")?;
     let source_manifest = source_transfer::request_manifest(value)?;
     let transferred_toolchain = toolchain_transfer::request_identity(value)?;

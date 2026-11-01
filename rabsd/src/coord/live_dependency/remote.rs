@@ -55,7 +55,7 @@ use rabs_protocol::input_evidence::ActionInputManifest;
 use rabs_protocol::result_identity::OutputRole;
 use rabs_sandbox::dependency_context::{
     CANONICAL_DEPENDENCY_CONTEXT_VERSION, DEPENDENCY_CONTEXT_VERSION, DependencyArtifactRoot,
-    DependencyExecContext, DependencyExecutionMode, DependencyNativeRoot,
+    DependencyExecContext, DependencyExecutionHost, DependencyExecutionMode, DependencyNativeRoot,
 };
 use rabs_sandbox::loader_directories::{LoaderDirectoryWitness, observe_loader_directories};
 use rabs_sandbox::runtime_cohort::observe_runtime_cohort;
@@ -1898,6 +1898,8 @@ fn dependency_execution_requirements(
     toolchain: &ToolchainIdentity,
 ) -> Result<Value, String> {
     let grant = dependency_execution_grant(plan, argv)?;
+    let host = DependencyExecutionHost::from_rustc_host(&plan.host_triple)
+        .ok_or("remote dependency compiler host requires a supported native Linux ISA")?;
     if context.execution_mode() != execution_mode(plan)?
         || context.canonical_cargo() != plan.canonical_cargo
         || context.workspace_execution_only() != plan.source_kind.is_workspace()
@@ -1921,6 +1923,7 @@ fn dependency_execution_requirements(
         "toolchain_identity":toolchain_identity_value(toolchain),
         "artifacts":{"files":plan.output_names()},
         "dependency_context":context_value(context),
+        "dependency_execution_host":host.as_str(),
     }))
 }
 
@@ -2739,6 +2742,7 @@ mod worker_pool_tests {
             "dependency_contexts":[CANONICAL_DEPENDENCY_CONTEXT_VERSION,
                 rabs_sandbox::dependency_context::CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION],
             "dependency_execution_modes":["rlib", "closed-metadata"],
+            "dependency_execution_hosts":[DependencyExecutionHost::LinuxX86_64.as_str()],
         })
     }
 
@@ -2757,6 +2761,7 @@ mod worker_pool_tests {
             "toolchain_transfer":TOOLCHAIN_TRANSFER_VERSION,
             "artifacts":{"files":["libunit.rmeta"]},
             "dependency_context":{"version":version,"execution_mode":mode},
+            "dependency_execution_host":DependencyExecutionHost::LinuxX86_64.as_str(),
         })
     }
 
@@ -2811,6 +2816,71 @@ mod worker_pool_tests {
             assert_eq!(reserved.worker(), "worker-2", "{field}");
             drop((reserved, claim, unsuitable, suitable));
         }
+    }
+
+    #[test]
+    fn compiler_host_placement_skips_missing_or_foreign_authenticated_hosts() {
+        let mut request = scheduling_request(true);
+        request["args"] = json!(["--target=aarch64-unknown-linux-gnu", "src/lib.rs"]);
+        for advertised in [
+            None,
+            Some(json!([DependencyExecutionHost::LinuxAarch64.as_str()])),
+            Some(json!(DependencyExecutionHost::LinuxX86_64.as_str())),
+        ] {
+            let state = crate::test_util::private_tempdir();
+            let pool = pool(state.path(), 2);
+            let mut hello = scheduling_hello();
+            if let Some(advertised) = advertised {
+                hello["dependency_execution_hosts"] = advertised;
+            } else {
+                hello
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("dependency_execution_hosts");
+            }
+            let unsuitable = pool.workers[0].advertise_for_test(&hello);
+            let suitable = pool.workers[1].advertise_for_test(&scheduling_hello());
+            assert_eq!(
+                pool.workers[0].placement_readiness(Some(&request)),
+                PlacementReadiness::Incompatible,
+            );
+            let (reserved, claim) = pool.try_reserve_for(&key(1), Some(&request)).unwrap();
+            assert_eq!(reserved.worker(), "worker-2");
+            assert_eq!(std::fs::read_dir(state.path()).unwrap().count(), 0);
+            drop((reserved, claim, unsuitable, suitable));
+            assert!(pool.pending.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn foreign_compiler_host_fleet_refuses_without_a_request_id_or_sticky_exclusion() {
+        let state = crate::test_util::private_tempdir();
+        let pool = pool(state.path(), 2);
+        let mut request = scheduling_request(true);
+        request["args"] = json!(["--target=aarch64-unknown-linux-gnu", "src/lib.rs"]);
+        let mut foreign = scheduling_hello();
+        foreign["dependency_execution_hosts"] =
+            json!([DependencyExecutionHost::LinuxAarch64.as_str()]);
+        let first = pool.workers[0].advertise_for_test(&foreign);
+        let second = pool.workers[1].advertise_for_test(&foreign);
+        assert_eq!(
+            pool.try_reserve_for(&key(1), Some(&request))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported,
+        );
+        assert!(pool.pending.lock().unwrap().is_empty());
+        assert_eq!(std::fs::read_dir(state.path()).unwrap().count(), 0);
+
+        // A later authenticated offer can execute the compiler, even though
+        // Cargo's output target remains the other architecture.
+        drop(second);
+        let replacement = pool.workers[1].advertise_for_test(&scheduling_hello());
+        let (reserved, claim) = pool.try_reserve_for(&key(1), Some(&request)).unwrap();
+        assert_eq!(reserved.worker(), "worker-2");
+        assert_eq!(std::fs::read_dir(state.path()).unwrap().count(), 0);
+        drop((reserved, claim, first, replacement));
+        assert!(pool.pending.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -5113,12 +5183,55 @@ mod execution_resource_tests {
             toolchain_identity_value(&fixture.toolchain)
         );
         assert_eq!(wire["dependency_context"], context_value(&fixture.context));
+        assert_eq!(
+            wire["dependency_execution_host"],
+            DependencyExecutionHost::LinuxX86_64.as_str(),
+        );
         assert_eq!(wire["artifacts"]["unit"], "dependency-0000000000000011");
         assert_eq!(
             wire["artifacts"]["files"],
             json!(fixture.plan.output_names())
         );
-        assert_eq!(wire.as_object().unwrap().len(), 10);
+        assert_eq!(wire.as_object().unwrap().len(), 11);
+    }
+
+    #[test]
+    fn dependency_placement_and_dispatch_bind_compiler_host_instead_of_output_target() {
+        let fixture = Fixture::new(&["--target=aarch64-unknown-linux-gnu"]);
+        assert_eq!(fixture.plan.host_triple, "x86_64-unknown-linux-gnu");
+        assert_eq!(fixture.plan.target_triple, "aarch64-unknown-linux-gnu");
+        let requirements = dependency_execution_requirements(
+            &fixture.plan,
+            &fixture.argv,
+            &fixture.context,
+            &fixture.toolchain,
+        )
+        .unwrap();
+        let wire = fixture.request().unwrap();
+        for request in [&requirements, &wire] {
+            assert_eq!(
+                request["dependency_execution_host"],
+                DependencyExecutionHost::LinuxX86_64.as_str(),
+            );
+            assert_eq!(request["args"], json!(fixture.argv[1..]));
+        }
+        assert!(requirements.get("request_id").is_none());
+        assert!(requirements["artifacts"].get("unit").is_none());
+    }
+
+    #[test]
+    fn unsupported_compiler_host_cannot_be_placed_using_a_supported_output_target() {
+        let mut fixture = Fixture::new(&["--target=aarch64-unknown-linux-gnu"]);
+        fixture.plan.host_triple = "x86_64-unknown-freebsd".into();
+        let error = dependency_execution_requirements(
+            &fixture.plan,
+            &fixture.argv,
+            &fixture.context,
+            &fixture.toolchain,
+        )
+        .unwrap_err();
+        assert!(error.contains("compiler host requires a supported native Linux ISA"));
+        assert_eq!(fixture.request().unwrap_err(), error);
     }
 
     #[test]

@@ -60,6 +60,76 @@ pub const MAX_DEPENDENCY_DIRS: usize = 64;
 /// Maximum independently retained native build-output roots per compilation.
 pub const MAX_NATIVE_ROOTS: usize = 32;
 
+/// Native Linux ISA required to run the retained compiler, independently of
+/// the target it produces. This is an early placement constraint, not proof
+/// of runtime compatibility: the exact ELF/CPU/kernel cohort still applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependencyExecutionHost {
+    /// Native 64-bit x86 Linux execution.
+    LinuxX86_64,
+    /// Native 64-bit ARM Linux execution.
+    LinuxAarch64,
+}
+
+impl DependencyExecutionHost {
+    /// Exact advertised capability. Unknown spellings grant no compatibility.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LinuxX86_64 => "linux-x86_64-v1",
+            Self::LinuxAarch64 => "linux-aarch64-v1",
+        }
+    }
+
+    /// Decode a selected capability without defaulting to the local machine.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "linux-x86_64-v1" => Some(Self::LinuxX86_64),
+            "linux-aarch64-v1" => Some(Self::LinuxAarch64),
+            _ => None,
+        }
+    }
+
+    /// Select from the compiler's probed host triple, never its output target.
+    /// GNU and musl use the same ISA constraint; the worker binary's own libc
+    /// does not determine which retained compiler/runtime it can execute.
+    #[must_use]
+    pub fn from_rustc_host(triple: &str) -> Option<Self> {
+        if triple.len() > 128
+            || !triple.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+            })
+        {
+            return None;
+        }
+        let mut fields = triple.split('-');
+        let architecture = fields.next()?;
+        let vendor = fields.next()?;
+        let operating_system = fields.next()?;
+        let environment = fields.next()?;
+        if vendor.is_empty() || environment.is_empty() || fields.next().is_some() {
+            return None;
+        }
+        Self::for_platform(operating_system, architecture)
+    }
+
+    /// The worker's native platform. No configured label or emulation claim
+    /// can add another ISA; unsupported platforms advertise no capability.
+    #[must_use]
+    pub fn native() -> Option<Self> {
+        Self::for_platform(std::env::consts::OS, std::env::consts::ARCH)
+    }
+
+    fn for_platform(operating_system: &str, architecture: &str) -> Option<Self> {
+        match (operating_system, architecture) {
+            ("linux", "x86_64") => Some(Self::LinuxX86_64),
+            ("linux", "aarch64") => Some(Self::LinuxAarch64),
+            _ => None,
+        }
+    }
+}
+
 /// The output class selects the filesystem contract independently of argv.
 /// The worker must also check that the actual invocation belongs to this class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1430,6 +1500,76 @@ fn build_dependency_argv_with_package_anchor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dependency_execution_host_keeps_native_isa_separate_from_compiler_libc() {
+        for (architecture, expected) in [
+            ("x86_64", DependencyExecutionHost::LinuxX86_64),
+            ("aarch64", DependencyExecutionHost::LinuxAarch64),
+        ] {
+            for vendor in ["unknown", "pc"] {
+                for environment in ["gnu", "musl"] {
+                    let host = format!("{architecture}-{vendor}-linux-{environment}");
+                    assert_eq!(
+                        DependencyExecutionHost::from_rustc_host(&host),
+                        Some(expected)
+                    );
+                }
+            }
+        }
+        for host in [
+            "",
+            "x86_64-linux-gnu",
+            "x86_64--linux-gnu",
+            "x86_64-unknown-linux-",
+            "x86_64-unknown-linux-gnu-extra",
+            "x86_64-unknown-linux-gnu\n",
+            "x86_64-unknown-linux-gnu\0",
+            "X86_64-unknown-linux-gnu",
+            "i686-unknown-linux-gnu",
+            "armv7-unknown-linux-gnueabihf",
+            "riscv64gc-unknown-linux-gnu",
+            "aarch64-apple-darwin",
+            "x86_64-pc-windows-gnu",
+            "aarch64-linux-android",
+        ] {
+            assert_eq!(
+                DependencyExecutionHost::from_rustc_host(host),
+                None,
+                "{host:?}"
+            );
+        }
+        let excessive = format!("x86_64-{}-linux-gnu", "v".repeat(128));
+        assert_eq!(DependencyExecutionHost::from_rustc_host(&excessive), None);
+    }
+
+    #[test]
+    fn dependency_execution_host_requires_an_exact_known_wire_capability() {
+        assert_eq!(
+            DependencyExecutionHost::parse("linux-x86_64-v1"),
+            Some(DependencyExecutionHost::LinuxX86_64)
+        );
+        assert_eq!(
+            DependencyExecutionHost::parse("linux-aarch64-v1"),
+            Some(DependencyExecutionHost::LinuxAarch64)
+        );
+        for value in [
+            "",
+            "linux-x86_64",
+            "linux-aarch64",
+            "linux-x86_64-v2",
+            "linux-aarch64-v0",
+            "linux-x86_64-v1 ",
+            "linux-x86_64-v1\0",
+            "Linux-x86_64-v1",
+            "linux-arm64-v1",
+            "macos-aarch64-v1",
+            "x86_64-unknown-linux-gnu",
+            "native",
+        ] {
+            assert_eq!(DependencyExecutionHost::parse(value), None, "{value:?}");
+        }
+    }
 
     const CANONICAL_SOURCE: &str = "/__rabs/cargo-home/registry/src/index/leaf-1.0.0";
     const CANONICAL_OUTPUT: &str = "/__rabs/out/cargo/debug/deps";

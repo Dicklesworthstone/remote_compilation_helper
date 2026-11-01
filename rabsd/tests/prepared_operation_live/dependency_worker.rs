@@ -17,7 +17,7 @@ use rabs_sandbox::cargo_artifacts::{
     CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION, CARGO_PRIVATE_INCREMENTAL_BENCH_ARTIFACTS_VERSION,
     CARGO_PRIVATE_INCREMENTAL_RUN_ARTIFACTS_VERSION,
 };
-use rabs_sandbox::dependency_context::DEPENDENCY_CONTEXT_VERSION;
+use rabs_sandbox::dependency_context::{DEPENDENCY_CONTEXT_VERSION, DependencyExecutionHost};
 use rabs_sandbox::runtime_cohort::observe_runtime_cohort;
 use rabs_sandbox::toolchain_dataset::{
     TOOLCHAIN_DATASET_VERSION, ToolchainLimits, fingerprint_toolchain,
@@ -167,6 +167,8 @@ fn path_preserving_dependency_matches_stock_over_real_tls_worker() {
         "toolchain_source":toolchain,
         "timeout_ms":240_000,
         "jobserver_grant":3,
+        "dependency_execution_host":DependencyExecutionHost::native()
+            .expect("native Linux dependency host").as_str(),
         "dependency_context":{
             "version":DEPENDENCY_CONTEXT_VERSION,
             "execution_mode":"metadata",
@@ -195,6 +197,10 @@ fn path_preserving_dependency_matches_stock_over_real_tls_worker() {
     );
     assert_eq!(request["program"], specification["program"]);
     assert_eq!(request["args"], specification["args"]);
+    assert_eq!(
+        request["dependency_execution_host"],
+        specification["dependency_execution_host"]
+    );
     for field in [
         "source_files",
         "toolchain_source",

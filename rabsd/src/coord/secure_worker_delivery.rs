@@ -1785,6 +1785,7 @@ fn receive_authenticated_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rabs_sandbox::dependency_context::DependencyExecutionHost;
     use std::collections::VecDeque;
 
     #[test]
@@ -1996,6 +1997,7 @@ mod tests {
         json!({"kind":"worker-hello", "worker_id":"worker", "peer_id":hex(&[1; 32]), "canonical":true, "slots":4,
             "boot_generation":1, "incarnation":"00000000000000000000000000000001",
             "execution_leases":["request-renewal-v1"],
+            "dependency_execution_hosts":[DependencyExecutionHost::LinuxX86_64.as_str()],
             "recovery_protocols":["request-journal-v1"], "output_transfers":["ranges-v1"],
             "artifact_transfers":["files-v1"],
             "transport":{"minimum_compatible":1,"current":1},
@@ -2926,6 +2928,8 @@ mod tests {
                 "compiler":"/tc/rustc", "out_dir":"/out", "env":[], "dependency_dirs":[],
                 "runtime_cohort_sha256":"ab".repeat(32)
             });
+            request["dependency_execution_host"] =
+                json!(DependencyExecutionHost::LinuxX86_64.as_str());
             request["program"] = json!("/tc/rustc");
             request["artifacts"] = json!({"unit":"dep", "files":["a"]});
             match case {
@@ -3000,6 +3004,8 @@ mod tests {
                 "compiler":"/tc/rustc", "out_dir":"/out", "env":[], "dependency_dirs":[],
                 "runtime_cohort_sha256":"ab".repeat(32)
             });
+            request["dependency_execution_host"] =
+                json!(DependencyExecutionHost::LinuxX86_64.as_str());
             request["program"] = json!("/tc/rustc");
             request["artifacts"] = json!({"unit":"dep", "files":["a"]});
             script.replies[0]["canonical"] = json!(canonical);
@@ -3065,6 +3071,8 @@ mod tests {
             request["dependency_context"] = json!({
                 "version":CANONICAL_DEPENDENCY_CONTEXT_VERSION, "execution_mode":"metadata"
             });
+            request["dependency_execution_host"] =
+                json!(DependencyExecutionHost::LinuxX86_64.as_str());
             request["artifacts"] = json!({"unit":"dep", "files":["a"]});
             script.replies[0]["dependency_contexts"] = json!([offered_version]);
             script.replies[0]["dependency_execution_modes"] = json!(["metadata"]);
