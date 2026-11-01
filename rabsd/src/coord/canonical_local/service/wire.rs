@@ -96,7 +96,7 @@ pub(super) fn check_client(stream: &mut UnixStream) -> io::Result<()> {
     match stream.read(&mut extra) {
         Ok(0) => Err(io::Error::new(
             io::ErrorKind::ConnectionAborted,
-            "canonical client disconnected; its operation was cancelled",
+            "canonical client disconnected",
         )),
         Ok(_) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,

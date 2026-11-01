@@ -11,6 +11,7 @@ use super::{
     Profile, SharedRuntime, ordinary_directory, overlap, plain_absolute, private_directory,
 };
 use crate::edge::live_facts::read_stable;
+use crate::edge::server::write_log_line;
 use asupersync::signal::ShutdownController;
 use rabs_protocol::canonical_service::{
     Header, Kind, MAX_CHUNK_BYTES, MAX_FAILURE_BYTES, MAX_PROFILE_BYTES, ResponseState,
@@ -228,10 +229,9 @@ impl Drop for ListenerOwner {
     fn drop(&mut self) {
         self.listener.take();
         if let Err(error) = self.lease.retire_bound() {
-            let _ = writeln!(
+            let _ = write_log_line(
                 io::stderr().lock(),
-                "{}",
-                json!({"kind":"canonical-service-endpoint-retirement-refused","reason":error.to_string()})
+                &json!({"kind":"canonical-service-endpoint-retirement-refused","reason":error.to_string()}).to_string(),
             );
         }
     }
@@ -327,10 +327,10 @@ impl OperationAdmissions {
                 return Ok(admitted);
             }
             if !reported {
-                let _ = writeln!(
+                let _ = write_log_line(
                     io::stderr().lock(),
-                    "{}",
-                    json!({"kind":"canonical-service-queued", "ticket":waiting.ticket})
+                    &json!({"kind":"canonical-service-queued", "ticket":waiting.ticket})
+                        .to_string(),
                 );
                 reported = true;
             }
@@ -410,14 +410,34 @@ impl OperationOwner {
             .join()
             .unwrap_or_else(|_| Err(io::Error::other("canonical operation panicked")))
     }
-}
 
-impl Drop for OperationOwner {
-    fn drop(&mut self) {
+    fn stop_and_join(&mut self) {
         if self.thread.is_some() {
             self.stopped.store(true, Ordering::Release);
             let _ = self.join();
         }
+    }
+
+    fn check_client(&mut self, stream: &mut UnixStream) -> io::Result<()> {
+        wire::check_client(stream).map_err(|error| {
+            if error.kind() == io::ErrorKind::ConnectionAborted {
+                // The wire is also checked before admission, when no
+                // operation exists. Only its owner can confirm this drain.
+                self.stop_and_join();
+                io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "canonical client disconnected; its operation was drained",
+                )
+            } else {
+                error
+            }
+        })
+    }
+}
+
+impl Drop for OperationOwner {
+    fn drop(&mut self) {
+        self.stop_and_join();
     }
 }
 
@@ -433,10 +453,10 @@ impl Session {
                 .join()
                 .unwrap_or_else(|_| Err(io::Error::other("canonical service session panicked")));
             if let Err(error) = outcome {
-                let _ = writeln!(
+                let _ = write_log_line(
                     io::stderr().lock(),
-                    "{}",
-                    json!({"kind":"canonical-service-session-error","reason":error.to_string()})
+                    &json!({"kind":"canonical-service-session-error","reason":error.to_string()})
+                        .to_string(),
                 );
             }
         }
@@ -624,7 +644,7 @@ fn relay_operation(
                 "canonical operation cancelled during service shutdown",
             ));
         }
-        wire::check_client(stream)?;
+        operation.check_client(stream)?;
         let progress =
             output.send_available(stream, Instant::now() + DELIVERY_BUDGET, &operation.stopped)?;
         if !progress {
@@ -634,7 +654,7 @@ fn relay_operation(
     // Join all writers before sending the last tail or a terminal result. The
     // same cursors continue; bytes already streamed are never replayed here.
     let outcome = operation.join();
-    wire::check_client(stream)?;
+    operation.check_client(stream)?;
     let deadline = Instant::now() + DELIVERY_BUDGET;
     while output.send_available(stream, deadline, &operation.stopped)? {}
     match outcome {
@@ -765,10 +785,9 @@ pub fn run_service_profile(
     let mut sessions = Sessions::default();
     let admissions = OperationAdmissions::new(config.max_roots, config.max_queued_roots);
     let mut sequence = 0_u64;
-    let _ = writeln!(
+    let _ = write_log_line(
         io::stderr().lock(),
-        "{}",
-        json!({
+        &json!({
             "kind":"canonical-service-listening", "version":SERVICE_VERSION,
             "socket":config.socket, "max_roots":config.max_roots,
             "max_queued_roots":config.max_queued_roots,
@@ -776,6 +795,7 @@ pub fn run_service_profile(
             "required_release":release_mode == ReleaseAuthorizationMode::Required,
             "workspace_cache":false
         })
+        .to_string(),
     );
     let result = loop {
         sessions.reap();
@@ -1123,8 +1143,15 @@ mod tests {
         .unwrap();
         assert_eq!(header.kind(), Kind::Stdout);
         assert_eq!(bytes, b"already visible");
-        drop(client);
-        assert!(relay.join().unwrap().is_err());
+        // Keep the output reader open so the real EOF is observed by the
+        // disconnect check rather than racing a broken-pipe output error.
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        let error = relay.join().unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+        assert_eq!(
+            error.to_string(),
+            "canonical client disconnected; its operation was drained"
+        );
         assert!(stopped.load(Ordering::Acquire));
         assert!(
             finished.load(Ordering::Acquire),
@@ -1134,6 +1161,30 @@ mod tests {
             fs::read(root.path().join("stdout")).unwrap(),
             b"already visible"
         );
+    }
+
+    #[test]
+    fn operation_connection_failure_is_not_reported_as_client_disconnection() {
+        let root = crate::test_util::private_tempdir();
+        let output = ServiceOutput::accepted(
+            output_file(root.path(), "stdout").unwrap(),
+            output_file(root.path(), "stderr").unwrap(),
+        )
+        .unwrap();
+        let operation = OperationOwner {
+            stopped: Arc::new(AtomicBool::new(false)),
+            thread: Some(std::thread::spawn(|| {
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "worker transport failed",
+                ))
+            })),
+        };
+        let (_client, mut server) = UnixStream::pair().unwrap();
+        wire::configure(&server).unwrap();
+        let error = relay_operation(&mut server, operation, output, || true).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+        assert_eq!(error.to_string(), "worker transport failed");
     }
 
     #[test]

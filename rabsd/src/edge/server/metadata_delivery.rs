@@ -138,17 +138,14 @@ async fn acknowledged(
             // Record the real delivery boundary on the existing installation
             // thread, after the exact ACK and before bulk staging. Logging
             // must not delay the socket task's release of the callback.
-            eprintln!(
-                "{}",
-                json!({
-                    "kind":"rabsd-metadata-prefix-acknowledged",
-                    "key":acknowledged_identity.action_key,
-                    "manifest_key":acknowledged_identity.manifest_key,
-                    "bytes":prefix.len(),
-                    "sequence":1,
-                    "remote":acknowledged_identity.is_remote(),
-                })
-            );
+            super::log_json_line(&json!({
+                "kind":"rabsd-metadata-prefix-acknowledged",
+                "key":acknowledged_identity.action_key,
+                "manifest_key":acknowledged_identity.manifest_key,
+                "bytes":prefix.len(),
+                "sequence":1,
+                "remote":acknowledged_identity.is_remote(),
+            }));
             Ok(())
         })
     }) {

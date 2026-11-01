@@ -274,7 +274,22 @@ pub struct EdgeServerConfig {
 /// quotes a path or an OS error with backslashes or newlines stays one
 /// parseable line instead of silently dropping out of the decision trail.
 pub(crate) fn log_line(kind: &str, fields: &[(&str, &str)]) {
-    eprintln!("{}", render_log_line(kind, fields));
+    write_log_line(std::io::stderr().lock(), &render_log_line(kind, fields))
+        .expect("write RABS diagnostic to stderr");
+}
+
+fn log_json_line(value: &serde_json::Value) {
+    write_log_line(std::io::stderr().lock(), &value.to_string())
+        .expect("write RABS diagnostic to stderr");
+}
+
+pub(crate) fn write_log_line(mut output: impl std::io::Write, line: &str) -> std::io::Result<()> {
+    // Cargo can share this descriptor and stop partway through a diagnostic.
+    // Render before writing, including both delimiters: bounded control events
+    // fit PIPE_BUF and cannot absorb or be split by another writer's text.
+    // Each caller retains its existing policy for stderr write failures.
+    let frame = format!("\n{line}\n");
+    std::io::Write::write_all(&mut output, frame.as_bytes())
 }
 
 /// Field order is preserved (a `Map` would sort it) for human readers.
@@ -1728,6 +1743,73 @@ mod edge_liveness_tests {
         assert_eq!(value["reason"], reason);
         // Field order is kept for people reading the raw stream.
         assert!(line.find("\"decision\"").unwrap() < line.find("\"reason\"").unwrap());
+    }
+
+    #[test]
+    fn log_records_survive_a_foreign_partial_diagnostic_on_the_same_pipe() {
+        use std::fs::File;
+        use std::io::{Read, Write};
+
+        const RECORDS: usize = 128;
+        fn collect(
+            mut emit: impl FnMut(&mut File, &str) -> std::io::Result<()>,
+        ) -> Vec<serde_json::Value> {
+            let (reader, writer) =
+                rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).unwrap();
+            let mut events = File::from(writer);
+            let mut compiler = events.try_clone().unwrap();
+            let drain = std::thread::spawn(move || {
+                let mut text = String::new();
+                File::from(reader).read_to_string(&mut text).unwrap();
+                text
+            });
+            let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+            let (resume_tx, resume_rx) = mpsc::sync_channel(0);
+            let foreign = std::thread::spawn(move || {
+                for _ in 0..RECORDS {
+                    compiler.write_all(b"   Compiling ").unwrap();
+                    ready_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    compiler.write_all(b"fixture\n").unwrap();
+                }
+            });
+            for sequence in 0..RECORDS {
+                ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let event = serde_json::json!({
+                    "kind":"framed-event", "sequence":sequence,
+                    "reason":"quoted \\\"path\\\" and newline\nremain JSON data",
+                });
+                let line = event.to_string();
+                // Exercise the portable atomic pipe-write size, not a larger
+                // host-specific buffer or a substituted in-memory writer.
+                assert!(line.len() + 2 <= 512);
+                emit(&mut events, &line).unwrap();
+                resume_tx.send(()).unwrap();
+            }
+            drop(events);
+            foreign.join().unwrap();
+            drain
+                .join()
+                .unwrap()
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect()
+        }
+
+        // The prior newline-at-the-end formatting deterministically loses
+        // these records after a foreign writer's incomplete line.
+        let legacy = collect(|output, line| writeln!(output, "{line}"));
+        assert!(legacy.is_empty());
+        let current = collect(|output, line| write_log_line(output, line));
+        assert_eq!(current.len(), RECORDS);
+        for (sequence, event) in current.iter().enumerate() {
+            assert_eq!(event["kind"], "framed-event");
+            assert_eq!(event["sequence"], sequence);
+            assert_eq!(
+                event["reason"],
+                "quoted \\\"path\\\" and newline\nremain JSON data"
+            );
+        }
     }
 
     #[test]
