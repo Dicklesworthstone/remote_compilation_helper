@@ -31,7 +31,6 @@ use rabs_protocol::identity_store::{IdentityStore, TransportIdentity, TrustScope
 use rabs_protocol::version_negotiation::{VersionHello, VersionRange};
 use rabs_protocol::worker_fence::WorkerSessionOffer;
 use rabs_protocol::worker_session::{CoordinatorSession, SessionPolicy, WorkerHelloClaims};
-use rabs_sandbox::dependency_context::DependencyExecutionMode;
 use rabs_sandbox::toolchain_transfer::TOOLCHAIN_UPLOAD_BUDGET;
 use serde_json::{Value, json};
 use std::ffi::OsStr;
@@ -525,7 +524,7 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
                 required_capability: CapabilityKind::ExecuteAction,
                 require_canonical: self.mode == DeliveryMode::Execute
                     && dependency_context
-                        .is_none_or(|selected| selected.mode != DependencyExecutionMode::Rlib),
+                        .is_none_or(|selected| selected.mode.requires_canonical_namespace()),
                 limits: DEFAULT_LIMITS,
                 max_sequence_buffer: 1,
             },

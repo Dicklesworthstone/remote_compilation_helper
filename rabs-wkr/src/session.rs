@@ -12,10 +12,10 @@ use crate::output::CapturedOutputs;
 use crate::source_transfer::SourceOwner;
 use rabs_protocol::capability_tokens::CapabilityToken;
 use rabs_sandbox::dependency_context::{
-    CANONICAL_DEPENDENCY_CONTEXT_VERSION, CANONICAL_WORKSPACE_CONTEXT_VERSION,
-    DEPENDENCY_CONTEXT_VERSION, DependencyArtifactRoot, DependencyExecContext,
-    DependencyExecutionMode, DependencyIsolationSupport, DependencyNativeRoot, MAX_DEPENDENCY_DIRS,
-    MAX_DEPENDENCY_ENV_ENTRIES, MAX_NATIVE_ROOTS,
+    CANONICAL_DEPENDENCY_CONTEXT_VERSION, CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION,
+    CANONICAL_WORKSPACE_CONTEXT_VERSION, DEPENDENCY_CONTEXT_VERSION, DependencyArtifactRoot,
+    DependencyExecContext, DependencyExecutionMode, DependencyIsolationSupport,
+    DependencyNativeRoot, MAX_DEPENDENCY_DIRS, MAX_DEPENDENCY_ENV_ENTRIES, MAX_NATIVE_ROOTS,
 };
 use rabs_sandbox::generated_source::MAX_GENERATED_DIRECTORIES;
 use rabs_sandbox::process_context::{
@@ -37,8 +37,8 @@ pub struct CapabilityReport {
     /// the rest — `HostIsolationSupport::missing_for_canonical`
     /// empty).
     pub canonical_namespace: bool,
-    /// Independently measured leaf rustc profiles. Supporting the closed rlib
-    /// namespace does not imply support for canonical commands or metadata.
+    /// Independently measured leaf rustc profiles. Supporting one strict mode
+    /// does not imply another mode or the canonical proc/device namespace.
     pub dependency_modes: Vec<DependencyExecutionMode>,
     /// Missing isolation facets (empty when `canonical_namespace`).
     pub missing: Vec<String>,
@@ -192,8 +192,14 @@ pub fn parse_dependency_context(
     let object = value
         .as_object()
         .ok_or("dependency_context must be an object")?;
-    let workspace = object.get("version").and_then(serde_json::Value::as_str)
-        == Some(CANONICAL_WORKSPACE_CONTEXT_VERSION);
+    let version = object.get("version").and_then(serde_json::Value::as_str);
+    let workspace = matches!(
+        version,
+        Some(
+            CANONICAL_WORKSPACE_CONTEXT_VERSION
+                | CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION
+        )
+    );
     let canonical = workspace
         || object.get("version").and_then(serde_json::Value::as_str)
             == Some(CANONICAL_DEPENDENCY_CONTEXT_VERSION);
@@ -226,6 +232,7 @@ pub fn parse_dependency_context(
                 DEPENDENCY_CONTEXT_VERSION
                     | CANONICAL_DEPENDENCY_CONTEXT_VERSION
                     | CANONICAL_WORKSPACE_CONTEXT_VERSION
+                    | CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION
             )
         )
     {
@@ -241,8 +248,14 @@ pub fn parse_dependency_context(
     let execution_mode = match text("execution_mode")?.as_str() {
         "metadata" => DependencyExecutionMode::Metadata,
         "rlib" => DependencyExecutionMode::Rlib,
+        "closed-metadata" => DependencyExecutionMode::ClosedMetadata,
         _ => return Err("unsupported dependency execution_mode".to_owned()),
     };
+    if (execution_mode == DependencyExecutionMode::ClosedMetadata)
+        != (version == Some(CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION))
+    {
+        return Err("closed metadata requires its exact workspace context and mode".into());
+    }
     let env = object
         .get("env")
         .and_then(serde_json::Value::as_array)
@@ -578,6 +591,8 @@ pub fn validate_dependency_execution(
             }
         }
         (DependencyExecutionMode::Rlib, RemoteDependencyOutputClass::Rlib) => {}
+        (DependencyExecutionMode::ClosedMetadata, RemoteDependencyOutputClass::Metadata)
+            if context.canonical_cargo() && context.workspace_execution_only() => {}
         _ => return Err("dependency execution mode differs from compiler outputs".into()),
     }
     let host = match (
@@ -782,6 +797,7 @@ pub fn probe_capability(worker_id: &str) -> CapabilityReport {
     let dependency_modes = [
         DependencyExecutionMode::Metadata,
         DependencyExecutionMode::Rlib,
+        DependencyExecutionMode::ClosedMetadata,
     ]
     .into_iter()
     .filter(|mode| DependencyIsolationSupport::probe(*mode).is_supported())

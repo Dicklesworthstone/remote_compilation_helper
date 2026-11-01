@@ -6,9 +6,10 @@
 //! Cargo namespace or grant action-cache publication authority. The selected
 //! ELF runtime is copied into a retained private tree before launch and must
 //! exactly match the measured runtime cohort. Metadata execution retains private
-//! /proc and /dev. Archive code generation uses a distinct negotiated mode with
-//! no procfs or general device tree, so assembler file reads cannot consume
-//! unkeyed process state or entropy. Neither mode admits arbitrary plugins.
+//! /proc and /dev. Archive code generation and explicitly closed workspace
+//! metadata use distinct negotiated modes with no procfs or general device
+//! tree, so compiler file reads cannot consume unkeyed process state or entropy.
+//! None of these modes admits arbitrary plugins.
 
 use crate::canonical_namespace::{
     Bind, CanonicalNamespaceSpec, HostIsolationSupport, IsolationError, NamespaceBoundary,
@@ -36,6 +37,12 @@ pub const CANONICAL_DEPENDENCY_CONTEXT_VERSION: &str = "canonical-dependency-exe
 /// that unit's complete, independently retained OUT_DIR. Metadata checks retain
 /// their existing binary, example and standard/custom harness contract.
 pub const CANONICAL_WORKSPACE_CONTEXT_VERSION: &str = "canonical-workspace-exec-v3";
+/// Canonical workspace metadata in an independently measured filesystem without
+/// procfs or entropy devices. Both this version and ClosedMetadata mode must be
+/// selected explicitly; the existing Metadata context retains its proc/device
+/// contract. This execution capability supplies no cache-publication authority.
+pub const CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION: &str =
+    "canonical-workspace-closed-metadata-v1";
 /// Separately advertised extension for metadata checks with static native inputs
 /// from the current canonical Cargo OUT_DIR. The existing context versions and
 /// measured metadata namespace remain unchanged; a coordinator must observe this
@@ -61,6 +68,8 @@ pub enum DependencyExecutionMode {
     Metadata,
     /// Pure Rust archive code generation, without procfs or entropy devices.
     Rlib,
+    /// Metadata and dep-info only, without procfs or entropy devices.
+    ClosedMetadata,
 }
 
 impl DependencyExecutionMode {
@@ -69,17 +78,24 @@ impl DependencyExecutionMode {
         match self {
             Self::Metadata => "metadata",
             Self::Rlib => "rlib",
+            Self::ClosedMetadata => "closed-metadata",
         }
+    }
+
+    /// Whether this mode requires the broader canonical proc/device namespace.
+    /// The strict modes each require their own measured dependency capability.
+    pub const fn requires_canonical_namespace(self) -> bool {
+        matches!(self, Self::Metadata)
     }
 }
 
 /// Measured permission to construct one dependency execution mode's base view.
 ///
-/// Canonical and metadata execution need a private proc mount. Archive execution
-/// deliberately omits procfs and general devices, and can work on hosts whose
-/// enclosing container forbids mounting procfs. Its separate no-op probe must
-/// succeed before that mode is advertised or executed. Neither result is input
-/// closure, runtime identity, or cache-publication authority.
+/// Canonical and ordinary metadata execution need a private proc mount. Archive
+/// and closed metadata execution deliberately omit procfs and general devices,
+/// and can work on hosts whose enclosing container forbids mounting procfs.
+/// Each mode's no-op probe must succeed before it is advertised or executed.
+/// No result is input closure, runtime identity, or cache-publication authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DependencyIsolationSupport {
     mode: DependencyExecutionMode,
@@ -176,9 +192,12 @@ impl DependencyIsolationSupport {
             missing.push(match self.mode {
                 DependencyExecutionMode::Metadata => "dependency-metadata-base-namespace",
                 DependencyExecutionMode::Rlib => "dependency-rlib-base-namespace",
+                DependencyExecutionMode::ClosedMetadata => {
+                    "dependency-closed-metadata-base-namespace"
+                }
             });
         }
-        if self.mode == DependencyExecutionMode::Rlib && !self.null_device {
+        if !self.mode.requires_canonical_namespace() && !self.null_device {
             missing.push("linux-null-device");
         }
         missing
@@ -201,7 +220,7 @@ impl DependencyIsolationSupport {
         let mut missing = self.missing();
         // The source of --dev-bind may have changed since capability probing.
         // Never mount arbitrary regular bytes or another device at /dev/null.
-        if mode == DependencyExecutionMode::Rlib
+        if !mode.requires_canonical_namespace()
             && !linux_null_device(null_device)
             && !missing.contains(&"linux-null-device")
         {
@@ -243,7 +262,7 @@ fn dependency_base_argv(mode: DependencyExecutionMode, env: &[(String, String)])
         DependencyExecutionMode::Metadata => {
             argv.extend(["--proc", "/proc", "--dev", "/dev"].map(OsString::from));
         }
-        DependencyExecutionMode::Rlib => {
+        DependencyExecutionMode::Rlib | DependencyExecutionMode::ClosedMetadata => {
             // LLVM's integrated assembler can read files absent from rustc's
             // dep-info. Process state and entropy do not belong to this view.
             // The null sink is deterministic and needed by ordinary I/O.
@@ -836,7 +855,12 @@ impl DependencyExecContext {
     /// Exact wire version selected for this validated path profile.
     pub const fn version(&self) -> &'static str {
         if self.workspace_execution_only {
-            CANONICAL_WORKSPACE_CONTEXT_VERSION
+            match self.execution_mode {
+                DependencyExecutionMode::ClosedMetadata => {
+                    CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION
+                }
+                _ => CANONICAL_WORKSPACE_CONTEXT_VERSION,
+            }
         } else if self.canonical_cargo {
             CANONICAL_DEPENDENCY_CONTEXT_VERSION
         } else {
@@ -856,7 +880,8 @@ impl DependencyExecContext {
     }
 
     /// Select the independently negotiated output class after path validation.
-    /// Rlib narrows the namespace; it never grants execution or cache authority.
+    /// Strict modes narrow the namespace; none grants cache authority. The
+    /// worker also binds ClosedMetadata to its separate workspace wire version.
     #[must_use]
     pub fn with_execution_mode(mut self, mode: DependencyExecutionMode) -> Self {
         self.execution_mode = mode;
@@ -2302,8 +2327,65 @@ mod tests {
             mode,
             bubblewrap: Some("test".into()),
             base_namespace: true,
-            null_device: mode == DependencyExecutionMode::Rlib,
+            null_device: !mode.requires_canonical_namespace(),
         }
+    }
+
+    #[test]
+    fn closed_metadata_has_its_own_context_and_measured_namespace() {
+        let mode = DependencyExecutionMode::ClosedMetadata;
+        let context =
+            workspace_context(mode, workspace_directories(), None, Vec::new(), Vec::new()).unwrap();
+        assert_eq!(
+            context.version(),
+            CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION
+        );
+        assert_eq!(context.execution_mode(), mode);
+        assert_eq!(mode.as_str(), "closed-metadata");
+        assert!(!mode.requires_canonical_namespace());
+        let argv = dependency_base_argv(mode, &[]);
+        let argv = argv
+            .iter()
+            .map(|argument| argument.to_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(!argv.contains(&"--proc") && !argv.contains(&"--dev"));
+        assert!(!argv.contains(&"/dev/random") && !argv.contains(&"/dev/urandom"));
+        assert!(
+            argv.windows(3)
+                .any(|window| window == ["--dev-bind", "/dev/null", "/dev/null"])
+        );
+        let measured = fixture_support(mode);
+        assert!(measured.is_supported());
+        for other in [
+            DependencyExecutionMode::Metadata,
+            DependencyExecutionMode::Rlib,
+        ] {
+            assert!(matches!(
+                measured.require_mode(other),
+                Err(IsolationError::InvalidSpec { .. })
+            ));
+            assert!(matches!(
+                fixture_support(other).require_mode(mode),
+                Err(IsolationError::InvalidSpec { .. })
+            ));
+            assert_eq!(
+                context.clone().with_execution_mode(other).version(),
+                CANONICAL_WORKSPACE_CONTEXT_VERSION
+            );
+        }
+        let missing = DependencyIsolationSupport {
+            base_namespace: false,
+            null_device: false,
+            ..measured
+        };
+        assert!(!missing.is_supported());
+        assert_eq!(
+            missing.missing(),
+            [
+                "dependency-closed-metadata-base-namespace",
+                "linux-null-device"
+            ]
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -2414,6 +2496,40 @@ mod tests {
                 .windows(3)
                 .any(|window| window == ["--ro-bind", "/", "/"])
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn closed_metadata_probe_uses_its_exact_production_view_and_checks_exit_status() {
+        // This fixture records the production probe; the real rustc test below
+        // supplies namespace execution evidence independently of this script.
+        let (owner, executable) = probe_fixture("exit 0");
+        let mode = DependencyExecutionMode::ClosedMetadata;
+        let support = DependencyIsolationSupport::probe_with_bubblewrap(mode, &executable);
+        assert_eq!(support.mode(), mode);
+        assert!(support.is_supported());
+        assert!(support.require_mode(mode).is_ok());
+        let recorded = std::fs::read_to_string(owner.path().join("bwrap.argv")).unwrap();
+        let argv = recorded.split_terminator('\0').collect::<Vec<_>>();
+        let production = dependency_base_argv(mode, &[]);
+        let expected = production[1..]
+            .iter()
+            .map(|argument| argument.to_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(argv.starts_with(&expected));
+        assert!(argv.ends_with(&["--chdir", layout::TMP, "--", "/usr/bin/true"]));
+        assert!(!argv.contains(&"--proc") && !argv.contains(&"--dev"));
+        let (_failed_owner, failed_executable) = probe_fixture("exit 42");
+        let failed = DependencyIsolationSupport::probe_with_bubblewrap(mode, &failed_executable);
+        assert!(!failed.is_supported());
+        assert_eq!(
+            failed.missing(),
+            ["dependency-closed-metadata-base-namespace"]
+        );
+        assert!(matches!(
+            failed.require_mode(mode),
+            Err(IsolationError::UnsupportedHost { .. })
+        ));
     }
 
     #[cfg(target_os = "linux")]
@@ -3253,6 +3369,170 @@ mod tests {
         );
         let dep_info = std::fs::read_to_string(output.join("retained_runtime_smoke.d")).unwrap();
         assert!(dep_info.contains("lib.rs"));
+        runtime.verify(|| false).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires bubblewrap and RABS_TEST_TOOLCHAIN_ROOT naming an installed rustc toolchain"]
+    fn real_closed_workspace_metadata_emits_exact_outputs_and_denies_unretained_reads() {
+        use std::process::Stdio;
+        use std::time::{Duration, Instant};
+
+        let toolchain = PathBuf::from(
+            std::env::var_os("RABS_TEST_TOOLCHAIN_ROOT")
+                .expect("set RABS_TEST_TOOLCHAIN_ROOT to the installed toolchain root"),
+        );
+        assert!(toolchain.is_absolute());
+        let mode = DependencyExecutionMode::ClosedMetadata;
+        let support = DependencyIsolationSupport::probe(mode);
+        assert!(support.is_supported(), "{support:?}");
+        let owner = tempfile::tempdir().unwrap();
+        let source = owner.path().join("package");
+        let output = owner.path().join("output");
+        let home = owner.path().join("home");
+        let empty = owner.path().join("empty-inputs");
+        for directory in [&source, &output, &home, &empty] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        std::fs::create_dir(source.join("empty")).unwrap();
+        std::fs::write(source.join("payload.txt"), b"retained metadata input\n").unwrap();
+        let host_only = owner.path().join("host-only.txt");
+        std::fs::write(&host_only, b"uncaptured host input\n").unwrap();
+        let runtime = crate::runtime_cohort::retain_runtime_cohort(
+            &toolchain.join("bin/rustc"),
+            &toolchain,
+            &[toolchain.join("lib")],
+            &output,
+            owner.path(),
+            || false,
+        )
+        .unwrap();
+        let context = DependencyExecContext::new_canonical_workspace_execution(
+            mode,
+            layout::WORKSPACE.into(),
+            CANONICAL_OUTPUT.into(),
+            vec![CANONICAL_OUTPUT.into()],
+            Vec::new(),
+            Vec::new(),
+            None,
+            vec!["empty".into()],
+            Vec::new(),
+            vec![
+                ("HOME".into(), layout::HOME.into()),
+                ("CARGO_HOME".into(), layout::CARGO_HOME.into()),
+                ("CARGO_MANIFEST_DIR".into(), layout::WORKSPACE.into()),
+                ("CARGO_PRIMARY_PACKAGE".into(), "1".into()),
+                ("LD_LIBRARY_PATH".into(), "/__rabs/toolchain/lib".into()),
+            ],
+            runtime.cohort().bytes,
+        )
+        .unwrap();
+        assert_eq!(
+            context.version(),
+            CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION
+        );
+        context.prepare_empty_backings(&empty).unwrap();
+        let spec = context
+            .namespace(&source, &toolchain, &output, &empty, &home)
+            .unwrap();
+        let compile = |path: &str, name: &str| {
+            // include_bytes! is evaluated during metadata compilation. Unlike
+            // assembler-only reads, it exercises this precise output mode.
+            std::fs::write(
+                source.join("lib.rs"),
+                format!(
+                    "pub const INPUT: &[u8] = include_bytes!({path:?});\npub fn answer() -> u32 {{ 42 }}\n"
+                ),
+            )
+            .unwrap();
+            let args = vec![
+                "lib.rs".into(),
+                format!("--crate-name={name}"),
+                "--edition=2024".into(),
+                "--crate-type=lib".into(),
+                "--emit=dep-info,metadata".into(),
+                format!("--out-dir={}", context.out_dir()),
+            ];
+            let launch = build_workspace_dependency_argv(
+                &context,
+                &spec,
+                &runtime,
+                &support,
+                context.compiler(),
+                &args,
+                &source,
+            )
+            .unwrap();
+            assert!(!launch.boundary.proc_private);
+            assert!(!launch.boundary.host_usr_ro);
+            let mut command = crate::canonical_namespace::command_for(&launch);
+            let mut child = command
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if child.try_wait().unwrap().is_none() {
+                // A namespace regression exposing an endless entropy device
+                // must fail this test promptly rather than hang the test host.
+                child.kill().unwrap();
+                let result = child.wait_with_output().unwrap();
+                panic!(
+                    "closed metadata compiler exceeded its deadline for {path}: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+            child.wait_with_output().unwrap()
+        };
+        let result = compile("payload.txt", "closed_metadata");
+        assert!(
+            result.status.success(),
+            "real closed metadata compilation failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let produced = std::fs::read_dir(&output)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            produced,
+            BTreeSet::from([
+                OsString::from("closed_metadata.d"),
+                OsString::from("libclosed_metadata.rmeta"),
+            ])
+        );
+        assert!(
+            std::fs::metadata(output.join("libclosed_metadata.rmeta"))
+                .unwrap()
+                .len()
+                > 0
+        );
+        let dep_info = std::fs::read_to_string(output.join("closed_metadata.d")).unwrap();
+        assert!(dep_info.contains("lib.rs") && dep_info.contains("payload.txt"));
+        for (index, denied) in [
+            host_only.to_str().unwrap(),
+            "/proc/self/stat",
+            "/proc/sys/kernel/random/uuid",
+            "/dev/urandom",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let name = format!("denied_metadata_{index}");
+            let result = compile(denied, &name);
+            assert!(
+                !result.status.success(),
+                "unretained metadata compiler read succeeded: {denied}"
+            );
+            assert!(String::from_utf8_lossy(&result.stderr).contains("error"));
+            assert!(!output.join(format!("lib{name}.rmeta")).exists());
+            assert!(!output.join(format!("lib{name}.rlib")).exists());
+        }
         runtime.verify(|| false).unwrap();
     }
 

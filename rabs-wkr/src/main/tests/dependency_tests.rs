@@ -127,6 +127,152 @@ fn canonical_workspace_request(archive: bool) -> Value {
     request
 }
 
+fn closed_workspace_metadata_request() -> Value {
+    let mut request = canonical_dependency_request();
+    let context = &mut request["dependency_context"];
+    context["version"] = json!(CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION);
+    context["execution_mode"] = json!("closed-metadata");
+    context["source_root"] = json!("/__rabs/workspace");
+    context["cwd"] = json!("/__rabs/workspace");
+    context["source_directories"] = json!(["empty", "src"]);
+    for pair in context["env"].as_array_mut().unwrap() {
+        if pair[0] == "CARGO_MANIFEST_DIR" {
+            pair[1] = json!("/__rabs/workspace");
+        }
+    }
+    request
+}
+
+#[test]
+fn closed_workspace_metadata_requires_exact_context_mode_and_metadata_outputs() {
+    let request = closed_workspace_metadata_request();
+    let parsed = parse_exec_request(&request).unwrap();
+    let context = parsed.dependency_context.as_ref().unwrap();
+    assert_eq!(
+        context.execution_mode(),
+        DependencyExecutionMode::ClosedMetadata
+    );
+    assert_eq!(
+        context.version(),
+        CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION
+    );
+    assert_eq!(context.source_directories(), ["empty", "src"]);
+    assert_eq!(
+        parsed.args,
+        parse_exec_request(&canonical_dependency_request())
+            .unwrap()
+            .args
+    );
+    for version in [
+        DEPENDENCY_CONTEXT_VERSION,
+        CANONICAL_DEPENDENCY_CONTEXT_VERSION,
+        CANONICAL_WORKSPACE_CONTEXT_VERSION,
+    ] {
+        let mut wrong = request.clone();
+        wrong["dependency_context"]["version"] = json!(version);
+        assert!(parse_exec_request(&wrong).is_err(), "{version}");
+    }
+    for mode in ["metadata", "rlib"] {
+        let mut wrong = request.clone();
+        wrong["dependency_context"]["execution_mode"] = json!(mode);
+        assert_eq!(
+            parse_exec_request(&wrong).unwrap_err(),
+            "closed metadata requires its exact workspace context and mode"
+        );
+    }
+    for emit in ["--emit=dep-info,metadata,link", "--emit=link", "--emit=obj"] {
+        let mut wrong = request.clone();
+        let argument = wrong["args"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|argument| argument.as_str() == Some("--emit=dep-info,metadata"))
+            .unwrap();
+        *argument = json!(emit);
+        assert!(parse_exec_request(&wrong).is_err(), "{emit}");
+    }
+    for files in [
+        json!(["leaf.d"]),
+        json!(["leaf.d", "libleaf.rmeta", "libleaf.rlib"]),
+    ] {
+        let mut wrong = request.clone();
+        wrong["artifacts"]["files"] = files;
+        assert!(parse_exec_request(&wrong).is_err());
+    }
+}
+
+#[test]
+fn closed_metadata_selection_cannot_borrow_metadata_archive_or_canonical_support() {
+    let mode = DependencyExecutionMode::ClosedMetadata;
+    let version = CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION;
+    let grant = json!({"dependency_context":version,
+        "dependency_execution_mode":mode.as_str()})
+    .to_string();
+    let selected = dependency_context_selection(&grant, &[mode], true, true, true, true, true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(selected, DependencySelection { version, mode });
+    for supported in [
+        Vec::new(),
+        vec![DependencyExecutionMode::Metadata],
+        vec![DependencyExecutionMode::Rlib],
+    ] {
+        assert!(
+            dependency_context_selection(&grant, &supported, true, true, true, true, true).is_err()
+        );
+    }
+    for (wrong_version, wrong_mode) in [
+        (DEPENDENCY_CONTEXT_VERSION, mode),
+        (CANONICAL_DEPENDENCY_CONTEXT_VERSION, mode),
+        (CANONICAL_WORKSPACE_CONTEXT_VERSION, mode),
+        (version, DependencyExecutionMode::Metadata),
+        (version, DependencyExecutionMode::Rlib),
+    ] {
+        let wrong = json!({"dependency_context":wrong_version,
+            "dependency_execution_mode":wrong_mode.as_str()})
+        .to_string();
+        assert!(
+            dependency_context_selection(&wrong, &[mode, wrong_mode], true, true, true, true, true)
+                .is_err()
+        );
+    }
+    for flags in [
+        [false, true, true, true, true],
+        [true, false, true, true, true],
+        [true, true, false, true, true],
+        [true, true, true, false, true],
+        [true, true, true, true, false],
+    ] {
+        assert!(
+            dependency_context_selection(
+                &grant,
+                &[mode],
+                flags[0],
+                flags[1],
+                flags[2],
+                flags[3],
+                flags[4]
+            )
+            .is_err()
+        );
+    }
+    let mut report = report();
+    report.canonical_namespace = false;
+    report.dependency_modes = vec![mode];
+    let closed = parse_exec_request(&closed_workspace_metadata_request()).unwrap();
+    assert!(validate_execution_selection(&closed, &report, Some(selected)).is_ok());
+    for other in [
+        canonical_dependency_request(),
+        canonical_workspace_request(false),
+        canonical_workspace_request(true),
+        request(19),
+    ] {
+        let other = parse_exec_request(&other).unwrap();
+        assert!(validate_execution_selection(&other, &report, Some(selected)).is_err());
+        assert!(validate_execution_selection(&other, &report, None).is_err());
+    }
+}
+
 #[test]
 fn workspace_decoder_preserves_primary_environment_relative_argv_and_both_input_trees() {
     for archive in [false, true] {
@@ -1753,6 +1899,47 @@ fn workspace_execution_requires_its_own_negotiated_version_in_both_modes() {
 
 #[cfg(unix)]
 #[test]
+fn closed_metadata_cannot_enter_an_ordinary_workspace_session_or_advance_its_journal() {
+    let root = private_root();
+    let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
+    let mut report = report();
+    report.dependency_modes = vec![DependencyExecutionMode::ClosedMetadata];
+    let mut wire = Wire::default();
+    let peer = wire.clone();
+    peer.frame(closed_workspace_metadata_request());
+    peer.frame(json!({"kind":"request-status","request_id":712}));
+    peer.close();
+    wait(drive_session_with_inputs(
+        &mut wire,
+        &report,
+        false,
+        Some(&mut journal),
+        true,
+        true,
+        true,
+        false,
+        &ExecutionLeaseSelection::default(),
+        false,
+        Some(DependencySelection {
+            version: CANONICAL_WORKSPACE_CONTEXT_VERSION,
+            mode: DependencyExecutionMode::Metadata,
+        }),
+        |_, _, _, _, _, _| panic!("mismatched closed metadata reached executor"),
+        pressure,
+    ))
+    .unwrap();
+    let replies = peer.replies();
+    assert_eq!(replies[0]["kind"], "error");
+    assert_eq!(
+        replies[0]["reason"],
+        "dependency context version does not match negotiation"
+    );
+    assert_eq!(replies[1]["status"], "unknown");
+    assert_eq!(journal.high_water(), None);
+}
+
+#[cfg(unix)]
+#[test]
 fn canonical_dependency_version_swap_refuses_before_input_or_durable_admission() {
     let root = private_root();
     let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
@@ -1931,7 +2118,8 @@ fn unnegotiated_dependency_request_never_burns_durable_admission() {
         json!([
             DEPENDENCY_CONTEXT_VERSION,
             CANONICAL_DEPENDENCY_CONTEXT_VERSION,
-            CANONICAL_WORKSPACE_CONTEXT_VERSION
+            CANONICAL_WORKSPACE_CONTEXT_VERSION,
+            CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION
         ])
     );
     assert_eq!(hello["dependency_execution_modes"], json!([]));

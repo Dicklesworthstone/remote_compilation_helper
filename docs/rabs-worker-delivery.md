@@ -287,26 +287,37 @@ it. Unsupported loader paths or changing source, generated input, build-script
 record, artifact, toolchain or runtime observations refuse remote admission
 or installation.
 The context also requires an explicit `execution_mode`: `metadata` retains the
-existing proc/device view, while `rlib` removes procfs and general devices and
-exposes only `/dev/null`. This closes assembler file reads that rustc dep-info
-does not record, including `.incbin`. Source, generated, dependency, toolchain
+existing proc/device view, while `rlib` and `closed-metadata` remove procfs and
+general devices and expose only `/dev/null`. For archives, this closes assembler
+file reads that rustc dep-info does not record, including `.incbin`. Source,
+generated, dependency, toolchain
 and selected runtime files remain captured and read-only; output and temporary
 trees remain private. Archive keys bind exact original paths and environment
 instead of inheriting metadata-only layout projections. Native inputs,
 proc macros and unmodeled codegen outputs cannot enter this archive class.
 This profile does not establish arbitrary workspace or plugin hermeticity.
 
+The `closed-metadata` mode requires the separately negotiated
+`canonical-workspace-closed-metadata-v1` context. It accepts metadata and dep-info
+output only, with the complete captured workspace and every directory listing
+retained in the closed filesystem. Both peers require this exact context/mode
+pair; neither an older workspace context nor an archive request can select it.
+The worker independently verifies the actual compiler output mode before launch.
+This capability supplies strict metadata execution; cache publication and reuse
+still require the coordinator's separate action policy and verification gates.
+
 Workers measure these profiles separately. Their hello advertises
-`dependency_execution_modes` containing only the supported `metadata` and/or
-`rlib` modes; the authenticated session grant selects the exact
-`dependency_execution_mode` in the request. Missing, unknown or mismatched
-modes refuse before admission, input upload or execution. The archive probe
-uses the same namespace setup as archive execution, including user, PID, IPC,
+`dependency_execution_modes` containing only the individually supported
+`metadata`, `rlib` and `closed-metadata` modes; the authenticated session grant
+selects the exact `dependency_execution_mode` in the request. Missing, unknown or mismatched
+modes refuse before admission, input upload or execution. Each strict-mode probe
+uses the same namespace setup as its execution, including user, PID, IPC,
 UTS and network isolation, private temporary filesystems and `/dev/null`.
 The null device must be the Linux character device 1:3; a symlink, regular
 file or different device refuses both probing and namespace construction.
-A host that cannot mount procfs can still execute the measured archive profile.
-Metadata and whole-Cargo execution retain their full canonical isolation checks.
+A host that cannot mount procfs can still execute either independently measured
+strict profile. Ordinary metadata and whole-Cargo execution retain their full
+canonical isolation checks.
 Sealed-result recovery requires the original request fingerprint and retained
 bytes, without requiring the restarted host to support new execution.
 

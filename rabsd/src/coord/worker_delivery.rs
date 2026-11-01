@@ -29,8 +29,8 @@ use rabs_sandbox::artifact_tree::{
 use rabs_sandbox::cargo_artifacts::{self, CargoArtifactReport};
 use rabs_sandbox::dependency_context::{
     CANONICAL_DEPENDENCY_CONTEXT_VERSION, CANONICAL_NATIVE_METADATA_CAPABILITY,
-    CANONICAL_NATIVE_ROOTS_CAPABILITY, CANONICAL_WORKSPACE_CONTEXT_VERSION,
-    DEPENDENCY_CONTEXT_VERSION, DependencyExecutionMode,
+    CANONICAL_NATIVE_ROOTS_CAPABILITY, CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION,
+    CANONICAL_WORKSPACE_CONTEXT_VERSION, DEPENDENCY_CONTEXT_VERSION, DependencyExecutionMode,
 };
 use rabs_sandbox::process_context::{
     COMMAND_CONTEXT_VERSION, CommandContext, MAX_COMMAND_ENV_ENTRIES,
@@ -96,6 +96,9 @@ pub(crate) fn negotiated_dependency_context(
         Some(DEPENDENCY_CONTEXT_VERSION) => DEPENDENCY_CONTEXT_VERSION,
         Some(CANONICAL_DEPENDENCY_CONTEXT_VERSION) => CANONICAL_DEPENDENCY_CONTEXT_VERSION,
         Some(CANONICAL_WORKSPACE_CONTEXT_VERSION) => CANONICAL_WORKSPACE_CONTEXT_VERSION,
+        Some(CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION) => {
+            CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION
+        }
         _ => return Err(invalid("unsupported dependency execution context")),
     };
     require(
@@ -107,8 +110,14 @@ pub(crate) fn negotiated_dependency_context(
     let selected = match context.get("execution_mode").and_then(Value::as_str) {
         Some("metadata") => DependencyExecutionMode::Metadata,
         Some("rlib") => DependencyExecutionMode::Rlib,
+        Some("closed-metadata") => DependencyExecutionMode::ClosedMetadata,
         _ => return Err(invalid("unsupported dependency execution mode")),
     };
+    require(
+        (selected == DependencyExecutionMode::ClosedMetadata)
+            == (version == CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION),
+        "closed metadata requires its exact workspace context and mode",
+    )?;
     require(
         hello["dependency_execution_modes"]
             .as_array()
@@ -980,7 +989,7 @@ pub fn receive_operation(
         let dependency_context = negotiated_dependency_context(&hello, request, mode)?;
         let require_canonical = mode == DeliveryMode::Execute
             && dependency_context
-                .is_none_or(|selected| selected.mode != DependencyExecutionMode::Rlib);
+                .is_none_or(|selected| selected.mode.requires_canonical_namespace());
         require(
             (!require_canonical || hello.get("canonical").and_then(Value::as_bool) == Some(true))
                 && number(&hello, "slots")? > 0
@@ -2228,6 +2237,92 @@ mod tests {
         );
         assert_eq!(peer.sent[0]["dependency_execution_mode"], "rlib");
         assert_eq!(peer.sent[1], request);
+    }
+
+    #[test]
+    fn closed_metadata_delivery_requires_its_exact_context_and_independent_capability() {
+        let version = CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION;
+        for (requested_version, requested_mode, offered_versions, offered_modes, accepted) in [
+            (
+                version,
+                "closed-metadata",
+                json!([version]),
+                json!(["closed-metadata"]),
+                true,
+            ),
+            (
+                version,
+                "closed-metadata",
+                json!([version]),
+                json!(["metadata", "rlib"]),
+                false,
+            ),
+            (
+                version,
+                "closed-metadata",
+                json!([CANONICAL_WORKSPACE_CONTEXT_VERSION]),
+                json!(["closed-metadata"]),
+                false,
+            ),
+            (
+                CANONICAL_WORKSPACE_CONTEXT_VERSION,
+                "closed-metadata",
+                json!([CANONICAL_WORKSPACE_CONTEXT_VERSION]),
+                json!(["closed-metadata"]),
+                false,
+            ),
+            (
+                CANONICAL_DEPENDENCY_CONTEXT_VERSION,
+                "closed-metadata",
+                json!([CANONICAL_DEPENDENCY_CONTEXT_VERSION]),
+                json!(["closed-metadata"]),
+                false,
+            ),
+            (
+                DEPENDENCY_CONTEXT_VERSION,
+                "closed-metadata",
+                json!([DEPENDENCY_CONTEXT_VERSION]),
+                json!(["closed-metadata"]),
+                false,
+            ),
+            (
+                version,
+                "metadata",
+                json!([version]),
+                json!(["metadata"]),
+                false,
+            ),
+            (version, "rlib", json!([version]), json!(["rlib"]), false),
+        ] {
+            let parent = tempfile::tempdir().unwrap();
+            let destination = parent.path().join("delivery");
+            let mut request = request();
+            request["dependency_context"] = json!({
+                "version":requested_version, "execution_mode":requested_mode,
+            });
+            let mut peer = fixture(&destination);
+            peer.replies[0]["canonical"] = json!(false);
+            peer.replies[0]["dependency_contexts"] = offered_versions;
+            peer.replies[0]["dependency_execution_modes"] = offered_modes;
+            let result = receive_execution(&mut peer, &request, "worker", &destination);
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "{requested_version}/{requested_mode}: {result:?}"
+            );
+            if accepted {
+                assert_eq!(peer.sent[0]["dependency_context"], version);
+                assert_eq!(peer.sent[0]["dependency_execution_mode"], "closed-metadata");
+                assert_eq!(peer.sent[1], request);
+            } else {
+                assert!(
+                    peer.sent.is_empty(),
+                    "unsupported profile must not dispatch"
+                );
+                assert!(!destination.exists());
+                assert!(!result.unwrap_err().execution_may_have_run);
+            }
+        }
     }
 
     #[test]

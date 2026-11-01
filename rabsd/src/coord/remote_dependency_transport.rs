@@ -24,8 +24,8 @@ use asupersync::runtime::RuntimeBuilder;
 use rabs_asupersync::worker_transport::{TlsFiles, accept_peer};
 use rabs_protocol::worker_fence::WorkerSessionOffer;
 use rabs_sandbox::dependency_context::{
-    CANONICAL_DEPENDENCY_CONTEXT_VERSION, CANONICAL_WORKSPACE_CONTEXT_VERSION,
-    DEPENDENCY_CONTEXT_VERSION,
+    CANONICAL_DEPENDENCY_CONTEXT_VERSION, CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION,
+    CANONICAL_WORKSPACE_CONTEXT_VERSION, DEPENDENCY_CONTEXT_VERSION,
 };
 use serde_json::Value;
 use std::future::{Future, poll_fn};
@@ -647,6 +647,7 @@ fn preflight(request: &Value, upload: &SourceUpload, destination: &Path) -> io::
             DEPENDENCY_CONTEXT_VERSION
                 | CANONICAL_DEPENDENCY_CONTEXT_VERSION
                 | CANONICAL_WORKSPACE_CONTEXT_VERSION
+                | CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION
         )
     ) || request.get("command_context").is_some()
         || request.get("artifacts").is_none()

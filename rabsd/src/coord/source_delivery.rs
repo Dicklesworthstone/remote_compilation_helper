@@ -1087,9 +1087,13 @@ impl SourceUpload {
             ..
         } = &self.layout
         {
-            if request["dependency_context"]["version"]
-                == rabs_sandbox::dependency_context::CANONICAL_WORKSPACE_CONTEXT_VERSION
-            {
+            if matches!(
+                request["dependency_context"]["version"].as_str(),
+                Some(
+                    rabs_sandbox::dependency_context::CANONICAL_WORKSPACE_CONTEXT_VERSION
+                        | rabs_sandbox::dependency_context::CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION
+                )
+            ) {
                 let captured = self
                     .image
                     .manifest(root)
@@ -1680,7 +1684,10 @@ mod tests {
 
     #[test]
     fn workspace_execution_upload_requires_every_file_and_empty_directory_from_one_capture() {
-        use rabs_sandbox::dependency_context::CANONICAL_WORKSPACE_CONTEXT_VERSION;
+        use rabs_sandbox::dependency_context::{
+            CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION,
+            CANONICAL_WORKSPACE_CONTEXT_VERSION,
+        };
         let root = tempfile::tempdir().unwrap();
         fs::create_dir_all(root.path().join("src")).unwrap();
         fs::create_dir_all(root.path().join("empty/inner")).unwrap();
@@ -1713,23 +1720,33 @@ mod tests {
             "dependency_context":{"version":CANONICAL_WORKSPACE_CONTEXT_VERSION,
                 "source_root":"/__rabs/workspace", "source_directories":["empty","empty/inner","src"],
                 "generated_root":null,"generated_directories":[]}});
-        upload.validate_request(&request).unwrap();
-        for directories in [
-            json!(["src"]),
-            json!(["empty", "empty/inner", "extra", "src"]),
-            Value::Null,
-        ] {
-            let mut changed = request.clone();
-            changed["dependency_context"]["source_directories"] = directories;
-            assert!(upload.validate_request(&changed).is_err());
-        }
         let subset = SourceUpload::from_snapshot(image, "workspace", &["src/lib.rs".into()])
             .unwrap()
             .with_dependency_artifacts(Vec::new())
             .unwrap();
-        let mut missing_sibling = request.clone();
-        missing_sibling["source_manifest"] = subset.wire_manifest();
-        assert!(subset.validate_request(&missing_sibling).is_err());
+        for version in [
+            CANONICAL_WORKSPACE_CONTEXT_VERSION,
+            CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION,
+        ] {
+            let mut request = request.clone();
+            request["dependency_context"]["version"] = json!(version);
+            upload.validate_request(&request).unwrap();
+            for directories in [
+                json!(["src"]),
+                json!(["empty", "empty/inner", "extra", "src"]),
+                Value::Null,
+            ] {
+                let mut changed = request.clone();
+                changed["dependency_context"]["source_directories"] = directories;
+                assert!(upload.validate_request(&changed).is_err(), "{version}");
+            }
+            let mut missing_sibling = request.clone();
+            missing_sibling["source_manifest"] = subset.wire_manifest();
+            assert!(
+                subset.validate_request(&missing_sibling).is_err(),
+                "{version}"
+            );
+        }
         // Upload authority remains the sealed capture even if the mutable
         // original changes after selection; execution rechecks its owner too.
         fs::write(root.path().join("README"), b"changed after capture\n").unwrap();

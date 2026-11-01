@@ -22,8 +22,8 @@ use rabs_protocol::lease_semantics::{
 use rabs_protocol::metadata_prefetch::VERSION as METADATA_PREFETCH_VERSION;
 use rabs_sandbox::dependency_context::{
     CANONICAL_DEPENDENCY_CONTEXT_VERSION, CANONICAL_NATIVE_METADATA_CAPABILITY,
-    CANONICAL_NATIVE_ROOTS_CAPABILITY, CANONICAL_WORKSPACE_CONTEXT_VERSION,
-    DEPENDENCY_CONTEXT_VERSION, DependencyExecutionMode,
+    CANONICAL_NATIVE_ROOTS_CAPABILITY, CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION,
+    CANONICAL_WORKSPACE_CONTEXT_VERSION, DEPENDENCY_CONTEXT_VERSION, DependencyExecutionMode,
 };
 use rabs_sandbox::source_transfer::SOURCE_TRANSFER;
 use rabs_sandbox::toolchain_transfer::{TOOLCHAIN_REUSE_VERSION, TOOLCHAIN_TRANSFER_VERSION};
@@ -1888,7 +1888,7 @@ fn worker_hello(report: &rabs_wkr::session::CapabilityReport, journal: &WorkerJo
         "toolchain_reuses": [TOOLCHAIN_REUSE_VERSION],
         "execution_leases": [REQUEST_EXECUTION_LEASE_VERSION],
         "command_contexts": [rabs_sandbox::process_context::COMMAND_CONTEXT_VERSION],
-        "dependency_contexts": [DEPENDENCY_CONTEXT_VERSION, CANONICAL_DEPENDENCY_CONTEXT_VERSION, CANONICAL_WORKSPACE_CONTEXT_VERSION],
+        "dependency_contexts": [DEPENDENCY_CONTEXT_VERSION, CANONICAL_DEPENDENCY_CONTEXT_VERSION, CANONICAL_WORKSPACE_CONTEXT_VERSION, CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION],
         "dependency_native_inputs": [CANONICAL_NATIVE_METADATA_CAPABILITY, CANONICAL_NATIVE_ROOTS_CAPABILITY],
         "dependency_execution_modes": report.dependency_modes.iter()
             .map(|mode| mode.as_str()).collect::<Vec<_>>(),
@@ -2306,24 +2306,34 @@ fn dependency_context_selection(
                     DEPENDENCY_CONTEXT_VERSION
                         | CANONICAL_DEPENDENCY_CONTEXT_VERSION
                         | CANONICAL_WORKSPACE_CONTEXT_VERSION
+                        | CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION
                 )
             ) =>
         {
-            let version = if selected.as_str() == Some(CANONICAL_WORKSPACE_CONTEXT_VERSION) {
-                CANONICAL_WORKSPACE_CONTEXT_VERSION
-            } else if selected.as_str() == Some(CANONICAL_DEPENDENCY_CONTEXT_VERSION) {
-                CANONICAL_DEPENDENCY_CONTEXT_VERSION
-            } else {
-                DEPENDENCY_CONTEXT_VERSION
-            };
+            let version =
+                if selected.as_str() == Some(CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION) {
+                    CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION
+                } else if selected.as_str() == Some(CANONICAL_WORKSPACE_CONTEXT_VERSION) {
+                    CANONICAL_WORKSPACE_CONTEXT_VERSION
+                } else if selected.as_str() == Some(CANONICAL_DEPENDENCY_CONTEXT_VERSION) {
+                    CANONICAL_DEPENDENCY_CONTEXT_VERSION
+                } else {
+                    DEPENDENCY_CONTEXT_VERSION
+                };
             let mode = match value
                 .get("dependency_execution_mode")
                 .and_then(serde_json::Value::as_str)
             {
                 Some("metadata") => DependencyExecutionMode::Metadata,
                 Some("rlib") => DependencyExecutionMode::Rlib,
+                Some("closed-metadata") => DependencyExecutionMode::ClosedMetadata,
                 _ => return Err("unsupported dependency_execution_mode selection".to_owned()),
             };
+            if (mode == DependencyExecutionMode::ClosedMetadata)
+                != (version == CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION)
+            {
+                return Err("closed metadata requires its exact workspace context and mode".into());
+            }
             if !supported.contains(&mode) {
                 return Err("dependency execution mode unavailable".to_owned());
             }
