@@ -1183,6 +1183,22 @@ the execution allowlist), as `--worker` does. A non-compilation command is
 refused with `RCH-E301` instead of running locally; to run one on a worker, use
 `rch exec --job -- <cmd>`.
 
+### Parallel dependency uploads
+
+Ordinary Cargo builds on Unix workers can upload up to eight independent
+dependency roots concurrently while holding their durable source grant. Every
+upload keeps checksum comparison and its existing transfer timeout, progress
+reporting, and receiver safety checks. Source verification, compilation, and
+retirement wait for all admitted uploads to finish. A failed upload stops new
+admission, drains every upload already admitted, and enters the existing durable
+preparation-cancellation protocol before another build can reuse those sources.
+
+Overlapping source roots keep their original order. A worker destination with a
+symlinked ancestor or an ambiguous physical directory identity uses the
+exclusive upload path. Clean-overlay archive materialization and Windows
+transfers keep their existing ordering. A positive `bwlimit_kbps` also keeps
+uploads sequential so concurrency cannot multiply the configured bandwidth cap.
+
 ### Exact source-content receipts
 
 Proof-oriented callers can require a single-worker, fail-closed source transfer

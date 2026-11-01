@@ -369,6 +369,101 @@ pub(super) fn sync_progress_line(
     }
 }
 
+// Leave room for the source holder and an optional source/target pair holder
+// on one owned SSH transport (OpenSSH's default MaxSessions is ten).
+const MAX_CONCURRENT_SOURCE_UPLOADS: usize = 8;
+
+/// Admit roots in source-plan order while independent receivers make progress
+/// together. An ancestor/descendant pair never runs together, even when one
+/// entry currently selects only workspace metadata. The remote upload prefix
+/// independently enforces this exclusion; local ordering avoids lock waiters
+/// occupying the bounded SSH channel budget.
+///
+/// A failure stops admission, but every admitted future is awaited before the
+/// caller can cancel or release its source grant. These futures stay in this
+/// task so the dispatch-owned SSH transport is available to every upload.
+async fn run_bounded_source_uploads<T, F, Fut>(
+    roots: &[String],
+    limit: usize,
+    mut upload: F,
+) -> Vec<(usize, anyhow::Result<T>)>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    use futures::StreamExt;
+    use futures::stream::FuturesUnordered;
+
+    let mut pending = FuturesUnordered::new();
+    let mut active = Vec::new();
+    let mut results = Vec::with_capacity(roots.len());
+    let mut next = 0;
+    let mut failed = false;
+    loop {
+        while !failed && next < roots.len() && pending.len() < limit.max(1) {
+            let root = Path::new(&roots[next]);
+            if active.iter().any(|&index: &usize| {
+                let other = Path::new(&roots[index]);
+                root.starts_with(other) || other.starts_with(root)
+            }) {
+                break;
+            }
+            let index = next;
+            next += 1;
+            active.push(index);
+            let future = upload(index);
+            pending.push(async move { (index, future.await) });
+        }
+        let Some((index, result)) = pending.next().await else {
+            break;
+        };
+        active.retain(|&current| current != index);
+        failed |= result.is_err();
+        results.push((index, result));
+    }
+    // Receipt ordinals and manifest diagnostics follow the source plan, not
+    // transfer completion timing.
+    results.sort_by_key(|(index, _)| *index);
+    results
+}
+
+/// Keep worker-fault evidence from all drained receivers. A sibling failure
+/// must not hide disk exhaustion or a live-checkout refusal merely because
+/// another root happened to fail first in source-plan order.
+fn combine_source_upload_errors(
+    errors: Vec<anyhow::Error>,
+    worker_id: &str,
+) -> Option<anyhow::Error> {
+    let live_checkout_refused = errors
+        .iter()
+        .any(crate::transfer::sync_refused_by_live_checkout);
+    let mut disk_roots = std::collections::BTreeSet::new();
+    for error in &errors {
+        if let Some(fault) = crate::transfer::find_remote_upload_disk_full(error)
+            && fault.worker_id == worker_id
+        {
+            disk_roots.extend(fault.roots.iter().cloned());
+        }
+    }
+    let mut errors = errors.into_iter();
+    let mut first = errors.next()?;
+    for error in errors {
+        first = first.context(format!("another source upload failed: {error:#}"));
+    }
+    if live_checkout_refused && !crate::transfer::sync_refused_by_live_checkout(&first) {
+        first = first.context(crate::transfer::LiveCheckoutRefused(
+            "a concurrent source receiver refused a live checkout".to_owned(),
+        ));
+    }
+    if !disk_roots.is_empty() {
+        first = first.context(crate::transfer::RemoteUploadDiskFull {
+            worker_id: worker_id.to_owned(),
+            roots: disk_roots.into_iter().collect(),
+        });
+    }
+    Some(first)
+}
+
 pub(super) fn apply_source_sync_integrity_policy(
     pipeline: TransferPipeline,
     exact_dependency_closure_sync: bool,
@@ -1765,8 +1860,18 @@ async fn execute_remote_compilation_inner(
     let sync_heartbeat_state = heartbeat_loop
         .as_ref()
         .map(BuildHeartbeatLoop::shared_state);
+    // A configured rsync bandwidth limit has historically capped this entire
+    // sequential phase. Preserve it rather than multiplying the user's cap
+    // by the number of receivers. Ordinary Cargo uploads retain checksums;
+    // clean-overlay's shared archive cache and freshness operations remain
+    // serialized by their existing exclusive activity protocol.
+    let concurrent_uploads = durable_sources
+        && exact_dependency_closure_sync
+        && sync_plan.len() > 1
+        && !transfer_config.bwlimit_kbps.is_some_and(|limit| limit > 0);
+    let mut queued_uploads = Vec::new();
     let mut root_outcomes: Vec<(SyncClosurePlanEntry, SyncRootOutcome)> = Vec::new();
-    for entry in &sync_plan {
+    for (root_index, entry) in sync_plan.iter().enumerate() {
         let root_overlay = clean_overlay
             .map(|spec| {
                 if entry.is_primary {
@@ -1870,16 +1975,10 @@ async fn execute_remote_compilation_inner(
 
         let prepared_source_root = if source_content_receipt {
             let mut prepared = if let Some(spec) = root_overlay {
-                prepare_clean_overlay_source_content_root(
-                    prepared_source_roots.len(),
-                    entry,
-                    &root_pipeline,
-                    spec,
-                )
-                .await?
-            } else {
-                prepare_source_content_root(prepared_source_roots.len(), entry, &root_pipeline)
+                prepare_clean_overlay_source_content_root(root_index, entry, &root_pipeline, spec)
                     .await?
+            } else {
+                prepare_source_content_root(root_index, entry, &root_pipeline).await?
             };
             attach_coalesced_source_roots(
                 &mut prepared,
@@ -1934,6 +2033,13 @@ async fn execute_remote_compilation_inner(
             entry.local_root.display(),
             entry.remote_root.as_str()
         ));
+        if concurrent_uploads {
+            // Finish local capture and pipeline construction before admitting
+            // any receiver. In particular, receipt ordinals stay tied to the
+            // selected closure, never to completion order.
+            queued_uploads.push((entry.clone(), root_pipeline, prepared_source_root));
+            continue;
+        }
         let sync_attempt = if let Some(spec) = root_overlay {
             spec.verify_archive_attributes(&entry.local_root).await?;
             spec.verify_overlay_unchanged(&entry.local_root)?;
@@ -2095,6 +2201,86 @@ async fn execute_remote_compilation_inner(
                     },
                 ));
             }
+        }
+    }
+
+    if !queued_uploads.is_empty() {
+        let identity = source_identity.context("concurrent uploads require their source grant")?;
+        let roots: Vec<_> = queued_uploads
+            .iter()
+            .map(|(entry, _, _)| entry.remote_root.clone())
+            .collect();
+        reporter.verbose(&format!(
+            "[RCH] syncing {} exact source roots with at most {} independent receivers",
+            roots.len(),
+            MAX_CONCURRENT_SOURCE_UPLOADS
+        ));
+        let upload_started = std::time::Instant::now();
+        let results = {
+            // The callback holds this mutex only while rendering one line;
+            // no lock guard crosses an await or hides heartbeat progress.
+            let progress = Mutex::new(&mut upload_progress);
+            run_bounded_source_uploads(&roots, MAX_CONCURRENT_SOURCE_UPLOADS, |index| {
+                let pipeline = &queued_uploads[index].1;
+                let progress = &progress;
+                let heartbeat = sync_heartbeat_state.as_ref();
+                let worker = &worker_config;
+                async move {
+                    pipeline
+                        .sync_to_remote_concurrent(worker, identity, |line| {
+                            let mut progress = progress
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            sync_progress_line(progress.as_mut(), heartbeat, line);
+                        })
+                        .await
+                }
+            })
+            .await
+        };
+        let duration_ms = u64::try_from(upload_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let mut errors = Vec::new();
+        let mut completed = Vec::with_capacity(results.len());
+        for (index, result) in results {
+            match result {
+                Ok(result) => completed.push((index, result)),
+                Err(error) => {
+                    reporter.summary(&format!(
+                        "[RCH] source sync failed for {} before remote Cargo execution; remote Cargo was not started: {error:#}",
+                        queued_uploads[index].0.local_root.display()
+                    ));
+                    errors.push(error);
+                }
+            }
+        }
+        if let Some(error) = combine_source_upload_errors(errors, worker_config.id.as_str()) {
+            // run_bounded_source_uploads has drained every admitted transfer.
+            // Only now may the outer recovery path cancel this grant and
+            // establish that no late receiver can race another preparation.
+            return Err(error);
+        }
+        anyhow::ensure!(
+            completed.len() == queued_uploads.len(),
+            "source upload scheduler returned an incomplete closure"
+        );
+        for ((entry, pipeline, prepared), (_, result)) in queued_uploads.into_iter().zip(completed)
+        {
+            aggregate_sync_result = Some(match &aggregate_sync_result {
+                Some(existing) => merge_sync_result(existing, &result),
+                None => result,
+            });
+            if entry.is_primary {
+                primary_pipeline = Some(pipeline);
+            }
+            if let Some(prepared) = prepared {
+                prepared_source_roots.push(prepared);
+            }
+            root_outcomes.push((entry, SyncRootOutcome::Synced));
+        }
+        if let Some(result) = &mut aggregate_sync_result {
+            // Summing receiver durations would overstate the elapsed sync
+            // phase once independent roots overlap.
+            result.duration_ms = duration_ms;
         }
     }
 
@@ -3726,6 +3912,49 @@ async fn execute_remote_compilation_inner(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn concurrent_source_errors_retain_every_worker_fault() {
+        use crate::transfer::{
+            LiveCheckoutRefused, RemoteExecutionUnconfirmed, RemoteUploadDiskFull,
+            find_remote_upload_disk_full, sync_refused_by_live_checkout,
+        };
+
+        assert!(super::combine_source_upload_errors(Vec::new(), "worker").is_none());
+        let error = super::combine_source_upload_errors(
+            vec![
+                anyhow::anyhow!("first root transport failed"),
+                anyhow::Error::new(RemoteUploadDiskFull {
+                    worker_id: "worker".into(),
+                    roots: vec!["/sources/b".into(), "/sources/a".into()],
+                }),
+                anyhow::Error::new(LiveCheckoutRefused("live checkout".into())),
+                anyhow::Error::new(RemoteUploadDiskFull {
+                    worker_id: "worker".into(),
+                    roots: vec!["/sources/b".into(), "/sources/c".into()],
+                }),
+                anyhow::Error::new(RemoteUploadDiskFull {
+                    worker_id: "other-worker".into(),
+                    roots: vec!["/unrelated".into()],
+                }),
+            ],
+            "worker",
+        )
+        .unwrap();
+        assert!(sync_refused_by_live_checkout(&error));
+        let disk = find_remote_upload_disk_full(&error).unwrap();
+        assert_eq!(disk.worker_id, "worker");
+        assert_eq!(disk.roots, ["/sources/a", "/sources/b", "/sources/c"]);
+        assert!(format!("{error:#}").contains("first root transport failed"));
+
+        // Recovery uncertainty remains authoritative over observed worker
+        // faults; the outer dispatch adds this context only after all local
+        // upload futures have drained and cancellation cannot be confirmed.
+        let unconfirmed = error.context(RemoteExecutionUnconfirmed);
+        assert!(super::super::is_remote_execution_unconfirmed(&unconfirmed));
+        assert!(find_remote_upload_disk_full(&unconfirmed).is_some());
+        assert!(sync_refused_by_live_checkout(&unconfirmed));
+    }
+
+    #[test]
     fn admitted_execution_disk_budget_preserves_reservation_and_floor() {
         use rch_common::BuildDiskBudget;
         let gib = BuildDiskBudget::GIB;
@@ -4854,4 +5083,423 @@ sys.exit(99)
         assert_ne!(a, b);
         assert!(a.contains("/.rch-target-") && a.contains("-pool-"));
     }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod concurrent_upload_tests {
+    use super::run_bounded_source_uploads;
+    use crate::transfer::{SyncResult, TransferPipeline};
+    use rch_common::ssh::OwnedProcessGroup;
+    use rch_common::{TransferConfig, WorkerConfig, WorkerId};
+    use sha2::{Digest, Sha256};
+    use std::fs;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::path::{Path, PathBuf};
+    use std::process::Stdio;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+
+    const CHILD: &str = "RCH_CONCURRENT_UPLOAD_CHILD";
+
+    tokio::task_local! {
+        static UPLOAD_SCOPE: &'static str;
+    }
+
+    struct Fixture {
+        directory: PathBuf,
+        local: Vec<PathBuf>,
+        roots: Vec<String>,
+        pipelines: Vec<TransferPipeline>,
+        identity: String,
+        worker: WorkerConfig,
+    }
+
+    impl Fixture {
+        fn new(name: &str, names: &[&str], fail: Option<usize>) -> Self {
+            let base = PathBuf::from(std::env::var_os("RCH_UPLOAD_FIXTURE").unwrap());
+            let directory = base.join(name);
+            fs::create_dir_all(&directory).unwrap();
+            let roots: Vec<_> = names
+                .iter()
+                .map(|name| directory.join("remote source ' quoted").join(name))
+                .map(|path| path.to_str().unwrap().to_owned())
+                .collect();
+            let identity = Sha256::digest(directory.as_os_str().as_encoded_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let mut claimed = roots.clone();
+            claimed.sort();
+            claimed.dedup();
+            let claim = format!("{}\n", claimed.join("\n"));
+            let registry = base.join("registry");
+            let digest = Sha256::digest(claim.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            fs::write(registry.join(format!("{identity}.{digest}.claim")), claim).unwrap();
+            let rsync = rch_common::rsync_flavor::resolve_rsync(Some(
+                &std::env::var("RCH_UPLOAD_REAL_RSYNC").unwrap(),
+            ))
+            .unwrap();
+            let mut local = Vec::new();
+            let mut pipelines = Vec::new();
+            let mut rules = serde_json::Map::new();
+            for (index, root) in roots.iter().enumerate() {
+                let source = directory.join(format!("local source {index}"));
+                fs::create_dir_all(source.join("empty/nested")).unwrap();
+                fs::create_dir_all(root).unwrap();
+                fs::write(source.join("input.txt"), b"selected\n").unwrap();
+                fs::write(source.join("run.sh"), b"#!/bin/sh\nexit 0\n").unwrap();
+                fs::set_permissions(source.join("run.sh"), fs::Permissions::from_mode(0o755))
+                    .unwrap();
+                symlink("input.txt", source.join("input-link")).unwrap();
+                rules.insert(
+                    root.clone(),
+                    serde_json::json!({
+                        "label": index,
+                        "directory": directory,
+                        "fail": fail == Some(index),
+                    }),
+                );
+                let pipeline = TransferPipeline::new(
+                    source.clone(),
+                    format!("source-{index}"),
+                    identity.clone(),
+                    TransferConfig {
+                        sync_timeout_ms: Some(20_000),
+                        source_sync_silence_timeout_secs: 15,
+                        max_transfer_time_ms: Some(25_000),
+                        ..Default::default()
+                    },
+                )
+                .with_rsync(rsync.clone())
+                .with_remote_path_override(root.clone())
+                .with_sync_checksum(true)
+                .with_source_authority(identity.clone())
+                .unwrap();
+                local.push(source);
+                pipelines.push(pipeline);
+            }
+            fs::write(
+                base.join("receivers.json"),
+                serde_json::to_vec(&rules).unwrap(),
+            )
+            .unwrap();
+            Self {
+                directory,
+                local,
+                roots,
+                pipelines,
+                identity,
+                worker: WorkerConfig {
+                    id: WorkerId::new("concurrent-upload-loopback"),
+                    host: "concurrent-upload.invalid".into(),
+                    user: "worker".into(),
+                    identity_file: "/unused/concurrent-upload-key".into(),
+                    ..WorkerConfig::default()
+                },
+            }
+        }
+
+        fn marker(&self, index: usize, state: &str) -> PathBuf {
+            self.directory.join(format!("{index}.{state}"))
+        }
+
+        async fn entered(&self, index: usize) {
+            wait_for(&self.marker(index, "entered")).await;
+        }
+
+        fn release(&self, index: usize) {
+            fs::write(self.marker(index, "release"), b"proceed\n").unwrap();
+        }
+
+        async fn upload(&self, limit: usize) -> Vec<(usize, anyhow::Result<SyncResult>)> {
+            UPLOAD_SCOPE
+                .scope("dispatch transport", async {
+                    run_bounded_source_uploads(&self.roots, limit, |index| async move {
+                        assert_eq!(UPLOAD_SCOPE.get(), "dispatch transport");
+                        let mut progress_lines = 0;
+                        let result = self.pipelines[index]
+                            .sync_to_remote_concurrent(&self.worker, &self.identity, |_| {
+                                assert_eq!(UPLOAD_SCOPE.get(), "dispatch transport");
+                                progress_lines += 1;
+                            })
+                            .await;
+                        if result.is_ok() {
+                            assert!(
+                                progress_lines > 0,
+                                "successful upload lost progress callbacks"
+                            );
+                        }
+                        fs::write(self.marker(index, "client-finished"), b"observed\n").unwrap();
+                        result
+                    })
+                    .await
+                })
+                .await
+        }
+
+        fn assert_bytes(&self, index: usize) {
+            let remote = Path::new(&self.roots[index]);
+            assert_eq!(
+                fs::read(remote.join("input.txt")).unwrap(),
+                fs::read(self.local[index].join("input.txt")).unwrap(),
+            );
+            assert!(remote.join("empty/nested").is_dir());
+            assert_eq!(
+                fs::read_link(remote.join("input-link")).unwrap(),
+                Path::new("input.txt")
+            );
+            assert_ne!(
+                fs::metadata(remote.join("run.sh"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o111,
+                0
+            );
+        }
+
+        fn maximum_receivers(&self) -> usize {
+            let events = fs::read_to_string(self.directory.join("receivers.log")).unwrap();
+            let mut active = std::collections::BTreeSet::new();
+            let mut maximum = 0;
+            for line in events.lines() {
+                let (event, receiver) = line.split_once(' ').unwrap();
+                match event {
+                    "enter" => assert!(active.insert(receiver)),
+                    "exit" => assert!(active.remove(receiver)),
+                    _ => panic!("unknown receiver event {line}"),
+                }
+                maximum = maximum.max(active.len());
+            }
+            assert!(
+                active.is_empty(),
+                "source upload returned while a receiver was live"
+            );
+            maximum
+        }
+    }
+
+    async fn wait_for(path: &Path) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !path.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("receiver did not reach {}", path.display()));
+    }
+
+    // SSH is bridged to a local shell in an isolated child. The rsync protocol,
+    // production upload supervisor, actual kernel locks, streaming runner and
+    // bounded scheduler all execute. A seeded claim exercises per-activity
+    // authority; the separate source-lock tests cover durable grant acquisition.
+    #[tokio::test]
+    async fn concurrent_source_uploads_compose_real_receivers_and_failure_drain() {
+        if std::env::var_os(CHILD).is_none() {
+            let fixture = tempfile::Builder::new()
+                .prefix("rch-concurrent-upload-")
+                .disable_cleanup(true)
+                .tempdir()
+                .unwrap();
+            fs::create_dir(fixture.path().join("registry")).unwrap();
+            let rsync = rch_common::rsync_flavor::resolve_rsync(None).unwrap();
+            for (name, contents) in [("ssh", SSH), ("rsync", RECEIVER)] {
+                let path = fixture.path().join(name);
+                fs::write(&path, contents).unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "concurrent_source_uploads_compose_real_receivers_and_failure_drain",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .env("RCH_MOCK_SSH", "0")
+                .env("RCH_UPLOAD_FIXTURE", fixture.path())
+                .env("RCH_UPLOAD_REAL_RSYNC", &rsync.path)
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        fixture.path().display(),
+                        std::env::var("PATH").unwrap()
+                    ),
+                )
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = OwnedProcessGroup::spawn(&mut command).unwrap();
+            let mut stdout = child.take_stdout().unwrap();
+            let mut stderr = child.take_stderr().unwrap();
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let (status, output, error) = tokio::time::timeout(Duration::from_secs(90), async {
+                tokio::join!(
+                    child.wait(),
+                    stdout.read_to_end(&mut out),
+                    stderr.read_to_end(&mut err)
+                )
+            })
+            .await
+            .expect("concurrent upload fixture timed out");
+            output.unwrap();
+            error.unwrap();
+            assert!(
+                status.unwrap().success(),
+                "stdout={}\nstderr={}\nfixture={}",
+                String::from_utf8_lossy(&out),
+                String::from_utf8_lossy(&err),
+                fixture.path().display()
+            );
+            return;
+        }
+
+        let parallel = Fixture::new("parallel", &["left", "right", "third"], None);
+        let control = async {
+            parallel.entered(0).await;
+            parallel.entered(1).await;
+            assert!(
+                !parallel.marker(2, "entered").exists(),
+                "upload bound exceeded"
+            );
+            parallel.release(1);
+            parallel.entered(2).await;
+            assert!(!parallel.marker(0, "exited").exists());
+            parallel.release(0);
+            parallel.release(2);
+        };
+        let (result, ()) = tokio::join!(parallel.upload(2), control);
+        assert_eq!(result.len(), 3);
+        for (expected, (index, result)) in result.into_iter().enumerate() {
+            assert_eq!(index, expected, "completion order changed source ordinals");
+            result.unwrap();
+            parallel.assert_bytes(index);
+        }
+        assert_eq!(
+            parallel.maximum_receivers(),
+            2,
+            "disjoint receivers did not overlap"
+        );
+
+        // A warm edit that preserves rsync's quick-check metadata must still
+        // refresh exact bytes through the concurrent path's checksum policy.
+        let input = parallel.local[0].join("input.txt");
+        let before = fs::metadata(&input).unwrap();
+        fs::write(&input, b"modified\n").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&input)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(before.modified().unwrap()))
+            .unwrap();
+        assert_eq!(before.len(), fs::metadata(&input).unwrap().len());
+        assert_eq!(
+            before.modified().unwrap(),
+            fs::metadata(&input).unwrap().modified().unwrap()
+        );
+        parallel.pipelines[0]
+            .sync_to_remote_concurrent(&parallel.worker, &parallel.identity, |_| {})
+            .await
+            .unwrap();
+        parallel.assert_bytes(0);
+
+        // Authority and lock keys are canonical even when an ordinary remote
+        // override spells the same receiver destination with duplicate slashes.
+        let raw_root = parallel.roots[0].replace("/remote source", "//remote source");
+        assert_ne!(raw_root, parallel.roots[0]);
+        parallel.pipelines[0]
+            .clone()
+            .with_remote_path_override(raw_root)
+            .sync_to_remote_concurrent(&parallel.worker, &parallel.identity, |_| {})
+            .await
+            .unwrap();
+        parallel.assert_bytes(0);
+
+        let overlap = Fixture::new("overlap", &["parent", "parent/child"], None);
+        fs::write(overlap.local[1].join("input.txt"), b"child wins\n").unwrap();
+        let control = async {
+            overlap.entered(0).await;
+            assert!(!overlap.marker(1, "entered").exists());
+            overlap.release(0);
+            overlap.entered(1).await;
+            assert!(overlap.marker(0, "exited").exists());
+            overlap.release(1);
+        };
+        let (result, ()) = tokio::join!(overlap.upload(2), control);
+        assert_eq!(result.len(), 2);
+        for (_, result) in result {
+            result.unwrap();
+        }
+        assert_eq!(overlap.maximum_receivers(), 1);
+        overlap.assert_bytes(0);
+        overlap.assert_bytes(1);
+
+        let failure = Fixture::new("failure", &["bad", "drain", "unstarted"], Some(0));
+        let control = async {
+            failure.entered(0).await;
+            failure.entered(1).await;
+            failure.release(0);
+            wait_for(&failure.marker(0, "client-finished")).await;
+            assert!(!failure.marker(1, "exited").exists());
+            assert!(!failure.marker(2, "entered").exists());
+            failure.release(1);
+        };
+        let (result, ()) = tokio::join!(failure.upload(2), control);
+        assert_eq!(result.len(), 2, "failure admitted an additional upload");
+        assert!(result[0].1.is_err());
+        assert!(result[1].1.is_ok());
+        assert!(failure.marker(1, "exited").exists());
+        assert!(!failure.marker(2, "entered").exists());
+        assert_eq!(failure.maximum_receivers(), 2);
+        failure.assert_bytes(1);
+    }
+
+    const SSH: &str = r#"#!/usr/bin/env python3
+import os, sys
+for index, argument in enumerate(sys.argv[1:], 1):
+    if argument in ("concurrent-upload.invalid", "worker@concurrent-upload.invalid"):
+        command = " ".join(sys.argv[index + 1:])
+        command = command.replace("/var/tmp/rch-source-authority-locks/claims-v1",
+                                  os.path.join(os.environ["RCH_UPLOAD_FIXTURE"], "registry"))
+        os.execvp("sh", ["sh", "-c", command])
+sys.exit(99)
+"#;
+
+    const RECEIVER: &str = r#"#!/usr/bin/env python3
+import fcntl, json, os, pathlib, subprocess, sys, time
+base = pathlib.Path(os.environ["RCH_UPLOAD_FIXTURE"])
+with (base / "receivers.json").open() as source:
+    rules = json.load(source)
+rule = rules[os.path.normpath(sys.argv[-1])]
+directory = pathlib.Path(rule["directory"])
+label = str(rule["label"])
+def record(event):
+    with (directory / "receivers.log").open("a") as log:
+        fcntl.flock(log.fileno(), fcntl.LOCK_EX)
+        log.write(event + " " + label + "\n")
+        log.flush()
+record("enter")
+(directory / (label + ".entered")).touch()
+status = 99
+try:
+    deadline = time.monotonic() + 15
+    while not (directory / (label + ".release")).exists():
+        if time.monotonic() > deadline:
+            raise RuntimeError("fixture did not release receiver " + label)
+        time.sleep(0.01)
+    if rule["fail"]:
+        sys.stderr.write("injected source receiver failure\n")
+        status = 23
+    else:
+        status = subprocess.call([os.environ["RCH_UPLOAD_REAL_RSYNC"], *sys.argv[1:]])
+finally:
+    record("exit")
+    (directory / (label + ".exited")).touch()
+sys.exit(status)
+"#;
 }

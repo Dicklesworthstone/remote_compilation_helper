@@ -1134,17 +1134,22 @@ const LIVE_CHECKOUT_REFUSAL_MARKER: &str = "RCH_SYNC_LIVE_CHECKOUT_REFUSED: ";
 /// a declared live checkout. Only a failed source rsync's own stderr is read;
 /// a build's output never becomes a `SyncFailed`.
 pub(crate) fn sync_refused_by_live_checkout(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause.downcast_ref::<LiveCheckoutRefused>().is_some()
-            || matches!(
-                cause.downcast_ref::<TransferError>(),
-                Some(TransferError::SyncFailed { stderr, .. })
-                    if stderr.lines().any(|line| line.starts_with(LIVE_CHECKOUT_REFUSAL_MARKER))
-            )
-    }) || error
-        .downcast_ref::<TransferAttemptsExhausted>()
-        .and_then(|exhausted| exhausted.cause.as_ref())
-        .is_some_and(sync_refused_by_live_checkout)
+    // Anyhow's typed contexts are not exposed as their concrete type by the
+    // std::error::Error source chain. Concurrent upload aggregation retains a
+    // sibling refusal as such a context, beneath later recovery diagnostics.
+    error.downcast_ref::<LiveCheckoutRefused>().is_some()
+        || error.chain().any(|cause| {
+            cause.downcast_ref::<LiveCheckoutRefused>().is_some()
+                || matches!(
+                    cause.downcast_ref::<TransferError>(),
+                    Some(TransferError::SyncFailed { stderr, .. })
+                        if stderr.lines().any(|line| line.starts_with(LIVE_CHECKOUT_REFUSAL_MARKER))
+                )
+        })
+        || error
+            .downcast_ref::<TransferAttemptsExhausted>()
+            .and_then(|exhausted| exhausted.cause.as_ref())
+            .is_some_and(sync_refused_by_live_checkout)
 }
 
 /// The pre-sync destination safety check refused a declared live checkout
@@ -3340,11 +3345,24 @@ impl TransferPipeline {
     // Activity fencing also wraps read-only retrieval. Keep the upload safety
     // check out of that path: a test result may legitimately contain .git.
     fn source_rsync_path_at(&self, command: String, remote_path: &str) -> String {
+        self.source_rsync_path_at_with_prefix(
+            command,
+            remote_path,
+            self.source_authority_prefix.as_deref(),
+        )
+    }
+
+    fn source_rsync_path_at_with_prefix(
+        &self,
+        command: String,
+        remote_path: &str,
+        prefix: Option<&str>,
+    ) -> String {
         let command = self
             .resolved_rsync()
             .flavor
             .remote_path_command(command, remote_path);
-        match &self.source_authority_prefix {
+        match prefix {
             Some(prefix) => {
                 let script = format!("{command} \"$@\"");
                 format!(
@@ -6272,6 +6290,26 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         escaped_remote_path: &str,
         effective_excludes: &[String],
     ) -> Command {
+        self.build_sync_streaming_command_with_upload_prefix(
+            worker,
+            destination,
+            escaped_remote_path,
+            effective_excludes,
+            None,
+        )
+    }
+
+    /// Only ordinary source uploads may substitute the shared upload fence.
+    /// Every verifier, archive operation, retrieval and compiler keeps the
+    /// pipeline's exclusive source-activity prefix.
+    fn build_sync_streaming_command_with_upload_prefix(
+        &self,
+        worker: &WorkerConfig,
+        destination: &str,
+        escaped_remote_path: &str,
+        effective_excludes: &[String],
+        upload_prefix: Option<&str>,
+    ) -> Command {
         let (mut cmd, capabilities) = self.rsync_command();
         self.append_source_rsync_io_timeout(&mut cmd);
 
@@ -6300,11 +6338,23 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         // same remote shell invocation includes the configured sweeps only
         // without a durable source grant (bd-wfumv); granted transfers sweep
         // only their TMPDIR under guards, owned materializations nothing.
-        cmd.arg("--rsync-path").arg(self.source_rsync_path(format!(
+        let receiver = format!(
             "{}mkdir -p {} && rsync",
             self.source_sync_prune_prefix(escaped_remote_path),
             escaped_remote_path
-        )));
+        );
+        let rsync_path = match upload_prefix {
+            Some(prefix) => self.source_rsync_path_at_with_prefix(
+                format!(
+                    "{} || exit 73; {receiver}",
+                    live_checkout_sync_guard(&self.remote_path())
+                ),
+                &self.remote_path(),
+                Some(prefix),
+            ),
+            None => self.source_rsync_path(receiver),
+        };
+        cmd.arg("--rsync-path").arg(rsync_path);
 
         self.append_sync_filter_args(&mut cmd, effective_excludes);
 
@@ -7319,6 +7369,52 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
     pub async fn sync_to_remote_streaming<F>(
         &self,
         worker: &WorkerConfig,
+        on_line: F,
+    ) -> Result<SyncResult>
+    where
+        F: FnMut(&str),
+    {
+        self.sync_to_remote_streaming_with_upload_prefix(worker, None, on_line)
+            .await
+    }
+
+    /// Stream one ordinary exact-source root alongside other roots belonging
+    /// to the same durable grant. The capability is checked and constructed
+    /// for this call only; it never persists on the pipeline later used for
+    /// receipt verification, execution, retrieval or retirement.
+    #[cfg(unix)]
+    pub(crate) async fn sync_to_remote_concurrent<F>(
+        &self,
+        worker: &WorkerConfig,
+        source_identity: &str,
+        on_line: F,
+    ) -> Result<SyncResult>
+    where
+        F: FnMut(&str),
+    {
+        let active = crate::hook::SourceAuthorityNamespace::Current
+            .activity_prefix(source_identity, false)?;
+        anyhow::ensure!(
+            !self.worker_platform.is_windows()
+                && self.sync_checksum
+                && self.clean_overlay_archive_cache.is_none()
+                && self.source_authority_prefix.as_deref() == Some(active.as_str()),
+            "concurrent source upload requires an exact ordinary POSIX upload under its active grant"
+        );
+        // The durable grant canonicalizes benign path spellings, whereas the
+        // rsync destination preserves its configured spelling. Bind the upload
+        // lock to that same canonical key without changing receiver semantics.
+        let authority_root = crate::hook::ssh::canonical_source_authority_root(&self.remote_path());
+        let prefix =
+            crate::hook::ssh::source_authority_upload_prefix(source_identity, &authority_root)?;
+        self.sync_to_remote_streaming_with_upload_prefix(worker, Some(&prefix), on_line)
+            .await
+    }
+
+    async fn sync_to_remote_streaming_with_upload_prefix<F>(
+        &self,
+        worker: &WorkerConfig,
+        upload_prefix: Option<&str>,
         mut on_line: F,
     ) -> Result<SyncResult>
     where
@@ -7352,13 +7448,20 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         // Rebuilt per retry attempt: rsync consumes its `Command`, and a
         // transient SSH/rsync drop requires a fresh command. Durable source
         // grants instead leave retries to the job's cancellation boundary.
-        let build_cmd = || {
-            self.build_sync_streaming_command(
+        let build_cmd = || match upload_prefix {
+            Some(prefix) => self.build_sync_streaming_command_with_upload_prefix(
                 worker,
                 &destination,
                 &escaped_remote_path,
                 &effective_excludes,
-            )
+                Some(prefix),
+            ),
+            None => self.build_sync_streaming_command(
+                worker,
+                &destination,
+                &escaped_remote_path,
+                &effective_excludes,
+            ),
         };
 
         debug!(
@@ -15898,6 +16001,125 @@ Number of files transferred: 42
                 .to_string()
                 .contains("requires a granted checksum overlay pipeline")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_upload_keeps_exact_sync_policy_and_exclusive_verifiers() {
+        let _guard = test_guard!();
+        let worker = flavour_test_worker();
+        let pipeline = flavour_test_pipeline(RsyncFlavor::Unknown, 0)
+            .with_source_authority("ab12".into())
+            .unwrap()
+            .with_sync_checksum(true)
+            .with_sync_include_patterns(vec!["/Cargo.toml".into(), "/src/***".into()]);
+        let remote = pipeline.remote_path();
+        let destination = pipeline.rsync_remote_spec(&worker, &remote);
+        let escaped = escape(Cow::from(remote.as_str()));
+        let sequential = command_args(&pipeline.build_sync_streaming_command(
+            &worker,
+            &destination,
+            &escaped,
+            &["/private/***".into()],
+        ));
+        let prefix = crate::hook::ssh::source_authority_upload_prefix("ab12", &remote).unwrap();
+        let concurrent = command_args(&pipeline.build_sync_streaming_command_with_upload_prefix(
+            &worker,
+            &destination,
+            &escaped,
+            &["/private/***".into()],
+            Some(&prefix),
+        ));
+        let receiver = sequential
+            .iter()
+            .position(|arg| arg == "--rsync-path")
+            .unwrap()
+            + 1;
+        for (index, (before, after)) in sequential.iter().zip(&concurrent).enumerate() {
+            if index != receiver {
+                assert_eq!(before, after, "only the receiver fence may change");
+            }
+        }
+        assert_eq!(sequential.len(), concurrent.len());
+        assert!(concurrent.iter().any(|arg| arg == "--checksum"));
+        assert!(concurrent.iter().any(|arg| arg == "--delete"));
+        assert!(concurrent[receiver].starts_with(&prefix));
+        assert!(concurrent[receiver].contains("RCH_SYNC_LIVE_CHECKOUT_REFUSED"));
+        assert!(!concurrent[receiver].contains(".rch-target-*-pool-*"));
+        assert!(!concurrent[receiver].contains("-name 'rch-cargo-cache-*' -mmin"));
+
+        // Constructing an upload never changes the pipeline's later source
+        // authority, including the proof that immediately precedes Cargo.
+        let active = pipeline.source_authority_prefix.as_ref().unwrap();
+        let barrier = command_args(&pipeline.build_source_content_rsync_barrier_command(
+            &worker,
+            &[],
+            SourceContentBarrier::Ordinary,
+        ));
+        let barrier_receiver = &barrier
+            .windows(2)
+            .find(|args| args[0] == "--rsync-path")
+            .unwrap()[1];
+        assert!(barrier_receiver.starts_with(active));
+        assert!(!barrier_receiver.starts_with(&prefix));
+        assert!(
+            pipeline
+                .source_activity_command("compiler")
+                .starts_with(active)
+        );
+        assert!(
+            pipeline
+                .source_rsync_path_at("rsync".into(), &remote)
+                .starts_with(active)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_upload_requires_matching_active_exact_source_grant() {
+        let _guard = test_guard!();
+        let worker = flavour_test_worker();
+        let ungranted = flavour_test_pipeline(RsyncFlavor::Unknown, 0).with_sync_checksum(true);
+        let active = ungranted
+            .clone()
+            .with_source_authority("ab12".into())
+            .unwrap();
+        let mut archive = active.clone();
+        archive.clean_overlay_archive_cache = Some(GitArchiveCache {
+            slot: "archive-test".into(),
+            min_free_bytes: 0,
+        });
+        for (pipeline, identity) in [
+            (ungranted, "ab12"),
+            (active.clone(), "cd34"),
+            (active.clone().with_sync_checksum(false), "ab12"),
+            (
+                active.clone().with_worker_platform(WorkerPlatform::Windows),
+                "ab12",
+            ),
+            (
+                active
+                    .with_source_authority_cleanup(
+                        "ab12".into(),
+                        crate::hook::SourceAuthorityNamespace::Current,
+                    )
+                    .unwrap(),
+                "ab12",
+            ),
+            (archive, "ab12"),
+        ] {
+            let error = pipeline
+                .sync_to_remote_concurrent(&worker, identity, |_| {
+                    panic!("invalid upload must fail before starting transport")
+                })
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("requires an exact ordinary POSIX upload")
+            );
+        }
     }
 
     #[cfg(unix)]
