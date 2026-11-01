@@ -24,6 +24,23 @@ const INITIAL_DELAY_MS: u64 = 250;
 const MAX_DELAY_MS: u64 = 30_000;
 const STABLE_SESSION: Duration = Duration::from_secs(60);
 
+/// Transport liveness is separate from application admission. Standby records
+/// only the interval confirmed by successful ping/pong exchanges, never time
+/// spent waiting for a silent peer. It grants no request or execution authority.
+#[derive(Default)]
+pub(super) struct SessionHealth {
+    pub(super) admitted_at: Option<Instant>,
+    pub(super) confirmed_standby_for: Option<Duration>,
+}
+
+impl SessionHealth {
+    fn healthy_for(&self) -> Option<Duration> {
+        self.admitted_at
+            .map(|start| start.elapsed())
+            .max(self.confirmed_standby_for)
+    }
+}
+
 /// Durable delivery progress, sampled before and after one connection. A
 /// terminal process receipt alone is not progress: both result streams must
 /// have been accepted and their joint release persisted. Remembering the
@@ -103,7 +120,7 @@ impl Backoff {
         }
     }
 
-    fn next(&mut self, admitted_for: Option<Duration>, completed_delivery: bool) -> Duration {
+    fn next(&mut self, healthy_for: Option<Duration>, completed_delivery: bool) -> Duration {
         // A slow failed handshake is not a healthy session. Immediate EOF after
         // successful admission also must not reset an outage's backoff. A short
         // compile whose complete result was durably accepted IS useful work:
@@ -115,7 +132,10 @@ impl Backoff {
             self.ceiling_ms = INITIAL_DELAY_MS;
             return Duration::ZERO;
         }
-        if admitted_for.is_some_and(|elapsed| elapsed >= STABLE_SESSION) {
+        // Sustained authenticated standby is also a healthy connection, but
+        // earns only the initial nonzero jitter, never a delivery's immediate
+        // reconnect. Ready-only or short heartbeat loops do not reset outages.
+        if healthy_for.is_some_and(|elapsed| elapsed >= STABLE_SESSION) {
             self.ceiling_ms = INITIAL_DELAY_MS;
         }
         self.entropy ^= self.entropy << 13;
@@ -246,12 +266,12 @@ pub(super) fn run(
         let resources = resources.clone();
         let shutdown = controller.subscribe();
         let before_delivery = DeliveryProgress::read(&journal);
-        let (outcome, returned_journal, admitted_for) =
+        let (outcome, returned_journal, healthy_for) =
             crate::block_on_worker_runtime(&runtime, async move {
                 handle
                     .spawn(async move {
                         let cx = Cx::current().expect("runtime task Cx");
-                        let mut admitted_at: Option<Instant> = None;
+                        let mut health = SessionHealth::default();
                         let outcome = drain_on_shutdown(
                             &cx,
                             shutdown,
@@ -261,14 +281,14 @@ pub(super) fn run(
                                 &capability,
                                 once,
                                 &mut journal,
-                                &mut admitted_at,
+                                &mut health,
                                 resources,
                             ),
                         )
                         .await;
                         // session_loop has joined process cleanup and dropped both
                         // range-transfer owners before we regain durable ownership.
-                        (outcome, journal, admitted_at.map(|start| start.elapsed()))
+                        (outcome, journal, health.healthy_for())
                     })
                     .await
             });
@@ -306,7 +326,7 @@ pub(super) fn run(
         }
         let completed_delivery =
             outcome.is_ok() && before_delivery.advanced_to(DeliveryProgress::read(&journal));
-        let delay = backoff.next(admitted_for, completed_delivery);
+        let delay = backoff.next(healthy_for, completed_delivery);
         eprintln!(
             "{}",
             serde_json::json!({
@@ -370,6 +390,34 @@ mod tests {
             backoff.next(Some(STABLE_SESSION), false) <= Duration::from_millis(INITIAL_DELAY_MS)
         );
         assert_eq!(backoff.ceiling_ms, INITIAL_DELAY_MS * 2);
+    }
+
+    #[test]
+    fn confirmed_standby_resets_jitter_without_admission_or_immediate_privilege() {
+        let mut backoff = Backoff::new(29);
+        for _ in 0..20 {
+            backoff.next(None, false);
+        }
+        let mut health = SessionHealth::default();
+        assert!(health.admitted_at.is_none());
+        assert!(
+            backoff.next(health.healthy_for(), false) >= Duration::from_millis(MAX_DELAY_MS / 2),
+            "standby-ready alone cannot reset outage backoff",
+        );
+        health.confirmed_standby_for = Some(STABLE_SESSION - Duration::from_nanos(1));
+        assert!(
+            backoff.next(health.healthy_for(), false) >= Duration::from_millis(MAX_DELAY_MS / 2),
+            "short heartbeat loops cannot reset outage backoff",
+        );
+        health.confirmed_standby_for = Some(STABLE_SESSION);
+        let delay = backoff.next(health.healthy_for(), false);
+        assert!(delay >= Duration::from_millis(INITIAL_DELAY_MS / 2));
+        assert!(delay <= Duration::from_millis(INITIAL_DELAY_MS));
+        assert_eq!(backoff.ceiling_ms, INITIAL_DELAY_MS * 2);
+        assert!(health.admitted_at.is_none());
+        let failed = backoff.next(None, false);
+        assert!(failed >= Duration::from_millis(INITIAL_DELAY_MS));
+        assert!(failed <= Duration::from_millis(INITIAL_DELAY_MS * 2));
     }
 
     #[test]

@@ -74,6 +74,31 @@ remote execution. Keep the worker's reconnect loop running without `--once`;
 there is no idle connection queue on the listener. Preserve its
 durable state across reconnects and restarts.
 
+### Authenticated standby negotiation
+
+The worker advertises `worker-standby-v1` in its authenticated hello. A
+coordinator that supports standby can keep this same TLS connection available
+by selecting that version with `standby-ready`, then sending a numbered
+`standby-ping` every 15 seconds. The worker replies with the matching
+`standby-pong`. The sequence starts at one and increases by exactly one;
+replayed, skipped, unknown-version or authority-bearing standby records close
+the connection. Plaintext fixture connections cannot enter standby.
+
+Standby does not admit a session, allocate a request, start an execution lease,
+change the request journal or authorize retained-result access. When work is
+assigned, the normal `session-challenge` and authenticated admission establish
+those permissions. The worker retains its existing frame reader across this
+transition, including any already received bytes. Coordinators can also send
+the session challenge directly without selecting standby.
+
+The initial hello exchange and subsequent request admission each have a
+10-second deadline. During standby the worker requires a complete coordinator
+record within 45 seconds and must write and flush each pong within 10 seconds;
+partial records cannot extend those deadlines. Shutdown interrupts these waits.
+At least 60 seconds of confirmed heartbeat progress resets outage backoff to
+its initial nonzero jitter. Only a newly completed durable result delivery
+permits the existing immediate reconnect behavior.
+
 For a systemd worker, the fleet deployment script can install those same
 identity and journal settings alongside the worker's TLS credentials:
 

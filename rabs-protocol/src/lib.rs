@@ -120,6 +120,7 @@ pub mod volatility;
 pub mod wire_time;
 pub mod worker_fence;
 pub mod worker_session;
+pub mod worker_standby;
 pub mod workspace_lane;
 pub mod wrapper_breaker;
 pub mod wrapper_diagnostics;

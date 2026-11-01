@@ -20,6 +20,7 @@ use rabs_protocol::lease_semantics::{
     REQUEST_EXECUTION_LEASE_VERSION, RequestExecutionLease, RequestExecutionLeaseIdentity,
 };
 use rabs_protocol::metadata_prefetch::VERSION as METADATA_PREFETCH_VERSION;
+use rabs_protocol::worker_standby::{self, WorkerStandby};
 use rabs_sandbox::dependency_context::{
     CANONICAL_DEPENDENCY_CONTEXT_VERSION, CANONICAL_NATIVE_METADATA_CAPABILITY,
     CANONICAL_NATIVE_ROOTS_CAPABILITY, CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION,
@@ -69,6 +70,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_FRAME_BYTES: usize = 1 << 20;
 const OUTPUT_TRANSFER: &str = "ranges-v1";
 const INPUT_DEADLINE_EXCEEDED: &str = "input-upload-deadline-exceeded";
+const SESSION_ADMISSION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A mode alone does not identify the namespace's path semantics. Preserve the
 /// exact version selected by authenticated admission until each request has
@@ -882,6 +884,130 @@ async fn write_frame<W: AsyncWrite + Unpin>(stream: &mut W, line: &str) -> io::R
     bytes.push(b'\n');
     stream.write_all(&bytes).await?;
     stream.flush().await
+}
+
+/// Standby owns only an authenticated transport. Keep its liveness clocks
+/// outside the bounded application-admission phase, and retain this exact
+/// reader when the coordinator eventually sends a fresh challenge.
+async fn wait_for_worker_admission<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    reader: &mut FrameReader,
+    first: String,
+    authenticated: bool,
+    confirmed_standby_for: &mut Option<Duration>,
+    idle_timeout: Duration,
+    pong_timeout: Duration,
+) -> Result<String, String> {
+    let mut standby = WorkerStandby::new();
+    let mut standby_started = None;
+    let mut frame = first;
+    loop {
+        let value: serde_json::Value = serde_json::from_str(&frame)
+            .map_err(|error| format!("worker standby JSON: {error}"))?;
+        match value["kind"].as_str() {
+            Some("session-challenge") => {
+                standby
+                    .accept_challenge()
+                    .map_err(|error| format!("worker standby challenge: {error}"))?;
+                return Ok(frame);
+            }
+            Some("standby-ready") => {
+                if !authenticated {
+                    return Err("worker standby requires authenticated transport".to_owned());
+                }
+                if value.as_object().is_none_or(|object| object.len() != 2) {
+                    return Err("invalid worker standby-ready fields".to_owned());
+                }
+                let version = value["version"]
+                    .as_str()
+                    .ok_or("invalid worker standby-ready version")?;
+                standby
+                    .accept_ready(version)
+                    .map_err(|error| format!("worker standby selection: {error}"))?;
+                standby_started = Some(Instant::now());
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "kind":"worker-standby-ready", "protocol":worker_standby::VERSION,
+                    })
+                );
+            }
+            Some("standby-ping") => {
+                if !authenticated {
+                    return Err("worker standby requires authenticated transport".to_owned());
+                }
+                if value.as_object().is_none_or(|object| object.len() != 3) {
+                    return Err("invalid worker standby-ping fields".to_owned());
+                }
+                let version = value["version"]
+                    .as_str()
+                    .ok_or("invalid worker standby-ping version")?;
+                let sequence = value["sequence"]
+                    .as_u64()
+                    .ok_or("invalid worker standby-ping sequence")?;
+                let sequence = standby
+                    .accept_ping(version, sequence)
+                    .map_err(|error| format!("worker standby ping: {error}"))?;
+                let pong = serde_json::json!({
+                    "kind":"standby-pong", "version":worker_standby::VERSION,
+                    "sequence":sequence,
+                })
+                .to_string();
+                standby_io(pong_timeout, "pong write", write_frame(stream, &pong)).await?;
+                *confirmed_standby_for = standby_started.map(|start| start.elapsed());
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "kind":"worker-standby-heartbeat", "protocol":worker_standby::VERSION,
+                        "sequence":sequence,
+                    })
+                );
+                // An always-ready peer must still yield to shutdown and other
+                // runtime tasks. No journal or execution owner exists here.
+                let mut yielded = false;
+                poll_fn(|cx| {
+                    if yielded {
+                        Poll::Ready(())
+                    } else {
+                        yielded = true;
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                })
+                .await;
+            }
+            _ if standby_started.is_none() => return Ok(frame),
+            _ => return Err("unexpected worker standby frame".to_owned()),
+        }
+        frame = standby_io(idle_timeout, "idle read", reader.read(stream))
+            .await?
+            .ok_or("coordinator closed worker standby")?;
+    }
+}
+
+/// A whole frame (or pong flush) has one absolute budget. A byte trickle cannot
+/// extend it, and cancellation wakes the same task even if the peer is silent.
+async fn standby_io<T>(
+    budget: Duration,
+    stage: &str,
+    operation: impl Future<Output = io::Result<T>>,
+) -> Result<T, String> {
+    let mut operation = pin!(asupersync::time::timeout(
+        asupersync::time::wall_now(),
+        budget,
+        operation,
+    ));
+    poll_fn(|cx| {
+        if Cx::current().is_some_and(|cx| cx.checkpoint().is_err()) {
+            return Poll::Ready(Err("worker standby cancelled".to_owned()));
+        }
+        operation.as_mut().poll(cx).map(|result| {
+            result
+                .map_err(|_| format!("worker standby {stage} deadline exceeded"))?
+                .map_err(|error| format!("worker standby {stage}: {error}"))
+        })
+    })
+    .await
 }
 
 /// A timed-out write can have emitted a prefix. Return directly to joined
@@ -1951,7 +2077,7 @@ async fn session_loop(
     report: &rabs_wkr::session::CapabilityReport,
     once: bool,
     journal: &mut WorkerJournal,
-    admitted_at: &mut Option<std::time::Instant>,
+    health: &mut reconnect::SessionHealth,
     resources: reconnect::RuntimeResources,
 ) -> Result<(), String> {
     let mut stream = rabs_asupersync::worker_transport::connect_worker(coordinator).await?;
@@ -1970,20 +2096,9 @@ async fn session_loop(
     let target_scope =
         rabs_wkr::target_cache::TargetCacheScope::new(&report.worker_id, coordinator, &recipient);
     let mut reader = FrameReader::default();
-    let (
-        capture_output,
-        capture_artifacts,
-        retain_result,
-        receive_sources,
-        receive_toolchain,
-        reuse_toolchain,
-        output_preview,
-        metadata_prefetch,
-        execution_lease,
-        dependency_context,
-    ) = asupersync::time::timeout(
+    let first = asupersync::time::timeout(
         asupersync::time::wall_now(),
-        Duration::from_secs(10),
+        SESSION_ADMISSION_TIMEOUT,
         async {
             // Extend, rather than replace, the journal/artifact hello: transport
             // authentication does not replace durable execution ownership.
@@ -1999,6 +2114,7 @@ async fn session_loop(
                 );
                 hello["transport"] = serde_json::json!({"minimum_compatible":1,"current":1});
                 hello["application"] = serde_json::json!({"minimum_compatible":1,"current":1});
+                hello["standby_protocols"] = serde_json::json!([worker_standby::VERSION]);
                 hello
                     .as_object_mut()
                     .ok_or("local worker hello is not an object")?
@@ -2007,11 +2123,40 @@ async fn session_loop(
             write_frame(&mut stream, &hello.to_string())
                 .await
                 .map_err(|e| format!("hello write: {e}"))?;
-            let first = reader
+            reader
                 .read(&mut stream)
                 .await
                 .map_err(|e| format!("handshake read: {e}"))?
-                .ok_or("no worker session admission")?;
+                .ok_or_else(|| "no worker session admission".to_owned())
+        },
+    )
+    .await
+    .map_err(|_| "worker initial admission deadline exceeded".to_owned())??;
+    let first = wait_for_worker_admission(
+        &mut stream,
+        &mut reader,
+        first,
+        local_identity.is_some(),
+        &mut health.confirmed_standby_for,
+        worker_standby::IDLE_TIMEOUT,
+        worker_standby::PONG_TIMEOUT,
+    )
+    .await?;
+    let (
+        capture_output,
+        capture_artifacts,
+        retain_result,
+        receive_sources,
+        receive_toolchain,
+        reuse_toolchain,
+        output_preview,
+        metadata_prefetch,
+        execution_lease,
+        dependency_context,
+    ) = asupersync::time::timeout(
+        asupersync::time::wall_now(),
+        SESSION_ADMISSION_TIMEOUT,
+        async {
             let mut challenge_session = None;
             let ack =
                 match local_identity {
@@ -2128,7 +2273,7 @@ async fn session_loop(
     if retain_result {
         journal.authorize_result_recipient(recipient.clone());
     }
-    *admitted_at = Some(std::time::Instant::now());
+    health.admitted_at = Some(std::time::Instant::now());
     let outcome = drive_session_with_reader(
         &mut stream,
         reader,
@@ -2720,6 +2865,8 @@ mod tests {
         output: Vec<u8>,
         eof: bool,
         fail_write: bool,
+        block_write: bool,
+        block_flush: bool,
         reader: Option<Waker>,
     }
 
@@ -2795,11 +2942,18 @@ mod tests {
                     "closed peer",
                 )));
             }
+            if state.block_write {
+                return Poll::Pending;
+            }
             state.output.extend_from_slice(bytes);
             Poll::Ready(Ok(bytes.len()))
         }
         fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
+            if self.0.lock().unwrap().block_flush {
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(()))
+            }
         }
         fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
@@ -3310,6 +3464,86 @@ mod tests {
         }
 
         #[test]
+        fn standby_preserves_coalesced_challenge_and_admitted_commands() {
+            let ready = serde_json::json!({
+                "kind":"standby-ready", "version":worker_standby::VERSION,
+            });
+            let ping = |sequence| {
+                serde_json::json!({
+                    "kind":"standby-ping", "version":worker_standby::VERSION,
+                    "sequence":sequence,
+                })
+            };
+            let challenge =
+                serde_json::json!({"kind":"session-challenge", "session_id":7}).to_string();
+            let ack = serde_json::json!({"kind":"session-ok", "session_id":7}).to_string();
+            let mut wire = BulkWire::new(
+                format!(
+                    "{ready}\n{}\n{}\n{challenge}\n{ack}\n{{\"kind\":\"ping\"}}\n{{\"kind\":\"unknown\",\"request_id\":9}}\n",
+                    ping(1),
+                    ping(2),
+                )
+                .into_bytes(),
+                FrameReader::READ_BYTES,
+            );
+            let mut reader = FrameReader::default();
+            let first = wait(reader.read(&mut wire)).unwrap().unwrap();
+            let mut health = reconnect::SessionHealth::default();
+            assert_eq!(
+                wait(wait_for_worker_admission(
+                    &mut wire,
+                    &mut reader,
+                    first,
+                    true,
+                    &mut health.confirmed_standby_for,
+                    worker_standby::IDLE_TIMEOUT,
+                    worker_standby::PONG_TIMEOUT,
+                ))
+                .unwrap(),
+                challenge,
+            );
+            assert!(health.admitted_at.is_none());
+            assert!(health.confirmed_standby_for.is_some());
+            assert_eq!(wait(reader.read(&mut wire)).unwrap(), Some(ack));
+            assert_eq!(wire.reads, 1);
+            assert!(!reader.pending.is_empty());
+            wait(drive_session_with_reader(
+                &mut wire,
+                reader,
+                &report(),
+                false,
+                None,
+                false,
+                false,
+                false,
+                false,
+                &ExecutionLeaseSelection::default(),
+                false,
+                None,
+                InputBudgets::default(),
+                None,
+                |_, _, _, _, _, _| panic!("standby and control frames cannot launch execution"),
+                pressure,
+            ))
+            .unwrap();
+            let replies: Vec<serde_json::Value> = wire
+                .output
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_slice(line).unwrap())
+                .collect();
+            assert_eq!(replies.len(), 4);
+            for (index, reply) in replies[..2].iter().enumerate() {
+                assert_eq!(reply["kind"], "standby-pong");
+                assert_eq!(reply["version"], worker_standby::VERSION);
+                assert_eq!(reply["sequence"], index + 1);
+            }
+            assert_eq!(replies[2]["kind"], "heartbeat");
+            assert_eq!(replies[3]["kind"], "error");
+            assert_eq!(replies[3]["request_id"], 9);
+        }
+
+        #[test]
         fn admission_reader_hands_coalesced_commands_to_the_production_driver() {
             let ack = serde_json::json!({"kind":"session-ok", "session_id":7}).to_string();
             let mut wire = BulkWire::new(
@@ -3358,6 +3592,245 @@ mod tests {
             assert_eq!(replies[1]["kind"], "error");
             assert_eq!(replies[1]["request_id"], 9);
             assert_eq!(replies[1]["reason"], "unknown-frame");
+        }
+    }
+
+    mod standby_tests {
+        use super::*;
+        use asupersync::runtime::RuntimeBuilder;
+
+        fn ready() -> serde_json::Value {
+            serde_json::json!({
+                "kind":"standby-ready", "version":worker_standby::VERSION,
+            })
+        }
+
+        fn ping(sequence: serde_json::Value) -> serde_json::Value {
+            serde_json::json!({
+                "kind":"standby-ping", "version":worker_standby::VERSION,
+                "sequence":sequence,
+            })
+        }
+
+        fn exchange(
+            first: serde_json::Value,
+            frames: Vec<serde_json::Value>,
+            authenticated: bool,
+        ) -> (
+            Result<String, String>,
+            Vec<serde_json::Value>,
+            reconnect::SessionHealth,
+        ) {
+            let mut wire = Wire::default();
+            for frame in frames {
+                wire.frame(frame);
+            }
+            wire.close();
+            let mut reader = FrameReader::default();
+            let mut health = reconnect::SessionHealth::default();
+            let outcome = wait(wait_for_worker_admission(
+                &mut wire,
+                &mut reader,
+                first.to_string(),
+                authenticated,
+                &mut health.confirmed_standby_for,
+                worker_standby::IDLE_TIMEOUT,
+                worker_standby::PONG_TIMEOUT,
+            ));
+            (outcome, wire.replies(), health)
+        }
+
+        fn in_runtime(future: impl Future<Output = ()> + Send + 'static) {
+            let runtime = RuntimeBuilder::current_thread().build().unwrap();
+            let handle = runtime.handle();
+            block_on_worker_runtime(&runtime, async move { handle.spawn(future).await });
+        }
+
+        #[test]
+        fn old_coordinator_admission_passes_through_without_standby_authority() {
+            for (authenticated, first) in [
+                (
+                    true,
+                    serde_json::json!({"kind":"session-challenge", "session_id":7}),
+                ),
+                (
+                    false,
+                    serde_json::json!({"kind":"session-ok", "session_id":7}),
+                ),
+            ] {
+                let (outcome, replies, health) = exchange(first.clone(), vec![], authenticated);
+                assert_eq!(outcome.unwrap(), first.to_string());
+                assert!(replies.is_empty());
+                assert!(health.admitted_at.is_none());
+                assert!(health.confirmed_standby_for.is_none());
+            }
+        }
+
+        #[test]
+        fn standby_refuses_plaintext_and_unnegotiated_or_authoritative_frames() {
+            let (outcome, replies, health) = exchange(ready(), vec![], false);
+            assert!(outcome.unwrap_err().contains("authenticated transport"));
+            assert!(replies.is_empty());
+            assert!(health.admitted_at.is_none());
+            assert!(health.confirmed_standby_for.is_none());
+
+            let (outcome, replies, _) = exchange(ping(1.into()), vec![], true);
+            assert!(outcome.unwrap_err().contains("worker standby ping"));
+            assert!(replies.is_empty());
+
+            for forbidden in [
+                serde_json::json!({"kind":"session-ok", "session_id":7}),
+                serde_json::json!({"kind":"canonical-exec", "request_id":7}),
+                serde_json::json!({"kind":"source-begin", "request_id":7}),
+                serde_json::json!({"kind":"ping"}),
+            ] {
+                let (outcome, replies, health) = exchange(ready(), vec![forbidden], true);
+                assert!(
+                    outcome
+                        .unwrap_err()
+                        .contains("unexpected worker standby frame")
+                );
+                assert!(replies.is_empty());
+                assert!(health.admitted_at.is_none());
+                assert!(health.confirmed_standby_for.is_none());
+            }
+
+            let mut extra_authority = ready();
+            extra_authority["token_id"] = 3.into();
+            let (outcome, replies, _) = exchange(extra_authority, vec![], true);
+            assert!(outcome.unwrap_err().contains("standby-ready fields"));
+            assert!(replies.is_empty());
+            let mut extra_authority = ping(1.into());
+            extra_authority["execution_lease"] = serde_json::json!({"request_id":7});
+            let (outcome, replies, _) = exchange(ready(), vec![extra_authority], true);
+            assert!(outcome.unwrap_err().contains("standby-ping fields"));
+            assert!(replies.is_empty());
+        }
+
+        #[test]
+        fn standby_json_enforces_version_sequence_and_single_ready() {
+            for version in [
+                serde_json::Value::Null,
+                1.into(),
+                "worker-standby-v2".into(),
+            ] {
+                let mut wrong = ready();
+                wrong["version"] = version.clone();
+                let (outcome, replies, _) = exchange(wrong, vec![], true);
+                assert!(outcome.is_err(), "accepted standby-ready version {version}");
+                assert!(replies.is_empty());
+                let mut wrong = ping(1.into());
+                wrong["version"] = version;
+                let (outcome, replies, _) = exchange(ready(), vec![wrong], true);
+                assert!(outcome.is_err());
+                assert!(replies.is_empty());
+            }
+            let (outcome, replies, health) = exchange(ready(), vec![ready()], true);
+            assert!(outcome.unwrap_err().contains("worker standby selection"));
+            assert!(replies.is_empty());
+            assert!(health.confirmed_standby_for.is_none());
+            for sequence in [
+                serde_json::Value::Null,
+                0.into(),
+                (-1).into(),
+                2.into(),
+                "1".into(),
+                serde_json::json!(1.5),
+            ] {
+                let (outcome, replies, _) = exchange(ready(), vec![ping(sequence.clone())], true);
+                assert!(
+                    outcome.is_err(),
+                    "accepted standby-ping sequence {sequence}"
+                );
+                assert!(replies.is_empty());
+            }
+            let (outcome, replies, health) =
+                exchange(ready(), vec![ping(1.into()), ping(1.into())], true);
+            assert!(outcome.unwrap_err().contains("worker standby ping"));
+            assert_eq!(replies.len(), 1, "replayed ping must not earn another pong");
+            assert_eq!(replies[0]["sequence"], 1);
+            assert!(health.admitted_at.is_none());
+            assert!(health.confirmed_standby_for.is_some());
+        }
+
+        #[test]
+        fn standby_disconnect_returns_without_admission_or_confirmed_health() {
+            let (outcome, replies, health) = exchange(ready(), vec![], true);
+            assert_eq!(outcome.unwrap_err(), "coordinator closed worker standby");
+            assert!(replies.is_empty());
+            assert!(health.admitted_at.is_none());
+            assert!(health.confirmed_standby_for.is_none());
+        }
+
+        #[test]
+        fn native_standby_bounds_silent_partial_and_nonreading_peers() {
+            in_runtime(async {
+                for stage in ["silent", "partial", "write", "flush"] {
+                    let mut wire = Wire::default();
+                    if stage == "partial" {
+                        wire.bytes(b"{\"kind\":\"standby-ping\"");
+                    }
+                    if matches!(stage, "write" | "flush") {
+                        wire.frame(ping(1.into()));
+                        let mut state = wire.0.lock().unwrap();
+                        state.block_write = stage == "write";
+                        state.block_flush = stage == "flush";
+                    }
+                    let mut reader = FrameReader::default();
+                    let mut health = reconnect::SessionHealth::default();
+                    let outcome = asupersync::time::timeout(
+                        asupersync::time::wall_now(),
+                        Duration::from_secs(3),
+                        wait_for_worker_admission(
+                            &mut wire,
+                            &mut reader,
+                            ready().to_string(),
+                            true,
+                            &mut health.confirmed_standby_for,
+                            Duration::from_millis(20),
+                            Duration::from_millis(20),
+                        ),
+                    )
+                    .await
+                    .expect("standby must wake for its own deadline");
+                    let expected = if matches!(stage, "write" | "flush") {
+                        "worker standby pong write deadline exceeded"
+                    } else {
+                        "worker standby idle read deadline exceeded"
+                    };
+                    assert_eq!(outcome.unwrap_err(), expected, "{stage}");
+                    assert!(health.admitted_at.is_none());
+                    assert!(health.confirmed_standby_for.is_none());
+                }
+            });
+        }
+
+        #[test]
+        fn native_shutdown_interrupts_standby_without_waiting_for_idle_deadline() {
+            in_runtime(async {
+                let mut wire = Wire::default();
+                let mut reader = FrameReader::default();
+                let mut confirmed_standby_for = None;
+                let mut standby = pin!(wait_for_worker_admission(
+                    &mut wire,
+                    &mut reader,
+                    ready().to_string(),
+                    true,
+                    &mut confirmed_standby_for,
+                    worker_standby::IDLE_TIMEOUT,
+                    worker_standby::PONG_TIMEOUT,
+                ));
+                poll_fn(|task| {
+                    assert!(standby.as_mut().poll(task).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                Cx::current().unwrap().cancel_with(
+                    asupersync::types::CancelKind::User,
+                    Some("standby shutdown test"),
+                );
+                assert_eq!(standby.await.unwrap_err(), "worker standby cancelled");
+            });
         }
     }
 
