@@ -1813,6 +1813,18 @@ async fn execute_remote_compilation_inner(
             exact_dependency_closure_sync,
             source_content_receipt,
         );
+        if root_overlay.is_some()
+            && durable_sources
+            && source_pair_lock.is_some()
+            && source_authority_lock.is_some()
+            && pooled_target_dir_override.is_some()
+        {
+            // All roots share the already-granted target but receive distinct
+            // repository slots. No archive cache exists in the source tree.
+            root_pipeline = root_pipeline.with_clean_overlay_archive_cache(
+                execution_disk_budget.map(|budget| budget.min_free_bytes),
+            )?;
+        }
 
         let prepared_source_root = if source_content_receipt {
             let mut prepared = if let Some(spec) = root_overlay {

@@ -1333,6 +1333,19 @@ has finished execution, artifact retrieval, and source retirement. Different
 pairs remain independent. Source timestamps are refreshed beyond cached
 artifacts so changed archive or overlay contents cannot appear older than a
 previous build; registry and Git dependency caches remain reusable.
+These paired builds also retain immutable Git archives in a private directory
+inside the owned target pool. Each selected repository has a separate slot, so
+primary and sibling dependency archives can stay warm together. Before reuse,
+the worker verifies the archive's length and SHA-256 against the archive
+constructed by the caller, then copies it into the fresh source tree for normal
+extraction. A verified hit skips the base archive upload; local archive creation
+and source-content verification still run. The cache admits at most 64 slots
+and 1 GiB including pending publications, and preserves the configured worker
+free-space reserve. Capacity limits or unavailable Python/layout support use
+the ordinary upload path. Partial or corrupt cache files never count as hits.
+Cache files are excluded from artifact retrieval, including priority includes
+and recovery. Workers without durable paired source/target ownership continue
+to use ordinary archive uploads.
 Clean-overlay execution also pins Cargo's `build.build-dir` to its assigned
 target directory, overriding ambient and command-line Cargo configuration.
 Explicit `--build-dir` options are refused. This placement applies to isolated

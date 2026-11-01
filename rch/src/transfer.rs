@@ -524,8 +524,10 @@ impl ArtifactFilters {
 }
 
 pub(crate) fn is_internal_source_archive(path: &Path) -> bool {
-    path.components()
-        .any(|part| part.as_os_str() == ".rch-clean-overlay-base.tar")
+    path.components().any(|part| {
+        part.as_os_str() == ".rch-clean-overlay-base.tar"
+            || part.as_os_str() == ".rch-git-archive-cache-v1"
+    })
 }
 
 fn windows_artifact_relative_path(path: &str) -> Result<&str> {
@@ -2826,6 +2828,72 @@ enum SourceContentBarrier {
     CleanOverlayNamespace,
 }
 
+/// One bounded slot per selected repository, inside the already-owned target.
+/// The slot is only a lookup hint; the caller's archive digest authorizes reuse.
+#[derive(Clone)]
+struct GitArchiveCache {
+    slot: String,
+    min_free_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitArchiveCacheOperation {
+    Restore,
+    Publish,
+}
+
+impl GitArchiveCacheOperation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Restore => "restore",
+            Self::Publish => "publish",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitArchiveCacheStatus {
+    Hit,
+    Miss,
+    Published,
+    BypassCapacity,
+    BypassCorrupt,
+    BypassUnavailable,
+}
+
+impl GitArchiveCacheStatus {
+    /// A noisy or malformed successful SSH reply is not cache evidence.
+    fn parse(operation: GitArchiveCacheOperation, stdout: &[u8], stderr: &[u8]) -> Result<Self> {
+        anyhow::ensure!(
+            stderr.is_empty(),
+            "Git archive cache returned diagnostics: {}",
+            String::from_utf8_lossy(stderr)
+        );
+        let status = match stdout {
+            b"RCH_GIT_ARCHIVE_CACHE_V1 HIT\n" => Self::Hit,
+            b"RCH_GIT_ARCHIVE_CACHE_V1 MISS\n" => Self::Miss,
+            b"RCH_GIT_ARCHIVE_CACHE_V1 PUBLISHED\n" => Self::Published,
+            b"RCH_GIT_ARCHIVE_CACHE_V1 BYPASS_CAPACITY\n" => Self::BypassCapacity,
+            b"RCH_GIT_ARCHIVE_CACHE_V1 BYPASS_CORRUPT\n" => Self::BypassCorrupt,
+            b"RCH_GIT_ARCHIVE_CACHE_V1 BYPASS_UNAVAILABLE\n" => Self::BypassUnavailable,
+            _ => anyhow::bail!("Git archive cache returned an invalid response"),
+        };
+        anyhow::ensure!(
+            matches!(
+                (operation, status),
+                (GitArchiveCacheOperation::Restore, Self::Hit | Self::Miss)
+                    | (GitArchiveCacheOperation::Publish, Self::Published)
+                    | (
+                        _,
+                        Self::BypassCapacity | Self::BypassCorrupt | Self::BypassUnavailable
+                    )
+            ),
+            "Git archive cache returned a response for the wrong operation"
+        );
+        Ok(status)
+    }
+}
+
 /// Transfer pipeline for remote compilation.
 #[derive(Clone)]
 pub struct TransferPipeline {
@@ -2897,6 +2965,8 @@ pub struct TransferPipeline {
     /// UNDER it can never be reused across jobs. This override relocates the
     /// pooled store to a stable per-project path OUTSIDE the throwaway root.
     remote_cargo_target_dir_override: Option<String>,
+    /// Immutable baseline reuse under the held source/target pair authority.
+    clean_overlay_archive_cache: Option<GitArchiveCache>,
     /// Optional include-only patterns for sync-to-remote uploads.
     sync_include_patterns: Option<Vec<String>>,
     /// Whether sync-to-remote should delete extraneous files remotely.
@@ -3036,6 +3106,7 @@ impl TransferPipeline {
             remote_path_override: None,
             remote_cargo_target_dir_name: DEFAULT_REMOTE_CARGO_TARGET_DIR_NAME.to_string(),
             remote_cargo_target_dir_override: None,
+            clean_overlay_archive_cache: None,
             sync_include_patterns: None,
             sync_delete: true,
             sync_checksum: false,
@@ -4194,6 +4265,99 @@ impl TransferPipeline {
 
         self.remote_cargo_target_dir_override = Some(trimmed.trim_end_matches('/').to_string());
         self
+    }
+
+    /// Enable immutable archive reuse only after the caller holds the durable
+    /// source and paired target grants. Ordinary mirrors never enter this path.
+    pub(crate) fn with_clean_overlay_archive_cache(
+        mut self,
+        min_free_bytes: Option<u64>,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            !self.worker_platform.is_windows() && self.source_authority_prefix.is_some(),
+            "Git archive reuse requires a durable POSIX source grant"
+        );
+        let source = self.remote_path();
+        let target = self
+            .remote_cargo_target_dir_override
+            .as_deref()
+            .context("Git archive reuse requires a persistent paired target")?;
+        anyhow::ensure!(
+            source.starts_with('/')
+                && target.starts_with('/')
+                && !Path::new(target).starts_with(&source)
+                && !Path::new(&source).starts_with(target),
+            "Git archive cache must be outside the selected source root"
+        );
+        let selected_root = std::fs::canonicalize(&self.project_root)
+            .context("resolve selected repository for Git archive cache")?;
+        let mut slot = blake3::Hasher::new();
+        slot.update(b"rch-clean-overlay-git-archive-v1\0");
+        slot.update(selected_root.as_os_str().as_encoded_bytes());
+        self.clean_overlay_archive_cache = Some(GitArchiveCache {
+            slot: slot.finalize().to_hex().to_string(),
+            min_free_bytes: min_free_bytes.unwrap_or(1 << 30),
+        });
+        Ok(self)
+    }
+
+    fn git_archive_cache_script(
+        &self,
+        operation: GitArchiveCacheOperation,
+        digest: &str,
+        payload_bytes: u64,
+    ) -> Result<String> {
+        let cache = self
+            .clean_overlay_archive_cache
+            .as_ref()
+            .context("Git archive cache is not enabled")?;
+        let target = self
+            .remote_cargo_target_dir_override
+            .as_deref()
+            .context("Git archive cache has no paired target")?;
+        let source = self.remote_path();
+        // The same guarded mkdir used by the cold rsync receiver prepares
+        // sibling source roots under the existing durable source grant. The
+        // helper never creates ancestors above the exact paired target.
+        Ok(format!(
+            "set -eu\n{guard} || exit 73\numask 0022\nmkdir -p {source}\nif ! command -v python3 >/dev/null 2>&1; then\nprintf 'RCH_GIT_ARCHIVE_CACHE_V1 BYPASS_UNAVAILABLE\\n'\nexit 0\nfi\npython3 -I -c {program} {operation} {source} {target} {slot} {digest} {size} {reserve}",
+            guard = live_checkout_sync_guard(&source),
+            source = escape(Cow::Borrowed(&source)),
+            target = escape(Cow::Borrowed(target)),
+            program = escape(Cow::Borrowed(include_str!("transfer/git_archive_cache.py"))),
+            operation = operation.as_str(),
+            slot = escape(Cow::Borrowed(&cache.slot)),
+            digest = escape(Cow::Borrowed(digest)),
+            size = payload_bytes,
+            reserve = cache.min_free_bytes,
+        ))
+    }
+
+    #[cfg(unix)]
+    async fn git_archive_sha256(path: &Path) -> Result<String> {
+        use sha2::{Digest, Sha256};
+        let mut archive = tokio::fs::File::open(path)
+            .await
+            .context("open selected Git archive for hashing")?;
+        let mut hash = Sha256::new();
+        let mut buffer = vec![0_u8; 64 * 1024];
+        loop {
+            let read = archive
+                .read(&mut buffer)
+                .await
+                .context("hash selected Git archive")?;
+            if read == 0 {
+                break;
+            }
+            hash.update(&buffer[..read]);
+        }
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut digest = String::with_capacity(64);
+        for byte in hash.finalize().iter().copied() {
+            digest.push(char::from(HEX[usize::from(byte >> 4)]));
+            digest.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        Ok(digest)
     }
 
     fn remote_cargo_target_dir_for_remote_path(&self, remote_path: &str) -> String {
@@ -6319,16 +6483,53 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         let identity_file = shellexpand::tilde(&worker.identity_file);
         let ssh_command = self.build_rsync_ssh_command(identity_file.as_ref());
         let extraction_script = format!(
-            "{guard} || exit 73\numask 0022\nmkdir -p {path}\nTAR_OPTIONS='' tar -xf {archive} -C {path}",
+            "set -eu\n{guard} || exit 73\numask 0022\nmkdir -p {path}\nTAR_OPTIONS='' tar -xf {archive} -C {path}",
             guard = live_checkout_sync_guard(&remote_path),
             path = escaped_remote_path,
             archive = escaped_remote_archive
         );
+        let cache_scripts = if self.clean_overlay_archive_cache.is_some() && payload_bytes < 1 << 30
+        {
+            let digest = Self::git_archive_sha256(&archive_path).await?;
+            Some((
+                self.git_archive_cache_script(
+                    GitArchiveCacheOperation::Restore,
+                    &digest,
+                    payload_bytes,
+                )?,
+                format!(
+                    "{extraction_script}\n{}",
+                    self.git_archive_cache_script(
+                        GitArchiveCacheOperation::Publish,
+                        &digest,
+                        payload_bytes,
+                    )?
+                ),
+            ))
+        } else {
+            None
+        };
         let resolved_rsync = self.resolved_rsync();
         let rsync_path = resolved_rsync.path.clone();
-        let resume_args = resolved_rsync.capabilities().resume_args();
+        // A killed restore can leave a full-length unverified archive. Append
+        // mode skips receivers at least as long as the sender, even with
+        // append-verify. Checksum (or forced refresh on openrsync) plus ordinary
+        // delta transfer repairs those files and resumes useful partial bytes.
+        let cache_resume_args = [
+            "--partial",
+            Self::artifact_integrity_arg(resolved_rsync.flavor),
+        ];
+        let resume_args: &[&str] = if cache_scripts.is_some() {
+            &cache_resume_args
+        } else {
+            resolved_rsync.capabilities().resume_args()
+        };
+        // A retry may hit a slot published before an SSH acknowledgment was
+        // lost. Do not report zero upload bytes when an earlier attempt sent
+        // this payload; retain the ordinary payload-size accounting then.
+        let upload_attempted = std::sync::atomic::AtomicBool::new(false);
         let start = std::time::Instant::now();
-        let (((), attempts), duration_ms) = {
+        let ((cache_status, mut attempts), duration_ms) = {
             let result = run_source_transfer_attempts(
                 &self.source_retry_config(self.transfer_config.retry.clone()),
                 attempt_timeout,
@@ -6342,7 +6543,31 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                     let escaped_remote_path = escaped_remote_path.clone();
                     let remote_archive_path = remote_archive_path.clone();
                     let rsync_path = rsync_path.clone();
+                    let cache_scripts = cache_scripts.as_ref();
+                    let upload_attempted = &upload_attempted;
                     async move {
+                        if let Some((restore, _)) = cache_scripts {
+                            let output = self
+                                .run_remote_sh_capture(worker, restore, Some(attempt_timeout))
+                                .await
+                                .context("restore verified clean-overlay Git archive")?;
+                            let status = GitArchiveCacheStatus::parse(
+                                GitArchiveCacheOperation::Restore,
+                                &output.stdout,
+                                &output.stderr,
+                            )?;
+                            if status == GitArchiveCacheStatus::Hit {
+                                self.run_remote_sh(
+                                    worker,
+                                    &extraction_script,
+                                    Some(attempt_timeout),
+                                )
+                                .await
+                                .context("extract verified cached clean-overlay archive")?;
+                                return Ok(Some(status));
+                            }
+                            debug!(?status, "Git archive cache requires a source upload");
+                        }
                         let mut rsync = Command::new(&rsync_path); // ubs:ignore — same trusted rsync resolver as rsync_command; payload remains argv
                         rch_common::rsync_flavor::configure_rsync_remote_args(rsync.as_std_mut());
                         self.append_source_rsync_io_timeout(&mut rsync);
@@ -6351,9 +6576,6 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                             .arg("-a")
                             .arg("--no-owner")
                             .arg("--no-group")
-                            // `--partial --append-verify` on rsync 3.x; bare
-                            // `--partial` (delta-resumed) on openrsync/2.6.9,
-                            // which rejects `--append-verify` (issue #66).
                             .args(resume_args)
                             .arg("-e")
                             .arg(ssh_command)
@@ -6370,15 +6592,35 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                             .stdout(Stdio::piped())
                             .stderr(Stdio::piped())
                             .kill_on_drop(true);
+                        upload_attempted.store(true, std::sync::atomic::Ordering::Relaxed);
                         let output = rsync
                             .output()
                             .await
                             .context("run resumable clean-overlay base rsync")?;
                         check_archive_upload_result(&output, worker, &remote_root)?;
-                        self.run_remote_sh(worker, &extraction_script, Some(attempt_timeout))
-                            .await
-                            .context("extract clean-overlay base archive")?;
-                        Ok(())
+                        if let Some((_, extract_and_publish)) = cache_scripts {
+                            // Publication shares the existing extraction RPC.
+                            // set -e prevents a successful cache response from
+                            // concealing a failed tar extraction.
+                            let output = self
+                                .run_remote_sh_capture(
+                                    worker,
+                                    extract_and_publish,
+                                    Some(attempt_timeout),
+                                )
+                                .await
+                                .context("extract and cache clean-overlay base archive")?;
+                            Ok(Some(GitArchiveCacheStatus::parse(
+                                GitArchiveCacheOperation::Publish,
+                                &output.stdout,
+                                &output.stderr,
+                            )?))
+                        } else {
+                            self.run_remote_sh(worker, &extraction_script, Some(attempt_timeout))
+                                .await
+                                .context("extract clean-overlay base archive")?;
+                            Ok(None)
+                        }
                     }
                 },
             )
@@ -6386,10 +6628,24 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             .map_err(anyhow::Error::new)?;
             (result, start.elapsed().as_millis() as u64)
         };
+        let uploaded = upload_attempted.load(std::sync::atomic::Ordering::Relaxed);
+        if let Some(status) = cache_status {
+            info!(
+                ?status,
+                selected_archive_bytes = payload_bytes,
+                upload_attempted = uploaded,
+                "Clean-overlay Git archive materialized"
+            );
+            if let Some(attempt) = attempts.last_mut() {
+                attempt.detail.push_str(&format!(
+                    "; Git archive cache {status:?}; selected archive {payload_bytes} bytes; upload attempted: {uploaded}"
+                ));
+            }
+        }
 
         Ok(CleanOverlayMaterialization {
             sync_result: SyncResult {
-                bytes_transferred: payload_bytes,
+                bytes_transferred: if uploaded { payload_bytes } else { 0 },
                 files_transferred: 0,
                 duration_ms,
             },
@@ -6462,6 +6718,18 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         script: &str,
         rpc_timeout: Option<Duration>,
     ) -> Result<()> {
+        self.run_remote_sh_capture(worker, script, rpc_timeout)
+            .await
+            .map(|_| ())
+    }
+
+    /// Preserve the bounded activity supervisor while retaining protocol bytes.
+    async fn run_remote_sh_capture(
+        &self,
+        worker: &WorkerConfig,
+        script: &str,
+        rpc_timeout: Option<Duration>,
+    ) -> Result<std::process::Output> {
         let script = match rpc_timeout {
             Some(deadline) => self.source_activity_rpc_script(script, deadline),
             None => self.source_activity_script(script),
@@ -6501,7 +6769,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                 String::from_utf8_lossy(&out.stderr)
             ));
         }
-        Ok(())
+        Ok(out)
     }
 
     /// OpenSSH joins remote argv before cmd.exe parses it. A POSIX single quote
@@ -7671,7 +7939,10 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         // Internal immutable source input is never an output, even for old
         // recovery recipes or priority includes. Match the reserved basename
         // at every depth before any include rule can select it.
-        cmd.arg("--exclude").arg(".rch-clean-overlay-base.tar");
+        cmd.arg("--exclude")
+            .arg(".rch-clean-overlay-base.tar")
+            .arg("--exclude")
+            .arg(".rch-git-archive-cache-v1");
 
         // Add zstd compression (zlib on a legacy binary; issue #66)
         self.append_compression_args(&mut cmd, &capabilities);
@@ -7775,7 +8046,10 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             .arg("-e")
             .arg(ssh_command);
         self.append_source_rsync_path(&mut cmd, &format!("{remote_path}/"));
-        cmd.arg("--exclude").arg(".rch-clean-overlay-base.tar");
+        cmd.arg("--exclude")
+            .arg(".rch-clean-overlay-base.tar")
+            .arg("--exclude")
+            .arg(".rch-git-archive-cache-v1");
 
         // Add zstd compression (zlib on a legacy binary; issue #66)
         self.append_compression_args(&mut cmd, &capabilities);
@@ -8135,6 +8409,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             .arg("--timeout=30")
             .arg("--safe-links")
             .arg("--exclude=.rch-clean-overlay-base.tar")
+            .arg("--exclude=.rch-git-archive-cache-v1")
             .arg("-e")
             .arg(ssh_command);
 
@@ -9130,6 +9405,10 @@ except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
                     stderr: String::new(),
                 }
             })?;
+        anyhow::ensure!(
+            !is_internal_source_archive(rel),
+            "declared result directory names reserved source transport data"
+        );
 
         // Materialize only the PARENT tree of the local destination so nested
         // relative paths (`out/shards/a`) work; rsync itself creates the leaf
@@ -10549,6 +10828,139 @@ pub fn default_c_cpp_artifact_patterns() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_archive_cache_protocol_requires_exact_operation_evidence() {
+        use GitArchiveCacheOperation::{Publish, Restore};
+        use GitArchiveCacheStatus::{
+            BypassCapacity, BypassCorrupt, BypassUnavailable, Hit, Miss, Published,
+        };
+        for (operation, line, expected) in [
+            (Restore, "HIT", Hit),
+            (Restore, "MISS", Miss),
+            (Publish, "PUBLISHED", Published),
+            (Restore, "BYPASS_CAPACITY", BypassCapacity),
+            (Publish, "BYPASS_CORRUPT", BypassCorrupt),
+            (Publish, "BYPASS_UNAVAILABLE", BypassUnavailable),
+        ] {
+            let stdout = format!("RCH_GIT_ARCHIVE_CACHE_V1 {line}\n");
+            assert_eq!(
+                GitArchiveCacheStatus::parse(operation, stdout.as_bytes(), b"").unwrap(),
+                expected
+            );
+            assert!(
+                GitArchiveCacheStatus::parse(operation, stdout.as_bytes(), b"worker warning\n")
+                    .is_err()
+            );
+        }
+        for (operation, stdout) in [
+            (Restore, "RCH_GIT_ARCHIVE_CACHE_V1 PUBLISHED\n"),
+            (Publish, "RCH_GIT_ARCHIVE_CACHE_V1 HIT\n"),
+            (Publish, "RCH_GIT_ARCHIVE_CACHE_V1 MISS\n"),
+            (Restore, "RCH_GIT_ARCHIVE_CACHE_V1 HIT"),
+            (Restore, "RCH_GIT_ARCHIVE_CACHE_V1 HIT\nextra\n"),
+            (Restore, "RCH_GIT_ARCHIVE_CACHE_V1 UNKNOWN\n"),
+            (Restore, ""),
+        ] {
+            assert!(GitArchiveCacheStatus::parse(operation, stdout.as_bytes(), b"").is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_archive_cache_requires_separate_owned_pool_and_distinct_repository_slots() {
+        let retained = tempfile::tempdir().unwrap().keep();
+        let first = retained.join("first").join("same-name");
+        let sibling = retained.join("second").join("same-name");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let pipeline = |root: PathBuf| {
+            TransferPipeline::new(
+                root,
+                "repo".into(),
+                "abcd".into(),
+                TransferConfig::default(),
+            )
+            .with_remote_path_override("/worker/source/project")
+            .with_remote_cargo_target_dir_override("/worker/pool")
+        };
+        assert!(
+            pipeline(first.clone())
+                .with_clean_overlay_archive_cache(None)
+                .is_err()
+        );
+        let owned = |root| pipeline(root).with_source_authority("ab12".into()).unwrap();
+        assert!(
+            owned(first.clone())
+                .with_remote_cargo_target_dir_override("/worker/source/project/target")
+                .with_clean_overlay_archive_cache(None)
+                .is_err()
+        );
+        let first_cache = owned(first.clone())
+            .with_clean_overlay_archive_cache(Some(123))
+            .unwrap();
+        let changed_job = owned(first)
+            .with_remote_path_override("/worker/another-job/project")
+            .with_clean_overlay_archive_cache(None)
+            .unwrap();
+        let sibling_cache = owned(sibling)
+            .with_clean_overlay_archive_cache(None)
+            .unwrap();
+        let first_spec = first_cache.clean_overlay_archive_cache.as_ref().unwrap();
+        assert_eq!(first_spec.min_free_bytes, 123);
+        assert_eq!(
+            first_spec.slot,
+            changed_job
+                .clean_overlay_archive_cache
+                .as_ref()
+                .unwrap()
+                .slot
+        );
+        assert_ne!(
+            first_spec.slot,
+            sibling_cache
+                .clean_overlay_archive_cache
+                .as_ref()
+                .unwrap()
+                .slot
+        );
+        let digest = "a".repeat(64);
+        let script = first_cache
+            .git_archive_cache_script(GitArchiveCacheOperation::Restore, &digest, 10240)
+            .unwrap();
+        let fenced = first_cache.source_activity_rpc_script(&script, Duration::from_secs(3));
+        assert!(fenced.contains("--rch-finite-rpc 3000"));
+        assert!(fenced.contains(first_cache.source_authority_prefix.as_ref().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn result_directory_cannot_select_private_cache_as_its_transfer_root() {
+        let retained = tempfile::tempdir().unwrap().keep();
+        let destination = retained.join("not-created");
+        let pipeline = TransferPipeline::new(
+            destination.clone(),
+            "repo".into(),
+            "abcd".into(),
+            TransferConfig::default(),
+        );
+        let worker = worker_with_os(None);
+        for path in [
+            ".rch-git-archive-cache-v1",
+            "reports/.rch-git-archive-cache-v1",
+            ".rch-git-archive-cache-v1/nested",
+            ".rch-clean-overlay-base.tar",
+        ] {
+            let error = pipeline
+                .retrieve_result_dir(&worker, Path::new(path))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("reserved source transport data"));
+            assert!(
+                !destination.exists(),
+                "reject before creating a local destination"
+            );
+        }
+    }
 
     /// Pins this thread to the real transport for the guard's lifetime. Mock
     /// mode falls back to a process-global override that other tests enable
@@ -20576,6 +20988,13 @@ Total file size: 123 bytes";
                 .set_len(112_000_000)
                 .unwrap();
         }
+        for cache in [
+            ".rch-git-archive-cache-v1",
+            "build/.rch-git-archive-cache-v1",
+        ] {
+            std::fs::create_dir_all(source.join(cache)).unwrap();
+            std::fs::write(source.join(cache).join("private.sealed"), b"private source").unwrap();
+        }
         let pipeline = TransferPipeline::new(
             caller.clone(),
             "make".into(),
@@ -20612,6 +21031,8 @@ Total file size: 123 bytes";
             );
             assert!(!stage.join(".rch-clean-overlay-base.tar").exists());
             assert!(!stage.join("build/.rch-clean-overlay-base.tar").exists());
+            assert!(!stage.join(".rch-git-archive-cache-v1").exists());
+            assert!(!stage.join("build/.rch-git-archive-cache-v1").exists());
             for file in ["build/unit", "unit.o", "libunit.a", "a.out", "release.tar"] {
                 assert_eq!(
                     std::fs::read(stage.join(file)).unwrap(),
@@ -20624,22 +21045,54 @@ Total file size: 123 bytes";
         let paths = vec![
             PathBuf::from(".rch-clean-overlay-base.tar"),
             PathBuf::from("build/.rch-clean-overlay-base.tar"),
+            PathBuf::from(".rch-git-archive-cache-v1/private.sealed"),
+            PathBuf::from("build/.rch-git-archive-cache-v1/private.sealed"),
             PathBuf::from("build/unit"),
         ];
         let (admitted, outside) = pipeline
             .partition_staged_artifact_paths(&paths, &patterns)
             .unwrap();
         assert_eq!(admitted, vec![PathBuf::from("build/unit")]);
-        assert_eq!(outside.len(), 2);
+        assert_eq!(outside.len(), 4);
         let priority = vec![
             "+ .rch-clean-overlay-base.tar".into(),
             "+ build/.rch-clean-overlay-base.tar".into(),
+            "+ .rch-git-archive-cache-v1/***".into(),
+            "+ build/.rch-git-archive-cache-v1/***".into(),
         ];
         assert!(
             pipeline
-                .validate_staged_artifact_paths(&paths[..2], &priority)
+                .validate_staged_artifact_paths(&paths[..4], &priority)
                 .is_err()
         );
+        for command in [
+            pipeline.build_retrieve_command(&worker, source.to_str().unwrap(), &priority),
+            pipeline.build_retrieve_streaming_command(&worker, source.to_str().unwrap(), &priority),
+            pipeline.build_result_dir_retrieve_command(
+                &worker,
+                source.to_str().unwrap(),
+                Path::new("build"),
+            ),
+        ] {
+            let args: Vec<_> = command
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy())
+                .collect();
+            let excluded = args
+                .iter()
+                .position(|arg| {
+                    arg == ".rch-git-archive-cache-v1"
+                        || arg == "--exclude=.rch-git-archive-cache-v1"
+                })
+                .unwrap();
+            if let Some(included) = args.iter().position(|arg| arg == "--include") {
+                assert!(
+                    excluded < included,
+                    "private cache must precede priority includes"
+                );
+            }
+        }
         assert_eq!(
             std::fs::metadata(source.join(".rch-clean-overlay-base.tar"))
                 .unwrap()
