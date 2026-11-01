@@ -2674,9 +2674,27 @@ only the stated step, never closure of the surrounding milestone.
       7,844 bytes, held-file identity and read-only source manifest prepared
       on TRJ. Submitted at 20:05:34 UTC after the DSR timeout and observed old
       compiler exit; strict one-slot RCH job is first in queue behind a peer.
-      Queued request id 9253452172182422125; no active own compiler yet.
-      These combined-source commands are UNRUN; equality of four files does
-      not qualify the whole workspace.
+      First request 9253452172182422125 is admitted, then refuses before
+      compilation at its source audit: the old-cut exclusion list omitted 15
+      additional .beads recovery paths covered by the unchanged .beads/ policy.
+      All transferred source contents match. Raw one / build 30080135327648039,
+      wrapper rchw-7e76de93-912d-43b1-a44b-6791b4277c13, terminal ACK true;
+      no compiler or runtime verdict. Retain the original manifest/driver.
+      Derive the complete exclusion list from the unchanged configuration and
+      captured paths: 61 metadata/ntm/env-example exclusions; all other 1,694
+      files still require exact size, mode and hash. No production source is
+      exempted and the audit predicate is unchanged. Read-only mirror check
+      matches all 1,694 with zero differences and exactly those 61 omissions.
+      Refusal/policy explanation SHA
+      cd79cf9e7752cfbc67030f97f38ecc69b9da0a146f22898ef56b98d96c9dcef4;
+      corrected manifest SHA
+      918261f0c8d0aa88acaed39167e8b7a735565ed2d47f85dc2e9a1a4af854e8a7.
+      New driver saves source-before even on audit failure, SHA
+      52bd694590cfba261dea7cc194a4dc799fc9ad5d6bbbcaa0b8b41cb70af73bb6,
+      7,917 bytes. New request 9253452172182422126 submitted 20:24:58 UTC,
+      first queued behind a peer, same source bytes and one-slot policy.
+      Combined-source compiler/runtime commands remain UNRUN; equality of four
+      files does not qualify the whole workspace.
     - [x] Reconcile the execution history into the shared Beads tracker. Its
       JSONL/DB had remained at the initial reopened snapshot; private comments
       alone did not mark the shared task in progress. Supported import then
