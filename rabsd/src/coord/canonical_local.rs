@@ -16,10 +16,11 @@
 
 pub mod service;
 mod target_state;
+pub(crate) use target_state::RestoredTargetProvenance;
 
 use super::live::{CoordLive, cluster_id};
 use super::live_dependency::LiveDependencyLane;
-use super::live_dependency::canonical::CanonicalPaths;
+use super::live_dependency::canonical::{CanonicalPaths, CommittedOutputExportError};
 use super::live_dependency::remote::{RemoteDependencies, SharedRemoteExecutions};
 use super::source_delivery::control::{PreparationControl, PreparationRootGuard};
 use crate::edge::live_facts::{FileSig, read_stable};
@@ -1537,45 +1538,40 @@ fn run_operation(
         ),
         None => canonical_edge_work(config, Arc::clone(&paths), Arc::clone(&activity)),
     };
-    // The service's cancel flag also governs response delivery. Finishing a
-    // successfully drained scoped edge must not cancel that caller, while an
-    // edge that exits before the owner requests shutdown must stop its Cargo.
-    let normal_shutdown = shared.as_ref().map(|_| Arc::new(AtomicBool::new(false)));
-    let edge = match &normal_shutdown {
-        Some(expected) => stop_on_unexpected_exit(
-            edge,
-            Arc::clone(&stopped),
-            Arc::clone(&controller),
-            Arc::clone(expected),
-        ),
-        None => stop_on_exit(edge, Arc::clone(&stopped), Arc::clone(&controller)),
-    };
-    let options = DaemonRunOptions {
-        edge_work: Some(edge),
-        coord_work: shared.is_none().then(|| {
-            stop_on_exit(
-                coordinator_work(coord.clone()),
-                stopped.clone(),
-                controller.clone(),
-            )
-        }),
-        ..DaemonRunOptions::default()
-    };
-    let worker_controller = controller.clone();
-    let worker = std::thread::Builder::new()
-        .name("rabs-canonical-coord".into())
-        .spawn(move || run_daemon_controlled(options, worker_controller))?;
-    let server = ServerOwner {
+    let server = ServerOwner::start_operation(
+        edge,
+        shared.is_none().then(|| Arc::clone(&coord)),
+        Arc::clone(&stopped),
         controller,
-        worker: Some(worker),
-        normal_shutdown,
-    };
+    )?;
     wait_ready(&server, &socket, &coord, &stopped)?;
+    // A private target clone can make Cargo skip an unchanged producer. Restore
+    // its installation witnesses only after this coordinator owns live
+    // authority, and before Cargo can observe the restored outputs. Known
+    // revoked provenance is terminal here: dropping just the witnesses would
+    // still let Cargo's own Fresh path consume the revoked artifact bytes.
+    let restored_committed_outputs = match target_state
+        .as_mut()
+        .and_then(TargetState::take_restored_provenance)
+    {
+        Some(provenance) => {
+            let restored = paths.rehydrate_committed_outputs(&coord, provenance, &cancelled);
+            preparation.checkpoint()?;
+            restored.map_err(|error| {
+                io::Error::other(format!(
+                    "restored target provenance is no longer valid: {error}"
+                ))
+            })?
+        }
+        None => 0,
+    };
+    preparation.checkpoint()?;
     output.event(
         json!({"kind":"canonical-compilation-started", "version":PROFILE_VERSION,
         "command":profile.command.as_str(), "namespace":"canonical",
         "cache_scope":"external-dependency-metadata-and-worker-rlib",
         "private_target_state":private_target_state,
+        "restored_committed_outputs":restored_committed_outputs,
         "test_execution":profile.command == CompilationCommand::Test && !profile.no_run(),
         "test_result_cache":false,
         "run_execution":profile.command == CompilationCommand::Run,
@@ -1615,6 +1611,19 @@ fn run_operation(
     } else {
         Ok(())
     };
+    let retain_target = target_state.is_some()
+        && result.as_ref().is_ok_and(|compiled| {
+            compiled.status.success()
+                || (matches!(
+                    profile.command,
+                    CompilationCommand::Test | CompilationCommand::Run | CompilationCommand::Bench
+                ) && compiled.status.code().is_some())
+        });
+    // Export after the last publication, while its current authority is still
+    // alive. Nonshared server shutdown retires that authority. Persistence
+    // below still requires a clean shutdown and a verified private tree copy.
+    let target_provenance = (retain_target && publication_drain.is_ok())
+        .then(|| paths.export_committed_outputs(&coord, &cancelled));
     let shutdown = server.finish();
     let compiled = result?;
     publication_drain.map_err(io::Error::other)?;
@@ -1630,28 +1639,34 @@ fn run_operation(
     if let Some(retained) = &retained_toolchain {
         retained.image().verify_retained_generation(cancelled)?;
     }
+    if let Some(Err(CommittedOutputExportError::InvalidProducer(reason))) = &target_provenance {
+        // Cargo may have used a retained output without invoking its compiler
+        // wrapper at all. Revocation discovered at the final live boundary
+        // therefore fails this operation, even when every unit was Fresh.
+        return Err(io::Error::other(format!(
+            "completed target provenance is no longer valid: {reason}"
+        )));
+    }
     if !streamed {
         output.replay(&compiled)?;
     }
     output.line(&receipt.to_json_line())?;
-    if (compiled.status.success()
-        || (matches!(
-            profile.command,
-            CompilationCommand::Test | CompilationCommand::Run | CompilationCommand::Bench
-        ) && compiled.status.code().is_some()))
-        && let Some(cache) = &target_state
-    {
+    if let (Some(cache), Some(provenance)) = (&target_state, target_provenance) {
         // Retain state only after compiler, session, publication and coordinator
         // drain. Delivered files remain independent of this saved generation.
         // A normal program/harness failure can retain compiled artifacts too.
         // Cargo and the requested bodies execute again; no outcome is saved.
         let capture = || -> io::Result<()> {
+            // An export failure must preserve the old seed. Capturing with an
+            // empty inventory would erase known provenance and allow later
+            // Cargo Fresh reuse to bypass its current publication checks.
+            let provenance = provenance.map_err(io::Error::other)?;
             let _cache_guard = shared
                 .as_ref()
                 .map(|runtime| acquire_target_cache_lock(&runtime.target_cache_lock, &cancelled))
                 .transpose()?;
             preparation.checkpoint()?;
-            cache.capture(&target_root)
+            cache.capture(&target_root, &provenance)
         };
         if let Err(error) = capture() {
             if error.kind() == io::ErrorKind::Interrupted {
@@ -2067,6 +2082,46 @@ struct ServerOwner {
     normal_shutdown: Option<Arc<AtomicBool>>,
 }
 impl ServerOwner {
+    fn start_operation(
+        edge: SubsystemWork,
+        coordinator: Option<Arc<CoordLive>>,
+        stopped: Arc<AtomicBool>,
+        controller: Arc<ShutdownController>,
+    ) -> io::Result<Self> {
+        // Both standalone and shared operations still have target capture and
+        // delivery work after their scoped daemon drains. Expected subsystem
+        // shutdown must not manufacture cancellation of that completed Cargo
+        // invocation. Unexpected exit, panic and prior cancellation still stop
+        // the caller; the cancellation flag is never reset.
+        let normal_shutdown = Arc::new(AtomicBool::new(false));
+        let options = DaemonRunOptions {
+            edge_work: Some(stop_on_unexpected_exit(
+                edge,
+                Arc::clone(&stopped),
+                Arc::clone(&controller),
+                Arc::clone(&normal_shutdown),
+            )),
+            coord_work: coordinator.map(|coord| {
+                stop_on_unexpected_exit(
+                    coordinator_work(coord),
+                    Arc::clone(&stopped),
+                    Arc::clone(&controller),
+                    Arc::clone(&normal_shutdown),
+                )
+            }),
+            ..DaemonRunOptions::default()
+        };
+        let worker_controller = Arc::clone(&controller);
+        let worker = std::thread::Builder::new()
+            .name("rabs-canonical-coord".into())
+            .spawn(move || run_daemon_controlled(options, worker_controller))?;
+        Ok(Self {
+            controller,
+            worker: Some(worker),
+            normal_shutdown: Some(normal_shutdown),
+        })
+    }
+
     fn request_shutdown(&self) {
         if let Some(expected) = &self.normal_shutdown {
             expected.store(true, Ordering::Release);
@@ -3125,30 +3180,43 @@ mod tests {
     fn unexpected_scoped_edge_completion_cancels_its_caller() {
         let stopped = Arc::new(AtomicBool::new(false));
         let controller = Arc::new(ShutdownController::new());
-        let normal_shutdown = Arc::new(AtomicBool::new(false));
         let edge: SubsystemWork = Box::new(|_, _| Box::pin(async { Ok(()) }));
-        let options = DaemonRunOptions {
-            edge_work: Some(stop_on_unexpected_exit(
-                edge,
-                Arc::clone(&stopped),
-                Arc::clone(&controller),
-                Arc::clone(&normal_shutdown),
-            )),
-            ..DaemonRunOptions::default()
-        };
-        let worker_controller = Arc::clone(&controller);
-        let worker = std::thread::spawn(move || run_daemon_controlled(options, worker_controller));
-        let server = ServerOwner {
-            controller,
-            worker: Some(worker),
-            normal_shutdown: Some(normal_shutdown),
-        };
+        let server =
+            ServerOwner::start_operation(edge, None, Arc::clone(&stopped), controller).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !stopped.load(Ordering::Acquire) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(stopped.load(Ordering::Acquire));
         assert!(server.finish().unwrap().clean());
+    }
+
+    #[test]
+    fn normal_operation_shutdown_never_clears_a_prior_cancellation() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let controller = Arc::new(ShutdownController::new());
+        let (ready, started) = std::sync::mpsc::sync_channel(1);
+        let edge: SubsystemWork = Box::new(move |_, mut shutdown| {
+            Box::pin(async move {
+                ready.send(()).unwrap();
+                shutdown.wait().await;
+                Ok(())
+            })
+        });
+        let server =
+            ServerOwner::start_operation(edge, None, Arc::clone(&stopped), controller).unwrap();
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        stopped.store(true, Ordering::Release);
+        assert!(server.finish().unwrap().clean());
+        assert!(stopped.load(Ordering::Acquire));
+        let cancelled = || stopped.load(Ordering::Acquire);
+        assert_eq!(
+            PreparationControl::new(&cancelled, None)
+                .checkpoint()
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
     }
 
     #[test]
@@ -3231,22 +3299,13 @@ mod tests {
             paths,
             Arc::clone(&activity),
         );
-        let options = DaemonRunOptions {
-            edge_work: Some(stop_on_exit(edge, stopped.clone(), controller.clone())),
-            coord_work: Some(stop_on_exit(
-                coordinator_work(coord.clone()),
-                stopped.clone(),
-                controller.clone(),
-            )),
-            ..DaemonRunOptions::default()
-        };
-        let worker_controller = controller.clone();
-        let worker = std::thread::spawn(move || run_daemon_controlled(options, worker_controller));
-        let server = ServerOwner {
+        let server = ServerOwner::start_operation(
+            edge,
+            Some(Arc::clone(&coord)),
+            Arc::clone(&stopped),
             controller,
-            worker: Some(worker),
-            normal_shutdown: None,
-        };
+        )
+        .unwrap();
         wait_ready(&server, &socket, &coord, &stopped).unwrap();
         let stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
         stream
@@ -3285,9 +3344,13 @@ mod tests {
         // and join its own session before releasing socket/path ownership.
         assert!(server.finish().unwrap().clean());
         assert!(!socket.exists());
-        assert!(stopped.load(Ordering::Acquire));
+        assert!(!stopped.load(Ordering::Acquire));
         assert!(!coord.available());
         assert_eq!(activity.active_sessions(), 0);
+        let cancelled = || stopped.load(Ordering::Acquire);
+        PreparationControl::new(&cancelled, None)
+            .checkpoint()
+            .expect("clean standalone shutdown must allow target capture and final delivery");
     }
 
     fn reuse_source(source: &[u8], manifest: &[u8], cache: Option<&[u8]>) -> SourceManifest {

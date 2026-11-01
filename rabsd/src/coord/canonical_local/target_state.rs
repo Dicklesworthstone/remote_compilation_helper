@@ -10,6 +10,7 @@
 //! Failed captures preserve the committed families.
 
 use super::{create_private, private_directory};
+use crate::coord::live_dependency::canonical::CommittedOutputSeeds;
 use crate::edge::live_facts::read_stable;
 use rabs_cas::materialization::{publish_new_directory, try_verified_reflink};
 use rabs_sandbox::artifact_tree::{
@@ -118,6 +119,11 @@ struct SeedPayload {
     source: Vec<SourceRow>,
     source_times: SourceTimestamps,
     target: PrivateTreeSnapshot,
+    // Older private seeds carry no committed installation provenance. Omitting
+    // an empty inventory preserves their exact payload checksum while granting
+    // no authority to their otherwise independently verified target files.
+    #[serde(default, skip_serializing_if = "CommittedOutputSeeds::is_empty")]
+    committed_outputs: CommittedOutputSeeds,
 }
 
 impl SeedPayload {
@@ -141,6 +147,56 @@ impl SeedPayload {
 struct SeedEnvelope {
     sha256: [u8; 32],
     payload: SeedPayload,
+}
+
+/// The private target owner created by one complete, verified seed restore.
+/// Decoded seed metadata alone cannot construct this capability. Its inventory
+/// still requires current coordinator/publication validation and fresh file
+/// generations before it can become an operation's committed-output registry.
+#[derive(Debug)]
+pub(crate) struct RestoredTargetProvenance {
+    target: PathBuf,
+    directory: File,
+    seeds: CommittedOutputSeeds,
+}
+
+impl RestoredTargetProvenance {
+    fn bind(target: &Path, directory: File, seeds: CommittedOutputSeeds) -> io::Result<Self> {
+        let provenance = Self {
+            target: target.to_path_buf(),
+            directory,
+            seeds,
+        };
+        provenance.seeds_for(target)?;
+        Ok(provenance)
+    }
+
+    /// Synthetic restore boundary for coordinator/CAS tests. Production can
+    /// construct this owner only after the complete seed restoration below;
+    /// target-state tests separately exercise that real copy and metadata seal.
+    #[cfg(test)]
+    pub(crate) fn for_test(target: &Path, seeds: CommittedOutputSeeds) -> io::Result<Self> {
+        seeds.validate().map_err(io::Error::other)?;
+        Self::bind(target, open_directory(target)?, seeds)
+    }
+
+    /// The selected canonical mount must be the exact restored target, not a
+    /// replacement at the same path or another tree containing equal bytes.
+    /// Retaining the original descriptor also prevents inode reuse from
+    /// resurrecting a displaced target's installation provenance.
+    pub(crate) fn seeds_for(&self, target: &Path) -> io::Result<&CommittedOutputSeeds> {
+        require(
+            target == self.target,
+            "committed target provenance belongs to another root",
+        )?;
+        let current = open_directory(target)?.metadata()?;
+        let held = self.directory.metadata()?;
+        require(
+            (current.dev(), current.ino()) == (held.dev(), held.ino()),
+            "restored target changed before committed provenance admission",
+        )?;
+        Ok(&self.seeds)
+    }
 }
 
 /// Keep generated metadata under the same bound as persisted input, without
@@ -453,6 +509,11 @@ impl<'a> TargetFamily<'a> {
         envelope.payload.target.validate()?;
         envelope.payload.source_times.validate()?;
         envelope.payload.source_manifest()?;
+        envelope
+            .payload
+            .committed_outputs
+            .validate()
+            .map_err(io::Error::other)?;
         checkpoint(self.stopped)?;
         self.verify_owner()?;
         Ok(Some(envelope.payload))
@@ -703,6 +764,7 @@ pub(super) struct TargetState<'a> {
     workspace: PathBuf,
     manifest: SourceManifest,
     source_times: SourceTimestamps,
+    restored_provenance: Option<RestoredTargetProvenance>,
     stopped: &'a dyn Fn() -> bool,
 }
 
@@ -738,6 +800,7 @@ impl<'a> TargetState<'a> {
             workspace: workspace.to_path_buf(),
             manifest: manifest.clone(),
             source_times,
+            restored_provenance: None,
             stopped,
         })
     }
@@ -753,6 +816,9 @@ impl<'a> TargetState<'a> {
     /// remains available to capture a successful cold execution in this same
     /// operation, including after an unusable target seed was encountered.
     pub fn restore(&mut self, fresh_empty_target: &Path) -> io::Result<bool> {
+        // A failed, cancelled or missing later restore must never return the
+        // successful capability from an earlier destination or generation.
+        self.restored_provenance = None;
         let result = self.restore_inner(fresh_empty_target);
         if matches!(&result, Err(error) if error.kind() == io::ErrorKind::Interrupted) {
             return result;
@@ -766,6 +832,13 @@ impl<'a> TargetState<'a> {
                 SourceTimestamps::capture(&self.workspace, &self.manifest, &self.stopped)?;
         }
         result
+    }
+
+    /// Transfer this restore's target-bound provenance exactly once. The
+    /// canonical driver admits it only after its coordinator is live and
+    /// before Cargo can observe the restored target.
+    pub fn take_restored_provenance(&mut self) -> Option<RestoredTargetProvenance> {
+        self.restored_provenance.take()
     }
 
     fn restore_inner(&mut self, fresh_empty_target: &Path) -> io::Result<bool> {
@@ -814,6 +887,7 @@ impl<'a> TargetState<'a> {
             &seed.target,
             SystemTime::now(),
         )?;
+        let target_owner = open_directory(fresh_empty_target)?;
         seed.target.restore_into_with_cloner(
             &self.family.root.join("seed/target"),
             fresh_empty_target,
@@ -824,6 +898,11 @@ impl<'a> TargetState<'a> {
         self.verify_owner()?;
         self.source_times = wanted;
         self.family.promote()?;
+        self.restored_provenance = Some(RestoredTargetProvenance::bind(
+            fresh_empty_target,
+            target_owner,
+            seed.committed_outputs,
+        )?);
         Ok(true)
     }
 
@@ -832,9 +911,14 @@ impl<'a> TargetState<'a> {
     /// state; their outcome is never a cached test result.
     /// Snapshotting and cloning finish before the old seed is moved aside.
     /// The caller holds the same cache-I/O lock used for open plus restore.
-    pub fn capture(&self, target: &Path) -> io::Result<()> {
+    pub fn capture(
+        &self,
+        target: &Path,
+        committed_outputs: &CommittedOutputSeeds,
+    ) -> io::Result<()> {
         checkpoint(self.stopped)?;
         self.families.root.verify_owner()?;
+        committed_outputs.validate().map_err(io::Error::other)?;
         require(
             SourceTimestamps::capture(&self.workspace, &self.manifest, &self.stopped)?
                 == self.source_times,
@@ -873,6 +957,10 @@ impl<'a> TargetState<'a> {
         let copied = pending.join("target");
         create_private(&copied)?;
         snapshot.restore_into_with_cloner(target, &copied, &self.stopped, try_verified_reflink)?;
+        // Provenance and target bytes are one seed transaction. An inventory
+        // exported before capture cannot attach authority to different files
+        // that reached this private copy while the target was being observed.
+        committed_outputs.verify_target(&copied, self.stopped)?;
         require(
             SourceTimestamps::capture(&self.workspace, &self.manifest, &self.stopped)?
                 == self.source_times,
@@ -894,6 +982,7 @@ impl<'a> TargetState<'a> {
                 .collect(),
             source_times: self.source_times.clone(),
             target: snapshot,
+            committed_outputs: committed_outputs.clone(),
         };
         let sha256 = payload_digest(&payload)?;
         let bytes = encode(&SeedEnvelope { sha256, payload })?;
@@ -982,7 +1071,7 @@ mod tests {
         completed_target(target.path(), value);
         TargetState::open(state, settings, key, workspace.path(), &manifest, &|| false)
             .unwrap()
-            .capture(target.path())
+            .capture(target.path(), &CommittedOutputSeeds::default())
             .unwrap();
     }
 
@@ -1008,6 +1097,252 @@ mod tests {
             .unwrap()
             .set_times(FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(seconds)))
             .unwrap();
+    }
+
+    /// Synthetic publication identities test persistence only. The copied
+    /// target is real; these rows cannot pass coordinator/CAS qualification.
+    fn sample_committed_outputs(target: &Path) -> CommittedOutputSeeds {
+        let directory = target.join("debug/deps");
+        fs::create_dir_all(&directory).unwrap();
+        let output = directory.join("libupstream.rmeta");
+        fs::write(&output, b"complete private metadata output").unwrap();
+        let object = crate::edge::live_facts::digest_stable(&output).unwrap().1;
+        let seeds: CommittedOutputSeeds = serde_json::from_value(serde_json::json!({
+            "outputs":[{
+                "path":"/__rabs/out/cargo/debug/deps/libupstream.rmeta",
+                "producer_action":vec![1_u8; 32],
+                "producer_descriptor":vec![2_u8; 32],
+                "producer_manifest":vec![3_u8; 32],
+                "role":"metadata",
+                "virtual_path":b"libupstream.rmeta".to_vec(),
+                "object":object.bytes,
+            }]
+        }))
+        .unwrap();
+        seeds.validate().unwrap();
+        seeds
+    }
+
+    #[test]
+    fn restored_provenance_follows_the_verified_copy_and_is_bound_to_its_exact_root() {
+        let state = private();
+        let key = [71; 32];
+        let workspace = private();
+        let manifest = source(workspace.path(), b"source");
+        let target = private();
+        let seeds = sample_committed_outputs(target.path());
+        let expected = serde_json::to_value(&seeds).unwrap();
+        let cache = TargetState::open(
+            state.path(),
+            &config(),
+            key,
+            workspace.path(),
+            &manifest,
+            &|| false,
+        )
+        .unwrap();
+        cache.capture(target.path(), &seeds).unwrap();
+        let stored: serde_json::Value = serde_json::from_slice(
+            &fs::read(family_path(state.path(), key).join("seed/metadata.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stored["payload"]["committed_outputs"], expected);
+        drop(cache);
+
+        // A new owner reads the sealed inventory and clones independent files;
+        // no in-memory installation registry survives into this operation.
+        let next_workspace = private();
+        let next_manifest = source(next_workspace.path(), b"source");
+        let mut next = TargetState::open(
+            state.path(),
+            &config(),
+            key,
+            next_workspace.path(),
+            &next_manifest,
+            &|| false,
+        )
+        .unwrap();
+        let restored = private();
+        assert!(next.restore(restored.path()).unwrap());
+        let provenance = next.take_restored_provenance().unwrap();
+        assert!(next.take_restored_provenance().is_none());
+        assert_eq!(
+            serde_json::to_value(provenance.seeds_for(restored.path()).unwrap()).unwrap(),
+            expected,
+        );
+        let original = fs::metadata(target.path().join("debug/deps/libupstream.rmeta")).unwrap();
+        let copied = fs::metadata(restored.path().join("debug/deps/libupstream.rmeta")).unwrap();
+        assert_ne!(
+            (original.dev(), original.ino()),
+            (copied.dev(), copied.ino())
+        );
+        let other = private();
+        sample_committed_outputs(other.path());
+        assert!(provenance.seeds_for(other.path()).is_err());
+
+        // Preserve the verified original tree, replacing only its old name.
+        // Identical bytes at that name cannot inherit its directory capability.
+        fs::rename(restored.path(), state.path().join("displaced-target")).unwrap();
+        create_private(restored.path()).unwrap();
+        sample_committed_outputs(restored.path());
+        assert!(provenance.seeds_for(restored.path()).is_err());
+    }
+
+    #[test]
+    fn retained_provenance_is_covered_by_the_target_seed_checksum() {
+        let state = private();
+        let key = [72; 32];
+        let workspace = private();
+        let manifest = source(workspace.path(), b"source");
+        let target = private();
+        let seeds = sample_committed_outputs(target.path());
+        let cache = TargetState::open(
+            state.path(),
+            &config(),
+            key,
+            workspace.path(),
+            &manifest,
+            &|| false,
+        )
+        .unwrap();
+        cache.capture(target.path(), &seeds).unwrap();
+        let metadata = family_path(state.path(), key).join("seed/metadata.json");
+        let mut envelope: serde_json::Value =
+            serde_json::from_slice(&fs::read(&metadata).unwrap()).unwrap();
+        envelope["payload"]["committed_outputs"]["outputs"][0]["producer_manifest"][0] =
+            serde_json::json!(9);
+        // The modified row is structurally valid but no longer belongs to the
+        // seed's committed metadata transaction. Parsing it must not suffice.
+        let changed: CommittedOutputSeeds =
+            serde_json::from_value(envelope["payload"]["committed_outputs"].clone()).unwrap();
+        changed.validate().unwrap();
+        fs::write(metadata, serde_json::to_vec(&envelope).unwrap()).unwrap();
+        assert!(
+            cache
+                .family
+                .load_seed()
+                .unwrap_err()
+                .to_string()
+                .contains("digest differs")
+        );
+    }
+
+    #[test]
+    fn copied_target_must_match_provenance_before_replacing_a_healthy_seed() {
+        let state = private();
+        let key = [75; 32];
+        let workspace = private();
+        let manifest = source(workspace.path(), b"source");
+        let target = private();
+        let seeds = sample_committed_outputs(target.path());
+        let cache = TargetState::open(
+            state.path(),
+            &config(),
+            key,
+            workspace.path(),
+            &manifest,
+            &|| false,
+        )
+        .unwrap();
+        cache.capture(target.path(), &seeds).unwrap();
+        let family = family_path(state.path(), key);
+        let original = fs::read(family.join("seed/metadata.json")).unwrap();
+        let mut changed = serde_json::to_value(&seeds).unwrap();
+        changed["outputs"][0]["object"] = serde_json::json!(vec![7_u8; 32]);
+        let changed: CommittedOutputSeeds = serde_json::from_value(changed).unwrap();
+        changed.validate().unwrap();
+        assert!(cache.capture(target.path(), &changed).is_err());
+        assert_eq!(
+            fs::read(family.join("seed/metadata.json")).unwrap(),
+            original
+        );
+        assert!(
+            family
+                .join("pending/target/debug/deps/libupstream.rmeta")
+                .is_file()
+        );
+        assert!(!family.join("pending/metadata.json").exists());
+        let committed = cache.family.load_seed().unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&committed.committed_outputs).unwrap(),
+            serde_json::to_value(&seeds).unwrap(),
+        );
+    }
+
+    #[test]
+    fn later_restore_failure_cancellation_or_miss_cannot_reuse_an_earlier_provenance_owner() {
+        for failure in ["nonempty-destination", "cancelled", "missing-seed"] {
+            let state = private();
+            let key = [73; 32];
+            capture_family(state.path(), &config(), key, b"complete target");
+            let workspace = private();
+            let manifest = source(workspace.path(), b"source");
+            let cancelled = Cell::new(false);
+            let stopped = || cancelled.get();
+            let mut cache = TargetState::open(
+                state.path(),
+                &config(),
+                key,
+                workspace.path(),
+                &manifest,
+                &stopped,
+            )
+            .unwrap();
+            let first = private();
+            assert!(cache.restore(first.path()).unwrap());
+            assert!(cache.restored_provenance.is_some());
+            let next = private();
+            match failure {
+                "nonempty-destination" => {
+                    completed_target(next.path(), b"unrelated private file");
+                    assert!(cache.restore(next.path()).is_err());
+                }
+                "cancelled" => {
+                    cancelled.set(true);
+                    assert_eq!(
+                        cache.restore(next.path()).unwrap_err().kind(),
+                        io::ErrorKind::Interrupted,
+                    );
+                }
+                "missing-seed" => {
+                    fs::rename(
+                        family_path(state.path(), key).join("seed"),
+                        state.path().join("preserved-seed"),
+                    )
+                    .unwrap();
+                    assert!(!cache.restore(next.path()).unwrap());
+                }
+                _ => unreachable!(),
+            }
+            assert!(cache.take_restored_provenance().is_none(), "{failure}");
+        }
+    }
+
+    #[test]
+    fn private_seeds_without_provenance_keep_their_original_encoding_and_grant_no_witnesses() {
+        let state = private();
+        let key = [74; 32];
+        capture_family(state.path(), &config(), key, b"local target bytes");
+        let original = fs::read(family_path(state.path(), key).join("seed/metadata.json")).unwrap();
+        let envelope: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        assert!(envelope["payload"].get("committed_outputs").is_none());
+        let decoded: SeedEnvelope = serde_json::from_slice(&original).unwrap();
+        assert_eq!(encode(&decoded).unwrap(), original);
+        let workspace = private();
+        let manifest = source(workspace.path(), b"source");
+        let mut cache = TargetState::open(
+            state.path(),
+            &config(),
+            key,
+            workspace.path(),
+            &manifest,
+            &|| false,
+        )
+        .unwrap();
+        let target = private();
+        assert!(cache.restore(target.path()).unwrap());
+        let restored = cache.take_restored_provenance().unwrap();
+        assert!(restored.seeds_for(target.path()).unwrap().is_empty());
     }
 
     #[test]
@@ -1085,6 +1420,7 @@ mod tests {
             cache.restore(candidate.path()).unwrap_err().kind(),
             io::ErrorKind::Interrupted
         );
+        assert!(cache.take_restored_provenance().is_none());
         assert!(observed_cancel.get());
         assert_eq!(
             extra_polls.get(),
@@ -1131,7 +1467,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            cache.capture(target.path()).unwrap_err().kind(),
+            cache
+                .capture(target.path(), &CommittedOutputSeeds::default())
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::Interrupted
         );
         assert!(family.join("pending/target/artifact").is_file());
@@ -1297,7 +1636,11 @@ mod tests {
         .unwrap();
         let oversized = private();
         completed_target(oversized.path(), b"too large for the entire cache");
-        assert!(cache.capture(oversized.path()).is_err());
+        assert!(
+            cache
+                .capture(oversized.path(), &CommittedOutputSeeds::default())
+                .is_err()
+        );
         for key in [[14; 32], [15; 32]] {
             assert!(family_path(state.path(), key).join("seed").exists());
         }
@@ -1361,10 +1704,14 @@ mod tests {
         assert!(!family_path(state.path(), [40; 32]).exists());
 
         completed_target(first_target.path(), b"first completed");
-        first.capture(first_target.path()).unwrap();
+        first
+            .capture(first_target.path(), &CommittedOutputSeeds::default())
+            .unwrap();
         assert!(!family_path(state.path(), [41; 32]).exists());
         completed_target(second_target.path(), b"second completed");
-        second.capture(second_target.path()).unwrap();
+        second
+            .capture(second_target.path(), &CommittedOutputSeeds::default())
+            .unwrap();
         assert_eq!(
             restore_family(state.path(), &settings, [40; 32]).as_deref(),
             Some(b"first completed".as_slice())
@@ -1402,7 +1749,9 @@ mod tests {
         assert!(!family_path(state.path(), [42; 32]).exists());
         assert_eq!(fs::read(target.path().join("artifact")).unwrap(), b"aaaa");
         completed_target(target.path(), b"ccc");
-        inflight.capture(target.path()).unwrap();
+        inflight
+            .capture(target.path(), &CommittedOutputSeeds::default())
+            .unwrap();
         assert!(!family_path(state.path(), [43; 32]).exists());
         assert_eq!(
             restore_family(state.path(), &settings, [42; 32]).as_deref(),
@@ -1463,17 +1812,25 @@ mod tests {
         assert_ne!(second_inode, fs::metadata(&seed).unwrap().ino());
 
         completed_target(first_target.path(), b"first");
-        first.capture(first_target.path()).unwrap();
+        first
+            .capture(first_target.path(), &CommittedOutputSeeds::default())
+            .unwrap();
         assert_eq!(
             fs::read(second_target.path().join("artifact")).unwrap(),
             b"old"
         );
         completed_target(second_target.path(), b"oversized incomplete candidate");
-        assert!(second.capture(second_target.path()).is_err());
+        assert!(
+            second
+                .capture(second_target.path(), &CommittedOutputSeeds::default())
+                .is_err()
+        );
         assert_eq!(fs::read(&seed).unwrap(), b"first");
 
         completed_target(second_target.path(), b"second");
-        second.capture(second_target.path()).unwrap();
+        second
+            .capture(second_target.path(), &CommittedOutputSeeds::default())
+            .unwrap();
         completed_target(first_target.path(), b"not captured");
         assert_eq!(fs::read(&seed).unwrap(), b"second");
         assert_eq!(
@@ -1519,7 +1876,9 @@ mod tests {
                 capture_family(state.path(), &roomy, [47; 32], b"b");
             }
             completed_target(target.path(), b"new");
-            let refused = inflight.capture(target.path()).unwrap_err();
+            let refused = inflight
+                .capture(target.path(), &CommittedOutputSeeds::default())
+                .unwrap_err();
             assert!(refused.to_string().contains("retention budget changed"));
             let retained = TargetFamilies::open(state.path(), &roomy, &|| false)
                 .unwrap()
@@ -1777,7 +2136,9 @@ mod tests {
         .unwrap();
         let empty = private();
         assert!(!first.restore(empty.path()).unwrap());
-        first.capture(first_target.path()).unwrap();
+        first
+            .capture(first_target.path(), &CommittedOutputSeeds::default())
+            .unwrap();
         let original_times = first.source_times.clone();
         drop(first);
 
@@ -1810,7 +2171,8 @@ mod tests {
         );
         fs::write(target.path().join("artifact"), b"later private output").unwrap();
         assert_eq!(fs::read(seed).unwrap(), b"completed Cargo target");
-        next.capture(target.path()).unwrap();
+        next.capture(target.path(), &CommittedOutputSeeds::default())
+            .unwrap();
         assert!(!family_path(state.path(), [1; 32]).join("previous").exists());
     }
 
@@ -1830,7 +2192,9 @@ mod tests {
             &|| false,
         )
         .unwrap();
-        first.capture(target.path()).unwrap();
+        first
+            .capture(target.path(), &CommittedOutputSeeds::default())
+            .unwrap();
         let target_time = fs::metadata(target.path().join("artifact"))
             .unwrap()
             .modified()
@@ -1900,7 +2264,9 @@ mod tests {
                 &|| false,
             )
             .unwrap();
-            cache.capture(target.path()).unwrap();
+            cache
+                .capture(target.path(), &CommittedOutputSeeds::default())
+                .unwrap();
             let seed = family_path(state.path(), [4; 32]).join("seed");
             if corruption == 1 {
                 let mut envelope: SeedEnvelope =
@@ -1945,7 +2311,9 @@ mod tests {
             // produced a successful independent cold target. Neither case
             // requires another cold command before a healthy seed is retained.
             assert_eq!(seed.exists(), corruption == 0);
-            cache.capture(target.path()).unwrap();
+            cache
+                .capture(target.path(), &CommittedOutputSeeds::default())
+                .unwrap();
             drop(cache);
             let mut recovered = TargetState::open(
                 state.path(),
@@ -1987,7 +2355,9 @@ mod tests {
                 &|| false,
             )
             .unwrap();
-            cache.capture(target.path()).unwrap();
+            cache
+                .capture(target.path(), &CommittedOutputSeeds::default())
+                .unwrap();
             let seed = family_path(state.path(), [9; 32]).join("seed");
             let metadata = fs::read(seed.join(METADATA)).unwrap();
             let candidate_owner = private();
@@ -2010,7 +2380,9 @@ mod tests {
             // The caller keeps this adapter, runs Cargo with its original
             // cold target, and captures only after successful process drain.
             completed_target(target.path(), b"successful cold replacement");
-            cache.capture(target.path()).unwrap();
+            cache
+                .capture(target.path(), &CommittedOutputSeeds::default())
+                .unwrap();
             drop(cache);
             let next_workspace = private();
             source(next_workspace.path(), b"source");
@@ -2056,7 +2428,7 @@ mod tests {
             &|| false,
         )
         .unwrap()
-        .capture(old_target.path())
+        .capture(old_target.path(), &CommittedOutputSeeds::default())
         .unwrap();
         let seed = family_path(state.path(), [10; 32]).join("seed");
         let metadata = fs::read(seed.join(METADATA)).unwrap();
@@ -2084,7 +2456,9 @@ mod tests {
 
         let cold_target = private();
         completed_target(cold_target.path(), b"artifact from edited source");
-        cache.capture(cold_target.path()).unwrap();
+        cache
+            .capture(cold_target.path(), &CommittedOutputSeeds::default())
+            .unwrap();
         drop(cache);
         let mut next = TargetState::open(
             state.path(),
@@ -2126,7 +2500,9 @@ mod tests {
                 &|| false,
             )
             .unwrap();
-            cache.capture(target.path()).unwrap();
+            cache
+                .capture(target.path(), &CommittedOutputSeeds::default())
+                .unwrap();
             let root = family_path(state.path(), [5; 32]);
             create_private(&root.join("pending")).unwrap();
             create_private(&root.join("pending/target")).unwrap();
@@ -2179,13 +2555,23 @@ mod tests {
             &|| false,
         )
         .unwrap();
-        cache.capture(target.path()).unwrap();
+        cache
+            .capture(target.path(), &CommittedOutputSeeds::default())
+            .unwrap();
         let seed = family_path(state.path(), [6; 32]).join("seed/target/artifact");
         completed_target(target.path(), b"oversized target bytes");
-        assert!(cache.capture(target.path()).is_err());
+        assert!(
+            cache
+                .capture(target.path(), &CommittedOutputSeeds::default())
+                .is_err()
+        );
         assert_eq!(fs::read(&seed).unwrap(), b"valid");
         fs::write(workspace.path().join("lib.rs"), b"mutated during execution").unwrap();
-        assert!(cache.capture(target.path()).is_err());
+        assert!(
+            cache
+                .capture(target.path(), &CommittedOutputSeeds::default())
+                .is_err()
+        );
         assert_eq!(fs::read(seed).unwrap(), b"valid");
     }
 

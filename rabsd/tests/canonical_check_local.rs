@@ -5005,6 +5005,17 @@ fn workspace_dag_metadata_observations(
     target_state: &str,
     names: &[&str],
 ) -> Vec<String> {
+    workspace_dag_metadata_observations_with_fresh(events, output, target_state, names, &[], true)
+}
+
+fn workspace_dag_metadata_observations_with_fresh(
+    events: &[Value],
+    output: &str,
+    target_state: &str,
+    names: &[&str],
+    fresh: &[&str],
+    include_consumer: bool,
+) -> Vec<String> {
     let started = events
         .iter()
         .filter(|event| event["kind"] == "canonical-compilation-started")
@@ -5024,18 +5035,26 @@ fn workspace_dag_metadata_observations(
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter(|event| event["reason"] == "compiler-artifact")
         .collect::<Vec<_>>();
-    assert_eq!(artifacts.len(), names.len() + 1, "{output}");
+    assert_eq!(
+        artifacts.len(),
+        names.len() + usize::from(include_consumer),
+        "{output}"
+    );
     for name in names
         .iter()
         .copied()
-        .chain([WORKSPACE_METADATA_DAG_CONSUMER])
+        .chain(include_consumer.then_some(WORKSPACE_METADATA_DAG_CONSUMER))
     {
         let matching = artifacts
             .iter()
             .filter(|event| event["target"]["name"] == name)
             .collect::<Vec<_>>();
         assert_eq!(matching.len(), 1, "{name}: {output}");
-        assert_eq!(matching[0]["fresh"], false, "{output}");
+        assert_eq!(
+            matching[0]["fresh"],
+            fresh.contains(&name),
+            "{name}: {output}"
+        );
         assert!(matching[0]["executable"].is_null(), "{output}");
     }
     workspace_dag_diagnostics(output, names)
@@ -5050,11 +5069,20 @@ fn workspace_dag_metadata_files(
     output: &str,
     names: &[&str],
 ) -> BTreeMap<String, Vec<u8>> {
+    workspace_dag_metadata_files_with_consumer(target, output, names, true)
+}
+
+fn workspace_dag_metadata_files_with_consumer(
+    target: &Path,
+    output: &str,
+    names: &[&str],
+    include_consumer: bool,
+) -> BTreeMap<String, Vec<u8>> {
     let mut files = BTreeMap::new();
     for name in names
         .iter()
         .copied()
-        .chain([WORKSPACE_METADATA_DAG_CONSUMER])
+        .chain(include_consumer.then_some(WORKSPACE_METADATA_DAG_CONSUMER))
     {
         let metadata = delivered_cargo_outputs(target, output, name, "rmeta");
         assert_eq!(metadata.len(), 1, "{name}: {output}");
@@ -5097,7 +5125,10 @@ fn workspace_dag_metadata_files(
                 .is_none()
         );
     }
-    assert_eq!(files.len(), (names.len() + 1) * 2);
+    assert_eq!(
+        files.len(),
+        (names.len() + usize::from(include_consumer)) * 2
+    );
     files
 }
 
@@ -5647,6 +5678,344 @@ fn mixed_workspace_dag_replay(command: &str) {
     if command == "check" {
         assert!(fs::read_dir(root.join("ops")).unwrap().next().is_none());
     }
+    worker.finish();
+}
+
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; restored Cargo Fresh parents must preserve committed metadata authority across coordinator restarts and producer revocation"]
+fn canonical_warm_workspace_metadata_preserves_committed_provenance_across_restarts() {
+    warm_committed_metadata_replay(false);
+}
+
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; restored immutable and workspace producers must preserve mixed metadata authority across coordinator restarts and producer revocation"]
+fn canonical_warm_mixed_metadata_preserves_committed_provenance_across_restarts() {
+    warm_committed_metadata_replay(true);
+}
+
+fn warm_committed_metadata_replay(mixed: bool) {
+    use rabs_cas::metadata_store::{QuarantineScope, RabsMetadataStore};
+
+    let (owner, mut profile) = native_fixture();
+    let root = owner.path();
+    let first = root.join("warm-metadata-a");
+    let second = root.join("warm-metadata-b");
+    for source in [&first, &second] {
+        if mixed {
+            mixed_workspace_dag_source(source, false);
+        } else {
+            closed_workspace_dag_source(source);
+        }
+        let library = fs::read_to_string(source.join("top/src/lib.rs")).unwrap();
+        write(
+            source,
+            "top/src/lib.rs",
+            format!(
+                "{library}\npub const EDIT: usize = include_str!(\"../../top-value.txt\").len();\n"
+            ),
+        );
+        // Membership stays identical throughout. Only this already-present
+        // file changes; neither parent reads it.
+        write(source, "top-value.txt", "a");
+    }
+    profile["source_root"] = json!(first);
+    profile["command"] = json!("check");
+    profile["selection"] = json!({"workspace":true,"lib":true});
+    profile["env"] = json!({"WORKSPACE_DAG_INPUT":"warm committed metadata environment"});
+    profile["jobs"] = json!(1);
+    profile["target_cache"] =
+        json!({"runtime_epoch":"warm-committed-metadata-v1","max_bytes":268435456});
+    if !mixed {
+        profile["vendor"] = Value::Null;
+    }
+
+    // Independent stock controls use their own store and target family. They
+    // cannot seed remote qualification or change its required sample count.
+    let stock_root = root.join("stock-control");
+    for directory in [
+        stock_root.clone(),
+        stock_root.join("state"),
+        stock_root.join("ops"),
+    ] {
+        fs::DirBuilder::new().mode(0o700).create(directory).unwrap();
+    }
+    let mut stock_profile = profile.clone();
+    stock_profile["state_root"] = json!(stock_root.join("state"));
+    stock_profile["operation_root"] = json!(stock_root.join("ops"));
+    let variants = ["a", "bb"];
+    let mut stock = Vec::new();
+    for (variant, value) in variants.iter().enumerate() {
+        write(&first, "top-value.txt", value);
+        let (code, events, output) = run(root, 1200 + variant as u32, &stock_profile);
+        assert_eq!(code, 0, "{output}");
+        assert!(decisions(&events, "remote-offer").is_empty(), "{output}");
+        assert!(decisions(&events, "hit").is_empty(), "{output}");
+        let diagnostics = workspace_dag_metadata_observations_with_fresh(
+            &events,
+            &output,
+            if variant == 0 { "cold" } else { "restored" },
+            &WORKSPACE_DAG_NAMES,
+            if variant == 0 {
+                &[]
+            } else {
+                &WORKSPACE_DAG_NAMES[..2]
+            },
+            false,
+        );
+        stock.push((
+            workspace_dag_metadata_files_with_consumer(
+                &sole_retained_target(&stock_root),
+                &output,
+                &WORKSPACE_DAG_NAMES,
+                false,
+            ),
+            diagnostics,
+        ));
+    }
+    let (top_metadata, first_bytes) = stock[0]
+        .0
+        .iter()
+        .find(|(path, _)| {
+            path.ends_with(".rmeta")
+                && Path::new(path)
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with(&format!("lib{}-", WORKSPACE_DAG_NAMES[2]))
+        })
+        .unwrap();
+    assert_ne!(
+        first_bytes, &stock[1].0[top_metadata],
+        "the public constant edit must change actual metadata bytes"
+    );
+    assert!(
+        fs::read_dir(stock_root.join("ops"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+
+    let (mut worker, environment) = NativeWorker::start(root);
+    let mut keys = BTreeMap::new();
+    let mut top_keys: [Option<String>; 2] = [None, None];
+    let mut request_ids = BTreeSet::new();
+    let mut executions = 0;
+    for number in 1..=8 {
+        let variant = ((number - 1) % 2) as usize;
+        let source = if number < 5 { &first } else { &second };
+        profile["source_root"] = json!(source);
+        write(source, "top-value.txt", variants[variant]);
+        let hit = number > 6;
+        let before_journal = hit.then(|| read_bounded(&worker.state.join("requests.json")));
+        // run_with_environment starts and joins a distinct coordinator
+        // process each time. The private target family is never changed.
+        let (code, events, output) =
+            run_with_environment(root, 1210 + number, &profile, &environment);
+        assert_eq!(code, 0, "{output}\nworker: {:?}", worker.events());
+        let diagnostics = workspace_dag_metadata_observations_with_fresh(
+            &events,
+            &output,
+            if number == 1 { "cold" } else { "restored" },
+            &WORKSPACE_DAG_NAMES,
+            if number == 1 {
+                &[]
+            } else {
+                &WORKSPACE_DAG_NAMES[..2]
+            },
+            false,
+        );
+        assert!(decisions(&events, "execute").is_empty(), "{output}");
+        assert!(
+            !events.iter().any(|event| matches!(
+                event["kind"].as_str(),
+                Some("rabsd-remote-dependency-failed" | "rabsd-remote-dependency-install-failed")
+            )),
+            "warm metadata completion fell back locally: {output}"
+        );
+        let offered = decisions(&events, "remote-offer");
+        let hits = decisions(&events, "hit");
+        let expected_offers = if number == 1 {
+            BTreeSet::from(WORKSPACE_DAG_NAMES)
+        } else if hit {
+            BTreeSet::new()
+        } else {
+            BTreeSet::from([WORKSPACE_DAG_NAMES[2]])
+        };
+        assert_eq!(
+            offered.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+            expected_offers,
+            "Cargo Fresh parents must not be re-executed: {output}"
+        );
+        assert_eq!(
+            hits.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+            if hit {
+                BTreeSet::from([WORKSPACE_DAG_NAMES[2]])
+            } else {
+                BTreeSet::new()
+            },
+            "only the independently qualified edited consumer may replay: {output}"
+        );
+        if number == 1 {
+            for name in &WORKSPACE_DAG_NAMES[..2] {
+                keys.insert((*name).to_owned(), offered[*name].clone());
+            }
+        }
+        let actual = if hit { &hits } else { &offered };
+        let top = actual[WORKSPACE_DAG_NAMES[2]].clone();
+        if let Some(previous) = &top_keys[variant] {
+            assert_eq!(
+                &top, previous,
+                "restoring a prior source variant split its action key"
+            );
+        } else {
+            top_keys[variant] = Some(top.clone());
+        }
+        if number == 2 {
+            assert_ne!(
+                top_keys[0], top_keys[1],
+                "the source edit must change the consumer key"
+            );
+        }
+        if hit {
+            assert!(
+                events
+                    .iter()
+                    .any(|event| { event["decision"] == "served" && event["key"] == top }),
+                "the earned metadata hit was not installed: {output}"
+            );
+        }
+        keys.insert(WORKSPACE_DAG_NAMES[2].to_owned(), top);
+        let expected = offered.values().cloned().collect::<BTreeSet<_>>();
+        for kind in [
+            "rabsd-remote-dependency-admitted",
+            "rabsd-remote-dependency-executed",
+        ] {
+            let actual = events
+                .iter()
+                .filter(|event| event["kind"] == kind)
+                .map(|event| event["key"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(actual.len(), expected.len(), "{kind}: {output}");
+            assert_eq!(
+                actual.into_iter().collect::<BTreeSet<_>>(),
+                expected,
+                "{output}"
+            );
+        }
+        for (index, name) in WORKSPACE_DAG_NAMES.iter().enumerate() {
+            let class = match (mixed, index) {
+                (true, 0) => "rustc-dependency-compile",
+                (false, 0) => "rustc-workspace-closed-metadata-v1",
+                (true, _) => "rustc-workspace-committed-mixed-metadata-v1",
+                (false, _) => "rustc-workspace-committed-metadata-v1",
+            };
+            assert_closed_workspace_leaf_evidence(
+                root,
+                &keys[*name],
+                if index < 2 {
+                    1
+                } else {
+                    ((number + 1) / 2).min(3) as usize
+                },
+                class,
+            );
+        }
+        if mixed {
+            assert_qualified_immutable_leaf(root, &keys[WORKSPACE_DAG_NAMES[0]], "check");
+        }
+        let files = workspace_dag_metadata_files_with_consumer(
+            &sole_retained_target(root),
+            &output,
+            &WORKSPACE_DAG_NAMES,
+            false,
+        );
+        assert_closed_workspace_dag_ancestry(root, &keys, &files);
+        assert_eq!(
+            &files, &stock[variant].0,
+            "stock/warm/replayed metadata bytes differ"
+        );
+        assert_eq!(
+            &diagnostics, &stock[variant].1,
+            "stock/warm/replayed diagnostics differ"
+        );
+        executions += offered.len();
+        if !offered.is_empty() {
+            assert!(request_ids.insert(worker.completed_receipt()["request_id"].as_u64().unwrap()));
+        }
+        assert_eq!(
+            worker
+                .events()
+                .iter()
+                .filter(|event| event["kind"] == "worker-toolchain-acquired")
+                .count(),
+            executions,
+            "only current compiler offers may acquire a worker toolchain"
+        );
+        if let Some(before) = before_journal {
+            assert_eq!(read_bounded(&worker.state.join("requests.json")), before);
+        }
+        assert!(fs::read_dir(root.join("ops")).unwrap().next().is_none());
+    }
+    assert_eq!(executions, 8);
+    assert_eq!(request_ids.len(), 6);
+
+    // Every Cargo unit would now be Fresh. Revocation must reject the trusted
+    // seed before Cargo can consume those bytes, even without a new wrapper
+    // request. Dropping only the registry proof would leave revoked metadata
+    // usable through ordinary Cargo freshness.
+    let seed_metadata = sole_retained_target(root)
+        .parent()
+        .unwrap()
+        .join("metadata.json");
+    let before_seed = read_bounded(&seed_metadata);
+    let before_journal = read_bounded(&worker.state.join("requests.json"));
+    {
+        let cas = rabsd::janitor::store::mount_and_reconcile(
+            &root.join("state/canonical-compile-v1/cas"),
+        )
+        .unwrap();
+        cas.store()
+            .lock()
+            .unwrap()
+            .add_quarantine(
+                QuarantineScope::ActionEntry,
+                &keys[WORKSPACE_DAG_NAMES[0]],
+                "native warm-target producer revocation",
+            )
+            .unwrap();
+    }
+    let (code, events, output) = run_with_environment(root, 1220, &profile, &environment);
+    assert_ne!(code, 0, "a revoked warm producer reached Cargo: {output}");
+    assert!(
+        output.to_ascii_lowercase().contains("quarantin"),
+        "{output}"
+    );
+    assert!(output.contains(&keys[WORKSPACE_DAG_NAMES[0]]), "{output}");
+    assert!(
+        !events.iter().any(|event| matches!(
+            event["kind"].as_str(),
+            Some(
+                "canonical-compilation-started"
+                    | "rabsd-remote-dependency-admitted"
+                    | "rabsd-remote-dependency-executed"
+            )
+        )),
+        "revoked committed bytes must be refused before Cargo starts: {output}"
+    );
+    assert!(
+        !output
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(|event| event["reason"] == "compiler-artifact"),
+        "Cargo used the revoked warm target: {output}"
+    );
+    assert_eq!(
+        read_bounded(&worker.state.join("requests.json")),
+        before_journal
+    );
+    assert_eq!(read_bounded(&seed_metadata), before_seed);
+    assert!(fs::read_dir(root.join("ops")).unwrap().next().is_none());
     worker.finish();
 }
 

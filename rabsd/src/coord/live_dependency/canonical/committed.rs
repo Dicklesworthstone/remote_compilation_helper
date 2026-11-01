@@ -5,13 +5,15 @@
 //! this registry only after verifying actual files in place. Metadata is
 //! registered before notifying Cargo; archives require complete installation.
 
-use super::CanonicalPaths;
+use super::{CanonicalPaths, ordinary_absolute};
+use crate::coord::canonical_local::RestoredTargetProvenance;
 use crate::coord::live::CoordLive;
 use crate::coord::live_dependency::remote::{QualifiedImmutableDependencyLeaf, RemoteValidation};
 use crate::coord::live_dependency::{
-    KnownOutput, LiveDependencyRequest, committed_output, object_id,
+    KnownOutput, LiveDependencyRequest, committed_output, known_installed_output, object_id,
 };
 use crate::edge::live_facts::{DependencyFacts, FileSig};
+use rabs_cas::digest_set::ATP_OBJECT_CONTENT_DOMAIN;
 use rabs_cas::manifest_codec::encode_manifest_v1;
 use rabs_cas::metadata_store::digest_key;
 use rabs_cas::publication::ProvisionalAncestorRef;
@@ -20,15 +22,24 @@ use rabs_key::live_dependency::workspace_dependency_cache::{
     CommittedDependencyPolicy, CommittedWorkspaceDependency,
     committed_dependency_descriptor_policy, validate_committed_workspace_dependencies,
 };
+use rabs_key::typed_digest::{DOMAIN_ACTION_KEY, DOMAIN_DESCRIPTOR};
 use rabs_protocol::authority::CoordinatorAuthority;
-use rabs_protocol::result_identity::{CanonicalActionResultManifest, ObjectId, OutputRole};
+use rabs_protocol::raw_bytes::RawBytes;
+use rabs_protocol::result_identity::{
+    CanonicalActionResultManifest, DigestAlgorithm, ObjectId, OutputRole, TypedDigest,
+};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 
 // Several profiles/directories can occur within an operation. A full registry
 // stops minting entries; future consumers safely retain fresh execution.
 const MAX_COMMITTED_OUTPUTS: usize = 16_384;
+const TARGET_ROOT: &str = "/__rabs/out/cargo";
+const MAX_SEED_PATH_BYTES: usize = 4096;
 
 #[derive(Debug, Clone)]
 struct InstalledProducer {
@@ -39,6 +50,213 @@ struct InstalledProducer {
 
 #[derive(Debug, Default)]
 pub(super) struct CommittedOutputs(Mutex<BTreeMap<PathBuf, InstalledProducer>>);
+
+/// Historical installation provenance carried by one private target seed.
+///
+/// These serialized facts confer no current file or coordinator authority.
+/// Only the target-state owner can bind a verified restored tree to them; a
+/// subsequent rehydration checks actual bytes and current producer safety.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CommittedOutputSeeds {
+    outputs: Vec<CommittedOutputSeed>,
+}
+
+/// A changed local output can prevent optional retention without invalidating
+/// the completed build. Revoked known producers cannot: Cargo may have reused
+/// those bytes without executing a wrapper that would recheck their lineage.
+#[derive(Debug)]
+pub(crate) enum CommittedOutputExportError {
+    CannotRetain(String),
+    InvalidProducer(String),
+}
+
+impl std::fmt::Display for CommittedOutputExportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CannotRetain(reason) | Self::InvalidProducer(reason) => {
+                formatter.write_str(reason)
+            }
+        }
+    }
+}
+
+impl std::error::Error for CommittedOutputExportError {}
+
+/// The format fixes each digest field's algorithm and domain. Stored text can
+/// neither invent a digest domain nor reinterpret another class of object.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommittedOutputSeed {
+    path: String,
+    producer_action: [u8; 32],
+    producer_descriptor: [u8; 32],
+    producer_manifest: [u8; 32],
+    role: SeedRole,
+    virtual_path: Vec<u8>,
+    object: [u8; 32],
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum SeedRole {
+    Metadata,
+    Archive,
+}
+
+impl CommittedOutputSeed {
+    fn from_dependency(dependency: &CommittedWorkspaceDependency) -> Result<Self, String> {
+        let bytes = |digest: &TypedDigest, domain: &'static str| -> Result<[u8; 32], String> {
+            if digest.algorithm != DigestAlgorithm::Sha256V1 || digest.domain != domain {
+                return Err("committed target provenance has an unexpected digest domain".into());
+            }
+            Ok(digest.bytes)
+        };
+        Ok(Self {
+            path: dependency.path.clone(),
+            producer_action: bytes(&dependency.producer_action, DOMAIN_ACTION_KEY)?,
+            producer_descriptor: bytes(&dependency.producer_descriptor, DOMAIN_DESCRIPTOR)?,
+            producer_manifest: bytes(&dependency.producer_manifest, ATP_OBJECT_CONTENT_DOMAIN)?,
+            role: match dependency.role {
+                OutputRole::ProvisionalMetadata => SeedRole::Metadata,
+                OutputRole::Materializable => SeedRole::Archive,
+                _ => return Err("committed target provenance is not a Rust artifact".into()),
+            },
+            virtual_path: dependency.virtual_path.as_bytes().to_vec(),
+            object: bytes(&dependency.object.0, ATP_OBJECT_CONTENT_DOMAIN)?,
+        })
+    }
+
+    fn dependency(&self) -> CommittedWorkspaceDependency {
+        let digest = |domain: &'static str, bytes: [u8; 32]| TypedDigest {
+            algorithm: DigestAlgorithm::Sha256V1,
+            domain,
+            bytes,
+        };
+        CommittedWorkspaceDependency {
+            path: self.path.clone(),
+            producer_action: digest(DOMAIN_ACTION_KEY, self.producer_action),
+            producer_descriptor: digest(DOMAIN_DESCRIPTOR, self.producer_descriptor),
+            producer_manifest: digest(ATP_OBJECT_CONTENT_DOMAIN, self.producer_manifest),
+            role: match self.role {
+                SeedRole::Metadata => OutputRole::ProvisionalMetadata,
+                SeedRole::Archive => OutputRole::Materializable,
+            },
+            virtual_path: RawBytes::from(self.virtual_path.as_slice()),
+            object: ObjectId(digest(ATP_OBJECT_CONTENT_DOMAIN, self.object)),
+        }
+    }
+
+    fn relative_path(&self) -> Result<&Path, String> {
+        let path = Path::new(&self.path);
+        if self.path.len() > MAX_SEED_PATH_BYTES || !ordinary_absolute(path) {
+            return Err("committed target provenance path is not normalized".into());
+        }
+        let relative = path
+            .strip_prefix(TARGET_ROOT)
+            .map_err(|_| "committed target provenance is outside the Cargo target")?;
+        let name = relative
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or("committed target provenance has no artifact basename")?;
+        let suffix = match self.role {
+            SeedRole::Metadata => ".rmeta",
+            SeedRole::Archive => ".rlib",
+        };
+        if name.as_bytes() != self.virtual_path.as_slice() || !name.ends_with(suffix) {
+            return Err("committed target provenance role or output spelling differs".into());
+        }
+        Ok(relative)
+    }
+}
+
+impl CommittedOutputSeeds {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.outputs.is_empty()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.outputs.len()
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.outputs.len() > MAX_COMMITTED_OUTPUTS {
+            return Err("committed target provenance exceeds its output bound".into());
+        }
+        let mut previous: Option<&str> = None;
+        for output in &self.outputs {
+            output.relative_path()?;
+            if previous.is_some_and(|previous| previous >= output.path.as_str()) {
+                return Err("committed target provenance is not uniquely ordered".into());
+            }
+            previous = Some(output.path.as_str());
+        }
+        Ok(())
+    }
+
+    /// Check the privately copied target before publishing its seed. This does
+    /// not mint witnesses; it prevents a changed capture from replacing a good
+    /// seed with provenance referring to bytes that were never saved.
+    pub(crate) fn verify_target(
+        &self,
+        target: &Path,
+        stopped: &dyn Fn() -> bool,
+    ) -> io::Result<()> {
+        checkpoint(stopped)?;
+        self.validate().map_err(io::Error::other)?;
+        let before = std::fs::symlink_metadata(target)?;
+        if !before.is_dir() {
+            return Err(io::Error::other(
+                "committed target provenance requires an ordinary target directory",
+            ));
+        }
+        for output in &self.outputs {
+            checkpoint(stopped)?;
+            let mut physical = target.to_path_buf();
+            for component in output
+                .relative_path()
+                .map_err(io::Error::other)?
+                .components()
+            {
+                physical.push(component.as_os_str());
+                if std::fs::symlink_metadata(&physical)?
+                    .file_type()
+                    .is_symlink()
+                {
+                    return Err(io::Error::other(
+                        "committed target provenance traverses a symlink",
+                    ));
+                }
+            }
+            let installed = known_installed_output(&physical, &output.dependency().object.0)
+                .map_err(io::Error::other)?;
+            if installed.sig.size() == 0 {
+                return Err(io::Error::other(
+                    "committed target provenance contains an empty Rust artifact",
+                ));
+            }
+        }
+        checkpoint(stopped)?;
+        let after = std::fs::symlink_metadata(target)?;
+        if !after.is_dir() || (before.dev(), before.ino()) != (after.dev(), after.ino()) {
+            return Err(io::Error::other(
+                "committed target provenance root changed during verification",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn checkpoint(stopped: &dyn Fn() -> bool) -> io::Result<()> {
+    if stopped() {
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "committed target provenance verification cancelled",
+        ))
+    } else {
+        Ok(())
+    }
+}
 
 /// Opaque proof for one original dependency observation. Only the canonical
 /// operation can construct it from verified committed installations. Neither
@@ -157,6 +375,202 @@ impl CommittedWorkspaceInputs {
 }
 
 impl CanonicalPaths {
+    /// Capture only this operation's verified installed producers after Cargo
+    /// and publication writers drain, while the coordinator is still live.
+    /// Raw target files and local/request-owned results never enter this map.
+    pub(crate) fn export_committed_outputs(
+        &self,
+        coordinator: &Arc<CoordLive>,
+        stopped: &dyn Fn() -> bool,
+    ) -> Result<CommittedOutputSeeds, CommittedOutputExportError> {
+        use CommittedOutputExportError::{CannotRetain, InvalidProducer};
+
+        checkpoint(stopped).map_err(|error| CannotRetain(error.to_string()))?;
+        let authority = coordinator.authority().ok_or_else(|| {
+            InvalidProducer("committed target export has no coordinator authority".into())
+        })?;
+        let registered = self
+            .committed_outputs
+            .0
+            .lock()
+            .map_err(|_| InvalidProducer("committed output registry poisoned".into()))?
+            .clone();
+        if registered
+            .values()
+            .any(|witness| witness.authority != authority)
+        {
+            return Err(InvalidProducer(
+                "committed target export lost its coordinator authority".into(),
+            ));
+        }
+        let dependencies = registered
+            .values()
+            .map(|witness| witness.dependency.clone())
+            .collect::<Vec<_>>();
+        // Check every known producer even if an earlier local replacement will
+        // prevent retention. A stale file must not hide another Fresh unit's
+        // revoked publication, including its transitive or immutable parents.
+        Self::verify_seed_producers(coordinator, &authority, &dependencies, stopped)?;
+        let mut seeds = CommittedOutputSeeds {
+            outputs: registered
+                .values()
+                .map(|witness| CommittedOutputSeed::from_dependency(&witness.dependency))
+                .collect::<Result<_, _>>()
+                .map_err(CannotRetain)?,
+        };
+        // Physical PathBuf ordering compares components, while the durable
+        // format orders canonical path bytes across every retained directory.
+        seeds
+            .outputs
+            .sort_unstable_by(|left, right| left.path.cmp(&right.path));
+        let pending = self.observe_seed_outputs(&seeds, stopped);
+        // Hashing can be lengthy. Recheck current producer safety afterwards,
+        // including when an output changed and optional retention must fail.
+        Self::verify_seed_producers(coordinator, &authority, &dependencies, stopped)?;
+        let pending = pending.map_err(CannotRetain)?;
+        for (path, generation, _) in &pending {
+            let witness = registered.get(path).ok_or_else(|| {
+                CannotRetain("committed target export changed its original output path".into())
+            })?;
+            if witness.generation != *generation {
+                return Err(CannotRetain(
+                    "committed target export lost its installed generation".into(),
+                ));
+            }
+        }
+        self.verify_seed_generations(&pending, stopped)
+            .map_err(CannotRetain)?;
+        Ok(seeds)
+    }
+
+    /// Only a completely restored private target can re-establish installation
+    /// witnesses. Historical rows never supply a file generation or authority:
+    /// both are acquired now, before Cargo can use any restored output.
+    pub(crate) fn rehydrate_committed_outputs(
+        &self,
+        coordinator: &Arc<CoordLive>,
+        restored: RestoredTargetProvenance,
+        stopped: &dyn Fn() -> bool,
+    ) -> Result<usize, String> {
+        checkpoint(stopped).map_err(|error| error.to_string())?;
+        let target = self.physical(Path::new(TARGET_ROOT))?;
+        let seeds = restored
+            .seeds_for(&target)
+            .map_err(|error| format!("restored committed target ownership: {error}"))?;
+        if !self
+            .committed_outputs
+            .0
+            .lock()
+            .map_err(|_| "committed output registry poisoned")?
+            .is_empty()
+        {
+            return Err("restored committed outputs require an unused operation registry".into());
+        }
+        let authority = coordinator
+            .authority()
+            .ok_or("restored committed outputs have no coordinator authority")?;
+        let pending = self.observe_seed_outputs(seeds, stopped)?;
+        Self::verify_seed_producers(
+            coordinator,
+            &authority,
+            &pending
+                .iter()
+                .map(|(_, _, dependency)| dependency.clone())
+                .collect::<Vec<_>>(),
+            stopped,
+        )
+        .map_err(|error| format!("restored committed output provenance: {error}"))?;
+        self.verify_seed_generations(&pending, stopped)?;
+        restored
+            .seeds_for(&target)
+            .map_err(|error| format!("restored committed target ownership: {error}"))?;
+        let mut registered = self
+            .committed_outputs
+            .0
+            .lock()
+            .map_err(|_| "committed output registry poisoned")?;
+        if !registered.is_empty() {
+            return Err("restored committed output registry acquired another writer".into());
+        }
+        checkpoint(stopped).map_err(|error| error.to_string())?;
+        for (path, generation, dependency) in pending {
+            registered.insert(
+                path,
+                InstalledProducer {
+                    generation,
+                    authority: authority.clone(),
+                    dependency,
+                },
+            );
+        }
+        Ok(registered.len())
+    }
+
+    fn observe_seed_outputs(
+        &self,
+        seeds: &CommittedOutputSeeds,
+        stopped: &dyn Fn() -> bool,
+    ) -> Result<Vec<(PathBuf, FileSig, CommittedWorkspaceDependency)>, String> {
+        seeds.validate()?;
+        let mut pending = Vec::with_capacity(seeds.len());
+        for output in &seeds.outputs {
+            checkpoint(stopped).map_err(|error| error.to_string())?;
+            let dependency = output.dependency();
+            let physical = self.physical(Path::new(&dependency.path))?;
+            let installed = known_installed_output(&physical, &dependency.object.0)?;
+            if installed.sig.size() == 0 {
+                return Err("restored committed Rust artifact is empty".into());
+            }
+            pending.push((physical, installed.sig, dependency));
+        }
+        Ok(pending)
+    }
+
+    fn verify_seed_producers(
+        coordinator: &Arc<CoordLive>,
+        authority: &CoordinatorAuthority,
+        dependencies: &[CommittedWorkspaceDependency],
+        stopped: &dyn Fn() -> bool,
+    ) -> Result<(), CommittedOutputExportError> {
+        use CommittedOutputExportError::{CannotRetain, InvalidProducer};
+
+        checkpoint(stopped).map_err(|error| CannotRetain(error.to_string()))?;
+        if !dependencies.is_empty() {
+            coordinator
+                .verify_committed_dependencies(
+                    dependencies,
+                    // Keep all admitted producer families in the inventory. Each
+                    // later consumer still enforces its own narrower class policy.
+                    CommittedDependencyPolicy::WorkspaceDagMetadata,
+                )
+                .map_err(InvalidProducer)?;
+        }
+        if !coordinator.available() || coordinator.authority().as_ref() != Some(authority) {
+            return Err(InvalidProducer(
+                "committed target coordinator authority changed".into(),
+            ));
+        }
+        checkpoint(stopped).map_err(|error| CannotRetain(error.to_string()))
+    }
+
+    fn verify_seed_generations(
+        &self,
+        pending: &[(PathBuf, FileSig, CommittedWorkspaceDependency)],
+        stopped: &dyn Fn() -> bool,
+    ) -> Result<(), String> {
+        for (path, generation, dependency) in pending {
+            checkpoint(stopped).map_err(|error| error.to_string())?;
+            let metadata = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+            if self.physical(Path::new(&dependency.path))? != *path
+                || !metadata.is_file()
+                || FileSig::of(&metadata) != *generation
+            {
+                return Err("committed target output changed during producer verification".into());
+            }
+        }
+        checkpoint(stopped).map_err(|error| error.to_string())
+    }
+
     /// Every retained candidate, including unreferenced alternatives, must be an
     /// exact current generation installed by this operation from an admitted
     /// producer. The consumer class retains its own producer-policy boundary.
@@ -494,6 +908,583 @@ mod tests {
             installed,
             None,
         )
+    }
+
+    fn restored_owner(
+        paths: &CanonicalPaths,
+        seeds: CommittedOutputSeeds,
+    ) -> RestoredTargetProvenance {
+        // This is the explicit synthetic restore boundary for registry tests.
+        // The target-state tests exercise real seed storage and private copies.
+        RestoredTargetProvenance::for_test(&paths.physical(Path::new(TARGET_ROOT)).unwrap(), seeds)
+            .unwrap()
+    }
+
+    #[test]
+    fn restored_committed_parents_reestablish_consumer_witnesses_under_new_authority() {
+        for immutable in [false, true] {
+            for archive in [false, true] {
+                let fixture = WorkspaceLineageFixture::new();
+                let mut outputs = vec![(
+                    "libupstream.rmeta",
+                    OutputRole::ProvisionalMetadata,
+                    METADATA,
+                )];
+                if archive {
+                    outputs.push(("libupstream.rlib", OutputRole::Materializable, ARCHIVE));
+                }
+                // Only immutable qualification/class enrollment is synthetic.
+                // Publication, objects, installation and safety use real CAS.
+                let offer = if immutable {
+                    fixture.commit_immutable_leaf(71, &outputs, !archive)
+                } else if archive {
+                    fixture.commit_leaf(71, &outputs)
+                } else {
+                    fixture.commit_metadata_leaf(71, &outputs)
+                };
+                let original = paths();
+                let installed = outputs
+                    .iter()
+                    .map(|(name, _, bytes)| install_bytes(&original, &offer, name, bytes))
+                    .collect::<Vec<_>>();
+                let old_generation = installed[0].sig;
+                register(&original, &fixture, &offer, &installed).unwrap();
+                let consumer = match (immutable, archive) {
+                    (false, false) => CommittedDependencyPolicy::WorkspaceMetadata,
+                    (false, true) => CommittedDependencyPolicy::WorkspaceRlib,
+                    (true, false) => CommittedDependencyPolicy::MixedWorkspaceMetadata,
+                    (true, true) => CommittedDependencyPolicy::MixedWorkspaceRlib,
+                };
+                let before = original
+                    .capture_committed_inputs(
+                        &fixture.coord,
+                        observed(&original, archive),
+                        consumer,
+                    )
+                    .unwrap();
+                let seeds = original
+                    .export_committed_outputs(&fixture.coord, &|| false)
+                    .unwrap();
+                assert_eq!(seeds.len(), outputs.len());
+                let serialized = serde_json::to_vec(&seeds).unwrap();
+                let seeds = serde_json::from_slice(&serialized).unwrap();
+
+                let restored = paths();
+                for (name, _, bytes) in &outputs {
+                    install_bytes(&restored, &offer, name, bytes);
+                }
+                assert!(
+                    restored
+                        .capture_committed_inputs(
+                            &fixture.coord,
+                            observed(&restored, archive),
+                            consumer,
+                        )
+                        .is_err(),
+                    "retained bytes alone must not grant installation authority"
+                );
+                fixture.coord.mark_down();
+                let restarted = Arc::new(CoordLive::with_cas(Arc::clone(&fixture.cas)));
+                restarted
+                    .acquire_boot_authority("workspace-lineage-fixture")
+                    .unwrap();
+                restarted.mark_up();
+                assert!(before.verify_original().is_err());
+                assert_eq!(
+                    restored
+                        .rehydrate_committed_outputs(
+                            &restarted,
+                            restored_owner(&restored, seeds),
+                            &|| false,
+                        )
+                        .unwrap(),
+                    outputs.len()
+                );
+                let after = restored
+                    .capture_committed_inputs(&restarted, observed(&restored, archive), consumer)
+                    .unwrap();
+                after.verify_original().unwrap();
+                assert_eq!(after.dependencies(), before.dependencies());
+                {
+                    let registered = restored.committed_outputs.0.lock().unwrap();
+                    let metadata = restored
+                        .physical(&Path::new(OUTPUT).join("libupstream.rmeta"))
+                        .unwrap();
+                    let witness = registered.get(&metadata).unwrap();
+                    assert_ne!(witness.generation, old_generation);
+                    assert_eq!(Some(&witness.authority), restarted.authority().as_ref());
+                }
+                assert_eq!(
+                    serde_json::to_vec(
+                        &restored
+                            .export_committed_outputs(&restarted, &|| false)
+                            .unwrap()
+                    )
+                    .unwrap(),
+                    serialized,
+                    "durable provenance must contain neither physical generation nor boot authority"
+                );
+                if !archive {
+                    assert!(
+                        restored
+                            .capture_committed_inputs(
+                                &restarted,
+                                observed(&restored, false),
+                                CommittedDependencyPolicy::MixedWorkspaceRlib,
+                            )
+                            .is_err(),
+                        "restoration must preserve the metadata/archive producer boundary"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn restored_committed_output_failure_never_partially_registers_the_seed() {
+        for fault in [
+            "changed",
+            "missing",
+            "quarantined",
+            "changed-manifest",
+            "cancelled",
+            "foreign-owner",
+        ] {
+            let fixture = WorkspaceLineageFixture::new();
+            let outputs = [
+                (
+                    "libupstream.rmeta",
+                    OutputRole::ProvisionalMetadata,
+                    METADATA,
+                ),
+                ("libupstream.rlib", OutputRole::Materializable, ARCHIVE),
+            ];
+            let offer = fixture.commit_leaf(72, &outputs);
+            let original = paths();
+            let installed = outputs
+                .iter()
+                .map(|(name, _, bytes)| install_bytes(&original, &offer, name, bytes))
+                .collect::<Vec<_>>();
+            register(&original, &fixture, &offer, &installed).unwrap();
+            let mut seeds = original
+                .export_committed_outputs(&fixture.coord, &|| false)
+                .unwrap();
+            if fault == "changed-manifest" {
+                seeds.outputs[0].producer_manifest[0] ^= 1;
+            }
+            let restored = paths();
+            for (name, _, bytes) in &outputs {
+                install_bytes(&restored, &offer, name, bytes);
+            }
+            let owner = restored_owner(
+                if fault == "foreign-owner" {
+                    &original
+                } else {
+                    &restored
+                },
+                seeds,
+            );
+            let metadata = restored
+                .physical(&Path::new(OUTPUT).join("libupstream.rmeta"))
+                .unwrap();
+            match fault {
+                "changed" => std::fs::write(&metadata, b"changed restored Rust metadata").unwrap(),
+                "missing" => {
+                    std::fs::rename(&metadata, metadata.with_extension("displaced")).unwrap();
+                }
+                "quarantined" => fixture.quarantine(&offer.manifest.action_key),
+                "changed-manifest" | "cancelled" | "foreign-owner" => {}
+                _ => unreachable!(),
+            }
+            assert!(
+                restored
+                    .rehydrate_committed_outputs(&fixture.coord, owner, &|| fault == "cancelled")
+                    .is_err(),
+                "{fault} provenance must not restore authority"
+            );
+            assert!(
+                restored.committed_outputs.0.lock().unwrap().is_empty(),
+                "{fault} must not leave a usable witness for the unchanged archive"
+            );
+        }
+    }
+
+    #[test]
+    fn restored_committed_output_rechecks_transitive_ancestor_revocation() {
+        let fixture = WorkspaceLineageFixture::new();
+        let ancestor = fixture.commit_metadata_leaf(
+            73,
+            &[(
+                "libancestor.rmeta",
+                OutputRole::ProvisionalMetadata,
+                b"original ancestor metadata",
+            )],
+        );
+        let offer = fixture.prepare_metadata(
+            74,
+            vec![ProvisionalAncestorRef {
+                producer_action_key: ancestor.manifest.action_key.clone(),
+                role: OutputRole::ProvisionalMetadata,
+                virtual_path: RawBytes::from("libancestor.rmeta"),
+                consumed_object: ancestor.manifest.logical_outputs[0].object.clone(),
+            }],
+            &[(
+                "libupstream.rmeta",
+                OutputRole::ProvisionalMetadata,
+                METADATA,
+            )],
+        );
+        fixture.commit(&offer);
+        let original = paths();
+        let installed = install_bytes(&original, &offer, "libupstream.rmeta", METADATA);
+        register(&original, &fixture, &offer, &[installed]).unwrap();
+        let seeds = original
+            .export_committed_outputs(&fixture.coord, &|| false)
+            .unwrap();
+        let restored = paths();
+        install_bytes(&restored, &offer, "libupstream.rmeta", METADATA);
+        fixture.quarantine(&ancestor.manifest.action_key);
+        assert!(
+            restored
+                .rehydrate_committed_outputs(
+                    &fixture.coord,
+                    restored_owner(&restored, seeds),
+                    &|| false,
+                )
+                .is_err(),
+            "an unchanged immediate producer must not hide revoked upstream ancestry"
+        );
+        assert!(restored.committed_outputs.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn restored_dependency_dags_keep_their_policy_and_recheck_transitive_quarantine() {
+        for policy in [
+            CommittedDependencyPolicy::ImmutableDagMetadata,
+            CommittedDependencyPolicy::ImmutableDagRlib,
+            CommittedDependencyPolicy::WorkspaceDagMetadata,
+            CommittedDependencyPolicy::WorkspaceDagRlib,
+        ] {
+            let fixture = WorkspaceLineageFixture::new();
+            let archive = matches!(
+                policy,
+                CommittedDependencyPolicy::ImmutableDagRlib
+                    | CommittedDependencyPolicy::WorkspaceDagRlib
+            );
+            let workspace = matches!(
+                policy,
+                CommittedDependencyPolicy::WorkspaceDagMetadata
+                    | CommittedDependencyPolicy::WorkspaceDagRlib
+            );
+            let mut parent_outputs =
+                vec![("libparent.rmeta", OutputRole::ProvisionalMetadata, METADATA)];
+            let mut outputs = vec![(
+                "libupstream.rmeta",
+                OutputRole::ProvisionalMetadata,
+                METADATA,
+            )];
+            if archive {
+                parent_outputs.push(("libparent.rlib", OutputRole::Materializable, ARCHIVE));
+                outputs.push(("libupstream.rlib", OutputRole::Materializable, ARCHIVE));
+            }
+            let parent = fixture.commit_immutable_leaf(80, &parent_outputs, !archive);
+            let immutable = fixture.prepare_dag(
+                81,
+                vec![parent_dependency(&parent)],
+                &outputs,
+                if archive {
+                    CommittedDependencyPolicy::ImmutableDagRlib
+                } else {
+                    CommittedDependencyPolicy::ImmutableDagMetadata
+                },
+            );
+            fixture.commit(&immutable);
+            let offer = if workspace {
+                let offer =
+                    fixture.prepare_dag(82, vec![parent_dependency(&immutable)], &outputs, policy);
+                fixture.commit(&offer);
+                offer
+            } else {
+                immutable
+            };
+            let original = paths();
+            let installed = outputs
+                .iter()
+                .map(|(name, _, bytes)| install_bytes(&original, &offer, name, bytes))
+                .collect::<Vec<_>>();
+            register(&original, &fixture, &offer, &installed).unwrap();
+            let persisted = serde_json::to_vec(
+                &original
+                    .export_committed_outputs(&fixture.coord, &|| false)
+                    .unwrap(),
+            )
+            .unwrap();
+            let seeds: CommittedOutputSeeds = serde_json::from_slice(&persisted).unwrap();
+
+            fixture.coord.mark_down();
+            let restarted = Arc::new(CoordLive::with_cas(Arc::clone(&fixture.cas)));
+            restarted
+                .acquire_boot_authority("workspace-lineage-fixture")
+                .unwrap();
+            restarted.mark_up();
+            let restored = paths();
+            for (name, _, bytes) in &outputs {
+                install_bytes(&restored, &offer, name, bytes);
+            }
+            assert_eq!(
+                restored
+                    .rehydrate_committed_outputs(
+                        &restarted,
+                        restored_owner(&restored, seeds.clone()),
+                        &|| false,
+                    )
+                    .unwrap(),
+                outputs.len()
+            );
+            let candidates = observed(&restored, archive);
+            let inputs = restored
+                .capture_committed_inputs(&restarted, Arc::clone(&candidates), policy)
+                .unwrap();
+            inputs.verify_for_policy(policy).unwrap();
+            for legacy in [
+                CommittedDependencyPolicy::WorkspaceRlib,
+                CommittedDependencyPolicy::WorkspaceMetadata,
+                CommittedDependencyPolicy::MixedWorkspaceRlib,
+                CommittedDependencyPolicy::MixedWorkspaceMetadata,
+            ] {
+                assert!(
+                    restored
+                        .capture_committed_inputs(&restarted, Arc::clone(&candidates), legacy,)
+                        .is_err(),
+                    "restored {policy:?} must not widen legacy {legacy:?}"
+                );
+            }
+            if workspace {
+                assert!(
+                    restored
+                        .capture_committed_inputs(
+                            &restarted,
+                            Arc::clone(&candidates),
+                            CommittedDependencyPolicy::ImmutableDagMetadata,
+                        )
+                        .is_err(),
+                    "immutable consumers must not inherit workspace DAG authority"
+                );
+            }
+            if !archive {
+                assert!(
+                    restored
+                        .capture_committed_inputs(
+                            &restarted,
+                            Arc::clone(&candidates),
+                            CommittedDependencyPolicy::WorkspaceDagRlib,
+                        )
+                        .is_err(),
+                    "restored metadata DAGs must not authorize archive consumers"
+                );
+            }
+            restored
+                .export_committed_outputs(&restarted, &|| false)
+                .unwrap();
+
+            let rejected = paths();
+            for (name, _, bytes) in &outputs {
+                install_bytes(&rejected, &offer, name, bytes);
+            }
+            fixture.quarantine(&parent.manifest.action_key);
+            assert!(inputs.verify_original().is_err());
+            assert!(
+                rejected
+                    .rehydrate_committed_outputs(
+                        &restarted,
+                        restored_owner(&rejected, seeds),
+                        &|| false,
+                    )
+                    .is_err(),
+                "a revoked immutable root must reject the entire restored DAG"
+            );
+            assert!(rejected.committed_outputs.0.lock().unwrap().is_empty());
+            assert!(matches!(
+                restored.export_committed_outputs(&restarted, &|| false),
+                Err(CommittedOutputExportError::InvalidProducer(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn target_export_refuses_changed_generations_and_never_discovers_unregistered_producers() {
+        let fixture = WorkspaceLineageFixture::new();
+        let offer = fixture.commit_metadata_leaf(
+            75,
+            &[(
+                "libupstream.rmeta",
+                OutputRole::ProvisionalMetadata,
+                METADATA,
+            )],
+        );
+        let original = paths();
+        let installed = install_bytes(&original, &offer, "libupstream.rmeta", METADATA);
+        let seeds = original
+            .export_committed_outputs(&fixture.coord, &|| false)
+            .unwrap();
+        assert!(
+            seeds.is_empty(),
+            "matching a published CAS object must not discover installation authority"
+        );
+        let restored = paths();
+        install_bytes(&restored, &offer, "libupstream.rmeta", METADATA);
+        assert_eq!(
+            restored
+                .rehydrate_committed_outputs(
+                    &fixture.coord,
+                    restored_owner(&restored, seeds),
+                    &|| false,
+                )
+                .unwrap(),
+            0
+        );
+        assert!(
+            restored
+                .capture_committed_inputs(
+                    &fixture.coord,
+                    observed(&restored, false),
+                    CommittedDependencyPolicy::WorkspaceMetadata,
+                )
+                .is_err()
+        );
+        let metadata = installed.path.clone();
+        register(&original, &fixture, &offer, &[installed]).unwrap();
+        let replacement = metadata.with_extension("replacement");
+        std::fs::write(&replacement, METADATA).unwrap();
+        std::fs::rename(&metadata, metadata.with_extension("original")).unwrap();
+        std::fs::rename(&replacement, &metadata).unwrap();
+        assert!(
+            matches!(
+                original.export_committed_outputs(&fixture.coord, &|| false),
+                Err(CommittedOutputExportError::CannotRetain(_))
+            ),
+            "equal replacement bytes must not refresh the recorded installation generation"
+        );
+    }
+
+    #[test]
+    fn target_export_does_not_hide_revoked_fresh_producers_behind_changed_local_files() {
+        let fixture = WorkspaceLineageFixture::new();
+        let changed = fixture.commit_metadata_leaf(
+            78,
+            &[("libalpha.rmeta", OutputRole::ProvisionalMetadata, METADATA)],
+        );
+        let fresh = fixture.commit_metadata_leaf(
+            79,
+            &[(
+                "libupstream.rmeta",
+                OutputRole::ProvisionalMetadata,
+                METADATA,
+            )],
+        );
+        let original = paths();
+        let installed = install_bytes(&original, &changed, "libalpha.rmeta", METADATA);
+        let changed_path = installed.path.clone();
+        register(&original, &fixture, &changed, &[installed]).unwrap();
+        let installed = install_bytes(&original, &fresh, "libupstream.rmeta", METADATA);
+        register(&original, &fixture, &fresh, &[installed]).unwrap();
+        std::fs::write(&changed_path, b"a locally replaced output").unwrap();
+        fixture.quarantine(&fresh.manifest.action_key);
+        assert!(
+            matches!(
+                original.export_committed_outputs(&fixture.coord, &|| false),
+                Err(CommittedOutputExportError::InvalidProducer(_))
+            ),
+            "known unsafe Fresh ancestry must be terminal even when another file prevents retention"
+        );
+    }
+
+    #[test]
+    fn committed_seed_schema_rejects_aliases_roles_duplicate_rows_and_untyped_digests() {
+        let fixture = WorkspaceLineageFixture::new();
+        let offer = fixture.commit_metadata_leaf(
+            76,
+            &[(
+                "libupstream.rmeta",
+                OutputRole::ProvisionalMetadata,
+                METADATA,
+            )],
+        );
+        let original = paths();
+        let installed = install_bytes(&original, &offer, "libupstream.rmeta", METADATA);
+        register(&original, &fixture, &offer, &[installed]).unwrap();
+        let seeds = original
+            .export_committed_outputs(&fixture.coord, &|| false)
+            .unwrap();
+        for path in [
+            "/__rabs/workspace/libupstream.rmeta",
+            "/__rabs/out/cargo/../libupstream.rmeta",
+            "/__rabs/out/cargo//debug/deps/libupstream.rmeta",
+            "/__rabs/out/cargo/debug/deps/other.rmeta",
+        ] {
+            let mut invalid = seeds.clone();
+            invalid.outputs[0].path = path.to_owned();
+            assert!(invalid.validate().is_err(), "{path}");
+        }
+        let mut invalid = seeds.clone();
+        invalid.outputs[0].role = SeedRole::Archive;
+        assert!(invalid.validate().is_err());
+        let mut invalid = seeds.clone();
+        invalid.outputs.push(invalid.outputs[0].clone());
+        assert!(invalid.validate().is_err());
+        let invalid = CommittedOutputSeeds {
+            outputs: vec![seeds.outputs[0].clone(); MAX_COMMITTED_OUTPUTS + 1],
+        };
+        assert!(invalid.validate().is_err());
+        let mut dependency = seeds.outputs[0].dependency();
+        dependency.producer_manifest.domain = DOMAIN_ACTION_KEY;
+        assert!(CommittedOutputSeed::from_dependency(&dependency).is_err());
+        let mut encoded = serde_json::to_value(&seeds).unwrap();
+        encoded["outputs"][0]["authority"] = serde_json::json!("invented owner");
+        assert!(serde_json::from_value::<CommittedOutputSeeds>(encoded).is_err());
+    }
+
+    #[test]
+    fn target_export_orders_provenance_across_distinct_output_directories() {
+        let fixture = WorkspaceLineageFixture::new();
+        let offer = fixture.commit_metadata_leaf(
+            77,
+            &[(
+                "libupstream.rmeta",
+                OutputRole::ProvisionalMetadata,
+                METADATA,
+            )],
+        );
+        let original = paths();
+        let installed = install_bytes(&original, &offer, "libupstream.rmeta", METADATA);
+        register(&original, &fixture, &offer, &[installed]).unwrap();
+        let other_directory = Path::new("/__rabs/out/cargo/debug-extra/deps");
+        let other = original.physical(other_directory).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let other = other.join("libupstream.rmeta");
+        std::fs::write(&other, METADATA).unwrap();
+        let output = committed_output(&offer.manifest, &other).unwrap();
+        let installed = known_installed_output(&other, &output.object.0).unwrap();
+        original
+            .register_installed_producer(
+                &fixture.coord,
+                &offer.manifest,
+                &digest_key(&offer.manifest_id.0),
+                other_directory,
+                &[installed],
+                None,
+            )
+            .unwrap();
+        let seeds = original
+            .export_committed_outputs(&fixture.coord, &|| false)
+            .unwrap();
+        seeds.validate().unwrap();
+        assert_eq!(seeds.len(), 2);
+        assert_eq!(
+            seeds.outputs[0].path,
+            "/__rabs/out/cargo/debug-extra/deps/libupstream.rmeta"
+        );
+        assert_eq!(seeds.outputs[1].path, format!("{OUTPUT}/libupstream.rmeta"));
     }
 
     #[test]

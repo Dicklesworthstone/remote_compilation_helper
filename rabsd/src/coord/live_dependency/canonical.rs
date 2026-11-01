@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 mod committed;
 pub use committed::CommittedWorkspaceInputs;
+pub(crate) use committed::{CommittedOutputExportError, CommittedOutputSeeds};
 
 const ROOTS: [&str; 5] = [
     "/__rabs/workspace",
