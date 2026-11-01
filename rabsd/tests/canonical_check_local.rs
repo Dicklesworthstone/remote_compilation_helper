@@ -1397,6 +1397,9 @@ fn canonical_shared_workspace_queue_keeps_fresh_executions_and_cancels_one_waite
         "src/main.rs",
         "fn main() { println!(\"{}\", canonical_app::answer()); }\n",
     );
+    // A real selected project executor keeps this queue fixture in the fresh
+    // workspace class, even when ordinary leaf libraries can earn cache hits.
+    write(&source, "build.rs", "fn main() {}\n");
     let (mut worker, environment) = NativeWorker::start(root);
     let socket = root.join("canonical-service.sock");
     let service_profile = root.join("shared-workspace-queue-service.json");
@@ -4200,6 +4203,128 @@ fn retained_workspace_warning() {}
     );
 }
 
+fn closed_workspace_metadata_source(root: &Path) {
+    closed_workspace_leaf_source(root);
+    write(
+        root,
+        "member/Cargo.toml",
+        "[package]\nname='canonical_workspace_leaf'\nversion='0.1.0'\nedition='2021'\nautobins=false\n[[bin]]\nname='canonical_workspace_consumer'\npath='src/main.rs'\n",
+    );
+    write(
+        root,
+        "member/src/lib.rs",
+        r#"pub const INPUT: &str = include_str!("../../shared/value.txt");
+pub const ENVIRONMENT: &str = env!("WORKSPACE_METADATA_INPUT");
+pub const PRIMARY: &str = env!("CARGO_PRIMARY_PACKAGE");
+fn retained_workspace_warning() {}
+"#,
+    );
+    // The consumer independently reads current source/environment. Replaying
+    // stale library metadata makes these actual rustc type checks fail.
+    write(
+        root,
+        "member/src/main.rs",
+        r#"const _: [(); include_str!("../../shared/value.txt").len()] =
+    [(); canonical_workspace_leaf::INPUT.len()];
+const _: [(); env!("WORKSPACE_METADATA_INPUT").len()] =
+    [(); canonical_workspace_leaf::ENVIRONMENT.len()];
+const _: [(); 1] = [(); canonical_workspace_leaf::PRIMARY.len()];
+fn main() { panic!("RABS_CHECK_TARGET_EXECUTED"); }
+"#,
+    );
+}
+
+/// Check both actual Cargo units and retain the exact library diagnostics for
+/// stock/cold/hit comparison. Every request must reach rustc or cache serving;
+/// private Cargo target freshness cannot satisfy this fixture.
+fn closed_workspace_metadata_observations(
+    events: &[Value],
+    output: &str,
+    target_state: &str,
+) -> Vec<String> {
+    let started = events
+        .iter()
+        .filter(|event| event["kind"] == "canonical-compilation-started")
+        .collect::<Vec<_>>();
+    assert_eq!(started.len(), 1, "{output}");
+    assert_eq!(started[0]["command"], "check", "{output}");
+    assert_eq!(started[0]["private_target_state"], target_state, "{output}");
+    assert!(!output.contains("RABS_CHECK_TARGET_EXECUTED"), "{output}");
+    assert!(
+        !events.iter().any(|event| matches!(
+            event["kind"].as_str(),
+            Some(
+                "rabsd-remote-dependency-failed"
+                    | "rabsd-remote-dependency-install-failed"
+                    | "canonical-build-completed"
+            )
+        )),
+        "metadata checks must complete without fallback or executable delivery: {output}"
+    );
+    let artifacts = output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| event["reason"] == "compiler-artifact")
+        .collect::<Vec<_>>();
+    assert_eq!(artifacts.len(), 2, "{output}");
+    for name in ["canonical_workspace_leaf", "canonical_workspace_consumer"] {
+        let matching = artifacts
+            .iter()
+            .filter(|event| event["target"]["name"] == name)
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1, "{output}");
+        assert_eq!(matching[0]["fresh"], false, "{output}");
+        assert!(matching[0]["executable"].is_null(), "{output}");
+    }
+    let diagnostics = output
+        .lines()
+        .filter(|line| {
+            serde_json::from_str::<Value>(line).is_ok_and(|event| {
+                event["reason"] == "compiler-message"
+                    && event["target"]["name"] == "canonical_workspace_leaf"
+            })
+        })
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|line| line.contains("retained_workspace_warning")),
+        "the fixture must exercise actual library diagnostic replay: {output}"
+    );
+    diagnostics
+}
+
+/// Read installed outputs through Cargo's actual filename records, including
+/// the binary check's intentionally empty rmeta and each rustc dep-info file.
+fn closed_workspace_metadata_files(target: &Path, output: &str) -> BTreeMap<String, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    for name in ["canonical_workspace_leaf", "canonical_workspace_consumer"] {
+        let metadata = delivered_cargo_outputs(target, output, name, "rmeta");
+        assert_eq!(metadata.len(), 1, "{output}");
+        let metadata = &metadata[0];
+        let bytes = read_bounded(metadata);
+        assert_eq!(bytes.is_empty(), name == "canonical_workspace_consumer");
+        let filename = metadata.file_name().unwrap().to_str().unwrap();
+        files.insert(filename.to_owned(), bytes);
+        let stem = metadata.file_stem().unwrap().to_str().unwrap();
+        let dep_info = metadata
+            .parent()
+            .unwrap()
+            .join(format!("{}.d", stem.strip_prefix("lib").unwrap()));
+        assert_eq!(fs::canonicalize(&dep_info).unwrap(), dep_info);
+        assert!(fs::symlink_metadata(&dep_info).unwrap().is_file());
+        let bytes = read_bounded(&dep_info);
+        assert!(!bytes.is_empty());
+        files.insert(
+            dep_info.file_name().unwrap().to_str().unwrap().to_owned(),
+            bytes,
+        );
+    }
+    assert_eq!(files.len(), 4);
+    files
+}
+
 /// Read only user-delivered artifacts and the exact Cargo compiler-message
 /// lines. Each call must have a fresh target; Cargo freshness cannot satisfy
 /// this action-cache acceptance test.
@@ -4293,7 +4418,7 @@ fn closed_workspace_leaf_outputs(
 /// Inspect the real store only after its producing CLI has exited. Initial
 /// publication is not a comparison; only later independently admitted matching
 /// attempts may supply the two samples required by the unchanged serving gate.
-fn assert_closed_workspace_leaf_evidence(root: &Path, key: &str, executions: usize) {
+fn assert_closed_workspace_leaf_evidence(root: &Path, key: &str, executions: usize, class: &str) {
     use rabs_cas::metadata_store::{RabsMetadataStore, SqlValue};
 
     let cas =
@@ -4311,7 +4436,7 @@ fn assert_closed_workspace_leaf_evidence(root: &Path, key: &str, executions: usi
                 SqlValue::Text(key.to_owned()),
             ],
         ).unwrap(),
-        vec![vec![SqlValue::Text("rustc-workspace-closed-rlib-v1".into())]],
+        vec![vec![SqlValue::Text(class.into())]],
         "workspace publication must derive its own class from the submitted descriptor"
     );
     let attempts = store
@@ -4407,7 +4532,12 @@ fn canonical_cargo_workspace_leaf_archives_earn_hits_with_complete_source_closur
         }
         let receipt = worker.completed_receipt();
         assert!(request_ids.insert(receipt["request_id"].as_u64().unwrap()));
-        assert_closed_workspace_leaf_evidence(root, actual, number as usize);
+        assert_closed_workspace_leaf_evidence(
+            root,
+            actual,
+            number as usize,
+            "rustc-workspace-closed-rlib-v1",
+        );
     }
     let key = key.unwrap();
     let baseline = baseline.unwrap();
@@ -4464,7 +4594,7 @@ fn canonical_cargo_workspace_leaf_archives_earn_hits_with_complete_source_closur
                 .count(),
             executions
         );
-        assert_closed_workspace_leaf_evidence(root, &key, 3);
+        assert_closed_workspace_leaf_evidence(root, &key, 3, "rustc-workspace-closed-rlib-v1");
     }
 
     let mut previous_key = key;
@@ -4531,7 +4661,12 @@ fn canonical_cargo_workspace_leaf_archives_earn_hits_with_complete_source_closur
             );
         }
         assert!(request_ids.insert(worker.completed_receipt()["request_id"].as_u64().unwrap()));
-        assert_closed_workspace_leaf_evidence(root, &offered[NAME], 1);
+        assert_closed_workspace_leaf_evidence(
+            root,
+            &offered[NAME],
+            1,
+            "rustc-workspace-closed-rlib-v1",
+        );
         previous_key = offered[NAME].clone();
         previous_files = files;
     }
@@ -4566,8 +4701,271 @@ fn canonical_cargo_workspace_leaf_archives_earn_hits_with_complete_source_closur
 }
 
 #[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual stock/worker/cache metadata comparison and a fresh downstream Cargo consumer"]
+fn canonical_cargo_workspace_leaf_metadata_earns_hits_and_typechecks_a_fresh_consumer() {
+    const LEAF: &str = "canonical_workspace_leaf";
+    const CONSUMER: &str = "canonical_workspace_consumer";
+    const CLASS: &str = "rustc-workspace-closed-metadata-v1";
+
+    let (owner, mut profile) = native_fixture();
+    let root = owner.path();
+    let first = root.join("metadata-a");
+    let second = root.join("metadata-b");
+    closed_workspace_metadata_source(&first);
+    closed_workspace_metadata_source(&second);
+    profile["source_root"] = json!(first);
+    profile["vendor"] = Value::Null;
+    profile["command"] = json!("check");
+    profile["selection"] = json!({"lib":true,"bins":true});
+    profile["env"] = json!({"WORKSPACE_METADATA_INPUT":"first environment"});
+    assert!(profile.get("target_cache").is_none());
+
+    // Stock rustc runs through the same canonical Cargo namespace, without any
+    // configured worker or workspace cache authority. Capture its real outputs
+    // only for byte comparison; later requests cannot restore this family.
+    let mut stock_profile = profile.clone();
+    stock_profile["target_cache"] =
+        json!({"runtime_epoch":"closed-metadata-stock-v1", "max_bytes":268435456});
+    let (code, events, output) = run(root, 850, &stock_profile);
+    assert_eq!(code, 0, "{output}");
+    assert!(decisions(&events, "remote-offer").is_empty(), "{output}");
+    assert!(decisions(&events, "execute").is_empty(), "{output}");
+    assert!(decisions(&events, "hit").is_empty(), "{output}");
+    let stock_diagnostics = closed_workspace_metadata_observations(&events, &output, "cold");
+    let stock_target = sole_retained_target(root);
+    let stock_files = closed_workspace_metadata_files(&stock_target, &output);
+    let stock_family = stock_target.parent().unwrap().parent().unwrap();
+
+    let (mut worker, environment) = NativeWorker::start(root);
+    let mut previous_key: Option<String> = None;
+    let mut private_attempts = BTreeMap::new();
+    let mut worker_requests = BTreeSet::new();
+    let mut executions = 0;
+    for number in 1..=8 {
+        match number {
+            1..=4 => {}
+            5 => {
+                profile["source_root"] = json!(second);
+                // A different family must start cold. It retains the actual
+                // installed hit and consumer output without making Cargo Fresh.
+                profile["target_cache"] =
+                    json!({"runtime_epoch":"closed-metadata-hit-v1", "max_bytes":268435456});
+            }
+            6 => {
+                profile.as_object_mut().unwrap().remove("target_cache");
+                write(
+                    &second,
+                    "shared/value.txt",
+                    "changed source outside the library member\n",
+                );
+            }
+            7 => {
+                profile["env"]["WORKSPACE_METADATA_INPUT"] =
+                    json!("a different and longer environment input")
+            }
+            8 => write(
+                &second,
+                "directory-observations/new/marker",
+                "new unconsumed member\n",
+            ),
+            _ => unreachable!(),
+        }
+        let (code, events, output) =
+            run_with_environment(root, 850 + number, &profile, &environment);
+        assert_eq!(code, 0, "{output}\nworker: {:?}", worker.events());
+        let diagnostics = closed_workspace_metadata_observations(
+            &events,
+            &output,
+            if number == 5 { "cold" } else { "disabled" },
+        );
+        if number <= 5 {
+            assert_eq!(
+                diagnostics, stock_diagnostics,
+                "stock/cold/hit diagnostic divergence"
+            );
+        }
+        assert!(decisions(&events, "execute").is_empty(), "{output}");
+        let offered = decisions(&events, "remote-offer");
+        let hits = decisions(&events, "hit");
+        let hit = matches!(number, 4 | 5);
+        let leaf_key = if hit {
+            assert_eq!(
+                hits,
+                BTreeMap::from([(LEAF.to_owned(), previous_key.as_ref().unwrap().clone())]),
+                "only independently qualified library metadata may replay: {output}"
+            );
+            assert_eq!(
+                offered.len(),
+                1,
+                "the leaf hit dispatched compiler work: {output}"
+            );
+            assert!(offered.contains_key(CONSUMER), "{output}");
+            previous_key.as_ref().unwrap().clone()
+        } else {
+            assert!(
+                hits.is_empty(),
+                "unearned or invalidated metadata replayed: {output}"
+            );
+            assert_eq!(
+                offered.len(),
+                2,
+                "both actual Cargo units must execute: {output}"
+            );
+            assert!(
+                offered.contains_key(LEAF) && offered.contains_key(CONSUMER),
+                "{output}"
+            );
+            let key = offered[LEAF].clone();
+            if let Some(previous) = &previous_key {
+                if number <= 3 {
+                    assert_eq!(
+                        &key, previous,
+                        "identical fresh targets split the cache key"
+                    );
+                } else {
+                    assert_ne!(
+                        &key, previous,
+                        "changed closed input reused a workspace key"
+                    );
+                }
+            }
+            key
+        };
+        let admitted = events
+            .iter()
+            .filter(|event| event["kind"] == "rabsd-remote-dependency-admitted")
+            .map(|event| event["key"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        let completed = events
+            .iter()
+            .filter(|event| event["kind"] == "rabsd-remote-dependency-executed")
+            .map(|event| event["key"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        let expected = offered.values().cloned().collect::<BTreeSet<_>>();
+        assert_eq!(admitted.len(), expected.len(), "{output}");
+        assert_eq!(completed.len(), expected.len(), "{output}");
+        assert_eq!(
+            admitted.into_iter().collect::<BTreeSet<_>>(),
+            expected,
+            "{output}"
+        );
+        assert_eq!(
+            completed.into_iter().collect::<BTreeSet<_>>(),
+            expected,
+            "{output}"
+        );
+        if hit {
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event["decision"] == "served" && event["key"] == leaf_key),
+                "the cached metadata was not installed for this consumer: {output}"
+            );
+        }
+        assert_fresh_workspace_execution(
+            root,
+            &events,
+            &output,
+            CONSUMER,
+            &offered[CONSUMER],
+            &mut private_attempts,
+        );
+        assert_closed_workspace_leaf_evidence(
+            root,
+            &leaf_key,
+            if number <= 3 {
+                number as usize
+            } else if hit {
+                3
+            } else {
+                1
+            },
+            CLASS,
+        );
+        executions += if hit { 1 } else { 2 };
+        assert!(worker_requests.insert(worker.completed_receipt()["request_id"].as_u64().unwrap()));
+        assert_eq!(
+            worker
+                .events()
+                .iter()
+                .filter(|event| event["kind"] == "worker-toolchain-acquired")
+                .count(),
+            executions,
+            "a leaf hit must skip its compiler while the real consumer still executes"
+        );
+        if number == 5 {
+            let families = fs::read_dir(root.join("state/canonical-compile-v1/private-target-v2"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|family| family != stock_family)
+                .collect::<Vec<_>>();
+            assert_eq!(families.len(), 1);
+            let actual = closed_workspace_metadata_files(&families[0].join("seed/target"), &output);
+            assert_eq!(
+                actual, stock_files,
+                "cache hit changed stock rmeta or dep-info bytes"
+            );
+        }
+        previous_key = Some(leaf_key);
+    }
+
+    // Selecting actual project code removes cache authority for this operation.
+    // The same library still compiles remotely and its consumer remains valid.
+    write(
+        &second,
+        "member/build.rs",
+        "fn main() { println!(\"cargo:warning=WORKSPACE_METADATA_EXECUTOR_RAN\"); }\n",
+    );
+    for number in 9..=10 {
+        let (code, events, output) =
+            run_with_environment(root, 850 + number, &profile, &environment);
+        assert_eq!(code, 0, "{output}");
+        assert!(
+            output.contains("WORKSPACE_METADATA_EXECUTOR_RAN"),
+            "{output}"
+        );
+        assert!(decisions(&events, "hit").is_empty(), "{output}");
+        assert!(decisions(&events, "execute").is_empty(), "{output}");
+        let offered = decisions(&events, "remote-offer");
+        assert_eq!(offered.len(), 2, "{output}");
+        for name in [LEAF, CONSUMER] {
+            assert_fresh_workspace_execution(
+                root,
+                &events,
+                &output,
+                name,
+                &offered[name],
+                &mut private_attempts,
+            );
+        }
+        executions += 2;
+        assert!(worker_requests.insert(worker.completed_receipt()["request_id"].as_u64().unwrap()));
+        assert_eq!(
+            worker
+                .events()
+                .iter()
+                .filter(|event| event["kind"] == "worker-toolchain-acquired")
+                .count(),
+            executions
+        );
+    }
+    assert!(fs::read_dir(root.join("ops")).unwrap().next().is_none());
+    worker.finish();
+}
+
+#[test]
 #[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; denied archive input must drain the real worker before stock Cargo fallback and never publish"]
 fn canonical_workspace_leaf_denied_input_falls_back_only_after_worker_settlement() {
+    workspace_leaf_denied_input("build");
+}
+
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; denied metadata input must drain the closed worker before stock Cargo fallback and never publish"]
+fn canonical_workspace_leaf_metadata_denied_input_falls_back_only_after_worker_settlement() {
+    workspace_leaf_denied_input("check");
+}
+
+fn workspace_leaf_denied_input(command: &str) {
     use rabs_cas::metadata_store::{RabsMetadataStore, SqlValue};
 
     const NAME: &str = "canonical_workspace_leaf";
@@ -4575,7 +4973,7 @@ fn canonical_workspace_leaf_denied_input_falls_back_only_after_worker_settlement
     let root = owner.path();
     let source = root.join("leaf-denied-input");
     closed_workspace_leaf_source(&source);
-    // Canonical Cargo has its own procfs. The stricter archive worker does not,
+    // Canonical Cargo has its own procfs. The closed library worker does not,
     // so this actual compiler read must fail privately rather than acquire a
     // successful result or turn a local completion into remote cache evidence.
     write(
@@ -4585,7 +4983,7 @@ fn canonical_workspace_leaf_denied_input_falls_back_only_after_worker_settlement
     );
     profile["source_root"] = json!(source);
     profile["vendor"] = Value::Null;
-    profile["command"] = json!("build");
+    profile["command"] = json!(command);
     profile["selection"] = json!({"lib":true});
     let (worker, environment) = NativeWorker::start(root);
     let mut requests = BTreeSet::new();

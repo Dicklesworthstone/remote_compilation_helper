@@ -391,19 +391,19 @@ impl CanonicalPaths {
         Ok(())
     }
 
-    /// The complete-workspace cache class is limited to a selected ordinary
-    /// leaf-library archive in a graph that cannot execute project code. The
-    /// wrapper supplies neither graph membership nor this absence proof.
-    pub(crate) fn require_workspace_closed_rlib(
+    /// Complete-workspace cache classes require a selected ordinary leaf
+    /// library in the exact build/check mode and a graph that cannot execute
+    /// project code. The wrapper supplies neither membership nor absence proof.
+    pub(crate) fn require_workspace_closed_library(
         &self,
         plan: &DependencyActionPlan,
     ) -> Result<(), String> {
-        rabs_key::live_dependency::workspace_cache::validate_closed_workspace_rlib_plan(plan)
+        rabs_key::live_dependency::workspace_cache::validate_closed_workspace_library_plan(plan)
             .map_err(|error| error.to_string())?;
         self.require_workspace_execution(plan)?;
         if self.closed_dependency_execution_required {
             return Err(
-                "closed workspace archive caching requires a Cargo graph without project executors"
+                "closed workspace library caching requires a Cargo graph without project executors"
                     .into(),
             );
         }
@@ -1365,53 +1365,81 @@ mod tests {
     }
 
     #[test]
-    fn closed_workspace_rlib_requires_selected_build_unit_and_no_project_executors() {
+    fn closed_workspace_libraries_require_the_selected_output_mode_and_no_project_executors() {
         use rabs_sandbox::cargo_check::{CompilationCommand, validate_compilation_unit_graph};
 
-        let (owner, paths) = fixture();
-        std::fs::create_dir_all(owner.path().join("0/app/src")).unwrap();
-        std::fs::write(
-            owner.path().join("0/app/src/lib.rs"),
-            b"pub fn value() {}\n",
-        )
-        .unwrap();
-        let mut execution = workspace_plan();
-        execution.invocation.emit.push("link".into());
-        execution.outputs = rabs_key::output_derivation::derive_workspace_output_declarations(
-            &execution.invocation,
-            &execution.host_triple,
-        )
-        .unwrap();
-        let closed =
-            rabs_key::live_dependency::workspace_cache::plan_closed_workspace_rlib(&execution)
-                .unwrap();
-        assert!(paths.require_workspace_closed_rlib(&closed).is_err());
-        let graph = serde_json::json!({"version":1,"roots":[0],"units":[{
-            "pkg_id":"path+file:///__rabs/workspace/app#project@0.1.0",
-            "target":{"kind":["lib"],"crate_types":["lib"],"name":"project-lib",
-                "src_path":"/__rabs/workspace/app/src/lib.rs","edition":"2024"},
-            "profile":{"name":"dev"},"platform":null,"mode":"build",
-            "features":["base"],"dependencies":[]
-        }]});
-        let graph = validate_compilation_unit_graph(&graph, CompilationCommand::Build).unwrap();
-        assert!(!graph.requires_closed_dependency_execution());
-        let paths = paths
-            .with_workspace_units(graph.workspace_units(), None)
+        for (command, mode) in [
+            (CompilationCommand::Build, "build"),
+            (CompilationCommand::Check, "check"),
+        ] {
+            let (owner, paths) = fixture();
+            std::fs::create_dir_all(owner.path().join("0/app/src")).unwrap();
+            std::fs::write(
+                owner.path().join("0/app/src/lib.rs"),
+                b"pub fn value() {}\n",
+            )
             .unwrap();
-        assert!(paths.require_workspace_closed_rlib(&closed).is_ok());
-        assert!(
-            paths.require_workspace_closed_rlib(&execution).is_err(),
-            "the fresh profile must not gain cache authority"
-        );
-        let mut unselected = closed.clone();
-        unselected.invocation.crate_name = Some("unselected".into());
-        assert!(paths.require_workspace_closed_rlib(&unselected).is_err());
-        let guarded = paths.require_closed_dependency_execution().unwrap();
-        assert!(guarded.require_workspace_closed_rlib(&closed).is_err());
-        assert!(
-            guarded.require_workspace_execution(&execution).is_ok(),
-            "project executors retain fresh remote execution"
-        );
+            let mut execution = workspace_plan();
+            if mode == "build" {
+                execution.invocation.emit.push("link".into());
+            }
+            execution.outputs = rabs_key::output_derivation::derive_workspace_output_declarations(
+                &execution.invocation,
+                &execution.host_triple,
+            )
+            .unwrap();
+            let closed = rabs_key::live_dependency::workspace_cache::plan_closed_workspace_library(
+                &execution,
+            )
+            .unwrap();
+            assert!(paths.require_workspace_closed_library(&closed).is_err());
+            let graph = serde_json::json!({"version":1,"roots":[0],"units":[{
+                "pkg_id":"path+file:///__rabs/workspace/app#project@0.1.0",
+                "target":{"kind":["lib"],"crate_types":["lib"],"name":"project-lib",
+                    "src_path":"/__rabs/workspace/app/src/lib.rs","edition":"2024"},
+                "profile":{"name":"dev"},"platform":null,"mode":mode,
+                "features":["base"],"dependencies":[]
+            }]});
+            let graph = validate_compilation_unit_graph(&graph, command).unwrap();
+            assert!(!graph.requires_closed_dependency_execution());
+            let paths = paths
+                .with_workspace_units(graph.workspace_units(), None)
+                .unwrap();
+            assert!(paths.require_workspace_closed_library(&closed).is_ok());
+            assert!(
+                paths.require_workspace_closed_library(&execution).is_err(),
+                "the fresh profile must not gain cache authority"
+            );
+            let mut unselected = closed.clone();
+            unselected.invocation.crate_name = Some("unselected".into());
+            assert!(paths.require_workspace_closed_library(&unselected).is_err());
+            let mut other_mode = execution.clone();
+            if mode == "build" {
+                other_mode.invocation.emit.retain(|emit| emit != "link");
+            } else {
+                other_mode.invocation.emit.push("link".into());
+            }
+            other_mode.outputs = rabs_key::output_derivation::derive_workspace_output_declarations(
+                &other_mode.invocation,
+                &other_mode.host_triple,
+            )
+            .unwrap();
+            let other_mode =
+                rabs_key::live_dependency::workspace_cache::plan_closed_workspace_library(
+                    &other_mode,
+                )
+                .unwrap();
+            assert!(
+                paths.require_workspace_closed_library(&other_mode).is_err(),
+                "a selected {mode} unit cannot authorize the other compiler output class"
+            );
+            let guarded = paths.require_closed_dependency_execution().unwrap();
+            assert!(guarded.require_workspace_closed_library(&closed).is_err());
+            assert!(
+                guarded.require_workspace_execution(&execution).is_ok(),
+                "project executors retain fresh remote execution"
+            );
+        }
     }
 
     #[test]

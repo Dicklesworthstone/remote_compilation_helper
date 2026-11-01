@@ -113,7 +113,8 @@ pub(super) fn canonical_layout(plan: &DependencyActionPlan) -> Result<(), LiveRe
             directory_source(CARGO_HOME, &plan.package_root, true)?
         }
         DependencySourceKind::WorkspaceExecutionOnly
-        | DependencySourceKind::WorkspaceClosedRlib => {
+        | DependencySourceKind::WorkspaceClosedRlib
+        | DependencySourceKind::WorkspaceClosedMetadata => {
             return Err(LiveRefusal::NotDependencySource(plan.package_root.clone()));
         }
     };

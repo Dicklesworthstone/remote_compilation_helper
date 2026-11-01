@@ -457,6 +457,7 @@ fn resolve_destination(root: &Path, virtual_path: &[u8]) -> Option<PathBuf> {
 const LIVE_CLASS_RECEIPT: &str = "rabs-live-action-class-v1";
 const LIVE_DEPENDENCY_CLASS: &str = "rustc-dependency-compile";
 const LIVE_WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-closed-rlib-v1";
+const LIVE_WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-closed-metadata-v1";
 const LIVE_PRIVATE_CLASS: &str = "private-only";
 
 // This is an additional floor, not a replacement for the stored serving policy.
@@ -476,16 +477,20 @@ fn record_descriptor_class(
     store: &mut dyn RabsMetadataStore,
     descriptor: &ActionDescriptor,
 ) -> Result<(), StoreError> {
+    use rabs_key::live_dependency::workspace_cache::{
+        ClosedWorkspaceLibraryClass, closed_workspace_library_descriptor_class,
+    };
+
     let class = if descriptor.action_class
         == rabs_protocol::descriptor::ActionClass::RustcDependencyCompile
     {
         LIVE_DEPENDENCY_CLASS
-    } else if rabs_key::live_dependency::workspace_cache::is_closed_workspace_rlib_descriptor(
-        descriptor,
-    ) {
-        LIVE_WORKSPACE_RLIB_CLASS
     } else {
-        LIVE_PRIVATE_CLASS
+        match closed_workspace_library_descriptor_class(descriptor) {
+            Some(ClosedWorkspaceLibraryClass::Rlib) => LIVE_WORKSPACE_RLIB_CLASS,
+            Some(ClosedWorkspaceLibraryClass::Metadata) => LIVE_WORKSPACE_METADATA_CLASS,
+            None => LIVE_PRIVATE_CLASS,
+        }
     };
     store.record_decision_receipt(
         LIVE_CLASS_RECEIPT,
@@ -518,6 +523,9 @@ fn recorded_action_risk(
             }
             [SqlValue::Text(class)] if class == LIVE_WORKSPACE_RLIB_CLASS => {
                 Ok(ActionClassRisk::ClosedWorkspaceRlib)
+            }
+            [SqlValue::Text(class)] if class == LIVE_WORKSPACE_METADATA_CLASS => {
+                Ok(ActionClassRisk::ClosedWorkspaceMetadata)
             }
             [SqlValue::Text(_)] => Ok(ActionClassRisk::Elevated),
             _ => Err(StoreError::Backend(
@@ -5255,7 +5263,7 @@ mod tests {
     #[test]
     fn closed_workspace_class_receipt_requires_the_complete_qualified_descriptor_profile() {
         use rabs_key::live_dependency::workspace_cache::{
-            plan_closed_workspace_rlib, remote_closed_workspace_rlib_key,
+            plan_closed_workspace_library, remote_closed_workspace_library_key,
         };
         use rabs_key::live_dependency::{
             LiveRustcRequest, ToolchainFacts, plan_canonical_workspace_execution,
@@ -5263,98 +5271,119 @@ mod tests {
 
         // Exercise the real pure key builder and the production durable receipt
         // writer. Compiler execution is covered by the canonical Cargo fixture.
-        let argv = [
-            "/__rabs/toolchain/bin/rustc",
-            "--crate-name=leaf",
-            "--crate-type=lib",
-            "src.rs",
-            "--emit=dep-info,metadata,link",
-            "--error-format=json",
-            "--json=artifacts",
-            "--out-dir=/__rabs/out/cargo/debug/deps",
-        ]
-        .map(str::to_owned);
-        let env = [
-            ("CARGO_MANIFEST_DIR", "/__rabs/workspace"),
-            ("CARGO_PKG_NAME", "leaf"),
-            ("CARGO_PRIMARY_PACKAGE", "1"),
-            ("CARGO_HOME", "/__rabs/cargo-home"),
-            ("HOME", "/__rabs/home"),
-        ]
-        .map(|(name, value)| (name.to_owned(), value.to_owned()));
-        let execution = plan_canonical_workspace_execution(
-            LiveRustcRequest {
-                argv: &argv,
-                env: &env,
-                cwd: "/__rabs/workspace",
-            },
-            "x86_64-unknown-linux-gnu",
-        )
-        .unwrap();
-        let plan = plan_closed_workspace_rlib(&execution).unwrap();
-        let identity =
-            rabs_key::typed_digest::compute("rabs.closed-workspace-class-test.v1", b"fixture");
-        let inputs = ActionInputManifest {
-            schema_version: INPUT_EVIDENCE_SCHEMA_VERSION,
-            inputs: vec![PositiveInput {
-                virtual_path: RawBytes::new(plan.input_virtual_path("src.rs").into_bytes()),
-                object: ObjectId(identity.clone()),
-                file_type: InputFileType::Regular,
-                executable: false,
-                symlink_resolution: vec![],
-            }],
-            directory_enumerations: vec![DirectoryEnumeration {
-                virtual_path: RawBytes::new(plan.source_virtual_root().into_bytes()),
-                entries: vec![RawBytes::from("src.rs")],
-            }],
-            ..ActionInputManifest::default()
+        let descriptor = |emit: &str| {
+            let argv = [
+                "/__rabs/toolchain/bin/rustc",
+                "--crate-name=leaf",
+                "--crate-type=lib",
+                "src.rs",
+                emit,
+                "--error-format=json",
+                "--json=artifacts",
+                "--out-dir=/__rabs/out/cargo/debug/deps",
+            ]
+            .map(str::to_owned);
+            let env = [
+                ("CARGO_MANIFEST_DIR", "/__rabs/workspace"),
+                ("CARGO_PKG_NAME", "leaf"),
+                ("CARGO_PRIMARY_PACKAGE", "1"),
+                ("CARGO_HOME", "/__rabs/cargo-home"),
+                ("HOME", "/__rabs/home"),
+            ]
+            .map(|(name, value)| (name.to_owned(), value.to_owned()));
+            let execution = plan_canonical_workspace_execution(
+                LiveRustcRequest {
+                    argv: &argv,
+                    env: &env,
+                    cwd: "/__rabs/workspace",
+                },
+                "x86_64-unknown-linux-gnu",
+            )
+            .unwrap();
+            let plan = plan_closed_workspace_library(&execution).unwrap();
+            let identity =
+                rabs_key::typed_digest::compute("rabs.closed-workspace-class-test.v1", b"fixture");
+            let inputs = ActionInputManifest {
+                schema_version: INPUT_EVIDENCE_SCHEMA_VERSION,
+                inputs: vec![PositiveInput {
+                    virtual_path: RawBytes::new(plan.input_virtual_path("src.rs").into_bytes()),
+                    object: ObjectId(identity.clone()),
+                    file_type: InputFileType::Regular,
+                    executable: false,
+                    symlink_resolution: vec![],
+                }],
+                directory_enumerations: vec![DirectoryEnumeration {
+                    virtual_path: RawBytes::new(plan.source_virtual_root().into_bytes()),
+                    entries: vec![RawBytes::from("src.rs")],
+                }],
+                ..ActionInputManifest::default()
+            };
+            let toolchain = ToolchainFacts {
+                compiler_binary_digest: identity.clone(),
+                verbose_version: "rustc 1.100.0\nhost: x86_64-unknown-linux-gnu\nLLVM version: 21"
+                    .into(),
+                sysroot_root_digest: identity,
+                runtime_libraries: Vec::new(),
+            };
+            remote_closed_workspace_library_key(
+                &plan,
+                &toolchain,
+                &[],
+                &inputs,
+                None,
+                "/__rabs/toolchain",
+                &[39; 32],
+                &rabs_key::typed_digest::compute(
+                    rabs_key::live_dependency::remote::RUNTIME_COHORT_DOMAIN,
+                    b"runtime",
+                ),
+            )
+            .unwrap()
+            .descriptor
         };
-        let toolchain = ToolchainFacts {
-            compiler_binary_digest: identity.clone(),
-            verbose_version: "rustc 1.100.0\nhost: x86_64-unknown-linux-gnu\nLLVM version: 21"
-                .into(),
-            sysroot_root_digest: identity,
-            runtime_libraries: Vec::new(),
-        };
-        let descriptor = remote_closed_workspace_rlib_key(
-            &plan,
-            &toolchain,
-            &[],
-            &inputs,
-            None,
-            "/__rabs/toolchain",
-            &[39; 32],
-            &rabs_key::typed_digest::compute(
-                rabs_key::live_dependency::remote::RUNTIME_COHORT_DOMAIN,
-                b"runtime",
+        let descriptors = [
+            (
+                descriptor("--emit=dep-info,metadata,link"),
+                ActionClassRisk::ClosedWorkspaceRlib,
             ),
-        )
-        .unwrap()
-        .descriptor;
+            (
+                descriptor("--emit=dep-info,metadata"),
+                ActionClassRisk::ClosedWorkspaceMetadata,
+            ),
+        ];
+        assert_ne!(
+            compute_action_key(&descriptors[0].0).final_key,
+            compute_action_key(&descriptors[1].0).final_key,
+        );
         let (state, coord) = submission_coordinator();
         let mut private = Vec::new();
         {
             let mut store = coord.live_cas().unwrap().store().lock().unwrap();
-            record_descriptor_class(&mut *store, &descriptor).unwrap();
-            for mutation in 0..4 {
-                let mut changed = descriptor.clone();
-                match mutation {
-                    0 => changed.key_epoch += 1,
-                    1 => changed.projection_epoch += 1,
-                    2 => changed.sandbox_semantic_policy.bytes[0] ^= 1,
-                    _ => changed.execution_semantics.bytes[0] ^= 1,
+            for (descriptor, _) in &descriptors {
+                record_descriptor_class(&mut *store, descriptor).unwrap();
+                for mutation in 0..4 {
+                    let mut changed = descriptor.clone();
+                    match mutation {
+                        0 => changed.key_epoch += 1,
+                        1 => changed.projection_epoch += 1,
+                        2 => changed.sandbox_semantic_policy.bytes[0] ^= 1,
+                        _ => changed.execution_semantics.bytes[0] ^= 1,
+                    }
+                    record_descriptor_class(&mut *store, &changed).unwrap();
+                    private.push(compute_action_key(&changed).final_key);
                 }
-                record_descriptor_class(&mut *store, &changed).unwrap();
-                private.push(compute_action_key(&changed).final_key);
             }
         }
         drop(coord);
         let reopened = mount_and_reconcile(state.path()).unwrap();
         let mut store = reopened.store().lock().unwrap();
-        assert_eq!(
-            recorded_action_risk(&mut *store, &compute_action_key(&descriptor).final_key).unwrap(),
-            ActionClassRisk::ClosedWorkspaceRlib
-        );
+        for (descriptor, risk) in &descriptors {
+            assert_eq!(
+                recorded_action_risk(&mut *store, &compute_action_key(descriptor).final_key)
+                    .unwrap(),
+                *risk
+            );
+        }
         for key in private {
             assert_eq!(
                 recorded_action_risk(&mut *store, &key).unwrap(),

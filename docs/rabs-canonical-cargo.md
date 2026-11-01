@@ -1416,48 +1416,60 @@ closed-library class can qualify for reuse under the narrower rules below.
 Cargo still owns command execution and freshness; the optional private target
 reuse described below has its existing independent rules and limits.
 
-### Cache closed workspace leaf-library builds
+### Cache closed workspace leaf-library builds and checks
 
-The first workspace action-cache class admits selected ordinary Rust `lib` or
-`rlib` builds with archive output. It requires a retained Cargo unit graph with
+Workspace action caching admits selected ordinary Rust `lib` or `rlib` units in
+two independently qualified classes: builds with archive output, and checks with
+metadata and dep-info output only. Both require a retained Cargo unit graph with
 no project executors, no explicit external crates or implicit Rust artifact
 candidates, no generated inputs or native libraries, and no incremental state.
 The captured Rust standard library remains available through the retained
-toolchain. Metadata-only checks, test harnesses, binaries, procedural macros,
-libraries consuming other project or dependency artifacts, and generated/native
-workspace units retain their existing fresh-execution or ordinary Cargo paths.
+toolchain. Test harnesses, binaries, procedural macros, libraries consuming other
+project or dependency artifacts, and generated/native workspace units retain
+their existing fresh-execution or ordinary Cargo paths.
 
-This class keys the **complete captured workspace**, including sibling files,
+Each class keys the **complete captured workspace**, including sibling files,
 every directory listing and empty directories. It also binds the exact compiler
 arguments, working directory, environment, toolchain and measured runtime. An
-unrelated workspace edit can therefore invalidate the result. This is an initial
-complete-input class, not a discovered minimal source closure or a cache for
-arbitrary workspace compilations.
+unrelated workspace edit can therefore invalidate the result. These initial
+classes retain complete inputs; they do not establish a discovered minimal source
+closure or cache arbitrary workspace compilations.
 
 The coordinator independently matches the request to the driver's retained
-selected library unit and graph. It then requires the worker's existing
-`canonical-workspace-exec-v3` namespace in closed `rlib` mode, with no process
-filesystem or entropy devices. The distinct
-`canonical-workspace-closed-rlib-v1` policy and versioned action identity keep
-these results separate from execution-only workspace results and external
-dependency results. A workspace descriptor, canonical-looking path or local
-wrapper completion cannot confer this authority.
+selected library unit, its build/check mode and its graph. Archive builds require
+the worker's existing `canonical-workspace-exec-v3` context in closed `rlib` mode.
+Metadata checks require the separately negotiated
+`canonical-workspace-closed-metadata-v1` context in `closed-metadata` mode. Both
+strict namespaces omit the process filesystem and entropy devices and expose
+only the checked null device. The worker measures each mode independently;
+support for ordinary metadata execution does not authorize closed metadata.
+
+The distinct `canonical-workspace-closed-rlib-v1` and
+`canonical-workspace-closed-metadata-v1` policies and versioned action identities
+separate archive and check results from each other, execution-only workspace
+results and external dependency results. Existing archive identities remain
+unchanged. A workspace descriptor, canonical-looking path or local wrapper
+completion cannot confer this authority. Dispatch, completed result capture and
+cache replay each revalidate the selected class and its execution policy.
 
 Eligible cold results still require authenticated remote execution, compiler and
 descendant drain, complete output/transcript capture, unchanged retained inputs,
 and the wrapper's exact manifest acknowledgment before private installation.
 Publication and subsequent reuse pass the existing independent differential
-sampling, release authorization and serving gates. A divergent closed-workspace
-result quarantines its own cache class. Execution-only workspace results cannot
-train these gates or become replayable by changing a profile flag.
-The initial class uses the existing fixed sampling policy; the optional
+sampling, release authorization and serving gates. Metadata and archive results
+earn separate samples, and divergence quarantines the affected class independently.
+Execution-only workspace results cannot train these gates or become replayable by
+changing a profile flag. Both classes use the existing fixed sampling policy; the optional
 dependency-only SPRT promotion policy does not authorize workspace replay.
 
-Once qualified, a hit restores the declared archive, metadata when emitted,
-dep-info and compiler diagnostics through the verified installer. Source or
-environment changes require a different action identity. Missing, unsupported or
-changed evidence preserves the existing refusal and fallback rules, including
-the prohibition on a second compilation while a remote execution is uncertain.
+Once qualified, a hit restores the declared archive and metadata when emitted,
+or the check's metadata, together with dep-info and compiler diagnostics through
+the verified installer. Cargo can use the restored `.rmeta` in subsequent
+consumer compilations; those consumers still qualify independently for their own
+execution or reuse paths. Source, environment or workspace-directory changes
+require a different action identity. Missing, unsupported or changed evidence
+preserves the existing refusal and fallback rules, including the prohibition on
+a second compilation while a remote execution is uncertain.
 
 ### Local Clippy with reusable dependency compilation
 

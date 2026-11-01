@@ -659,9 +659,9 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
     if workspace_requested
         && let Some(paths) = &live.canonical
         && let Ok(candidate) =
-            rabs_key::live_dependency::workspace_cache::plan_closed_workspace_rlib(&plan)
-        && paths.require_workspace_closed_rlib(&candidate).is_ok()
-        && rabs_key::live_dependency::workspace_cache::remote_closed_workspace_rlib_shape(
+            rabs_key::live_dependency::workspace_cache::plan_closed_workspace_library(&plan)
+        && paths.require_workspace_closed_library(&candidate).is_ok()
+        && rabs_key::live_dependency::workspace_cache::remote_closed_workspace_library_shape(
             &candidate,
             &key_directories,
             rabs_sandbox::layout::TOOLCHAIN,

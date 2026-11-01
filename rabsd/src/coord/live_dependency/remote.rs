@@ -30,8 +30,9 @@ use rabs_key::live_dependency::remote::{
     remote_dependency_output_class, remote_dependency_shape, remote_empty_loader_directories,
 };
 use rabs_key::live_dependency::workspace_cache::{
-    remote_closed_workspace_rlib_isolation_policy, remote_closed_workspace_rlib_key,
-    remote_closed_workspace_rlib_shape,
+    ClosedWorkspaceLibraryClass, closed_workspace_library_descriptor_class,
+    remote_closed_workspace_library_isolation_policy, remote_closed_workspace_library_key,
+    remote_closed_workspace_library_shape, validate_closed_workspace_library_plan,
 };
 use rabs_key::live_dependency::{
     DependencyDirectoryFact, DependencySourceKind, ToolchainFacts, native_input_directories,
@@ -566,19 +567,24 @@ impl RemoteValidation {
                 .as_ref()
                 .ok_or("workspace execution lost its retained Cargo graph")?
                 .require_workspace_execution(&request.plan)?;
-        } else if request.plan.source_kind == DependencySourceKind::WorkspaceClosedRlib {
+        } else if matches!(
+            request.plan.source_kind,
+            DependencySourceKind::WorkspaceClosedRlib
+                | DependencySourceKind::WorkspaceClosedMetadata
+        ) {
             request
                 .canonical_paths
                 .as_ref()
-                .ok_or("closed workspace archive lost its retained Cargo graph")?
-                .require_workspace_closed_rlib(&request.plan)?;
+                .ok_or("closed workspace library lost its retained Cargo graph")?
+                .require_workspace_closed_library(&request.plan)?;
         }
         let shape = match request.plan.source_kind {
             DependencySourceKind::WorkspaceExecutionOnly => {
                 remote_workspace_execution_shape(&request.plan, &directories, &toolchain)
             }
-            DependencySourceKind::WorkspaceClosedRlib => {
-                remote_closed_workspace_rlib_shape(&request.plan, &directories, &toolchain)
+            DependencySourceKind::WorkspaceClosedRlib
+            | DependencySourceKind::WorkspaceClosedMetadata => {
+                remote_closed_workspace_library_shape(&request.plan, &directories, &toolchain)
             }
             _ => remote_dependency_shape(&request.plan, &directories, &toolchain),
         };
@@ -613,6 +619,17 @@ impl RemoteValidation {
 }
 
 fn execution_mode(plan: &DependencyActionPlan) -> Result<DependencyExecutionMode, String> {
+    if matches!(
+        plan.source_kind,
+        DependencySourceKind::WorkspaceClosedRlib | DependencySourceKind::WorkspaceClosedMetadata
+    ) {
+        return validate_closed_workspace_library_plan(plan)
+            .map(|class| match class {
+                ClosedWorkspaceLibraryClass::Rlib => DependencyExecutionMode::Rlib,
+                ClosedWorkspaceLibraryClass::Metadata => DependencyExecutionMode::ClosedMetadata,
+            })
+            .map_err(|error| error.to_string());
+    }
     match remote_dependency_output_class(&plan.invocation).map_err(|error| error.to_string())? {
         RemoteDependencyOutputClass::Metadata => Ok(DependencyExecutionMode::Metadata),
         RemoteDependencyOutputClass::Rlib => Ok(DependencyExecutionMode::Rlib),
@@ -621,7 +638,9 @@ fn execution_mode(plan: &DependencyActionPlan) -> Result<DependencyExecutionMode
 
 /// The cache policy and the worker's enforced namespace must describe the same
 /// output class. A metadata receipt or copied isolation label cannot authorize
-/// archives whose assembler reads require the stricter namespace.
+/// archives whose assembler reads require the stricter namespace. Closed
+/// workspace metadata also requires its independently negotiated strict view;
+/// ordinary metadata execution cannot establish that class's cache authority.
 fn verify_execution_policy(
     plan: &DependencyActionPlan,
     key: &LiveDependencyKey,
@@ -634,8 +653,16 @@ fn verify_execution_policy(
         DependencySourceKind::WorkspaceExecutionOnly => {
             remote_workspace_execution_isolation_policy(plan)
         }
-        DependencySourceKind::WorkspaceClosedRlib => {
-            remote_closed_workspace_rlib_isolation_policy(plan)
+        DependencySourceKind::WorkspaceClosedRlib
+        | DependencySourceKind::WorkspaceClosedMetadata => {
+            let class =
+                validate_closed_workspace_library_plan(plan).map_err(|error| error.to_string())?;
+            if closed_workspace_library_descriptor_class(&key.descriptor) != Some(class) {
+                return Err(
+                    "remote workspace descriptor differs from its qualified cache class".into(),
+                );
+            }
+            remote_closed_workspace_library_isolation_policy(plan)
         }
         _ => remote_dependency_isolation_policy(plan),
     }
@@ -753,10 +780,14 @@ impl RemoteDependencies {
             return Err("remote canonical key requires its retained driver capability".into());
         }
         let workspace = plan.source_kind.is_workspace();
-        if plan.source_kind == DependencySourceKind::WorkspaceClosedRlib {
+        if matches!(
+            plan.source_kind,
+            DependencySourceKind::WorkspaceClosedRlib
+                | DependencySourceKind::WorkspaceClosedMetadata
+        ) {
             canonical
-                .ok_or("closed workspace archive requires its retained Cargo graph")?
-                .require_workspace_closed_rlib(plan)?;
+                .ok_or("closed workspace library requires its retained Cargo graph")?
+                .require_workspace_closed_library(plan)?;
         } else if workspace {
             canonical
                 .ok_or("workspace execution requires its retained Cargo graph")?
@@ -776,8 +807,9 @@ impl RemoteDependencies {
             DependencySourceKind::WorkspaceExecutionOnly => {
                 remote_workspace_execution_shape(plan, directories, &visible_root)
             }
-            DependencySourceKind::WorkspaceClosedRlib => {
-                remote_closed_workspace_rlib_shape(plan, directories, &visible_root)
+            DependencySourceKind::WorkspaceClosedRlib
+            | DependencySourceKind::WorkspaceClosedMetadata => {
+                remote_closed_workspace_library_shape(plan, directories, &visible_root)
             }
             _ => remote_dependency_shape(plan, directories, &visible_root),
         };
@@ -808,7 +840,8 @@ impl RemoteDependencies {
         .map_err(|error| format!("edge runtime cohort: {error}"))?;
         let key_builder = match plan.source_kind {
             DependencySourceKind::WorkspaceExecutionOnly => remote_workspace_execution_key,
-            DependencySourceKind::WorkspaceClosedRlib => remote_closed_workspace_rlib_key,
+            DependencySourceKind::WorkspaceClosedRlib
+            | DependencySourceKind::WorkspaceClosedMetadata => remote_closed_workspace_library_key,
             _ => remote_dependency_key,
         };
         let key = key_builder(
@@ -3119,6 +3152,136 @@ mod execution_resource_tests {
                     bytes: 100,
                 },
             }
+        }
+    }
+
+    #[test]
+    fn closed_workspace_metadata_requires_its_own_context_and_complete_cache_descriptor() {
+        use rabs_key::live_dependency::workspace_cache::plan_closed_workspace_library;
+        use rabs_protocol::input_evidence::{
+            DirectoryEnumeration, INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType, PositiveInput,
+        };
+        use rabs_protocol::raw_bytes::RawBytes;
+        use rabs_protocol::result_identity::ObjectId;
+
+        let mut fixture = Fixture::workspace_metadata(Some("lib"), false);
+        let fresh = fixture.plan.clone();
+        fixture.plan = plan_closed_workspace_library(&fresh).unwrap();
+        assert!(
+            fixture.request().is_err(),
+            "the existing workspace metadata namespace cannot authorize closed metadata caching"
+        );
+        fixture.context = fixture
+            .context
+            .with_execution_mode(DependencyExecutionMode::ClosedMetadata);
+        let request = fixture.request().unwrap();
+        assert_eq!(request["args"], json!(fixture.argv[1..]));
+        assert_eq!(request["jobserver_grant"], 3);
+        assert_eq!(
+            request["dependency_context"]["execution_mode"],
+            "closed-metadata"
+        );
+        assert_eq!(
+            request["dependency_context"]["version"],
+            rabs_sandbox::dependency_context::CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION
+        );
+        assert_eq!(
+            request["artifacts"]["files"],
+            json!(["libworkspace_app.rmeta", "workspace_app.d"])
+        );
+
+        let plan = &fixture.plan;
+        let directories = plan
+            .dependency_dirs
+            .iter()
+            .map(|path| DependencyDirectoryFact {
+                path: path.clone(),
+                artifacts: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let input = "member/src/main.rs";
+        let inputs = ActionInputManifest {
+            schema_version: INPUT_EVIDENCE_SCHEMA_VERSION,
+            inputs: vec![PositiveInput {
+                virtual_path: RawBytes::new(plan.input_virtual_path(input).into_bytes()),
+                object: ObjectId(rabs_key::typed_digest::compute(
+                    "rabs.test.v1",
+                    input.as_bytes(),
+                )),
+                file_type: InputFileType::Regular,
+                executable: false,
+                symlink_resolution: Vec::new(),
+            }],
+            directory_enumerations: [("", "member"), ("member", "src"), ("member/src", "main.rs")]
+                .into_iter()
+                .map(|(directory, member)| DirectoryEnumeration {
+                    virtual_path: RawBytes::new(
+                        if directory.is_empty() {
+                            plan.source_virtual_root()
+                        } else {
+                            plan.input_virtual_path(directory)
+                        }
+                        .into_bytes(),
+                    ),
+                    entries: vec![RawBytes::from(member)],
+                })
+                .collect(),
+            ..ActionInputManifest::default()
+        };
+        let toolchain = ToolchainFacts {
+            compiler_binary_digest: rabs_key::typed_digest::compute("rabs.test.v1", b"rustc"),
+            verbose_version: "rustc 1.100.0\nhost: x86_64-unknown-linux-gnu\nLLVM version: 21"
+                .into(),
+            sysroot_root_digest: rabs_key::typed_digest::compute("rabs.test.v1", b"sysroot"),
+            runtime_libraries: Vec::new(),
+        };
+        let key = remote_closed_workspace_library_key(
+            plan,
+            &toolchain,
+            &directories,
+            &inputs,
+            None,
+            "/__rabs/toolchain",
+            &fixture.toolchain.sha256,
+            &rabs_key::typed_digest::compute(
+                rabs_key::live_dependency::remote::RUNTIME_COHORT_DOMAIN,
+                b"runtime",
+            ),
+        )
+        .unwrap();
+        assert!(
+            verify_execution_policy(plan, &key, DependencyExecutionMode::ClosedMetadata).is_ok()
+        );
+        for mode in [
+            DependencyExecutionMode::Metadata,
+            DependencyExecutionMode::Rlib,
+        ] {
+            assert!(verify_execution_policy(plan, &key, mode).is_err());
+        }
+        assert!(
+            verify_execution_policy(&fresh, &key, DependencyExecutionMode::ClosedMetadata).is_err()
+        );
+        // Rehashing a changed descriptor cannot turn private workspace policy
+        // or an unknown epoch into the separately admitted closed cache class.
+        for mutation in 0..3 {
+            let mut changed = key.clone();
+            match mutation {
+                0 => {
+                    changed.descriptor.sandbox_semantic_policy =
+                        remote_workspace_execution_isolation_policy(&fresh).unwrap()
+                }
+                1 => changed.descriptor.execution_semantics.bytes[0] ^= 1,
+                _ => changed.descriptor.key_epoch += 1,
+            }
+            changed.action_key =
+                rabs_key::action_key::compute_action_key(&changed.descriptor).final_key;
+            changed.descriptor_digest = rabs_key::hit_verification::descriptor_digest(
+                &rabs_key::hit_verification::descriptor_canonical_bytes(&changed.descriptor),
+            );
+            assert!(
+                verify_execution_policy(plan, &changed, DependencyExecutionMode::ClosedMetadata)
+                    .is_err()
+            );
         }
     }
 

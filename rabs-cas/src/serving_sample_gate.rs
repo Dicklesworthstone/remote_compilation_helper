@@ -64,6 +64,10 @@ pub enum ActionClassRisk {
     /// retained Cargo graph and closed remote execution profile. This does not
     /// inherit the dependency class's optional SPRT promotion evidence.
     ClosedWorkspaceRlib,
+    /// Complete-workspace pure Rust leaf-library checks in the independently
+    /// negotiated closed metadata namespace. Archive and dependency evidence
+    /// cannot promote this separately qualified class.
+    ClosedWorkspaceMetadata,
     /// Anything else: general workspace outputs, tool-generated code, unknown
     /// classes. Never sampled.
     Elevated,

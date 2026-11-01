@@ -20,6 +20,7 @@ use crate::metadata_store::{RabsMetadataStore, SqlValue, StoreError};
 const CLASS_RECEIPT: &str = "rabs-live-action-class-v1";
 const DEPENDENCY_CLASS: &str = "rustc-dependency-compile";
 const WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-closed-rlib-v1";
+const WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-closed-metadata-v1";
 
 const CLASS_SQL: &str = r#"
 SELECT decision FROM decision_receipts
@@ -84,6 +85,9 @@ pub(super) fn refusal(
         [row] => match row.as_slice() {
             [SqlValue::Text(class)] if class == DEPENDENCY_CLASS => DEPENDENCY_CLASS,
             [SqlValue::Text(class)] if class == WORKSPACE_RLIB_CLASS => WORKSPACE_RLIB_CLASS,
+            [SqlValue::Text(class)] if class == WORKSPACE_METADATA_CLASS => {
+                WORKSPACE_METADATA_CLASS
+            }
             // A caller's LowRiskRegistry flag cannot overrule a recorded
             // private/unknown class, even if its per-action evidence passes.
             [SqlValue::Text(_)] => return Ok(Some(PrivateExecutionReason::ElevatedClassRisk)),
@@ -499,6 +503,89 @@ mod tests {
                 reason: "divergence-incident",
             })
         );
+        assert_eq!(refusal(&mut reopened, &dependency).unwrap(), None);
+    }
+
+    #[test]
+    fn closed_workspace_metadata_earns_its_own_samples_and_persistent_class_quarantine() {
+        let path = fresh_path("workspace-metadata-class-reopen");
+        let metadata;
+        let culprit;
+        let archive;
+        let dependency;
+        let policy = SamplingPolicy::sample_all(2, 10_000);
+        {
+            let mut store = SqlMetadataStore::open(RusqliteEngine::open(&path).unwrap()).unwrap();
+            metadata = published(&mut store, 1, 10);
+            bind(&mut store, &metadata, WORKSPACE_METADATA_CLASS);
+            culprit = published(&mut store, 2, 11);
+            bind(&mut store, &culprit, WORKSPACE_METADATA_CLASS);
+            archive = published(&mut store, 3, 12);
+            bind(&mut store, &archive, WORKSPACE_RLIB_CLASS);
+            samples(&mut store, 3, 12, 3, 0);
+            dependency = healthy(&mut store, 4, 13);
+            assert!(matches!(
+                serving_sample_decision(
+                    &mut store,
+                    &action(1),
+                    ActionClassRisk::ClosedWorkspaceMetadata,
+                    &policy
+                )
+                .unwrap(),
+                SampleGateDecision::ExecutePrivately(
+                    PrivateExecutionReason::InsufficientVerificationSamples {
+                        observed: 0,
+                        required: 2
+                    }
+                )
+            ));
+            samples(&mut store, 1, 10, 2, 0);
+            assert_eq!(
+                serving_sample_decision(
+                    &mut store,
+                    &action(1),
+                    ActionClassRisk::ClosedWorkspaceMetadata,
+                    &policy
+                )
+                .unwrap(),
+                SampleGateDecision::ServeFromCache
+            );
+            let private = published(&mut store, 5, 14);
+            bind(&mut store, &private, "private-only");
+            samples(&mut store, 5, 14, 3, 0);
+            assert_eq!(
+                serving_sample_decision(
+                    &mut store,
+                    &action(5),
+                    ActionClassRisk::ClosedWorkspaceMetadata,
+                    &policy
+                )
+                .unwrap(),
+                SampleGateDecision::ExecutePrivately(PrivateExecutionReason::ElevatedClassRisk)
+            );
+            incident(&mut store, &culprit, "semantic");
+            assert_eq!(decide(&mut store, 4), SampleGateDecision::ServeFromCache);
+            assert_eq!(
+                serving_sample_decision(
+                    &mut store,
+                    &action(3),
+                    ActionClassRisk::ClosedWorkspaceRlib,
+                    &policy
+                )
+                .unwrap(),
+                SampleGateDecision::ServeFromCache
+            );
+        }
+        let mut reopened = SqlMetadataStore::open(RusqliteEngine::open(&path).unwrap()).unwrap();
+        assert_eq!(
+            refusal(&mut reopened, &metadata).unwrap(),
+            Some(PrivateExecutionReason::ClassSafetyHold {
+                class: WORKSPACE_METADATA_CLASS.into(),
+                culprit_action_key: culprit,
+                reason: "divergence-incident",
+            })
+        );
+        assert_eq!(refusal(&mut reopened, &archive).unwrap(), None);
         assert_eq!(refusal(&mut reopened, &dependency).unwrap(), None);
     }
 }
