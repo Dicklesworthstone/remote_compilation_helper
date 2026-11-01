@@ -1321,8 +1321,11 @@ commits in the selected base. Their dirty working files and current checkout
 revisions do not affect the selected bytes. Each submodule must have the pinned
 commit locally; RCH never fetches or updates a checkout during admission. Missing
 pins, uninitialized or symlinked submodule roots, archive-transform attributes
-in any selected repository, and overlays inside or containing a submodule fail
-closed. The source fingerprint and execution receipt bind every submodule path,
+or NUL-containing attribute files in any selected repository, and overlays
+inside or containing a submodule fail closed. All clean-overlay compilers,
+including direct `rustc`, validate selected symlinks before upload: targets must
+exist inside the selected source inventory without escapes or cycles. The source
+fingerprint and execution receipt bind every submodule path,
 commit, and Git tree. Admission allows at most 1,024 submodules and 32 nesting
 levels, including queued descendants. Composed archives preserve executable
 permissions and symlinks and refuse case-aliased destination paths.

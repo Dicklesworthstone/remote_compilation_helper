@@ -8779,7 +8779,7 @@ sys.argv = sys.argv[:5]
     // Its only callers are Linux-only tests; on macOS it is dead code and
     // fails `clippy -D warnings`.
     #[cfg(all(test, target_os = "linux"))]
-    fn clean_overlay_source_refresh_command(&self, identity: &str) -> Result<String> {
+    pub(crate) fn clean_overlay_source_refresh_command(&self, identity: &str) -> Result<String> {
         self.clean_overlay_source_refresh_command_at(identity, &self.remote_path())
     }
 

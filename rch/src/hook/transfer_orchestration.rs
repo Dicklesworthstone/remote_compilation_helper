@@ -280,30 +280,56 @@ fn consume_recovery_request(path: &Path, identity: &JobIdentity) -> bool {
     }
 }
 
-fn clean_overlay_cargo_policy_failure(
+fn clean_overlay_source_policy_failure(
     root: &Path,
     worker: &str,
     detail: String,
+    cargo_sources: bool,
 ) -> DependencyPreflightFailure {
     DependencyPreflightFailure::from_report(super::dependency_closure::DependencyPreflightReport {
         schema_version: DEPENDENCY_PREFLIGHT_SCHEMA_VERSION,
         worker: worker.to_owned(),
         verified: false,
         reason_code: Some(DEPENDENCY_PREFLIGHT_CODE_POLICY),
-        remediation: Some(
-            "Clean-overlay requires selected Cargo inputs. Bind each external sibling Git root with --dependency-base PATH=REV; non-sibling layouts are refused.",
-        ),
+        remediation: Some(if cargo_sources {
+            "Clean-overlay requires selected Cargo inputs. Bind each external sibling Git root with --dependency-base PATH=REV; non-sibling layouts are refused."
+        } else {
+            "Clean-overlay requires all source paths and symlink targets to remain inside the selected source inventory; commit the required inputs or correct the pinned links."
+        }),
         evidence: vec![DependencyPreflightEvidence {
             root: root.display().to_string(),
-            manifest: "Cargo.toml".to_owned(),
+            manifest: if cargo_sources { "Cargo.toml" } else { "" }.to_owned(),
             required_path: root.display().to_string(),
-            required_kind: "selected_cargo_sources",
+            required_kind: if cargo_sources {
+                "selected_cargo_sources"
+            } else {
+                "selected_source_namespace"
+            },
             status: super::dependency_closure::DependencyPreflightStatus::PolicyViolation,
             reason_code: DEPENDENCY_PREFLIGHT_CODE_POLICY,
             detail,
             is_primary: true,
         }],
     })
+}
+
+/// Every compiler must see a closed selected namespace. Cargo additionally
+/// validates manifest/configuration references, but direct rustc, gcc and other
+/// clean-overlay commands must not follow a pinned symlink into ambient worker
+/// files merely because they do not use Cargo metadata.
+async fn validate_clean_overlay_source_inputs(
+    root: &Path,
+    spec: &CleanOverlaySpec,
+    command: &str,
+    cargo_sources: bool,
+) -> anyhow::Result<()> {
+    if cargo_sources {
+        return super::validate_clean_overlay_cargo_sources(root, spec, command).await;
+    }
+    let entries = super::selected_clean_overlay_source_tree(root, spec, false).await?;
+    rch_common::cargo_path_deps::validate_selected_cargo_path(&entries, Path::new("."))
+        .context("clean-overlay source namespace is not contained")?;
+    spec.verify_overlay_unchanged(root)
 }
 
 pub(super) fn source_sync_terminal_summary(
@@ -428,7 +454,7 @@ fn clean_overlay_source_pair_pool_name(legacy_name: &str, source_base: &str) -> 
 /// Bind freshness to the entire selected closure, including explicit overlays.
 /// The source-pair lease and fresh-root materialization remain prerequisites;
 /// this identity only permits reusing the prior source timestamp, not bytes.
-fn clean_overlay_freshness_identity(spec: &CleanOverlaySpec) -> String {
+pub(super) fn clean_overlay_freshness_identity(spec: &CleanOverlaySpec) -> String {
     fn field(hash: &mut blake3::Hasher, bytes: &[u8]) {
         hash.update(&(bytes.len() as u64).to_le_bytes());
         hash.update(bytes);
@@ -911,23 +937,28 @@ async fn execute_remote_compilation_inner(
                 .kind
                 .is_some_and(|kind| kind.command_base() == "cargo"));
     if clean_overlay_cargo && worker_is_windows {
-        return Err(clean_overlay_cargo_policy_failure(
+        return Err(clean_overlay_source_policy_failure(
             &normalized_project_root,
             &worker_config.id.to_string(),
             "Selected Cargo configuration validation requires a Unix worker".to_owned(),
+            true,
         )
         .into());
     }
     if let Some(spec) = clean_overlay
-        && clean_overlay_cargo
-        && let Err(error) =
-            super::validate_clean_overlay_cargo_sources(&normalized_project_root, spec, command)
-                .await
+        && let Err(error) = validate_clean_overlay_source_inputs(
+            &normalized_project_root,
+            spec,
+            command,
+            clean_overlay_cargo,
+        )
+        .await
     {
-        return Err(clean_overlay_cargo_policy_failure(
+        return Err(clean_overlay_source_policy_failure(
             &normalized_project_root,
             &worker_config.id.to_string(),
             format!("{error:#}"),
+            clean_overlay_cargo,
         )
         .into());
     }
@@ -3651,11 +3682,12 @@ async fn execute_remote_compilation_inner(
         && result.exit_code == 113
         && stderr_capture.contains("RCH-E413 clean-overlay unselected Cargo configuration")
     {
-        return Err(clean_overlay_cargo_policy_failure(
+        return Err(clean_overlay_source_policy_failure(
             &normalized_project_root,
             &worker_config.id.to_string(),
             "Worker refused unselected Cargo home or ancestor configuration before starting Cargo"
                 .to_owned(),
+            true,
         )
         .into());
     }
@@ -3734,6 +3766,245 @@ mod tests {
     use super::foreign_artifact_gate_disabled_from_value;
     use super::{CleanOverlaySpec, clean_overlay_freshness_identity};
     use std::path::PathBuf;
+
+    #[cfg(unix)]
+    async fn retained_direct_submodule_fixture(target: &str) -> (PathBuf, PathBuf) {
+        use super::super::git_output;
+
+        let fixture = tempfile::Builder::new()
+            .prefix("rch-direct-submodule-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        let app = fixture.join("app");
+        let upstream = fixture.join("upstream");
+        for root in [&app, &upstream] {
+            std::fs::create_dir(root).unwrap();
+            git_output(root, &["init", "-q", "-b", "main"])
+                .await
+                .unwrap();
+            for (key, value) in [
+                ("user.name", "RCH Test"),
+                ("user.email", "rch-test@example.invalid"),
+                ("core.hooksPath", "/dev/null"),
+            ] {
+                git_output(root, &["config", key, value]).await.unwrap();
+            }
+        }
+        std::fs::write(upstream.join("data.txt"), "pinned submodule bytes\n").unwrap();
+        std::os::unix::fs::symlink(target, upstream.join("value")).unwrap();
+        git_output(&upstream, &["add", "."]).await.unwrap();
+        git_output(
+            &upstream,
+            &["commit", "-q", "--no-gpg-sign", "-m", "selected pin"],
+        )
+        .await
+        .unwrap();
+        std::fs::write(
+            app.join("main.rs"),
+            "fn main() { print!(\"{}\", include_str!(\"vendor/dep/value\")); }\n",
+        )
+        .unwrap();
+        git_output(
+            &app,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                upstream.to_str().unwrap(),
+                "vendor/dep",
+            ],
+        )
+        .await
+        .unwrap();
+        git_output(&app, &["add", "."]).await.unwrap();
+        git_output(
+            &app,
+            &["commit", "-q", "--no-gpg-sign", "-m", "select submodule"],
+        )
+        .await
+        .unwrap();
+        let module = app.join("vendor/dep");
+        (app, module)
+    }
+
+    #[cfg(unix)]
+    async fn run_direct_overlay_rustc(root: &std::path::Path) -> Vec<u8> {
+        let output = root.join("selected-bin");
+        let compile = tokio::process::Command::new("rustc")
+            .current_dir(root)
+            .args(["main.rs", "--crate-name", "selected_submodule"])
+            .arg("-o")
+            .arg(&output)
+            .output()
+            .await
+            .unwrap();
+        assert!(compile.status.success(), "{compile:?}");
+        let execution = tokio::process::Command::new(&output)
+            .output()
+            .await
+            .unwrap();
+        assert!(execution.status.success(), "{execution:?}");
+        execution.stdout
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn direct_clean_overlay_compiles_pinned_symlink_despite_dirty_checkout() {
+        use super::super::prepare_clean_overlay_spec;
+        use super::{TransferPipeline, validate_clean_overlay_source_inputs};
+
+        let (app, module) = retained_direct_submodule_fixture("data.txt").await;
+        // A direct compiler has no Cargo manifest to trigger metadata validation.
+        assert!(!app.join("Cargo.toml").exists());
+        let spec = prepare_clean_overlay_spec(&app, Some("HEAD".into()), true, vec![], true)
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::write(module.join("data.txt"), "unselected local bytes\n").unwrap();
+        std::fs::rename(module.join("value"), module.join("parked-value")).unwrap();
+        std::os::unix::fs::symlink("/unselected/ambient-input", module.join("value")).unwrap();
+        validate_clean_overlay_source_inputs(&app, &spec, "rustc main.rs", false)
+            .await
+            .unwrap();
+
+        let selected = spec
+            .submodules
+            .iter()
+            .map(|module| (module.path.clone(), module.base_commit.clone()))
+            .collect::<Vec<_>>();
+        let archive =
+            TransferPipeline::create_selected_git_archive(&app, spec.base_commit(), &selected)
+                .await
+                .unwrap();
+        let delivered = tempfile::tempdir().unwrap().keep();
+        tar::Archive::new(archive.reopen().unwrap())
+            .unpack(&delivered)
+            .unwrap();
+        assert_eq!(
+            run_direct_overlay_rustc(&delivered).await,
+            b"pinned submodule bytes\n"
+        );
+        assert_eq!(
+            std::fs::read_link(delivered.join("vendor/dep/value")).unwrap(),
+            std::path::Path::new("data.txt")
+        );
+        assert_eq!(
+            std::fs::read_to_string(module.join("data.txt")).unwrap(),
+            "unselected local bytes\n"
+        );
+        assert_eq!(
+            std::fs::read_link(module.join("value")).unwrap(),
+            std::path::Path::new("/unselected/ambient-input")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn direct_clean_overlay_rejects_escaping_missing_and_cyclic_pinned_links() {
+        use super::super::prepare_clean_overlay_spec;
+        use super::validate_clean_overlay_source_inputs;
+
+        for (target, diagnostic) in [
+            ("/unselected/ambient-input", "absolute path"),
+            ("../../../ambient-input", "escapes the selected root"),
+            ("missing.txt", "missing selected path"),
+            ("value", "symlink cycle"),
+        ] {
+            let (app, _) = retained_direct_submodule_fixture(target).await;
+            let spec = prepare_clean_overlay_spec(&app, Some("HEAD".into()), true, vec![], true)
+                .await
+                .unwrap()
+                .unwrap();
+            let error = validate_clean_overlay_source_inputs(&app, &spec, "rustc main.rs", false)
+                .await
+                .expect_err("direct compiler admission must validate the selected namespace");
+            assert!(
+                format!("{error:#}").contains(diagnostic),
+                "target {target}: {error:#}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn direct_clean_overlay_namespace_honors_explicit_sibling_sources() {
+        use super::super::{
+            bind_clean_overlay_dependencies, git_output, prepare_clean_overlay_spec,
+        };
+        use super::{TransferPipeline, validate_clean_overlay_source_inputs};
+
+        let (app, _) = retained_direct_submodule_fixture("../../../shared/data.txt").await;
+        let mut spec = prepare_clean_overlay_spec(&app, Some("HEAD".into()), true, vec![], true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            validate_clean_overlay_source_inputs(&app, &spec, "rustc main.rs", false)
+                .await
+                .is_err()
+        );
+        // The source validator uses the same combined layout as Cargo's explicit
+        // sibling selection; it must not apply a smaller per-archive boundary.
+        let sibling = app.parent().unwrap().join("shared");
+        std::fs::create_dir(&sibling).unwrap();
+        git_output(&sibling, &["init", "-q", "-b", "main"])
+            .await
+            .unwrap();
+        std::fs::write(sibling.join("data.txt"), "selected sibling bytes\n").unwrap();
+        git_output(&sibling, &["add", "."]).await.unwrap();
+        git_output(
+            &sibling,
+            &[
+                "-c",
+                "user.name=RCH Test",
+                "-c",
+                "user.email=rch-test@example.invalid",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "-q",
+                "--no-gpg-sign",
+                "-m",
+                "select sibling file",
+            ],
+        )
+        .await
+        .unwrap();
+        bind_clean_overlay_dependencies(&app, &mut spec, &["../shared=HEAD".into()])
+            .await
+            .unwrap();
+        validate_clean_overlay_source_inputs(&app, &spec, "rustc main.rs", false)
+            .await
+            .unwrap();
+        let delivered = tempfile::tempdir().unwrap().keep();
+        for (root, selected_spec, relative) in [
+            (&app, &spec, "app"),
+            (&sibling, &spec.dependencies[0].1, "shared"),
+        ] {
+            let selected = selected_spec
+                .submodules
+                .iter()
+                .map(|module| (module.path.clone(), module.base_commit.clone()))
+                .collect::<Vec<_>>();
+            let archive = TransferPipeline::create_selected_git_archive(
+                root,
+                selected_spec.base_commit(),
+                &selected,
+            )
+            .await
+            .unwrap();
+            tar::Archive::new(archive.reopen().unwrap())
+                .unpack(delivered.join(relative))
+                .unwrap();
+        }
+        assert_eq!(
+            run_direct_overlay_rustc(&delivered.join("app")).await,
+            b"selected sibling bytes\n"
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]

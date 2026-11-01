@@ -179,7 +179,7 @@ async fn clean_overlay_fixture_bytes_are_data_until_the_same_manifest_is_selecte
     validate_clean_overlay_cargo_sources(&root, &spec, "cargo check --all-targets")
         .await
         .unwrap();
-    let selected = selected_clean_overlay_cargo_tree(&root, &spec)
+    let selected = selected_clean_overlay_cargo_tree(&root, &spec, true)
         .await
         .unwrap();
     for (name, bytes, diagnostic) in [
@@ -478,7 +478,7 @@ async fn clean_overlay_dependency_binding_captures_committed_tree_and_ignores_pe
     validate_clean_overlay_cargo_sources(&app, &spec, "cargo test")
         .await
         .unwrap();
-    let selected = selected_clean_overlay_cargo_tree(&dep, &spec.dependencies[0].1)
+    let selected = selected_clean_overlay_cargo_tree(&dep, &spec.dependencies[0].1, true)
         .await
         .unwrap();
     assert!(
@@ -1799,6 +1799,138 @@ async fn clean_overlay_submodule_archive_attributes_are_checked_at_admission_and
     assert!(
         error.to_string().contains("non-checkout-equivalent"),
         "{error:#}"
+    );
+}
+
+#[cfg(unix)]
+async fn selected_git_archive_fixture_member(
+    root: &Path,
+    commit: &str,
+    path: &Path,
+) -> Option<Vec<u8>> {
+    let bytes = git_output_bytes(root, &["archive", "--format=tar", commit])
+        .await
+        .unwrap();
+    let mut archive = tar::Archive::new(bytes.as_slice());
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        if entry.path().unwrap() == path {
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            return Some(bytes);
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn clean_overlay_submodule_rejects_nul_hidden_committed_archive_transformations() {
+    let _guard = test_guard!();
+    for attribute in ["export-ignore", "export-subst"] {
+        let (app, module, _) = retained_clean_overlay_submodule_fixture().await;
+        let original = b"pub const COMMIT: &str = \"$Format:%H$\";\n";
+        std::fs::write(module.join("src/lib.rs"), original).unwrap();
+        std::fs::write(module.join(".gitattributes"), "src/lib.rs text\n").unwrap();
+        let benign_pin = commit_clean_overlay_submodule_fixture(&module).await;
+        commit_clean_overlay_submodule_fixture(&app).await;
+        prepare_clean_overlay_spec(&app, Some("HEAD".into()), true, vec![], true)
+            .await
+            .expect("ordinary text attributes remain supported");
+        assert_eq!(
+            selected_git_archive_fixture_member(&module, &benign_pin, Path::new("src/lib.rs"))
+                .await
+                .unwrap(),
+            original
+        );
+
+        std::fs::write(
+            module.join(".gitattributes"),
+            format!("src/lib.rs {attribute}\0hidden\n"),
+        )
+        .unwrap();
+        let selected_pin = commit_clean_overlay_submodule_fixture(&module).await;
+        commit_clean_overlay_submodule_fixture(&app).await;
+        // Exercise Git's parser independently: the hidden attribute really
+        // changes the archive, despite the suffix being part of a Rust token.
+        let archived =
+            selected_git_archive_fixture_member(&module, &selected_pin, Path::new("src/lib.rs"))
+                .await;
+        if attribute == "export-ignore" {
+            assert!(archived.is_none());
+        } else {
+            assert_eq!(
+                archived.unwrap(),
+                format!("pub const COMMIT: &str = \"{selected_pin}\";\n").as_bytes()
+            );
+        }
+        let error = prepare_clean_overlay_spec(&app, Some("HEAD".into()), true, vec![], true)
+            .await
+            .expect_err("committed NUL attribute input must fail closed");
+        assert!(error.to_string().contains("NUL bytes"), "{error:#}");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn clean_overlay_nested_submodule_rejects_nul_hidden_info_attributes() {
+    let _guard = test_guard!();
+    let (app, module, _) = retained_clean_overlay_submodule_fixture().await;
+    let leaf_source = init_clean_overlay_test_repo().keep();
+    let original = b"pub const COMMIT: &str = \"$Format:%H$\";\n";
+    std::fs::write(leaf_source.join("src/lib.rs"), original).unwrap();
+    let leaf_pin = commit_clean_overlay_submodule_fixture(&leaf_source).await;
+    git_output(
+        &module,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            leaf_source.to_str().unwrap(),
+            "nested/leaf",
+        ],
+    )
+    .await
+    .unwrap();
+    commit_clean_overlay_submodule_fixture(&module).await;
+    commit_clean_overlay_submodule_fixture(&app).await;
+    let spec = prepare_clean_overlay_spec(&app, Some("HEAD".into()), true, vec![], true)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(spec.submodules.len(), 2);
+    let leaf = module.join("nested/leaf");
+    let attributes = git_output(&leaf, &["rev-parse", "--git-path", "info/attributes"])
+        .await
+        .unwrap();
+    for attribute in ["export-ignore", "export-subst"] {
+        std::fs::write(&attributes, format!("src/lib.rs {attribute}\0hidden\n")).unwrap();
+        let archived =
+            selected_git_archive_fixture_member(&leaf, &leaf_pin, Path::new("src/lib.rs")).await;
+        if attribute == "export-ignore" {
+            assert!(archived.is_none());
+        } else {
+            assert_eq!(
+                archived.unwrap(),
+                format!("pub const COMMIT: &str = \"{leaf_pin}\";\n").as_bytes()
+            );
+        }
+        let error = spec.verify_archive_attributes(&app).await.unwrap_err();
+        assert!(error.to_string().contains("info/attributes"), "{error:#}");
+        assert!(error.to_string().contains("NUL bytes"), "{error:#}");
+        prepare_clean_overlay_spec(&app, Some("HEAD".into()), true, vec![], true)
+            .await
+            .expect_err("nested info attributes must also fail admission");
+    }
+    std::fs::write(&attributes, "src/lib.rs text\n").unwrap();
+    spec.verify_archive_attributes(&app).await.unwrap();
+    assert_eq!(
+        selected_git_archive_fixture_member(&leaf, &leaf_pin, Path::new("src/lib.rs"))
+            .await
+            .unwrap(),
+        original
     );
 }
 

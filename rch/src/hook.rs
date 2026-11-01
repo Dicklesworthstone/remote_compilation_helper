@@ -3606,7 +3606,14 @@ async fn git_output(project_root: &Path, args: &[&str]) -> anyhow::Result<String
     )
 }
 
-fn contains_git_archive_transform_attribute(contents: &str) -> bool {
+fn git_archive_attributes_require_refusal(contents: &str) -> bool {
+    // Git parses attribute lines as C strings. A NUL can terminate an active
+    // attribute name before suffix bytes that this text scanner would retain,
+    // e.g. `export-ignore\0hidden`. Refuse binary attribute input rather than
+    // accepting an archive whose selected paths or bytes Git may transform.
+    if contents.contains('\0') {
+        return true;
+    }
     contents.lines().any(|line| {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -3647,9 +3654,9 @@ async fn validate_clean_overlay_archive_attributes(
                     "failed to read known .gitattributes path {path} from clean-overlay base {commit}"
                 )
             })?;
-        if contains_git_archive_transform_attribute(&contents) {
+        if git_archive_attributes_require_refusal(&contents) {
             anyhow::bail!(
-                "clean-overlay base uses export-ignore/export-subst in {path}; refusing a non-checkout-equivalent Git archive"
+                "clean-overlay base has NUL bytes or export-ignore/export-subst in {path}; refusing a non-checkout-equivalent Git archive"
             );
         }
     }
@@ -3665,9 +3672,9 @@ async fn validate_clean_overlay_archive_attributes(
         project_root.join(info_attributes)
     };
     match std::fs::read_to_string(&info_attributes) {
-        Ok(contents) if contains_git_archive_transform_attribute(&contents) => {
+        Ok(contents) if git_archive_attributes_require_refusal(&contents) => {
             anyhow::bail!(
-                "clean-overlay repository info/attributes uses export-ignore/export-subst; refusing a non-checkout-equivalent Git archive"
+                "clean-overlay repository info/attributes has NUL bytes or export-ignore/export-subst; refusing a non-checkout-equivalent Git archive"
             );
         }
         Ok(_) => {}
@@ -3723,6 +3730,7 @@ fn is_selected_cargo_metadata(path: &Path) -> bool {
 async fn selected_clean_overlay_cargo_tree(
     project_root: &Path,
     spec: &CleanOverlaySpec,
+    retain_cargo_metadata: bool,
 ) -> anyhow::Result<
     std::collections::BTreeMap<PathBuf, rch_common::cargo_path_deps::SelectedCargoEntry>,
 > {
@@ -3804,6 +3812,10 @@ async fn selected_clean_overlay_cargo_tree(
     for overlay in spec.overlay_paths() {
         add_overlay(project_root, overlay, &mut entries)?;
     }
+    if !retain_cargo_metadata {
+        spec.verify_overlay_unchanged(project_root)?;
+        return Ok(entries);
+    }
     let mut metadata_paths: Vec<_> = entries
         .keys()
         .filter(|path| is_selected_cargo_metadata(path))
@@ -3851,6 +3863,40 @@ async fn selected_clean_overlay_cargo_tree(
     Ok(entries)
 }
 
+/// Combine the selected repositories in their actual remote layout. Source
+/// containment is a property of this complete inventory, not of one archive:
+/// explicitly selected sibling roots may refer to one another through symlinks.
+async fn selected_clean_overlay_source_tree(
+    project_root: &Path,
+    spec: &CleanOverlaySpec,
+    retain_cargo_metadata: bool,
+) -> anyhow::Result<
+    std::collections::BTreeMap<PathBuf, rch_common::cargo_path_deps::SelectedCargoEntry>,
+> {
+    let primary_directory = spec.primary_directory.as_deref().unwrap_or(Path::new(""));
+    let mut entries = selected_clean_overlay_cargo_tree(project_root, spec, retain_cargo_metadata)
+        .await?
+        .into_iter()
+        .map(|(path, entry)| (primary_directory.join(path), entry))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for (root, selected) in &spec.dependencies {
+        let directory = root
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("missing dependency directory"))?;
+        for (path, entry) in
+            selected_clean_overlay_cargo_tree(root, selected, retain_cargo_metadata).await?
+        {
+            anyhow::ensure!(
+                entries
+                    .insert(Path::new(directory).join(path), entry)
+                    .is_none(),
+                "overlapping selected dependency inventory"
+            );
+        }
+    }
+    Ok(entries)
+}
+
 async fn validate_clean_overlay_cargo_sources(
     project_root: &Path,
     spec: &CleanOverlaySpec,
@@ -3862,24 +3908,7 @@ async fn validate_clean_overlay_cargo_sources(
     };
 
     let primary_directory = spec.primary_directory.as_deref().unwrap_or(Path::new(""));
-    let mut entries = selected_clean_overlay_cargo_tree(project_root, spec)
-        .await?
-        .into_iter()
-        .map(|(path, entry)| (primary_directory.join(path), entry))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    for (root, selected) in &spec.dependencies {
-        let directory = root
-            .file_name()
-            .ok_or_else(|| anyhow::anyhow!("missing dependency directory"))?;
-        for (path, entry) in selected_clean_overlay_cargo_tree(root, selected).await? {
-            anyhow::ensure!(
-                entries
-                    .insert(Path::new(directory).join(path), entry)
-                    .is_none(),
-                "overlapping selected dependency inventory"
-            );
-        }
-    }
+    let entries = selected_clean_overlay_source_tree(project_root, spec, true).await?;
     let invocation_directory = primary_directory.join(&spec.invocation_directory);
     let mut primary_manifest = None;
     let mut manifest_selected = false;
@@ -4004,7 +4033,7 @@ async fn detect_clean_overlay_toolchain(
 ) -> anyhow::Result<Option<ToolchainInfo>> {
     use rch_common::cargo_path_deps::{SelectedCargoEntry, validate_selected_cargo_path};
 
-    let entries = selected_clean_overlay_cargo_tree(project_root, spec).await?;
+    let entries = selected_clean_overlay_cargo_tree(project_root, spec, true).await?;
     for directory in spec.invocation_directory.ancestors() {
         for name in ["rust-toolchain", "rust-toolchain.toml"] {
             let path = directory.join(name);
