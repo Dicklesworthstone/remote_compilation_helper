@@ -389,7 +389,9 @@ fn lifecycle_accepts_new_builds(lifecycle: WorkerLifecycle) -> bool {
 enum DrainCompletionAction {
     #[default]
     StayDrained,
-    RemoveFromPool,
+    /// The inventory removal itself requested this drain. Reintroducing the
+    /// config may resume it only while no later operator action supersedes it.
+    ResumeOnConfigReturn,
     Disable {
         reason: Option<String>,
     },
@@ -549,6 +551,10 @@ pub struct WorkerState {
     disabled_reason: RwLock<Option<String>>,
     /// Administrative intent to apply when a draining worker reaches zero slots.
     drain_completion: RwLock<DrainCompletionAction>,
+    /// Inventory removal is independent of operator intent. A disabled worker
+    /// must remain dormant while its owned slots drain, yet still be removable
+    /// once they are released. Mutations serialize under `network_transition`.
+    removal_pending: AtomicBool,
     /// Unix timestamp (seconds since epoch) when worker was disabled.
     ///
     /// **Why atomic:** Queried during worker selection to skip disabled workers.
@@ -681,6 +687,7 @@ impl WorkerState {
             unmeasured_capacity_hold_until: std::sync::Mutex::new(None),
             disabled_reason: RwLock::new(None),
             drain_completion: RwLock::new(DrainCompletionAction::default()),
+            removal_pending: AtomicBool::new(false),
             disabled_at: AtomicI64::new(0),
         }
     }
@@ -947,59 +954,63 @@ impl WorkerState {
         self.set_pooled_connections_enabled(false).await;
     }
 
-    /// Update configuration, returning whether the connection endpoint changed.
+    /// Update configuration, returning whether health/recovery monitors need
+    /// to wake for a new endpoint or a resumed inventory drain. Resuming the
+    /// same endpoint preserves its existing transport recovery deadline.
     pub async fn update_config(&self, new_config: WorkerConfig) -> bool {
-        let endpoint_changed = {
-            let mut config = self.config.write().await;
-            let endpoint_changed = !same_endpoint(&config, &new_config);
-            self.disk_capacity_generation.fetch_add(1, Ordering::AcqRel);
-            if endpoint_changed {
-                let _transition = self.network_transition.lock().await;
-                self.require_connection_probe();
-                *self.transport.lock().await = WorkerTransportState::default();
-                self.set_pooled_connections_enabled(false).await;
-                self.endpoint_incarnation
-                    .generation
-                    .fetch_add(1, Ordering::AcqRel);
-                // Observations of the previous host/key/OS cannot condemn (or
-                // qualify) its replacement. Preserve build ownership and the
-                // operator's administrative intent, including an active bypass.
-                *self.circuit.write().await = CircuitStats::new();
-                *self.last_error_msg.write().await = None;
-                self.last_latency_ms.store(0, Ordering::Relaxed);
-                self.cached_projects.write().await.clear();
-                self.toolchain_preflight.write().await.clear();
-                *self.capabilities.write().await = WorkerCapabilities::new();
-                *self.disk_capacity_observation.write().await = None;
-                *self.pressure_assessment.write().await = PressureAssessment::default();
-                self.lifecycle
-                    .write()
-                    .await
-                    .observe_health(EligibilityState::Unreachable);
-            }
-            *config = new_config;
-            endpoint_changed
-        };
+        let mut config = self.config.write().await;
+        let _transition = self.network_transition.lock().await;
+        let endpoint_changed = !same_endpoint(&config, &new_config);
+        self.disk_capacity_generation.fetch_add(1, Ordering::AcqRel);
+        if endpoint_changed {
+            self.require_connection_probe();
+            *self.transport.lock().await = WorkerTransportState::default();
+            self.set_pooled_connections_enabled(false).await;
+            self.endpoint_incarnation
+                .generation
+                .fetch_add(1, Ordering::AcqRel);
+            // Observations of the previous host/key/OS cannot condemn (or
+            // qualify) its replacement. Preserve build ownership and the
+            // operator's administrative intent, including an active bypass.
+            *self.circuit.write().await = CircuitStats::new();
+            *self.last_error_msg.write().await = None;
+            self.last_latency_ms.store(0, Ordering::Relaxed);
+            self.cached_projects.write().await.clear();
+            self.toolchain_preflight.write().await.clear();
+            *self.capabilities.write().await = WorkerCapabilities::new();
+            *self.disk_capacity_observation.write().await = None;
+            *self.pressure_assessment.write().await = PressureAssessment::default();
+            self.lifecycle
+                .write()
+                .await
+                .observe_health(EligibilityState::Unreachable);
+        }
+        *config = new_config;
 
-        let cancelled_pending_removal = {
+        let resume_inventory_drain = {
+            let removed = self.removal_pending.swap(false, Ordering::AcqRel);
             let mut completion = self.drain_completion.write().await;
-            let should_cancel = *completion == DrainCompletionAction::RemoveFromPool;
-            if should_cancel {
+            let resume = removed && *completion == DrainCompletionAction::ResumeOnConfigReturn;
+            if resume {
                 *completion = DrainCompletionAction::StayDrained;
             }
-            should_cancel
+            resume
         };
 
-        if cancelled_pending_removal {
-            let mut lifecycle = self.lifecycle.write().await;
-            if matches!(
-                lifecycle.admin,
-                AdminIntent::Draining | AdminIntent::Drained
-            ) {
-                lifecycle.set_admin(AdminIntent::Active);
+        if resume_inventory_drain {
+            {
+                let mut lifecycle = self.lifecycle.write().await;
+                if matches!(
+                    lifecycle.admin,
+                    AdminIntent::Draining | AdminIntent::Drained
+                ) {
+                    lifecycle.set_admin(AdminIntent::Active);
+                }
             }
+            self.set_pooled_connections_enabled(self.background_network_allowed().await)
+                .await;
         }
-        endpoint_changed
+        endpoint_changed || resume_inventory_drain
     }
 
     /// Get the current worker status as the legacy single-axis [`WorkerStatus`].
@@ -1580,32 +1591,59 @@ impl WorkerState {
 
     /// Start draining the worker (no new jobs, but finish existing).
     pub async fn drain(&self) {
-        *self.drain_completion.write().await = DrainCompletionAction::StayDrained;
-        self.lifecycle
-            .write()
-            .await
-            .set_admin(AdminIntent::Draining);
+        let transition = self.network_transition.lock().await;
+        let admin = self.lifecycle.read().await.admin;
+        let disabled = admin == AdminIntent::Disabled
+            || matches!(
+                *self.drain_completion.read().await,
+                DrainCompletionAction::Disable { .. }
+            );
+        if !disabled {
+            *self.drain_completion.write().await = DrainCompletionAction::StayDrained;
+            if admin == AdminIntent::Active {
+                self.lifecycle
+                    .write()
+                    .await
+                    .set_admin(AdminIntent::Draining);
+            }
+        }
+        drop(transition);
         self.check_drain_complete().await;
     }
 
     /// Start draining a worker that should be removed once active jobs finish.
     pub async fn drain_for_removal(&self) {
-        *self.drain_completion.write().await = DrainCompletionAction::RemoveFromPool;
-        self.lifecycle
-            .write()
-            .await
-            .set_admin(AdminIntent::Draining);
+        let transition = self.network_transition.lock().await;
+        self.removal_pending.store(true, Ordering::Release);
+        let admin = self.lifecycle.read().await.admin;
+        if admin == AdminIntent::Active {
+            *self.drain_completion.write().await = DrainCompletionAction::ResumeOnConfigReturn;
+            self.lifecycle
+                .write()
+                .await
+                .set_admin(AdminIntent::Draining);
+        }
+        drop(transition);
         self.check_drain_complete().await;
     }
 
     /// Start draining a worker that should become disabled once active jobs finish.
     pub async fn drain_then_disable(&self, reason: Option<String>) {
         let transition = self.network_transition.lock().await;
-        *self.drain_completion.write().await = DrainCompletionAction::Disable { reason };
-        self.lifecycle
-            .write()
-            .await
-            .set_admin(AdminIntent::Draining);
+        let disabled = self.lifecycle.read().await.admin == AdminIntent::Disabled;
+        if disabled {
+            // A repeated disable with drain requested must not relax an
+            // already effective disable while its existing builds finish.
+            *self.disabled_reason.write().await = reason;
+            self.disabled_at
+                .store(current_unix_secs_for_disabled_at(), Ordering::Relaxed);
+        } else {
+            *self.drain_completion.write().await = DrainCompletionAction::Disable { reason };
+            self.lifecycle
+                .write()
+                .await
+                .set_admin(AdminIntent::Draining);
+        }
         self.require_connection_probe();
         self.set_pooled_connections_enabled(false).await;
         drop(transition);
@@ -1616,15 +1654,29 @@ impl WorkerState {
     /// Clears disabled reason and timestamp, sets status to Healthy.
     pub async fn enable(&self) {
         let _transition = self.network_transition.lock().await;
-        *self.drain_completion.write().await = DrainCompletionAction::StayDrained;
-        // Operator re-enable is an authoritative override: restore both axes to
-        // fully in-service (Active + Healthy) and clear any bypass cause.
-        *self.lifecycle.write().await = WorkerLifecycle::new();
+        let removed = self.removal_pending.load(Ordering::Acquire);
+        *self.drain_completion.write().await = if removed {
+            DrainCompletionAction::ResumeOnConfigReturn
+        } else {
+            DrainCompletionAction::StayDrained
+        };
+        // Operator re-enable clears administrative disable and quarantine. It
+        // does not reintroduce missing inventory: those owners remain draining
+        // until their builds finish or configuration explicitly restores them.
+        let mut lifecycle = WorkerLifecycle::new();
+        if removed {
+            lifecycle.set_admin(if self.used_slots() == 0 {
+                AdminIntent::Drained
+            } else {
+                AdminIntent::Draining
+            });
+        }
+        *self.lifecycle.write().await = lifecycle;
         self.revoke_background_network();
         *self.transport.lock().await = WorkerTransportState::default();
         // Admission still requires the next health probe for monitored daemon
         // workers. An explicit enable does not prove the SSH endpoint is up.
-        self.set_pooled_connections_enabled(self.connection_ready.load(Ordering::Acquire))
+        self.set_pooled_connections_enabled(self.background_network_allowed().await)
             .await;
         *self.disabled_reason.write().await = None;
         self.disabled_at.store(0, Ordering::Relaxed);
@@ -1672,7 +1724,7 @@ impl WorkerState {
         }
 
         let disable_reason = match completion {
-            DrainCompletionAction::StayDrained | DrainCompletionAction::RemoveFromPool => {
+            DrainCompletionAction::StayDrained | DrainCompletionAction::ResumeOnConfigReturn => {
                 lifecycle.set_admin(AdminIntent::Drained);
                 None
             }
@@ -1694,8 +1746,8 @@ impl WorkerState {
         }
     }
 
-    async fn remove_after_drain_pending(&self) -> bool {
-        *self.drain_completion.read().await == DrainCompletionAction::RemoveFromPool
+    pub(crate) async fn remove_after_drain_pending(&self) -> bool {
+        self.removal_pending.load(Ordering::Acquire)
     }
 
     /// Get the reason this worker was disabled (if any).
@@ -1999,7 +2051,7 @@ impl WorkerPool {
             worker.check_drain_complete().await;
             let status = worker.status().await;
 
-            if status == WorkerStatus::Drained
+            if matches!(status, WorkerStatus::Drained | WorkerStatus::Disabled)
                 && worker.used_slots() == 0
                 && worker.remove_after_drain_pending().await
             {
@@ -2018,8 +2070,10 @@ impl WorkerPool {
             }
 
             worker.check_drain_complete().await;
-            let should_remove = worker.status().await == WorkerStatus::Drained
-                && worker.used_slots() == 0
+            let should_remove = matches!(
+                worker.status().await,
+                WorkerStatus::Drained | WorkerStatus::Disabled
+            ) && worker.used_slots() == 0
                 && worker.remove_after_drain_pending().await;
             if should_remove {
                 worker.retire_endpoint().await;
@@ -2345,7 +2399,11 @@ async fn refresh_worker_capabilities_for_worker(
 
 /// Handle a worker drain request.
 pub async fn handle_worker_drain(ctx: &DaemonContext, worker_id: &WorkerId) -> WorkerStateResponse {
-    match ctx.pool.get(worker_id).await {
+    // Keep the resolved incarnation registered through publication, just as
+    // enable/disable do. Reload cannot replace it while this action waits on
+    // an existing transition and then receive a drain of only its retired Arc.
+    let workers = ctx.pool.workers.read().await;
+    match workers.get(worker_id) {
         Some(worker) => {
             let active_slots = worker.used_slots();
             worker.drain().await;
@@ -4929,6 +4987,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn operator_disable_dominates_subsequent_drain_requests() {
+        for drain_first in [false, true] {
+            for removal in [false, true] {
+                let state = WorkerState::new(test_config("disabled"));
+                assert!(state.reserve_slots(3).await);
+                if drain_first {
+                    state.drain_then_disable(Some("maintenance".into())).await;
+                } else {
+                    state.disable(Some("maintenance".into())).await;
+                }
+                let status = state.status().await;
+                if removal {
+                    state.drain_for_removal().await;
+                }
+                state.drain().await;
+                assert_eq!(state.status().await, status);
+                assert!(state.background_probe().await.is_none());
+                assert!(state.next_health_probe_in().await.is_none());
+                assert!(
+                    state
+                        .health_probe_permit(
+                            Duration::from_secs(30),
+                            &CircuitBreakerConfig::default()
+                        )
+                        .await
+                        .is_none(),
+                    "drain_first={drain_first}, removal={removal}: disable must still forbid SSH"
+                );
+                assert!(!state.reserve_slots(1).await);
+                assert_eq!(state.used_slots(), 3);
+                assert_eq!(state.remove_after_drain_pending().await, removal);
+                state.release_slots(3).await;
+                assert!(state.is_disabled().await);
+                assert_eq!(
+                    state.disabled_reason().await.as_deref(),
+                    Some("maintenance")
+                );
+                assert_eq!(state.remove_after_drain_pending().await, removal);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn removal_reintroduction_preserves_later_operator_intent() {
+        for intent in ["drain", "disable", "disable-after-drain"] {
+            let config = test_config("operator");
+            let state = WorkerState::new(config.clone());
+            assert!(state.reserve_slots(1).await);
+            state.drain_for_removal().await;
+            match intent {
+                "disable" => state.disable(Some("maintenance".into())).await,
+                "disable-after-drain" => {
+                    state.drain_then_disable(Some("maintenance".into())).await;
+                }
+                _ => state.drain().await,
+            }
+            assert!(state.remove_after_drain_pending().await, "{intent}");
+            let status = state.status().await;
+            state.update_config(config).await;
+            assert_eq!(state.status().await, status, "{intent}");
+            assert!(!state.remove_after_drain_pending().await);
+            assert_eq!(state.used_slots(), 1);
+            state.release_slots(1).await;
+            if intent == "drain" {
+                assert!(state.is_drained().await);
+            } else {
+                assert!(state.is_disabled().await);
+                assert_eq!(
+                    state.disabled_reason().await.as_deref(),
+                    Some("maintenance")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn inventory_drain_keeps_owned_monitoring_and_restores_pools_on_return() {
+        for enable_while_absent in [false, true] {
+            let config = test_config("returning");
+            let state = WorkerState::new(config.clone());
+            let mut pools = Vec::new();
+            for _ in 0..2 {
+                let pool = Arc::new(rch_common::SshPool::new(rch_common::SshOptions {
+                    connect_timeout: Duration::ZERO,
+                    ..Default::default()
+                }));
+                state.attach_ssh_pool(pool.clone()).await;
+                pools.push(pool);
+            }
+            assert!(state.reserve_slots(1).await);
+            state.drain_for_removal().await;
+            if enable_while_absent {
+                state.enable().await;
+            }
+            assert!(state.is_draining().await);
+            assert!(state.remove_after_drain_pending().await);
+            assert_eq!(state.used_slots(), 1);
+            assert!(!state.reserve_slots(1).await);
+            assert!(state.background_probe().await.is_some());
+            assert!(
+                state
+                    .health_probe_permit(Duration::from_secs(30), &CircuitBreakerConfig::default())
+                    .await
+                    .is_some(),
+                "reachable draining builds still require normal monitoring"
+            );
+            state.release_slots(1).await;
+            assert!(state.is_drained().await);
+            for pool in &pools {
+                let error = pool.get_or_connect(&config).await.err().unwrap();
+                assert!(
+                    format!("{error:#}").contains("disabled or its pool admission was revoked")
+                );
+            }
+
+            // Config reappears after the last owner finishes but before prune.
+            // The endpoint remains verified; both pools must match its resumed
+            // admission instead of causing a false transport failure at health.
+            state.update_config(config.clone()).await;
+            assert!(!state.remove_after_drain_pending().await);
+            assert!(state.lifecycle().await.is_schedulable());
+            assert!(state.background_probe().await.is_some());
+            for pool in pools {
+                let error = pool.get_or_connect(&config).await.err().unwrap();
+                assert!(
+                    format!("{error:#}").contains("SSH connection timed out before spawn"),
+                    "verified inventory return must restore pool admission without dialing: {error:#}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_cached_projects() {
         let state = WorkerState::new(test_config("test"));
 
@@ -5296,6 +5487,104 @@ mod tests {
         health.changed().await.unwrap();
         recovery.changed().await.unwrap();
         assert_eq!(*health.borrow_and_update(), *recovery.borrow_and_update());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inventory_resume_wakes_health_without_resetting_recovery_deadline() {
+        let heartbeat = Duration::from_secs(30);
+        let circuit = CircuitBreakerConfig {
+            failure_threshold: 1,
+            open_cooldown_secs: 900,
+            ..Default::default()
+        };
+        for connected in [true, false] {
+            let pool = WorkerPool::new().with_connection_monitoring();
+            let config = test_config("returning");
+            pool.add_worker(config.clone()).await;
+            let worker = pool.get(&config.id).await.unwrap();
+            worker
+                .record_transport_result(true, heartbeat, &circuit)
+                .await;
+            assert!(worker.reserve_slots(1).await);
+            let initial = worker
+                .health_probe_permit(heartbeat, &circuit)
+                .await
+                .unwrap();
+            worker
+                .record_transport_result(connected, heartbeat, &circuit)
+                .await;
+            drop(initial);
+
+            worker.drain_for_removal().await;
+            worker.release_slots(1).await;
+            assert!(worker.is_drained().await);
+            assert!(worker.next_health_probe_in().await.is_none());
+            let mut changes = pool.subscribe_endpoint_changes();
+            tokio::time::advance(heartbeat).await;
+
+            // With its sole worker drained, the monitor may be asleep for the
+            // 900s fallback. Returning identical inventory must wake it even
+            // though the connection endpoint and its existing clock are intact.
+            pool.add_worker(config.clone()).await;
+            assert!(
+                changes.has_changed().unwrap(),
+                "inventory resume must wake health"
+            );
+            changes.changed().await.unwrap();
+            assert!(Arc::ptr_eq(&worker, &pool.get(&config.id).await.unwrap()));
+            assert_eq!(worker.transport_is_down().await, !connected);
+            assert_eq!(
+                worker.next_health_probe_in().await,
+                Some(if connected {
+                    Duration::ZERO
+                } else {
+                    Duration::from_secs(870)
+                })
+            );
+            pool.add_worker(config.clone()).await;
+            assert!(
+                !changes.has_changed().unwrap(),
+                "unchanged active inventory needs no wake"
+            );
+
+            if connected {
+                let due = worker
+                    .health_probe_permit(heartbeat, &circuit)
+                    .await
+                    .unwrap();
+                assert!(
+                    !due.isolated,
+                    "the verified healthy endpoint is immediately due"
+                );
+            } else {
+                assert!(
+                    worker
+                        .health_probe_permit(heartbeat, &circuit)
+                        .await
+                        .is_none()
+                );
+                tokio::time::advance(Duration::from_secs(869)).await;
+                assert_eq!(
+                    worker.next_health_probe_in().await,
+                    Some(Duration::from_secs(1))
+                );
+                assert!(
+                    worker
+                        .health_probe_permit(heartbeat, &circuit)
+                        .await
+                        .is_none()
+                );
+                tokio::time::advance(Duration::from_secs(1)).await;
+                let due = worker
+                    .health_probe_permit(heartbeat, &circuit)
+                    .await
+                    .unwrap();
+                assert!(
+                    due.isolated,
+                    "outage recovery still waits the full 900 seconds"
+                );
+            }
+        }
     }
 
     #[tokio::test]

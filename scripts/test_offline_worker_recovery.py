@@ -214,14 +214,7 @@ class DaemonFixture:
         ssh = self.root / "bin/ssh"
         ssh.write_text(f'#!/bin/sh\nexec {invocation} "$@"\n')
         ssh.chmod(0o700)
-        user = pwd.getpwuid(os.getuid()).pw_name
-        workers = []
-        for worker in self.modes:
-            workers.append(
-                f'[[workers]]\nid = "{worker}"\nhost = "{worker}"\nuser = "{user}"\n'
-                f'identity_file = "{self.root / "client"}"\ntotal_slots = 64\npriority = 100\n'
-            )
-        (self.root / "config/workers.toml").write_text("\n".join(workers))
+        self.write_workers(self.modes)
         (self.root / "config/daemon.toml").write_text(
             f"health_check_interval_secs = {health_interval}\nworker_timeout_secs = {worker_timeout}\n"
             f"connection_pooling = {str(pooling).lower()}\n"
@@ -266,6 +259,20 @@ class DaemonFixture:
         temporary = self.root / "modes.next"
         temporary.write_text(json.dumps(self.modes))
         temporary.replace(self.root / "modes.json")
+
+    def write_workers(self, worker_ids):
+        """Atomically replace inventory without changing the transport fixture."""
+        user = pwd.getpwuid(os.getuid()).pw_name
+        workers = []
+        for worker in worker_ids:
+            assert worker in self.modes, worker
+            workers.append(
+                f'[[workers]]\nid = "{worker}"\nhost = "{worker}"\nuser = "{user}"\n'
+                f'identity_file = "{self.root / "client"}"\ntotal_slots = 64\npriority = 100\n'
+            )
+        temporary = self.root / "config/workers.next"
+        temporary.write_text("\n".join(workers) if workers else "workers = []\n")
+        temporary.replace(self.root / "config/workers.toml")
 
     def start(self):
         self.log = (self.root / "daemon.log").open("ab")
@@ -596,6 +603,129 @@ def run_warm_transport_freeze(binary, root, openssh):
         fixture.stop()
 
 
+def run_disabled_worker_reload(binary, root, openssh):
+    """Inventory retirement must preserve disablement and live build ownership."""
+    fixture = DaemonFixture(binary, root, openssh=openssh,
+                            modes={"offline": "healthy", "healthy": "healthy"})
+    results = {"reservation_slots": 3, "phases": {}}
+    try:
+        fixture.start()
+        for worker in ("offline", "healthy"):
+            wait_until(lambda: fixture.status(worker)["status"].lower() == "healthy"
+                       and fixture.status(worker)["total_slots"] > 0, 8, f"warm {worker}")
+        toolchain = quote(json.dumps({"channel": "stable", "date": None,
+                                     "full_version": "rustc 1.100.0"}))
+        reservation = fixture.request(
+            "GET /select-worker?project=disabled-reload-owned-reservation&cores=3"
+            f"&runtime=none&worker=offline&hook_pid={os.getpid()}&toolchain={toolchain}")
+        selected = reservation.get("worker")
+        assert selected and selected["id"] == "offline", reservation
+        build_id = reservation.get("build_id") or selected.get("build_id")
+        assert build_id, reservation
+        wait_until(lambda: sum(transport_stats(dial)[1] > 0
+                               for dial in fixture.dials("offline")) >= 2,
+                   8, "both authenticated pools warm before inventory retirement")
+
+        def owned_state():
+            snapshot = fixture.request("GET /status")
+            active = next((build for build in snapshot["active_builds"]
+                           if build["id"] == build_id), None)
+            worker = next((worker for worker in snapshot["workers"]
+                           if worker["id"] == "offline"), None)
+            return {"worker": worker, "active_build": active}
+
+        def assert_owned(state):
+            assert state["active_build"] is not None, state
+            assert state["active_build"]["worker_id"] == "offline", state
+            assert state["active_build"]["slots"] == 3, state
+            assert state["worker"] is not None, state
+            assert state["worker"]["used_slots"] == 3, state
+
+        def retain_observations():
+            # Preserve the first failed before/after phase, including real
+            # dial counts, rather than losing it to the caller's assertion.
+            (fixture.root / "reload-observations.json").write_text(
+                json.dumps(results, indent=2) + "\n")
+
+        assert_owned(owned_state())
+        response = fixture.request("POST /workers/offline/disable?reason=owned-reload-fixture")
+        assert response.get("status") == "ok", response
+        wait_until(lambda: not any(transport_stats(dial)[1]
+                                   for dial in fixture.dials("offline")),
+                   3, "disabled owned worker closes both SSH pools")
+        disabled_dials = len(fixture.dials("offline"))
+        results["dials_before_inventory_changes"] = disabled_dials
+
+        def assert_disabled_phase(name, reload_response=None):
+            observation = fixture.observe(3.2, "offline")
+            state = owned_state()
+            phase = {"observation": observation, "state": state,
+                     "new_dials_since_disable": len(fixture.dials("offline")) - disabled_dials}
+            if reload_response is not None:
+                phase["reload_response"] = reload_response
+            results["phases"][name] = phase
+            retain_observations()
+            assert observation["dial_attempts"] == 0, phase
+            assert phase["new_dials_since_disable"] == 0, phase
+            assert observation["sampled_peak_live_transport_processes"] == 0, phase
+            assert_owned(state)
+            assert state["worker"]["status"].lower() == "disabled", phase
+            assert fixture.select("offline") is None
+            peer = fixture.select("healthy")
+            assert peer and peer["id"] == "healthy", peer
+            assert_owned(owned_state())
+
+        fixture.write_workers(["healthy"])
+        removed = fixture.request("POST /reload")
+        assert removed.get("success") is True, removed
+        assert removed["removed"] == 0, removed
+        assert_disabled_phase("removed_with_owned_build", removed)
+
+        # Reintroduce the exact original configuration while the reservation
+        # still belongs to its original worker; no changed field can hide an
+        # omitted transition for an otherwise identical inventory entry.
+        fixture.write_workers(["offline", "healthy"])
+        readded = fixture.request("POST /reload")
+        assert readded.get("success") is True, readded
+        assert_disabled_phase("identical_reintroduction", readded)
+        fixture.stop()
+        fixture.start()
+        assert_disabled_phase("disabled_restart")
+
+        # Enable restores permission to probe, not proof of connectivity.
+        # Keep the endpoint refused until health records the outage, then let
+        # a successful scheduled recovery probe restore admission.
+        fixture.set_modes(offline="refused")
+        enable_dials = len(fixture.dials("offline"))
+        response = fixture.request("POST /workers/offline/enable")
+        assert response.get("status") == "ok", response
+        assert fixture.select("offline") is None
+        wait_until(lambda: len(fixture.dials("offline")) > enable_dials
+                   and fixture.status("offline")["status"].lower() == "unreachable",
+                   8, "enabled worker requires fresh connectivity evidence")
+        assert fixture.select("offline") is None
+        assert_owned(owned_state())
+        results["enable_refused_probe_dials"] = len(fixture.dials("offline")) - enable_dials
+        fixture.set_modes(offline="healthy")
+        recovery_started = time.monotonic()
+        wait_until(lambda: fixture.status("offline")["status"].lower() == "healthy"
+                   and fixture.status("offline")["total_slots"] > 0,
+                   8, "explicitly enabled worker recovers through a successful probe")
+        results["recovery_latency_seconds"] = time.monotonic() - recovery_started
+        assert fixture.select("offline")["id"] == "offline"
+        assert_owned(owned_state())
+        response = fixture.request(
+            f"POST /release-worker?worker=offline&slots=3&exit_code=0&build_id={build_id}")
+        assert response == {}, response
+        assert fixture.status("offline")["used_slots"] == 0
+        assert all(build["id"] != build_id for build in fixture.request("GET /status")["active_builds"])
+        results["reservation_slots_preserved_until_explicit_release"] = 3
+        retain_observations()
+        return results
+    finally:
+        fixture.stop()
+
+
 def run_regressions(binary, root, openssh):
     results = {}
     fixture = DaemonFixture(binary, root / "recovery", openssh=openssh)
@@ -728,6 +858,8 @@ def run_regressions(binary, root, openssh):
         fixture.stop()
     results["authenticated_transport_freeze"] = run_warm_transport_freeze(
         binary, root / "warm-freeze", openssh)
+    results["disabled_worker_reload"] = run_disabled_worker_reload(
+        binary, root / "disabled-reload", openssh)
     results["saturated_recovery_fleet"] = run_saturated_fleet(binary, root / "saturated", openssh)
     return results
 

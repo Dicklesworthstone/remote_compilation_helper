@@ -75,7 +75,7 @@ impl Default for ReloadResult {
 pub struct ConfigDiff {
     /// Workers to add (new in config).
     pub to_add: Vec<WorkerConfig>,
-    /// Workers to update or reconcile after a drain.
+    /// Workers to update or reconcile after inventory reintroduction.
     pub to_update: Vec<WorkerConfig>,
     /// Worker IDs to remove (no longer in config).
     pub to_remove: Vec<WorkerId>,
@@ -94,7 +94,7 @@ pub async fn compute_worker_diff(
 ) -> Result<ConfigDiff> {
     let current_workers = pool.all_workers().await;
     let mut current_ids: HashSet<WorkerId> = HashSet::new();
-    let mut draining_ids: HashSet<WorkerId> = HashSet::new();
+    let mut pending_removal_ids: HashSet<WorkerId> = HashSet::new();
 
     // Build map of current workers
     let mut current_configs: std::collections::HashMap<WorkerId, WorkerConfig> =
@@ -102,8 +102,8 @@ pub async fn compute_worker_diff(
     for worker in &current_workers {
         let config = worker.config.read().await.clone();
         current_ids.insert(config.id.clone());
-        if worker.is_draining().await || worker.is_drained().await {
-            draining_ids.insert(config.id.clone());
+        if worker.remove_after_drain_pending().await {
+            pending_removal_ids.insert(config.id.clone());
         }
         current_configs.insert(config.id.clone(), config);
     }
@@ -122,7 +122,7 @@ pub async fn compute_worker_diff(
             // is still draining for removal. update_config cancels only that
             // removal intent; manual drains/disables and health remain intact.
             if worker_config_changed(current_config, new_config)
-                || draining_ids.contains(&new_config.id)
+                || pending_removal_ids.contains(&new_config.id)
             {
                 to_update.push(new_config.clone());
             }
@@ -1904,6 +1904,128 @@ enabled = true
             assert_eq!(pool.prune_drained().await, 0);
             let retained = pool.get(&id).await.unwrap();
             assert!(std::sync::Arc::ptr_eq(&worker, &retained));
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_removal_preserves_durable_disable_and_owned_slots() {
+        use rch_common::CircuitBreakerConfig;
+        use rch_common::bypass_record::AdminDisableStore;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        for drain_first in [false, true] {
+            for restore_while_busy in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("workers.toml");
+                let admin_path = directory.path().join("admin.json");
+                let snapshot =
+                    "[[workers]]\nid = 'disabled'\nhost = 'localhost'\ntotal_slots = 8\n";
+                std::fs::write(&path, snapshot).unwrap();
+                let store = Arc::new(Mutex::new(AdminDisableStore::with_path(&admin_path)));
+                let pool = WorkerPool::new().with_admin_disable_store(store.clone());
+                reload_workers(&pool, Some(&path), true).await.unwrap();
+                let id = WorkerId::new("disabled");
+                let original = pool.get(&id).await.unwrap();
+                assert!(original.reserve_slots(3).await);
+                let mut context = crate::test_daemon_context(pool.clone());
+                context.admin_disable_store = Some(store.clone());
+                let response = crate::workers::handle_worker_disable(
+                    &context,
+                    &id,
+                    Some("maintenance".into()),
+                    drain_first,
+                )
+                .await;
+                assert_eq!(response.status, "ok");
+                let status = original.status().await;
+                let record = store.lock().await.get("disabled").cloned().unwrap();
+
+                std::fs::write(&path, "workers = []\n").unwrap();
+                let removed = reload_workers(&pool, Some(&path), true).await.unwrap();
+                assert_eq!(removed.removed, 0, "active builds must keep their owner");
+                assert_eq!(original.used_slots(), 3);
+                assert_eq!(original.status().await, status);
+                assert!(original.background_probe().await.is_none());
+                assert!(
+                    original
+                        .health_probe_permit(
+                            Duration::from_secs(30),
+                            &CircuitBreakerConfig::default()
+                        )
+                        .await
+                        .is_none(),
+                    "inventory removal cannot authorize a disabled worker's SSH"
+                );
+                assert_eq!(pool.prune_drained().await, 0);
+                assert_eq!(
+                    AdminDisableStore::try_load(&admin_path)
+                        .unwrap()
+                        .get("disabled"),
+                    Some(&record)
+                );
+
+                if !restore_while_busy {
+                    original.release_slots(3).await;
+                    assert!(original.is_disabled().await);
+                    assert_eq!(pool.prune_drained().await, 1);
+                    assert!(pool.get(&id).await.is_none());
+                    assert!(!original.reserve_slots(1).await);
+                }
+                std::fs::write(&path, snapshot).unwrap();
+                let restored = reload_workers(&pool, Some(&path), true).await.unwrap();
+                let current = pool.get(&id).await.unwrap();
+                assert_eq!(Arc::ptr_eq(&original, &current), restore_while_busy);
+                assert_eq!(current.used_slots(), if restore_while_busy { 3 } else { 0 });
+                if restore_while_busy {
+                    assert_eq!(restored.updated, 1);
+                    assert_eq!(current.status().await, status);
+                } else {
+                    assert_eq!(restored.added, 1);
+                    assert!(current.is_disabled().await);
+                }
+                assert!(current.background_probe().await.is_none());
+                assert!(current.next_health_probe_in().await.is_none());
+                assert!(!current.reserve_slots(1).await);
+                if restore_while_busy {
+                    current.release_slots(3).await;
+                }
+                assert!(current.is_disabled().await);
+                assert_eq!(
+                    current.disabled_reason().await.as_deref(),
+                    Some("maintenance")
+                );
+                assert_eq!(pool.prune_drained().await, 0);
+
+                let restarted_store = Arc::new(Mutex::new(
+                    AdminDisableStore::try_load(&admin_path).unwrap(),
+                ));
+                let restarted = WorkerPool::new().with_admin_disable_store(restarted_store.clone());
+                reload_workers(&restarted, Some(&path), true).await.unwrap();
+                let worker = restarted.get(&id).await.unwrap();
+                assert!(worker.is_disabled().await);
+                assert_eq!(
+                    worker.disabled_reason().await.as_deref(),
+                    Some("maintenance")
+                );
+                assert!(worker.next_health_probe_in().await.is_none());
+                assert_eq!(restarted_store.lock().await.get("disabled"), Some(&record));
+                let mut context = crate::test_daemon_context(restarted);
+                context.admin_disable_store = Some(restarted_store);
+                assert_eq!(
+                    crate::workers::handle_worker_enable(&context, &id)
+                        .await
+                        .status,
+                    "ok"
+                );
+                assert!(!worker.is_disabled().await);
+                assert!(
+                    AdminDisableStore::try_load(&admin_path)
+                        .unwrap()
+                        .get("disabled")
+                        .is_none()
+                );
+            }
         }
     }
 }
