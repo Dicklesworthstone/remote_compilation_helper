@@ -6027,7 +6027,8 @@ mod progress_reporting;
 mod transfer_orchestration;
 use transfer_orchestration::execute_remote_compilation;
 pub(crate) use transfer_orchestration::recovery::{
-    daemon_absence_is_conclusive, recover_job, recover_job_cargo_json, unix_ms_now,
+    daemon_absence_is_conclusive, recover_job, recover_job_cargo_json, recover_job_locally,
+    unix_ms_now,
 };
 
 // Exact source-byte manifest construction and worker-side re-verification for

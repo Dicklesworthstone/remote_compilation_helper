@@ -3404,6 +3404,63 @@ pub(crate) async fn recover_job(
     Ok((exit, owned))
 }
 
+/// Complete only local daemon accounting after all worker obligations have
+/// already settled. The daemon may admit this operation while a worker is
+/// offline or explicitly disabled, so no worker recovery path is reachable.
+pub(crate) async fn recover_job_locally(
+    writer: &DurableLeaseWriter,
+) -> anyhow::Result<(i32, DurableLeaseWriter)> {
+    let owned = recovery_owner::claim_journal(writer).await?;
+    let mut socket = None;
+    let exit = recover_owned_job_locally_with_daemon(&owned, async |command: &str| {
+        if socket.is_none() {
+            let config = crate::config::load_config()?;
+            socket = Some(shellexpand::tilde(&config.general.socket_path).into_owned());
+        }
+        recovery_completion::request(socket.as_deref().expect("resolved socket"), command).await
+    })
+    .await?;
+    Ok((exit, owned))
+}
+
+async fn recover_owned_job_locally_with_daemon(
+    writer: &DurableLeaseWriter,
+    daemon: impl AsyncFnMut(&str) -> anyhow::Result<String>,
+) -> anyhow::Result<i32> {
+    let ownership = writer
+        .recovery_ownership
+        .as_ref()
+        .context("local recovery has no journal owner")?;
+    ownership.verify()?;
+    let before = writer.snapshot();
+    // Selection happened before the child acquired the journal. Recheck the
+    // freshly claimed snapshot so a new cancellation or unfinished source
+    // obligation cannot turn a local admission into an SSH recovery attempt.
+    anyhow::ensure!(
+        rch_common::job_identity::local_terminal_settlement_candidate(&before),
+        "local recovery requires exact retired delivery and settled worker obligations; journal retained"
+    );
+    let session = RecoverySession {
+        recipe: load_recipe(writer)?,
+        writer: writer.clone(),
+    };
+    let exit = session
+        .recipe
+        .returned
+        .context("local recovery has no retained delivery result")?;
+    if exit == 0 {
+        // Reuse the original producer binding check, without opening any
+        // released worker path or replacing absent legacy receipt evidence.
+        session.retained_cargo_artifact_evidence()?;
+    }
+    writer.record_exit(exit)?;
+    if !before.terminal_acknowledged {
+        recovery_completion::finish(writer, daemon).await?;
+    }
+    ownership.verify()?;
+    Ok(exit)
+}
+
 async fn recover_owned_job(writer: &DurableLeaseWriter) -> anyhow::Result<i32> {
     // The recipe is reloaded after claim. Persist extensions before collection
     // so a subsequent retry keeps them even without the invocation config.
@@ -4561,6 +4618,139 @@ mod tests {
             writer.set_recovery(original).unwrap();
         }
         (directory, writer)
+    }
+
+    #[cfg(unix)]
+    fn local_settlement_fixture(exit: i32) -> (tempfile::TempDir, DurableLeaseWriter) {
+        let (directory, writer) = retired_legacy_cancellation_fixture(
+            Some(SourceAuthorityNamespace::Current),
+            true,
+            None,
+        );
+        let mut recipe = writer.snapshot().recovery.unwrap();
+        recipe["exit_code"] = serde_json::json!(if exit == 0 { 0 } else { 137 });
+        recipe["returned"] = serde_json::json!(exit);
+        recipe["source_cancellation_settled"] = if exit == 0 {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!(true)
+        };
+        writer.set_recovery(recipe).unwrap();
+        (directory, writer)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn offline_worker_local_settlement_reloads_before_rejecting_new_worker_obligations() {
+        for changed in [
+            "unretired",
+            "unreleased",
+            "pending-cancellation",
+            "legacy-failure",
+        ] {
+            let (_directory, writer) = local_settlement_fixture(0);
+            let observed = DurableLeaseWriter {
+                path: writer.path.clone(),
+                recovery_ownership: None,
+                lease: Arc::new(Mutex::new(writer.snapshot())),
+            };
+            assert!(
+                rch_common::job_identity::local_terminal_settlement_candidate(&observed.snapshot())
+            );
+            let mut recipe = writer.snapshot().recovery.unwrap();
+            match changed {
+                "unretired" => recipe["retired"] = serde_json::json!(false),
+                "unreleased" => recipe["sources_released"] = serde_json::json!(false),
+                "pending-cancellation" => {
+                    recipe["source_cancellation_settled"] = serde_json::json!(false);
+                }
+                "legacy-failure" => {
+                    recipe["exit_code"] = serde_json::json!(137);
+                    recipe["returned"] = serde_json::json!(EXIT_BUILD_ERROR);
+                }
+                _ => unreachable!(),
+            }
+            writer.set_recovery(recipe).unwrap();
+            let before = std::fs::read(&writer.path).unwrap();
+            let error = recover_job_locally(&observed)
+                .await
+                .err()
+                .expect("new worker obligations must refuse local settlement");
+            assert!(
+                error
+                    .to_string()
+                    .contains("local recovery requires exact retired delivery"),
+                "{changed}: {error:#}"
+            );
+            assert_eq!(std::fs::read(&writer.path).unwrap(), before, "{changed}");
+            assert!(!observed.snapshot().terminal_acknowledged);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn offline_worker_local_settlement_preserves_exact_result_and_excludes_concurrent_recovery()
+     {
+        for exit in [0, EXIT_BUILD_ERROR] {
+            let (_directory, writer) = local_settlement_fixture(exit);
+            let original = writer.snapshot().recovery.unwrap();
+            let daemon_exit = if exit == 0 { 0 } else { 130 };
+            let owned = recovery_owner::claim_journal(&writer).await.unwrap();
+            let mut requests = Vec::new();
+            let settled = recover_owned_job_locally_with_daemon(&owned, async |request: &str| {
+                assert!(recovery_owner::claim_journal(&writer).await.is_err());
+                assert!(!owned.snapshot().terminal_acknowledged);
+                requests.push(request.to_owned());
+                let status = match requests.len() {
+                    1 => serde_json::json!({
+                        "status": "active",
+                        "active": {"id": 41, "worker_id": "source-recovery",
+                            "local_wrapper_id": owned.wrapper_id(), "slots": 3}
+                    }),
+                    2 => {
+                        assert!(request.starts_with("POST /release-worker?"));
+                        assert!(request.contains("slots=3&build_id=41&"));
+                        // A lost release reply must still be followed by exact
+                        // terminal readback before local acknowledgement.
+                        anyhow::bail!("release reply lost after daemon settlement");
+                    }
+                    3 => serde_json::json!({
+                        "status": "completed", "local_wrapper_id": owned.wrapper_id(),
+                        "record": {"id": 41, "worker_id": "source-recovery", "exit_code": daemon_exit}
+                    }),
+                    _ => panic!("unexpected repeated daemon settlement: {request}"),
+                };
+                Ok(format!("HTTP/1.1 200 OK\r\n\r\n{status}"))
+            })
+            .await
+            .unwrap();
+            assert_eq!(settled, exit);
+            assert_eq!(requests.len(), 3);
+            assert!(owned.snapshot().terminal_acknowledged);
+            let mut expected = original;
+            expected["daemon_exit_code"] = serde_json::json!(daemon_exit);
+            assert_eq!(owned.snapshot().recovery.unwrap(), expected);
+            assert_eq!(owned.snapshot().exit_code, Some(exit));
+            assert_eq!(
+                load_recipe(&owned).unwrap().exit_code,
+                Some(if exit == 0 { 0 } else { 137 })
+            );
+            let acknowledged = std::fs::read(&writer.path).unwrap();
+            drop(owned);
+
+            // A restart/retry uses the terminal receipt without reopening the
+            // worker or releasing the same reservation for a second time.
+            let reopened = recovery_owner::claim_journal(&writer).await.unwrap();
+            assert_eq!(
+                recover_owned_job_locally_with_daemon(&reopened, async |_request: &str| {
+                    panic!("acknowledged local recovery must not contact the daemon")
+                })
+                .await
+                .unwrap(),
+                exit
+            );
+            assert_eq!(std::fs::read(&writer.path).unwrap(), acknowledged);
+        }
     }
 
     #[cfg(unix)]
@@ -7617,6 +7807,12 @@ mod tests {
             session.recipe.pair_released = true;
             session.recipe.sources_released = true;
             session.recipe.retired = true;
+            if delivered_exit != 0 {
+                // The failed terminal fixture has already settled worker
+                // cancellation. Otherwise generic recovery must discover its
+                // legacy obligation, which is separate from producer custody.
+                session.recipe.source_cancellation_settled = Some(true);
+            }
             match receipt_case {
                 "wrong-present" | "failed-delivery-unbound" => {
                     let path = directory.join("wrong-present-producer");
@@ -7650,6 +7846,26 @@ mod tests {
                 session.writer.acknowledge_terminal().unwrap();
             }
             let journal = std::fs::read(&session.writer.path).unwrap();
+            {
+                let owned = recovery_owner::claim_journal(&session.writer)
+                    .await
+                    .unwrap();
+                let local =
+                    recover_owned_job_locally_with_daemon(&owned, async |_request: &str| {
+                        panic!("local producer check unexpectedly contacted daemon")
+                    })
+                    .await;
+                if matches!(receipt_case, "wrong-present" | "missing") {
+                    let error = local.expect_err("local settlement must verify original producer");
+                    assert!(
+                        format!("{error:#}").contains("retained Cargo stdout"),
+                        "{receipt_case}: {error:#}"
+                    );
+                } else {
+                    assert_eq!(local.unwrap(), delivered_exit);
+                }
+                assert_eq!(std::fs::read(&session.writer.path).unwrap(), journal);
+            }
             let result = recover_job_with_daemon(&session.writer, async |_request: &str| {
                 panic!("terminal producer check unexpectedly contacted daemon")
             })

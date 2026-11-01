@@ -711,6 +711,7 @@ async fn until_cancelled<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asupersync::runtime::RuntimeBuilder;
 
     fn transport() -> Arc<RemoteDependencyTransport> {
         transport_at(Path::new("/private/remote-state"))

@@ -4,10 +4,13 @@
 #![cfg(target_os = "linux")]
 
 use rch_common::job_identity::{DurableJobLease, JobIdentity};
+use rch_common::{CompilationKind, TransferConfig, WorkerConfig, WorkerId};
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::thread::{self, JoinHandle};
@@ -29,21 +32,11 @@ impl Fixture {
         fs::create_dir_all(root.path().join("home")).unwrap();
         fs::create_dir_all(root.path().join("config")).unwrap();
         let pid = std::process::id();
-        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
-        let ticks = stat
-            .rsplit_once(") ")
-            .unwrap()
-            .1
-            .split_whitespace()
-            .nth(19)
-            .unwrap()
-            .parse()
-            .unwrap();
         let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
         let mut lease = DurableJobLease::new(
             JobIdentity::new_local(),
             pid,
-            Some(ticks),
+            Some(process_start_ticks(pid)),
             Some(boot.trim().to_owned()),
             0,
             true,
@@ -66,7 +59,7 @@ impl Fixture {
         }
     }
 
-    fn spawn(&self, action: &str, timeout_secs: Option<u64>) -> OwnedChild {
+    fn command(&self, action: &str, timeout_secs: Option<u64>) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_rch"));
         command
             .env_clear()
@@ -89,6 +82,22 @@ impl Fixture {
         if let Some(timeout_secs) = timeout_secs {
             command.args(["--timeout-secs", &timeout_secs.to_string()]);
         }
+        command
+    }
+
+    fn spawn(&self, action: &str, timeout_secs: Option<u64>) -> OwnedChild {
+        OwnedChild(Some(self.command(action, timeout_secs).spawn().unwrap()))
+    }
+
+    fn spawn_local_settlement(&self, transport_bin: &Path, sentinel: &Path) -> OwnedChild {
+        let mut command = self.command("recover", Some(5));
+        command
+            .args(["--daemon-managed", "false", "--daemon-local-only"])
+            .env("PATH", transport_bin)
+            .env("RCH_TEST_TRANSPORT_SENTINEL", sentinel)
+            .process_group(0)
+            // OwnedChild keeps this parent permission pipe open until exit.
+            .stdin(Stdio::piped());
         OwnedChild(Some(command.spawn().unwrap()))
     }
 
@@ -115,6 +124,18 @@ impl Fixture {
             "record": {"id": 42, "worker_id": "worker-a", "exit_code": code},
         })
     }
+}
+
+fn process_start_ticks(pid: u32) -> u64 {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    stat.rsplit_once(") ")
+        .unwrap()
+        .1
+        .split_whitespace()
+        .nth(19)
+        .unwrap()
+        .parse()
+        .unwrap()
 }
 
 fn write_lease(path: &Path, lease: &DurableJobLease) {
@@ -401,4 +422,199 @@ fn owner_exit_during_status_does_not_erase_a_new_recovery_intent() {
     assert!(output_text(&output).contains("use jobs recover"));
     assert_eq!(fs::read(&fixture.lease_path).unwrap(), retained);
     assert!(!fixture.cancel_receipt().exists());
+}
+
+#[test]
+fn daemon_local_settlement_requires_exact_receipts_without_worker_transport() {
+    for case in ["exact-receipt", "missing-slots", "foreign-readback"] {
+        let mut fixture = Fixture::new(true);
+        // Capture a real owner identity while it is alive, then reap only that
+        // child. Local settlement must still prove the original wrapper exited.
+        let mut owner = OwnedChild(Some(
+            Command::new("/bin/cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        ));
+        let pid = owner.0.as_ref().unwrap().id();
+        fixture.lease.wrapper_pid = pid;
+        fixture.lease.process_start_ticks = Some(process_start_ticks(pid));
+        drop(owner.0.as_mut().unwrap().stdin.take());
+        assert!(owner.finish().status.success());
+
+        let project = fixture.root.path().join("project");
+        fs::create_dir_all(project.join("build")).unwrap();
+        let source = project.join("source.c");
+        let artifact = project.join("build/app");
+        let artifact_bytes = b"original published output";
+        fs::write(&source, b"original source").unwrap();
+        fs::write(&artifact, artifact_bytes).unwrap();
+        let worker = WorkerConfig {
+            id: WorkerId::new("worker-a"),
+            host: "unavailable.invalid".into(),
+            user: "fixture".into(),
+            identity_file: "/unused/worker-key".into(),
+            ..WorkerConfig::default()
+        };
+        let transfer = TransferConfig::default();
+        let identity = "0123456789abcdef0123456789abcdef";
+        let original = json!({
+            "version": 2,
+            "wrapper_id": fixture.lease.identity.local_wrapper_id,
+            "build_id": 42,
+            "worker": worker,
+            "identity": identity,
+            "completion": format!(
+                "{}/recovery-42-{identity}.done",
+                transfer.remote_base.trim_end_matches('/'),
+            ),
+            "source_roots": ["/owned/project"],
+            "source_authority_namespace": "current",
+            "pair": null,
+            "retire_root": null,
+            "transfer": transfer,
+            "project_root": project,
+            "kind": CompilationKind::Make,
+            "expected_triple": "x86_64-unknown-linux-gnu",
+            "pinned_triple": null,
+            "allow_foreign": false,
+            "package_archive": false,
+            "phases": [{
+                "name": "project",
+                "local": project,
+                "remote": "/owned/project",
+                "patterns": ["build/**"],
+                "result_dir": null,
+                "custom_target": false,
+                "output_gate": false,
+                "baseline": {},
+                "published": {"build/app": blake3::hash(artifact_bytes).to_hex().to_string()},
+                "complete": true,
+            }],
+            "exit_code": 0,
+            "returned": 0,
+            "prepared": true,
+            "execution_started": true,
+            "preparation_cancelled": false,
+            "sources_released": true,
+            "pair_released": true,
+            "tree_retired": true,
+            "retired": true,
+            "custody_note": {"original_path": "/original//evidence/", "keep": [9, "exact"]},
+        });
+        fixture.lease.recovery = Some(original.clone());
+        // Successful detached delivery may supersede the wrapper's original
+        // retrieval failure, but only an exact daemon receipt permits ack.
+        fixture.lease.exit_code = Some(102);
+        fixture.lease.phase = "finalize".into();
+        write_lease(&fixture.lease_path, &fixture.lease);
+
+        let transport_bin = fixture.root.path().join("transport-bin");
+        let sentinel = fixture.root.path().join("transport-attempted");
+        fs::create_dir(&transport_bin).unwrap();
+        for name in ["ssh", "rsync"] {
+            let executable = transport_bin.join(name);
+            fs::write(
+                &executable,
+                "#!/bin/sh\nprintf '%s\\n' \"$0\" >> \"$RCH_TEST_TRANSPORT_SENTINEL\"\nexit 97\n",
+            )
+            .unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let mut active = fixture.active();
+        let mut terminal = fixture.completed(0);
+        let replies = if case == "missing-slots" {
+            vec![active]
+        } else {
+            active["active"]["slots"] = json!(3);
+            if case == "foreign-readback" {
+                terminal["record"]["worker_id"] = json!("other-worker");
+            }
+            vec![active, json!({}), terminal]
+        };
+        let path = fixture.lease_path.clone();
+        let daemon = peer(&fixture.socket, replies, move |_| {
+            let lease: DurableJobLease = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            // Even after the release response, acknowledgement must wait for
+            // the exact terminal readback that this peer has not yet sent.
+            assert!(!lease.terminal_acknowledged, "{case}");
+            assert!(
+                lease
+                    .recovery
+                    .as_ref()
+                    .unwrap()
+                    .get("daemon_exit_code")
+                    .is_none()
+            );
+        });
+        let output = fixture
+            .spawn_local_settlement(&transport_bin, &sentinel)
+            .finish();
+        let requests = daemon.join().unwrap();
+        let wrapper = &fixture.lease.identity.local_wrapper_id;
+        let query = format!("GET /builds/42?local_wrapper_id={wrapper}\n");
+        if case == "missing-slots" {
+            assert_eq!(requests, vec![query]);
+        } else {
+            assert_eq!(
+                requests,
+                vec![
+                    query.clone(),
+                    format!(
+                        "POST /release-worker?worker=worker-a&slots=3&build_id=42&local_wrapper_id={wrapper}&exit_code=0\n"
+                    ),
+                    query,
+                ],
+            );
+        }
+
+        let after: DurableJobLease =
+            serde_json::from_slice(&fs::read(&fixture.lease_path).unwrap()).unwrap();
+        assert_eq!(after.identity, fixture.lease.identity);
+        assert_eq!(after.wrapper_pid, pid);
+        assert_eq!(after.owner_identity(), fixture.lease.owner_identity());
+        assert_eq!(after.exit_code, Some(0));
+        if case == "exact-receipt" {
+            let result = output_json(&output);
+            assert_eq!(result["status"], "recovered");
+            assert_eq!(result["exit_code"], 0);
+            assert_eq!(result["terminal_acknowledged"], true);
+            assert!(after.terminal_acknowledged);
+            let mut expected = original;
+            expected["daemon_exit_code"] = json!(0);
+            assert_eq!(after.recovery, Some(expected));
+
+            // The peer has exited and its socket has no listener. An already
+            // acknowledged retry must succeed without any IPC or release.
+            let acknowledged = fs::read(&fixture.lease_path).unwrap();
+            let retry = output_json(
+                &fixture
+                    .spawn_local_settlement(&transport_bin, &sentinel)
+                    .finish(),
+            );
+            assert_eq!(retry, result);
+            assert_eq!(fs::read(&fixture.lease_path).unwrap(), acknowledged);
+        } else {
+            assert!(!output.status.success(), "{case}");
+            assert!(!after.terminal_acknowledged, "{case}");
+            assert_eq!(after.recovery, Some(original));
+            let expected = if case == "missing-slots" {
+                "slot count"
+            } else {
+                "exact terminal receipt"
+            };
+            assert!(
+                output_text(&output).contains(expected),
+                "{case}: {}",
+                output_text(&output)
+            );
+        }
+        assert!(!sentinel.exists(), "{case}: worker transport was invoked");
+        assert_eq!(fs::read(&artifact).unwrap(), artifact_bytes);
+        assert_eq!(fs::read(&source).unwrap(), b"original source");
+        assert!(!fixture.cancel_receipt().exists());
+    }
 }

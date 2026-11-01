@@ -961,7 +961,16 @@ mod tests {
     #[tokio::test]
     async fn retired_recovery_resumes_at_daemon_handoff_without_contacting_worker() {
         let (_directory, writer) = fixture(102);
-        writer.lease.lock().unwrap().wrapper_pid = 2_147_483_646;
+        let mut owner = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let owner_pid = owner.id();
+        assert!(owner.wait().unwrap().success());
+        writer.lease.lock().unwrap().wrapper_pid = owner_pid;
+        // This fixture starts after worker cancellation has settled. A failed
+        // legacy delivery without that receipt must still discover its worker
+        // obligations; retirement flags alone cannot make it local-only.
+        let mut recovery = writer.snapshot().recovery.unwrap();
+        recovery["source_cancellation_settled"] = serde_json::json!(true);
+        writer.set_recovery(recovery).unwrap();
         writer.persist().unwrap();
         let mut queries = 0;
         // Boxed: the debug-build recovery future overflowed the test thread's

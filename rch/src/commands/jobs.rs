@@ -29,6 +29,14 @@ pub enum JobsAction {
         /// Internal daemon admission: stdin lifetime and SSH foreground support.
         #[arg(long, hide = true, action = clap::ArgAction::Set)]
         daemon_managed: Option<bool>,
+        /// Internal settlement of retired delivery using only local daemon IPC.
+        #[arg(
+            long,
+            hide = true,
+            requires = "daemon_managed",
+            conflicts_with = "cargo_json"
+        )]
+        daemon_local_only: bool,
     },
 }
 
@@ -627,20 +635,42 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
         }
         return Ok(());
     };
-    let (wrapper_id, recover, cancel, timeout_secs, cargo_json) = match action {
+    let (wrapper_id, recover, cancel, timeout_secs, cargo_json, local_only) = match action {
         JobsAction::Attach {
             wrapper_id,
             timeout_secs,
-        } => (wrapper_id, false, false, timeout_secs, false),
+        } => (wrapper_id, false, false, timeout_secs, false, false),
         JobsAction::Recover {
             wrapper_id,
             timeout_secs,
             cargo_json,
             daemon_managed: _,
-        } => (wrapper_id, true, false, timeout_secs, cargo_json),
-        JobsAction::Cancel { wrapper_id } => (wrapper_id, false, true, 30, false),
+            daemon_local_only,
+        } => (
+            wrapper_id,
+            true,
+            false,
+            timeout_secs,
+            cargo_json,
+            daemon_local_only,
+        ),
+        JobsAction::Cancel { wrapper_id } => (wrapper_id, false, true, 30, false, false),
     };
     let deadline = Instant::now() + Duration::from_secs(timeout_secs.min(86400));
+    if local_only {
+        let writer = DurableLeaseWriter::load(&wrapper_id)?;
+        let (code, recovered_writer) = within_job_deadline(
+            deadline,
+            "local recovery settlement (retry the same journal)",
+            crate::hook::recover_job_locally(&writer),
+        )
+        .await?;
+        emit(
+            ctx,
+            &recovered_writer.terminal_job_report(&wrapper_id, "recovered", Some(code))?,
+        )?;
+        return Ok(());
+    }
     if cargo_json {
         anyhow::ensure!(
             !ctx.is_json(),
@@ -1013,6 +1043,47 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::fd::AsFd;
+
+    #[test]
+    fn offline_worker_local_settlement_requires_managed_recovery_without_cargo_output() {
+        use clap::Parser;
+
+        assert!(
+            crate::Cli::try_parse_from([
+                "rch",
+                "jobs",
+                "recover",
+                "wrapper",
+                "--daemon-local-only",
+            ])
+            .is_err()
+        );
+        assert!(
+            crate::Cli::try_parse_from([
+                "rch",
+                "jobs",
+                "recover",
+                "wrapper",
+                "--daemon-managed",
+                "false",
+                "--daemon-local-only",
+                "--cargo-json",
+            ])
+            .is_err()
+        );
+        assert!(
+            crate::Cli::try_parse_from([
+                "rch",
+                "jobs",
+                "recover",
+                "wrapper",
+                "--daemon-managed",
+                "false",
+                "--daemon-local-only",
+            ])
+            .is_ok()
+        );
+    }
 
     #[cfg(unix)]
     #[tokio::test]

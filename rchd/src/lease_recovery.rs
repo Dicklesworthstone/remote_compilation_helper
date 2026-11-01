@@ -20,7 +20,8 @@ use crate::events::EventBus;
 use crate::workers::{BackgroundProbe, OwnedRecoveryAdmission, WorkerPool};
 use rch_common::bypass_record::{AdminDisableStore, AdminNetworkPermit};
 use rch_common::job_identity::{
-    DurableJobLease, default_job_lease_directory, source_recovery_resources_retired,
+    DurableJobLease, default_job_lease_directory, local_terminal_settlement_candidate,
+    source_recovery_resources_retired,
 };
 use rch_common::process_identity::{OwnerPresence, owner_presence};
 use rch_common::ssh::{OwnedProcessGroup, ssh_can_disable_background};
@@ -65,23 +66,41 @@ enum RecoveryOutcome {
     Deferred,
 }
 
-struct RecoveryAdmission {
-    admin: AdminNetworkPermit,
-    network: Option<BackgroundProbe>,
+enum RecoveryAdmission {
+    /// All worker obligations are settled. The child must use its enforced
+    /// local-only path and reload this evidence after claiming the journal.
+    Local,
+    Network {
+        admin: AdminNetworkPermit,
+        network: Option<BackgroundProbe>,
+    },
 }
 
 impl RecoveryAdmission {
     async fn run<F: Future>(&mut self, operation: F) -> Option<F::Output> {
-        self.admin
-            .run(async {
-                match &mut self.network {
-                    Some(network) => network.run(operation).await,
-                    None => Some(operation.await),
-                }
-            })
-            .await
-            .flatten()
+        match self {
+            Self::Local => Some(operation.await),
+            Self::Network { admin, network } => admin
+                .run(async {
+                    match network {
+                        Some(network) => network.run(operation).await,
+                        None => Some(operation.await),
+                    }
+                })
+                .await
+                .flatten(),
+        }
     }
+}
+
+#[derive(Clone, Copy)]
+enum RecoveryClientPolicy {
+    #[cfg(test)]
+    Unmanaged,
+    Network {
+        can_disable_background: bool,
+    },
+    Local,
 }
 
 /// A settled, identity-bound delivery result whose source resources are retired.
@@ -612,21 +631,33 @@ async fn recover(
     else {
         return Ok(RecoveryOutcome::Deferred);
     };
+    let local_only = matches!(admission, RecoveryAdmission::Local);
     let result = admission
         .run(tokio::time::timeout(RECOVER_KILL_AFTER, async {
-            // Probe locally in the daemon's owned process before spawning the
-            // CLI. A hard stop of that CLI cannot orphan a separate -G group.
-            let can_disable_background =
-                ssh_can_disable_background(Path::new("ssh"), Duration::from_secs(10))
-                    .await
-                    .map_err(|error| format!("recovery SSH capability probe failed: {error:#}"))?;
+            let policy = if local_only {
+                // No SSH process is needed to reconcile already-retired
+                // delivery, including the local capability query below.
+                RecoveryClientPolicy::Local
+            } else {
+                // Probe locally in the daemon's owned process before spawning
+                // the CLI. A hard stop cannot orphan a separate -G group.
+                let can_disable_background =
+                    ssh_can_disable_background(Path::new("ssh"), Duration::from_secs(10))
+                        .await
+                        .map_err(|error| {
+                            format!("recovery SSH capability probe failed: {error:#}")
+                        })?;
+                RecoveryClientPolicy::Network {
+                    can_disable_background,
+                }
+            };
             recover_in_with_policy(
                 rch,
                 socket,
                 &directory,
                 &candidate.wrapper_id,
                 Some(candidate),
-                Some(can_disable_background),
+                policy,
             )
             .await
         }))
@@ -644,6 +675,11 @@ async fn recovery_admission(
     lease_dir: &Path,
     candidate: &RecoveryCandidate,
 ) -> Result<Option<RecoveryAdmission>, String> {
+    let before = read_lease(lease_dir, &candidate.wrapper_id)?;
+    check_candidate(&before, &candidate.wrapper_id, Some(candidate))?;
+    if local_terminal_settlement_candidate(&before) {
+        return Ok(Some(RecoveryAdmission::Local));
+    }
     let Some(admin) = admin_store
         .lock()
         .await
@@ -651,8 +687,6 @@ async fn recovery_admission(
     else {
         return Ok(None);
     };
-    let before = read_lease(lease_dir, &candidate.wrapper_id)?;
-    check_candidate(&before, &candidate.wrapper_id, Some(candidate))?;
     let network = if let Some(recipe) = &before.recovery {
         let endpoint: WorkerConfig = serde_json::from_value(recipe["worker"].clone())
             .map_err(|error| format!("recovery has no valid admitted worker endpoint: {error}"))?;
@@ -674,7 +708,7 @@ async fn recovery_admission(
     if !admin.is_current() {
         return Ok(None);
     }
-    Ok(Some(RecoveryAdmission { admin, network }))
+    Ok(Some(RecoveryAdmission::Network { admin, network }))
 }
 
 fn check_candidate(
@@ -700,7 +734,15 @@ async fn recover_in(
     wrapper_id: &str,
     candidate: Option<&RecoveryCandidate>,
 ) -> Result<(), String> {
-    recover_in_with_policy(rch, socket, lease_dir, wrapper_id, candidate, None).await
+    recover_in_with_policy(
+        rch,
+        socket,
+        lease_dir,
+        wrapper_id,
+        candidate,
+        RecoveryClientPolicy::Unmanaged,
+    )
+    .await
 }
 
 async fn recover_in_with_policy(
@@ -709,10 +751,25 @@ async fn recover_in_with_policy(
     lease_dir: &Path,
     wrapper_id: &str,
     candidate: Option<&RecoveryCandidate>,
-    automatic_ssh: Option<bool>,
+    policy: RecoveryClientPolicy,
 ) -> Result<(), String> {
     let before = read_lease(lease_dir, wrapper_id)?;
     check_candidate(&before, wrapper_id, candidate)?;
+    if matches!(policy, RecoveryClientPolicy::Local)
+        && !local_terminal_settlement_candidate(&before)
+    {
+        return Err(
+            "local recovery obligations changed before launch; client was not started".into(),
+        );
+    }
+    let automatic_ssh = match policy {
+        #[cfg(test)]
+        RecoveryClientPolicy::Unmanaged => None,
+        RecoveryClientPolicy::Network {
+            can_disable_background,
+        } => Some(can_disable_background),
+        RecoveryClientPolicy::Local => Some(false),
+    };
     let mut command = tokio::process::Command::new(rch);
     command
         .args(["jobs", "recover", wrapper_id, "--timeout-secs"])
@@ -729,6 +786,9 @@ async fn recover_in_with_policy(
         command
             .arg("--daemon-managed")
             .arg(can_disable_background.to_string());
+    }
+    if matches!(policy, RecoveryClientPolicy::Local) {
+        command.arg("--daemon-local-only");
     }
     let child = OwnedProcessGroup::spawn(&mut command)
         .map_err(|error| format!("cannot run {}: {error}", rch.display()))?;
@@ -925,6 +985,359 @@ mod tests {
         }
     }
 
+    fn retired_recovery_fixture(
+        directory: &Path,
+        endpoint: &WorkerConfig,
+    ) -> (DurableJobLease, RecoveryCandidate) {
+        let (mut owned, candidate) = owned_recovery_fixture(directory, endpoint);
+        owned.recovery = Some(serde_json::json!({
+            "version": 2,
+            "wrapper_id": owned.identity.local_wrapper_id,
+            "build_id": candidate.build_id,
+            "worker": endpoint,
+            "prepared": true,
+            "execution_started": true,
+            "exit_code": 0,
+            "source_roots": ["/owned/source"],
+            "sources_released": true,
+            "retired": true,
+            "returned": 0
+        }));
+        std::fs::write(
+            directory.join(format!("{}.json", candidate.wrapper_id)),
+            serde_json::to_vec(&owned).unwrap(),
+        )
+        .unwrap();
+        (owned, candidate)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_recovery_launch_keeps_strict_mode_and_rejects_changed_journal() {
+        let directory = tempfile::tempdir().unwrap();
+        let endpoint = recovery_worker("disabled-worker");
+        let (owned, candidate) = retired_recovery_fixture(directory.path(), &endpoint);
+        let store = Arc::new(Mutex::new(AdminDisableStore::with_path(
+            directory.path().join("admin"),
+        )));
+        store
+            .lock()
+            .await
+            .upsert(operator_disable(endpoint.id.as_str()))
+            .unwrap();
+        let pool = WorkerPool::new().with_admin_disable_store(store.clone());
+        pool.add_worker(endpoint.clone()).await;
+        let mut admission = recovery_admission(&store, &pool, directory.path(), &candidate)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(admission, RecoveryAdmission::Local));
+        let child = fake_rch(
+            directory.path(),
+            "printf '%s\\n' \"$@\" >\"$(dirname \"$0\")/args\"\n\
+             cp \"$(dirname \"$0\")/settled\" \"$(dirname \"$0\")/$3.json\"\n",
+        );
+        let journal = directory
+            .path()
+            .join(format!("{}.json", candidate.wrapper_id));
+        let socket = directory.path().join("daemon.sock");
+        for changed in [
+            "unreleased",
+            "unretired",
+            "pending-cancellation",
+            "legacy-failure",
+        ] {
+            let mut pending = owned.clone();
+            let recipe = pending.recovery.as_mut().unwrap();
+            match changed {
+                "unreleased" => recipe["sources_released"] = serde_json::json!(false),
+                "unretired" => recipe["retired"] = serde_json::json!(false),
+                "pending-cancellation" => {
+                    recipe["source_cancellation_settled"] = serde_json::json!(false);
+                }
+                "legacy-failure" => {
+                    recipe["exit_code"] = serde_json::json!(137);
+                    recipe["returned"] = serde_json::json!(101);
+                }
+                _ => unreachable!(),
+            }
+            let bytes = serde_json::to_vec(&pending).unwrap();
+            std::fs::write(&journal, &bytes).unwrap();
+            let error = admission
+                .run(recover_in_with_policy(
+                    &child,
+                    &socket,
+                    directory.path(),
+                    &candidate.wrapper_id,
+                    Some(&candidate),
+                    RecoveryClientPolicy::Local,
+                ))
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert!(
+                error.contains("local recovery obligations changed"),
+                "{error}"
+            );
+            assert!(!directory.path().join("args").exists(), "{changed}");
+            assert_eq!(std::fs::read(&journal).unwrap(), bytes);
+            assert!(
+                recovery_admission(&store, &pool, directory.path(), &candidate)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{changed}"
+            );
+        }
+        std::fs::write(&journal, serde_json::to_vec(&owned).unwrap()).unwrap();
+        let mut settled = owned.clone();
+        settled.exit_code = Some(0);
+        settled.acknowledge_terminal(2);
+        settled.recovery.as_mut().unwrap()["daemon_exit_code"] = serde_json::json!(0);
+        std::fs::write(
+            directory.path().join("settled"),
+            serde_json::to_vec(&settled).unwrap(),
+        )
+        .unwrap();
+        admission
+            .run(recover_in_with_policy(
+                &child,
+                &socket,
+                directory.path(),
+                &candidate.wrapper_id,
+                Some(&candidate),
+                RecoveryClientPolicy::Local,
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let args = std::fs::read_to_string(directory.path().join("args")).unwrap();
+        assert_eq!(
+            args.lines().collect::<Vec<_>>(),
+            [
+                "jobs",
+                "recover",
+                candidate.wrapper_id.as_str(),
+                "--timeout-secs",
+                "300",
+                "--daemon-managed",
+                "false",
+                "--daemon-local-only",
+            ]
+        );
+        assert_eq!(
+            read_lease(directory.path(), &candidate.wrapper_id).unwrap(),
+            settled
+        );
+        assert!(pool.get(&endpoint.id).await.unwrap().is_disabled().await);
+    }
+
+    #[tokio::test]
+    async fn local_recovery_admission_survives_worker_disable_during_settlement() {
+        let directory = tempfile::tempdir().unwrap();
+        let endpoint = recovery_worker("retired-worker");
+        let (_, candidate) = retired_recovery_fixture(directory.path(), &endpoint);
+        let store = Arc::new(Mutex::new(AdminDisableStore::with_path(
+            directory.path().join("admin"),
+        )));
+        let pool = WorkerPool::new().with_admin_disable_store(store.clone());
+        pool.add_worker(endpoint.clone()).await;
+        let mut admission = recovery_admission(&store, &pool, directory.path(), &candidate)
+            .await
+            .unwrap()
+            .unwrap();
+        let (started, entered) = tokio::sync::oneshot::channel();
+        let (resume, resumed) = tokio::sync::oneshot::channel();
+        let operation = admission.run(async {
+            started.send(()).unwrap();
+            resumed.await.unwrap();
+            7
+        });
+        let disable = async {
+            entered.await.unwrap();
+            store
+                .lock()
+                .await
+                .upsert(operator_disable(endpoint.id.as_str()))
+                .unwrap();
+            pool.get(&endpoint.id)
+                .await
+                .unwrap()
+                .disable(Some("maintenance".into()))
+                .await;
+            resume.send(()).unwrap();
+        };
+        let (settled, ()) = tokio::join!(operation, disable);
+        assert_eq!(settled, Some(7));
+        assert!(pool.get(&endpoint.id).await.unwrap().is_disabled().await);
+    }
+
+    #[tokio::test]
+    async fn retired_local_recovery_settles_disabled_reservations_after_restart() {
+        use crate::history::BuildHistory;
+        use tokio::io::AsyncWriteExt;
+
+        for dormant in ["disabled", "outage", "removed-disabled"] {
+            let directory = tempfile::tempdir().unwrap();
+            let history_path = directory.path().join("history.jsonl");
+            let admin_path = directory.path().join("admin.json");
+            let endpoint = recovery_worker("retired-worker");
+            let mut owned = lease(1, 4242, serde_json::json!({}));
+            let history = BuildHistory::new(10).with_persistence(history_path.clone());
+            let build = history.start_active_build_with_wrapper(
+                "completed-project".into(),
+                endpoint.id.to_string(),
+                "cargo check".into(),
+                owned.wrapper_pid,
+                Some(owned.identity.local_wrapper_id.clone()),
+                3,
+                rch_common::BuildLocation::Remote,
+            );
+            let peer = history.start_active_build_with_wrapper(
+                "unrelated-project".into(),
+                "peer".into(),
+                "cargo test".into(),
+                0,
+                Some(JobIdentity::new_local().local_wrapper_id),
+                1,
+                rch_common::BuildLocation::Remote,
+            );
+            owned.admit(build.id, endpoint.id.to_string(), 1);
+            owned.recovery = Some(serde_json::json!({
+                "version": 2,
+                "wrapper_id": owned.identity.local_wrapper_id,
+                "build_id": build.id,
+                "worker": endpoint,
+                "prepared": true,
+                "execution_started": true,
+                "preparation_cancelled": false,
+                "exit_code": 0,
+                "source_roots": ["/owned/source"],
+                "sources_released": true,
+                "pair": null,
+                "retire_root": null,
+                "retired": true,
+                "returned": 0
+            }));
+            let journal = directory
+                .path()
+                .join(format!("{}.json", owned.identity.local_wrapper_id));
+            std::fs::write(&journal, serde_json::to_vec(&owned).unwrap()).unwrap();
+            let mut store = AdminDisableStore::with_path(&admin_path);
+            if dormant != "outage" {
+                store
+                    .upsert(operator_disable(endpoint.id.as_str()))
+                    .unwrap();
+            }
+            drop(history);
+            drop(store);
+
+            // Restore the actual durable reservation after the wrapper died
+            // between resource retirement and local daemon release/readback.
+            let store = Arc::new(Mutex::new(
+                AdminDisableStore::try_load(&admin_path).unwrap(),
+            ));
+            let pool = WorkerPool::new().with_admin_disable_store(store.clone());
+            if dormant != "removed-disabled" {
+                pool.add_worker(endpoint.clone()).await;
+            }
+            pool.add_worker(recovery_worker("peer")).await;
+            let mut context = crate::test_daemon_context(pool.clone());
+            context.admin_disable_store = Some(store.clone());
+            context.history = Arc::new(BuildHistory::load_from_file(&history_path, 10).unwrap());
+            for active in context.history.active_builds() {
+                pool.restore_recovered_slots(&WorkerId::new(&active.worker_id), active.slots)
+                    .await
+                    .unwrap();
+            }
+            if dormant == "outage" {
+                pool.get(&endpoint.id)
+                    .await
+                    .unwrap()
+                    .record_transport_result(
+                        false,
+                        Duration::from_secs(30),
+                        &rch_common::CircuitBreakerConfig {
+                            failure_threshold: 1,
+                            open_cooldown_secs: 900,
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+            }
+            let candidates =
+                recoverable_candidates(directory.path(), 3_600_001, |_| OwnerPresence::Absent);
+            assert_eq!(candidates.len(), 1);
+            let selected = &candidates[0];
+            let mut admission = recovery_admission(&store, &pool, directory.path(), selected)
+                .await
+                .unwrap()
+                .expect(
+                    "retired delivery needs local accounting even while its worker stays dormant",
+                );
+            let (_, remote) = owned_recovery_fixture(directory.path(), &endpoint);
+            assert!(
+                recovery_admission(&store, &pool, directory.path(), &remote)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+
+            let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+            let (shutdown, _) = tokio::sync::mpsc::channel(1);
+            let release = format!(
+                "POST /release-worker?worker={}&build_id={}&local_wrapper_id={}&exit_code=0\n",
+                endpoint.id, build.id, owned.identity.local_wrapper_id
+            );
+            let (completed, response) = tokio::join!(
+                admission.run(crate::api::handle_connection(
+                    server,
+                    context.clone(),
+                    shutdown
+                )),
+                async {
+                    client.write_all(release.as_bytes()).await.unwrap();
+                    client.shutdown().await.unwrap();
+                    let mut response = String::new();
+                    client.read_to_string(&mut response).await.unwrap();
+                    response
+                }
+            );
+            completed
+                .expect("local settlement is not revoked by dormant transport")
+                .unwrap();
+            assert!(response.starts_with("HTTP/1.0 200"), "{response}");
+            assert!(context.history.active_build(build.id).is_none());
+            assert_eq!(
+                context
+                    .history
+                    .terminal_build(build.id, &owned.identity.local_wrapper_id)
+                    .unwrap()
+                    .exit_code,
+                0
+            );
+            assert!(context.history.active_build(peer.id).is_some());
+            assert_eq!(
+                pool.get(&WorkerId::new("peer")).await.unwrap().used_slots(),
+                1
+            );
+            if dormant == "removed-disabled" {
+                pool.add_worker(endpoint.clone()).await;
+            }
+            let worker = pool.get(&endpoint.id).await.unwrap();
+            assert_eq!(worker.used_slots(), 0);
+            assert!(!worker.background_network_allowed().await);
+            assert_eq!(worker.is_disabled().await, dormant != "outage");
+            assert_eq!(
+                read_lease(directory.path(), &selected.wrapper_id).unwrap(),
+                owned
+            );
+            let restored = BuildHistory::load_from_file(&history_path, 10).unwrap();
+            assert!(restored.active_build(build.id).is_none());
+            assert!(restored.active_build(peer.id).is_some());
+        }
+    }
+
     #[tokio::test]
     async fn offline_worker_lease_recovery_keeps_operator_disable_across_restart() {
         let directory = tempfile::tempdir().unwrap();
@@ -1093,7 +1506,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(historical.network.is_none());
+        assert!(matches!(
+            historical,
+            RecoveryAdmission::Network { network: None, .. }
+        ));
         assert_eq!(worker.used_slots(), 2);
         assert_eq!(replacement.used_slots(), 3);
         assert_eq!(
@@ -1164,7 +1580,9 @@ mod tests {
                         &lease_dir,
                         &id,
                         Some(&candidate),
-                        Some(true),
+                        RecoveryClientPolicy::Network {
+                            can_disable_background: true,
+                        },
                     ))
                     .await
             });

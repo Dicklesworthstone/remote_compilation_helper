@@ -1461,6 +1461,97 @@ pub fn source_recovery_resources_retired(recipe: &serde_json::Value) -> bool {
         && acknowledged("tree_retired", has_tree)
 }
 
+/// Select a retired delivery whose remaining settlement can use local daemon IPC.
+///
+/// This is a structural admission check, not permission to run general recovery.
+/// The client must claim and reload the original journal, recheck this predicate,
+/// validate the complete recipe and retained delivery evidence, then use only
+/// local settlement operations. In particular, a failed legacy delivery without
+/// an exact cancellation acknowledgement still needs worker discovery and must
+/// remain subject to worker network admission.
+#[must_use]
+pub fn local_terminal_settlement_candidate(lease: &DurableJobLease) -> bool {
+    use serde_json::Value;
+
+    let canonical_wrapper = lease
+        .identity
+        .local_wrapper_id
+        .strip_prefix(LOCAL_WRAPPER_ID_PREFIX)
+        .is_some_and(|suffix| Uuid::parse_str(suffix).is_ok_and(|id| id.to_string() == suffix));
+    let Some(build_id) = lease.identity.remote_build_id.filter(|id| *id > 0) else {
+        return false;
+    };
+    let Some(worker_id) = lease.worker_id.as_deref().filter(|id| !id.is_empty()) else {
+        return false;
+    };
+    let Some(recipe) = lease.recovery.as_ref() else {
+        return false;
+    };
+    if lease.schema_version != 1
+        || !canonical_wrapper
+        || !matches!(
+            lease.state,
+            JobLifecycleState::Running | JobLifecycleState::Finished | JobLifecycleState::Abandoned
+        )
+        || recipe["version"].as_u64() != Some(2)
+        || recipe["wrapper_id"].as_str() != Some(lease.identity.local_wrapper_id.as_str())
+        || recipe["build_id"].as_u64() != Some(build_id)
+        || recipe["worker"]["id"].as_str() != Some(worker_id)
+        || recipe["retired"].as_bool() != Some(true)
+        || !source_recovery_resources_retired(recipe)
+    {
+        return false;
+    }
+    let Some(returned) = recipe["returned"]
+        .as_i64()
+        .and_then(|exit| i32::try_from(exit).ok())
+    else {
+        return false;
+    };
+    if lease.terminal_acknowledged
+        && (lease.state != JobLifecycleState::Finished || lease.exit_code != Some(returned))
+    {
+        return false;
+    }
+    let optional_flag = |name: &str| match recipe.get(name) {
+        None => Some(false),
+        Some(Value::Bool(value)) => Some(*value),
+        _ => None,
+    };
+    let Some(prepared) = optional_flag("prepared") else {
+        return false;
+    };
+    let Some(execution_started) = optional_flag("execution_started") else {
+        return false;
+    };
+    let Some(preparation_cancelled) = optional_flag("preparation_cancelled") else {
+        return false;
+    };
+    let cancellation_settled = match recipe.get("source_cancellation_settled") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(value)) => Some(*value),
+        _ => return false,
+    };
+    let source_namespace = match recipe.get("source_authority_namespace") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(namespace)) if matches!(namespace.as_str(), "current" | "legacy") => {
+            Some(namespace)
+        }
+        _ => return false,
+    };
+    if returned == 0 {
+        prepared
+            && execution_started
+            && recipe["exit_code"].as_i64() == Some(0)
+            && !preparation_cancelled
+            && cancellation_settled.is_none()
+    } else {
+        cancellation_settled == Some(true)
+            && (recipe["source_roots"].as_array().is_some_and(Vec::is_empty)
+                || source_namespace.is_some())
+    }
+}
+
 impl JobRecord {
     /// Build a record, deriving the lifecycle state from the identity +
     /// signals. `admitted` is taken from the identity so callers cannot pass a
@@ -1491,6 +1582,154 @@ impl JobRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn local_settlement_lease(exit: i32) -> DurableJobLease {
+        let mut lease = DurableJobLease::new(
+            JobIdentity::new_local(),
+            4242,
+            None,
+            None,
+            1,
+            false,
+            true,
+            "blake3:original-command".into(),
+        );
+        lease.admit(7, "worker".into(), 1);
+        lease.recovery = Some(serde_json::json!({
+            "version": 2,
+            "wrapper_id": lease.identity.local_wrapper_id,
+            "build_id": 7,
+            "worker": {"id": "worker"},
+            "prepared": true,
+            "execution_started": true,
+            "preparation_cancelled": false,
+            "exit_code": exit,
+            "source_roots": ["/source"],
+            "pair": ["/source", "original-claim"],
+            "retire_root": "/source",
+            "sources_released": true,
+            "pair_released": true,
+            "tree_retired": true,
+            "retired": true,
+            "returned": exit,
+            "source_authority_namespace": "current",
+            "source_cancellation_settled": if exit == 0 { None } else { Some(true) },
+            "future_custody": {"original": true}
+        }));
+        lease
+    }
+
+    #[test]
+    fn local_terminal_settlement_requires_exact_delivery_and_all_retirements() {
+        for exit in [0, 101] {
+            let mut lease = local_settlement_lease(exit);
+            // A previous retrieval error does not overwrite the later durable
+            // delivery. The local completion operation records that delivery.
+            lease.exit_code = Some(102);
+            let original = lease.clone();
+            assert!(local_terminal_settlement_candidate(&lease));
+            assert_eq!(lease, original);
+            for field in [
+                "retired",
+                "sources_released",
+                "pair_released",
+                "tree_retired",
+            ] {
+                let mut pending = lease.clone();
+                pending.recovery.as_mut().unwrap()[field] = serde_json::json!(false);
+                assert!(!local_terminal_settlement_candidate(&pending), "{field}");
+            }
+            lease.acknowledge_terminal(2);
+            assert!(!local_terminal_settlement_candidate(&lease));
+            lease.exit_code = Some(exit);
+            assert!(local_terminal_settlement_candidate(&lease));
+            lease.state = JobLifecycleState::Running;
+            assert!(!local_terminal_settlement_candidate(&lease));
+        }
+    }
+
+    #[test]
+    fn local_terminal_settlement_never_admits_uncertain_cancellation() {
+        for exit in [0, 101] {
+            for evidence in [
+                serde_json::Value::Null,
+                serde_json::json!(false),
+                serde_json::json!(true),
+                serde_json::json!("true"),
+            ] {
+                let mut lease = local_settlement_lease(exit);
+                lease.recovery.as_mut().unwrap()["source_cancellation_settled"] = evidence.clone();
+                assert_eq!(
+                    local_terminal_settlement_candidate(&lease),
+                    if exit == 0 {
+                        evidence.is_null()
+                    } else {
+                        evidence == serde_json::json!(true)
+                    },
+                    "exit={exit}, evidence={evidence}"
+                );
+            }
+            let mut lease = local_settlement_lease(exit);
+            lease
+                .recovery
+                .as_mut()
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .remove("source_cancellation_settled");
+            assert_eq!(local_terminal_settlement_candidate(&lease), exit == 0);
+        }
+        let mut failed = local_settlement_lease(101);
+        failed.recovery.as_mut().unwrap()["source_authority_namespace"] = serde_json::Value::Null;
+        assert!(!local_terminal_settlement_candidate(&failed));
+        failed.recovery.as_mut().unwrap()["source_roots"] = serde_json::json!([]);
+        assert!(local_terminal_settlement_candidate(&failed));
+        failed.recovery.as_mut().unwrap()["preparation_cancelled"] = serde_json::json!(true);
+        failed.recovery.as_mut().unwrap()["prepared"] = serde_json::json!(false);
+        failed.recovery.as_mut().unwrap()["execution_started"] = serde_json::json!(false);
+        assert!(local_terminal_settlement_candidate(&failed));
+    }
+
+    #[test]
+    fn local_terminal_settlement_rejects_malformed_or_contradictory_evidence() {
+        for (field, value) in [
+            ("version", serde_json::json!(1)),
+            ("wrapper_id", serde_json::json!("unrelated")),
+            ("build_id", serde_json::json!(8)),
+            ("worker", serde_json::json!({"id": "other-worker"})),
+            ("returned", serde_json::json!(i64::MAX)),
+            ("returned", serde_json::json!("0")),
+            ("prepared", serde_json::json!(false)),
+            ("execution_started", serde_json::json!(false)),
+            ("preparation_cancelled", serde_json::json!(true)),
+            ("exit_code", serde_json::json!(137)),
+            ("source_authority_namespace", serde_json::json!("unknown")),
+        ] {
+            let mut lease = local_settlement_lease(0);
+            lease.recovery.as_mut().unwrap()[field] = value;
+            assert!(!local_terminal_settlement_candidate(&lease), "{field}");
+        }
+        for exit in [0, 101] {
+            for field in ["prepared", "execution_started", "preparation_cancelled"] {
+                let mut lease = local_settlement_lease(exit);
+                lease.recovery.as_mut().unwrap()[field] = serde_json::Value::Null;
+                assert!(!local_terminal_settlement_candidate(&lease), "{field}");
+            }
+        }
+        for change in ["schema", "wrapper", "build", "worker", "recipe", "state"] {
+            let mut lease = local_settlement_lease(0);
+            match change {
+                "schema" => lease.schema_version = 2,
+                "wrapper" => lease.identity.local_wrapper_id = "rchw-not-canonical".into(),
+                "build" => lease.identity.remote_build_id = None,
+                "worker" => lease.worker_id = None,
+                "recipe" => lease.recovery = None,
+                "state" => lease.state = JobLifecycleState::FailedBeforeAdmission,
+                _ => unreachable!(),
+            }
+            assert!(!local_terminal_settlement_candidate(&lease), "{change}");
+        }
+    }
 
     #[test]
     fn source_recovery_resources_retired_accepts_legacy_absent_resources() {

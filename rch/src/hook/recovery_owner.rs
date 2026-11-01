@@ -281,9 +281,18 @@ async fn owner_is_absent(lease: &DurableJobLease) -> anyhow::Result<bool> {
 pub(in crate::hook) async fn claim(
     writer: &DurableLeaseWriter,
 ) -> anyhow::Result<DurableLeaseWriter> {
-    let owned = claim_with(writer, |lease| async move { owner_is_absent(&lease).await }).await?;
+    let owned = claim_journal(writer).await?;
     artifact_policy::apply_from_environment(&owned)?;
     Ok(owned)
+}
+
+/// Acquire and reload the original journal without changing artifact policy.
+/// Local terminal settlement must validate its current evidence before any
+/// write, and has no remaining collection to which an override could apply.
+pub(in crate::hook) async fn claim_journal(
+    writer: &DurableLeaseWriter,
+) -> anyhow::Result<DurableLeaseWriter> {
+    claim_with(writer, |lease| async move { owner_is_absent(&lease).await }).await
 }
 
 async fn claim_with<F, Fut>(
