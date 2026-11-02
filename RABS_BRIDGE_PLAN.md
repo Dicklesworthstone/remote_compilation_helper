@@ -2487,7 +2487,7 @@ real Cargo serving, fleet performance or release qualification.
     and a local Bash descendant remains. No completed/cancelled native result
     is asserted. Its sampled leaf is blocked writing a heredoc, before native
     compilation. Preserve recipe/log/sample; no manual lock or state cleanup.
-  - [ ] Complete the shorter ordinary Mac DSR retry, run
+  - [x] Complete the shorter ordinary Mac DSR retry, run
     `22004a69-367f-488e-9918-cef3607ab1e2`, same source1ade3f8b, private state
     `/Users/jemanuel/.local/state/rch-source-framing-short-dsr-20261102/state`.
     Native logs show actual compilation (fsqlite-core at22:04UTC), unlike the
@@ -2516,6 +2516,17 @@ real Cargo serving, fleet performance or release qualification.
       does not turn the original writer-closure failure into a Cargo/RABS pass.
       Recovery logs retain daemon130 versus delivery255 disagreement and the
       incompatible config-cache warning. No manual state or lock removal.
+    - [ ] **Storage-admission limitation disclosed22:20UTC:** retained
+      preflight is DSR split20GiB role admission, not a physical-USB SBH14%
+      receipt. No such pre-build backing receipt or owner exception exists.
+      A peer reports the physical backing currently fails14%; the retained
+      health itself reports USB cargo_target1.660TB free and image40.702GB.
+      Do not infer physical admission from an image pass, full preallocation,
+      or actual compilation. Native build/recovery outcomes above remain real
+      but are not complete storage/release qualification. No further builds on
+      this backing; Linux validation uses independently admitted healthy ZFS.
+      Earlier unqualified references to unchanged storage gates must be read
+      with this explicit missing-role limitation, not as full backing proof.
 
 **Worker-local RABS activation — concrete wiring gap, new45994eed cut.**
 
@@ -2559,6 +2570,10 @@ real Cargo serving, fleet performance or release qualification.
   The currently compiling Mac1ade client repairs source framing only; it does
   not contain this later worker-cache wiring fix. Current RABS272 acceptance
   likewise excludes these seven later RCH edits. No combined-source claim.
+  Further Mac builds on the image are held by the physical-admission gap
+  above. Prefer proving the actual opt-in path with the newly built Linux
+  client and private RABS tools on qualified ZFS once they exist, explicitly
+  distinguishing same-host SSH from distinct-host/fleet or Mac qualification.
 - [x] Probe mandatory same-filesystem reflink on healthy ZFS using a new
   private retained data fixture: cp --reflink=always returns0. This establishes
   filesystem capability only, no RABS clone/identity/performance result.
