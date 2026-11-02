@@ -6,7 +6,48 @@
 **CI/release policy, explicitly confirmed by the user November 1:** DSR only.
 Never enable or dispatch GitHub Actions. Historical workflow receipts below
 remain unqualified history; the earlier optional enablement question is closed.
-**Current status, November 1 at 21:48 UTC:** controlled native RABS is working
+**Continuation, November 2 at 00:44 UTC:** the explicit-daemon dev harness
+compiled successfully (497.84s), and its selector and real-process shutdown
+controls each pass 1/1. The original three-hour job then times out during
+workspace/all-target checking. Frontend exit one and recovered terminal 255
+are distinct; supported recovery confirms ACK true, sources released and
+process tree retired. Check is incomplete; Clippy/fmt are UNRUN. This is not
+a nine-command QA pass. All 1,683 transferred members of the 1,729-file
+capsule, the exact prior 46 exclusions, the retained harness and eight
+production executable hashes are verified again after termination. Genuine
+partial logs are retained in `/Volumes/trj-data/rabs-daemon-selector-timeout-results-20261102`.
+
+- [x] Preserve the 10,800s timeout and all completed rows; retire/recover only
+  the exact owned wrapper before another use of its target.
+- [x] Compile the explicit selector fixture and execute its two controls.
+- [x] Re-audit source/harness/production bytes after that timeout.
+- [x] Execute retained production-404 bootstrap, status, doctor and same-state
+  restart: five CLI commands zero, doctor 5/5 twice, two clean timed boots,
+  term 1 to 2 and fresh incarnation. Local bootstrap proof only.
+- [ ] Finish the actual DSR retained-production runtime diagnostic now
+  submitted: original overlap prerequisite, full 33-case canonical suite
+  only if it passes, then five original overhead/support cases. It explicitly
+  records the private workspace timeout; no quality gate is waived or called
+  green. Production tools are DSR-compiled 404; the separately compiled dev
+  fixture is not an optimized harness. The overhead pair remains scoped 6a.
+  First attempt `dabfb43b-88b3-47a1-9aa4-3d8e7ee6fc6c` is terminal raw
+  runner one / DSR six before any case: the runner was supplied the RCH
+  journal's published digest as SHA-256. The actual file SHA-256 is
+  `f809df9d494547eab89418f820eb2a6c9a036c6ba6cac9bd4c6277a4998c245c`,
+  independently equal in the retrieved bytes and post-timeout audit. Correct
+  only that input and use a fresh output directory; retain the failed attempt.
+  Fresh read-only preflight verifies all 21 executable hashes and enumerates
+  the expected 33 canonical tests. The corrected DSR retry is submitted;
+  enumeration is not test execution, and no runtime pass is claimed yet.
+- [ ] After runtime termination, execute the prepared combined-source 5ab
+  native run: full daemon/CAS/doctor targets, strict dependency guards,
+  metadata, workspace/all-target check, strict Clippy and fmt. Preserve the
+  four known budget overages rather than changing limits or hiding edges.
+- [ ] Diagnose actual new failures, re-run their original consumers, then
+  re-audit what can be claimed. M6/S7/A012 remain in progress; multi-host
+  authority, portable packaging, storm/performance and soak stay unqualified.
+
+**Prior status, November 1 at 21:48 UTC:** controlled native RABS is working
 for real Cargo archive execution/delivery and five shared-service consumers.
 Production source 6a79d453 passes six of seven original canonical cases and
 all five overhead/support tests; the overlap case fails final SDK cleanup
