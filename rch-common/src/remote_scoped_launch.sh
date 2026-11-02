@@ -234,11 +234,11 @@ rch_scope_launch_child() {
         [ -n "$rch_policy_nice$rch_policy_slice" ] || return 0
         rch_policy_enforce
     }
-    rch_observation_clock || exit 125
+    rch_observation_clock_checked || exit 125
     rch_observation_deadline=$((rch_observation_now + 6000))
     rch_remote_record "$__sl_record" "$__sl_build" || exit 125
     rch_scope_launch_binding_matches || exit 125
-    unset rch_observation_deadline
+    unset rch_observation_deadline rch_observation_last_clock
     __sl_cancelled=0
     trap '__sl_cancelled=1' HUP INT TERM
     while [ ! -f "$__sl_control/go" ]; do
@@ -413,6 +413,7 @@ rch_scope_launch_finish() {
     __sl_admission_observations=0
     rch_scope_launch_clock || return 255
     __sl_setup_started=$rch_launch_now
+    __sl_last_clock=$rch_launch_now
     while :; do
         rch_scope_launch_process "$__sl_child"
         __sl_live=$?
@@ -426,6 +427,8 @@ rch_scope_launch_finish() {
         fi
         if [ "$__sl_cancelled" = 1 ]; then __sl_reason=cancelled; break; fi
         rch_scope_launch_clock || { __sl_reason=unknown; break; }
+        [ "$rch_launch_now" -ge "$__sl_last_clock" ] || { __sl_reason=unknown; break; }
+        __sl_last_clock=$rch_launch_now
         if [ "$__sl_admitted" = 0 ]; then
             # One deadline covers publication and all admission observations.
             if [ "$((rch_launch_now - __sl_setup_started))" -ge 6000 ]; then
@@ -441,9 +444,10 @@ rch_scope_launch_finish() {
                 if [ $rch_scope_bound = 1 ]; then
                     __sl_admission_observations=$((__sl_admission_observations + 1))
                     rch_observation_deadline=$((__sl_setup_started + 6000))
+                    rch_observation_last_clock=$rch_launch_now
                     rch_scope_operation state
                     __sl_scope_state=$?
-                    unset rch_observation_deadline
+                    unset rch_observation_deadline rch_observation_last_clock
                     case "$__sl_scope_state" in
                         1) ;;
                         2)
@@ -458,6 +462,8 @@ rch_scope_launch_finish() {
                     esac
                 fi
                 rch_scope_launch_clock || { __sl_reason=unknown; break; }
+                [ "$rch_launch_now" -ge "$__sl_last_clock" ] || { __sl_reason=unknown; break; }
+                __sl_last_clock=$rch_launch_now
                 if [ "$((rch_launch_now - __sl_setup_started))" -ge 6000 ]; then
                     __sl_reason=unknown; break
                 fi

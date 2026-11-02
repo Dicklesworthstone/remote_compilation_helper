@@ -609,6 +609,31 @@ rch_scope_launch_clock() {
         self.assertFalse((Path(str(record) + ".supervisor.v1") / "go").exists())
         self.assertEqual(self.recover(record).returncode, 0)
 
+    def test_backward_clock_after_successful_observation_cannot_open_gate(self) -> None:
+        # Keep the real birth-bound resource backend and successful admission
+        # observation. Only the supervisor's following clock read moves back.
+        launch = (SOURCE / "remote_scoped_launch.sh").read_text()
+        self.assertEqual(launch.count("rch_scope_launch_clock() {"), 1)
+        adapted = launch.replace("rch_scope_launch_clock() {", "rch_fixture_launch_clock() {") + r'''
+rch_scope_launch_clock() {
+    rch_fixture_launch_clock || return 1
+    if [ "$0" = rch-build ] && [ -e "$RCH_TEST_ROOT/admission-observed" ]; then
+        rch_launch_now=$((__sl_setup_started - 1))
+    fi
+}
+'''
+        proc, job, record = self.start(script=protocol().replace(launch, adapted), env={
+            **self.env, "RCH_TEST_ADMISSION_EXPIRE": "1",
+        })
+        self.finish(proc, job, 255)
+        self.assertTrue((self.root / "admission-observed").exists())
+        self.assertFalse((job / "executions").exists())
+        self.assertFalse((Path(str(record) + ".supervisor.v1") / "go").exists())
+        before = (record.stat().st_ino, record.read_bytes())
+        self.assertTrue(before[1].startswith(b"RCH_REMOTE_PROCESS_V2:"))
+        self.assertEqual(self.recover(record).returncode, 0)
+        self.assertEqual((record.stat().st_ino, record.read_bytes()), before)
+
     def health_probe(self, env=None):
         return subprocess.run([SHELL, "-c", protocol() + "\nrch_process_health_probe\n",
                                "rch-health-observer"],

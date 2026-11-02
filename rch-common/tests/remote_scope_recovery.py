@@ -51,6 +51,25 @@ case "$1" in -fc|-fLc) printf '%s\n' cgroup2fs;; *) exec /usr/bin/stat "$@";; es
 for unit do :; done
 file="$RCH_SCOPE_TEST_ROOT/manager/$unit"
 [ -f "$file" ] || exit 1
+case " $* " in
+    *' --all '* )
+        phase=before_pin
+        if [ -e /proc/self/fd/8/cgroup.events ]; then phase=pinned; fi
+        printf '%s\n' "$phase" >> "$RCH_SCOPE_TEST_ROOT/snapshot-started"
+        [ ! -e "$RCH_SCOPE_TEST_ROOT/snapshots-down" ] || exit 19
+        delay=${RCH_SCOPE_TEST_SNAPSHOT_DELAY:-0}
+        if [ "$phase" = pinned ]; then
+            delay=${RCH_SCOPE_TEST_PINNED_DELAY:-$delay}
+        elif [ -n "${RCH_SCOPE_TEST_CLOCK_AFTER_SNAPSHOT:-}" ]; then
+            printf '%s\n' "$RCH_SCOPE_TEST_CLOCK_AFTER_SNAPSHOT" > "$RCH_SCOPE_TEST_ROOT/clock"
+        fi
+        sleep "$delay" || exit 1
+        if [ "$phase" = pinned ] && [ -e "$RCH_SCOPE_TEST_ROOT/change-generation-when-pinned" ]; then
+            sed 's/^InvocationID=.*/InvocationID=ffffffffffffffffffffffffffffffff/' "$file" > "$file.changed" || exit 1
+            mv "$file.changed" "$file" || exit 1
+        fi
+        printf '%s\n' "$phase" >> "$RCH_SCOPE_TEST_ROOT/snapshot-completed";;
+esac
 # A path swap after the caller pinned fd 8. The fake manager deliberately
 # retains the same generation to isolate the kernel-descriptor fence.
 if [ -e "$RCH_SCOPE_TEST_ROOT/swap-when-pinned" ] && [ -e /proc/self/fd/8/cgroup.events ]; then
@@ -100,9 +119,10 @@ esac
         return {"unit": unit, "directory": directory, "snapshot": snapshot,
                 "fields": fields, "record": record}
 
-    def run_shell(self, body: str, *args: object, shell: str = TEST_SHELL) -> subprocess.CompletedProcess[str]:
+    def run_shell(self, body: str, *args: object, shell: str = TEST_SHELL,
+                  timeout: float = 12) -> subprocess.CompletedProcess[str]:
         return subprocess.run([shell, "-c", SCRIPT + PRELUDE + body, "scope-test", *map(str, args)],
-                              env=self.env, capture_output=True, text=True, timeout=12,
+                              env=self.env, capture_output=True, text=True, timeout=timeout,
                               start_new_session=True)
 
     def operation(self, operation: str, scope: dict[str, object] | None = None) -> subprocess.CompletedProcess[str]:
@@ -124,7 +144,8 @@ esac
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.scope["directory"] / "cgroup.kill").read_text(), "")
 
-    def launch_with_scope_fixture(self, omit_kill: bool) -> subprocess.CompletedProcess[str]:
+    def launch_with_scope_fixture(self, omit_kill: bool, *,
+                                  timeout: float = 12) -> subprocess.CompletedProcess[str]:
         # Model ONLY systemd's creation/move. The binding, cleanup admission,
         # atomic receipt publication and payload gate are production functions.
         return self.run_shell(r'''
@@ -146,7 +167,8 @@ rch_remote_record "$1" 42 || exit $?
 printf 'payload\n' > "$2"
 rch_read_record "$1" 42 || exit $?
 [ "$rch_scope_bound" = 1 ] && [ "$rch_identified" = 1 ]
-''', self.root / "launched.pgid", self.root / "payload", "yes" if omit_kill else "no")
+''', self.root / "launched.pgid", self.root / "payload", "yes" if omit_kill else "no",
+                              timeout=timeout)
 
     def test_publisher_binds_scope_in_one_atomic_required_record(self) -> None:
         result = self.launch_with_scope_fixture(False)
@@ -161,6 +183,150 @@ rch_read_record "$1" 42 || exit $?
         result = self.launch_with_scope_fixture(True)
         self.assertEqual(result.returncode, 125, result.stderr)
         self.assertFalse((self.root / "launched.pgid").exists())
+        self.assertFalse((self.root / "payload").exists())
+
+    def test_slow_scope_snapshots_admit_only_after_both_generation_checks(self) -> None:
+        # Delay the manager, not the production admission/binding functions.
+        # Both complete snapshots exceed the former one-second deadline.
+        self.env["RCH_SCOPE_TEST_SNAPSHOT_DELAY"] = "1.25"
+        result = self.launch_with_scope_fixture(False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = self.root / "launched.pgid"
+        self.assertTrue(record.read_text().startswith("RCH_REMOTE_PROCESS_V2:42:"))
+        self.assertEqual(record.stat().st_mode & 0o777, 0o600)
+        self.assertEqual((self.root / "payload").read_text(), "payload\n")
+        self.assertEqual(list(self.root.glob("launched.pgid.*")), [])
+        self.assertEqual((self.root / "snapshot-completed").read_text().splitlines(),
+                         ["before_pin", "pinned"])
+
+    def test_unavailable_scope_snapshots_never_publish_or_start_payload(self) -> None:
+        unavailable = self.root / "snapshots-down"
+        unavailable.touch()
+        for fault in ("failure", "timeout"):
+            with self.subTest(fault=fault):
+                (self.root / "snapshot-started").write_text("")
+                if fault == "timeout":
+                    unavailable.rename(self.root / "snapshots-down-resolved")
+                    self.env["RCH_SCOPE_TEST_SNAPSHOT_DELAY"] = "20"
+                # Three adaptive exchanges share the production 30s probe
+                # budget. The outer test limit includes ordinary setup work.
+                result = self.launch_with_scope_fixture(False, timeout=35)
+                self.assertEqual(result.returncode, 125, result.stderr)
+                self.assertFalse((self.root / "launched.pgid").exists())
+                self.assertFalse((self.root / "payload").exists())
+                self.assertEqual(list(self.root.glob("launched.pgid.*")), [])
+                started = (self.root / "snapshot-started").read_text().splitlines()
+                self.assertGreaterEqual(len(started), 1)
+                self.assertLessEqual(len(started), 3, "unavailable observations have bounded retries")
+                self.assertEqual(set(started), {"before_pin"})
+                self.assertFalse((self.root / "snapshot-completed").exists())
+
+    def test_slow_scope_state_and_kill_preserve_pinned_generation_authority(self) -> None:
+        self.env["RCH_SCOPE_TEST_SNAPSHOT_DELAY"] = "1.25"
+        record = self.scope["record"]
+        before = (record.stat().st_ino, record.read_bytes())
+        state = self.operation("state")
+        self.assertEqual(state.returncode, 1, state.stderr)
+        stopped = self.operation("kill")
+        self.assertEqual(stopped.returncode, 0, stopped.stderr)
+        self.assertEqual((self.scope["directory"] / "cgroup.kill").read_text(), "1\n")
+        self.assertEqual((record.stat().st_ino, record.read_bytes()), before)
+        self.assertEqual((self.root / "snapshot-completed").read_text().splitlines(),
+                         ["before_pin", "pinned", "before_pin", "pinned"])
+
+    def test_generation_change_during_slow_pinned_snapshot_never_authorizes_kill(self) -> None:
+        self.env["RCH_SCOPE_TEST_SNAPSHOT_DELAY"] = "1.25"
+        (self.root / "change-generation-when-pinned").touch()
+        record = self.scope["record"]
+        before = (record.stat().st_ino, record.read_bytes())
+        result = self.operation("kill")
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertEqual((self.scope["directory"] / "cgroup.kill").read_text(), "")
+        self.assertEqual((record.stat().st_ino, record.read_bytes()), before)
+        self.assertIn("InvocationID=" + "f" * 32, self.scope["snapshot"].read_text())
+        self.assertEqual((self.root / "snapshot-completed").read_text().splitlines(),
+                         ["before_pin", "pinned"])
+
+    def test_unavailable_post_exit_observation_retains_record_until_recovery(self) -> None:
+        # Only the backend's kernel transition is modeled. The process census,
+        # complete manager snapshots and durable recovery record are real.
+        self.assertEqual(self.operation("kill").returncode, 0)
+        (self.scope["directory"] / "cgroup.events").write_text("populated 0\n")
+        unavailable = self.root / "snapshots-down"
+        unavailable.touch()
+        record = self.scope["record"]
+        before = (record.stat().st_ino, record.read_bytes())
+        failed = self.run_shell('rch_remote_cancel "$1" 42 kill', record)
+        self.assertEqual(failed.returncode, 44, failed.stderr)
+        self.assertEqual((record.stat().st_ino, record.read_bytes()), before)
+        unavailable.rename(self.root / "snapshots-restored")
+        self.env["RCH_SCOPE_TEST_SNAPSHOT_DELAY"] = "1.25"
+        recovered = self.run_shell('rch_remote_cancel "$1" 42 kill', record)
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertEqual((record.stat().st_ino, record.read_bytes()), before)
+        self.assertEqual((self.scope["directory"] / "cgroup.kill").read_text(), "1\n")
+        self.assertFalse((self.root / "payload").exists(), "recovery must never replay a payload")
+
+    def test_shared_budget_bounds_the_pinned_snapshot_without_granting_kill(self) -> None:
+        # Advance only the monotonic accounting. The nested manager process,
+        # real timeout, inherited pinned FD and all identity checks stay real.
+        # At entry100 +3000, clock3000 leaves one second, not a fresh allowance.
+        # Clock3050 leaves less than a whole second: no exchange may start.
+        record = self.scope["record"]
+        before = (record.stat().st_ino, record.read_bytes())
+        self.env["RCH_SCOPE_TEST_PINNED_DELAY"] = "1.25"
+        for clock in ("3000", "3050"):
+            with self.subTest(clock=clock):
+                (self.root / "clock").write_text("100\n")
+                (self.root / "snapshot-started").write_text("")
+                (self.root / "snapshot-completed").write_text("")
+                self.env["RCH_SCOPE_TEST_CLOCK_AFTER_SNAPSHOT"] = clock
+                result = self.run_shell(r'''
+rch_observation_clock() { read -r rch_observation_now < "$RCH_SCOPE_TEST_ROOT/clock"; }
+rch_remote_cancel "$1" 42 kill
+''', record)
+                self.assertEqual(result.returncode, 44, result.stderr)
+                self.assertEqual((self.scope["directory"] / "cgroup.kill").read_text(), "")
+                self.assertEqual((record.stat().st_ino, record.read_bytes()), before)
+                started = (self.root / "snapshot-started").read_text().splitlines()
+                completed = (self.root / "snapshot-completed").read_text().splitlines()
+                self.assertIn("before_pin", started)
+                self.assertNotIn("pinned", completed)
+                if clock == "3000":
+                    self.assertIn("pinned", started, "remaining second must use a real timed exchange")
+                else:
+                    self.assertNotIn("pinned", started, "subsecond remainder must not disable timeout")
+
+    def test_invalid_snapshot_clock_cannot_confirm_an_empty_scope(self) -> None:
+        # The group has exited and the backend reports an empty scope. A
+        # completed manager response still needs a valid observation clock.
+        (self.scope["directory"] / "cgroup.events").write_text("populated 0\n")
+        record = self.scope["record"]
+        before = (record.stat().st_ino, record.read_bytes())
+        for clock in ("99", "3100"):
+            with self.subTest(clock=clock):
+                (self.root / "clock").write_text("100\n")
+                (self.root / "snapshot-started").write_text("")
+                (self.root / "snapshot-completed").write_text("")
+                self.env["RCH_SCOPE_TEST_CLOCK_AFTER_SNAPSHOT"] = clock
+                result = self.run_shell(r'''
+rch_observation_clock() { read -r rch_observation_now < "$RCH_SCOPE_TEST_ROOT/clock"; }
+rch_remote_cancel "$1" 42 kill
+''', record)
+                self.assertEqual(result.returncode, 44, result.stderr)
+                self.assertEqual((record.stat().st_ino, record.read_bytes()), before)
+                self.assertEqual((self.scope["directory"] / "cgroup.kill").read_text(), "")
+                self.assertEqual((self.root / "snapshot-started").read_text().splitlines(),
+                                 ["before_pin"])
+                self.assertEqual((self.root / "snapshot-completed").read_text().splitlines(),
+                                 ["before_pin"])
+
+        # Only a later valid exchange may establish cleanup; it retains the
+        # durable record and never replays the payload.
+        self.env.pop("RCH_SCOPE_TEST_CLOCK_AFTER_SNAPSHOT")
+        recovered = self.run_shell('rch_remote_cancel "$1" 42 kill', record)
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertEqual((record.stat().st_ino, record.read_bytes()), before)
         self.assertFalse((self.root / "payload").exists())
 
     def test_kill_targets_the_bound_subtree_not_a_pid_or_unit_name(self) -> None:
