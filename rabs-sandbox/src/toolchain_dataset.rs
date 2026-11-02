@@ -330,9 +330,9 @@ pub fn open_toolchain(
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
-    use rustix::fs::{CWD, Dir, Mode, OFlags, ResolveFlags, openat2, readlinkat};
+    use rustix::fs::{Advice, CWD, Dir, Mode, OFlags, ResolveFlags, fadvise, openat2, readlinkat};
     use sha2::{Digest, Sha256};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, VecDeque};
     use std::fs::{self, Metadata, OpenOptions};
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
@@ -768,6 +768,16 @@ mod linux {
             let mut digest = Sha256::new();
             digest.update(TOOLCHAIN_DATASET_VERSION.as_bytes());
             let mut buffer = [0_u8; 64 * 1024];
+            // A complete installed toolchain contains many small files. Keep
+            // only eight anchored descriptors ahead of the reader, with at
+            // most 1 MiB of advice per file, so filesystem reads can overlap.
+            // Advice supplies no content evidence: every selected file still
+            // passes the original read, stamp and independent-copy checks.
+            let mut ahead = self
+                .entries
+                .iter()
+                .filter(|(_, entry)| matches!(entry.kind, Kind::File));
+            let mut pending = VecDeque::with_capacity(8);
             for (path, entry) in &self.entries {
                 checkpoint(stopped)?;
                 digest.update((path.len() as u64).to_be_bytes());
@@ -791,8 +801,30 @@ mod linux {
                     Kind::File => {
                         digest.update([2, u8::from(entry.stamp.mode & 0o111 != 0)]);
                         digest.update(entry.stamp.size.to_be_bytes());
-                        let mut source =
-                            self.open(path, OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOCTTY)?;
+                        while pending.len() < 8 {
+                            let Some((next, observed)) = ahead.next() else {
+                                break;
+                            };
+                            checkpoint(stopped)?;
+                            let source = self
+                                .open(next, OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOCTTY)?;
+                            require(
+                                Stamp::of(&source.metadata()?) == observed.stamp,
+                                "toolchain changed before read-ahead",
+                            )?;
+                            if let Some(bytes) =
+                                std::num::NonZeroU64::new(observed.stamp.size.min(1024 * 1024))
+                            {
+                                // Unsupported advice falls back to the same
+                                // ordinary verified read; it never admits a file.
+                                let _ = fadvise(&source, 0, Some(bytes), Advice::WillNeed);
+                            }
+                            pending.push_back((next, source));
+                        }
+                        let (next, mut source) = pending
+                            .pop_front()
+                            .ok_or_else(|| invalid("toolchain read-ahead lost a selected file"))?;
+                        require(next == path, "toolchain read-ahead changed file order")?;
                         require(
                             Stamp::of(&source.metadata()?) == entry.stamp,
                             "toolchain changed before read",

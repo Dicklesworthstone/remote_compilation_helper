@@ -2091,6 +2091,76 @@ real Cargo serving, fleet performance or release qualification.
     failure remains preserved too; no cause is inferred from host contention.
   - [ ] Resolve that warmup blocker and pass the original service case, keeping
     its full selected toolchain and all original budgets/assertions.
+    - [x] Profile the original service case with retained optimized404 tools:
+      **0/1, raw101**, libtest136.53s, complete observer140.68s. Capture is still
+      copying the full selected installation, including cross-target libraries
+      and HTML documentation, at the deadline. Early samples are cached; later
+      samples include substantial disk reads. Kernel CPU dominates the observed
+      copying thread; measured cgroup throttling and memory-limit/OOM events are0.
+      This is diagnosis of old404, not acceptance of repaired tools or a speed win.
+      Build `30091812672634931`, wrapper
+      `rchw-37d7c934-8383-4e21-ae0a-bf15954820c1`: five result files retrieved,
+      CLI101/terminal ACK/all ownership retired; original and copied binaries
+      unchanged. Report `90ceedd81b2cd437f36ea797776e817087960e6293e82f21249bf4a7bd1730ac`;
+      actual 22 process samples `67fd6deb4b1c18f8c566152f31cf859e851e857f275dbbf4f19f8aaebed7f720`.
+      First launch never executed because its source-lock supervisor terminated;
+      its separate103/ACK/preparation-cancelled receipt is retained too.
+    - [x] Implement a bounded read-ahead candidate: at most eight anchored
+      descriptors and 1MiB advice per file; every selected byte is still read
+      and hashed, the actual copy independently rehashed, and all original
+      ownership, mutation, cancellation, namespace, size and deadline checks stay.
+      Add a complete wide/empty-file positive and queued content/replacement/
+      cancellation negatives without changing any original assertion or test.
+    - [ ] Compile and run frozen cut
+      `85dc06ed-overlay-be324-toolchain-read-ahead-92abde131a5acb43ee1c0edf45d250bdbbf950c0bef5302eed0687e187a0a8f6`:
+      all18 real-filesystem names, including explicitly running the original
+      installed-rustc capture/compilation case; workspace all-target check,
+      strict Clippy and formatting; source/harness before/after and terminal
+      receipt. Complete1,755-input manifest
+      `5e9c296453efdd26ae5e10741153a555b52a7da581486fe199b8110631a64ca9`,
+      two-pass verified, differs from be324 in exactly two manually edited files.
+      Its first two RCH launches both stopped before execution with a terminated
+      source-lock supervisor; genuine terminal receipts confirm cancellation
+      settled and all ownership retired, no test body ran. DSR then passed source
+      and storage checks and copied the development cache in233.20s, but my setup
+      asserted0700 after preserving the source cache's actual0775 mode. That
+      setup failed before compilation; frontend6/native1, no realfs or QA pass.
+      Partial report `caa68b04f0e6cc8ed73f7ffeb1f9b6febf0dad5dad474036456442dae43528c2`
+      remains without aggregate exit or source-after.
+    - [x] Correct only that owned-cache setup: verify the completed copy's actual
+      prior report, retain its existing files, make the new owned root0700, and
+      make only the new quality copy private too. Select the actual ELF Cargo
+      inside the explicit native DSR job. No source cache, product guard, test,
+      assertion or runtime deadline changed. Full source/engine verified again.
+    - [ ] Complete corrected DSR run
+      `1a54317c-95fd-423d-b8ad-92888562f0f4` (session32117): source-before
+      1,697/1,755 plus58 allowed metadata omissions, zero differences; both
+      original storage guards0, private quality-cache copy0/220.78s. Actual
+      realfs build0/374.80s and full18-name list verified. All17 nonignored
+      filesystem cases pass; the original ignored installed-rustc case is
+      explicitly run and passes1/1 in397.40s after capturing the full selected
+      installation and compiling with its retained rustc. Workspace all-target
+      check is still running; strict Clippy, formatting, aggregate/source-after
+      and managed terminal completion remain pending. These18 actual passes
+      do not establish the120s service startup budget or a speed improvement.
+      Earlier failed inputs/results remain untouched in separate directories.
+    - [ ] Use the existing `scripts/test_rabs_live.py` on this exact frozen
+      cut for the next actual runtime proof, with matching development tools
+      selected from Cargo JSON artifacts. Predeclare all10 worktrees cases
+      (six real Cargo cases and four binary-selection controls), then each of
+      the original service, cross-worktree and Cargo/TLS cases exactly once.
+      Compile the canonical harness from current source too. Preserve full
+      original toolchain, namespace, sampling and120s/300s product deadlines;
+      neither green Cargo fallback nor frontend preparation counts as worker
+      execution. Retain binaries/results outside DSR staging and bind source
+      before/after. Finish mandatory workspace check/Clippy/fmt on this cut.
+      The next development orchestration budget is explicitly10,800s; the
+      previous optimized3,600s timeout remains a loss, not a passed budget.
+      No optimized-profile, full57, fleet, net-speed, soak or release claim.
+    - [ ] Rerun the unchanged service case with matching current tools; compare
+      incumbent and candidate in the same invocation before claiming a speed
+      benefit. Preserve losses. Source-cache warming by these diagnostics must
+      not be described as cold-start qualification; do not trim the toolchain.
   - [x] Pass genuine cross-worktree local-cache qualification, invalidation,
     build-script/proc-macro and forged-request controls in its existing case:
     **1/1, zero ignored, 1055.53s**. All three initial fresh-target compiler
@@ -2204,10 +2274,18 @@ real Cargo serving, fleet performance or release qualification.
     mutated. An initial failed receipt-staging attempt left an empty terminal
     input, preserved and unused; the selected new runner reads the genuine
     completion response instead of synthesizing an ACK.
-    DSR run `72a0d36f-101d-42a0-9afb-36eb572027f6` is running on native Linux,
-    all four storage checks0 and source-before verified 1,697/1,755 with the
-    same 58 allowed metadata omissions. Normal optimized dependencies are
-    compiling; tools and all three runtime results remain pending.
+    DSR run `72a0d36f-101d-42a0-9afb-36eb572027f6` actually FAILED at17:09UTC:
+    its host build reached the default3,600s limit, native timeout5/frontend6.
+    All four storage checks0 and source-before1,697/1,755 plus58 allowed metadata
+    omissions are valid, but the four-tool build is partial and **all three
+    original Cargo cases are UNRUN**. No artifact or source-after/aggregate pass.
+    Partial report `a7e5f01ef63222efe0f93bdf6471da95cb3d754475a0792f6d0510d4cfb1c94b`.
+    My monitoring incorrectly used the still-live compiler process as evidence
+    that DSR remained active through17:34; terminal state disproved that, and
+    the error was disclosed to the user. The old Cargo/compiler processes were
+    absent at17:37. A separate post-timeout source audit attempt also failed;
+    no successful after-audit has been fabricated. Future monitoring must read
+    managed terminal status alongside native process/log progress.
   - [ ] Exercise the public `cargo rabs --rabs-canonical-local` launcher with
     those exact DSR-built tools, separately from the native harness. Copy the
     frozen hello-world fixture and launcher verbatim into a new private test
@@ -2224,6 +2302,11 @@ real Cargo serving, fleet performance or release qualification.
       before/after hashes; retain the managed job's terminal receipt promptly.
       These no-dependency cases prove launcher/run/exit behavior, not TLS,
       dependency-cache serving, release authorization or fleet qualification.
+    - [ ] In the same invocation, execute stock Cargo run/test controls on the
+      identical copied fixture with separate fresh target trees. Report cold
+      no-dependency startup overhead and both paths' original output/counts/exits.
+      One observation per path is a usability diagnostic, not representative
+      workload, statistical speed, throughput or release qualification.
   - [x] Read-only prerequisite inventory on distinct Linux hosts `trj`
     (`threadripperje`) and `ts1` (`thinkstation1`): bwrap, cc, ar and OpenSSL
     resolve on both; no RABS tools resolve on either login PATH. Actual basic

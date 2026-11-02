@@ -123,6 +123,97 @@ fn copied_dataset_is_complete_and_independent_of_source_inodes() {
 }
 
 #[test]
+fn read_ahead_preserves_complete_wide_and_empty_file_datasets() {
+    let source = private();
+    for number in 0_u8..19 {
+        write(
+            source.path(),
+            &format!("lib/member-{number:02}"),
+            &vec![number; usize::from(number) * 137],
+            0o644,
+        );
+    }
+    let parent = private();
+    let expected =
+        fingerprint_toolchain(source.path(), &ToolchainLimits::default(), || false).unwrap();
+    let retained = capture_toolchain(
+        source.path(),
+        &parent.path().join("wide"),
+        Some(&expected),
+        &ToolchainLimits::default(),
+        || false,
+    )
+    .unwrap();
+    assert_eq!(*retained.identity(), expected);
+    assert_eq!(expected.files, 19);
+    for number in 0_u8..19 {
+        assert_eq!(
+            fs::read(retained.root().join(format!("lib/member-{number:02}"))).unwrap(),
+            vec![number; usize::from(number) * 137]
+        );
+    }
+    retained.verify(|| false).unwrap();
+    retained
+        .verify_source_unchanged(source.path(), || false)
+        .unwrap();
+}
+
+#[test]
+fn queued_toolchain_files_cannot_hide_mutation_replacement_or_cancellation() {
+    for change in ["content", "replacement", "cancel"] {
+        let source = private();
+        write(source.path(), "a-compiler", &vec![42; 128 * 1024], 0o755);
+        write(source.path(), "z-runtime", b"selected runtime bytes", 0o644);
+        let replacement = private();
+        write(
+            replacement.path(),
+            "runtime",
+            b"selected runtime bytes",
+            0o644,
+        );
+        let parent = private();
+        let attempted = Cell::new(false);
+        let error = capture_toolchain_with_cloner(
+            source.path(),
+            &parent.path().join("changed"),
+            None,
+            &ToolchainLimits::default(),
+            || change == "cancel" && attempted.get(),
+            |_, _, _| {
+                assert!(!attempted.replace(true));
+                match change {
+                    "content" => {
+                        fs::write(source.path().join("z-runtime"), b"changed runtime bytes")
+                            .unwrap();
+                    }
+                    "replacement" => {
+                        fs::rename(
+                            replacement.path().join("runtime"),
+                            source.path().join("z-runtime"),
+                        )
+                        .unwrap();
+                    }
+                    "cancel" => {}
+                    _ => unreachable!(),
+                }
+                false
+            },
+        )
+        .unwrap_err();
+        assert!(attempted.get());
+        assert_eq!(
+            error.kind(),
+            if change == "cancel" {
+                io::ErrorKind::Interrupted
+            } else {
+                io::ErrorKind::InvalidData
+            },
+            "queued source change {change} must not produce a toolchain owner"
+        );
+    }
+}
+
+#[test]
 fn clone_strategy_preserves_identity_and_hashes_the_actual_retained_tree() {
     let source = private();
     let bytes = b"retained toolchain content\0\xff".repeat(4096);

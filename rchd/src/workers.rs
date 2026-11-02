@@ -1525,8 +1525,7 @@ impl WorkerState {
                 .incarnation
                 .as_ref()
                 .is_some_and(|incarnation| Arc::ptr_eq(incarnation, &self.endpoint_incarnation))
-            && endpoint.generation
-                == self.endpoint_incarnation.generation.load(Ordering::Acquire)
+            && endpoint.generation == self.endpoint_incarnation.generation.load(Ordering::Acquire)
             && same_endpoint(&config, &endpoint.config);
         if !endpoint_current || !lifecycle.is_schedulable() {
             return None;
@@ -3233,7 +3232,8 @@ mod tests {
             std::future::poll_fn(|cx| {
                 assert!(std::future::Future::poll(pending.as_mut(), cx).is_pending());
                 std::task::Poll::Ready(())
-            }).await;
+            })
+            .await;
         }
         drop(pressure);
         assert_eq!(worker.used_slots(), 3);
