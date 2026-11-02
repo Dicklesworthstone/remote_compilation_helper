@@ -2936,18 +2936,15 @@ async fn handle_select_worker_mode(
                         request.estimated_cores
                     }
                 };
-                if worker.reserve_slots(reserve_slots).await {
-                    // Keep the returned endpoint and its disk evidence under
-                    // one configuration generation through durable admission.
-                    // A retarget between cloning the address and reading disk
-                    // capacity must not fund the old host with the new host's
-                    // free space. No SSH runs under this short read lock.
-                    let Some(config) = worker.lock_current_endpoint(&selected_endpoint).await
-                    else {
-                        worker.release_slots(reserve_slots).await;
-                        excluded_worker_ids.insert(selected_worker_id.as_str().to_string());
-                        continue;
-                    };
+                if let Some(slot_admission) = worker
+                    .reserve_slots_for_endpoint(reserve_slots, &selected_endpoint)
+                    .await
+                {
+                    // Endpoint identity and disk evidence were validated before
+                    // slot accounting. From this point through synchronous
+                    // durable-history publication there is no await, so a
+                    // cancelled request cannot strand capacity without an owner.
+                    let config = &selected_endpoint.config;
                     let (id, host, user, identity_file, declared_os) = (
                         config.id.clone(),
                         config.host.clone(),
@@ -2976,7 +2973,7 @@ async fn handle_select_worker_mode(
                                 .min_free_bytes
                                 .div_ceil(rch_common::BuildDiskBudget::GIB)
                         }),
-                        capacity: worker.disk_capacity_observation().await,
+                        capacity: slot_admission.disk_capacity,
                     };
 
                     let admission = ctx.history.try_start_active_build_in_lanes(
@@ -2992,7 +2989,6 @@ async fn handle_select_worker_mode(
                         Some(selected_endpoint.clone()),
                         ctx.pool.project_lanes(id.as_str()),
                     );
-                    drop(config);
                     let state = match admission {
                         Ok(Some(state)) => state,
                         Ok(None) => {
