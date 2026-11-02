@@ -2043,7 +2043,7 @@ async fn clean_overlay_git_blob_batch_protocol_preserves_binary_bytes_and_bounds
     assert!(read_git_blob_batch(&b"extra"[..], &[], 0).await.is_err());
     let empty = format!("{first} blob 0\n\n");
     assert!(
-        read_git_blob_batch(empty.as_bytes(), &[first.clone()], 0)
+        read_git_blob_batch(empty.as_bytes(), std::slice::from_ref(&first), 0)
             .await
             .unwrap()[&first]
             .is_empty()
@@ -2075,7 +2075,7 @@ async fn clean_overlay_git_blob_batch_protocol_refuses_ambiguous_or_incomplete_f
     ];
     for frame in frames {
         assert!(
-            read_git_blob_batch(frame.as_bytes(), &[id.clone()], 16)
+            read_git_blob_batch(frame.as_bytes(), std::slice::from_ref(&id), 16)
                 .await
                 .is_err(),
             "accepted malformed frame {frame:?}"

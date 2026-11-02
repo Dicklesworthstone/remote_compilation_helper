@@ -135,7 +135,8 @@ preflight still checks the payload allocation. Space checks are advisory:
 quotas, metadata allocation and concurrent writers can still fail a transfer.
 Neither a RAM-backed caller nor `TMPDIR` selects the durable staging volume.
 
-Only the staging-directory field is changed by relocation. The exact prior
+Relocation records the new staging directory and its private ownership receipt;
+the command, artifact policy and delivery checkpoints remain unchanged. The exact prior
 journal is retained in an `artifact-policy-<uuid>.before` file using the same
 synchronized backup mechanism as refinement. Old staged payloads, source
 archives and partial files are not copied, moved, rewritten or deleted.
@@ -159,3 +160,35 @@ location leaves that directory retained and the old location authoritative.
 Select another unused durable base for the next attempt; no automatic cleanup
 or adoption of the uncertain directory is authorized. The original journal
 filesystem must still have enough space for its small backup and atomic update.
+
+## Reclaiming completed retrieval payloads
+
+New retrieval stages record their directory identity and a private ownership
+marker before the first phase collects any bytes. Once eligible delivery and
+source retirement are durable, RCH releases the duplicate phase payloads and
+records completion in the recovery journal. Published caller outputs and the
+separate retained Cargo receipts remain available.
+
+If a process stops after retirement or during payload release, recovery repeats
+the unfinished release before acknowledging the job. The ordinary
+`rch jobs recover <wrapper-id>` path also performs this check for an already
+retired job. A changed directory identity, substituted path, or damaged ownership
+marker refuses cleanup and leaves the job available for recovery and inspection. Removal uses
+the held original directory descriptors and does not follow staged symlinks.
+
+A local cleanup failure preserves the original command result and recovery
+record. Both `rch exec` and the hook retain the admission for recovery and refuse
+automatic command replay. This local failure does not quarantine a worker whose
+execution already completed. After the original staging identity is available,
+recover that wrapper to finish cleanup and acknowledge its recorded result.
+
+The small identity directory and ownership marker remain after the payloads are
+released. A durable completion flag makes later recovery read-only for that
+stage, including any new files added afterward. Failed-delivery and pending
+publication evidence retains the existing recovery protections.
+
+Older or pre-existing stages without creation-time ownership evidence remain
+retained. Recovery does not adopt them for automatic cleanup, scan unrelated
+staging jobs, or reclaim the worker's retained source trees. This prevents new
+duplicate-output accumulation for owned stages; it does not remove historical
+orphaned payloads.

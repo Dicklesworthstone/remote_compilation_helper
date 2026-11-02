@@ -421,7 +421,7 @@ async fn confirm_source_namespace_preflight_release(
 }
 
 fn classify_remote_pipeline_failure(error: &anyhow::Error) -> RemotePipelineFailurePolicy {
-    if is_remote_execution_unconfirmed(error)
+    if requires_recovery_before_release(error)
         || (is_ssh_command_timeout_error(error) && !error.is::<SourceNamespacePreflightFailure>())
         || error
             .downcast_ref::<crate::transfer::RemoteBuildDiskBudgetExceeded>()
@@ -446,6 +446,11 @@ fn is_remote_execution_unconfirmed(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<crate::transfer::RemoteExecutionUnconfirmed>()
         .is_some()
+}
+
+fn requires_recovery_before_release(error: &anyhow::Error) -> bool {
+    is_remote_execution_unconfirmed(error)
+        || error.is::<transfer_orchestration::recovery::LocalRetirementPending>()
 }
 
 fn is_remote_process_observation_failure(error: &anyhow::Error) -> bool {
@@ -485,7 +490,7 @@ fn remote_release_faults<'a>(
             source_busy: false,
             disk_peak_output_bytes: result.disk_peak_output_bytes,
         },
-        Err(error) if !is_remote_execution_unconfirmed(error) => {
+        Err(error) if !requires_recovery_before_release(error) => {
             let live_checkout_refused = crate::transfer::sync_refused_by_live_checkout(error);
             let source_busy = crate::transfer::source_authority_busy(error);
             if let Some(failure) = error
@@ -531,6 +536,11 @@ fn is_ssh_command_timeout_error(error: &anyhow::Error) -> bool {
 }
 
 fn remote_pipeline_failure_summary(worker_id: &WorkerId, error: &anyhow::Error) -> String {
+    if let Some(pending) =
+        error.downcast_ref::<transfer_orchestration::recovery::LocalRetirementPending>()
+    {
+        return format!("[RCH] remote {worker_id} completed; {pending}");
+    }
     if is_remote_execution_unconfirmed(error) {
         return format!(
             "[RCH] remote {} completion unconfirmed; ownership retained for recovery (no local fallback)",
@@ -2477,6 +2487,7 @@ impl DurableLeaseWriter {
                 "previous remote source ownership is unresolved; recover this wrapper before another admission"
             );
         }
+        transfer_orchestration::recovery::ensure_local_retirement_complete(&lease)?;
         let mut next = lease.clone();
         next.recovery = None;
         next.exit_code = None;
@@ -2499,6 +2510,7 @@ impl DurableLeaseWriter {
                 lease.identity.local_wrapper_id
             );
         }
+        transfer_orchestration::recovery::ensure_local_retirement_complete(&lease)?;
         Ok(())
     }
 
@@ -2528,6 +2540,7 @@ impl DurableLeaseWriter {
                 "previous remote source ownership is unresolved; retry refused"
             );
         }
+        transfer_orchestration::recovery::ensure_local_retirement_complete(&lease)?;
         let previous = lease.clone();
         let mut pending = previous.clone();
         pending.identity.remote_build_id = None;
@@ -2811,6 +2824,7 @@ impl DurableLeaseWriter {
                 "terminal command result contradicts durable delivery; acknowledgement refused"
             );
         }
+        transfer_orchestration::recovery::ensure_local_retirement_complete(lease)?;
         Ok(())
     }
 
@@ -5545,12 +5559,13 @@ pub async fn run_exec(
                 error
             );
         }
-        // An unconfirmed execution still owns its reservation. A generic
-        // failure release would fabricate completion and permit another job.
-        let retain_unconfirmed_ownership = result
+        // Execution uncertainty and pending local retirement both retain this
+        // reservation. Generic failure release must not authorize replay of a
+        // completed command whose original cleanup receipt is still needed.
+        let retain_recovery_ownership = result
             .as_ref()
             .err()
-            .is_some_and(is_remote_execution_unconfirmed);
+            .is_some_and(requires_recovery_before_release);
         let release_exit_code = result
             .as_ref()
             .map(|ok| ok.exit_code)
@@ -5585,9 +5600,9 @@ pub async fn run_exec(
         {
             warn!(worker = %worker.id, %error, "Could not persist process-observation bypass");
         }
-        let release_acknowledged = if retain_unconfirmed_ownership {
+        let release_acknowledged = if retain_recovery_ownership {
             warn!(
-                "Remote completion unconfirmed; retaining build {} ownership",
+                "Invocation requires recovery before release; retaining build {} ownership",
                 remote_build_id
             );
             false
@@ -5619,12 +5634,12 @@ pub async fn run_exec(
             // without pretending its reservation/ownership was retired.
             durable_lease.record_exit(result.exit_code)?;
         } else if let Err(error) = result.as_ref()
-            && !retain_unconfirmed_ownership
+            && !retain_recovery_ownership
             && error.is::<crate::transfer::RemoteBuildDiskBudgetExceeded>()
         {
             durable_lease.record_exit(release_exit_code)?;
         }
-        if !retain_unconfirmed_ownership && !release_acknowledged {
+        if !retain_recovery_ownership && !release_acknowledged {
             if let Err(persist_error) = durable_lease.heartbeat("release_unconfirmed") {
                 return Err(release_unconfirmed_error(&worker.id, remote_build_id).context(
                     format!("could not persist release uncertainty in the durable lease: {persist_error}"),
@@ -5633,7 +5648,7 @@ pub async fn run_exec(
             return Err(release_unconfirmed_error(&worker.id, remote_build_id));
         }
 
-        if !retain_unconfirmed_ownership
+        if !retain_recovery_ownership
             && let Err(error) = result.as_ref()
             && let Some(failure) = error.downcast_ref::<SourceNamespacePreflightFailure>()
         {
@@ -6993,11 +7008,12 @@ async fn handle_selection_response(
     .await;
     let remote_elapsed = remote_start.elapsed();
 
-    // Ownership/receipt loss after execution is not a terminal completion.
-    let retain_unconfirmed_ownership = result
+    // Neither ownership uncertainty nor pending local retirement authorizes
+    // a terminal release or another execution of the same invocation.
+    let retain_recovery_ownership = result
         .as_ref()
         .err()
-        .is_some_and(is_remote_execution_unconfirmed);
+        .is_some_and(requires_recovery_before_release);
     let release_exit_code = result
         .as_ref()
         .map(|ok| ok.exit_code)
@@ -7030,9 +7046,9 @@ async fn handle_selection_response(
     {
         warn!(worker = %worker.id, %error, "Could not persist process-observation bypass");
     }
-    if retain_unconfirmed_ownership {
+    if retain_recovery_ownership {
         warn!(
-            "Remote completion unconfirmed; retaining worker {} ownership",
+            "Invocation requires recovery before release; retaining worker {} ownership",
             worker.id
         );
     } else if let Err(e) = release_worker_with_fault(

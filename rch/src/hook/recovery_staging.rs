@@ -144,7 +144,7 @@ impl FreshStage {
         &self,
         writer: &DurableLeaseWriter,
         lease: &DurableJobLease,
-        next: serde_json::Value,
+        mut next: serde_json::Value,
         reserve: u64,
     ) -> anyhow::Result<PathBuf> {
         let ownership = writer
@@ -164,6 +164,19 @@ impl FreshStage {
             ownership.read(&writer.wrapper_id())? == *lease,
             "journal changed before fresh staging publication; all evidence retained"
         );
+        let recipe: RecoveryRecipe = serde_json::from_value(next.clone())?;
+        let held = HeldRetrievalStage::record_created(
+            self.base.try_clone()?,
+            self.directory.try_clone()?,
+            &self.root,
+            &recipe,
+        )?;
+        next["staging_ownership"] = serde_json::to_value(&held.evidence)?;
+        next.as_object_mut()
+            .context("fresh staging recipe is not an object")?
+            .remove("staging_released");
+        self.verify_names()?;
+        held.verify_empty()?;
         writer.set_recovery(next).with_context(|| {
             format!(
                 "fresh staging publication unverified; prior journal {}",
@@ -172,7 +185,7 @@ impl FreshStage {
         })?;
         // A post-publication error must not be reported as a rollback: leave
         // the journal and both trees for reconciliation, never erase evidence.
-        self.verify().context(
+        self.verify_names().and_then(|()| held.verify_empty()).context(
             "staging changed during journal publication; recorded location requires reconciliation",
         )?;
         Ok(previous)
@@ -285,9 +298,9 @@ pub(super) fn relocate(
             );
         }
     }
-    // Change ONE field in the original value, preserving even unknown fields
-    // and old source-root spellings. load_recipe's normalization is for reads,
-    // not permission to rewrite the admitted contract during relocation.
+    // Change the stage location and its new creation-time ownership receipt,
+    // preserving unknown fields and old source-root spellings. load_recipe's
+    // normalization is not permission to rewrite the admitted contract.
     let mut next = lease
         .recovery
         .clone()
@@ -521,11 +534,18 @@ mod tests {
             .publish(writer, &lease, next_stage(&lease, &base), 0)
             .unwrap();
         assert_eq!(std::fs::read(backup).unwrap(), before);
-        assert_eq!(
-            writer.snapshot().recovery.unwrap(),
-            next_stage(&lease, &base)
-        );
-        assert!(guard.verify().is_ok());
+        let recipe = load_recipe(writer).unwrap();
+        let evidence = recipe.staging_ownership.as_ref().unwrap();
+        assert_eq!(evidence.base, base);
+        assert_ne!(Some(evidence), session.recipe.staging_ownership.as_ref());
+        let mut expected = next_stage(&lease, &base);
+        expected["staging_ownership"] = serde_json::to_value(evidence).unwrap();
+        assert_eq!(writer.snapshot().recovery.unwrap(), expected);
+        assert!(guard.verify_names().is_ok());
+        HeldRetrievalStage::open(&recipe, evidence)
+            .unwrap()
+            .verify_empty()
+            .unwrap();
         assert!(!writer.snapshot().terminal_acknowledged);
     }
 
@@ -574,6 +594,16 @@ mod tests {
         // set_recovery may update journal heartbeat fields; the complete
         // recovery value and all immutable admitted identity remain exact.
         let actual = session.writer.snapshot();
+        let relocated = load_recipe(&session.writer).unwrap();
+        let evidence = relocated.staging_ownership.as_ref().unwrap();
+        assert_eq!(Some(&evidence.base), current.retrieval_staging_dir.as_ref());
+        assert_ne!(Some(evidence), session.recipe.staging_ownership.as_ref());
+        HeldRetrievalStage::open(&relocated, evidence)
+            .unwrap()
+            .verify_empty()
+            .unwrap();
+        expected.recovery.as_mut().unwrap()["staging_ownership"] =
+            serde_json::to_value(evidence).unwrap();
         assert_eq!(actual.recovery, expected.recovery);
         assert_eq!(actual.identity, expected.identity);
         assert_eq!(actual.exit_code, expected.exit_code);

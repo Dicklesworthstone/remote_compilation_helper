@@ -782,23 +782,34 @@ impl WorkerSelector {
     }
 
     /// Select a worker while excluding specific worker IDs from consideration.
-    pub async fn select_with_exclusions(
-        &self,
-        pool: &WorkerPool,
-        request: &SelectionRequest,
-        excluded_worker_ids: &HashSet<String>,
-    ) -> SelectionResult {
-        // Scoring, diagnostics, and audit must see this request's verdicts.
-        // A shared cache lets concurrent requests erase one another's disk
-        // decisions. Recovery hysteresis stays shared inside the forked gate.
-        let mut round = self.clone();
-        round.admission_gate = self
-            .admission_gate
-            .as_ref()
-            .map(|gate| Arc::new(gate.for_selection()));
-        round
-            .select_in_round(pool, request, excluded_worker_ids)
-            .await
+    /// Check `Send` here so connection tasks do not recursively prove it through
+    /// the entire eligibility, lifecycle and SSH preflight future chain.
+    pub fn select_with_exclusions<'a>(
+        &'a self,
+        pool: &'a WorkerPool,
+        request: &'a SelectionRequest,
+        excluded_worker_ids: &'a HashSet<String>,
+    ) -> impl std::future::Future<Output = SelectionResult> + Send + 'a {
+        async fn select_round(
+            selector: &WorkerSelector,
+            pool: &WorkerPool,
+            request: &SelectionRequest,
+            excluded_worker_ids: &HashSet<String>,
+        ) -> SelectionResult {
+            // Scoring, diagnostics, and audit must see this request's verdicts.
+            // A shared cache lets concurrent requests erase one another's disk
+            // decisions. Recovery hysteresis stays shared inside the forked gate.
+            let mut round = selector.clone();
+            round.admission_gate = selector
+                .admission_gate
+                .as_ref()
+                .map(|gate| Arc::new(gate.for_selection()));
+            round
+                .select_in_round(pool, request, excluded_worker_ids)
+                .await
+        }
+
+        select_round(self, pool, request, excluded_worker_ids)
     }
 
     /// The worker [`Self::select_with_exclusions`] would choose, without

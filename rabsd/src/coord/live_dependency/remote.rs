@@ -532,9 +532,9 @@ impl DependencyWorkerPool {
         // connection deadline. The second pass reobserves hints, preserving
         // the existing connection path when readiness is unknown or revoked.
         for ready_only in [true, false] {
-            for offset in 0..self.workers.len() {
+            for (offset, &ready) in ready_order.iter().enumerate() {
                 let (index, readiness) = if ready_only {
-                    ready_order[offset]
+                    ready
                 } else {
                     let index = (start + offset) % self.workers.len();
                     (index, self.workers[index].placement_readiness(request))
