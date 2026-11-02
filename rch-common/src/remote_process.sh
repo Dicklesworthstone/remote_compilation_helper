@@ -497,6 +497,7 @@ rch_remote_cancel_loaded() (
         2)
             # Unknown is neither stop authority nor death proof. V2 binds its
             # scope; V1 needs a live leader for KILL. No witnesses means no TERM.
+            [ "${rch_identified:-0}" = 1 ] || return 43
             [ "${rch_scope_bound:-0}" = 1 ] || rch_posix_signal_authorized KILL || return 44
             rch_mode=kill;;
         *) return 44;;
