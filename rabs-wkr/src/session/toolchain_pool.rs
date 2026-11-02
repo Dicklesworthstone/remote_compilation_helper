@@ -3,10 +3,13 @@
 //! Only a complete ToolchainIdentity selects reuse. A pathname, compiler version,
 //! timestamp or cache hit never substitutes for content verification. Unpinned
 //! requests keep their private capture. Pooled bytes are rehashed on acquisition
-//! and by the executor before/after execution, and every lease retains the real
-//! private directory owner through process cleanup. Optional durable storage
-//! retains verified compiler inputs across worker restarts; it does not grant
-//! action publication or compiler-result reuse.
+//! and by the executor before/after execution. Overlapping checks of the exact
+//! same live dataset share one full byte verification, with each caller checking
+//! its retained generation before joining and after success. Completed checks
+//! are never memoized, and cancellation belongs to each caller. Every lease
+//! retains the real private directory owner through process cleanup. Optional
+//! durable storage retains verified compiler inputs across worker restarts; it
+//! does not grant action publication or compiler-result reuse.
 //!
 //! The pool serializes admission, not filesystem work. Same-identity misses join
 //! one capture; different identities can capture concurrently. Reservations count
@@ -70,14 +73,183 @@ fn private_directory(parent: Option<&Path>) -> io::Result<tempfile::TempDir> {
 
 /// The parent and optional durable-cache lock outlive every execution lease.
 struct PoolDirectory(tempfile::TempDir, Option<Arc<durable::DurableCache>>);
+
+#[derive(Clone)]
+struct VerificationFailure {
+    kind: io::ErrorKind,
+    message: String,
+}
+
+impl VerificationFailure {
+    fn of(error: &io::Error) -> Self {
+        Self {
+            kind: error.kind(),
+            message: error.to_string(),
+        }
+    }
+
+    fn into_error(self) -> io::Error {
+        io::Error::new(self.kind, self.message)
+    }
+}
+
+#[derive(Default)]
+struct VerificationFlight {
+    result: Mutex<Option<Result<(), VerificationFailure>>>,
+    changed: Condvar,
+}
+
+impl VerificationFlight {
+    fn wait(&self, stopped: &impl Fn() -> bool) -> io::Result<Result<(), VerificationFailure>> {
+        loop {
+            // Cancellation belongs to the caller and may inspect other
+            // ownership state. Never invoke it while holding the flight mutex.
+            checkpoint(stopped)?;
+            let result = self
+                .result
+                .lock()
+                .map_err(|_| invalid("toolchain verification result is poisoned"))?;
+            if let Some(result) = result.as_ref() {
+                return Ok(result.clone());
+            }
+            let (next, _) = self
+                .changed
+                .wait_timeout(result, WAIT_SLICE)
+                .map_err(|_| invalid("toolchain verification result is poisoned"))?;
+            drop(next);
+        }
+    }
+}
+
 struct Dataset {
     // Field order closes inventory descriptors before removing the private tree,
     // and removes the child before dropping its last parent-directory reference.
     toolchain: PreparedToolchain,
     _directory: Option<tempfile::TempDir>,
     pool: Arc<PoolDirectory>,
+    // Only overlapping full checks may join. This is neither a digest memo nor
+    // an admission lock, and different retained owners never share a flight.
+    verification: Mutex<Option<Arc<VerificationFlight>>>,
 }
+
+struct VerificationOwner<'a> {
+    dataset: &'a Dataset,
+    flight: Arc<VerificationFlight>,
+    finished: bool,
+}
+
+impl VerificationOwner<'_> {
+    fn finish(&mut self, result: &io::Result<()>) -> io::Result<()> {
+        let mut active = self
+            .dataset
+            .verification
+            .lock()
+            .map_err(|_| invalid("toolchain verification ownership is poisoned"))?;
+        if active
+            .as_ref()
+            .is_some_and(|flight| Arc::ptr_eq(flight, &self.flight))
+        {
+            active.take();
+        }
+        // Detach before publishing: a later caller must perform its own full
+        // check even if an earlier waiter has not consumed this result yet.
+        drop(active);
+        *self
+            .flight
+            .result
+            .lock()
+            .map_err(|_| invalid("toolchain verification result is poisoned"))? = Some(
+            result
+                .as_ref()
+                .map(|()| ())
+                .map_err(VerificationFailure::of),
+        );
+        self.finished = true;
+        self.flight.changed.notify_all();
+        Ok(())
+    }
+}
+
+impl Drop for VerificationOwner<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let mut active = self
+            .dataset
+            .verification
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if active
+            .as_ref()
+            .is_some_and(|flight| Arc::ptr_eq(flight, &self.flight))
+        {
+            active.take();
+        }
+        drop(active);
+        *self
+            .flight
+            .result
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(Err(VerificationFailure {
+            kind: io::ErrorKind::Interrupted,
+            message: "toolchain verification owner abandoned its check".into(),
+        }));
+        self.flight.changed.notify_all();
+    }
+}
+
 impl Dataset {
+    fn verify(&self, stopped: &impl Fn() -> bool) -> io::Result<()> {
+        self.verify_with(stopped, || self.toolchain.verify(stopped))
+    }
+
+    fn verify_with(
+        &self,
+        stopped: &impl Fn() -> bool,
+        verify: impl Fn() -> io::Result<()>,
+    ) -> io::Result<()> {
+        loop {
+            self.toolchain.verify_retained_generation(stopped)?;
+            let (flight, leader) = {
+                let mut active = self
+                    .verification
+                    .lock()
+                    .map_err(|_| invalid("toolchain verification ownership is poisoned"))?;
+                if let Some(flight) = active.as_ref() {
+                    (Arc::clone(flight), false)
+                } else {
+                    let flight = Arc::new(VerificationFlight::default());
+                    *active = Some(Arc::clone(&flight));
+                    (flight, true)
+                }
+            };
+            if leader {
+                let mut owner = VerificationOwner {
+                    dataset: self,
+                    flight,
+                    finished: false,
+                };
+                let result = verify();
+                owner.finish(&result)?;
+                result?;
+            } else {
+                match flight.wait(stopped)? {
+                    Ok(()) => {}
+                    // The original caller's cancellation does not cancel an
+                    // independent request. A live waiter elects a fresh owner;
+                    // no incomplete byte scan can become a successful check.
+                    Err(error) if error.kind == io::ErrorKind::Interrupted => {
+                        checkpoint(stopped)?;
+                        continue;
+                    }
+                    Err(error) => return Err(error.into_error()),
+                }
+            }
+            return self.toolchain.verify_retained_generation(stopped);
+        }
+    }
+
     fn retained(
         pool: &Arc<PoolDirectory>,
         expected: &ToolchainIdentity,
@@ -91,6 +263,7 @@ impl Dataset {
                 toolchain,
                 _directory: None,
                 pool: Arc::clone(pool),
+                verification: Mutex::new(None),
             })
         }))
     }
@@ -109,6 +282,7 @@ impl Dataset {
                 toolchain,
                 _directory: None,
                 pool: Arc::clone(pool),
+                verification: Mutex::new(None),
             }));
         }
         let directory = private_directory(Some(pool.0.path()))?;
@@ -131,6 +305,7 @@ impl Dataset {
             toolchain,
             _directory: Some(directory),
             pool: Arc::clone(pool),
+            verification: Mutex::new(None),
         }))
     }
 }
@@ -157,7 +332,7 @@ impl ToolchainLease {
         self.disposition
     }
     pub(crate) fn verify(&self, stopped: impl Fn() -> bool) -> io::Result<()> {
-        self.dataset.toolchain.verify(stopped)
+        self.dataset.verify(&stopped)
     }
 
     /// Read-only at its canonical name is insufficient when another writable
@@ -373,7 +548,7 @@ impl ToolchainPool {
         };
         // Keep the dataset pinned during verification, outside the admission
         // mutex. A filename or matching identity record is never a cache hit.
-        if let Err(error) = dataset.toolchain.verify(&stopped) {
+        if let Err(error) = dataset.verify(&stopped) {
             if !stopped() {
                 self.discard_failed(identity, &dataset)?;
             }
@@ -414,7 +589,7 @@ impl ToolchainPool {
                     drop(state);
                     // Never consult the mutable original installation on a hit:
                     // the request selected these exact bytes, not that pathname.
-                    if let Err(error) = dataset.toolchain.verify(&stopped) {
+                    if let Err(error) = dataset.verify(&stopped) {
                         if !stopped() {
                             self.discard_failed(identity, &dataset)?;
                         }
@@ -640,9 +815,9 @@ mod tests {
     mod linux {
         use super::*;
         use rabs_sandbox::toolchain_dataset::fingerprint_toolchain;
-        use std::fs;
+        use std::fs::{self, File};
         use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::mpsc;
         use std::thread;
         use std::time::Instant;
@@ -674,6 +849,347 @@ mod tests {
             spec.rw_binds
                 .push(Bind::new(writable, rabs_sandbox::layout::WORKSPACE));
             spec
+        }
+
+        fn wait_for_verification_followers(dataset: &Dataset, followers: usize) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                // The active slot and leader each retain one flight reference.
+                // Extra references establish that followers joined THIS flight,
+                // not merely that their threads have started running.
+                if dataset
+                    .verification
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|flight| Arc::strong_count(flight) >= followers + 2)
+                {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "verification followers did not join"
+                );
+                thread::yield_now();
+            }
+        }
+
+        #[test]
+        fn overlapping_verifications_share_one_full_scan_but_later_checks_rehash() {
+            let (source, identity) = source(b"compiler\0\xff");
+            let pool = pool(1024, 2);
+            let lease = pool
+                .acquire(source.path(), Some(&identity), || false)
+                .unwrap();
+            let scans = Arc::new(AtomicUsize::new(0));
+            let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+            let (release_tx, release_rx) = mpsc::sync_channel(1);
+            let dataset = Arc::clone(&lease.dataset);
+            let leader_scans = Arc::clone(&scans);
+            let leader = thread::spawn(move || {
+                dataset.verify_with(&|| false, || {
+                    leader_scans.fetch_add(1, Ordering::SeqCst);
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    dataset.toolchain.verify(|| false)
+                })
+            });
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let followers: Vec<_> = (0..2)
+                .map(|_| {
+                    let dataset = Arc::clone(&lease.dataset);
+                    let scans = Arc::clone(&scans);
+                    thread::spawn(move || {
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        dataset.verify_with(&|| Instant::now() >= deadline, || {
+                            scans.fetch_add(1, Ordering::SeqCst);
+                            dataset.toolchain.verify(|| Instant::now() >= deadline)
+                        })
+                    })
+                })
+                .collect();
+            wait_for_verification_followers(&lease.dataset, followers.len());
+            release_tx.send(()).unwrap();
+            leader.join().unwrap().unwrap();
+            for follower in followers {
+                follower.join().unwrap().unwrap();
+            }
+            assert_eq!(scans.load(Ordering::SeqCst), 1);
+            assert!(lease.dataset.verification.lock().unwrap().is_none());
+            lease
+                .dataset
+                .verify_with(&|| false, || {
+                    scans.fetch_add(1, Ordering::SeqCst);
+                    lease.dataset.toolchain.verify(|| false)
+                })
+                .unwrap();
+            assert_eq!(scans.load(Ordering::SeqCst), 2);
+        }
+
+        #[test]
+        fn equal_identities_in_distinct_dataset_owners_do_not_share_verification() {
+            let (source, identity) = source(b"compiler");
+            let pool = pool(0, 2);
+            let first = pool
+                .acquire(source.path(), Some(&identity), || false)
+                .unwrap();
+            let second = pool
+                .acquire(source.path(), Some(&identity), || false)
+                .unwrap();
+            assert_eq!(first.identity(), second.identity());
+            assert_ne!(first.root(), second.root());
+            let scans = Arc::new(AtomicUsize::new(0));
+            let (entered_tx, entered_rx) = mpsc::sync_channel(2);
+            let mut releases = Vec::new();
+            let mut threads = Vec::new();
+            for dataset in [&first.dataset, &second.dataset] {
+                let dataset = Arc::clone(dataset);
+                let scans = Arc::clone(&scans);
+                let entered_tx = entered_tx.clone();
+                let (release_tx, release_rx) = mpsc::sync_channel(1);
+                releases.push(release_tx);
+                threads.push(thread::spawn(move || {
+                    dataset.verify_with(&|| false, || {
+                        scans.fetch_add(1, Ordering::SeqCst);
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        dataset.toolchain.verify(|| false)
+                    })
+                }));
+            }
+            for _ in 0..2 {
+                entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            for release in releases {
+                release.send(()).unwrap();
+            }
+            for thread in threads {
+                thread.join().unwrap().unwrap();
+            }
+            assert_eq!(scans.load(Ordering::SeqCst), 2);
+        }
+
+        #[test]
+        fn cancelled_verification_follower_does_not_cancel_the_leader_or_retire_storage() {
+            let (source, identity) = source(b"compiler");
+            let pool = Arc::new(pool(1024, 2));
+            let lease = pool
+                .acquire(source.path(), Some(&identity), || false)
+                .unwrap();
+            let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+            let (release_tx, release_rx) = mpsc::sync_channel(1);
+            let dataset = Arc::clone(&lease.dataset);
+            let leader = thread::spawn(move || {
+                dataset.verify_with(&|| false, || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    dataset.toolchain.verify(|| false)
+                })
+            });
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let follower_cancelled = Arc::clone(&cancelled);
+            let follower_pool = Arc::clone(&pool);
+            let follower = thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                follower_pool.lookup(&identity, || {
+                    follower_cancelled.load(Ordering::Acquire) || Instant::now() >= deadline
+                })
+            });
+            wait_for_verification_followers(&lease.dataset, 1);
+            cancelled.store(true, Ordering::Release);
+            let error = follower.join().unwrap().err().unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+            assert!(lease.dataset.verification.lock().unwrap().is_some());
+            assert_eq!(pool.lock().unwrap().entries.len(), 1);
+            assert_eq!(pool.lock().unwrap().reserved_bytes, identity.bytes);
+            assert!(lease.root().is_dir());
+            release_tx.send(()).unwrap();
+            leader.join().unwrap().unwrap();
+            lease.verify(|| false).unwrap();
+        }
+
+        #[test]
+        fn cancelled_or_panicking_verification_leader_allows_a_live_follower_to_retry() {
+            for panics in [false, true] {
+                let (source, identity) = source(b"compiler");
+                let pool = pool(1024, 2);
+                let lease = pool
+                    .acquire(source.path(), Some(&identity), || false)
+                    .unwrap();
+                let scans = Arc::new(AtomicUsize::new(0));
+                let cancelled = Arc::new(AtomicBool::new(false));
+                let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+                let (release_tx, release_rx) = mpsc::sync_channel(1);
+                let dataset = Arc::clone(&lease.dataset);
+                let leader_scans = Arc::clone(&scans);
+                let leader_cancelled = Arc::clone(&cancelled);
+                let leader = thread::spawn(move || {
+                    let stopped = || leader_cancelled.load(Ordering::Acquire);
+                    dataset.verify_with(&stopped, || {
+                        leader_scans.fetch_add(1, Ordering::SeqCst);
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        assert!(!panics, "injected verification-owner unwind");
+                        dataset.toolchain.verify(stopped)
+                    })
+                });
+                entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let dataset = Arc::clone(&lease.dataset);
+                let follower_scans = Arc::clone(&scans);
+                let follower = thread::spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let stopped = || Instant::now() >= deadline;
+                    dataset.verify_with(&stopped, || {
+                        follower_scans.fetch_add(1, Ordering::SeqCst);
+                        dataset.toolchain.verify(stopped)
+                    })
+                });
+                wait_for_verification_followers(&lease.dataset, 1);
+                if !panics {
+                    cancelled.store(true, Ordering::Release);
+                }
+                release_tx.send(()).unwrap();
+                let leader = leader.join();
+                if panics {
+                    assert!(leader.is_err());
+                } else {
+                    assert_eq!(
+                        leader.unwrap().unwrap_err().kind(),
+                        io::ErrorKind::Interrupted
+                    );
+                }
+                follower.join().unwrap().unwrap();
+                assert_eq!(scans.load(Ordering::SeqCst), 2);
+                assert!(lease.dataset.verification.lock().unwrap().is_none());
+                lease.verify(|| false).unwrap();
+                assert_eq!(pool.lock().unwrap().reserved_bytes, identity.bytes);
+            }
+        }
+
+        #[test]
+        fn mutation_during_shared_verification_is_rejected_before_or_after_the_byte_scan() {
+            for after_scan in [false, true] {
+                let (source, identity) = source(b"compiler");
+                let pool = pool(1024, 2);
+                let lease = pool
+                    .acquire(source.path(), Some(&identity), || false)
+                    .unwrap();
+                let scans = Arc::new(AtomicUsize::new(0));
+                let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+                let (release_tx, release_rx) = mpsc::sync_channel(1);
+                let dataset = Arc::clone(&lease.dataset);
+                let leader_scans = Arc::clone(&scans);
+                let leader = thread::spawn(move || {
+                    dataset.verify_with(&|| false, || {
+                        leader_scans.fetch_add(1, Ordering::SeqCst);
+                        if after_scan {
+                            dataset.toolchain.verify(|| false)?;
+                        }
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        if after_scan {
+                            Ok(())
+                        } else {
+                            dataset.toolchain.verify(|| false)
+                        }
+                    })
+                });
+                entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let dataset = Arc::clone(&lease.dataset);
+                let follower_scans = Arc::clone(&scans);
+                let follower = thread::spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    dataset.verify_with(&|| Instant::now() >= deadline, || {
+                        follower_scans.fetch_add(1, Ordering::SeqCst);
+                        dataset.toolchain.verify(|| Instant::now() >= deadline)
+                    })
+                });
+                wait_for_verification_followers(&lease.dataset, 1);
+                let path = lease.root().join("bin/compiler");
+                let modified = fs::metadata(&path).unwrap().modified().unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+                fs::write(&path, b"tampered").unwrap();
+                File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_modified(modified)
+                    .unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o555)).unwrap();
+                release_tx.send(()).unwrap();
+                for result in [leader.join().unwrap(), follower.join().unwrap()] {
+                    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+                }
+                assert_eq!(scans.load(Ordering::SeqCst), 1);
+                assert!(pool.lookup(&identity, || false).is_err());
+                assert!(pool.lock().unwrap().entries.is_empty());
+                assert_eq!(
+                    fs::read(source.path().join("bin/compiler")).unwrap(),
+                    b"compiler"
+                );
+            }
+        }
+
+        #[test]
+        fn retained_generation_mutations_refuse_lease_lookup_and_acquisition() {
+            for operation in 0..3 {
+                for fault in 0..5 {
+                    let (source, identity) = source(b"compiler");
+                    let pool = pool(1024, 2);
+                    let lease = pool
+                        .acquire(source.path(), Some(&identity), || false)
+                        .unwrap();
+                    let root = lease.root();
+                    let file = root.join("bin/compiler");
+                    match fault {
+                        0 => {
+                            let modified = fs::metadata(&file).unwrap().modified().unwrap();
+                            fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).unwrap();
+                            fs::write(&file, b"tampered").unwrap();
+                            File::options()
+                                .write(true)
+                                .open(&file)
+                                .unwrap()
+                                .set_modified(modified)
+                                .unwrap();
+                            fs::set_permissions(&file, fs::Permissions::from_mode(0o555)).unwrap();
+                        }
+                        1 => {
+                            fs::rename(&file, root.parent().unwrap().join("original-compiler"))
+                                .unwrap();
+                            fs::write(&file, b"compiler").unwrap();
+                            fs::set_permissions(&file, fs::Permissions::from_mode(0o555)).unwrap();
+                        }
+                        2 => {
+                            fs::rename(
+                                root.join("bin/rustc"),
+                                root.parent().unwrap().join("original-alias"),
+                            )
+                            .unwrap();
+                            symlink("compiler", root.join("bin/rustc")).unwrap();
+                        }
+                        3 => fs::create_dir(root.join("added-member")).unwrap(),
+                        _ => {
+                            fs::rename(root, root.parent().unwrap().join("original-dataset"))
+                                .unwrap();
+                            fs::create_dir(root).unwrap();
+                        }
+                    }
+                    let result = match operation {
+                        0 => lease.verify(|| false),
+                        1 => pool.lookup(&identity, || false).map(|_| ()),
+                        _ => pool
+                            .acquire(Path::new("/absent"), Some(&identity), || false)
+                            .map(|_| ()),
+                    };
+                    assert!(result.is_err(), "operation {operation}, fault {fault}");
+                    assert_eq!(
+                        fs::read(source.path().join("bin/compiler")).unwrap(),
+                        b"compiler"
+                    );
+                }
+            }
         }
 
         #[test]
