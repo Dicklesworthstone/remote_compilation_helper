@@ -48,9 +48,11 @@ SNAPSHOT_CALL = 'rch_scope_manager=user; rch_scope_unit=test.scope; rch_scope_sn
                      "requires Linux pidfd handles and GNU timeout")
 class ControlDeadlines(unittest.TestCase):
     def setUp(self) -> None:
-        self.root = Path(tempfile.mkdtemp(prefix="rch-control-deadlines-"))
+        temporary = tempfile.TemporaryDirectory(prefix="rch-control-deadlines-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
         self.env = {**os.environ, "PATH": f"{self.root}:/usr/bin:/bin",
-                    "RCH_CONTROL_TEST_ROOT": str(self.root)}
+                    "RCH_CONTROL_TEST_ROOT": str(self.root), "TMPDIR": str(self.root)}
 
     def helper(self, name: str, body: str) -> None:
         path = self.root / name
@@ -148,6 +150,139 @@ time.sleep(20)
         result = self.run_shell(SNAPSHOT_CALL, stalled=True)
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertEqual(result.stdout, b"")
+
+    def test_slow_complete_manager_snapshot_remains_usable(self) -> None:
+        self.helper("systemctl", f'time.sleep(1.25)\nprint({SNAPSHOT!r}, end="")\n')
+        result = self.run_shell(SNAPSHOT_CALL + ''' || exit $?
+[ "$rch_scope_load:$rch_scope_active" = loaded:active ] || exit 91
+printf '%s\\n' "$rch_scope_observed_invocation" "$rch_scope_observed_cgroup"
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout,
+                         b"1234567890abcdef1234567890abcdef\n/jobs.slice/test.scope\n")
+
+    def test_shared_budget_stops_a_pipe_holder_before_the_exchange_limit(self) -> None:
+        self.stalled_helper("systemctl", "stdout")
+        # Only the clock is controlled: the two-second timeout, reader, pipe
+        # holder and their pidfd-confirmed termination are real subprocesses.
+        result = self.run_shell('''
+rch_observation_clock() { rch_observation_now=100; }
+rch_observation_last_clock=100; rch_observation_deadline=300
+rch_control_capture 8s systemctl
+''', stalled=True, budget=4)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(list(self.root.glob("rch-control-output.*")), [])
+
+    def test_invalid_or_exhausted_budget_cannot_start_an_observer(self) -> None:
+        self.helper("systemctl", '(root / "started").touch(); print("unexpected")\n')
+        for clock in ("return 1", "rch_observation_now=99", "rch_observation_now=300",
+                      "rch_observation_now=250"):
+            with self.subTest(clock=clock):
+                result = self.run_shell('rch_observation_clock() { ' + clock + '''; }
+rch_observation_last_clock=100; rch_observation_deadline=300
+rch_control_capture 8s systemctl
+''')
+                self.assertEqual(result.returncode, 125, result.stderr)
+                self.assertEqual(result.stdout, b"")
+                self.assertFalse((self.root / "started").exists())
+                self.assertEqual(list(self.root.glob("rch-control-output.*")), [])
+
+    def test_elapsed_temporary_setup_cannot_launch_an_unbounded_observer(self) -> None:
+        self.helper("systemctl", '(root / "started").touch(); print("unexpected")\n')
+        result = self.run_shell('''
+rch_observation_clock() {
+    if [ -f "$RCH_CONTROL_TEST_ROOT/setup-finished" ]; then
+        rch_observation_now=300
+    else
+        rch_observation_now=100
+    fi
+}
+mkfifo() {
+    command mkfifo "$@" || return $?
+    : > "$RCH_CONTROL_TEST_ROOT/setup-finished"
+}
+rch_observation_last_clock=100; rch_observation_deadline=300
+rch_control_capture 8s systemctl
+''')
+        self.assertEqual(result.returncode, 125, result.stderr)
+        self.assertEqual(result.stdout, b"")
+        self.assertTrue((self.root / "setup-finished").exists())
+        self.assertFalse((self.root / "started").exists())
+        self.assertEqual(list(self.root.glob("rch-control-output.*")), [])
+
+    def test_response_after_shared_deadline_cannot_publish_authority(self) -> None:
+        self.helper("systemctl", f'(root / "response-ready").touch()\nprint({SNAPSHOT!r}, end="")\n')
+        result = self.run_shell('''
+rch_observation_clock() {
+    if [ -f "$RCH_CONTROL_TEST_ROOT/response-ready" ]; then
+        rch_observation_now=300
+    else
+        rch_observation_now=100
+    fi
+}
+rch_observation_last_clock=100; rch_observation_deadline=300
+''' + SNAPSHOT_CALL)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, b"")
+        self.assertTrue((self.root / "response-ready").exists())
+        self.assertEqual(list(self.root.glob("rch-control-output.*")), [])
+
+    def test_clock_reversal_within_an_exchange_cannot_publish_authority(self) -> None:
+        self.helper("systemctl", f'(root / "response-ready").touch()\nprint({SNAPSHOT!r}, end="")\n')
+        # Every value is inside the original [100, 300) range, but the last
+        # observation reverses the second one. Only the clock is injected.
+        result = self.run_shell('''
+rch_test_clock_reads=0
+rch_observation_clock() {
+    rch_test_clock_reads=$((rch_test_clock_reads + 1))
+    case "$rch_test_clock_reads" in
+        1) rch_observation_now=150;;
+        2) rch_observation_now=200;;
+        *) rch_observation_now=175;;
+    esac
+    printf '%s\\n' "$rch_observation_now" >> "$RCH_CONTROL_TEST_ROOT/clock-reads"
+}
+rch_observation_last_clock=100; rch_observation_deadline=300
+''' + SNAPSHOT_CALL)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, b"")
+        self.assertTrue((self.root / "response-ready").exists())
+        self.assertEqual((self.root / "clock-reads").read_text(), "150\n200\n175\n")
+        self.assertEqual(list(self.root.glob("rch-control-output.*")), [])
+
+    def test_policy_slice_requires_success_after_publishing_active(self) -> None:
+        self.helper("systemctl", 'print("active")\n')
+        self.helper("busctl", '(root / "scope-created").touch()\n')
+        # The real capture publishes its valid bytes, then loses its budget.
+        # Policy must also check the exit status before trusting those bytes.
+        result = self.run_shell('''
+rch_observation_clock() {
+    if [ -f "$RCH_CONTROL_TEST_ROOT/publication-finished" ]; then
+        rch_observation_now=300
+    else
+        rch_observation_now=100
+    fi
+}
+cat() {
+    command cat "$@" || return $?
+    case "$1:${2:-}" in
+        --:*/rch-control-output.*/output)
+            : > "$RCH_CONTROL_TEST_ROOT/publication-finished";;
+    esac
+}
+rch_observation_last_clock=100; rch_observation_deadline=300
+rch_policy_manager=user; rch_policy_slice=jobs.slice
+rch_boot=12345678-1234-1234-1234-123456789abc; rch_pgid=$$; rch_start=1
+rch_policy_enter_scope || exit $?
+printf payload-admitted
+''')
+        self.assertEqual(result.returncode, 125, result.stderr)
+        self.assertIn(b"RCH_WORKER_POLICY_REFUSED:slice_not_active", result.stderr)
+        self.assertEqual(result.stdout, b"")
+        self.assertTrue((self.root / "publication-finished").exists())
+        self.assertFalse((self.root / "scope-created").exists())
+        self.assertEqual(list(self.root.glob("rch-control-output.*")), [])
 
     def test_process_census_deadline_stops_a_term_resistant_ps(self) -> None:
         self.stalled_helper("ps", "client")
@@ -439,6 +574,19 @@ rch_observation_clock() {
         self.assertEqual(result.returncode, 44, result.stderr)
         self.assertEqual(int(self.count.read_text()), 1)
         self.assertEqual(self.signals(), [f"-KILL -{group[0].pid}"])
+        self.assert_stopped(group)
+        self.assertEqual(self.recover(group).returncode, 0)
+
+    def test_recovery_budget_cannot_leak_into_a_later_control_exchange(self):
+        group = self.group()
+        # Keep real census, receipt and signals. A later broken clock may not
+        # reuse this completed cancellation's private observation deadline.
+        result = self.recover(group, extra='rch_observation_clock() { rch_observation_now=100; }\n', body='''
+rch_remote_cancel "$1" 41 "$2" || exit $?
+rch_observation_clock() { return 1; }
+rch_control_capture 8s /bin/sh -c 'sleep 1.25; printf recovered'
+''')
+        self.assertEqual((result.returncode, result.stdout), (0, b"recovered"), result.stderr)
         self.assert_stopped(group)
         self.assertEqual(self.recover(group).returncode, 0)
 

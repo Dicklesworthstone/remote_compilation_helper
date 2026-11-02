@@ -8308,14 +8308,19 @@ fn terminal_leaf_metadata_source(root: &Path, kind: &str, harness: Option<bool>)
     write(root, "value.txt", "terminal metadata source\n");
 }
 
-fn terminal_leaf_metadata_observations(events: &[Value], output: &str) -> Vec<String> {
+fn terminal_leaf_metadata_observations(
+    events: &[Value],
+    output: &str,
+    target_state: &str,
+    fresh: bool,
+) -> Vec<String> {
     let started = events
         .iter()
         .filter(|event| event["kind"] == "canonical-compilation-started")
         .collect::<Vec<_>>();
     assert_eq!(started.len(), 1, "{output}");
     assert_eq!(started[0]["command"], "check", "{output}");
-    assert_eq!(started[0]["private_target_state"], "cold", "{output}");
+    assert_eq!(started[0]["private_target_state"], target_state, "{output}");
     assert!(!output.contains("RABS_CHECK_TARGET_EXECUTED"), "{output}");
     assert!(
         !events.iter().any(|event| matches!(
@@ -8338,10 +8343,7 @@ fn terminal_leaf_metadata_observations(events: &[Value], output: &str) -> Vec<St
         artifacts[0]["target"]["name"],
         WORKSPACE_METADATA_DAG_CONSUMER
     );
-    assert_eq!(
-        artifacts[0]["fresh"], false,
-        "Cargo Fresh bypassed the wrapper"
-    );
+    assert_eq!(artifacts[0]["fresh"], fresh, "{output}");
     assert!(artifacts[0]["executable"].is_null(), "{output}");
     workspace_dag_diagnostics(output, &[WORKSPACE_METADATA_DAG_CONSUMER])
 }
@@ -8379,7 +8381,8 @@ fn canonical_terminal_metadata_leaves_earn_hits_without_running_programs_or_harn
         for decision in ["remote-offer", "execute", "hit"] {
             assert!(decisions(&events, decision).is_empty(), "{output}");
         }
-        let stock_diagnostics = terminal_leaf_metadata_observations(&events, &output);
+        let stock_diagnostics =
+            terminal_leaf_metadata_observations(&events, &output, "cold", false);
         let stock_target = sole_retained_target(root);
         let stock_files = workspace_dag_metadata_files(&stock_target, &output, &[]);
         let mut families = BTreeSet::from([stock_target
@@ -8415,7 +8418,7 @@ fn canonical_terminal_metadata_leaves_earn_hits_without_running_programs_or_harn
             let (code, events, output) =
                 run_with_environment(root, 1300 + number, &profile, &environment);
             assert_eq!(code, 0, "{kind}/{harness:?}: {output}");
-            let diagnostics = terminal_leaf_metadata_observations(&events, &output);
+            let diagnostics = terminal_leaf_metadata_observations(&events, &output, "cold", false);
             let offered = decisions(&events, "remote-offer");
             let hits = decisions(&events, "hit");
             assert!(decisions(&events, "execute").is_empty(), "{output}");
@@ -8570,6 +8573,276 @@ fn canonical_terminal_metadata_leaves_earn_hits_without_running_programs_or_harn
         worker.finish();
         let _retained = owner.keep();
     }
+}
+
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; terminal action quarantine must revoke the same retained Cargo Fresh target"]
+fn canonical_warm_terminal_metadata_rejects_own_action_quarantine_before_cargo_fresh() {
+    warm_terminal_metadata_quarantine(false);
+}
+
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; a real terminal class peer quarantine must revoke the same retained Cargo Fresh target"]
+fn canonical_warm_terminal_metadata_rejects_class_quarantine_before_cargo_fresh() {
+    warm_terminal_metadata_quarantine(true);
+}
+
+fn warm_terminal_metadata_quarantine(class_quarantine: bool) {
+    use rabs_cas::metadata_store::{QuarantineScope, RabsMetadataStore, SqlValue};
+    use rabs_sandbox::cargo_target::state::PrivateTreeSnapshot;
+
+    const CLASS: &str = "rustc-workspace-terminal-leaf-metadata-v1";
+    const TARGET_BYTES: u64 = 268435456;
+
+    let (owner, mut profile) = native_fixture();
+    let root = owner.path();
+    let source = root.join("terminal-warm");
+    terminal_leaf_metadata_source(&source, "bin", None);
+    profile["source_root"] = json!(source);
+    profile["vendor"] = Value::Null;
+    profile["command"] = json!("check");
+    profile["selection"] = json!({"bin":[WORKSPACE_METADATA_DAG_CONSUMER]});
+    profile["env"] = json!({"TERMINAL_METADATA_INPUT":"original terminal environment"});
+    let (mut worker, environment) = NativeWorker::start(root);
+    let mut primary_key: Option<String> = None;
+    let mut peer_key: Option<String> = None;
+    let mut diagnostics = None;
+    let mut retained_files = None;
+    let mut request_ids = BTreeSet::new();
+
+    // Three independent cold executions earn A's existing serving gate. Only
+    // the actual fourth-round cache hit creates retained family F. The next
+    // unchanged request must restore F and let Cargo choose Fresh normally.
+    // For the class case, a real direct execution of B supplies the separate
+    // class witness without altering A's retained family or manufacturing rows.
+    for number in 1..=if class_quarantine { 6 } else { 5 } {
+        if number == 4 {
+            profile["target_cache"] = json!({
+                "runtime_epoch":"warm-terminal-completion-v1", "max_bytes":TARGET_BYTES,
+            });
+        }
+        let mut current = profile.clone();
+        if number == 6 {
+            assert!(
+                current
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("target_cache")
+                    .is_some()
+            );
+            current["env"]["TERMINAL_METADATA_INPUT"] = json!("independent terminal class peer");
+        }
+        let hit = number == 4;
+        let fresh = number == 5;
+        let before_journal =
+            (hit || fresh).then(|| read_bounded(&worker.state.join("requests.json")));
+        let (code, events, output) =
+            run_with_environment(root, 1400 + number, &current, &environment);
+        assert_eq!(code, 0, "{output}");
+        let observed = terminal_leaf_metadata_observations(
+            &events,
+            &output,
+            match number {
+                4 => "cold",
+                5 => "restored",
+                _ => "disabled",
+            },
+            fresh,
+        );
+        if number == 1 {
+            diagnostics = Some(observed);
+        } else if number <= 5 {
+            assert_eq!(
+                &observed,
+                diagnostics.as_ref().unwrap(),
+                "terminal diagnostics changed across direct, hit or Cargo Fresh completion"
+            );
+        }
+        let offered = decisions(&events, "remote-offer");
+        let hits = decisions(&events, "hit");
+        assert!(decisions(&events, "execute").is_empty(), "{output}");
+        let key = if hit || fresh {
+            let key = primary_key.as_ref().unwrap().clone();
+            assert!(
+                offered.is_empty(),
+                "retained terminal requested rustc: {output}"
+            );
+            assert_eq!(
+                hits,
+                if hit {
+                    BTreeMap::from([(WORKSPACE_METADATA_DAG_CONSUMER.to_owned(), key.clone())])
+                } else {
+                    BTreeMap::new()
+                },
+                "the fourth round must replay A and the fifth must bypass the wrapper: {output}"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .any(|event| { event["decision"] == "served" && event["key"] == key }),
+                hit,
+                "Cargo Fresh must not request a second cache installation: {output}"
+            );
+            key
+        } else {
+            assert!(hits.is_empty(), "unearned terminal hit: {output}");
+            assert_eq!(offered.len(), 1, "{output}");
+            let key = offered[WORKSPACE_METADATA_DAG_CONSUMER].clone();
+            if number == 1 {
+                primary_key = Some(key.clone());
+            } else if number <= 3 {
+                assert_eq!(Some(&key), primary_key.as_ref());
+            } else {
+                assert_ne!(Some(&key), primary_key.as_ref());
+                peer_key = Some(key.clone());
+            }
+            key
+        };
+        let expected = offered.values().cloned().collect::<BTreeSet<_>>();
+        for event_kind in [
+            "rabsd-remote-dependency-admitted",
+            "rabsd-remote-dependency-executed",
+        ] {
+            let actual = events
+                .iter()
+                .filter(|event| event["kind"] == event_kind)
+                .map(|event| event["key"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(actual.len(), expected.len(), "{event_kind}: {output}");
+            assert_eq!(actual.into_iter().collect::<BTreeSet<_>>(), expected);
+        }
+        assert_closed_workspace_leaf_evidence(
+            root,
+            &key,
+            if number == 6 {
+                1
+            } else {
+                number.min(3) as usize
+            },
+            CLASS,
+        );
+        assert_no_immutable_leaf_qualification(root, &key);
+        if hit || fresh {
+            let files = workspace_dag_metadata_files(&sole_retained_target(root), &output, &[]);
+            if hit {
+                retained_files = Some(files);
+            } else {
+                assert_eq!(Some(files), retained_files);
+            }
+        }
+        if !offered.is_empty() {
+            assert!(request_ids.insert(worker.completed_receipt()["request_id"].as_u64().unwrap()));
+        }
+        assert_eq!(
+            worker
+                .events()
+                .iter()
+                .filter(|event| event["kind"] == "worker-toolchain-acquired")
+                .count(),
+            request_ids.len(),
+            "cache hits and Cargo Fresh must not acquire a worker compiler"
+        );
+        if let Some(before_journal) = before_journal {
+            assert_eq!(
+                read_bounded(&worker.state.join("requests.json")),
+                before_journal
+            );
+        }
+        assert!(fs::read_dir(root.join("ops")).unwrap().next().is_none());
+    }
+    assert_eq!(request_ids.len(), if class_quarantine { 4 } else { 3 });
+
+    let primary_key = primary_key.unwrap();
+    let culprit = peer_key.as_ref().unwrap_or(&primary_key);
+    let target = sole_retained_target(root);
+    let seed_metadata = target.parent().unwrap().join("metadata.json");
+    let before_seed = read_bounded(&seed_metadata);
+    let before_target = PrivateTreeSnapshot::capture(&target, TARGET_BYTES, &|| false).unwrap();
+    let before_journal = read_bounded(&worker.state.join("requests.json"));
+    {
+        let cas = rabsd::janitor::store::mount_and_reconcile(
+            &root.join("state/canonical-compile-v1/cas"),
+        )
+        .unwrap();
+        let mut store = cas.store().lock().unwrap();
+        assert!(
+            store
+                .list_provisional_ancestors(&primary_key)
+                .unwrap()
+                .is_empty(),
+            "this regression must revoke the terminal itself without an ancestor"
+        );
+        store
+            .add_quarantine(
+                QuarantineScope::ActionEntry,
+                culprit,
+                "native warm terminal completion revocation",
+            )
+            .unwrap();
+        let own_quarantine = store
+            .query(
+                "SELECT reason FROM quarantines WHERE scope = ?1 AND subject = ?2",
+                &[
+                    SqlValue::Text(QuarantineScope::ActionEntry.as_str().to_owned()),
+                    SqlValue::Text(primary_key.clone()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(own_quarantine.is_empty(), class_quarantine);
+    }
+
+    // Keep the exact profile/runtime epoch that just produced Cargo Fresh.
+    // Revoked completion provenance must fail before Cargo can consume F's
+    // successful fingerprint, even though its terminal metadata is empty.
+    let (code, events, output) = run_with_environment(root, 1407, &profile, &environment);
+    assert_ne!(
+        code, 0,
+        "revoked terminal completion reached Cargo: {output}"
+    );
+    assert!(
+        output.to_ascii_lowercase().contains("quarantin"),
+        "{output}"
+    );
+    assert!(output.contains(&primary_key), "{output}");
+    assert!(output.contains(culprit), "{output}");
+    assert!(
+        !events.iter().any(|event| matches!(
+            event["kind"].as_str(),
+            Some(
+                "canonical-compilation-started"
+                    | "rabsd-remote-dependency-admitted"
+                    | "rabsd-remote-dependency-executed"
+            )
+        )),
+        "terminal revocation must be checked before Cargo starts: {output}"
+    );
+    assert!(
+        !output
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(|event| event["reason"] == "compiler-artifact"),
+        "Cargo consumed revoked terminal completion through Fresh: {output}"
+    );
+    for decision in ["remote-offer", "execute", "hit"] {
+        assert!(decisions(&events, decision).is_empty(), "{output}");
+    }
+    assert!(
+        !events.iter().any(|event| event["decision"] == "served"),
+        "refused terminal completion must not install a cached result: {output}"
+    );
+    assert_eq!(
+        read_bounded(&worker.state.join("requests.json")),
+        before_journal
+    );
+    assert_eq!(read_bounded(&seed_metadata), before_seed);
+    assert_eq!(sole_retained_target(root), target);
+    assert_eq!(
+        PrivateTreeSnapshot::capture(&target, TARGET_BYTES, &|| false).unwrap(),
+        before_target,
+        "refused warm restore must preserve the complete committed target"
+    );
+    assert!(fs::read_dir(root.join("ops")).unwrap().next().is_none());
+    worker.finish();
 }
 
 fn metadata_check_targets(root: &Path, leaf: u32) {

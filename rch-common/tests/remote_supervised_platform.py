@@ -198,7 +198,30 @@ class SupervisedPlatform(unittest.TestCase):
         self.assertNotEqual(run[0].wait(timeout=15), 0)
         self.assert_empty()
 
-    def cancel_with_probe(self, probe):
+    def pause_collection_group(self):
+        # The positive complete-collection cases need stable live members.
+        # The native watchdog and payload otherwise replace their short sleep
+        # children between census and birth checks, correctly refusing TERM.
+        # Synchronize only these fixtures; production observation stays real.
+        result = self.observe(f'''
+rch_read_record {shlex.quote(str(self.receipt))} 115 || exit 80
+rch_posix_signal_authorized TERM || exit 81
+kill -STOP -"$rch_pgid" || exit 82
+attempt=0
+while [ "$attempt" -lt 20 ]; do
+    rch_group_state; [ "$?" = 1 ] || exit 83
+    if printf '%s\\n' "$rch_snapshot" | awk -v group="$rch_pgid" '
+        $2 == group && $3 !~ /^[ZXx]/ {{ seen=1; if ($3 !~ /^[Tt]/) moving=1 }}
+        END {{ exit !seen || moving }}
+    '; then exit 0; fi
+    attempt=$((attempt + 1))
+    sleep .05 || exit 84
+done
+exit 85
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def cancel_with_probe(self, probe, resume_before_term=False):
         # Fault injection is confined to the cancelling channel. Launch,
         # leader identity, actual signals and the final census remain native.
         # Put it in the literal shared source so a bounded collector sees the
@@ -207,8 +230,14 @@ class SupervisedPlatform(unittest.TestCase):
         core += "\n" + probe
         trace = self.root / "signals"
         core = core.replace("rch_signal_group() {", "rch_real_signal_group() {")
+        resume = '''
+if [ "$1" = TERM ]; then
+    rch_posix_signal_authorized TERM || return $?
+    kill -CONT -"$rch_pgid" || return 44
+fi
+''' if resume_before_term else ""
         core += ("\nrch_signal_group() { printf '%s\\n' \"$1\" >> "
-                 + shlex.quote(str(trace)) + '; rch_real_signal_group "$@"; }\n')
+                 + shlex.quote(str(trace)) + '; ' + resume + 'rch_real_signal_group "$@"; }\n')
         script = PROTOCOL.replace(CORE, core) + (
             f"\nrch_remote_cancel {shlex.quote(str(self.receipt))} 115 term")
         started = time.monotonic()
@@ -255,9 +284,10 @@ rch_read_process() {
     def test_complete_collection_retains_graceful_term(self):
         run = self.start(self.blocking_payload())
         self.wait_ready(run[0])
+        self.pause_collection_group()
         result, _, signals = self.cancel_with_probe('''
 rch_read_process() { rch_real_read_process "$1"; }
-''')
+''', resume_before_term=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(signals.startswith("TERM\n"), signals)
         self.assert_empty()
@@ -324,6 +354,7 @@ rch_remote_cancel {shlex.quote(str(self.receipt))} 115 term
     def test_bounded_witness_match_preserves_birth_and_exchange_fences(self):
         run = self.start(self.blocking_payload())
         self.wait_ready(run[0])
+        self.pause_collection_group()
         result = self.observe(f'''
 rch_read_record {shlex.quote(str(self.receipt))} 115 || exit 80
 rch_group_state; [ "$?" = 1 ] || exit 81

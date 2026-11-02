@@ -54,6 +54,17 @@ rch_observation_clock() {
     rch_observation_now=$((rch_observation_secs * 100 + 1$rch_observation_frac - 100))
 }
 
+# Owners seed the floor; captures advance their subprocess-local copy.
+rch_observation_clock_checked() {
+    rch_observation_clock || return 1
+    if [ -n "${rch_observation_last_clock:-}" ]; then
+        rch_scope_uint "$rch_observation_last_clock" || return 1
+        [ "${#rch_observation_last_clock}" -le 15 ] || return 1
+        [ "$rch_observation_now" -ge "$rch_observation_last_clock" ] || return 1
+    fi
+    rch_observation_last_clock=$rch_observation_now
+}
+
 # A foreign procfs view proves neither ownership nor absence. NSpid must have
 # exactly our own ID, not a coincidentally equal first ID in a namespace chain.
 # Builtin read observes this shell; exec under substitution supplies its PID
@@ -462,13 +473,10 @@ rch_remote_cancel() {
     rch_remote_cancel_loaded "$3"
 }
 
-# Operate on the already validated identity. The in-session supervisor has
-# additionally bound it to its direct child; rereading a mutable receipt here
-# could replace that authority between its check and the first scope operation.
+# Use validated in-memory identity; never replace signal authority from a receipt.
 rch_remote_cancel_loaded() (
-    # One 30s budget covers retries, witnesses and scope reads inside the 45s
-    # SSH channel. Subshell scope prevents deadline/authority leaks across calls.
-    rch_observation_clock || return 44
+    # Share 30s inside 45s SSH; subshell isolates deadlines and authority.
+    rch_observation_clock_checked || return 44
     rch_cancel_deadline=$((rch_observation_now + 3000))
     if [ -n "${rch_observation_deadline:-}" ]; then
         case "$rch_observation_deadline" in ''|*[!0-9]*|0[0-9]*) return 44;; esac
@@ -478,7 +486,6 @@ rch_remote_cancel_loaded() (
     fi
     rch_observation_deadline=$rch_cancel_deadline
     [ "$rch_observation_now" -lt "$rch_observation_deadline" ] || return 44
-    rch_cancel_last_clock=$rch_observation_now
     rch_witnesses=
     rch_witness_identity=
     rch_term_sent=0
@@ -488,11 +495,8 @@ rch_remote_cancel_loaded() (
         0) return 0;;
         1) ;;
         2)
-            # A broken census is neither stop authority nor death proof.
-            # V2 has its separately bound cgroup. V1 may stop ONLY if the live
-            # leader independently authenticates a group outside our own; no
-            # witnesses from a prior call survive the reset above. Skip TERM
-            # because this census cannot safely establish escalation witnesses.
+            # Unknown is neither stop authority nor death proof. V2 binds its
+            # scope; V1 needs a live leader for KILL. No witnesses means no TERM.
             [ "${rch_scope_bound:-0}" = 1 ] || rch_posix_signal_authorized KILL || return 44
             rch_mode=kill;;
         *) return 44;;
@@ -513,17 +517,14 @@ rch_remote_cancel_loaded() (
         case $? in
             0) return 0;;
             1) ;;
-            # After our TERM the leader may be gone. An already captured live
-            # witness can still authenticate escalation despite census loss.
-            # The signal boundary rechecks it; the post-kill census is mandatory.
+            # After TERM, revalidate live witnesses before KILL; still require
+            # a complete post-kill census.
             2) [ "${rch_scope_bound:-0}" = 1 ] || rch_posix_signal_authorized KILL || return 44;;
             *) return 44;;
         esac
     fi
-    # 43: the recorded leader no longer authenticates the group, so nothing may
-    # be signalled. The group deadline watchdog may already have killed
-    # it (the leader dies first, members a moment later): keep the census
-    # running and confirm only if the group empties; otherwise still 43.
+    # Missing leader authority (43) forbids signals. A later complete census
+    # can still confirm watchdog cleanup; otherwise preserve the refusal.
     rch_kill_status=0
     rch_signal_group KILL || rch_kill_status=$?
     case "$rch_kill_status" in 0|43) ;; *) return "$rch_kill_status";; esac
@@ -534,9 +535,7 @@ rch_remote_cancel_loaded() (
     # observations get at most three retries, within the same overall budget.
     rch_attempt_limit=20
     while [ "$rch_attempt" -lt "$rch_attempt_limit" ]; do
-        rch_observation_clock || return 44
-        [ "$rch_observation_now" -ge "$rch_cancel_last_clock" ] || return 44
-        rch_cancel_last_clock=$rch_observation_now
+        rch_observation_clock_checked || return 44
         [ "$rch_observation_now" -lt "$rch_observation_deadline" ] || return 44
         rch_group_state
         rch_last_state=$?
@@ -670,13 +669,8 @@ rch_policy_read_file() {
     esac
 }
 
-# Bound helpers AND pipe holders in one private group, killed at the deadline.
-# This never includes the workload/supervisor. Capture stderr too; failed output
-# is diagnostic only, never admission evidence. Successful output needs parsing:
-# warnings fail closed. No captured payload is evaluated as code.
-# GNU timeout kills its whole process group at the deadline; uutils timeout
-# (Ubuntu 25.10+ /usr/bin/timeout) kills only its direct child, so a pipe
-# holder survives. Ubuntu ships GNU as gnutimeout; Homebrew as gtimeout.
+# Kill helpers AND pipe holders in a private group, never the workload. Prefer
+# GNU (gnutimeout/gtimeout): uutils timeout kills only the direct child.
 rch_group_timeout() {
     if command -v gnutimeout >/dev/null 2>&1; then
         gnutimeout "$@"
@@ -730,28 +724,43 @@ sys.exit(status if status >= 0 else 128 - status)
     fi
 }
 
+rch_control_in_budget() {
+    [ -n "${rch_observation_deadline:-}" ] || return 0
+    rch_scope_uint "$rch_observation_deadline" || return 125
+    [ "${#rch_observation_deadline}" -le 15 ] || return 125
+    rch_observation_clock_checked || return 125
+    [ "$rch_observation_now" -lt "$rch_observation_deadline" ] || return 125
+}
+
+rch_control_budget() {
+    [ -n "${rch_observation_deadline:-}" ] || return 0
+    rch_control_in_budget || return 125
+    rch_control_remaining=$(((rch_observation_deadline - rch_observation_now) / 100))
+    # Never pass timeout 0: it disables the deadline.
+    [ "$rch_control_remaining" -gt 0 ] || return 125
+    [ "$rch_control_remaining" -ge "${rch_control_timeout%s}" ] || \
+        rch_control_timeout=${rch_control_remaining}s
+}
+
 rch_control_capture() {
     case "$1" in [1-8]s) ;; *) return 125;; esac
     rch_control_timeout=$1
     shift
     # Nested captures and retries consume one admission/cancellation deadline.
-    if [ -n "${rch_observation_deadline:-}" ]; then
-        case "$rch_observation_deadline" in ''|*[!0-9]*|0[0-9]*) return 125;; esac
-        [ "${#rch_observation_deadline}" -le 15 ] || return 125
-        rch_observation_clock || return 125
-        rch_control_remaining=$(((rch_observation_deadline - rch_observation_now) / 100))
-        [ "$rch_control_remaining" -gt 0 ] || return 125
-        [ "$rch_control_remaining" -ge "${rch_control_timeout%s}" ] || \
-            rch_control_timeout=${rch_control_remaining}s
-    fi
-    # Validate raw bytes before shell substitution can discard NUL. The private
-    # bounded output file belongs to this observer, outside the timed group.
+    rch_control_budget || return 125
+    # Validate raw bytes before substitution discards NUL; keep output private.
     rch_control_base=${TMPDIR:-/tmp}
     case "$rch_control_base" in /*) ;; *) return 125;; esac
     rch_control_dir=$(umask 077; mktemp -d "$rch_control_base/rch-control-output.XXXXXXXXXX") || return 125
     rch_control_file=$rch_control_dir/output
     rch_control_pipe=$rch_control_dir/pipe
     (umask 077; : > "$rch_control_file" && mkfifo -m 600 "$rch_control_pipe") || {
+        rm -f -- "$rch_control_pipe" "$rch_control_file"
+        rmdir -- "$rch_control_dir" 2>/dev/null || :
+        return 125
+    }
+    # Setup consumed time: clamp again before starting the helper.
+    rch_control_budget || {
         rm -f -- "$rch_control_pipe" "$rch_control_file"
         rmdir -- "$rch_control_dir" 2>/dev/null || :
         return 125
@@ -803,10 +812,8 @@ rch_control_capture() {
         return 125
     fi
 
-    if [ "$rch_control_status" = 0 ] && [ -n "${rch_observation_deadline:-}" ]; then
-        if ! rch_observation_clock || [ "$rch_observation_now" -ge "$rch_observation_deadline" ]; then
-            rch_control_status=125
-        fi
+    if [ "$rch_control_status" = 0 ] && ! rch_control_in_budget; then
+        rch_control_status=125
     fi
     if [ "$rch_control_status" -ne 0 ]; then
         cat -- "$rch_control_file" >&2
@@ -821,16 +828,18 @@ rch_control_capture() {
     rm -f -- "$rch_control_file"
     rmdir -- "$rch_control_dir" 2>/dev/null || :
     [ "$rch_control_output_status" -eq 0 ] || return 125
-    # Metadata/byte validation and publication also consume the shared budget.
-    # A late successful child never upgrades expired evidence to a valid read.
-    if [ -n "${rch_observation_deadline:-}" ]; then
-        rch_observation_clock || return 125
-        [ "$rch_observation_now" -lt "$rch_observation_deadline" ] || return 125
-    fi
+    # Validation and publication consume the budget too.
+    rch_control_in_budget
 }
 
 rch_policy_systemctl() {
     rch_control_capture 5s systemctl "--$rch_policy_manager" --no-pager --no-ask-password "$@"
+}
+
+# Publication may precede a failed final deadline check. Require status AND value.
+rch_policy_property_is() {
+    rch_policy_value=$(rch_policy_systemctl show --value --property="$1" -- "$2") &&
+        [ "$rch_policy_value" = "$3" ]
 }
 
 # Read the actual launcher unified cgroup. A successful D-Bus job submission
@@ -854,7 +863,7 @@ rch_policy_enter_scope() {
         command -v timeout >/dev/null 2>&1 || { rch_policy_refuse systemd_tools; return 125; }
     # An operator must start/configure the selected slice. Do not synthesize a
     # missing slice and accidentally run without its intended resource limits.
-    [ "$(rch_policy_systemctl show --value --property=ActiveState -- "$rch_policy_slice")" = active ] || {
+    rch_policy_property_is ActiveState "$rch_policy_slice" active || {
         rch_policy_refuse slice_not_active; return 125;
     }
     rch_policy_slice_cgroup=$(rch_policy_systemctl show --value --property=ControlGroup -- "$rch_policy_slice") || {
@@ -880,9 +889,9 @@ rch_policy_enter_scope() {
         [ "$rch_policy_poll" -lt 50 ] || { rch_policy_refuse scope_not_enforced; return 125; }
         sleep 0.1 || { rch_policy_refuse scope_wait; return 125; }
     done
-    [ "$(rch_policy_systemctl show --value --property=ActiveState -- "$rch_policy_scope")" = active ] &&
-        [ "$(rch_policy_systemctl show --value --property=Slice -- "$rch_policy_scope")" = "$rch_policy_slice" ] &&
-        [ "$(rch_policy_systemctl show --value --property=ControlGroup -- "$rch_policy_scope")" = "$rch_policy_expected_cgroup" ] || {
+    rch_policy_property_is ActiveState "$rch_policy_scope" active &&
+        rch_policy_property_is Slice "$rch_policy_scope" "$rch_policy_slice" &&
+        rch_policy_property_is ControlGroup "$rch_policy_scope" "$rch_policy_expected_cgroup" || {
         rch_policy_refuse scope_evidence; return 125;
     }
     # Admission includes the ability to stop and observe the whole subtree,
@@ -1136,7 +1145,7 @@ rch_scope_bind_created() {
     # Retry observations of this same binding, never scope creation or a
     # changed identity. Keep the payload gate closed throughout the retries.
     (
-        rch_observation_clock || exit 1
+        rch_observation_clock_checked || exit 1
         rch_probe_deadline=$((rch_observation_now + 3000))
         if [ -n "${rch_observation_deadline:-}" ]; then
             case "$rch_observation_deadline" in ''|*[!0-9]*|0[0-9]*) exit 1;; esac
@@ -1147,6 +1156,7 @@ rch_scope_bind_created() {
         rch_observation_deadline=$rch_probe_deadline
         rch_probe_attempt=0
         while [ "$rch_probe_attempt" -lt 3 ]; do
+            rch_control_in_budget || exit 1
             rch_scope_operation probe
             case $? in 0) exit 0;; 2) ;; *) exit 1;; esac
             rch_probe_attempt=$((rch_probe_attempt + 1))

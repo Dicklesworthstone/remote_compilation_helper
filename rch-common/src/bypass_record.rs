@@ -1762,7 +1762,10 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert_eq!(fs::read(path.with_extension("checked")).unwrap(), b"rejected");
+        assert_eq!(
+            fs::read(path.with_extension("checked")).unwrap(),
+            b"rejected"
+        );
         assert!(fs::symlink_metadata(&path).unwrap().file_type().is_fifo());
     }
 

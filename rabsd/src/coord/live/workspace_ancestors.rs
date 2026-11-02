@@ -227,6 +227,110 @@ impl CoordLive {
             .map_err(store_error)
     }
 
+    /// Check a completed terminal result without granting it producer authority.
+    /// Fresh published attempts need no positive replay samples, but every
+    /// adverse, class, output-object and recursive ancestry veto still applies.
+    pub(crate) fn verify_terminal_completion(
+        &self,
+        action: &TypedDigest,
+        descriptor: &TypedDigest,
+        manifest_id: &TypedDigest,
+        policy: CommittedDependencyPolicy,
+    ) -> Result<CanonicalActionResultManifest, String> {
+        let (risk, key_epoch) = match policy {
+            CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata => {
+                (ActionClassRisk::WorkspaceTerminalLeafMetadata, 14)
+            }
+            CommittedDependencyPolicy::WorkspaceTerminalMetadata => {
+                (ActionClassRisk::WorkspaceTerminalMetadata, 15)
+            }
+            _ => return Err("terminal completion has a nonterminal policy".into()),
+        };
+        let held = self
+            .authority()
+            .ok_or("terminal completion has no coordinator authority")?;
+        let cas = self
+            .cas
+            .as_ref()
+            .ok_or("terminal completion has no store")?;
+        let mut store = cas
+            .store()
+            .lock()
+            .map_err(|_| "terminal completion metadata lock is unavailable")?;
+        if !self.available()
+            || !store
+                .active_authority()
+                .map_err(store_error)?
+                .is_some_and(|active| active.digest == authority_digest(&held))
+        {
+            return Err("terminal completion coordinator authority changed".into());
+        }
+        let key = digest_key(action);
+        let expected_manifest = digest_key(manifest_id);
+        if store
+            .published_manifest_key(action)
+            .map_err(store_error)?
+            .as_deref()
+            != Some(expected_manifest.as_str())
+        {
+            return Err(format!(
+                "terminal completion {key} lost its exact publication"
+            ));
+        }
+        let manifest = load_manifest(&mut *store, &expected_manifest)
+            .ok_or_else(|| format!("terminal completion {key} manifest is unavailable"))?;
+        if manifest.action_key != *action
+            || manifest.canonical_descriptor_digest != *descriptor
+            || manifest.key_epoch != key_epoch
+            || manifest.result_kind != ResultKind::Success
+            || recorded_action_risk(&mut *store, action).map_err(store_error)? != risk
+            || manifest.logical_outputs.len() != 2
+            || manifest
+                .logical_outputs
+                .iter()
+                .filter(|output| {
+                    output.role == OutputRole::ProvisionalMetadata
+                        && output.virtual_path.as_bytes().ends_with(b".rmeta")
+                })
+                .count()
+                != 1
+            || manifest
+                .logical_outputs
+                .iter()
+                .filter(|output| {
+                    output.role == OutputRole::DepInfo
+                        && output.virtual_path.as_bytes().ends_with(b".d")
+                })
+                .count()
+                != 1
+        {
+            return Err(format!(
+                "terminal completion {key} differs from its exact class or manifest"
+            ));
+        }
+        // These are safety checks, not a new replay or a new sampling credit.
+        if let Some(refusal) = live_producer_gate(&mut *store, action).map_err(store_error)? {
+            return Err(format!("terminal completion {key} is unsafe: {refusal:?}"));
+        }
+        let standing = serving_gate(&mut *store, &key, now_micros(), 0).map_err(store_error)?;
+        if standing != ServeDecision::Servable {
+            return Err(format!(
+                "terminal completion {key} is not servable: {standing:?}"
+            ));
+        }
+        for output in &manifest.logical_outputs {
+            if !store.query(
+                "SELECT 1 FROM quarantines WHERE scope = 'logical-object' AND subject = ?1 LIMIT 1",
+                &[SqlValue::Text(digest_key(&output.object.0))],
+            ).map_err(store_error)?.is_empty() {
+                return Err(format!("terminal completion {key} output is quarantined"));
+            }
+        }
+        check_serving(&mut *store, action, now_micros(), 0)
+            .map_err(|reason| format!("terminal completion {key} ancestry is invalid: {reason}"))?;
+        Ok(manifest)
+    }
+
     /// Check operation-owned installation witnesses against current durable
     /// producer authority. Callers still have to verify the exact physical
     /// candidate generation before and after this check.
@@ -892,6 +996,25 @@ pub(crate) mod tests {
             self.prepare_class(tag, parents, outputs, class)
         }
 
+        pub(crate) fn prepare_terminal(
+            &self,
+            tag: u8,
+            parents: Vec<ProvisionalAncestorRef>,
+            outputs: &[(&str, OutputRole, &[u8])],
+            policy: CommittedDependencyPolicy,
+        ) -> OfferPreparedActionResult {
+            let class = match policy {
+                CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata => {
+                    LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS
+                }
+                CommittedDependencyPolicy::WorkspaceTerminalMetadata => {
+                    LIVE_WORKSPACE_TERMINAL_METADATA_CLASS
+                }
+                _ => panic!("terminal fixture requires an independently keyed terminal policy"),
+            };
+            self.prepare_class(tag, parents, outputs, class)
+        }
+
         fn prepare_class(
             &self,
             tag: u8,
@@ -914,6 +1037,11 @@ pub(crate) mod tests {
             authority.action_key = tagged_digest("rabs.action-key.sha256.v1", tag);
             let mut manifest = base.manifest.clone();
             manifest.action_key = authority.action_key.clone();
+            manifest.key_epoch = match class {
+                LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS => 14,
+                LIVE_WORKSPACE_TERMINAL_METADATA_CLASS => 15,
+                _ => manifest.key_epoch,
+            };
             manifest.logical_outputs = logical_outputs;
             let declared: Vec<_> = manifest
                 .logical_outputs
@@ -1199,6 +1327,107 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn terminal_completion_standing_requires_exact_publication_without_positive_samples() {
+        for policy in [
+            CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata,
+            CommittedDependencyPolicy::WorkspaceTerminalMetadata,
+        ] {
+            let fixture = WorkspaceLineageFixture::new();
+            let parents = if policy == CommittedDependencyPolicy::WorkspaceTerminalMetadata {
+                let upstream = fixture.commit_metadata_leaf(
+                    90,
+                    &[(
+                        "libupstream.rmeta",
+                        OutputRole::ProvisionalMetadata,
+                        b"library metadata",
+                    )],
+                );
+                vec![consumes(&upstream)]
+            } else {
+                Vec::new()
+            };
+            let terminal = fixture.prepare_terminal(
+                91,
+                parents,
+                &[
+                    ("libterminal.rmeta", OutputRole::ProvisionalMetadata, b""),
+                    (
+                        "terminal.d",
+                        OutputRole::DepInfo,
+                        b"/__rabs/out/libterminal.rmeta:\n",
+                    ),
+                ],
+                policy,
+            );
+            assert!(
+                fixture
+                    .coord
+                    .verify_terminal_completion(
+                        &terminal.manifest.action_key,
+                        &terminal.manifest.canonical_descriptor_digest,
+                        &terminal.manifest_id.0,
+                        policy,
+                    )
+                    .is_err(),
+                "unpublished output has no completion standing"
+            );
+            fixture.commit(&terminal);
+            fixture.assert_unsampled(&terminal);
+            fixture
+                .coord
+                .verify_terminal_completion(
+                    &terminal.manifest.action_key,
+                    &terminal.manifest.canonical_descriptor_digest,
+                    &terminal.manifest_id.0,
+                    policy,
+                )
+                .expect("a first published primary execution needs no replay samples");
+            let mut descriptor = terminal.manifest.canonical_descriptor_digest.clone();
+            descriptor.bytes[0] ^= 1;
+            assert!(
+                fixture
+                    .coord
+                    .verify_terminal_completion(
+                        &terminal.manifest.action_key,
+                        &descriptor,
+                        &terminal.manifest_id.0,
+                        policy,
+                    )
+                    .is_err()
+            );
+            let mut manifest = terminal.manifest_id.0.clone();
+            manifest.bytes[0] ^= 1;
+            assert!(
+                fixture
+                    .coord
+                    .verify_terminal_completion(
+                        &terminal.manifest.action_key,
+                        &terminal.manifest.canonical_descriptor_digest,
+                        &manifest,
+                        policy,
+                    )
+                    .is_err()
+            );
+            let wrong = if policy == CommittedDependencyPolicy::WorkspaceTerminalMetadata {
+                CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata
+            } else {
+                CommittedDependencyPolicy::WorkspaceTerminalMetadata
+            };
+            assert!(
+                fixture
+                    .coord
+                    .verify_terminal_completion(
+                        &terminal.manifest.action_key,
+                        &terminal.manifest.canonical_descriptor_digest,
+                        &terminal.manifest_id.0,
+                        wrong,
+                    )
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn terminal_checks_replay_exact_outputs_without_producer_authority() {
         for committed in [false, true] {
             for bytes in [b"".as_slice(), b"nonempty terminal output".as_slice()] {
@@ -1316,7 +1545,9 @@ pub(crate) mod tests {
                 &mut *fixture.cas.store().lock().unwrap(),
                 &offer.manifest.action_key,
                 now_micros(),
-                offer.manifest.key_epoch.into(),
+                // Serving uses the coordinator clock epoch, independent of
+                // this terminal class's action-key schema epoch.
+                0,
             )
             .unwrap();
         }

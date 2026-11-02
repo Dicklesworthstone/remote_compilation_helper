@@ -501,6 +501,14 @@ mod tests {
         apply(writer, &input, &current).unwrap();
         let next = load_recipe(writer).unwrap();
         let mut expected = serde_json::to_value(&session.recipe).unwrap();
+        let evidence = next.staging_ownership.as_ref().unwrap();
+        assert_eq!(Some(&evidence.base), current.retrieval_staging_dir.as_ref());
+        assert_ne!(Some(evidence), session.recipe.staging_ownership.as_ref());
+        HeldRetrievalStage::open(&next, evidence)
+            .unwrap()
+            .verify_empty()
+            .unwrap();
+        expected["staging_ownership"] = serde_json::to_value(evidence).unwrap();
         expected["transfer"]["retrieval_staging_dir"] =
             serde_json::to_value(&current.retrieval_staging_dir).unwrap();
         expected["phases"][0]["patterns"]

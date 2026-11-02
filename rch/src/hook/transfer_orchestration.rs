@@ -3138,7 +3138,7 @@ async fn execute_remote_compilation_inner(
             if let Some(session) = recovery_session.as_ref() {
                 artifact_patterns = session.cargo_artifact_patterns("project")?;
             }
-            let retrieval_pipeline = match recovery_session.as_ref() {
+            let retrieval_pipeline = match recovery_session.as_mut() {
                 Some(session) => session.staging_pipeline("project", &pipeline)?,
                 None => pipeline.clone(),
             };
@@ -3326,7 +3326,7 @@ async fn execute_remote_compilation_inner(
                 .with_worker_platform(WorkerPlatform::from_worker(&worker_config));
                 let target_pipeline =
                     bind_retrieval_source_authority(target_pipeline, source_identity)?;
-                let target_pipeline = match recovery_session.as_ref() {
+                let target_pipeline = match recovery_session.as_mut() {
                     Some(session) => session.staging_pipeline("target", &target_pipeline)?,
                     None => target_pipeline,
                 };
@@ -3467,7 +3467,7 @@ async fn execute_remote_compilation_inner(
         }
         for dir in result_dirs {
             let phase_name = format!("result:{}", dir.display());
-            let result_pipeline = match recovery_session.as_ref() {
+            let result_pipeline = match recovery_session.as_mut() {
                 Some(session) => session.staging_pipeline(&phase_name, &pipeline)?,
                 None => pipeline.clone(),
             };

@@ -57,6 +57,14 @@ pub(crate) struct RecoveryRecipe {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     retained_materialized: Option<bool>,
     transfer: TransferConfig,
+    /// Created and synchronized before the first retrieval writes. Old stages
+    /// without this evidence are never adopted for automatic reclamation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    staging_ownership: Option<StagingOwnership>,
+    /// Keep the small owned root and marker after payload reclamation. This
+    /// durable tombstone makes later retries leave newly added bytes alone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    staging_released: bool,
     project_root: PathBuf,
     kind: Option<CompilationKind>,
     expected_triple: String,
@@ -119,6 +127,309 @@ pub(crate) struct RecoveryRecipe {
     retired: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct StagingOwnership {
+    base: PathBuf,
+    base_device: u64,
+    base_inode: u64,
+    stage_device: u64,
+    stage_inode: u64,
+    marker: String,
+}
+
+#[cfg(unix)]
+const STAGING_OWNERSHIP_MARKER: &str = ".rch-staging-ownership";
+
+#[cfg(unix)]
+struct HeldRetrievalStage {
+    base: File,
+    stage: File,
+    evidence: StagingOwnership,
+    identity: String,
+    phase_count: usize,
+}
+
+#[cfg(unix)]
+impl HeldRetrievalStage {
+    fn directory_flags() -> rustix::fs::OFlags {
+        use rustix::fs::OFlags;
+        OFlags::RDONLY
+            | OFlags::DIRECTORY
+            | OFlags::CLOEXEC
+            | OFlags::NOFOLLOW
+            | OFlags::NONBLOCK
+            | OFlags::NOCTTY
+    }
+
+    /// The caller just created this empty directory exclusively. Merely
+    /// finding a directory (even an empty one) never grants this authority.
+    fn record_created(
+        base: File,
+        stage: File,
+        root: &Path,
+        recipe: &RecoveryRecipe,
+    ) -> anyhow::Result<Self> {
+        use rustix::fs::{Mode, OFlags};
+        use std::os::unix::fs::MetadataExt;
+        let base_metadata = base.metadata()?;
+        let stage_metadata = stage.metadata()?;
+        let evidence = StagingOwnership {
+            base: root.to_owned(),
+            base_device: base_metadata.dev(),
+            base_inode: base_metadata.ino(),
+            stage_device: stage_metadata.dev(),
+            stage_inode: stage_metadata.ino(),
+            marker: format!(
+                "{}:{}:{}:{}",
+                recipe.wrapper_id,
+                recipe.build_id,
+                recipe.identity,
+                uuid::Uuid::new_v4().simple()
+            ),
+        };
+        let held = Self {
+            base,
+            stage,
+            evidence,
+            identity: recipe.identity.clone(),
+            phase_count: recipe.phases.len(),
+        };
+        held.verify_names()?;
+        let mut entries = rustix::fs::Dir::read_from(&held.stage)?;
+        entries.rewind();
+        while let Some(entry) = entries.read() {
+            let entry = entry?;
+            anyhow::ensure!(
+                matches!(entry.file_name().to_bytes(), b"." | b".."),
+                "new retrieval staging directory is not empty; existing bytes retained"
+            );
+        }
+        let mut marker = File::from(rustix::fs::openat(
+            &held.stage,
+            STAGING_OWNERSHIP_MARKER,
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::RUSR | Mode::WUSR,
+        )?);
+        marker.write_all(held.evidence.marker.as_bytes())?;
+        marker.sync_all()?;
+        held.stage.sync_all()?;
+        held.base.sync_all()?;
+        held.verify_empty()?;
+        Ok(held)
+    }
+
+    fn open(recipe: &RecoveryRecipe, evidence: &StagingOwnership) -> anyhow::Result<Self> {
+        use rustix::fs::Mode;
+        let base = File::from(rustix::fs::open(
+            &evidence.base,
+            Self::directory_flags(),
+            Mode::empty(),
+        )?);
+        let stage = File::from(rustix::fs::openat(
+            &base,
+            recipe.identity.as_str(),
+            Self::directory_flags(),
+            Mode::empty(),
+        )?);
+        let held = Self {
+            base,
+            stage,
+            evidence: evidence.clone(),
+            identity: recipe.identity.clone(),
+            phase_count: recipe.phases.len(),
+        };
+        held.verify()?;
+        Ok(held)
+    }
+
+    fn verify_names(&self) -> anyhow::Result<()> {
+        use rustix::fs::Mode;
+        use std::os::unix::fs::MetadataExt;
+        let base = self.base.metadata()?;
+        let named_base = std::fs::symlink_metadata(&self.evidence.base)?;
+        let stage = self.stage.metadata()?;
+        let named_stage = File::from(rustix::fs::openat(
+            &self.base,
+            self.identity.as_str(),
+            Self::directory_flags(),
+            Mode::empty(),
+        )?)
+        .metadata()?;
+        let uid = rustix::process::geteuid().as_raw();
+        anyhow::ensure!(
+            base.is_dir()
+                && named_base.is_dir()
+                && stage.is_dir()
+                && named_stage.is_dir()
+                && base.dev() == self.evidence.base_device
+                && base.ino() == self.evidence.base_inode
+                && named_base.dev() == self.evidence.base_device
+                && named_base.ino() == self.evidence.base_inode
+                && stage.dev() == self.evidence.stage_device
+                && stage.ino() == self.evidence.stage_inode
+                && named_stage.dev() == self.evidence.stage_device
+                && named_stage.ino() == self.evidence.stage_inode
+                && base.uid() == uid
+                && named_base.uid() == uid
+                && stage.uid() == uid
+                && base.mode() & 0o022 == 0
+                && named_base.mode() & 0o022 == 0
+                && stage.mode() & 0o077 == 0,
+            "retired retrieval stage is not its original directory; all replacement bytes retained"
+        );
+        Ok(())
+    }
+
+    fn verify(&self) -> anyhow::Result<()> {
+        use rustix::fs::{Mode, OFlags};
+        use std::os::unix::fs::MetadataExt;
+        self.verify_names()?;
+        let marker = File::from(rustix::fs::openat(
+            &self.stage,
+            STAGING_OWNERSHIP_MARKER,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            Mode::empty(),
+        )?);
+        let metadata = marker.metadata()?;
+        anyhow::ensure!(
+            metadata.is_file()
+                && metadata.nlink() == 1
+                && metadata.uid() == rustix::process::geteuid().as_raw()
+                && metadata.mode() & 0o077 == 0
+                && metadata.len() == self.evidence.marker.len() as u64,
+            "retrieval staging ownership marker changed; all staging retained"
+        );
+        let mut contents = Vec::new();
+        marker
+            .take(self.evidence.marker.len() as u64 + 1)
+            .read_to_end(&mut contents)?;
+        anyhow::ensure!(
+            contents == self.evidence.marker.as_bytes(),
+            "retrieval staging ownership marker changed; all staging retained"
+        );
+        self.verify_names()
+    }
+
+    /// Fresh-stage handoff must still contain only the exact private marker.
+    /// A concurrent writer cannot turn an empty preparation into adopted data.
+    fn verify_empty(&self) -> anyhow::Result<()> {
+        self.verify()?;
+        let mut entries = rustix::fs::Dir::read_from(&self.stage)?;
+        entries.rewind();
+        while let Some(entry) = entries.read() {
+            let entry = entry?;
+            let name = entry.file_name().to_bytes();
+            anyhow::ensure!(
+                matches!(name, b"." | b"..") || name == STAGING_OWNERSHIP_MARKER.as_bytes(),
+                "prepared retrieval staging is no longer empty; retained entries were not changed"
+            );
+        }
+        self.verify()
+    }
+
+    fn release_payloads(
+        &self,
+        observe: &mut impl FnMut(&Path) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        self.verify()?;
+        self.release_directory(&self.stage, Path::new(""), observe)?;
+        // The root and marker stay live even if this sync or the subsequent
+        // journal tombstone fails. A retry cannot mistake a reused inode for
+        // this stage, and never needs a path-based recursive remove.
+        self.stage.sync_all()?;
+        self.verify_empty()
+    }
+
+    fn release_directory(
+        &self,
+        directory: &File,
+        relative: &Path,
+        observe: &mut impl FnMut(&Path) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        use rustix::fs::{AtFlags, FileType, Mode};
+        use std::os::unix::ffi::OsStrExt;
+        anyhow::ensure!(
+            relative.components().count() < 256,
+            "retrieval staging nesting exceeds release bound; remaining bytes retained"
+        );
+        let stage_device = rustix::fs::fstat(&self.stage)?.st_dev;
+        let mut entries = rustix::fs::Dir::read_from(directory)?;
+        entries.rewind();
+        while let Some(entry) = entries.read() {
+            let entry = entry?;
+            let bytes = entry.file_name().to_bytes();
+            if matches!(bytes, b"." | b"..")
+                || (relative.as_os_str().is_empty() && bytes == STAGING_OWNERSHIP_MARKER.as_bytes())
+            {
+                continue;
+            }
+            let name = std::ffi::OsStr::from_bytes(bytes);
+            if relative.as_os_str().is_empty() {
+                anyhow::ensure!(
+                    name.to_str()
+                        .and_then(|name| name.parse::<usize>().ok())
+                        .is_some_and(|index| index < self.phase_count
+                            && index.to_string().as_bytes() == bytes),
+                    "unrecognized retrieval staging entry; remaining bytes retained"
+                );
+            }
+            let path = relative.join(name);
+            self.verify()?;
+            let initial = rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)?;
+            anyhow::ensure!(
+                initial.st_dev == stage_device,
+                "retrieval staging crossed a filesystem boundary; remaining bytes retained"
+            );
+            let kind = FileType::from_raw_mode(initial.st_mode);
+            anyhow::ensure!(
+                matches!(
+                    kind,
+                    FileType::Directory | FileType::RegularFile | FileType::Symlink
+                ),
+                "unexpected retrieval staging entry; remaining bytes retained"
+            );
+            observe(&path)?;
+            let same = |actual: &rustix::fs::Stat| {
+                anyhow::ensure!(
+                    initial.st_dev == actual.st_dev
+                        && initial.st_ino == actual.st_ino
+                        && FileType::from_raw_mode(actual.st_mode) == kind,
+                    "retrieval staging entry changed during release; replacement bytes retained"
+                );
+                Ok::<(), anyhow::Error>(())
+            };
+            if kind == FileType::Directory {
+                let child = File::from(rustix::fs::openat(
+                    directory,
+                    name,
+                    Self::directory_flags(),
+                    Mode::empty(),
+                )?);
+                same(&rustix::fs::fstat(&child)?)?;
+                self.release_directory(&child, &path, observe)?;
+                child.sync_all()?;
+                self.verify()?;
+                same(&rustix::fs::statat(
+                    directory,
+                    name,
+                    AtFlags::SYMLINK_NOFOLLOW,
+                )?)?;
+                rustix::fs::unlinkat(directory, name, AtFlags::REMOVEDIR)?;
+            } else {
+                self.verify()?;
+                same(&rustix::fs::statat(
+                    directory,
+                    name,
+                    AtFlags::SYMLINK_NOFOLLOW,
+                )?)?;
+                rustix::fs::unlinkat(directory, name, AtFlags::empty())?;
+            }
+        }
+        directory.sync_all()?;
+        self.verify()
+    }
+}
+
 impl RecoveryRecipe {
     fn caller_local_source_root(&self) -> &Path {
         self.caller_json_local_source_root
@@ -131,6 +442,81 @@ impl RecoveryRecipe {
             && (self.pair.is_none() || self.pair_released)
             && (self.retire_root.is_none() || self.tree_retired)
     }
+
+    /// A successful delivery no longer needs the disposable local payloads.
+    /// Required caller JSON must already have its retained first reply.
+    fn successful_delivery_complete(&self) -> bool {
+        self.exit_code == Some(0)
+            && self.returned == Some(0)
+            && !self.phases.is_empty()
+            && self.phases.iter().all(|phase| {
+                phase.complete && phase.pending.is_none() && phase.missing_result.is_none()
+            })
+            && (self.caller_json_policy.is_none() || self.caller_delivery.is_some())
+    }
+
+    fn retain_failed_delivery_evidence(&self) -> bool {
+        result_recovery::has_missing_results(self)
+            || (self.exit_code == Some(0)
+                && self
+                    .phases
+                    .iter()
+                    .any(|phase| phase.native_outputs.is_some() && !phase.complete))
+            || (self.cargo_output_capture.is_some()
+                && self.exit_code == Some(0)
+                && self
+                    .phases
+                    .iter()
+                    .any(|phase| phase.output_gate && !phase.complete))
+            || (self.exit_code == Some(0)
+                && self.returned == Some(EXIT_ARTIFACT_TRANSFER_FAILED)
+                && self.phases.iter().any(|phase| !phase.complete))
+    }
+
+    fn retain_staging_evidence(&self) -> bool {
+        (self.retained_root.is_some() && !self.successful_delivery_complete())
+            || self.retain_failed_delivery_evidence()
+    }
+
+    fn staging_release_pending(&self) -> bool {
+        cfg!(unix)
+            && self.staging_ownership.is_some()
+            && !self.staging_released
+            && !self.retain_staging_evidence()
+    }
+}
+
+/// Remote execution and source retirement are already accounted for. A local
+/// cleanup error retains this invocation without accusing the worker of an
+/// unobservable process or authorizing another execution of its command.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "local staging retirement remains pending; run rch jobs recover {wrapper_id}; command must not be replayed"
+)]
+pub(in crate::hook) struct LocalRetirementPending {
+    wrapper_id: String,
+}
+
+/// Readmission and acknowledgement use raw lease snapshots while holding the
+/// writer mutex. Reuse the collector's exact retention policy without reading
+/// the journal again or treating an intentionally retained failed/legacy stage
+/// as unfinished cleanup. Malformed owned-stage evidence remains recoverable.
+pub(in crate::hook) fn ensure_local_retirement_complete(
+    lease: &DurableJobLease,
+) -> anyhow::Result<()> {
+    let Some(value) = lease.recovery.as_ref().filter(|value| {
+        value
+            .get("staging_ownership")
+            .is_some_and(|ownership| !ownership.is_null())
+    }) else {
+        return Ok(());
+    };
+    let pending = || LocalRetirementPending {
+        wrapper_id: lease.identity.local_wrapper_id.clone(),
+    };
+    let recipe: RecoveryRecipe = serde_json::from_value(value.clone()).with_context(pending)?;
+    anyhow::ensure!(!recipe.staging_release_pending(), pending());
+    Ok(())
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -988,6 +1374,8 @@ impl RecoverySession {
             retained_root,
             retained_materialized: None,
             transfer,
+            staging_ownership: None,
+            staging_released: false,
             project_root,
             kind: None,
             expected_triple: String::new(),
@@ -1169,6 +1557,8 @@ impl RecoverySession {
             retained_root,
             retained_materialized: None,
             transfer,
+            staging_ownership: None,
+            staging_released: false,
             project_root,
             kind: delivery_kind,
             expected_triple: pinned_triple
@@ -1991,12 +2381,101 @@ impl RecoverySession {
     }
     fn stage(&self, index: usize) -> PathBuf {
         self.recipe
-            .transfer
-            .retrieval_staging_dir
-            .clone()
+            .staging_ownership
+            .as_ref()
+            .map(|ownership| ownership.base.clone())
+            .or_else(|| self.recipe.transfer.retrieval_staging_dir.clone())
             .unwrap_or_else(|| default_job_lease_directory().join("retrieval"))
             .join(&self.recipe.identity)
             .join(index.to_string())
+    }
+
+    /// Acquire reclamation evidence only for a directory that this call just
+    /// created. An existing legacy tree remains usable, but is never promoted
+    /// into deletion authority from its current path, contents or permissions.
+    fn prepare_staging(&mut self, index: usize) -> anyhow::Result<()> {
+        let stage = self.stage(index);
+        anyhow::ensure!(
+            stage.is_absolute() && !self.recipe.staging_released && !self.recipe.retired,
+            "retrieval staging requires an absolute, unreleased live stage"
+        );
+        let mut identity = Path::new(&self.recipe.identity).components();
+        anyhow::ensure!(
+            matches!(identity.next(), Some(std::path::Component::Normal(_)))
+                && identity.next().is_none(),
+            "retrieval staging requires one exact identity directory"
+        );
+        #[cfg(unix)]
+        {
+            use rustix::fs::Mode;
+            use std::os::unix::fs::DirBuilderExt;
+            let held = if let Some(evidence) = &self.recipe.staging_ownership {
+                Some(HeldRetrievalStage::open(&self.recipe, evidence)?)
+            } else {
+                let base_path = stage
+                    .parent()
+                    .and_then(Path::parent)
+                    .context("retrieval stage has no base directory")?;
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(base_path)?;
+                let base = File::from(rustix::fs::open(
+                    base_path,
+                    HeldRetrievalStage::directory_flags(),
+                    Mode::empty(),
+                )?);
+                match rustix::fs::mkdirat(
+                    &base,
+                    self.recipe.identity.as_str(),
+                    Mode::RUSR | Mode::WUSR | Mode::XUSR,
+                ) {
+                    Ok(()) => {
+                        let directory = File::from(rustix::fs::openat(
+                            &base,
+                            self.recipe.identity.as_str(),
+                            HeldRetrievalStage::directory_flags(),
+                            Mode::empty(),
+                        )?);
+                        let held = HeldRetrievalStage::record_created(
+                            base,
+                            directory,
+                            base_path,
+                            &self.recipe,
+                        )?;
+                        let mut next = self.recipe.clone();
+                        next.staging_ownership = Some(held.evidence.clone());
+                        self.persist_next_recipe(next)?;
+                        held.verify_empty()?;
+                        Some(held)
+                    }
+                    Err(rustix::io::Errno::EXIST) => None,
+                    Err(error) => return Err(error).context("create owned retrieval stage"),
+                }
+            };
+            if let Some(held) = held {
+                held.verify()?;
+                let phase = index.to_string();
+                match rustix::fs::mkdirat(
+                    &held.stage,
+                    phase.as_str(),
+                    Mode::RUSR | Mode::WUSR | Mode::XUSR,
+                ) {
+                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                    Err(error) => return Err(error).context("create owned retrieval phase"),
+                }
+                let _phase = rustix::fs::openat(
+                    &held.stage,
+                    phase.as_str(),
+                    HeldRetrievalStage::directory_flags(),
+                    Mode::empty(),
+                )?;
+                held.stage.sync_all()?;
+                return held.verify();
+            }
+        }
+        std::fs::create_dir_all(stage)?;
+        Ok(())
     }
 
     /// Apply operator recovery settings under the exclusive journal claim.
@@ -2043,6 +2522,14 @@ impl RecoverySession {
                     "cannot change retrieval staging after publication began; retained staging and ownership are unchanged"
                 );
                 next.transfer.retrieval_staging_dir = Some(root.clone());
+                if next
+                    .staging_ownership
+                    .as_ref()
+                    .is_some_and(|owned| &owned.base != root)
+                {
+                    next.staging_ownership = None;
+                    next.staging_released = false;
+                }
             }
         }
         next.transfer.retrieval_min_free_bytes = next
@@ -2052,7 +2539,7 @@ impl RecoverySession {
         self.persist_next_recipe(next)
     }
     pub(crate) fn staging_pipeline(
-        &self,
+        &mut self,
         name: &str,
         pipeline: &TransferPipeline,
     ) -> anyhow::Result<TransferPipeline> {
@@ -2062,12 +2549,8 @@ impl RecoverySession {
             .iter()
             .position(|phase| phase.name == name)
             .context("missing retrieval phase")?;
+        self.prepare_staging(index)?;
         let stage = self.stage(index);
-        anyhow::ensure!(
-            stage.is_absolute(),
-            "retrieval staging directory must be absolute"
-        );
-        std::fs::create_dir_all(&stage)?;
         Ok(pipeline
             .clone()
             .with_retrieval_reference_root(self.recipe.phases[index].local.clone())
@@ -2916,23 +3399,160 @@ impl RecoverySession {
         let mut next_recipe = self.recipe.clone();
         next_recipe.retired = true;
         self.persist_next_recipe(next_recipe)?;
+        self.release_retired_staging()
+    }
+
+    /// Retirement is durable before any staging bytes are discarded. Recovery
+    /// must repeat this step before terminal acknowledgement: a process can
+    /// stop after that journal write or partway through directory removal.
+    fn release_retired_staging(&mut self) -> anyhow::Result<()> {
+        self.release_retired_staging_with(&mut |_| Ok(()))
+            .with_context(|| LocalRetirementPending {
+                wrapper_id: self.recipe.wrapper_id.clone(),
+            })
+    }
+
+    fn release_retired_staging_with(
+        &mut self,
+        observe: &mut impl FnMut(&Path) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        if !self.recipe.retired {
+            return Ok(());
+        }
+        let mut writer = self.writer.clone();
+        // Live Unix writers already retain this gate. Older test/legacy
+        // writers acquire it here too, so cleanup never races another owner
+        // publishing an unfinished or relocated recipe for this wrapper.
+        if writer.recovery_ownership.is_none() {
+            writer.recovery_ownership = Some(std::sync::Arc::new(recovery_owner::acquire_gate(
+                &writer.path,
+            )?));
+        }
+        let ownership = writer
+            .recovery_ownership
+            .as_deref()
+            .context("staging release requires exclusive journal ownership")?;
+        ownership.verify()?;
+        let mut observed = ownership.read(&writer.wrapper_id())?;
+        let latest = writer.snapshot();
+        // A live writer's progress heartbeat can advance while cleanup reads
+        // its journal; every lifecycle, identity and recipe field must match.
+        observed.heartbeat_unix_ms = latest.heartbeat_unix_ms;
+        observed.phase.clone_from(&latest.phase);
+        anyhow::ensure!(
+            observed == latest,
+            "journal changed before staging release; retained staging is unchanged"
+        );
+        let durable = Self {
+            recipe: load_recipe(&writer)?,
+            writer: writer.clone(),
+        };
+        anyhow::ensure!(
+            durable.recipe.wrapper_id == self.recipe.wrapper_id
+                && durable.recipe.build_id == self.recipe.build_id
+                && durable.recipe.identity == self.recipe.identity
+                && durable.recipe.transfer.retrieval_staging_dir
+                    == self.recipe.transfer.retrieval_staging_dir
+                && durable.recipe.staging_ownership == self.recipe.staging_ownership,
+            "retired staging identity changed; reload the original journal"
+        );
+        anyhow::ensure!(
+            durable.recipe.retired
+                && durable.recipe.returned.is_some()
+                && durable.recipe.source_resources_retired()
+                && durable.recipe.source_cancellation_settled != Some(false)
+                && (!durable.recipe.preparation_cancelled
+                    || durable.recipe.source_roots.is_empty()
+                    || durable.recipe.source_cancellation_settled == Some(true)),
+            "staging release requires complete durable retirement"
+        );
         // Whole-stage removal also discards unpublished collector inputs. The
         // owner decided (bd-ra5aw, 2026-10-30) that a retained-source job's
         // local stage is not custody once a successful delivery is complete:
         // the worker's retained tree stays and the caller holds the published
         // bytes. Failed or unfinished deliveries keep their stage as evidence.
-        if (!self.retain_source_lifecycle_evidence() || self.successful_delivery_complete())
-            && !self.retain_failed_delivery_evidence()
-            && let Some(stages) = self.stage(0).parent()
-        {
-            let _ = std::fs::remove_dir_all(stages);
+        if durable.recipe.retain_staging_evidence() {
+            return Ok(());
         }
+        if durable.recipe.staging_released {
+            self.recipe.staging_released = true;
+            return Ok(());
+        }
+        let Some(evidence) = durable.recipe.staging_ownership.as_ref() else {
+            // Legacy or pre-existing staging has no creation-time ownership
+            // receipt. Its path and successful job are not deletion authority.
+            return Ok(());
+        };
+        let mut identity = Path::new(&durable.recipe.identity).components();
+        anyhow::ensure!(
+            matches!(identity.next(), Some(std::path::Component::Normal(_)))
+                && identity.next().is_none(),
+            "staging release requires one exact identity directory"
+        );
+        #[cfg(unix)]
+        {
+            let held = HeldRetrievalStage::open(&durable.recipe, evidence)
+                .context("retired retrieval stage is not its original directory")?;
+            let resolved =
+                output_lock_root_identity(&evidence.base.join(&durable.recipe.identity))?;
+            for protected in std::iter::once(durable.recipe.project_root.as_path())
+                .chain(
+                    durable
+                        .recipe
+                        .phases
+                        .iter()
+                        .map(|phase| phase.local.as_path()),
+                )
+                .chain(writer.path.parent())
+                .chain(
+                    durable
+                        .recipe
+                        .cargo_stdout
+                        .iter()
+                        .filter_map(|receipt| receipt.path.parent()),
+                )
+                .chain(
+                    durable
+                        .recipe
+                        .cargo_stderr
+                        .iter()
+                        .filter_map(|receipt| receipt.path.parent()),
+                )
+                .chain(durable.recipe.caller_delivery.iter().flat_map(|delivery| {
+                    delivery
+                        .path
+                        .parent()
+                        .into_iter()
+                        .chain(std::iter::once(delivery.output_root.as_path()))
+                }))
+            {
+                anyhow::ensure!(
+                    !output_lock_root_identity(protected)?.starts_with(&resolved),
+                    "retired retrieval stage contains caller outputs or retained receipts"
+                );
+            }
+            ownership.verify()?;
+            held.release_payloads(observe)?;
+            // Tests interrupt here after the payload unlink/sync, before the
+            // completion tombstone. The original root and marker still prove
+            // ownership of an empty retry; no missing path needs to be adopted.
+            observe(Path::new(""))?;
+            ownership.verify()?;
+            held.verify_empty()?;
+            let mut next = durable.recipe.clone();
+            next.staging_released = true;
+            writer.set_recovery(serde_json::to_value(&next)?)?;
+            self.recipe = next;
+            ownership.verify()?;
+        }
+        #[cfg(not(unix))]
+        let _ = (evidence, observe);
         Ok(())
     }
     pub(crate) async fn retire_returned(&mut self) -> anyhow::Result<()> {
         if self.recipe.retired {
             self.reconcile_source_cancellation().await?;
-            return Ok(());
+            return self.release_retired_staging();
         }
         anyhow::ensure!(
             self.recipe.returned.is_some(),
@@ -3062,37 +3682,8 @@ impl RecoverySession {
         self.recipe.retained_root.is_some()
     }
 
-    /// A successful delivery that no longer needs its local stage: the command
-    /// and the caller both saw exit 0, every phase is published with nothing
-    /// pending or missing, and any first caller Cargo reply is prepared.
-    fn successful_delivery_complete(&self) -> bool {
-        self.recipe.exit_code == Some(0)
-            && self.recipe.returned == Some(0)
-            && !self.recipe.phases.is_empty()
-            && self.recipe.phases.iter().all(|phase| {
-                phase.complete && phase.pending.is_none() && phase.missing_result.is_none()
-            })
-            && (self.recipe.caller_json_policy.is_none() || self.recipe.caller_delivery.is_some())
-    }
-
     fn retain_failed_delivery_evidence(&self) -> bool {
-        result_recovery::has_missing_results(&self.recipe)
-            || (self.recipe.exit_code == Some(0)
-                && self
-                    .recipe
-                    .phases
-                    .iter()
-                    .any(|phase| phase.native_outputs.is_some() && !phase.complete))
-            || (self.recipe.cargo_output_capture.is_some()
-                && self.recipe.exit_code == Some(0)
-                && self
-                    .recipe
-                    .phases
-                    .iter()
-                    .any(|phase| phase.output_gate && !phase.complete))
-            || (self.recipe.exit_code == Some(0)
-                && self.recipe.returned == Some(EXIT_ARTIFACT_TRANSFER_FAILED)
-                && self.recipe.phases.iter().any(|phase| !phase.complete))
+        self.recipe.retain_failed_delivery_evidence()
     }
     async fn discard_completion_receipts(&self) {
         // Retained source custody protects the original completion too. Keep
@@ -3154,6 +3745,31 @@ fn load_recipe(writer: &DurableLeaseWriter) -> anyhow::Result<RecoveryRecipe> {
             .as_ref()
             .is_none_or(|path| path.is_absolute()),
         "persisted retrieval staging directory must be absolute"
+    );
+    if let Some(staging) = &recipe.staging_ownership {
+        let marker_prefix = format!(
+            "{}:{}:{}:",
+            recipe.wrapper_id, recipe.build_id, recipe.identity
+        );
+        anyhow::ensure!(
+            staging.base.is_absolute()
+                && recipe
+                    .transfer
+                    .retrieval_staging_dir
+                    .as_ref()
+                    .is_none_or(|base| base == &staging.base)
+                && staging
+                    .marker
+                    .strip_prefix(&marker_prefix)
+                    .is_some_and(|nonce| {
+                        nonce.len() == 32 && nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    }),
+            "retrieval staging ownership does not match its original recipe"
+        );
+    }
+    anyhow::ensure!(
+        !recipe.staging_released || (recipe.retired && recipe.staging_ownership.is_some()),
+        "retrieval staging release has no durable retirement and ownership proof"
     );
     anyhow::ensure!(
         recipe.retained_materialized.is_none() || recipe.retained_root.is_some(),
@@ -3440,7 +4056,7 @@ async fn recover_owned_job_locally_with_daemon(
         rch_common::job_identity::local_terminal_settlement_candidate(&before),
         "local recovery requires exact retired delivery and settled worker obligations; journal retained"
     );
-    let session = RecoverySession {
+    let mut session = RecoverySession {
         recipe: load_recipe(writer)?,
         writer: writer.clone(),
     };
@@ -3454,6 +4070,7 @@ async fn recover_owned_job_locally_with_daemon(
         session.retained_cargo_artifact_evidence()?;
     }
     writer.record_exit(exit)?;
+    session.release_retired_staging()?;
     if !before.terminal_acknowledged {
         recovery_completion::finish(writer, daemon).await?;
     }
@@ -3798,6 +4415,7 @@ async fn finish_recovered_delivery_with(
             && after.terminal_acknowledged == before.terminal_acknowledged,
         "recovery completion changed during source reconciliation"
     );
+    session.release_retired_staging()?;
     if !before.terminal_acknowledged {
         recovery_completion::finish(writer, &mut daemon).await?;
     }
@@ -4077,7 +4695,7 @@ async fn recover_owned_job_until_retired(writer: &DurableLeaseWriter) -> anyhow:
             .with_remote_path_override(phase.remote.clone())
             .with_retrieval_reference_root(phase.local.clone())
             .with_local_root(session.stage(index));
-        std::fs::create_dir_all(session.stage(index))?;
+        session.prepare_staging(index)?;
         if phase.result_dir.is_some() {
             // The completion receipt and recovered source grant above fence
             // the producer. Absence is now a failed output contract, not an
@@ -8026,6 +8644,9 @@ mod tests {
             session.recipe.retained_root = None;
         }
         session.persist().unwrap();
+        session
+            .prepare_staging(session.recipe.phases.len() - 1)
+            .unwrap();
         let stage = session.stage(session.recipe.phases.len() - 1);
         std::fs::create_dir_all(stage.join(output_relative)).unwrap();
         std::fs::write(stage.join("collector-source.c"), b"private collector input").unwrap();
@@ -8121,7 +8742,8 @@ mod tests {
         // A successful retained delivery releases its local stage at
         // retirement (bd-ra5aw, owner decision 2026-10-30), so recovery below
         // must work from the copies outside it.
-        assert!(!original_stage.exists());
+        assert!(!stage.exists());
+        assert!(original_stage.join(STAGING_OWNERSHIP_MARKER).is_file());
         for name in ["app", "helper"] {
             std::fs::write(
                 local.join("target/lean").join(name),
@@ -8140,7 +8762,8 @@ mod tests {
         );
         assert_eq!(recovered_stderr, stderr);
         assert_eq!(std::fs::read(&writer.path).unwrap(), journal);
-        assert!(!original_stage.exists());
+        assert!(!stage.exists());
+        assert!(original_stage.join(STAGING_OWNERSHIP_MARKER).is_file());
         assert_eq!(std::fs::read(producer).unwrap(), stdout);
         assert_eq!(std::fs::read(stderr_path).unwrap(), stderr);
         assert_eq!(std::fs::read(&delivery.path).unwrap(), expected_stdout);
@@ -9755,6 +10378,501 @@ mod tests {
         assert!(writer.ensure_released_for_retry().is_err());
     }
 
+    #[cfg(unix)]
+    async fn retired_staging_crash_fixture() -> (PathBuf, RecoverySession) {
+        use std::os::unix::fs::MetadataExt;
+        let (directory, mut session) = caller_delivery_fixture(true, false);
+        let evidence = session.recipe.staging_ownership.as_ref().unwrap();
+        assert_eq!(std::fs::metadata(&evidence.base).unwrap().mode() & 0o077, 0);
+        session.publish("project").await.unwrap();
+        session.returned(0).unwrap();
+        session.caller_cargo_json().await.unwrap();
+        session.persist_tree_retirement(Some(true)).unwrap();
+        session.pair_released().unwrap();
+        session.sources_released().unwrap();
+        // Publication and caller delivery use real files. Worker retirement
+        // flags are unit inputs; no compiler or source-tree operation ran.
+        // A live, unretired wrapper still owns the full stage at this boundary.
+        assert!(!session.recipe.retired);
+        session.release_retired_staging().unwrap();
+        assert!(session.stage(0).join("collector-source.c").is_file());
+        assert!(
+            recovery_owner::claim_journal(&session.writer)
+                .await
+                .is_err()
+        );
+
+        // Model interruption immediately after retired() durably writes its
+        // checkpoint, before it can remove any local staging bytes.
+        let mut next = session.recipe.clone();
+        next.retired = true;
+        session.persist_next_recipe(next).unwrap();
+        let mut wrapper = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let wrapper_pid = wrapper.id();
+        assert!(wrapper.wait().unwrap().success());
+        {
+            let mut lease = session.writer.lease.lock().unwrap();
+            lease.wrapper_pid = wrapper_pid;
+            lease.process_start_ticks = None;
+            lease.boot_id = None;
+            lease.process_birth = None;
+        }
+        session.writer.persist().unwrap();
+        (directory, session)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retired_staging_cleanup_resumes_before_acknowledgement_and_is_idempotent() {
+        let _guard = test_guard!();
+        for local_only in [false, true] {
+            for acknowledged in [false, true] {
+                let (directory, session) = retired_staging_crash_fixture().await;
+                let writer = session.writer.clone();
+                let stage = session.stage(0);
+                let stages = stage.parent().unwrap();
+                assert!(load_recipe(&writer).unwrap().retired);
+                assert_eq!(
+                    std::fs::read(stage.join("target/lean/app")).unwrap(),
+                    b"app"
+                );
+                let neighbor = directory.join("retrieval/another-live-job/0");
+                std::fs::create_dir_all(&neighbor).unwrap();
+                std::fs::write(neighbor.join("output"), b"another job's pending bytes").unwrap();
+                let delivery = session.recipe.caller_delivery.as_ref().unwrap().clone();
+                let producer = session.recipe.cargo_stdout.as_ref().unwrap();
+                let expected_stdout = delivery.read(producer).unwrap();
+                let expected_producer = producer.read().unwrap();
+                let expected_stderr = session
+                    .recipe
+                    .cargo_stderr
+                    .as_ref()
+                    .unwrap()
+                    .read()
+                    .unwrap();
+                if acknowledged {
+                    // Explicit recovery of an older terminal journal follows
+                    // the same local cleanup rule without reopening accounting.
+                    // Model a persisted acknowledgment from before the local
+                    // cleanup gate existed; current writers must refuse it.
+                    writer.record_exit(0).unwrap();
+                    assert!(writer.acknowledge_terminal().is_err());
+                    writer
+                        .lease
+                        .lock()
+                        .unwrap()
+                        .acknowledge_terminal(now_unix_ms());
+                    writer.persist().unwrap();
+                }
+                let mut requests = 0;
+                let mut daemon = async |request: &str| {
+                    assert!(request.starts_with("GET /builds/41?"));
+                    assert!(
+                        !stage.exists(),
+                        "cleanup must precede terminal acknowledgement"
+                    );
+                    requests += 1;
+                    let response = serde_json::json!({
+                        "status": "completed", "local_wrapper_id": writer.wrapper_id(),
+                        "record": {"id": 41, "worker_id": "source-recovery", "exit_code": 0}
+                    });
+                    Ok(format!("HTTP/1.1 200 OK\r\n\r\n{response}"))
+                };
+                let exit = if local_only {
+                    let owned = recovery_owner::claim_journal(&writer).await.unwrap();
+                    recover_owned_job_locally_with_daemon(&owned, &mut daemon)
+                        .await
+                        .unwrap()
+                } else {
+                    Box::pin(recover_job_with_daemon(&writer, &mut daemon))
+                        .await
+                        .unwrap()
+                };
+                assert_eq!(exit, 0);
+                assert_eq!(requests, usize::from(!acknowledged));
+                assert!(writer.snapshot().terminal_acknowledged);
+                assert!(!stage.exists());
+                assert!(stages.join(STAGING_OWNERSHIP_MARKER).is_file());
+                assert!(load_recipe(&writer).unwrap().staging_released);
+                assert_eq!(
+                    std::fs::read(neighbor.join("output")).unwrap(),
+                    b"another job's pending bytes"
+                );
+                assert_eq!(
+                    std::fs::read(session.recipe.project_root.join("Cargo.toml")).unwrap(),
+                    b"[workspace]\n"
+                );
+                assert_eq!(producer.read().unwrap(), expected_producer);
+                assert_eq!(delivery.read(producer).unwrap(), expected_stdout);
+                assert_eq!(
+                    session
+                        .recipe
+                        .cargo_stderr
+                        .as_ref()
+                        .unwrap()
+                        .read()
+                        .unwrap(),
+                    expected_stderr
+                );
+                for name in ["app", "helper"] {
+                    assert_eq!(
+                        std::fs::read(session.recipe.project_root.join("target/lean").join(name))
+                            .unwrap(),
+                        name.as_bytes()
+                    );
+                }
+                // Released authority is final: a later writer can place new
+                // bytes here without an acknowledged recovery deleting them.
+                let late = stages.join("late-unrelated-bytes");
+                std::fs::write(&late, b"created after successful release").unwrap();
+                let journal = std::fs::read(&writer.path).unwrap();
+                assert_eq!(
+                    crate::hook::after_gate_release(|| Box::pin(recover_job_with_daemon(
+                        &writer,
+                        async |_: &str| { panic!("already acknowledged cleanup contacted a peer") }
+                    )))
+                    .await
+                    .unwrap(),
+                    0
+                );
+                assert_eq!(std::fs::read(&writer.path).unwrap(), journal);
+                assert!(!stage.exists());
+                assert!(stages.join(STAGING_OWNERSHIP_MARKER).is_file());
+                assert_eq!(
+                    std::fs::read(late).unwrap(),
+                    b"created after successful release"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retired_staging_cleanup_refuses_changed_path_and_retries_without_acknowledgement() {
+        let _guard = test_guard!();
+        let (directory, session) = retired_staging_crash_fixture().await;
+        let writer = session.writer.clone();
+        let stage = session.stage(0);
+        let stages = stage.parent().unwrap();
+        let preserved = directory.join("original-staging-evidence");
+        std::fs::rename(stages, &preserved).unwrap();
+        std::os::unix::fs::symlink(&session.recipe.project_root, stages).unwrap();
+        let error = Box::pin(recover_job_with_daemon(&writer, async |_: &str| {
+            panic!("unverified staging cleanup must not acknowledge the job")
+        }))
+        .await
+        .unwrap_err();
+        assert!(error.is::<LocalRetirementPending>());
+        assert!(
+            format!("{error:#}").contains("retired retrieval stage is not its original directory")
+        );
+        assert!(!writer.snapshot().terminal_acknowledged);
+        assert!(load_recipe(&writer).unwrap().retired);
+        assert_eq!(
+            std::fs::read(preserved.join("0/collector-source.c")).unwrap(),
+            b"private collector input"
+        );
+        assert_eq!(
+            std::fs::read(session.recipe.project_root.join("target/lean/app")).unwrap(),
+            b"app"
+        );
+        // Retain the substituted link as evidence, then restore the exact
+        // original stage; the retry removes only its already-delivered copies.
+        std::fs::rename(stages, directory.join("substituted-stage-link")).unwrap();
+        std::fs::rename(&preserved, stages).unwrap();
+        let exit = crate::hook::after_gate_release(|| {
+            Box::pin(recover_job_with_daemon(&writer, async |_: &str| {
+                assert!(!stage.exists());
+                let response = serde_json::json!({
+                    "status": "completed", "local_wrapper_id": writer.wrapper_id(),
+                    "record": {"id": 41, "worker_id": "source-recovery", "exit_code": 0}
+                });
+                Ok(format!("HTTP/1.1 200 OK\r\n\r\n{response}"))
+            }))
+        })
+        .await
+        .unwrap();
+        assert_eq!(exit, 0);
+        assert!(writer.snapshot().terminal_acknowledged);
+        assert!(!stage.exists());
+        assert!(stages.join(STAGING_OWNERSHIP_MARKER).is_file());
+        assert!(directory.join("substituted-stage-link").is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retired_staging_cleanup_preserves_an_ordinary_replacement_and_legacy_stage() {
+        let _guard = test_guard!();
+        for legacy in [false, true] {
+            let (directory, mut session) = retired_staging_crash_fixture().await;
+            let stage = session.stage(0);
+            let stages = stage.parent().unwrap();
+            if legacy {
+                let mut next = session.recipe.clone();
+                next.staging_ownership = None;
+                session.persist_next_recipe(next).unwrap();
+                session.release_retired_staging().unwrap();
+                assert!(stage.join("collector-source.c").is_file());
+            } else {
+                let preserved = directory.join("original-stage");
+                std::fs::rename(stages, &preserved).unwrap();
+                std::fs::create_dir(stages).unwrap();
+                std::fs::write(stages.join("unrelated"), b"ordinary replacement directory")
+                    .unwrap();
+                assert!(session.release_retired_staging().is_err());
+                assert_eq!(
+                    std::fs::read(stages.join("unrelated")).unwrap(),
+                    b"ordinary replacement directory"
+                );
+                assert_eq!(
+                    std::fs::read(preserved.join("0/collector-source.c")).unwrap(),
+                    b"private collector input"
+                );
+            }
+            assert!(!load_recipe(&session.writer).unwrap().staging_released);
+            assert!(!session.writer.snapshot().terminal_acknowledged);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retired_staging_cleanup_refuses_base_swap_before_and_during_descriptor_walk() {
+        let _guard = test_guard!();
+        for during in [false, true] {
+            let (directory, mut session) = retired_staging_crash_fixture().await;
+            let evidence = session.recipe.staging_ownership.as_ref().unwrap().clone();
+            let identity = session.recipe.identity.clone();
+            let preserved = directory.join("original-staging-base");
+            let mut injected = false;
+            let mut replace_base = || -> anyhow::Result<()> {
+                std::fs::rename(&evidence.base, &preserved)?;
+                let replacement = evidence.base.join(&identity).join("0");
+                std::fs::create_dir_all(&replacement)?;
+                std::fs::write(replacement.join("unrelated"), b"new base's unrelated bytes")?;
+                injected = true;
+                Ok(())
+            };
+            let result = if during {
+                session.release_retired_staging_with(&mut |relative| {
+                    if relative == Path::new("0") {
+                        replace_base()?;
+                    }
+                    Ok(())
+                })
+            } else {
+                replace_base().unwrap();
+                session.release_retired_staging()
+            };
+            assert!(injected);
+            assert!(result.is_err());
+            assert_eq!(
+                std::fs::read(evidence.base.join(&identity).join("0/unrelated")).unwrap(),
+                b"new base's unrelated bytes"
+            );
+            assert_eq!(
+                std::fs::read(preserved.join(&identity).join("0/collector-source.c")).unwrap(),
+                b"private collector input"
+            );
+            assert!(!load_recipe(&session.writer).unwrap().staging_released);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retired_staging_cleanup_requires_the_original_private_marker() {
+        let _guard = test_guard!();
+        let (directory, mut session) = retired_staging_crash_fixture().await;
+        let stage = session.stage(0);
+        let marker = stage.parent().unwrap().join(STAGING_OWNERSHIP_MARKER);
+        let original = directory.join("retained-original-marker");
+        std::fs::rename(&marker, &original).unwrap();
+        let mut changed = std::fs::read(&original).unwrap();
+        changed[0] ^= 1;
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&marker)
+            .unwrap()
+            .write_all(&changed)
+            .unwrap();
+        assert!(session.release_retired_staging().is_err());
+        assert_eq!(std::fs::read(&marker).unwrap(), changed);
+        assert_eq!(
+            std::fs::read(stage.join("collector-source.c")).unwrap(),
+            b"private collector input"
+        );
+        assert!(!load_recipe(&session.writer).unwrap().staging_released);
+        assert!(!session.writer.snapshot().terminal_acknowledged);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retired_staging_cleanup_retries_after_payload_sync_before_tombstone() {
+        let _guard = test_guard!();
+        let (_directory, mut session) = retired_staging_crash_fixture().await;
+        let stage = session.stage(0);
+        let stages = stage.parent().unwrap();
+        let result = session.release_retired_staging_with(&mut |relative| {
+            anyhow::ensure!(
+                !relative.as_os_str().is_empty(),
+                "interrupt before cleanup tombstone"
+            );
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(!stage.exists());
+        assert!(stages.join(STAGING_OWNERSHIP_MARKER).is_file());
+        assert!(!load_recipe(&session.writer).unwrap().staging_released);
+        assert!(!session.writer.snapshot().terminal_acknowledged);
+        let writer = session.writer.clone();
+        let exit = Box::pin(recover_job_with_daemon(&writer, async |_: &str| {
+            assert!(load_recipe(&writer).unwrap().staging_released);
+            let response = serde_json::json!({
+                "status": "completed", "local_wrapper_id": writer.wrapper_id(),
+                "record": {"id": 41, "worker_id": "source-recovery", "exit_code": 0}
+            });
+            Ok(format!("HTTP/1.1 200 OK\r\n\r\n{response}"))
+        }))
+        .await
+        .unwrap();
+        assert_eq!(exit, 0);
+        assert!(writer.snapshot().terminal_acknowledged);
+        assert!(!stage.exists());
+        assert!(stages.join(STAGING_OWNERSHIP_MARKER).is_file());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_staging_retirement_failure_blocks_live_replay_until_original_recovery() {
+        let _guard = test_guard!();
+        let (directory, mut session) = retired_staging_crash_fixture().await;
+        let writer = session.writer.clone();
+        let stage = session.stage(0);
+        let marker = stage.parent().unwrap().join(STAGING_OWNERSHIP_MARKER);
+        let original_marker = directory.join("retained-ownership-marker");
+        std::fs::rename(&marker, &original_marker).unwrap();
+
+        // This is the live pipeline's retirement entry point, after actual
+        // local publication and durable source-retirement fixture receipts.
+        // A missing local marker cannot turn the completed command into a
+        // retryable worker failure or erase its original recovery identity.
+        let error = session
+            .retire_returned()
+            .await
+            .unwrap_err()
+            .context("live pipeline retirement failed");
+        assert!(error.is::<LocalRetirementPending>());
+        let before = writer.snapshot();
+        let journal = std::fs::read(&writer.path).unwrap();
+        assert!(cancel_preparation(&writer).await.unwrap());
+        assert_eq!(writer.snapshot(), before);
+        assert_eq!(std::fs::read(&writer.path).unwrap(), journal);
+        let recipe = load_recipe(&writer).unwrap();
+        assert!(recipe.retired && !recipe.staging_released);
+        assert_eq!(recipe.exit_code, Some(0));
+        assert_eq!(recipe.returned, Some(0));
+
+        // Both run_exec and the hook use these same release and replay
+        // decisions. Local custody must not enter ProcessObservation bypass.
+        assert!(crate::hook::requires_recovery_before_release(&error));
+        assert_eq!(
+            crate::hook::classify_remote_pipeline_failure(&error),
+            crate::hook::RemotePipelineFailurePolicy::FailClosedNoLocalFallback
+        );
+        assert!(!crate::hook::is_remote_execution_unconfirmed(&error));
+        assert!(!crate::hook::is_remote_process_observation_failure(&error));
+        let summary = crate::hook::remote_pipeline_failure_summary(&recipe.worker.id, &error);
+        assert!(summary.contains("local staging retirement remains pending"));
+        assert!(summary.contains(&writer.wrapper_id()));
+        assert!(!summary.contains("completion unconfirmed"));
+        assert!(!summary.contains("SSH command timed out"));
+
+        // Exercise every raw writer transition that could otherwise hide or
+        // replace the still-needed cleanup receipt, including heartbeat ack.
+        for (gate, result) in [
+            ("retry permission", writer.ensure_released_for_retry()),
+            (
+                "retry selection",
+                writer.begin_retry_selection(true).map(|_| ()),
+            ),
+            (
+                "admission",
+                writer.admit(42, &WorkerId::new("other-worker")),
+            ),
+            ("terminal acknowledgement", writer.acknowledge_terminal()),
+            (
+                "observed completion",
+                writer.acknowledge_observed_completion(&before, 0),
+            ),
+        ] {
+            assert!(result.unwrap_err().is::<LocalRetirementPending>(), "{gate}");
+        }
+        let completion = recovery_completion::finish(&writer, async |_: &str| {
+            panic!("pending local cleanup must not contact or release the daemon")
+        })
+        .await
+        .unwrap_err();
+        assert!(completion.is::<LocalRetirementPending>());
+        assert_eq!(writer.snapshot(), before);
+        assert_eq!(std::fs::read(&writer.path).unwrap(), journal);
+        assert_eq!(
+            std::fs::read(stage.join("collector-source.c")).unwrap(),
+            b"private collector input"
+        );
+        assert_eq!(
+            std::fs::read(recipe.project_root.join("target/lean/app")).unwrap(),
+            b"app"
+        );
+
+        // Restore the original ownership proof and run real local recovery.
+        // Only after cleanup may its identity-bound daemon release report the
+        // original successful result. No command/worker transport is invoked.
+        std::fs::rename(&original_marker, &marker).unwrap();
+        let owned = recovery_owner::claim_journal(&writer).await.unwrap();
+        let mut requests = 0;
+        let exit = recover_owned_job_locally_with_daemon(&owned, async |request: &str| {
+            assert!(!stage.exists());
+            assert!(load_recipe(&writer).unwrap().staging_released);
+            requests += 1;
+            let response = match requests {
+                1 => {
+                    assert!(request.starts_with("GET /builds/41?"));
+                    serde_json::json!({"status": "active", "active": {
+                        "id": 41, "worker_id": "source-recovery", "slots": 1,
+                        "local_wrapper_id": writer.wrapper_id()
+                    }})
+                }
+                2 => {
+                    assert!(request.starts_with("POST /release-worker?"));
+                    assert!(request.contains("&exit_code=0"));
+                    serde_json::json!({"status": "ok"})
+                }
+                3 => {
+                    assert!(request.starts_with("GET /builds/41?"));
+                    serde_json::json!({
+                        "status": "completed", "local_wrapper_id": writer.wrapper_id(),
+                        "record": {"id": 41, "worker_id": "source-recovery", "exit_code": 0}
+                    })
+                }
+                _ => panic!("unexpected recovery request: {request}"),
+            };
+            Ok(format!("HTTP/1.1 200 OK\r\n\r\n{response}"))
+        })
+        .await
+        .unwrap();
+        assert_eq!(requests, 3);
+        assert_eq!(exit, 0);
+        assert_eq!(writer.snapshot().exit_code, Some(0));
+        assert!(writer.snapshot().terminal_acknowledged);
+        let recipe = load_recipe(&writer).unwrap();
+        assert_eq!(recipe.returned, Some(0));
+        assert_eq!(recipe.exit_code, Some(0));
+        assert!(recipe.staging_released);
+        ensure_local_retirement_complete(&writer.snapshot()).unwrap();
+    }
+
     #[tokio::test]
     async fn retained_source_retirement_releases_a_successful_stage_and_keeps_a_failed_one() {
         let _guard = test_guard!();
@@ -9800,9 +10918,7 @@ mod tests {
                 missing_result: None,
             });
             let stage = session.stage(0);
-            std::fs::create_dir_all(stage.parent().unwrap().parent().unwrap()).unwrap();
-            std::fs::create_dir(stage.parent().unwrap()).unwrap();
-            std::fs::create_dir(&stage).unwrap();
+            session.prepare_staging(0).unwrap();
             std::fs::create_dir(stage.join("build")).unwrap();
             for (path, bytes) in [
                 (local.join("source.c"), b"original caller source".as_slice()),
@@ -9850,11 +10966,15 @@ mod tests {
                 b"retained delivery bytes"
             );
             session.retired().unwrap();
+            session.retire_returned().await.unwrap();
             let recovered = reload_publication(&session);
             assert!(recovered.recipe.retired);
             assert!(recovered.recipe.phases[0].complete);
             assert_eq!(recovered.recipe.returned, Some(command_exit));
             assert!(recovered.retain_source_lifecycle_evidence());
+            // Intentionally retained failed-delivery evidence is settled too;
+            // it must not block the same terminal or readmission gates.
+            ensure_local_retirement_complete(&writer.snapshot()).unwrap();
             // The caller's source and its published output are never touched.
             for (path, bytes) in [
                 (local.join("source.c"), b"original caller source".as_slice()),
@@ -9869,7 +10989,15 @@ mod tests {
             // releases the local stage; a failed command keeps all of it,
             // unpublished collector input included.
             if command_exit == 0 {
-                assert!(!stage.parent().unwrap().exists());
+                assert!(!stage.exists());
+                #[cfg(unix)]
+                assert!(
+                    stage
+                        .parent()
+                        .unwrap()
+                        .join(STAGING_OWNERSHIP_MARKER)
+                        .is_file()
+                );
             } else {
                 for (path, bytes) in [
                     (
@@ -9924,6 +11052,8 @@ mod tests {
                 missing_result: None,
             });
         }
+        session.prepare_staging(0).unwrap();
+        session.prepare_staging(1).unwrap();
         let artifact_stage = session.stage(0);
         let result_stage = session.stage(1);
         std::fs::create_dir_all(artifact_stage.join("build")).unwrap();
@@ -9983,6 +11113,7 @@ mod tests {
         session.pair_released().unwrap();
         session.sources_released().unwrap();
         session.retired().unwrap();
+        session.retire_returned().await.unwrap();
         let recovered = reload_publication(&session);
         assert!(recovered.recipe.retired);
         assert_eq!(recovered.recipe.exit_code, Some(7));

@@ -17,14 +17,15 @@ import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
-CORE = (ROOT / "rch-common/src/remote_process.sh").read_text()
+CORE = Path(os.environ.get("RCH_CONTROL_TEST_PROTOCOL",
+                           str(ROOT / "rch-common/src/remote_process.sh"))).read_text()
 SHELL = os.environ.get("RCH_TEST_SHELL", "/bin/sh")
 # Deliberately exclude timeout, gtimeout and gnutimeout. Symlink real utilities;
 # changing uname or returning fake identity observations would hide this bug.
 TOOLS = (
     "awk", "cat", "chmod", "cmp", "cut", "date", "id", "kill", "mkdir",
     "mkfifo", "mktemp", "mv", "ps", "python3", "rch-wkr", "rm", "rmdir",
-    "sh", "sleep", "stat", "tr", "uname", "wc",
+    "setsid", "sh", "sleep", "stat", "tr", "uname", "wc",
 )
 
 
@@ -107,6 +108,32 @@ class ControlTimeout(WithoutTimeout):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "valid")
 
+    def test_adaptive_deadlines_keep_the_native_monitor_available(self):
+        for seconds in range(2, 9):
+            with self.subTest(seconds=seconds):
+                result = self.run_protocol(
+                    f"rch_group_timeout --signal=KILL {seconds}s /bin/sh -c 'printf valid'"
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "valid")
+
+    def test_remaining_recovery_budget_bounds_the_fallback_and_its_pipe_holder(self):
+        marker = self.root / "descendant-survived-shared-budget"
+        # The eight-second per-call allowance would let this descendant write.
+        # A two-second remaining budget must stop the real monitor group first.
+        payload = "(sleep 3; printf survived > " + shlex.quote(str(marker)) + ") & exit 0"
+        started = time.monotonic()
+        result = self.run_protocol('''
+rch_observation_clock() { rch_observation_now=100; }
+rch_observation_last_clock=100; rch_observation_deadline=300
+rch_control_capture 8s /bin/sh -c ''' + shlex.quote(payload))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertLess(time.monotonic() - started, 4.0)
+        time.sleep(1.3)
+        self.assertFalse(marker.exists(), "shared deadline did not stop the pipe holder")
+        self.assert_no_capture_files()
+
     def test_monitor_owns_a_separate_kernel_session_and_group(self):
         code = "import os; print(os.getpid(), os.getppid(), os.getpgrp(), os.getsid(0))"
         result = self.run_protocol(
@@ -187,10 +214,13 @@ class ControlTimeout(WithoutTimeout):
 class NativeLifecycleWithoutTimeout(WithoutTimeout):
     def test_all_existing_lifecycle_operations_without_coreutils(self):
         # On macOS the workflow supplies the candidate native rch-wkr. This
-        # invokes all existing real launch, watchdog, cancellation and recovery
-        # tests unchanged, but with every GNU timeout alias absent from PATH.
+        # invokes the original launch, watchdog, cancellation, recovery and
+        # portable boundary tests unchanged, with GNU timeout absent from PATH.
+        # LinuxBusyCensus and the opt-in dedicated-host stress suite run
+        # independently; their platform/opt-in skips are not lifecycle failures.
         result = subprocess.run(
-            [sys.executable, str(ROOT / "rch-common/tests/remote_process_platform.py"), "-v"],
+            [sys.executable, str(ROOT / "rch-common/tests/remote_process_platform.py"),
+             "PlatformIdentity", "DarwinCensusBoundary", "-v"],
             env=self.env, text=True, capture_output=True, timeout=120,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

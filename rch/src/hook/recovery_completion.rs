@@ -191,6 +191,7 @@ pub(super) async fn finish(
         .returned
         .context("recovery delivery is not settled")?;
     validate_successful_delivery(&recipe)?;
+    super::ensure_local_retirement_complete(&lease)?;
     anyhow::ensure!(
         recipe.retired
             && recipe.build_id > 0
