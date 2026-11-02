@@ -2139,9 +2139,15 @@ real Cargo serving, fleet performance or release qualification.
       realfs build0/374.80s and full18-name list verified. All17 nonignored
       filesystem cases pass; the original ignored installed-rustc case is
       explicitly run and passes1/1 in397.40s after capturing the full selected
-      installation and compiling with its retained rustc. Workspace all-target
-      check is still running; strict Clippy, formatting, aggregate/source-after
-      and managed terminal completion remain pending. These18 actual passes
+      installation and compiling with its retained rustc. The run then reached
+      its original3,600s orchestration deadline: managed FAILED18:46:35UTC,
+      native timeout5/frontend6, target duration3,779s including preparation.
+      Workspace all-target check is interrupted; strict Clippy/formatting are
+      UNRUN. No aggregate/source-after pass or artifact. Partial results are
+      retained at `/Volumes/trj-data/rabs-read-ahead-timeout-results-20261102`.
+      A fresh full `/proc` scan finds no remaining owned cache/compiler process;
+      no cancellation, peer interference or manual lock removal was needed.
+      These18 actual passes
       do not establish the120s service startup budget or a speed improvement.
       Earlier failed inputs/results remain untouched in separate directories.
     - [ ] Use the existing `scripts/test_rabs_live.py` on this exact frozen
@@ -2157,6 +2163,15 @@ real Cargo serving, fleet performance or release qualification.
       The next development orchestration budget is explicitly10,800s; the
       previous optimized3,600s timeout remains a loss, not a passed budget.
       No optimized-profile, full57, fleet, net-speed, soak or release claim.
+      Submitted native-only DSR tool `rabs_current92_live_development`, version
+      `2.1.34-rabslive.92abde13`, session51698. Source1,755/1,755 and frozen DSR
+      engine409/409 reverified before launch. Select immutable existing-runner
+      driver `08c41c66ec242b73298700037672790aed1981949db14ee68dcd0dcddd351bc2`.
+      `DSR_KEEP_BUILD_STAGES=1` preserves this attempt's private registry path
+      for future reuse. Old compiled caches embed `/home/ubuntu/.cargo`; that
+      filesystem now has10.19% free, below14%, so no writes are made there.
+      Managed dependency copies stay on the healthy ZFS volume. Runtime and
+      workspace-check phases remain pending until their actual terminal results.
     - [ ] Rerun the unchanged service case with matching current tools; compare
       incumbent and candidate in the same invocation before claiming a speed
       benefit. Preserve losses. Source-cache warming by these diagnostics must
