@@ -1227,7 +1227,9 @@ mod tests {
         fs::write(metadata, serde_json::to_vec(&envelope).unwrap()).unwrap();
         assert!(
             cache
-                .family
+                .families
+                .family(&key)
+                .unwrap()
                 .load_seed()
                 .unwrap_err()
                 .to_string()
@@ -1270,7 +1272,13 @@ mod tests {
                 .is_file()
         );
         assert!(!family.join("pending/metadata.json").exists());
-        let committed = cache.family.load_seed().unwrap().unwrap();
+        let committed = cache
+            .families
+            .family(&key)
+            .unwrap()
+            .load_seed()
+            .unwrap()
+            .unwrap();
         assert_eq!(
             serde_json::to_value(&committed.committed_outputs).unwrap(),
             serde_json::to_value(&seeds).unwrap(),

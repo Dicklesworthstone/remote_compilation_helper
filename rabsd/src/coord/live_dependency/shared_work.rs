@@ -594,10 +594,18 @@ impl<K: Eq + Hash + Clone + Send, R: Send + Sync + 'static> SharedWork<K, R> {
                 permit.cancel();
                 return Ok(LaunchStatus::CancelledBeforeStart);
             }
-            let job = registry
-                .jobs
-                .get(&permit.key)
-                .ok_or(StartError::StaleDeferred)?;
+            let job = match registry.jobs.get(&permit.key) {
+                Some(job) => job,
+                // The reaper may already have removed this cancelled waiter.
+                // A replacement entry still takes the strict identity check
+                // below; its old handle must never acquire launch authority.
+                None if !permit.is_pending() => {
+                    drop(registry);
+                    permit.cancel();
+                    return Ok(LaunchStatus::CancelledBeforeStart);
+                }
+                None => return Err(StartError::StaleDeferred),
+            };
             if !Arc::ptr_eq(&job.flight, &permit.flight) || job.worker.is_some() || job.preparing {
                 return Err(StartError::StaleDeferred);
             }

@@ -1004,7 +1004,7 @@ fn plan_in_profile(
     } else {
         derive_dependency_output_declarations(&invocation, host_triple)
     }
-    .map_err(|error| LiveRefusal::Outputs(format!("{error:?}")))?;
+    .map_err(|error| LiveRefusal::Outputs(error.to_string()))?;
     if !workspace_execution_only && invocation.cap_lints.as_deref() != Some("allow") {
         return Err(LiveRefusal::NotDependencyCompile(
             "Cargo caps lints for external dependencies; this invocation does not",

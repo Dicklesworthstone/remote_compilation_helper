@@ -2332,8 +2332,10 @@ mod tests {
         use rabs_key::live_dependency::{
             LiveRustcRequest, plan_canonical_remote_dependency_action,
         };
+        use std::os::unix::fs::PermissionsExt;
 
         let (directory, _) = generated_fixture();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let owner = Arc::new(directory);
         let mappings = [
             ("/__rabs/workspace", "workspace"),

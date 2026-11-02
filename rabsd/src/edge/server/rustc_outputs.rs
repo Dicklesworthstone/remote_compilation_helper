@@ -169,7 +169,7 @@ mod tests {
 
     #[test]
     fn accepts_an_absolute_out_dir_but_never_a_different_destination() {
-        let mut frame = request("/workspace", "link");
+        let mut frame = request("/workspace", "dep-info,link");
         frame["rustc_invocation"]["argv"][8] = json!("/workspace/target/debug/deps");
         assert!(derive_frame(&frame).is_ok());
         for destination in [
@@ -314,7 +314,7 @@ mod tests {
         coord
             .commit_offer(&offer, &sample_expected_descriptor())
             .unwrap();
-        let mut frame = request(dir.path().to_str().unwrap(), "link");
+        let mut frame = request(dir.path().to_str().unwrap(), "dep-info,link");
         frame["action_key"] = json!(
             sample_action_key()
                 .bytes

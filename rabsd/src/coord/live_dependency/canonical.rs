@@ -1573,7 +1573,7 @@ mod tests {
 
     #[test]
     fn immutable_dag_requires_its_retained_package_mount_and_exact_output_policy() {
-        use rabs_key::live_dependency::plan_canonical_cargo_dependency_action;
+        use rabs_key::live_dependency::plan_canonical_remote_dependency_action;
 
         for (policy, emit) in [
             (
@@ -1607,7 +1607,7 @@ mod tests {
                 ("CARGO_MANIFEST_DIR".into(), package.into()),
                 ("CARGO_PKG_NAME".into(), "dag".into()),
             ];
-            let plan = plan_canonical_cargo_dependency_action(
+            let plan = plan_canonical_remote_dependency_action(
                 LiveRustcRequest {
                     argv: &argv,
                     cwd: package,
