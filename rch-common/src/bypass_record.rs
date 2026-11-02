@@ -660,6 +660,90 @@ pub fn default_admin_disable_path() -> PathBuf {
     default_bypass_record_path().with_file_name("admin_disables.json")
 }
 
+/// ENOENT from opening a state document is not necessarily first startup: a
+/// broken link anywhere in its path produces the same error. Walk upward to
+/// the first existing entry without following the final component. A valid
+/// directory alias is fine (including macOS /tmp); an unreadable/broken alias
+/// is not evidence that the operator has never disabled a worker.
+fn admin_disable_document_is_missing(path: &Path) -> std::io::Result<bool> {
+    for ancestor in path.ancestors().filter(|p| !p.as_os_str().is_empty()) {
+        match fs::symlink_metadata(ancestor) {
+            Ok(metadata) => {
+                // The document appeared after open failed, or is a dangling
+                // link. Neither observation authorizes an empty state.
+                if ancestor == path {
+                    return Ok(false);
+                }
+                return if metadata.file_type().is_symlink() {
+                    fs::metadata(ancestor).map(|target| target.is_dir())
+                } else {
+                    Ok(metadata.is_dir())
+                };
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    // A relative missing path has no explicit "." ancestor.
+    fs::metadata(".").map(|directory| directory.is_dir())
+}
+
+/// Read only a regular administrative document. The writer atomically replaces
+/// this directory entry, so following a leaf symlink would give reads and
+/// writes different authorities. On Unix, enforce that at open (not with a
+/// check-then-open race), and never block startup opening a substituted FIFO.
+fn read_admin_disable_document(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    if path.as_os_str().is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "administrative disable state must name a file",
+        ));
+    }
+    #[cfg(unix)]
+    let opened = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    )
+    .map(fs::File::from)
+    .map_err(std::io::Error::from);
+    #[cfg(not(unix))]
+    let opened = fs::symlink_metadata(path).and_then(|metadata| {
+        if metadata.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "administrative disable state cannot be a symlink",
+            ));
+        }
+        fs::File::open(path)
+    });
+    let mut file = match opened {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if admin_disable_document_is_missing(path)? {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "administrative disable state is not a regular file: {}",
+                path.display()
+            ),
+        ));
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes)?;
+    Ok(Some(bytes))
+}
+
 /// Revocable administrative permission for automatic recovery of owned work.
 ///
 /// This follows a worker ID across inventory replacement, independently of
@@ -736,16 +820,14 @@ impl AdminDisableStore {
         Self::try_load(path).expect("cannot safely load administrative worker disablement")
     }
 
-    /// Load administrative intent before any worker activity starts. Missing
-    /// files represent first startup; every other error must reach the caller.
+    /// Load administrative intent before any worker activity starts. Only a
+    /// genuinely absent document represents first startup. Symlink documents,
+    /// broken directory aliases and non-regular files fail closed without
+    /// modifying the state; every other read/parse error reaches the caller.
     pub fn try_load(path: impl Into<PathBuf>) -> std::io::Result<Self> {
         let path = path.into();
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::with_path(path));
-            }
-            Err(error) => return Err(error),
+        let Some(bytes) = read_admin_disable_document(&path)? else {
+            return Ok(Self::with_path(path));
         };
         let file: AdminDisableFile = serde_json::from_slice(&bytes).map_err(|error| {
             std::io::Error::new(
@@ -1509,6 +1591,179 @@ mod tests {
         let non_directory = dir.path().join("not-a-directory");
         std::fs::write(&non_directory, "file").unwrap();
         assert!(AdminDisableStore::try_load(non_directory.join("state.json")).is_err());
+    }
+
+    #[test]
+    fn admin_disable_document_missing_is_not_an_empty_path_or_an_existing_entry() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.json");
+        assert!(admin_disable_document_is_missing(&path).unwrap());
+        assert_eq!(
+            AdminDisableStore::try_load("").unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        // Model a document appearing between the failed open and the absence
+        // check: never reinterpret a current entry as first-start state.
+        fs::write(&path, b"{\"schema_version\":1,\"records\":[]}").unwrap();
+        assert!(!admin_disable_document_is_missing(&path).unwrap());
+        assert!(!admin_disable_document_is_missing(directory.path()).unwrap());
+    }
+
+    #[test]
+    fn admin_disable_document_first_start_and_restart_keep_network_intent() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("not-created/nested/state.json");
+        let mut store = AdminDisableStore::try_load(&path).unwrap();
+        assert!(store.all().is_empty());
+        assert!(!path.parent().unwrap().exists(), "load must be read-only");
+        let disabled = AdminDisableRecord {
+            worker_id: "offline".into(),
+            reason: Some("operator: powered off".into()),
+            disabled_unix_ms: TS,
+        };
+        store.upsert(disabled.clone()).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let mut restarted = AdminDisableStore::try_load(&path).unwrap();
+        assert_eq!(restarted.get("offline"), Some(&disabled));
+        assert!(restarted.automatic_network_permit("offline").is_none());
+        assert!(restarted.automatic_network_permit("healthy-peer").is_some());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admin_disable_document_links_never_become_empty_or_redirected_state() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("retained-state.json");
+        let mut store = AdminDisableStore::with_path(&target);
+        let disabled = AdminDisableRecord {
+            worker_id: "offline".into(),
+            reason: Some("operator: do not reconnect".into()),
+            disabled_unix_ms: TS,
+        };
+        store.upsert(disabled.clone()).unwrap();
+        let bytes = fs::read(&target).unwrap();
+        for (name, destination) in [
+            ("valid-link", target.clone()),
+            ("broken-link", directory.path().join("missing-state.json")),
+            ("directory-link", directory.path().to_path_buf()),
+            ("cycle-link", directory.path().join("cycle-link")),
+        ] {
+            let path = directory.path().join(name);
+            symlink(&destination, &path).unwrap();
+            for _ in 0..3 {
+                assert!(AdminDisableStore::try_load(&path).is_err(), "{name}");
+                assert_eq!(fs::read_link(&path).unwrap(), destination);
+                assert_eq!(fs::read(&target).unwrap(), bytes);
+            }
+        }
+        assert!(!directory.path().join("missing-state.json").exists());
+        let mut restarted = AdminDisableStore::try_load(&target).unwrap();
+        assert_eq!(restarted.get("offline"), Some(&disabled));
+        assert!(restarted.automatic_network_permit("offline").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admin_disable_document_broken_parent_cannot_erase_restart_disablement() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state_home = directory.path().join("state-home");
+        fs::create_dir(&state_home).unwrap();
+        let alias = directory.path().join("state-alias");
+        symlink(&state_home, &alias).unwrap();
+        let path = alias.join("admin_disables.json");
+        // Valid directory aliases, including an absent descendant on genuine
+        // first startup, remain supported. Only the state leaf must be regular.
+        assert!(
+            AdminDisableStore::try_load(alias.join("not-created/state.json"))
+                .unwrap()
+                .all()
+                .is_empty()
+        );
+        let mut store = AdminDisableStore::try_load(&path).unwrap();
+        let disabled = AdminDisableRecord {
+            worker_id: "offline".into(),
+            reason: Some("operator: maintenance".into()),
+            disabled_unix_ms: TS,
+        };
+        store.upsert(disabled.clone()).unwrap();
+        let retained = directory.path().join("retained-state-home");
+        fs::rename(&state_home, &retained).unwrap();
+        for suffix in ["admin_disables.json", "not-created/nested/state.json"] {
+            let broken = alias.join(suffix);
+            assert_eq!(
+                fs::read(&broken).unwrap_err().kind(),
+                std::io::ErrorKind::NotFound
+            );
+            assert!(AdminDisableStore::try_load(&broken).is_err());
+        }
+        assert!(
+            !state_home.exists(),
+            "load must not repair or overwrite state"
+        );
+        let saved = retained.join("admin_disables.json");
+        assert_eq!(
+            AdminDisableStore::try_load(&saved).unwrap().get("offline"),
+            Some(&disabled)
+        );
+        fs::rename(&retained, &state_home).unwrap();
+        let mut restarted = AdminDisableStore::try_load(&path).unwrap();
+        assert_eq!(restarted.get("offline"), Some(&disabled));
+        assert!(restarted.automatic_network_permit("offline").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admin_disable_document_fifo_fails_without_waiting_for_a_writer() {
+        use std::os::unix::fs::FileTypeExt;
+
+        const CHILD_PATH: &str = "RCH_ADMIN_DISABLE_FIFO_TEST_PATH";
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            let path = PathBuf::from(path);
+            let error = AdminDisableStore::try_load(&path).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            fs::write(path.with_extension("checked"), b"rejected").unwrap();
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.fifo");
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &path,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .unwrap();
+        // A regression must fail, not hang the test runner inside blocking
+        // open(). No writer ever opens the FIFO, and no global env is changed.
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "bypass_record::tests::admin_disable_document_fifo_fails_without_waiting_for_a_writer",
+                "--nocapture",
+            ])
+            .env(CHILD_PATH, &path)
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success(), "FIFO loader subprocess failed: {status}");
+                break;
+            }
+            if started.elapsed() >= std::time::Duration::from_secs(10) {
+                let _ = child.kill();
+                child.wait().unwrap();
+                panic!("administrative state load waited for a FIFO writer");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(fs::read(path.with_extension("checked")).unwrap(), b"rejected");
+        assert!(fs::symlink_metadata(&path).unwrap().file_type().is_fifo());
     }
 
     #[test]
