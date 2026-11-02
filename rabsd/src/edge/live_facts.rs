@@ -2348,6 +2348,7 @@ mod tests {
         .map(|(visible, relative)| {
             let backing = owner.path().join(relative);
             std::fs::create_dir_all(&backing).unwrap();
+            std::fs::set_permissions(&backing, std::fs::Permissions::from_mode(0o700)).unwrap();
             (PathBuf::from(visible), backing)
         })
         .collect();

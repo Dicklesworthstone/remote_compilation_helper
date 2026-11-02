@@ -2359,7 +2359,7 @@ mod tests {
         fixture.coord.mark_down();
         let restarted = Arc::new(CoordLive::with_cas(Arc::clone(&fixture.cas)));
         restarted
-            .acquire_boot_authority("empty-metadata-restart")
+            .acquire_boot_authority("workspace-lineage-fixture")
             .unwrap();
         restarted.mark_up();
         assert!(before.verify_original().is_err());

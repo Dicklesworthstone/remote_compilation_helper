@@ -100,6 +100,14 @@ fn rejection_for(request: LiveRustcRequest<'_>, mode: PreflightMode) -> Option<L
         Ok(invocation) => invocation,
         Err(error) => return Some(LiveRefusal::Unparseable(format!("{error:?}"))),
     };
+    let options = if workspace {
+        check_workspace_output_options(&invocation)
+    } else {
+        check_dependency_output_options(&invocation)
+    };
+    let output_refusal = options
+        .err()
+        .map(|error| LiveRefusal::Outputs(error.to_string()));
     if !workspace && invocation.cap_lints.as_deref() != Some("allow") {
         return Some(LiveRefusal::NotDependencyCompile(
             "Cargo caps lints for external dependencies; this invocation does not",
@@ -151,6 +159,12 @@ fn rejection_for(request: LiveRustcRequest<'_>, mode: PreflightMode) -> Option<L
             "live dependency serving requires dep-info read evidence",
         ));
     }
+    // Once read evidence is requested, metadata candidates get final
+    // derivation's precise output refusal. Pure codegen keeps its read-closure
+    // refusal before facts warm. Neither path may bypass missing read evidence.
+    if invocation.emit.iter().any(|kind| kind == "metadata") && output_refusal.is_some() {
+        return output_refusal;
+    }
     // A .d file does not report assembler reads such as global_asm! .incbin.
     // Only an explicitly configured remote execution path may proceed toward
     // its separately enforced archive profile; the unsandboxed local lane
@@ -183,19 +197,7 @@ fn rejection_for(request: LiveRustcRequest<'_>, mode: PreflightMode) -> Option<L
         ),
     )
     .or_else(|| sysroot_preflight::rejection(&invocation))
-    // Use the SAME option model as final derivation, not a second flag
-    // list or a fabricated host triple. Supported threaded compiles keep
-    // going; incremental/save-temps/unknown modes never start cold hashing.
-    .or_else(|| {
-        let options = if workspace {
-            check_workspace_output_options(&invocation)
-        } else {
-            check_dependency_output_options(&invocation)
-        };
-        options
-            .err()
-            .map(|error| LiveRefusal::Outputs(error.to_string()))
-    })
+    .or(output_refusal)
 }
 
 fn dependency_inputs_rejection(
@@ -203,6 +205,10 @@ fn dependency_inputs_rejection(
     generated_root: Option<&str>,
     canonical_archive_execution: bool,
 ) -> Option<LiveRefusal> {
+    if canonical_archive_execution && !invocation.native_libs.is_empty() && generated_root.is_none()
+    {
+        return Some(LiveRefusal::MissingEnv("OUT_DIR"));
+    }
     let native_roots = if canonical_archive_execution {
         match canonical_generated_native_roots(invocation, generated_root) {
             Ok(roots) => roots,

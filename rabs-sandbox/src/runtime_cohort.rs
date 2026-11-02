@@ -1001,7 +1001,10 @@ mod linux {
         path: PathBuf,
     }
 
-    fn libraries(stdout: &[u8]) -> Result<Vec<Library>, RuntimeCohortError> {
+    fn libraries(
+        stdout: &[u8],
+        toolchain_root: Option<&Path>,
+    ) -> Result<Vec<Library>, RuntimeCohortError> {
         let stdout = std::str::from_utf8(stdout).map_err(|_| invalid("non-UTF-8 loader output"))?;
         let mut result = BTreeMap::new();
         for line in stdout
@@ -1030,7 +1033,7 @@ mod linux {
                 || path.len() > 4096
                 || path[1..]
                     .split('/')
-                    .any(|part| part.is_empty() || part == "." || part == "..")
+                    .any(|part| part.is_empty() || part == ".")
                 || path
                     .bytes()
                     .any(|byte| byte.is_ascii_whitespace() || byte == 0)
@@ -1040,7 +1043,31 @@ mod linux {
             if result.len() >= MAX_LIBRARIES && !result.contains_key(name) {
                 return Err(invalid("too many runtime libraries"));
             }
-            let path = PathBuf::from(path);
+            let path = if path.split('/').any(|part| part == "..") {
+                // Official rustc RPATHs use $ORIGIN/../lib. Resolve those
+                // aliases only inside the complete retained toolchain. Every
+                // traversed prefix must remain inside it, including after a
+                // symlink or parent component; host-library traversal remains
+                // refused. The caller retains and revalidates this whole tree.
+                let root = toolchain_root
+                    .ok_or_else(|| invalid("unbound ELF library parent traversal"))?;
+                let relative = Path::new(path)
+                    .strip_prefix(root)
+                    .map_err(|_| invalid("ELF library parent traversal outside toolchain"))?;
+                if name.starts_with('/') {
+                    return Err(invalid("ELF interpreter parent traversal is unsupported"));
+                }
+                let mut resolved = root.to_path_buf();
+                for component in relative.components() {
+                    resolved = fs::canonicalize(resolved.join(component.as_os_str()))?;
+                    if !resolved.starts_with(root) {
+                        return Err(invalid("ELF library traversal leaves retained toolchain"));
+                    }
+                }
+                resolved
+            } else {
+                PathBuf::from(path)
+            };
             if let Some(previous) = result.insert(name.to_owned(), path.clone())
                 && previous != path
             {
@@ -1723,7 +1750,7 @@ mod linux {
         measurement.loader_cache(&cache)?;
         let search = validated_search_paths(loader_search_paths)?;
         let targets = probe_targets(&compiler, &root)?;
-        let libraries = libraries(&probe(&targets, &search)?)?;
+        let libraries = libraries(&probe(&targets, &search)?, Some(&root))?;
         check_cancelled(cancelled)?;
         preload.verify()?;
         cache.verify()?;
@@ -1840,7 +1867,7 @@ mod linux {
         fn loader_addresses_are_ignored_but_unresolved_and_relative_paths_are_refused() {
             let a = b"linux-vdso.so.1 (0x1111)\nlibc.so.6 => /lib/libc.so.6 (0x2222)\n/lib64/ld-linux.so.2 (0x3333)\n";
             let b = b"linux-vdso.so.1 (0x9999)\n/lib64/ld-linux.so.2 (0xaaaa)\nlibc.so.6 => /lib/libc.so.6 (0xbbbb)\n";
-            assert_eq!(libraries(a).unwrap(), libraries(b).unwrap());
+            assert_eq!(libraries(a, None).unwrap(), libraries(b, None).unwrap());
             for bad in [
                 b"libmissing.so => not found\n".as_slice(),
                 b"libc.so => relative/libc.so (0x1234)\n",
@@ -1850,7 +1877,70 @@ mod linux {
                 b"/lib64/ld-linux.so.2 => /lib/other-loader.so (0x1234)\n",
                 b"libc.so => /usr/lib/../lib/libc.so (0x1234)\n",
             ] {
-                assert!(libraries(bad).is_err(), "{bad:?}");
+                assert!(libraries(bad, None).is_err(), "{bad:?}");
+            }
+        }
+
+        #[test]
+        fn rustc_origin_paths_resolve_only_inside_the_retained_toolchain() {
+            let owner = tempfile::Builder::new()
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap();
+            let root = owner.path().join("toolchain");
+            fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(root.join("bin"))
+                .unwrap();
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(root.join("lib"))
+                .unwrap();
+            let root = fs::canonicalize(root).unwrap();
+            let driver = root.join("lib/librustc_driver.so");
+            fs::write(&driver, b"parser fixture, not ELF execution evidence").unwrap();
+            let report = format!(
+                "librustc_driver.so => {}/bin/../lib/librustc_driver.so (0x1234)\n\
+                 librustc_driver.so => {}/lib/../lib/librustc_driver.so (0x5678)\n",
+                root.display(),
+                root.display()
+            );
+            assert!(libraries(report.as_bytes(), None).is_err());
+            assert_eq!(
+                libraries(report.as_bytes(), Some(&root)).unwrap(),
+                vec![Library {
+                    name: "librustc_driver.so".to_owned(),
+                    path: driver,
+                }]
+            );
+            std::os::unix::fs::symlink("lib", root.join("inside")).unwrap();
+            let inside = format!(
+                "driver.so => {}/inside/../lib/librustc_driver.so (0x1234)\n",
+                root.display()
+            );
+            assert!(libraries(inside.as_bytes(), Some(&root)).is_ok());
+            std::os::unix::fs::symlink(owner.path(), root.join("outside")).unwrap();
+            for bad in [
+                "driver.so => /usr/lib/../lib/libc.so (0x1234)\n".to_owned(),
+                format!(
+                    "driver.so => {}/../toolchain/lib/librustc_driver.so (0x1234)\n",
+                    root.display()
+                ),
+                format!(
+                    "driver.so => {}/outside/toolchain/../toolchain/lib/librustc_driver.so (0x1234)\n",
+                    root.display()
+                ),
+                format!(
+                    "driver.so => {}/bin/../lib/missing.so (0x1234)\n",
+                    root.display()
+                ),
+                format!(
+                    "driver.so => {}/bin//../lib/librustc_driver.so (0x1234)\n",
+                    root.display()
+                ),
+            ] {
+                assert!(libraries(bad.as_bytes(), Some(&root)).is_err(), "{bad}");
             }
         }
 
@@ -1878,7 +1968,7 @@ mod linux {
                 codegen.display()
             );
             let flattened = without_probe_headers(raw.as_bytes(), &targets).unwrap();
-            assert_eq!(libraries(&flattened).unwrap().len(), 2);
+            assert_eq!(libraries(&flattened, None).unwrap().len(), 2);
             assert!(without_probe_headers(b"/unrequested/compiler:\n", &targets).is_err());
         }
 
@@ -2005,7 +2095,7 @@ mod linux {
                 baseline
             );
 
-            let needed = libraries(&probe(std::slice::from_ref(&compiler), &[]).unwrap())
+            let needed = libraries(&probe(std::slice::from_ref(&compiler), &[]).unwrap(), None)
                 .unwrap()
                 .into_iter()
                 .find(|library| !library.name.starts_with('/'))
@@ -2049,7 +2139,10 @@ mod linux {
 
         #[test]
         fn retained_selected_runtime_matches_observer_and_uses_only_owned_mounts() {
-            let directory = tempfile::tempdir().unwrap();
+            let directory = tempfile::Builder::new()
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap();
             let toolchain = directory.path().join("toolchain");
             fs::create_dir_all(toolchain.join("bin")).unwrap();
             fs::create_dir(toolchain.join("lib")).unwrap();
@@ -2100,7 +2193,10 @@ mod linux {
 
         #[test]
         fn same_read_capture_keeps_bytes_and_aliases_after_source_changes() {
-            let directory = tempfile::tempdir().unwrap();
+            let directory = tempfile::Builder::new()
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap();
             let source = directory.path().join("source");
             fs::create_dir(&source).unwrap();
             let library = source.join("libfixture.so.1");
@@ -2138,7 +2234,10 @@ mod linux {
 
         #[test]
         fn loader_cache_capture_witnesses_presence_bytes_and_generation() {
-            let directory = tempfile::tempdir().unwrap();
+            let directory = tempfile::Builder::new()
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap();
             let path = directory.path().join("cache");
             let missing = OptionalFile::read(&path, MAX_LOADER_CACHE_BYTES, &|| false).unwrap();
             missing.verify().unwrap();
@@ -2174,7 +2273,10 @@ mod linux {
 
         #[test]
         fn retained_tree_refuses_extra_entries_hardlinks_and_replaced_owner() {
-            let directory = tempfile::tempdir().unwrap();
+            let directory = tempfile::Builder::new()
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap();
             let source = directory.path().join("source");
             fs::write(&source, b"runtime bytes").unwrap();
             let owner = RuntimeDirectory::new(directory.path()).unwrap();
@@ -2214,7 +2316,10 @@ mod linux {
 
         #[test]
         fn capture_bounds_and_cancellation_are_fail_closed() {
-            let directory = tempfile::tempdir().unwrap();
+            let directory = tempfile::Builder::new()
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap();
             assert!(
                 retain_runtime_cohort(
                     Path::new("/not-probed"),
@@ -2227,6 +2332,10 @@ mod linux {
                 .is_err()
             );
             assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+            let shared = directory.path().join("shared-parent");
+            fs::create_dir(&shared).unwrap();
+            fs::set_permissions(&shared, fs::Permissions::from_mode(0o770)).unwrap();
+            assert!(RuntimeDirectory::new(&shared).is_err());
             let owner = RuntimeDirectory::new(directory.path()).unwrap();
             assert!(RuntimeTree::default().verify(&owner, &|| true).is_err());
             let source = directory.path().join("source");
@@ -2252,7 +2361,7 @@ mod linux {
                     "lib{index}.so => /usr/lib/lib{index}.so (0x1234)\n"
                 ));
             }
-            assert!(libraries(output.as_bytes()).is_err());
+            assert!(libraries(output.as_bytes(), None).is_err());
             let large = directory.path().join("large-library");
             OpenOptions::new()
                 .write(true)
@@ -2267,7 +2376,10 @@ mod linux {
 
         #[test]
         fn writable_aliases_and_ancestors_cannot_expose_retained_runtime() {
-            let directory = tempfile::tempdir().unwrap();
+            let directory = tempfile::Builder::new()
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap();
             let toolchain = directory.path().join("toolchain");
             fs::create_dir_all(toolchain.join("bin")).unwrap();
             let compiler = toolchain.join("bin/rustc");

@@ -1391,6 +1391,21 @@ mod tests {
 
             // Named static inputs must exist in an actual searched directory,
             // even when the broader foreign tree is completely retained.
+            // A raw request has no retained owner yet: only the later key
+            // check below may reason from these complete captured inputs.
+            let mut named_request = argv.clone();
+            named_request.push("-lstatic=answer".into());
+            assert!(matches!(
+                plan_canonical_workspace_execution(
+                    LiveRustcRequest {
+                        argv: &named_request,
+                        env: &env,
+                        cwd: WORKSPACE,
+                    },
+                    HOST,
+                ),
+                Err(LiveRefusal::MissingEnv("OUT_DIR"))
+            ));
             let mut named = plan.clone();
             named.invocation.native_libs.push("static=answer".into());
             assert!(key(&named, &retained).is_ok());

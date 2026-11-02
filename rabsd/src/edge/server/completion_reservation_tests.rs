@@ -718,6 +718,9 @@ fn canonical_drain_waits_for_acknowledged_publication_after_wrapper_exit() {
         let server_controller = Arc::clone(&controller);
         let server = scope.spawn(move || run_daemon_controlled(options, server_controller));
         listening.recv_timeout(Duration::from_secs(10)).unwrap();
+        let hello = json!({"kind":"hello",
+            "transport":{"minimum_compatible":1,"current":1},
+            "application":{"minimum_compatible":1,"current":1}});
         let connect_peer = || {
             let peer = std::os::unix::net::UnixStream::connect(&path).unwrap();
             peer.set_read_timeout(Some(Duration::from_secs(10)))
@@ -725,9 +728,6 @@ fn canonical_drain_waits_for_acknowledged_publication_after_wrapper_exit() {
             peer.set_write_timeout(Some(Duration::from_secs(10)))
                 .unwrap();
             let mut peer = BufReader::new(peer);
-            let hello = json!({"kind":"hello",
-                "transport":{"minimum_compatible":1,"current":1},
-                "application":{"minimum_compatible":1,"current":1}});
             writeln!(peer.get_mut(), "{hello}").unwrap();
             assert_eq!(read_reply(&mut peer)["kind"], "hello-ok");
             peer

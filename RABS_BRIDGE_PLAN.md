@@ -1823,56 +1823,125 @@ only the stated step, never closure of the surrounding milestone.
 doctor successfully, then ran all **1,435 daemon cases: 1,419 passed, 16
 failed, zero ignored** (raw 101). Shutdown, selector and pipe controls each
 passed 1/1; service sockets passed 12/12 and live doctor 4/4. CAS compilation
-and subsequent workspace checks are still running in wrapper
+hit the original 10,800s limit in wrapper
 `rchw-c6eb99ec-6a2a-43e7-88f6-94b3f30269ab`, build
-`30080135327648060`, with the original 10,800s deadline. No aggregate pass,
-terminal acknowledgement or final source-after audit exists yet. The complete
+`30080135327648060`. CAS tests, dependency guards and workspace QA are unrun.
+Supported recovery acknowledged 255 and released/retired every ownership
+component; this is a timeout receipt, not a compiler result. An independent
+post-terminal audit matched 1,694/1,755 files plus the 61 exact policy omissions,
+zero differences, five unchanged executables and no source-cwd process.
+The original partial report has no aggregate exit or source-after field; it was
+preserved without manufacturing either. Genuine 19-file results are in
+`/Volumes/trj-data/rabs-shared5ab-native-results-20261102`, archive SHA-256
+`879c320713d124d74956167fb7b3adb1bb8ba4fd9b9fb096e0f9b5978c85e4be`.
+The complete
 daemon log is `/Volumes/trj-data/rabs-shared5ab-daemon-lib-partial-20261102.log`,
 SHA-256 `a54452d3739dd06af4be1a8da814c7640c924ce4abfdfe76add175c1fb82979d`.
 
-The following candidate repairs are applied in the shared working tree but
-**remain unchecked until a fresh combined frozen source compiles and runs**.
-Checked preparation subtasks earn no native acceptance credit.
+The following repairs now pass on the complete frozen `8130e3c9` cut below:
+473 key and 1,464 daemon tests, zero ignored, plus required workspace QA.
+This validates these component repairs, not concurrent current-main changes,
+real Cargo serving, fleet performance or release qualification.
 
-- [ ] Validate both stale target-family-owner fixtures against a fresh held
+- [x] Validate both stale target-family-owner fixtures against a fresh held
   family after cache recapture; retain checksum and healthy-seed assertions.
   - [x] Reopen the current family in each fixture; production owner fencing unchanged.
-- [ ] Align the workspace read-closure refusal assertion with the actual
+- [x] Align the workspace read-closure refusal assertion with the actual
   independently isolated compiler boundary; preserve all bypass negatives.
   - [x] Match the current refusal text; rejection and all bypass negatives remain.
-- [ ] Validate the immutable archive-DAG fixture through the remote codegen
+- [x] Validate the immutable archive-DAG fixture through the remote codegen
   planner, with the original retained-mount and exact-output negatives.
   - [x] Correct only that fixture's planner selection.
-- [ ] Validate cancelled shared-work reaping without disrupting another key
+- [x] Validate cancelled shared-work reaping without disrupting another key
   or accepting a replacement generation's stale capability.
   - [x] Handle a reaped, cancelled permit as CancelledBeforeStart; existing
     replacement-generation checks remain before any such classification.
   - [x] Add a positive native worker-thread case proving the other key still
     launches and joins and the cancelled key never probes a worker.
-- [ ] Repair and re-run all three source-planning cleanup cases: cancellation
+- [x] Repair and re-run all three source-planning cleanup cases: cancellation
   must release roots only after descendant closure, timeout/output bounds
   must kill/reap, and cleanup must work with no kill executable on PATH.
   Keep the original 500ms closure budget and operation/test deadlines.
   - [x] Candidate: signal a still-running unreaped group leader before the
     global procfs scan. An exited leader still requires membership inspection;
-    complete closure and retained-root behavior remain mandatory. Native untested.
-- [ ] Validate warmed generated capture with the required private operation
+    complete closure and retained-root behavior remain mandatory. All three
+    original native cases pass on `8130e3c9`.
+- [x] Validate warmed generated capture with the required private operation
   parent and retain the canonical-root rebinding rejection.
   - [x] Make the positive fixture's operation directory mode 0700.
-- [ ] Validate publication drain across the real per-connection request cap;
+- [x] Validate publication drain across the real per-connection request cap;
   retain acknowledged-publication ordering and the original overall deadline.
   - [x] Renew the fixture's session at MAX_REQUESTS_PER_CONNECTION (64);
     the failing native trace contains exactly 64 warming replies.
-- [ ] Validate both output fixtures with required dep-info read closure;
+- [x] Validate both output fixtures with required dep-info read closure;
   retain absolute-destination fencing and the elevated-evidence refusal.
   - [x] Request dep-info,link in the two positive fixtures; no adapter guard changed.
-- [ ] Resolve the missing-OUT_DIR native-archive policy from the actual
+- [x] Resolve the missing-OUT_DIR native-archive policy from the actual
   foreign-root contract; do not weaken a negative or reject legitimate Cargo
   consumers merely to turn the fixture green.
-  - [x] Candidate production fix: require this package's own OUT_DIR for
+  - [x] Trial production fix: require this package's own OUT_DIR for
     explicit native -l directives. Search-only propagated roots still admit
     consumers without a build script; retain the original missing-OUT_DIR
     rejection assertion and existing foreign-root positive tests unchanged.
+    **Rejected after the complete key run below; manually revert only this
+    added restriction in the shared tree. Both existing assertions stay intact.**
+  - [x] Compile the repaired key test library natively (0, 621.692s) and run
+    the unchanged foreign-root controls 2/2 plus native-modifier policy 1/1
+    (all zero ignored). This selects three of 473 key cases; it is not the
+    full key suite, the daemon preflight regression or actual Cargo execution.
+    Genuine logs: `/Volumes/trj-data/rabs-daemon16-key-controls-20261102`.
+  - [x] Run all 473 cases from that already-built frozen key harness, including
+    ignored cases, in a separate strict one-slot managed job. Bind its original
+    Cargo artifact, executable hash and complete frozen source before/after;
+    retain the raw exit and any failures. This adds no daemon, serving or
+    performance qualification and does not modify the running daemon job.
+    Actual raw 101: **472 passed, one failed, zero ignored**, 24.407s.
+    `workspace_native_consumers_retain_foreign_trees_without_gaining_cache_authority`
+    fails its unchanged positive named `static=answer` assertion. The added
+    ownership restriction is therefore not accepted. Both full frozen source
+    audits match 1,694/1,755 plus 61 exact omissions; original and retained
+    harness hashes are unchanged. Build `30090363205058948`, wrapper
+    `rchw-2e1793f9-f900-45e2-b9e6-2338645afb51`, terminal 101 acknowledged,
+    outputs retrieved and every ownership component released/retired.
+    Genuine local results are the existing probe's
+    `.rch-tmp/rabs-key473-proof/{run.json,list.log,tests.log}`;
+    tests log SHA-256 `aaf5234e4f4eb689765f5e0cf150df40bb5fad34963465321dcbfd2a27ac111e`.
+  - [x] Resolve the conflicting named-foreign-archive positive and missing-own-
+    OUT_DIR preflight negative using the retained producer-record contract;
+    neither existing assertion is weakened. Raw request planning now requires
+    its owner, while retained-key validation still admits complete foreign
+    archives. Both original assertions and all 473 key tests pass on `8130e3c9`.
+    The old `99d3bafa` cut retained the rejected trial and remains rejected.
+  - [x] Compile and run the corrected frozen key source. Source
+    `85dc06ed-overlay-99d3bafa-key-owner-rollback-4868e0d18f29b3c7f5a2bfa49738c76ed030127fb1c1722b45a0ebd11def2f68`
+    differs from the complete 1,755-file `99d3bafa` capture in that production
+    guard alone; both conflicting existing tests remain byte-identical.
+    First attempt `30090363205058949` exits 97 before Cargo: my extracted
+    snapshot lacks Git metadata, so RCH's existing tracked-source protection
+    cannot preserve six `rabs-wkr/src/target_cache/` source files against
+    `target_*/`. The strict source audit catches all six, not a product-test
+    failure. Retain that report and acknowledged/released terminal receipt.
+    Add only a private main-branch index containing the exact 1,755 manifest
+    paths; no source bytes, filters, omission allowance or Git commit changes.
+    The next source audit matches 1,694/1,755 plus exactly the original 61
+    omissions. Both 20G storage guards pass.
+  - [x] Corrected cut build `30090363205058950`, wrapper
+    `rchw-55bf8387-d024-4763-8c3b-8d5fa5c4a0ae`: actual locked/offline key
+    build 0 (172.994s), **473/473 tests passed, zero ignored** (11.555s).
+    Test-name sets exactly equal the rejected run's 473 names; its original
+    failed foreign-archive positive now passes. Timing is not a speedup claim.
+    Both full source audits and the 23,723,832-byte executable are unchanged;
+    harness SHA-256 `20000c142e54a9b93c3d8da2b7723adb02089e33a3df383e7bd32196fed6c9d0`.
+    CLI exits 0, retrieves results, acknowledges terminal state and releases/
+    retires every ownership component. Actual report:
+    `/Users/jemanuel/.local/state/rabs-key-owner-rollback-20261102/source/.rch-tmp/key-owner-rollback-indexed-proof/run.json`,
+    SHA-256 `0439a6b24df7d476a428508b7178a3bb98c6543562b8d7e802c369f0caacfb16`.
+  - [ ] Finish mandatory workspace/all-target check, strict Clippy and native
+    fmt for that corrected cut. A new strict one-slot managed job (session
+    86721, 10,800s compiler budget) runs all three with the original gates,
+    standard Cargo cache locking and full source audits. The separate daemon
+    development cache/source remain intact. Local corrected-cut fmt passes 0;
+    this is not an aggregate native QA verdict or daemon acceptance.
 - [ ] Validate consistent output-option refusal text from preflight and full
   planner while preserving identical unsupported-option rejection.
   - [x] Use the error's Display representation in the full planner.
@@ -1883,16 +1952,357 @@ Checked preparation subtasks earn no native acceptance credit.
   - [x] Preserve the original named test and all four assertions using a
     runtime task's Cx; remove only the dev feature and Cargo-generated lock
     edges. Locked metadata resolves proc-macros,tls; this is not compilation.
-- [ ] Freeze a combined source containing these repairs. The previously staged
+- [x] Freeze a combined source containing these repairs. Source
+  `85dc06ed-overlay-99d3bafa`, 1,755 files / 61 unchanged policy omissions,
+  archive SHA-256 `ab4e464dac207229119f05d49bac8e260727874ac069527af6fea8452442ed6c`.
+  It preserves the complete coherent shared capture plus the native owner fix
+  and updated TODO; it is not a clean Git or official RCH-generated receipt.
+  CSS unpack reverified 1,755/1,755; native compilation remains pending. The previously staged
   three-file `real-cx-locked5ab` capsule is unrun and does not cover the later
   repairs; do not use it as combined acceptance.
-- [ ] Preserve current terminal/ACK, genuine logs, original failures, exact
+- [x] Preserve current terminal/ACK, genuine logs, original failures, exact
   source-after audit and binaries before reusing its Cargo caches.
+  Actual SHA-256s: acknowledged journal `e9e548d565295c5004b5b43ac205355a250be981ac9d95b1f1b6157485b37999`,
+  partial run `53dd07c33a72047a5eeb7a1460105daa986ff3dd2de077553969da4a53d7bdf6`,
+  independent post-terminal source audit `7922bc5a7bc1d72b9a1b9957823c40518ab07f691b1942d781de8e08cf4cebb9`.
+  The successor must preserve the old harnesses before changing shared caches.
 - [ ] Run the combined native daemon and targeted regression cases, then the
   required workspace/all-target check, strict Clippy and fmt. Keep all original
   dependency budgets and record any remaining losses without suppressions.
+  - [x] Admit the fresh snapshot through managed RCH, wrapper
+    `rchw-baf4378c-d7e9-4c8b-82b4-cbf7b26b36f1`, build
+    `30080135327648098`, original 10,800s / one slot. Source audit is
+    1,694/1,755 plus 61 exact omissions / zero differences; three storage
+    guards and locked native metadata pass. Key controls above pass; the
+    normal-feature daemon build subsequently fails 101 (9,179.186s): my
+    reconnect-fixture edit scoped `hello` inside the closure, but the later
+    sealed-endpoint handshake still uses it. Compiler E0425 at
+    `completion_reservation_tests.rs:792` is retained in
+    `/Volumes/trj-data/rabs-daemon16-compile-error-20261102.log`.
+    All new daemon regressions and full daemon/doctor execution are unrun.
+    No aggregate pass exists.
+  - [x] Correct only that `hello` scope in the shared tree and isolated cut:
+    move the identical JSON value immediately before the reconnect closure.
+    Preserve the later sealed-endpoint assertion, every ACK/publication test,
+    the 64-request server cap and all original deadlines.
+  - [x] Stop only my obsolete `99d3bafa` daemon and `4868e0d1` quality runs
+    through supported exact-wrapper cancellation, after retaining the actual
+    compiler 101. Both recover at 143 with terminal acknowledgment and all
+    ownership released/retired. The quality cancellation initially reports
+    unconfirmed; supported recovery settles it. Its check/Clippy/native fmt
+    have no completed result. Both partial run reports stay partial.
+  - [x] Independently audit both physical source trees after recovery and
+    before Cargo-cache reuse: each matches 1,694/1,755 plus the exact 61
+    omissions, zero differences. Actual combined audit SHA-256
+    `401658d6cf6cf649d1a3981053cf619e4120a126c9e0d2f9dec99e5b627386e4`;
+    daemon terminal journal `352d03534ca896a18ce14530992be09929ad5c1c7231847705d401a8d33ee64a`.
+  - [x] Freeze the next full cut
+    `85dc06ed-overlay-99d3bafa-owner-rollback-hello-scope-b737841743340502d5d16537cbbdeee3ffb8e4dd296ec88fa23c41b14a74f5d0`.
+    Exactly two source files differ from `99d3bafa`: the rejected native owner
+    restriction is removed and the handshake value's scope is corrected.
+    No existing test/assertion/limit or manifest changes. Source manifest
+    SHA-256 `e052b886887e2a5e898ebba84d1a165afcdf0f6b4ce52dbce394373d0322836f`;
+    immutable driver `24177b4044a5f5779cd81e5a223ffc8478e2dcc561f4aea75ad2b49612877276`.
+  - [x] Complete that new strict one-slot, 10,800s managed job (session 91139):
+    fresh complete key suite, original daemon regressions/full suite, doctor,
+    and required workspace QA. Build `30090363205058952`, wrapper
+    `rchw-61a2a18c-3337-40f3-beed-8ada8f7bb20f`, actually compiles the daemon,
+    canonical and doctor harnesses (0, 104.175s) with normal Asupersync features.
+    Full key 473/473, actor 1/1, three cleanup cases 3/3, cancelled-worker and
+    replacement-generation 1/1 each, shutdown/selector 1/1 each and doctor 4/4
+    pass, all zero ignored. The old native-OUT_DIR negative remains red.
+    Full daemon: **1,460/1,464 passed, four failed, zero ignored**, raw 101,
+    78.277s. Every one of the prior 1,435 names remains in the new list.
+    Workspace check (876.37s), strict Clippy (269.01s) and native fmt (7.94s)
+    exit 0. Raw 101 results retrieved and terminal acknowledged, all ownership
+    retired. Complete source-after audit and every executable remain unchanged.
+    This remains a frozen cut, not current-main or release qualification.
+  - [x] Validate the four remaining native failures on the next corrected cut:
+    - [x] Keep both original native-library assertions unchanged. Apply the
+      missing-OUT_DIR check to raw request planning/preflight, where producer
+      ownership is not yet retained; leave complete foreign-tree key validation
+      intact. Add a cross-layer negative to the existing key positive case.
+    - [x] Preserve pure-codegen read-closure refusals, and give metadata
+      candidates the full output adapter's precise refusal before that gate.
+      Keep the existing output-option differential assertions unchanged.
+    - [x] Make all five mapped backing directories in the warmed generated
+      fixture explicitly 0700. Actual failure is a group-writable backing
+      ancestor under the test umask; production path ownership checks stay strict.
+    - [x] Reopen the empty-metadata fixture's CAS with its persisted
+      `workspace-lineage-fixture` cluster identity, matching its existing
+      restart peers. Keep old-authority invalidation and producer-count checks.
+    - [x] Preserve the exact preimages in
+      `/Volumes/trj-data/rabs-four-native-failures-before-20261102.tar` and
+      capture a full 1,755-file cut with exactly those five source-file changes:
+      `85dc06ed-overlay-b737-four-native-repairs-bc9abda79a1c0791c1c75a6bf80feaab744ceed4966a2bdebc7594edadc35d9c`.
+    - [x] Build that corrected key crate and run all 473 cases: exit 0,
+      **473/473 passed**, zero ignored, same test names. Build
+      `30090363205058953`, wrapper
+      `rchw-4e7a5dfb-5765-4024-a86d-d0dbe90a9387`, source before/after and
+      executable unchanged, results retrieved, terminal acknowledged and all
+      ownership retired. Original retired harness is preserved before cache
+      reuse. Report SHA-256 `ad89f6fd78a579e62e458848a9073a5927cfaf99883f42d482525e69d1824621`.
+    - [x] Complete the fresh corrected native run, build `30090363205058954`,
+      wrapper `rchw-84809c27-bfc3-4c53-aef9-e3109528eccd`: all four original
+      regressions now pass, key 473/473 and doctor 4/4 pass, zero ignored.
+      Full daemon **1,463/1,464 pass, one fails**, raw 101 (76.83s), with all
+      prior 1,464 names retained. Workspace check (249.28s), strict Clippy
+      (255.39s) and fmt (7.55s) exit 0. Source/executable audits unchanged,
+      45 result files retrieved, terminal 101 acknowledged and all ownership
+      retired. Actual failed runtime result remains preserved.
+    - [x] Inspect the new failure, `missing_read_evidence_is_rejected_by_preflight_and_the_full_planner`.
+      The precise metadata output refusal incorrectly preceded the required
+      read-evidence refusal. Move it after that check; leave every test and
+      assertion unchanged. Freeze all 1,755 inputs with only that source-file
+      difference as `85dc06ed-overlay-bc9-read-evidence-order-8130e3c94433c7e68550cfdb45b2c9a5e5c23aad9f7eee40c8d6e5e63bdfe5fd`.
+    - [x] Once the predecessor is acknowledged and releases its cache, build
+      and run the new preflight regression, all previous controls/full suites
+      and mandatory workspace QA on that exact corrected cut.
+      Build `30090363205058955`, wrapper
+      `rchw-77611d63-77cf-4c64-8fff-56174f0b1a93`: **473/473 key, 1,464/1,464
+      daemon and 4/4 doctor pass**, zero ignored; every prior daemon name remains.
+      All named actor, cleanup, cancellation, generation, original four repairs,
+      missing-read-evidence, shutdown and selection controls pass. Workspace
+      check 0/247.24s, strict Clippy 0/250.80s, fmt 0/7.29s. Source before/after
+      matches 1,694/1,755 plus the same 61 exact omissions, zero differences;
+      every original/retained executable hash unchanged. CLI exits 0, outputs
+      retrieved, terminal acknowledged and all ownership retired. Actual report
+      SHA-256 `4c4ecbf8b54cb3f03924a91d702182148af9a5031f898a2ffec34dcce249a722`;
+      terminal `55c6de8e73c4f92c82ed6481b7a47d7fe1c1062d59fddcb10f69a14b91c1ea40`.
+  - [x] Separately check the current shared tree's workspace formatting. Its
+    first run found two formatting diagnostics in newer concurrent
+    `rchd/src/workers.rs`; manually correct only those two whitespace hunks,
+    compare against the saved preimage, and re-run `cargo fmt --check` to 0.
+    File SHA-256 `9641c204be4fae617ca7ed07c2ce22b7415df2db1d492c8ecadfdbb814ad23b9`.
+    This file already differed from the frozen snapshot before formatting;
+    this is a shared-tree format result, not frozen native QA or runtime proof.
 - [ ] Re-run real Cargo acceptance with matching tools after native regressions
   settle; no unit-fixture result closes M6, S7, A012 or the fleet/storm gates.
+  - [x] Prepare and submit a separate strict managed job on the identical
+    frozen source. Reserve two slots for the original two-root overlap case;
+    each compiler remains `-j1`, all original test/deadline/namespace gates stay.
+    Before shared-cache reuse, validate the actual successful predecessor ACK
+    and preserve its four harnesses and daemon outside the cache. Build all
+    four matching development binaries: daemon, wrapper, worker, Cargo-root helper.
+  - [x] Execute the original persistent-service overlap/cancellation/private-
+    target reuse case with matching development binaries. Actual **0/1, raw101**,
+    121.42s: `toolchain capture interrupted` at the existing 120s warmup bound,
+    before reaching overlap/cancellation assertions. The prior optimized404
+    failure remains preserved too; no cause is inferred from host contention.
+  - [ ] Resolve that warmup blocker and pass the original service case, keeping
+    its full selected toolchain and all original budgets/assertions.
+  - [x] Pass genuine cross-worktree local-cache qualification, invalidation,
+    build-script/proc-macro and forged-request controls in its existing case:
+    **1/1, zero ignored, 1055.53s**. All three initial fresh-target compiler
+    samples execute; the next worktree earns its two installed dependency hits;
+    changed source invalidates, and real project executors cannot forge authority.
+  - [x] Execute the original actual Cargo/TLS worker case: **0/1, raw101**,
+    295.74s. Cargo itself succeeds, but the unchanged assertion requires four
+    actual worker executions and observes zero. All four units report
+    `edge runtime cohort: runtime cohort invalid: nonabsolute or unrepresentable ELF library path`;
+    dependencies execute/commit locally and workspace units pass through.
+    Successful Cargo fallback is not remote-worker acceptance.
+  - [x] Retrieve actual runtime results and acknowledge terminal ownership:
+    build `30090363205058956`, wrapper
+    `rchw-d5b71c27-28b0-447b-aceb-2d8346a3f71e`, CLI101, all ownership retired.
+    Four matching normal-graph development binaries compile in 565.40s; actual
+    Asupersync artifacts have no test-internals. Full canonical list is now 57;
+    this run selects three, **one passed/two failed**, all zero ignored.
+    Source before/after matches 1,694/1,755 plus the original 61 omissions;
+    every retained tool/harness/daemon remains unchanged. Actual report SHA-256
+    `7c0bd56218d50ed27683f0a2b809f7f66cfddf7b6d884fa3598a88db650656e5`;
+    terminal `13959a440edbfccabdfb10c041eb642bb71285ef7ef739e8f9518b9685ea716f`.
+  - [x] Reproduce the ELF refusal with real `ldd` on the exact pinned rustc.
+    Its driver resolves through `bin/../lib`, and LLVM through
+    `bin/../lib/../lib`. These normal Rust RPATHs conflict with the strict
+    generic parent-component refusal. No TLS transport pass is claimed.
+  - [x] Apply a candidate retained-toolchain-only correction in
+    `rabs-sandbox/src/runtime_cohort.rs`: every traversed canonical prefix must
+    remain in the complete held toolchain; generic host-parent, relative,
+    unresolved, ambiguous-name and interpreter traversal refusals remain.
+    Existing assertions stay; add one owned-root/deduplication positive with
+    five negatives including escape-and-return, symlink escape and empty segments.
+    Gate admission split: newly admits contained standard Rust DSO RPATHs;
+    continues refusing unbound and external traversals. This needs native proof.
+  - [x] Compile and run that first corrected full cut
+    `85dc06ed-overlay-813-retained-elf-paths-de5efa663fe6e00cba17a964549ae0d290c3e31f3e6e0e568e4ffe5b294549ed`:
+    all runtime-cohort cases, all 473 key/1,464 daemon cases and previous
+    controls/doctor, then required workspace compiler/strict-Clippy/fmt checks.
+    Manifest `9c16daf7d1725ffa9b3b72c258ea9368152b8449e95d5d920dcccbee74ba7f45`,
+    immutable driver `d7093575de045093b0e81bd1274710ba1b980c26aae97e6bad889ea43925eb3a`.
+    Build `30090363205058957`, wrapper
+    `rchw-b588e4db-a599-4a12-a574-0d11703c1636`: new RPATH positive and old
+    strict-refusal case pass; all 27 cohort tests run, **21 pass/six fail**,
+    zero ignored. All six fail on their positive retention parent's ownership/
+    privacy precondition. Key 473/473, daemon 1,464/1,464 (78.10s), doctor4/4
+    and all original controls pass; every old daemon name remains.
+    Preserve all five executable copies before stopping ONLY this owned job's
+    superseded workspace checks. Actual cancellation143/ACK retires all ownership;
+    compiler check interrupted, Clippy/fmt unrun. Original partial report still
+    has no aggregate exit or source-after. Separate post-terminal physical audit
+    matches 1,694/1,755 plus 61 omissions, zero differences, all cached/retained
+    harness and daemon hashes unchanged. Partial report SHA-256
+    `5e8543252163f1846fb5fa6ab0bc0e476c8c4fe52caf6fd535a1da685a52a12b`;
+    separate audit `1d5b93849c98a8acb081ca9f96c940067ac37be128763bbf743ba29097770da0`.
+  - [x] Correct only the six positive fixtures to use atomic private directory
+    creation, and make the new parser fixture private too. The pinned library's
+    default temporary-directory permissions are 0777 before umask; select 0700
+    explicitly through [Builder::permissions](https://docs.rs/tempfile/3.25.0/tempfile/struct.Builder.html#method.permissions).
+    Production privacy checks remain unchanged. Add an explicitly 0770 parent
+    that must still be rejected. Production Rust before cfg(test) is byte-
+    identical to the preceding candidate; all original assertions remain.
+  - [x] Freeze the complete resulting cut
+    `85dc06ed-overlay-de5-private-runtime-fixtures-be324720b65da5e86a5a21f79f213652b47715934d9e5ffc464b7882e6c3c52f`
+    (manifest `a97d6fb709ffe8ef383a39b6ab5cdc16afe299fd75e712c57d99a5a34cae1707`)
+    and independently compile/run all **27/27 cohort tests, zero ignored**,
+    7.25s. Build `30090363205058958`, wrapper
+    `rchw-c5391486-3bed-433f-8794-fc4ac11d10c5`: CLI0, six result files retrieved,
+    source before/after and executable unchanged, terminal ACK/all ownership
+    retired. This scoped pass does not substitute for full QA or actual TLS.
+    Report SHA-256 `acfc2e64cb667443b1085aa2f246a6131479d9eaab441761fe32644d82573946`.
+  - [ ] Finish complete fresh validation of that corrected cut: build
+    `30091812672634881`, wrapper `rchw-63aa0886-2836-4b9b-927f-8bf12e10aece`,
+    strict one-slot 10,800s job (session34196). Actual **27/27 cohort, 473/473
+    key, 1,464/1,464 daemon and 4/4 doctor pass**, zero ignored; all prior daemon
+    names and original controls retained. Workspace check exits0 (304.2s).
+    Strict Clippy, fmt, final source/executable audit and terminal retrieval pending.
+  - [x] Preserve the first optimized DSR setup failure on old813:
+    run `18488377-bd18-4054-ac6f-b290cc0ef718`, frontend6/native1 before Cargo.
+    SBH observes 13.9103% free below its unchanged 14% pressure floor, despite
+    passing the absolute 20G need. Source-before is 1,697/1,755 with 58 omissions
+    all within the original 61 metadata exclusions, zero differences. The report
+    remains partial: no compilation, runtime, aggregate exit or source-after.
+    It is an ordinary dirty-worktree development build, not strict release proof;
+    DSR's generic purpose/publishable metadata is not publication authorization.
+  - [x] Select an independently healthy build filesystem on the same worker:
+    new private `/bulk/rabs-lilacshore-native-20261102` on ZFS, 10.89TB free,
+    68.69%, SBH original 20G/pressure checks pass. Fork the three Cargo caches
+    there without deleting or changing the old caches. Existing XFS reflink
+    controls and their storage guard stay on XFS; `/tmp` is unchanged.
+  - [ ] After corrected native QA, build matching optimized tools via DSR on
+    that qualified storage and rerun the original TLS and service cases with
+    the same complete selected toolchain, namespace checks and deadlines.
+    No full57, optimized-overhead, fleet, soak, signing or release acceptance yet.
+    Preparation uses a separate complete be324 working-tree snapshot and private
+    DSR configuration with build/cache/compiler-temporary storage on the healthy
+    ZFS volume. Original real tests still use `/tmp`, their complete selected
+    toolchain and existing deadlines. Fresh DSR host health is0; the native
+    optimized runner is staged but waits for the actual successful full-QA ACK.
+  - [x] Read-only prerequisite inventory on distinct Linux hosts `trj`
+    (`threadripperje`) and `ts1` (`thinkstation1`): bwrap, cc, ar and OpenSSL
+    resolve on both; no RABS tools resolve on either login PATH. Actual basic
+    user/PID/network namespace probes with read-only `/` and `/usr/bin/true`
+    exit 0 on both. This is neither full production sandbox support nor
+    cross-host RABS execution/singleflight/authority/performance proof.
+    At this probe ts1 `/tmp` has 9,538,531,328 bytes free, below the current
+    20G guard; its NAS has 15,870,990,163,968 bytes free. Select and measure
+    a qualifying real temporary/state filesystem before any such run; do not
+    lower the guard. No daemon, slot, priority, active job or worker setting changed.
+
+**Mac client build enabler — DSR only, separate clean source `85dc06ed`.**
+This unblocks development tooling; it is not the RABS `99d3bafa` runtime verdict
+or delivery of the four RABS tools. Keep S7 open.
+
+- [x] Fresh default DSR checks: mmini fails with 10.37 GiB free; mminiold
+  fails because its configured ExtData build volume is 96% used. Retain the
+  unchanged 20 GiB minimum and usage thresholds.
+- [x] Create one new, fully allocated 64 GiB file on mminiold's external
+  ExFAT volume (1.8 TB free before allocation), containing case-sensitive APFS.
+  `/Volumes/USBNVME16TB/DSR_RCH_NATIVE_20261102.dmg` is mounted at
+  `/Volumes/DSR_RCH_NATIVE_20261102`. No existing file, device or volume was
+  overwritten. The file stays retained; no deletion is authorized.
+- [x] Prove ownership enabled, private directory 0700 and file modes
+  0755/0644/0600 preserved exactly. Fresh per-run DSR health passes 0:
+  build root 63.69 GiB free; root/home remain warned at 24.63 GiB, above
+  the unchanged minimum. Only the isolated DSR config selects this new path;
+  global hosts/configuration remain unchanged.
+- [x] Prepare clean main `85dc06edb34010930d443977e43eaf43f07e5892`
+  in `/Users/jemanuel/.local/state/rch-mac-source-85dc-20261102`, local
+  diagnostic tag `v2.1.34-rchdiag.85dc06ed`, no source edits or new code commit.
+  Pin nightly-2026-08-31, the actual CLT SDK and one Cargo job.
+- [x] Verify all 409 files of the frozen DSR engine against its manifest.
+- [x] Actual first run `f11d4094-0b63-45dd-90a4-383c5589b8c7` passes
+  source/cache admission: 710 locked registry packages, five Git packages,
+  54,540 authenticated source files. It then fails before Cargo (DSR 6,
+  native setup 1): the recipe redirected into an uncreated target directory.
+  Preserve `/Volumes/trj-data/rch-mac-native-99d3-20261102/build.log` and
+  `recipe-before-target-directory.yaml`; this was my recipe error.
+- [x] Add only target-directory creation before redirection and submit a fresh
+  DSR diagnostic attempt (session 14521). The per-run directory name retains
+  an earlier planning label; the actual Mac source is clean `85dc06ed`, not
+  the RABS `99d3bafa` overlay. No prior failure is converted to a pass.
+- [x] Compile all three native Mac RCH binaries through DSR. Run
+  `4b7bfc7a-4b41-4027-8969-c2db777833e8` completes 0 in 811 seconds:
+  clean `85dc06ed`, pinned nightly, native `aarch64-apple-darwin`, three
+  successful Cargo binary artifacts. Purpose is diagnostic-native;
+  publishable/signing are false. This is not full-package tests or RABS proof.
+- [x] Run the built client's version/source check and JSON config read;
+  all three binary hashes remain unchanged. Retain actual native build/smoke
+  outputs in `/Volumes/trj-data/rch-mac-native-99d3-20261102/native-results`.
+- [x] Retrieve and verify the 11,134,795-byte diagnostic bundle, SHA-256
+  `dc68fa154235c474ff93928d9be90f92b4700c808f201354b4e64914a68de45c`.
+  Its three regular arm64 Mach-O binaries match the native artifact hashes.
+  Extract privately under `~/.local/state/rch-mac-client-85dc-20261102/bin`.
+- [x] Run private-client read-only probes: version, config, current daemon and
+  workers list all pass (4/4, 17 workers). Before/after controls preserve the
+  default client hash and daemon uptime; all candidate hashes remain unchanged.
+- [x] Attempt the existing hello_world fixture as a real strict managed job,
+  with predeclared positive 10 passed/0 failed/3 ignored and all-cases
+  11 passed/2 intentionally failed/0 ignored, preserving Cargo exit 101.
+  First attempt refuses an out-of-canonical-root scratch directory (103).
+  Copying the same five source files into the configured canonical root
+  reaches trj selection but namespace initialization refuses before any source
+  or execution grant: `RCH_SOURCE_NAMESPACE_CONTROL_UNSETTLED status=0`,
+  worker status 73, CLI 103. Build `30090363205058943`, wrapper
+  `rchw-7c221dc7-6608-4ce2-ab2c-3c20e37caf86` is terminal/acknowledged;
+  there is no execution recovery record. Neither Cargo case ran.
+  Retain both `mac-client-real-job.log` and `mac-client-canonical-root-job.log`
+  under the same `/Volumes/trj-data/rch-mac-native-99d3-20261102` directory.
+- [ ] Finish diagnosing the original namespace-control interruption before
+  considering default-client replacement. Real managed-job execution and
+  retrieval subsequently complete below. A separate exact-85dc finite
+  controller/printf probe passes on trj; that alone does not validate topology
+  initialization. No timeout, ownership guard, default binary, daemon, worker
+  slot or priority was changed. No public release or global install yet.
+- [x] Diagnose the configured-path mismatch: Mac canonical root is
+  `/Users/jemanuel/projects`, but worker `/dp` points to `/data/projects`.
+  A private sibling alias also refuses because its parent is root-owned 0755;
+  no existing alias, ownership or mode is repaired or replaced. Select the
+  existing supported off-root route with the exact five-file fixture as
+  `RCH_CANONICAL_PROJECT_ROOT`; the worker stages under its configured
+  `/data/tmp/rch/offroot/` and requires no global alias. Two attempts on this
+  route refuse before execution; the first reports a killed source-lock
+  supervisor without completion receipt. Their journals acknowledge terminal
+  cancellation and all releases. The cause of that interruption is unresolved.
+- [x] Complete the same real workload through that route, with optional config
+  cache disabled to avoid mixed-version cache churn and proper debug logging.
+  Do not infer that cache isolation caused the earlier interruption to stop.
+  Build `30090363205058947`, wrapper
+  `rchw-77b655f9-f3f2-442f-b218-45050c324d94`, actually compiles and executes
+  on Linux `threadripperje`: positive Cargo exit 0, 10 passed/0 failed/3
+  pre-existing ignored (13.028s); all existing cases including ignored exit
+  101, 11 passed/2 intentional failures/0 ignored (3.018s). The unchanged
+  exclusive launch marker records one execution. CLI preserves 101 and retrieves
+  all three portable result files; both source audits match 5/5 files.
+- [x] Freshly inspect retrieved Cargo logs/report and the terminal journal:
+  result phase complete, returned/remote exit 101, terminal acknowledged,
+  sources/pair released, tree retired and ownership retired. Candidate hashes
+  remain unchanged 3/3. Actual retrieved report is
+  `/Users/jemanuel/projects/rch_client_probe_85dc_20261102/.rch-tmp/client-pipeline-proof/run.json`,
+  SHA-256 `9846a655e5700b30294cda1e9f060f35b9e364ee2011d71bdff854825aec7bb7`.
+  Raw client log is `mac-client-isolated-diagnostic-job.log` in the DSR run's
+  controller directory. This proves the private RCH transport path, including
+  nonzero result delivery; it does not qualify RABS Cargo/TLS/fleet serving.
+  A fresh daemon query confirms uptime increased from 73,665 to 75,638 seconds
+  and the default client hash is unchanged. Its admission subresponse remains
+  `unknown` because the old daemon's response lacks the new `success` field;
+  read-only connectivity and this one managed job do not prove full protocol
+  compatibility with the installed daemon.
+- [ ] Investigate the retained pre-execution supervisor interruption before
+  treating this single success as reliability evidence. Keep the default client
+  and live daemon intact until a separate scoped rollout is justified.
+- [ ] Continue S7's original RABS packaging, portable-platform, signing and
+  installation/upgrade acceptance separately; this RCH client is an enabler.
 
 - [x] Merge upstream d05cefb2/a1fe627c without changing the running e808 source.
   The sole conflict is the same six-case mutation-table type alias; all cases

@@ -1052,6 +1052,14 @@ fn plan_in_profile(
         return Err(LiveRefusal::UnrepresentablePath(out_dir));
     }
     let generated_root = env_value(request.env, "OUT_DIR").map(str::to_owned);
+    // Raw Cargo requests with direct native-library directives need their
+    // package's build-script owner before observation can begin. Retained-key
+    // validation separately checks complete foreign trees and named archives;
+    // that stronger evidence must not be mistaken for request admission.
+    if canonical_archive_execution && !invocation.native_libs.is_empty() && generated_root.is_none()
+    {
+        return Err(LiveRefusal::MissingEnv("OUT_DIR"));
+    }
     if let Some(root) = &generated_root
         && (!plain_path_in_profile(root, canonical_cargo)
             // Dep-info replay substitutes the compiler output placement.
