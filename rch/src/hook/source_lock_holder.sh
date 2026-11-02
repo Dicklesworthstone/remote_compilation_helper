@@ -94,7 +94,13 @@ if monitor:
     os.close(0)
     if finite_rpc:
         os.close(3)
-    signal.sigwait({signal.SIGCHLD})
+    # sigwaitinfo consumes the same blocked notification without reaping.
+    # Keep sigwait for platforms that lack the optional diagnostic detail.
+    notification = None
+    if hasattr(signal, "sigwaitinfo"):
+        notification = signal.sigwaitinfo({signal.SIGCHLD})
+    else:
+        signal.sigwait({signal.SIGCHLD})
     # Revoke the exact child first, including one stopped before setsid.
     # Then signal its still-pinned group unconditionally: inspecting getpgid
     # first would race setup, and zombie getpgid is not portable. Only this
@@ -118,8 +124,12 @@ if monitor:
             and receipt.endswith(b"\n") and receipt[:-1].isdigit()
             and 0 <= int(receipt) <= 255):
         sys.exit(int(receipt))
+    detail = "" if notification is None else (
+        "; notification_pid=" + str(notification.si_pid)
+        + "; notification_code=" + str(notification.si_code)
+        + "; notification_status=" + str(notification.si_status))
     diagnostic(family + "_SUPERVISOR_TERMINATED: no holder completion receipt; "
-               + "durable ownership retained; status=" + str(status))
+               + "durable ownership retained; status=" + str(status) + detail)
     sys.exit(73)
 
 os.close(receipt_read)

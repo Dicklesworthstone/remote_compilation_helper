@@ -213,8 +213,10 @@ class Holder:
         command += "exec sh -c {} {} {}".format(
             shlex.quote(script), shlex.quote(script), shlex.join(args))
         if session_idle is not None:
-            # Match source_authority_live_session_command: the supervisor
-            # receives the whole holder script on fd 3, never through argv.
+            # Exercise the observer primitive directly so its PID remains
+            # this fixture's signal target. The production stdin transport
+            # retains its delivery shell to own heredoc-writer children.
+            # The supervisor receives the holder on fd 3, never through argv.
             command = ("set -eu\nexec 3<<'RCH_SOURCE_LOCK_SESSION_PROGRAM'\n{}\n"
                        "RCH_SOURCE_LOCK_SESSION_PROGRAM\nexec sh -c {} {} --rch-session {}"
                        ).format(command, shlex.quote(script), shlex.quote(script), session_idle)
@@ -1853,6 +1855,19 @@ class SourceLockHolderTests(unittest.TestCase):
         self.assertEqual(claim.read_text(), "durable owner\n")
         self.assertTrue(available(lock))
 
+    def test_session_sigwait_fallback_keeps_exact_release(self):
+        env = self.session_python_environment(
+            "if hasattr(signal, 'sigwaitinfo'):\n"
+            "    delattr(signal, 'sigwaitinfo')")
+        holder, lock, claim, receipt, release = self.session_fixture(idle=90, env=env)
+        holder.send(release + "\n")
+        stdout, stderr = holder.finish()
+        self.assertEqual((holder.process.returncode, stdout, stderr),
+                         (0, (release + "\n").encode(), b""))
+        self.assertEqual(receipt.read_text(), release + "\n")
+        self.assertEqual(claim.read_text(), "durable owner\n")
+        self.assertTrue(available(lock))
+
     def test_session_descendant_receives_child_exit_after_inherited_blocked_sigchld(self):
         env = self.session_python_environment(
             "signal.signal(signal.SIGCHLD, signal.SIG_IGN)\n"
@@ -1939,6 +1954,10 @@ class SourceLockHolderTests(unittest.TestCase):
         stdout, stderr = holder.finish()
         self.assertEqual((holder.process.returncode, stdout), (73, b""))
         self.assertIn(b"RCH_SOURCE_LOCK_SUPERVISOR_TERMINATED", stderr)
+        if hasattr(signal, "sigwaitinfo"):
+            self.assertIn(("notification_pid=" + str(monitor)).encode(), stderr)
+            self.assertIn(("notification_code=" + str(signal.CLD_STOPPED)).encode(), stderr)
+            self.assertIn(("notification_status=" + str(signal.SIGSTOP)).encode(), stderr)
         self.assertEqual(claim.read_text(), "durable owner\n")
         self.assertTrue(available(lock), "stopped monitor stranded inherited source locks")
 
@@ -1952,6 +1971,9 @@ class SourceLockHolderTests(unittest.TestCase):
         stdout, stderr = holder.finish()
         self.assertEqual((holder.process.returncode, stdout), (73, b""))
         self.assertIn(b"RCH_SOURCE_LOCK_SUPERVISOR_TERMINATED", stderr)
+        if hasattr(signal, "sigwaitinfo"):
+            self.assertIn(("notification_pid=" + str(os.getpid())).encode(), stderr)
+            self.assertIn(b"notification_status=0", stderr)
         self.assertEqual(claim.read_text(), "durable owner\n")
         self.assertFalse(receipt.exists())
         self.assertTrue(available(lock))
