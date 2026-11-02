@@ -137,6 +137,17 @@ def process_snapshot(heartbeat=lambda: None):
     return result
 
 
+def darwin_leader_start(group, boot):
+    # Native witness rejects dead/zombie leaders and rechecks birth and group
+    # membership. A whole-machine ps census adds no owner identity evidence.
+    witness = subprocess.check_output(
+        ["rch-wkr", "process-identity", str(group)], timeout=1, text=True
+    ).split()
+    if len(witness) != 3 or witness[0] != boot or int(witness[2]) != group:
+        raise BudgetFailure("monitor_unavailable", detail="unverified Darwin group identity")
+    return witness[1]
+
+
 def leader_start(group, snapshot):
     record = snapshot.get(group)
     if record is None or record["state"] in ("Z", "X"):
@@ -144,12 +155,7 @@ def leader_start(group, snapshot):
     if sys.platform == "darwin":
         # ps display timestamps are too coarse to fence PID reuse. Reuse the
         # worker's native kernel birth witness, already required for recovery.
-        witness = subprocess.check_output(
-            ["rch-wkr", "process-identity", str(group)], timeout=1, text=True
-        ).split()
-        if len(witness) != 3 or witness[0] != boot_identity() or int(witness[2]) != group:
-            raise BudgetFailure("monitor_unavailable", detail="unverified Darwin group identity")
-        return witness[1]
+        return darwin_leader_start(group, boot_identity())
     return record["start"]
 
 
@@ -404,6 +410,10 @@ class Monitor:
     def check_owner(self):
         if os.getppid() != self.parent:
             raise BudgetFailure("interrupted", detail="disk guardian disappeared")
+        if sys.platform == "darwin":
+            if darwin_leader_start(self.group, self.boot) != self.start:
+                raise BudgetFailure("interrupted", detail="build group leader changed")
+            return
         if sys.platform.startswith("linux"):
             try:
                 snapshot = {self.group: linux_process("/proc/" + str(self.group) + "/stat")}

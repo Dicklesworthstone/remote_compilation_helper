@@ -29,6 +29,36 @@ MARKER = "RCH_TEST_ATTEMPT_DISK_BUDGET:"
 
 
 class DiskMonitorTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin native identity")
+    def test_darwin_owner_rejects_live_nonleader(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.processes.append(child)
+        self.assertNotEqual(os.getpgid(child.pid), child.pid)
+        with self.assertRaises(monitor.BudgetFailure):
+            monitor.darwin_leader_start(child.pid, monitor.boot_identity())
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin native identity")
+    def test_darwin_owner_native_identity_survives_census_failure(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+        self.processes.append(child)
+        value = monitor.Monitor.__new__(monitor.Monitor)
+        value.parent, value.group, value.boot = os.getppid(), child.pid, monitor.boot_identity()
+        value.start = monitor.darwin_leader_start(value.group, value.boot)
+        with patch.object(monitor, "process_snapshot", side_effect=AssertionError("unrelated census")):
+            value.check_owner()
+            value.start = str(int(value.start) + 1)
+            with self.assertRaises(monitor.BudgetFailure):
+                value.check_owner()
+            value.start = monitor.darwin_leader_start(value.group, value.boot)
+            value.boot = "00000000-0000-0000-0000-000000000000"
+            with self.assertRaises(monitor.BudgetFailure):
+                value.check_owner()
+            value.boot = monitor.boot_identity()
+            child.terminate()
+            child.wait(timeout=3)
+            with self.assertRaises(subprocess.CalledProcessError):
+                value.check_owner()
+
     @unittest.skipUnless(sys.platform == "darwin", "Darwin process census")
     def test_darwin_census_omits_reaped_probe_but_keeps_live_child(self):
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
