@@ -30,7 +30,8 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-const VERSION: &str = "canonical-private-target-v1";
+const VERSION: &str = "canonical-private-target-v2";
+const LEGACY_VERSION: &str = "canonical-private-target-v1";
 const DIGEST_DOMAIN: &[u8] = b"rabs.canonical-private-target.metadata.v1\0";
 const METADATA: &str = "metadata.json";
 const FAMILIES_ROOT: &str = "private-target-v2";
@@ -119,9 +120,9 @@ struct SeedPayload {
     source: Vec<SourceRow>,
     source_times: SourceTimestamps,
     target: PrivateTreeSnapshot,
-    // Older private seeds carry no committed installation provenance. Omitting
-    // an empty inventory preserves their exact payload checksum while granting
-    // no authority to their otherwise independently verified target files.
+    // Preserve integrity checks and inventory for older generations. They lack
+    // terminal completion provenance and cannot be restored; omitting empty
+    // rows keeps their original checksum valid until a successful v2 capture.
     #[serde(default, skip_serializing_if = "CommittedOutputSeeds::is_empty")]
     committed_outputs: CommittedOutputSeeds,
 }
@@ -502,7 +503,7 @@ impl<'a> TargetFamily<'a> {
         private_metadata(&metadata)?;
         let envelope: SeedEnvelope = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
         require(
-            envelope.payload.version == VERSION
+            matches!(envelope.payload.version.as_str(), VERSION | LEGACY_VERSION)
                 && payload_digest(&envelope.payload)? == envelope.sha256,
             "private target metadata version or digest differs",
         )?;
@@ -869,6 +870,13 @@ impl<'a> TargetState<'a> {
                 return Err(error);
             }
         };
+        // v1 can contain a terminal cache success without its completion
+        // provenance. Keep the valid retained generation intact, and execute
+        // cold before copying target bytes or changing source timestamps. Only
+        // a later successful capture replaces it through the normal transaction.
+        if seed.version != VERSION {
+            return Ok(false);
+        }
         require(
             !fresh_empty_target.starts_with(&self.workspace)
                 && !self.workspace.starts_with(fresh_empty_target),
@@ -1343,6 +1351,178 @@ mod tests {
         assert!(cache.restore(target.path()).unwrap());
         let restored = cache.take_restored_provenance().unwrap();
         assert!(restored.seeds_for(target.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn legacy_seed_stays_intact_on_cold_miss_until_a_valid_v2_capture() {
+        for with_producers in [false, true] {
+            let state = private();
+            let key = [75; 32];
+            let workspace = private();
+            let manifest = source(workspace.path(), b"source");
+            let target = private();
+            completed_target(target.path(), b"legacy target artifact");
+            let seeds = if with_producers {
+                sample_committed_outputs(target.path())
+            } else {
+                CommittedOutputSeeds::default()
+            };
+            TargetState::open(
+                state.path(),
+                &config(),
+                key,
+                workspace.path(),
+                &manifest,
+                &|| false,
+            )
+            .unwrap()
+            .capture(target.path(), &seeds)
+            .unwrap();
+            let family = family_path(state.path(), key);
+            let metadata = family.join("seed/metadata.json");
+            let mut envelope: SeedEnvelope =
+                serde_json::from_slice(&fs::read(&metadata).unwrap()).unwrap();
+            envelope.payload.version = LEGACY_VERSION.into();
+            envelope.sha256 = payload_digest(&envelope.payload).unwrap();
+            fs::write(&metadata, encode(&envelope).unwrap()).unwrap();
+            last_used(state.path(), key, 123);
+            let before =
+                PrivateTreeSnapshot::capture(&family.join("seed"), config().max_bytes, &|| false)
+                    .unwrap();
+            let recency = fs::metadata(&family).unwrap().modified().unwrap();
+
+            let next_workspace = private();
+            let next_manifest = source(next_workspace.path(), b"source");
+            File::open(next_workspace.path().join("lib.rs"))
+                .unwrap()
+                .set_times(FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(2000)))
+                .unwrap();
+            let source_times =
+                SourceTimestamps::capture(next_workspace.path(), &next_manifest, &|| false)
+                    .unwrap();
+            let cancelled = Cell::new(false);
+            let stopped = || cancelled.get();
+            let mut cache = TargetState::open(
+                state.path(),
+                &config(),
+                key,
+                next_workspace.path(),
+                &next_manifest,
+                &stopped,
+            )
+            .unwrap();
+            assert_eq!(
+                cache.family.load_seed().unwrap().unwrap().version,
+                LEGACY_VERSION
+            );
+            let cold_target = private();
+            assert!(!cache.restore(cold_target.path()).unwrap());
+            assert!(cache.take_restored_provenance().is_none());
+            assert!(fs::read_dir(cold_target.path()).unwrap().next().is_none());
+            assert_eq!(
+                SourceTimestamps::capture(next_workspace.path(), &next_manifest, &|| false)
+                    .unwrap(),
+                source_times
+            );
+            assert_eq!(
+                PrivateTreeSnapshot::capture(&family.join("seed"), config().max_bytes, &|| false)
+                    .unwrap(),
+                before
+            );
+            assert_eq!(fs::metadata(&family).unwrap().modified().unwrap(), recency);
+            cancelled.set(true);
+            assert_eq!(
+                cache
+                    .capture(cold_target.path(), &CommittedOutputSeeds::default())
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::Interrupted
+            );
+            assert_eq!(
+                PrivateTreeSnapshot::capture(&family.join("seed"), config().max_bytes, &|| false)
+                    .unwrap(),
+                before
+            );
+            cancelled.set(false);
+            completed_target(cold_target.path(), b"new cold compilation artifact");
+            let next_seeds = if with_producers {
+                sample_committed_outputs(cold_target.path())
+            } else {
+                CommittedOutputSeeds::default()
+            };
+            cache.capture(cold_target.path(), &next_seeds).unwrap();
+            assert_eq!(cache.family.load_seed().unwrap().unwrap().version, VERSION);
+            drop(cache);
+            assert_eq!(
+                restore_family(state.path(), &config(), key).unwrap(),
+                b"new cold compilation artifact"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_seed_retains_empty_terminal_completion_rows_in_the_verified_target_copy() {
+        let state = private();
+        let key = [76; 32];
+        let workspace = private();
+        let manifest = source(workspace.path(), b"source");
+        let target = private();
+        fs::create_dir_all(target.path().join("debug/deps")).unwrap();
+        let output = target.path().join("debug/deps/libterminal.rmeta");
+        fs::write(&output, b"").unwrap();
+        let object = crate::edge::live_facts::digest_stable(&output).unwrap().1;
+        // Publication identities are synthetic storage fixtures. Current CAS
+        // authority and revocation are covered by the completion-registry tests.
+        let seeds: CommittedOutputSeeds = serde_json::from_value(serde_json::json!({
+            "outputs": [],
+            "terminal_completions": [{
+                "path": "/__rabs/out/cargo/debug/deps/libterminal.rmeta",
+                "action": vec![1_u8; 32], "descriptor": vec![2_u8; 32],
+                "manifest": vec![3_u8; 32], "policy": "leaf",
+                "virtual_path": b"libterminal.rmeta".to_vec(), "object": object.bytes,
+            }],
+        }))
+        .unwrap();
+        let expected = serde_json::to_value(&seeds).unwrap();
+        let mut cache = TargetState::open(
+            state.path(),
+            &config(),
+            key,
+            workspace.path(),
+            &manifest,
+            &|| false,
+        )
+        .unwrap();
+        cache.capture(target.path(), &seeds).unwrap();
+        let restored = private();
+        assert!(cache.restore(restored.path()).unwrap());
+        let provenance = cache.take_restored_provenance().unwrap();
+        assert_eq!(
+            serde_json::to_value(provenance.seeds_for(restored.path()).unwrap()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            fs::metadata(restored.path().join("debug/deps/libterminal.rmeta"))
+                .unwrap()
+                .len(),
+            0
+        );
+        let metadata = family_path(state.path(), key).join("seed/metadata.json");
+        let mut encoded: serde_json::Value =
+            serde_json::from_slice(&fs::read(&metadata).unwrap()).unwrap();
+        assert_eq!(encoded["payload"]["version"], VERSION);
+        assert_eq!(encoded["payload"]["committed_outputs"], expected);
+        encoded["payload"]["committed_outputs"]["terminal_completions"][0]["manifest"][0] =
+            serde_json::json!(9);
+        fs::write(&metadata, serde_json::to_vec(&encoded).unwrap()).unwrap();
+        assert!(
+            cache
+                .family
+                .load_seed()
+                .unwrap_err()
+                .to_string()
+                .contains("digest differs")
+        );
     }
 
     #[test]

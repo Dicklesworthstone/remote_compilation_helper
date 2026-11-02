@@ -1621,6 +1621,11 @@ results never grant early metadata readiness or become reusable dependency
 producers, including when a compiler emits nonempty terminal metadata. Existing
 library and producer-witness nonempty checks are unchanged.
 
+Warm private targets retain terminal completion validity separately from
+dependency-producer authority. Restoring Cargo's terminal fingerprints therefore
+rechecks the original terminal publication and its quarantine before Cargo can
+treat the unit as Fresh.
+
 Broad selections such as `check --all-targets` can leave earlier terminal
 outputs visible in later units' search directories. Exact empty metadata stays
 in the keyed and materialized input inventory without becoming a producer.
@@ -2115,6 +2120,22 @@ metadata-check consumer can therefore use its committed-dependency cache after
 a source edit while unchanged parents remain Cargo-Fresh, subject to the usual
 sampling and input checks.
 
+Verified terminal metadata completions have a separate inventory under the same
+seed integrity seal. Each entry binds the terminal policy, action, descriptor,
+manifest and installed metadata bytes. Restore verifies its own action, class
+and output-object standing, together with any required producer ancestry, before
+Cargo starts. Terminal entries never create dependency installation witnesses or
+early metadata readiness, even when their metadata is nonempty. Both producer
+and terminal completion standing are checked again before accepting the current
+command's completion, including when optional target capture fails.
+
+Completion-aware target seeds use payload version 2. An integrity-valid version
+1 seed remains available for existing inventory and recovery bookkeeping but
+produces a cold restore: it cannot prove whether a terminal fingerprint came
+from a revoked cached result. A later successful capture replaces it through
+the existing verified publication transaction. A failed or cancelled capture
+does not discard the old seed.
+
 Ordinary `check --workspace --lib --bins` and check-mode harnesses can leave
 empty `.rmeta` files in those same dependency directories. Rust's crate locator
 skips their metadata; RABS still hashes their exact paths and bytes, copies them
@@ -2143,11 +2164,18 @@ and
 `canonical_warm_mixed_metadata_with_bins_preserves_committed_provenance_across_restarts`
 exercise this path with real Cargo, isolated workers and a separate stock
 control. They alternate two source variants, restart the coordinator for every
-operation, retain Cargo-Fresh parents, require the binary check to execute each
-time, and earn library replay from actual comparisons. They also quarantine a
-retained producer and require rejection before Cargo starts. They require the
+operation, retain Cargo-Fresh parents, and earn library and terminal replay from
+actual comparisons. They also quarantine a retained producer and require
+rejection before Cargo starts. They require the
 same full Linux namespace capability and matching binaries as the other native
 cache fixtures; their presence is not evidence that they have run.
+
+The same-family terminal regressions first earn a terminal cache hit, retain it,
+and prove that an unchanged command can use Cargo Fresh. They then quarantine
+that terminal action or a distinct real action in the same terminal class and
+require refusal before Cargo starts, without changing the retained seed or
+dispatching another worker request. These also require the full native fixture
+environment.
 
 The persistent service serializes target-cache I/O around open/restore and around
 completed capture, releasing that lock while Cargo runs. Waiting for this lock,

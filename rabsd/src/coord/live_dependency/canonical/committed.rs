@@ -4,6 +4,8 @@
 //! completion can mint a witness. The published-result installation owners call
 //! this registry only after verifying actual files in place. Metadata is
 //! registered before notifying Cargo; archives require complete installation.
+//! Terminal checks keep separate completion standing after full installation.
+//! Their empty or nonempty metadata never becomes a dependency witness.
 
 use super::{CanonicalPaths, ordinary_absolute};
 use crate::coord::canonical_local::RestoredTargetProvenance;
@@ -35,8 +37,9 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 
-// Several profiles/directories can occur within an operation. A full registry
-// stops minting entries; future consumers safely retain fresh execution.
+// Several profiles/directories can occur within an operation. Once published
+// output is installed, its completion standing cannot be silently lost at a
+// bound: Cargo may later reuse its success fingerprint without a rustc request.
 const MAX_COMMITTED_OUTPUTS: usize = 16_384;
 const TARGET_ROOT: &str = "/__rabs/out/cargo";
 const MAX_SEED_PATH_BYTES: usize = 4096;
@@ -49,7 +52,91 @@ struct InstalledProducer {
 }
 
 #[derive(Debug, Default)]
-pub(super) struct CommittedOutputs(Mutex<BTreeMap<PathBuf, InstalledProducer>>);
+pub(super) struct CommittedOutputs(
+    Mutex<BTreeMap<PathBuf, InstalledProducer>>,
+    Mutex<TerminalCompletions>,
+);
+
+#[derive(Debug, Clone)]
+struct InstalledTerminalCompletion {
+    generation: FileSig,
+    authority: CoordinatorAuthority,
+    seed: TerminalCompletionSeed,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TerminalCompletions {
+    current: BTreeMap<PathBuf, InstalledTerminalCompletion>,
+    // A verified replacement can update the saved file, but cannot hide an
+    // earlier completion's revocation during this operation. Only current
+    // bindings enter the next seed after all these identities are rechecked.
+    replaced: BTreeMap<[u8; 32], InstalledTerminalCompletion>,
+    // Shared sticky completeness failure for either installation registry.
+    failure: Option<String>,
+}
+
+impl TerminalCompletions {
+    fn witnesses(&self) -> impl Iterator<Item = &InstalledTerminalCompletion> {
+        self.current.values().chain(self.replaced.values())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.current.is_empty() && self.replaced.is_empty() && self.failure.is_none()
+    }
+
+    fn fail(&mut self, reason: &str) -> String {
+        self.failure
+            .get_or_insert_with(|| reason.to_owned())
+            .clone()
+    }
+
+    fn insert(
+        &mut self,
+        path: PathBuf,
+        completion: InstalledTerminalCompletion,
+    ) -> Result<(), String> {
+        if let Some(reason) = &self.failure {
+            return Err(reason.clone());
+        }
+        let old = self.current.get(&path);
+        if self.current.iter().any(|(current_path, current)| {
+            current.seed.action == completion.seed.action && current_path != &path
+        }) || old.is_some_and(|old| {
+            old.seed.action == completion.seed.action && old.seed != completion.seed
+        }) || self
+            .replaced
+            .get(&completion.seed.action)
+            .is_some_and(|old| old.seed != completion.seed)
+        {
+            return Err(self.fail("terminal completion changed identity for an existing action"));
+        }
+        let new_path = usize::from(old.is_none());
+        let prior = usize::from(old.is_some_and(|old| {
+            old.seed.action != completion.seed.action
+                && !self.replaced.contains_key(&old.seed.action)
+        }));
+        let duplicate = usize::from(self.replaced.contains_key(&completion.seed.action));
+        if self
+            .current
+            .len()
+            .saturating_add(self.replaced.len())
+            .saturating_add(new_path)
+            .saturating_add(prior)
+            .saturating_sub(duplicate)
+            > MAX_COMMITTED_OUTPUTS
+        {
+            return Err(self.fail("terminal completion registry exceeds its bound"));
+        }
+        self.replaced.remove(&completion.seed.action);
+        let action = completion.seed.action;
+        if let Some(old) = self.current.insert(path, completion)
+            && old.seed.action != action
+        {
+            self.replaced.insert(old.seed.action, old);
+        }
+        Ok(())
+    }
+}
 
 /// Historical installation provenance carried by one private target seed.
 ///
@@ -60,6 +147,10 @@ pub(super) struct CommittedOutputs(Mutex<BTreeMap<PathBuf, InstalledProducer>>);
 #[serde(deny_unknown_fields)]
 pub(crate) struct CommittedOutputSeeds {
     outputs: Vec<CommittedOutputSeed>,
+    // Keep v1 payloads readable for integrity/inventory without granting them
+    // v2 restoration. Terminal completion rows never join `outputs`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    terminal_completions: Vec<TerminalCompletionSeed>,
 }
 
 /// A changed local output can prevent optional retention without invalidating
@@ -102,6 +193,99 @@ struct CommittedOutputSeed {
 enum SeedRole {
     Metadata,
     Archive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum TerminalCompletionPolicy {
+    Leaf,
+    Committed,
+}
+
+impl TerminalCompletionPolicy {
+    fn from_policy(policy: CommittedDependencyPolicy) -> Result<Self, String> {
+        match policy {
+            CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata => Ok(Self::Leaf),
+            CommittedDependencyPolicy::WorkspaceTerminalMetadata => Ok(Self::Committed),
+            _ => Err("terminal completion has a nonterminal policy".into()),
+        }
+    }
+
+    fn policy(self) -> CommittedDependencyPolicy {
+        match self {
+            Self::Leaf => CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata,
+            Self::Committed => CommittedDependencyPolicy::WorkspaceTerminalMetadata,
+        }
+    }
+}
+
+/// Completion validity, deliberately without a dependency/producer conversion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TerminalCompletionSeed {
+    path: String,
+    action: [u8; 32],
+    descriptor: [u8; 32],
+    manifest: [u8; 32],
+    policy: TerminalCompletionPolicy,
+    virtual_path: Vec<u8>,
+    object: [u8; 32],
+}
+
+impl TerminalCompletionSeed {
+    fn object(&self) -> TypedDigest {
+        seed_digest(ATP_OBJECT_CONTENT_DOMAIN, self.object)
+    }
+
+    fn relative_path(&self) -> Result<&Path, String> {
+        let path = Path::new(&self.path);
+        if self.path.len() > MAX_SEED_PATH_BYTES || !ordinary_absolute(path) {
+            return Err("terminal completion path is not normalized".into());
+        }
+        let relative = path
+            .strip_prefix(TARGET_ROOT)
+            .map_err(|_| "terminal completion is outside the Cargo target")?;
+        let name = relative
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or("terminal completion has no metadata basename")?;
+        if name.as_bytes() != self.virtual_path.as_slice()
+            || !name.starts_with("lib")
+            || !name.ends_with(".rmeta")
+        {
+            return Err("terminal completion output spelling differs".into());
+        }
+        Ok(relative)
+    }
+
+    fn verify_standing(&self, coordinator: &CoordLive) -> Result<(), String> {
+        let action = seed_digest(DOMAIN_ACTION_KEY, self.action);
+        let manifest = coordinator.verify_terminal_completion(
+            &action,
+            &seed_digest(DOMAIN_DESCRIPTOR, self.descriptor),
+            &seed_digest(ATP_OBJECT_CONTENT_DOMAIN, self.manifest),
+            self.policy.policy(),
+        )?;
+        if !manifest.logical_outputs.iter().any(|output| {
+            output.role == OutputRole::ProvisionalMetadata
+                && output.virtual_path.as_bytes() == self.virtual_path.as_slice()
+                && output.object.0 == self.object()
+        }) {
+            return Err(format!(
+                "terminal completion {} lost its exact metadata output",
+                digest_key(&action)
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn seed_digest(domain: &'static str, bytes: [u8; 32]) -> TypedDigest {
+    TypedDigest {
+        algorithm: DigestAlgorithm::Sha256V1,
+        domain,
+        bytes,
+    }
 }
 
 impl CommittedOutputSeed {
@@ -172,24 +356,42 @@ impl CommittedOutputSeed {
 
 impl CommittedOutputSeeds {
     pub(crate) fn is_empty(&self) -> bool {
-        self.outputs.is_empty()
+        self.outputs.is_empty() && self.terminal_completions.is_empty()
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.outputs.len()
+        self.outputs
+            .len()
+            .saturating_add(self.terminal_completions.len())
     }
 
     pub(crate) fn validate(&self) -> Result<(), String> {
-        if self.outputs.len() > MAX_COMMITTED_OUTPUTS {
+        if self.len() > MAX_COMMITTED_OUTPUTS {
             return Err("committed target provenance exceeds its output bound".into());
         }
         let mut previous: Option<&str> = None;
+        let mut paths = BTreeSet::new();
         for output in &self.outputs {
             output.relative_path()?;
             if previous.is_some_and(|previous| previous >= output.path.as_str()) {
                 return Err("committed target provenance is not uniquely ordered".into());
             }
             previous = Some(output.path.as_str());
+            paths.insert(output.path.as_str());
+        }
+        let mut previous: Option<&str> = None;
+        let mut actions = BTreeSet::new();
+        for completion in &self.terminal_completions {
+            completion.relative_path()?;
+            if previous.is_some_and(|previous| previous >= completion.path.as_str())
+                || !paths.insert(completion.path.as_str())
+                || !actions.insert(completion.action)
+            {
+                return Err(
+                    "terminal completion provenance is not uniquely ordered or bound".into(),
+                );
+            }
+            previous = Some(completion.path.as_str());
         }
         Ok(())
     }
@@ -210,31 +412,43 @@ impl CommittedOutputSeeds {
                 "committed target provenance requires an ordinary target directory",
             ));
         }
-        for output in &self.outputs {
-            checkpoint(stopped)?;
-            let mut physical = target.to_path_buf();
-            for component in output
-                .relative_path()
-                .map_err(io::Error::other)?
-                .components()
-            {
-                physical.push(component.as_os_str());
-                if std::fs::symlink_metadata(&physical)?
-                    .file_type()
-                    .is_symlink()
-                {
+        let verify =
+            |relative: &Path, object: &TypedDigest, require_nonempty: bool| -> io::Result<()> {
+                checkpoint(stopped)?;
+                let mut physical = target.to_path_buf();
+                for component in relative.components() {
+                    physical.push(component.as_os_str());
+                    if std::fs::symlink_metadata(&physical)?
+                        .file_type()
+                        .is_symlink()
+                    {
+                        return Err(io::Error::other(
+                            "committed target provenance traverses a symlink",
+                        ));
+                    }
+                }
+                let installed =
+                    known_installed_output(&physical, object).map_err(io::Error::other)?;
+                if require_nonempty && installed.sig.size() == 0 {
                     return Err(io::Error::other(
-                        "committed target provenance traverses a symlink",
+                        "committed target provenance contains an empty Rust artifact",
                     ));
                 }
-            }
-            let installed = known_installed_output(&physical, &output.dependency().object.0)
-                .map_err(io::Error::other)?;
-            if installed.sig.size() == 0 {
-                return Err(io::Error::other(
-                    "committed target provenance contains an empty Rust artifact",
-                ));
-            }
+                Ok(())
+            };
+        for output in &self.outputs {
+            verify(
+                output.relative_path().map_err(io::Error::other)?,
+                &output.dependency().object.0,
+                true,
+            )?;
+        }
+        for completion in &self.terminal_completions {
+            verify(
+                completion.relative_path().map_err(io::Error::other)?,
+                &completion.object(),
+                false,
+            )?;
         }
         checkpoint(stopped)?;
         let after = std::fs::symlink_metadata(target)?;
@@ -398,7 +612,7 @@ fn empty_metadata_observation(
 }
 
 impl CanonicalPaths {
-    /// Recheck every registered producer at operation completion, including
+    /// Recheck every registered producer and terminal completion, including
     /// Cargo Fresh outputs and builds that do not retain a private target.
     /// This checks current publication standing, not optional seed eligibility:
     /// a changed local file must not hide another producer's revoked ancestry.
@@ -432,7 +646,18 @@ impl CanonicalPaths {
                 .map(|witness| witness.dependency.clone())
                 .collect::<Vec<_>>()
         };
-        let verified = Self::verify_seed_producers(coordinator, &authority, &dependencies, stopped);
+        let terminals = self
+            .terminal_completions(&authority)
+            .map_err(io::Error::other)?;
+        let verified = Self::verify_seed_producers(coordinator, &authority, &dependencies, stopped)
+            .and_then(|()| {
+                Self::verify_seed_terminal_completions(
+                    coordinator,
+                    &authority,
+                    terminals.witnesses().map(|witness| &witness.seed),
+                    stopped,
+                )
+            });
         // Cancellation can arrive while the durable lineage check is running.
         // Preserve its terminal Interrupted classification instead of turning
         // it into an optional target-retention warning or a generic refusal.
@@ -447,7 +672,7 @@ impl CanonicalPaths {
         })
     }
 
-    /// Capture only this operation's verified installed producers after Cargo
+    /// Capture only this operation's verified installed results after Cargo
     /// and publication writers drain, while the coordinator is still live.
     /// Raw target files and local/request-owned results never enter this map.
     pub(crate) fn export_committed_outputs(
@@ -467,6 +692,9 @@ impl CanonicalPaths {
             .lock()
             .map_err(|_| InvalidProducer("committed output registry poisoned".into()))?
             .clone();
+        let terminals = self
+            .terminal_completions(&authority)
+            .map_err(InvalidProducer)?;
         if registered
             .values()
             .any(|witness| witness.authority != authority)
@@ -483,23 +711,45 @@ impl CanonicalPaths {
         // prevent retention. A stale file must not hide another Fresh unit's
         // revoked publication, including its transitive or immutable parents.
         Self::verify_seed_producers(coordinator, &authority, &dependencies, stopped)?;
+        Self::verify_seed_terminal_completions(
+            coordinator,
+            &authority,
+            terminals.witnesses().map(|witness| &witness.seed),
+            stopped,
+        )?;
         let mut seeds = CommittedOutputSeeds {
             outputs: registered
                 .values()
                 .map(|witness| CommittedOutputSeed::from_dependency(&witness.dependency))
                 .collect::<Result<_, _>>()
                 .map_err(CannotRetain)?,
+            terminal_completions: terminals
+                .current
+                .values()
+                .map(|witness| witness.seed.clone())
+                .collect(),
         };
         // Physical PathBuf ordering compares components, while the durable
         // format orders canonical path bytes across every retained directory.
         seeds
             .outputs
             .sort_unstable_by(|left, right| left.path.cmp(&right.path));
+        seeds
+            .terminal_completions
+            .sort_unstable_by(|left, right| left.path.cmp(&right.path));
         let pending = self.observe_seed_outputs(&seeds, stopped);
+        let terminal_pending = self.observe_seed_terminal_completions(&seeds, stopped);
         // Hashing can be lengthy. Recheck current producer safety afterwards,
         // including when an output changed and optional retention must fail.
         Self::verify_seed_producers(coordinator, &authority, &dependencies, stopped)?;
+        Self::verify_seed_terminal_completions(
+            coordinator,
+            &authority,
+            terminals.witnesses().map(|witness| &witness.seed),
+            stopped,
+        )?;
         let pending = pending.map_err(CannotRetain)?;
+        let terminal_pending = terminal_pending.map_err(CannotRetain)?;
         for (path, generation, _) in &pending {
             let witness = registered.get(path).ok_or_else(|| {
                 CannotRetain("committed target export changed its original output path".into())
@@ -511,6 +761,18 @@ impl CanonicalPaths {
             }
         }
         self.verify_seed_generations(&pending, stopped)
+            .map_err(CannotRetain)?;
+        for (path, generation, _) in &terminal_pending {
+            let witness = terminals.current.get(path).ok_or_else(|| {
+                CannotRetain("terminal target export changed its original output path".into())
+            })?;
+            if witness.generation != *generation {
+                return Err(CannotRetain(
+                    "terminal target export lost its installed generation".into(),
+                ));
+            }
+        }
+        self.verify_terminal_generations(&terminal_pending, stopped)
             .map_err(CannotRetain)?;
         Ok(seeds)
     }
@@ -529,19 +791,28 @@ impl CanonicalPaths {
         let seeds = restored
             .seeds_for(&target)
             .map_err(|error| format!("restored committed target ownership: {error}"))?;
-        if !self
-            .committed_outputs
-            .0
-            .lock()
-            .map_err(|_| "committed output registry poisoned")?
-            .is_empty()
         {
-            return Err("restored committed outputs require an unused operation registry".into());
+            let registered = self
+                .committed_outputs
+                .0
+                .lock()
+                .map_err(|_| "committed output registry poisoned")?;
+            let terminals = self
+                .committed_outputs
+                .1
+                .lock()
+                .map_err(|_| "terminal completion registry poisoned")?;
+            if !registered.is_empty() || !terminals.is_empty() {
+                return Err(
+                    "restored committed outputs require an unused operation registry".into(),
+                );
+            }
         }
         let authority = coordinator
             .authority()
             .ok_or("restored committed outputs have no coordinator authority")?;
         let pending = self.observe_seed_outputs(seeds, stopped)?;
+        let terminal_pending = self.observe_seed_terminal_completions(seeds, stopped)?;
         Self::verify_seed_producers(
             coordinator,
             &authority,
@@ -552,7 +823,15 @@ impl CanonicalPaths {
             stopped,
         )
         .map_err(|error| format!("restored committed output provenance: {error}"))?;
+        Self::verify_seed_terminal_completions(
+            coordinator,
+            &authority,
+            seeds.terminal_completions.iter(),
+            stopped,
+        )
+        .map_err(|error| format!("restored terminal completion provenance: {error}"))?;
         self.verify_seed_generations(&pending, stopped)?;
+        self.verify_terminal_generations(&terminal_pending, stopped)?;
         restored
             .seeds_for(&target)
             .map_err(|error| format!("restored committed target ownership: {error}"))?;
@@ -561,7 +840,12 @@ impl CanonicalPaths {
             .0
             .lock()
             .map_err(|_| "committed output registry poisoned")?;
-        if !registered.is_empty() {
+        let mut terminals = self
+            .committed_outputs
+            .1
+            .lock()
+            .map_err(|_| "terminal completion registry poisoned")?;
+        if !registered.is_empty() || !terminals.is_empty() {
             return Err("restored committed output registry acquired another writer".into());
         }
         checkpoint(stopped).map_err(|error| error.to_string())?;
@@ -575,7 +859,38 @@ impl CanonicalPaths {
                 },
             );
         }
-        Ok(registered.len())
+        for (path, generation, seed) in terminal_pending {
+            terminals.current.insert(
+                path,
+                InstalledTerminalCompletion {
+                    generation,
+                    authority: authority.clone(),
+                    seed,
+                },
+            );
+        }
+        Ok(registered.len() + terminals.current.len())
+    }
+
+    fn terminal_completions(
+        &self,
+        authority: &CoordinatorAuthority,
+    ) -> Result<TerminalCompletions, String> {
+        let terminals = self
+            .committed_outputs
+            .1
+            .lock()
+            .map_err(|_| "terminal completion registry poisoned")?;
+        if let Some(reason) = &terminals.failure {
+            return Err(reason.clone());
+        }
+        if terminals
+            .witnesses()
+            .any(|witness| &witness.authority != authority)
+        {
+            return Err("terminal completions lost their original coordinator authority".into());
+        }
+        Ok(terminals.clone())
     }
 
     fn observe_seed_outputs(
@@ -584,7 +899,7 @@ impl CanonicalPaths {
         stopped: &dyn Fn() -> bool,
     ) -> Result<Vec<(PathBuf, FileSig, CommittedWorkspaceDependency)>, String> {
         seeds.validate()?;
-        let mut pending = Vec::with_capacity(seeds.len());
+        let mut pending = Vec::with_capacity(seeds.outputs.len());
         for output in &seeds.outputs {
             checkpoint(stopped).map_err(|error| error.to_string())?;
             let dependency = output.dependency();
@@ -596,6 +911,44 @@ impl CanonicalPaths {
             pending.push((physical, installed.sig, dependency));
         }
         Ok(pending)
+    }
+
+    fn observe_seed_terminal_completions(
+        &self,
+        seeds: &CommittedOutputSeeds,
+        stopped: &dyn Fn() -> bool,
+    ) -> Result<Vec<(PathBuf, FileSig, TerminalCompletionSeed)>, String> {
+        seeds.validate()?;
+        let mut pending = Vec::with_capacity(seeds.terminal_completions.len());
+        for seed in &seeds.terminal_completions {
+            checkpoint(stopped).map_err(|error| error.to_string())?;
+            let physical = self.physical(Path::new(&seed.path))?;
+            let installed = known_installed_output(&physical, &seed.object())?;
+            pending.push((physical, installed.sig, seed.clone()));
+        }
+        Ok(pending)
+    }
+
+    fn verify_seed_terminal_completions<'a>(
+        coordinator: &Arc<CoordLive>,
+        authority: &CoordinatorAuthority,
+        completions: impl IntoIterator<Item = &'a TerminalCompletionSeed>,
+        stopped: &dyn Fn() -> bool,
+    ) -> Result<(), CommittedOutputExportError> {
+        use CommittedOutputExportError::{CannotRetain, InvalidProducer};
+
+        for completion in completions {
+            checkpoint(stopped).map_err(|error| CannotRetain(error.to_string()))?;
+            completion
+                .verify_standing(coordinator)
+                .map_err(InvalidProducer)?;
+        }
+        if !coordinator.available() || coordinator.authority().as_ref() != Some(authority) {
+            return Err(InvalidProducer(
+                "terminal target coordinator authority changed".into(),
+            ));
+        }
+        checkpoint(stopped).map_err(|error| CannotRetain(error.to_string()))
     }
 
     fn verify_seed_producers(
@@ -638,6 +991,24 @@ impl CanonicalPaths {
                 || FileSig::of(&metadata) != *generation
             {
                 return Err("committed target output changed during producer verification".into());
+            }
+        }
+        checkpoint(stopped).map_err(|error| error.to_string())
+    }
+
+    fn verify_terminal_generations(
+        &self,
+        pending: &[(PathBuf, FileSig, TerminalCompletionSeed)],
+        stopped: &dyn Fn() -> bool,
+    ) -> Result<(), String> {
+        for (path, generation, seed) in pending {
+            checkpoint(stopped).map_err(|error| error.to_string())?;
+            let metadata = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+            if self.physical(Path::new(&seed.path))? != *path
+                || !metadata.is_file()
+                || FileSig::of(&metadata) != *generation
+            {
+                return Err("terminal target output changed during completion verification".into());
             }
         }
         checkpoint(stopped).map_err(|error| error.to_string())
@@ -721,6 +1092,15 @@ impl CanonicalPaths {
         installed: &[KnownOutput],
         remote: Option<&RemoteValidation>,
     ) -> Result<(), String> {
+        if request
+            .canonical_paths
+            .as_ref()
+            .is_none_or(|paths| !std::ptr::eq(self, paths.as_ref()))
+            || manifest.action_key != request.key.action_key
+            || manifest.canonical_descriptor_digest != request.key.descriptor_digest
+        {
+            return Err("committed installation differs from its retained operation/action".into());
+        }
         let qualification = match request.plan.source_kind {
             DependencySourceKind::WorkspaceClosedRlib
             | DependencySourceKind::WorkspaceCommittedRlib
@@ -752,18 +1132,43 @@ impl CanonicalPaths {
                     }
                 }
             }
-            DependencySourceKind::WorkspaceExecutionOnly
-            | DependencySourceKind::WorkspaceTerminalMetadata => return Ok(()),
+            DependencySourceKind::WorkspaceExecutionOnly => return Ok(()),
+            DependencySourceKind::WorkspaceTerminalMetadata => {
+                let registered = (|| {
+                    let remote =
+                        remote.ok_or("terminal completion has no retained remote validation")?;
+                    let policy = remote
+                        .verify_committed_producer(request)?
+                        .ok_or("terminal completion has no retained class capability")?;
+                    if committed_dependency_descriptor_policy(&request.key.descriptor)
+                        != Some(policy)
+                    {
+                        return Err(
+                            "terminal completion differs from its retained class capability".into(),
+                        );
+                    }
+                    self.register_installed_terminal_completion(
+                        coordinator,
+                        manifest,
+                        manifest_key,
+                        Path::new(&request.plan.out_dir),
+                        installed,
+                        TerminalCompletionPolicy::from_policy(policy)?,
+                    )
+                })();
+                // Installation already happened. A failed registration must
+                // also veto the operation barrier if a caller catches its
+                // error and later reaches Cargo's normal completion path.
+                if let Err(reason) = &registered {
+                    self.committed_outputs
+                        .1
+                        .lock()
+                        .map_err(|_| "terminal completion registry poisoned")?
+                        .fail(reason);
+                }
+                return registered;
+            }
         };
-        if request
-            .canonical_paths
-            .as_ref()
-            .is_none_or(|paths| !std::ptr::eq(self, paths.as_ref()))
-            || manifest.action_key != request.key.action_key
-            || manifest.canonical_descriptor_digest != request.key.descriptor_digest
-        {
-            return Err("committed installation differs from its retained operation/action".into());
-        }
         self.register_installed_producer(
             coordinator,
             manifest,
@@ -772,6 +1177,107 @@ impl CanonicalPaths {
             installed,
             qualification.as_ref(),
         )
+    }
+
+    /// Full published terminal installation only. This records completion
+    /// standing separately; even nonempty terminal metadata is never a producer.
+    fn register_installed_terminal_completion(
+        &self,
+        coordinator: &Arc<CoordLive>,
+        manifest: &CanonicalActionResultManifest,
+        manifest_key: &str,
+        output_directory: &Path,
+        installed: &[KnownOutput],
+        policy: TerminalCompletionPolicy,
+    ) -> Result<(), String> {
+        let manifest_id = object_id(&encode_manifest_v1(manifest))?;
+        if digest_key(&manifest_id) != manifest_key {
+            return Err("terminal installation manifest identity changed".into());
+        }
+        let authority = coordinator.authority().ok_or("no coordinator authority")?;
+        let bytes = |digest: &TypedDigest, domain: &'static str| -> Result<[u8; 32], String> {
+            if digest.algorithm != DigestAlgorithm::Sha256V1 || digest.domain != domain {
+                return Err("terminal completion has an unexpected digest domain".into());
+            }
+            Ok(digest.bytes)
+        };
+        let mut pending = None;
+        for installed in installed {
+            let output = committed_output(manifest, &installed.path)?;
+            if output.role != OutputRole::ProvisionalMetadata {
+                continue;
+            }
+            if pending.is_some() {
+                return Err("terminal completion has more than one metadata output".into());
+            }
+            let name = std::str::from_utf8(output.virtual_path.as_bytes())
+                .map_err(|_| "terminal metadata basename is not UTF-8")?;
+            let logical = self.logical(&installed.path)?;
+            let metadata =
+                std::fs::symlink_metadata(&installed.path).map_err(|error| error.to_string())?;
+            if logical != output_directory.join(name)
+                || self.physical(&logical)? != installed.path
+                || !metadata.is_file()
+                || FileSig::of(&metadata) != installed.sig
+                || installed.digest != output.object.0
+            {
+                return Err("terminal metadata changed before completion registration".into());
+            }
+            let seed = TerminalCompletionSeed {
+                path: logical
+                    .into_os_string()
+                    .into_string()
+                    .map_err(|_| "terminal output path is not UTF-8")?,
+                action: bytes(&manifest.action_key, DOMAIN_ACTION_KEY)?,
+                descriptor: bytes(&manifest.canonical_descriptor_digest, DOMAIN_DESCRIPTOR)?,
+                manifest: bytes(&manifest_id, ATP_OBJECT_CONTENT_DOMAIN)?,
+                policy,
+                virtual_path: output.virtual_path.as_bytes().to_vec(),
+                object: bytes(&installed.digest, ATP_OBJECT_CONTENT_DOMAIN)?,
+            };
+            seed.relative_path()?;
+            pending = Some((
+                installed.path.clone(),
+                InstalledTerminalCompletion {
+                    generation: installed.sig,
+                    authority: authority.clone(),
+                    seed,
+                },
+            ));
+        }
+        let (path, completion) =
+            pending.ok_or("terminal installation omitted its metadata output")?;
+        completion.seed.verify_standing(coordinator)?;
+        if coordinator.authority().as_ref() != Some(&authority) {
+            return Err("coordinator authority changed before terminal registration".into());
+        }
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+        if !metadata.is_file() || FileSig::of(&metadata) != completion.generation {
+            return Err("terminal metadata changed during publication verification".into());
+        }
+        let registered = self
+            .committed_outputs
+            .0
+            .lock()
+            .map_err(|_| "committed output registry poisoned")?;
+        let mut terminals = self
+            .committed_outputs
+            .1
+            .lock()
+            .map_err(|_| "terminal completion registry poisoned")?;
+        if registered.contains_key(&path) {
+            return Err(terminals.fail("terminal completion overlaps a registered producer"));
+        }
+        let additional = usize::from(!terminals.current.contains_key(&path));
+        if registered
+            .len()
+            .saturating_add(terminals.current.len())
+            .saturating_add(additional)
+            > MAX_COMMITTED_OUTPUTS
+        {
+            return Err(terminals.fail("terminal completion registry exceeds its bound"));
+        }
+        terminals.insert(path, completion)
     }
 
     /// Actual publication and generation gate shared by both delivery phases.
@@ -868,12 +1374,31 @@ impl CanonicalPaths {
             .0
             .lock()
             .map_err(|_| "committed output registry poisoned")?;
+        let mut terminals = self
+            .committed_outputs
+            .1
+            .lock()
+            .map_err(|_| "terminal completion registry poisoned")?;
+        if let Some(reason) = &terminals.failure {
+            return Err(reason.clone());
+        }
+        if pending
+            .iter()
+            .any(|(path, _, _)| terminals.current.contains_key(path))
+        {
+            return Err(terminals.fail("committed producer overlaps a terminal completion"));
+        }
         let additional = pending
             .iter()
             .filter(|(path, _, _)| !registered.contains_key(path))
             .count();
-        if registered.len().saturating_add(additional) > MAX_COMMITTED_OUTPUTS {
-            return Ok(());
+        if registered
+            .len()
+            .saturating_add(terminals.current.len())
+            .saturating_add(additional)
+            > MAX_COMMITTED_OUTPUTS
+        {
+            return Err(terminals.fail("committed output registry exceeds its bound"));
         }
         for (path, generation, dependency) in pending {
             registered.insert(
@@ -895,6 +1420,7 @@ mod tests {
     use crate::coord::live::WorkspaceLineageFixture;
     use crate::coord::live_dependency::known_installed_output;
     use crate::edge::live_facts::{LiveFacts, digest_stable};
+    use rabs_cas::metadata_store::{QuarantineScope, RabsMetadataStore};
     use rabs_cas::publication::OfferPreparedActionResult;
     use rabs_key::live_dependency::{LiveRustcRequest, plan_canonical_workspace_execution};
     use std::os::unix::fs::DirBuilderExt;
@@ -1004,6 +1530,657 @@ mod tests {
         // The target-state tests exercise real seed storage and private copies.
         RestoredTargetProvenance::for_test(&paths.physical(Path::new(TARGET_ROOT)).unwrap(), seeds)
             .unwrap()
+    }
+
+    fn terminal_offer(
+        fixture: &WorkspaceLineageFixture,
+        tag: u8,
+        policy: TerminalCompletionPolicy,
+        bytes: &[u8],
+    ) -> OfferPreparedActionResult {
+        let parents = if policy == TerminalCompletionPolicy::Committed {
+            let upstream = fixture.commit_metadata_leaf(
+                tag - 1,
+                &[(
+                    "libancestor.rmeta",
+                    OutputRole::ProvisionalMetadata,
+                    METADATA,
+                )],
+            );
+            vec![ProvisionalAncestorRef {
+                producer_action_key: upstream.manifest.action_key.clone(),
+                role: OutputRole::ProvisionalMetadata,
+                virtual_path: RawBytes::from("libancestor.rmeta"),
+                consumed_object: upstream.manifest.logical_outputs[0].object.clone(),
+            }]
+        } else {
+            Vec::new()
+        };
+        let offer = fixture.prepare_terminal(
+            tag,
+            parents,
+            &[
+                ("libupstream.rmeta", OutputRole::ProvisionalMetadata, bytes),
+                (
+                    "upstream.d",
+                    OutputRole::DepInfo,
+                    b"/__rabs/out/cargo/debug/deps/libupstream.rmeta:\n",
+                ),
+            ],
+            policy.policy(),
+        );
+        fixture.commit(&offer);
+        offer
+    }
+
+    fn register_terminal(
+        paths: &CanonicalPaths,
+        fixture: &WorkspaceLineageFixture,
+        offer: &OfferPreparedActionResult,
+        installed: &[KnownOutput],
+        policy: TerminalCompletionPolicy,
+    ) -> Result<(), String> {
+        // The retained request/class proof is synthetic at this unit boundary;
+        // publication, installed generations, standing and persistence are real.
+        paths.register_installed_terminal_completion(
+            &fixture.coord,
+            &offer.manifest,
+            &digest_key(&offer.manifest_id.0),
+            Path::new(OUTPUT),
+            installed,
+            policy,
+        )
+    }
+
+    #[test]
+    fn restored_terminal_completions_never_grant_dependency_producer_authority() {
+        for policy in [
+            TerminalCompletionPolicy::Leaf,
+            TerminalCompletionPolicy::Committed,
+        ] {
+            for bytes in [b"".as_slice(), b"nonempty terminal metadata".as_slice()] {
+                let fixture = WorkspaceLineageFixture::new();
+                let offer = terminal_offer(&fixture, 100, policy, bytes);
+                let original = paths();
+                let installed = install_bytes(&original, &offer, "libupstream.rmeta", bytes);
+                let generation = installed.sig;
+                assert!(
+                    original
+                        .export_committed_outputs(&fixture.coord, &|| false)
+                        .unwrap()
+                        .is_empty(),
+                    "matching published bytes cannot discover completion authority"
+                );
+                register_terminal(&original, &fixture, &offer, &[installed], policy).unwrap();
+                original
+                    .verify_completed_producers(&fixture.coord, &|| false)
+                    .unwrap();
+                let seeds = original
+                    .export_committed_outputs(&fixture.coord, &|| false)
+                    .unwrap();
+                assert!(seeds.outputs.is_empty());
+                assert_eq!(seeds.terminal_completions.len(), 1);
+                let encoded = serde_json::to_vec(&seeds).unwrap();
+                let restored = paths();
+                install_bytes(&restored, &offer, "libupstream.rmeta", bytes);
+                seeds
+                    .verify_target(&restored.physical(Path::new(TARGET_ROOT)).unwrap(), &|| {
+                        false
+                    })
+                    .unwrap();
+                fixture.coord.mark_down();
+                let restarted = Arc::new(CoordLive::with_cas(Arc::clone(&fixture.cas)));
+                restarted
+                    .acquire_boot_authority("workspace-lineage-fixture")
+                    .unwrap();
+                restarted.mark_up();
+                assert_eq!(
+                    restored
+                        .rehydrate_committed_outputs(
+                            &restarted,
+                            restored_owner(&restored, serde_json::from_slice(&encoded).unwrap()),
+                            &|| false,
+                        )
+                        .unwrap(),
+                    1
+                );
+                assert!(restored.committed_outputs.0.lock().unwrap().is_empty());
+                {
+                    let terminals = restored.committed_outputs.1.lock().unwrap();
+                    let witness = terminals.current.values().next().unwrap();
+                    assert_ne!(witness.generation, generation);
+                    assert_eq!(Some(&witness.authority), restarted.authority().as_ref());
+                }
+                restored
+                    .verify_completed_producers(&restarted, &|| false)
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_vec(
+                        &restored
+                            .export_committed_outputs(&restarted, &|| false,)
+                            .unwrap()
+                    )
+                    .unwrap(),
+                    encoded
+                );
+                if !bytes.is_empty() {
+                    let error = restored
+                        .capture_committed_inputs(
+                            &restarted,
+                            observed(&restored, false),
+                            CommittedDependencyPolicy::WorkspaceMetadata,
+                        )
+                        .unwrap_err();
+                    assert!(error.contains("no committed installation witness"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_completion_restore_and_final_barriers_recheck_every_revocation_scope() {
+        for policy in [
+            TerminalCompletionPolicy::Leaf,
+            TerminalCompletionPolicy::Committed,
+        ] {
+            for scope in [
+                "action", "class", "metadata", "dep-info", "manifest", "ancestor",
+            ] {
+                if scope == "ancestor" && policy == TerminalCompletionPolicy::Leaf {
+                    continue;
+                }
+                let fixture = WorkspaceLineageFixture::new();
+                let offer = terminal_offer(&fixture, 110, policy, b"");
+                let original = paths();
+                let installed = install_bytes(&original, &offer, "libupstream.rmeta", b"");
+                register_terminal(&original, &fixture, &offer, &[installed], policy).unwrap();
+                let seeds = original
+                    .export_committed_outputs(&fixture.coord, &|| false)
+                    .unwrap();
+                let restored = paths();
+                install_bytes(&restored, &offer, "libupstream.rmeta", b"");
+                restored
+                    .rehydrate_committed_outputs(
+                        &fixture.coord,
+                        restored_owner(&restored, seeds.clone()),
+                        &|| false,
+                    )
+                    .unwrap();
+                let mut culprit = offer.manifest.action_key.clone();
+                match scope {
+                    "action" => fixture.quarantine(&culprit),
+                    "class" => {
+                        let other = terminal_offer(&fixture, 120, policy, b"");
+                        culprit = other.manifest.action_key;
+                        fixture.quarantine(&culprit);
+                    }
+                    "ancestor" => {
+                        culprit = offer.provisional_ancestors[0].producer_action_key.clone();
+                        fixture.quarantine(&culprit);
+                    }
+                    "metadata" | "dep-info" | "manifest" => {
+                        let object = if scope == "manifest" {
+                            &offer.manifest_id.0
+                        } else {
+                            let role = if scope == "metadata" {
+                                OutputRole::ProvisionalMetadata
+                            } else {
+                                OutputRole::DepInfo
+                            };
+                            &offer
+                                .manifest
+                                .logical_outputs
+                                .iter()
+                                .find(|output| output.role == role)
+                                .unwrap()
+                                .object
+                                .0
+                        };
+                        fixture
+                            .cas
+                            .store()
+                            .lock()
+                            .unwrap()
+                            .add_quarantine(
+                                QuarantineScope::LogicalObject,
+                                &digest_key(object),
+                                "explicit terminal completion quarantine",
+                            )
+                            .unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                let key = digest_key(&offer.manifest.action_key);
+                let error = restored
+                    .verify_completed_producers(&fixture.coord, &|| false)
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains(&key), "{scope}: {error}");
+                if scope == "class" {
+                    assert!(error.contains(&digest_key(&culprit)), "{error}");
+                }
+                assert!(
+                    matches!(
+                        restored.export_committed_outputs(&fixture.coord, &|| false),
+                        Err(CommittedOutputExportError::InvalidProducer(_))
+                    ),
+                    "{scope}"
+                );
+                let rejected = paths();
+                install_bytes(&rejected, &offer, "libupstream.rmeta", b"");
+                let error = rejected
+                    .rehydrate_committed_outputs(
+                        &fixture.coord,
+                        restored_owner(&rejected, seeds),
+                        &|| false,
+                    )
+                    .unwrap_err();
+                assert!(error.contains(&key), "{scope}: {error}");
+                assert!(rejected.committed_outputs.0.lock().unwrap().is_empty());
+                assert!(rejected.committed_outputs.1.lock().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_generation_loss_never_hides_revocation_at_completion() {
+        for change in ["equal-replacement", "local-write", "target-move"] {
+            let fixture = WorkspaceLineageFixture::new();
+            let offer = terminal_offer(&fixture, 125, TerminalCompletionPolicy::Leaf, b"");
+            let original = paths();
+            let installed = install_bytes(&original, &offer, "libupstream.rmeta", b"");
+            let output = installed.path.clone();
+            register_terminal(
+                &original,
+                &fixture,
+                &offer,
+                &[installed],
+                TerminalCompletionPolicy::Leaf,
+            )
+            .unwrap();
+            match change {
+                "equal-replacement" => {
+                    std::fs::rename(&output, output.with_extension("original")).unwrap();
+                    std::fs::write(&output, b"").unwrap();
+                }
+                "local-write" => std::fs::write(&output, b"raw local replacement").unwrap(),
+                "target-move" => std::fs::rename(
+                    original.physical(Path::new(TARGET_ROOT)).unwrap(),
+                    original._owner.path().join("completed-target"),
+                )
+                .unwrap(),
+                _ => unreachable!(),
+            }
+            assert!(
+                matches!(
+                    original.export_committed_outputs(&fixture.coord, &|| false),
+                    Err(CommittedOutputExportError::CannotRetain(_))
+                ),
+                "{change}"
+            );
+            original
+                .verify_completed_producers(&fixture.coord, &|| false)
+                .unwrap();
+            fixture.quarantine(&offer.manifest.action_key);
+            assert!(
+                original
+                    .verify_completed_producers(&fixture.coord, &|| false)
+                    .is_err()
+            );
+            assert!(
+                matches!(
+                    original.export_committed_outputs(&fixture.coord, &|| false),
+                    Err(CommittedOutputExportError::InvalidProducer(_))
+                ),
+                "{change}"
+            );
+        }
+    }
+
+    #[test]
+    fn revoked_terminal_restore_never_partially_admits_the_valid_producer_inventory() {
+        let fixture = WorkspaceLineageFixture::new();
+        let producer = fixture.commit_metadata_leaf(
+            160,
+            &[(
+                "libancestor.rmeta",
+                OutputRole::ProvisionalMetadata,
+                METADATA,
+            )],
+        );
+        let terminal = fixture.prepare_terminal(
+            161,
+            vec![ProvisionalAncestorRef {
+                producer_action_key: producer.manifest.action_key.clone(),
+                role: OutputRole::ProvisionalMetadata,
+                virtual_path: RawBytes::from("libancestor.rmeta"),
+                consumed_object: producer.manifest.logical_outputs[0].object.clone(),
+            }],
+            &[
+                ("libupstream.rmeta", OutputRole::ProvisionalMetadata, b""),
+                (
+                    "upstream.d",
+                    OutputRole::DepInfo,
+                    b"/__rabs/out/cargo/debug/deps/libupstream.rmeta:\n",
+                ),
+            ],
+            CommittedDependencyPolicy::WorkspaceTerminalMetadata,
+        );
+        fixture.commit(&terminal);
+        let original = paths();
+        let installed = install_bytes(&original, &producer, "libancestor.rmeta", METADATA);
+        register(&original, &fixture, &producer, &[installed]).unwrap();
+        let installed = install_bytes(&original, &terminal, "libupstream.rmeta", b"");
+        register_terminal(
+            &original,
+            &fixture,
+            &terminal,
+            &[installed],
+            TerminalCompletionPolicy::Committed,
+        )
+        .unwrap();
+        let seeds = original
+            .export_committed_outputs(&fixture.coord, &|| false)
+            .unwrap();
+        assert_eq!(seeds.outputs.len(), 1);
+        assert_eq!(seeds.terminal_completions.len(), 1);
+        fixture.quarantine(&terminal.manifest.action_key);
+        let restored = paths();
+        install_bytes(&restored, &producer, "libancestor.rmeta", METADATA);
+        install_bytes(&restored, &terminal, "libupstream.rmeta", b"");
+        assert!(
+            restored
+                .rehydrate_committed_outputs(
+                    &fixture.coord,
+                    restored_owner(&restored, seeds),
+                    &|| false,
+                )
+                .is_err()
+        );
+        assert!(restored.committed_outputs.0.lock().unwrap().is_empty());
+        assert!(restored.committed_outputs.1.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn terminal_replacement_keeps_prior_standing_until_completion_but_saves_only_current() {
+        let fixture = WorkspaceLineageFixture::new();
+        let before = terminal_offer(&fixture, 130, TerminalCompletionPolicy::Leaf, b"");
+        let after = terminal_offer(&fixture, 140, TerminalCompletionPolicy::Committed, b"");
+        let original = paths();
+        for (offer, policy) in [
+            (&before, TerminalCompletionPolicy::Leaf),
+            (&after, TerminalCompletionPolicy::Committed),
+        ] {
+            let installed = install_bytes(&original, offer, "libupstream.rmeta", b"");
+            register_terminal(&original, &fixture, offer, &[installed], policy).unwrap();
+        }
+        let seeds = original
+            .export_committed_outputs(&fixture.coord, &|| false)
+            .unwrap();
+        assert_eq!(seeds.terminal_completions.len(), 1);
+        assert_eq!(
+            seeds.terminal_completions[0].action,
+            after.manifest.action_key.bytes
+        );
+        assert_eq!(
+            original.committed_outputs.1.lock().unwrap().replaced.len(),
+            1
+        );
+        fixture.quarantine(&before.manifest.action_key);
+        // The new class has no safety hold. Only the replaced completion
+        // invalidates this operation, even though its current bytes are sound.
+        seeds.terminal_completions[0]
+            .verify_standing(&fixture.coord)
+            .unwrap();
+        let error = original
+            .verify_completed_producers(&fixture.coord, &|| false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&digest_key(&before.manifest.action_key)),
+            "{error}"
+        );
+        let next = paths();
+        install_bytes(&next, &after, "libupstream.rmeta", b"");
+        next.rehydrate_committed_outputs(&fixture.coord, restored_owner(&next, seeds), &|| false)
+            .unwrap();
+        next.verify_completed_producers(&fixture.coord, &|| false)
+            .unwrap();
+    }
+
+    #[test]
+    fn terminal_registry_capacity_failure_remains_a_completion_veto() {
+        let fixture = WorkspaceLineageFixture::new();
+        let offer = terminal_offer(&fixture, 150, TerminalCompletionPolicy::Leaf, b"");
+        let original = paths();
+        let installed = install_bytes(&original, &offer, "libupstream.rmeta", b"");
+        register_terminal(
+            &original,
+            &fixture,
+            &offer,
+            &[installed],
+            TerminalCompletionPolicy::Leaf,
+        )
+        .unwrap();
+        {
+            let mut terminals = original.committed_outputs.1.lock().unwrap();
+            let template = terminals.current.values().next().unwrap().clone();
+            // Only registry capacity is synthetic here; no fake row is ever
+            // submitted to CAS or used as valid restoration/producer evidence.
+            terminals.current.clear();
+            for index in 0..MAX_COMMITTED_OUTPUTS {
+                let mut completion = template.clone();
+                completion.seed.action[..8].copy_from_slice(&(index as u64).to_be_bytes());
+                completion.seed.path = format!("{OUTPUT}/libterminal{index}.rmeta");
+                completion.seed.virtual_path = format!("libterminal{index}.rmeta").into_bytes();
+                terminals
+                    .current
+                    .insert(PathBuf::from(&completion.seed.path), completion);
+            }
+            let (path, same) = terminals.current.iter().next().unwrap();
+            let path = path.clone();
+            let same = same.clone();
+            terminals.insert(path.clone(), same.clone()).unwrap();
+            let mut extra = template;
+            extra.seed.action = [0xfe; 32];
+            let error = terminals
+                .insert(PathBuf::from("/extra/libterminal.rmeta"), extra)
+                .unwrap_err();
+            assert!(error.contains("bound"));
+            assert_eq!(terminals.current.len(), MAX_COMMITTED_OUTPUTS);
+            assert!(
+                terminals.insert(path, same).is_err(),
+                "a later install cannot erase overflow"
+            );
+        }
+        assert!(
+            original
+                .verify_completed_producers(&fixture.coord, &|| false)
+                .unwrap_err()
+                .to_string()
+                .contains("bound")
+        );
+        assert!(
+            matches!(original.export_committed_outputs(&fixture.coord, &|| false),
+            Err(CommittedOutputExportError::InvalidProducer(reason)) if reason.contains("bound"))
+        );
+    }
+
+    #[test]
+    fn producer_registry_capacity_never_allows_untracked_published_success() {
+        let fixture = WorkspaceLineageFixture::new();
+        let offer = fixture.commit_metadata_leaf(
+            180,
+            &[(
+                "libupstream.rmeta",
+                OutputRole::ProvisionalMetadata,
+                METADATA,
+            )],
+        );
+        let extra = fixture.commit_metadata_leaf(
+            181,
+            &[("libextra.rmeta", OutputRole::ProvisionalMetadata, METADATA)],
+        );
+        let original = paths();
+        let installed = install_bytes(&original, &offer, "libupstream.rmeta", METADATA);
+        register(
+            &original,
+            &fixture,
+            &offer,
+            std::slice::from_ref(&installed),
+        )
+        .unwrap();
+        {
+            let mut registered = original.committed_outputs.0.lock().unwrap();
+            let template = registered.values().next().unwrap().clone();
+            // Bound padding is synthetic; the overflowing result below is a
+            // real publication and a verified installed generation.
+            for index in 1..MAX_COMMITTED_OUTPUTS {
+                let mut witness = template.clone();
+                witness.dependency.path = format!("{OUTPUT}/libpadding{index}.rmeta");
+                let path = original
+                    .physical(Path::new(&witness.dependency.path))
+                    .unwrap();
+                registered.insert(path, witness);
+            }
+        }
+        let additional = install_bytes(&original, &extra, "libextra.rmeta", METADATA);
+        assert!(
+            register(&original, &fixture, &extra, &[additional])
+                .unwrap_err()
+                .contains("bound")
+        );
+        assert_eq!(
+            original.committed_outputs.0.lock().unwrap().len(),
+            MAX_COMMITTED_OUTPUTS
+        );
+        assert!(register(&original, &fixture, &offer, &[installed]).is_err());
+        assert!(
+            original
+                .verify_completed_producers(&fixture.coord, &|| false)
+                .unwrap_err()
+                .to_string()
+                .contains("bound")
+        );
+        assert!(
+            matches!(original.export_committed_outputs(&fixture.coord, &|| false),
+            Err(CommittedOutputExportError::InvalidProducer(reason)) if reason.contains("bound"))
+        );
+    }
+
+    #[test]
+    fn terminal_seed_schema_rejects_aliases_duplicate_actions_and_producer_overlap() {
+        let fixture = WorkspaceLineageFixture::new();
+        let offer = terminal_offer(&fixture, 170, TerminalCompletionPolicy::Leaf, b"");
+        let original = paths();
+        let installed = install_bytes(&original, &offer, "libupstream.rmeta", b"");
+        register_terminal(
+            &original,
+            &fixture,
+            &offer,
+            &[installed],
+            TerminalCompletionPolicy::Leaf,
+        )
+        .unwrap();
+        let seeds = original
+            .export_committed_outputs(&fixture.coord, &|| false)
+            .unwrap();
+        for path in [
+            "/__rabs/workspace/libupstream.rmeta",
+            "/__rabs/out/cargo/../libupstream.rmeta",
+            "/__rabs/out/cargo//debug/deps/libupstream.rmeta",
+            "/__rabs/out/cargo/debug/deps/other.rmeta",
+        ] {
+            let mut invalid = seeds.clone();
+            invalid.terminal_completions[0].path = path.into();
+            assert!(invalid.validate().is_err(), "{path}");
+        }
+        let mut invalid = seeds.clone();
+        invalid
+            .terminal_completions
+            .push(invalid.terminal_completions[0].clone());
+        assert!(invalid.validate().is_err());
+        let mut another_path = seeds.terminal_completions[0].clone();
+        another_path.path = format!("{OUTPUT}/libz.rmeta");
+        another_path.virtual_path = b"libz.rmeta".to_vec();
+        invalid.terminal_completions[1] = another_path;
+        assert!(
+            invalid.validate().is_err(),
+            "one terminal action cannot acquire another logical output"
+        );
+        let terminal = &seeds.terminal_completions[0];
+        let mut invalid = seeds.clone();
+        invalid.outputs.push(CommittedOutputSeed {
+            path: terminal.path.clone(),
+            producer_action: terminal.action,
+            producer_descriptor: terminal.descriptor,
+            producer_manifest: terminal.manifest,
+            role: SeedRole::Metadata,
+            virtual_path: terminal.virtual_path.clone(),
+            object: terminal.object,
+        });
+        assert!(
+            invalid.validate().is_err(),
+            "one path cannot be both terminal and a producer"
+        );
+        let mut encoded = serde_json::to_value(&seeds).unwrap();
+        encoded["terminal_completions"][0]["policy"] = serde_json::json!("metadata-producer");
+        assert!(serde_json::from_value::<CommittedOutputSeeds>(encoded).is_err());
+    }
+
+    #[test]
+    fn contradictory_terminal_identity_cannot_erase_existing_completion_standing() {
+        for another_path in [false, true] {
+            let fixture = WorkspaceLineageFixture::new();
+            let offer = terminal_offer(&fixture, 175, TerminalCompletionPolicy::Leaf, b"");
+            let original = paths();
+            let installed = install_bytes(&original, &offer, "libupstream.rmeta", b"");
+            register_terminal(
+                &original,
+                &fixture,
+                &offer,
+                &[installed],
+                TerminalCompletionPolicy::Leaf,
+            )
+            .unwrap();
+            {
+                let mut terminals = original.committed_outputs.1.lock().unwrap();
+                let (path, completion) = terminals.current.iter().next().unwrap();
+                let mut path = path.clone();
+                let mut changed = completion.clone();
+                if another_path {
+                    path = path.with_file_name("libother.rmeta");
+                    changed.seed.path = format!("{OUTPUT}/libother.rmeta");
+                    changed.seed.virtual_path = b"libother.rmeta".to_vec();
+                } else {
+                    changed.seed.object[0] ^= 1;
+                }
+                assert!(
+                    terminals
+                        .insert(path, changed)
+                        .unwrap_err()
+                        .contains("identity")
+                );
+                assert_eq!(terminals.current.len(), 1);
+                assert_eq!(
+                    terminals.current.values().next().unwrap().seed.object,
+                    offer
+                        .manifest
+                        .logical_outputs
+                        .iter()
+                        .find(|output| output.role == OutputRole::ProvisionalMetadata)
+                        .unwrap()
+                        .object
+                        .0
+                        .bytes
+                );
+            }
+            assert!(
+                original
+                    .verify_completed_producers(&fixture.coord, &|| false)
+                    .is_err()
+            );
+        }
     }
 
     #[test]
@@ -1812,6 +2989,7 @@ mod tests {
         assert!(invalid.validate().is_err());
         let invalid = CommittedOutputSeeds {
             outputs: vec![seeds.outputs[0].clone(); MAX_COMMITTED_OUTPUTS + 1],
+            ..CommittedOutputSeeds::default()
         };
         assert!(invalid.validate().is_err());
         let mut dependency = seeds.outputs[0].dependency();
