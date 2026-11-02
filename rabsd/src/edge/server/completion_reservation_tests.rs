@@ -718,20 +718,33 @@ fn canonical_drain_waits_for_acknowledged_publication_after_wrapper_exit() {
         let server_controller = Arc::clone(&controller);
         let server = scope.spawn(move || run_daemon_controlled(options, server_controller));
         listening.recv_timeout(Duration::from_secs(10)).unwrap();
-        let peer = std::os::unix::net::UnixStream::connect(&path).unwrap();
-        peer.set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
-        peer.set_write_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
-        let mut peer = BufReader::new(peer);
-        let hello = json!({"kind":"hello",
-            "transport":{"minimum_compatible":1,"current":1},
-            "application":{"minimum_compatible":1,"current":1}});
-        writeln!(peer.get_mut(), "{hello}").unwrap();
-        assert_eq!(read_reply(&mut peer)["kind"], "hello-ok");
+        let connect_peer = || {
+            let peer = std::os::unix::net::UnixStream::connect(&path).unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            peer.set_write_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut peer = BufReader::new(peer);
+            let hello = json!({"kind":"hello",
+                "transport":{"minimum_compatible":1,"current":1},
+                "application":{"minimum_compatible":1,"current":1}});
+            writeln!(peer.get_mut(), "{hello}").unwrap();
+            assert_eq!(read_reply(&mut peer)["kind"], "hello-ok");
+            peer
+        };
+        let mut peer = connect_peer();
+        let mut requests_on_connection = 0;
         let deadline = Instant::now() + Duration::from_secs(10);
         let decision = loop {
+            // Cold facts may need more than one bounded session. Keep the
+            // server's per-connection quota and the original warmup deadline.
+            if requests_on_connection == crate::edge::server::MAX_REQUESTS_PER_CONNECTION {
+                assert!(Instant::now() < deadline, "fixture facts did not warm");
+                peer = connect_peer();
+                requests_on_connection = 0;
+            }
             writeln!(peer.get_mut(), "{}", fixture.request).unwrap();
+            requests_on_connection += 1;
             let decision = read_reply(&mut peer);
             if decision["decision"] == "preparing" {
                 assert!(Instant::now() < deadline, "fixture facts did not warm");

@@ -1292,9 +1292,17 @@ impl OwnedGroup {
     fn stop(&mut self) {
         if let Some(process) = &mut self.process {
             #[cfg(target_os = "linux")]
-            if process.refresh_members().is_ok_and(|count| count == 0) {
+            if !process
+                .leader_try_wait()
+                .is_ok_and(|status| status.is_none())
+                && process.refresh_members().is_ok_and(|count| count == 0)
+            {
                 return;
             }
+            // A still-running, unreaped leader pins its own group identity.
+            // Signal it before a fleet-wide procfs scan can spend the closure
+            // budget. An exited leader still requires the membership check
+            // above; the drain loop independently verifies complete closure.
             #[cfg(unix)]
             if let Some(group) = i32::try_from(process.pgid())
                 .ok()

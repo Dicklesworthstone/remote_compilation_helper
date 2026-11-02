@@ -1052,6 +1052,49 @@ mod tests {
     }
 
     #[test]
+    fn reaped_cancelled_waiter_settles_without_probing_or_disrupting_another_key() {
+        let supervisor: SharedWork<u32, thread::ThreadId> = SharedWork::new(1, 3);
+        let first_cancellations = Arc::new(AtomicUsize::new(0));
+        let second_cancellations = Arc::new(AtomicUsize::new(0));
+        let cancelled = Arc::clone(&first_cancellations);
+        let (origin, mut first) = supervisor
+            .defer(1, move || {
+                cancelled.fetch_add(1, Ordering::SeqCst);
+            })
+            .unwrap();
+        let cancelled = Arc::clone(&second_cancellations);
+        let (mut survivor, mut second) = supervisor
+            .defer(2, move || {
+                cancelled.fetch_add(1, Ordering::SeqCst);
+            })
+            .unwrap();
+        drop(origin);
+        assert_eq!(first_cancellations.load(Ordering::SeqCst), 1);
+        assert_eq!(second_cancellations.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            supervisor
+                .try_launch(&mut first, || -> Option<fn() -> thread::ThreadId> {
+                    panic!("a cancelled waiter must never probe a worker");
+                })
+                .unwrap(),
+            LaunchStatus::CancelledBeforeStart
+        );
+        drop(first);
+        assert!(second.is_pending());
+        assert_eq!(
+            supervisor
+                .try_launch(&mut second, || Some(|| thread::current().id()))
+                .unwrap(),
+            LaunchStatus::Started
+        );
+        assert_ne!(*wait(&mut survivor, None).unwrap(), thread::current().id());
+        drop(survivor);
+        supervisor.shutdown().unwrap();
+        assert_eq!(first_cancellations.load(Ordering::SeqCst), 1);
+        assert_eq!(second_cancellations.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn stale_deferred_capability_cannot_launch_or_finish_a_replacement_generation() {
         let supervisor: SharedWork<u32, &'static str> = SharedWork::new(1, 3);
         let cancellations = Arc::new(AtomicUsize::new(0));

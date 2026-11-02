@@ -4,7 +4,8 @@ use rabs_key::live_dependency::{
     plan_dependency_action,
 };
 use rabs_protocol::input_evidence::{
-    ActionInputManifest, INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType, PositiveInput,
+    ActionInputManifest, DirectoryEnumeration, INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType,
+    PositiveInput,
 };
 use rabs_protocol::raw_bytes::RawBytes;
 use rabs_protocol::result_identity::ObjectId;
@@ -108,6 +109,15 @@ fn derive_with(
                 executable: false,
                 symlink_resolution: Vec::new(),
             })
+            .collect(),
+        directory_enumerations: plan
+            .generated_root
+            .as_ref()
+            .map(|_| DirectoryEnumeration {
+                virtual_path: RawBytes::new(plan.generated_virtual_root().into_bytes()),
+                entries: Vec::new(),
+            })
+            .into_iter()
             .collect(),
         ..ActionInputManifest::default()
     };

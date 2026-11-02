@@ -1932,7 +1932,7 @@ mod tests {
             assert!(request.verify_output_contract().is_ok());
             assert_eq!(
                 request.verify_read_closure().unwrap_err(),
-                "workspace execution requires a fresh isolated remote compiler"
+                "workspace actions require an independently isolated remote compiler"
             );
             request.plan.outputs.declarations.pop();
             assert!(request.verify_output_contract().is_err());
