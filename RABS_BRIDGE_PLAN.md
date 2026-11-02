@@ -1818,6 +1818,82 @@ only the stated step, never closure of the surrounding milestone.
 
 ### Current integration repair and execution TODO
 
+**2026-11-02 native 5ab overlay follow-through (still open).** The frozen
+`5ab9bd16-overlay-306203c1` run compiled the daemon, canonical harness and
+doctor successfully, then ran all **1,435 daemon cases: 1,419 passed, 16
+failed, zero ignored** (raw 101). Shutdown, selector and pipe controls each
+passed 1/1; service sockets passed 12/12 and live doctor 4/4. CAS compilation
+and subsequent workspace checks are still running in wrapper
+`rchw-c6eb99ec-6a2a-43e7-88f6-94b3f30269ab`, build
+`30080135327648060`, with the original 10,800s deadline. No aggregate pass,
+terminal acknowledgement or final source-after audit exists yet. The complete
+daemon log is `/Volumes/trj-data/rabs-shared5ab-daemon-lib-partial-20261102.log`,
+SHA-256 `a54452d3739dd06af4be1a8da814c7640c924ce4abfdfe76add175c1fb82979d`.
+
+The following candidate repairs are applied in the shared working tree but
+**remain unchecked until a fresh combined frozen source compiles and runs**.
+Checked preparation subtasks earn no native acceptance credit.
+
+- [ ] Validate both stale target-family-owner fixtures against a fresh held
+  family after cache recapture; retain checksum and healthy-seed assertions.
+  - [x] Reopen the current family in each fixture; production owner fencing unchanged.
+- [ ] Align the workspace read-closure refusal assertion with the actual
+  independently isolated compiler boundary; preserve all bypass negatives.
+  - [x] Match the current refusal text; rejection and all bypass negatives remain.
+- [ ] Validate the immutable archive-DAG fixture through the remote codegen
+  planner, with the original retained-mount and exact-output negatives.
+  - [x] Correct only that fixture's planner selection.
+- [ ] Validate cancelled shared-work reaping without disrupting another key
+  or accepting a replacement generation's stale capability.
+  - [x] Handle a reaped, cancelled permit as CancelledBeforeStart; existing
+    replacement-generation checks remain before any such classification.
+  - [x] Add a positive native worker-thread case proving the other key still
+    launches and joins and the cancelled key never probes a worker.
+- [ ] Repair and re-run all three source-planning cleanup cases: cancellation
+  must release roots only after descendant closure, timeout/output bounds
+  must kill/reap, and cleanup must work with no kill executable on PATH.
+  Keep the original 500ms closure budget and operation/test deadlines.
+  - [x] Candidate: signal a still-running unreaped group leader before the
+    global procfs scan. An exited leader still requires membership inspection;
+    complete closure and retained-root behavior remain mandatory. Native untested.
+- [ ] Validate warmed generated capture with the required private operation
+  parent and retain the canonical-root rebinding rejection.
+  - [x] Make the positive fixture's operation directory mode 0700.
+- [ ] Validate publication drain across the real per-connection request cap;
+  retain acknowledged-publication ordering and the original overall deadline.
+  - [x] Renew the fixture's session at MAX_REQUESTS_PER_CONNECTION (64);
+    the failing native trace contains exactly 64 warming replies.
+- [ ] Validate both output fixtures with required dep-info read closure;
+  retain absolute-destination fencing and the elevated-evidence refusal.
+  - [x] Request dep-info,link in the two positive fixtures; no adapter guard changed.
+- [ ] Resolve the missing-OUT_DIR native-archive policy from the actual
+  foreign-root contract; do not weaken a negative or reject legitimate Cargo
+  consumers merely to turn the fixture green.
+  - [x] Candidate production fix: require this package's own OUT_DIR for
+    explicit native -l directives. Search-only propagated roots still admit
+    consumers without a build script; retain the original missing-OUT_DIR
+    rejection assertion and existing foreign-root positive tests unchanged.
+- [ ] Validate consistent output-option refusal text from preflight and full
+  planner while preserving identical unsupported-option rejection.
+  - [x] Use the error's Display representation in the full planner.
+- [ ] Validate both build-script placement/key fixtures with complete captured
+  directory witnesses and all original key-equality/inequality assertions.
+  - [x] Include the empty generated directory in the synthetic input witness.
+- [ ] Compile and run the real-runtime-Cx actor test without test-internals.
+  - [x] Preserve the original named test and all four assertions using a
+    runtime task's Cx; remove only the dev feature and Cargo-generated lock
+    edges. Locked metadata resolves proc-macros,tls; this is not compilation.
+- [ ] Freeze a combined source containing these repairs. The previously staged
+  three-file `real-cx-locked5ab` capsule is unrun and does not cover the later
+  repairs; do not use it as combined acceptance.
+- [ ] Preserve current terminal/ACK, genuine logs, original failures, exact
+  source-after audit and binaries before reusing its Cargo caches.
+- [ ] Run the combined native daemon and targeted regression cases, then the
+  required workspace/all-target check, strict Clippy and fmt. Keep all original
+  dependency budgets and record any remaining losses without suppressions.
+- [ ] Re-run real Cargo acceptance with matching tools after native regressions
+  settle; no unit-fixture result closes M6, S7, A012 or the fleet/storm gates.
+
 - [x] Merge upstream d05cefb2/a1fe627c without changing the running e808 source.
   The sole conflict is the same six-case mutation-table type alias; all cases
   and assertions survive. Merge 9e5c7020 includes no manifest/lock changes.
