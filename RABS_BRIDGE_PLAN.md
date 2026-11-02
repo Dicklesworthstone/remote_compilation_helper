@@ -2160,12 +2160,23 @@ real Cargo serving, fleet performance or release qualification.
     source before/after and executable unchanged, terminal ACK/all ownership
     retired. This scoped pass does not substitute for full QA or actual TLS.
     Report SHA-256 `acfc2e64cb667443b1085aa2f246a6131479d9eaab441761fe32644d82573946`.
-  - [ ] Finish complete fresh validation of that corrected cut: build
+  - [x] Complete fresh native tests and compiler validation of that corrected cut: build
     `30091812672634881`, wrapper `rchw-63aa0886-2836-4b9b-927f-8bf12e10aece`,
     strict one-slot 10,800s job (session34196). Actual **27/27 cohort, 473/473
     key, 1,464/1,464 daemon and 4/4 doctor pass**, zero ignored; all prior daemon
-    names and original controls retained. Workspace check exits0 (304.2s).
-    Strict Clippy, fmt, final source/executable audit and terminal retrieval pending.
+    names and original controls retained. Workspace check0/304.16s, strict
+    Clippy0/260.55s and fmt0/7.24s. Source before/after matches 1,694/1,755 plus
+    the exact 61 omissions, zero differences; every original/retained executable
+    stays byte-identical. CLI0 and 55 result files retrieved. Actual 53-command
+    report SHA-256 `d33a28c467a541beb67a3c4f8231983acc5f69730398311b30ed76a3901969e0`.
+  - [ ] Establish the original unit job's remaining custody status without
+    manufacturing a journal. After the long input pause, its local lease JSON
+    is absent; supported same-ID recovery reports RCH-E504. The exact public
+    daemon tuple query returns HTTP200/completed for the original wrapper,
+    build and worker with exit0; raw body SHA-256
+    `8b263625dfa2beff31e1cc34afd1ba6f3f8e704057cfee1b87bfc00fcec638fa`.
+    This confirms completion, not source retirement. The passing native tests
+    and source audit remain valid; no local terminal-ACK claim is made.
   - [x] Preserve the first optimized DSR setup failure on old813:
     run `18488377-bd18-4054-ac6f-b290cc0ef718`, frontend6/native1 before Cargo.
     SBH observes 13.9103% free below its unchanged 14% pressure floor, despite
@@ -2183,11 +2194,36 @@ real Cargo serving, fleet performance or release qualification.
     that qualified storage and rerun the original TLS and service cases with
     the same complete selected toolchain, namespace checks and deadlines.
     No full57, optimized-overhead, fleet, soak, signing or release acceptance yet.
-    Preparation uses a separate complete be324 working-tree snapshot and private
+    Execution uses a separate complete be324 working-tree snapshot and private
     DSR configuration with build/cache/compiler-temporary storage on the healthy
     ZFS volume. Original real tests still use `/tmp`, their complete selected
-    toolchain and existing deadlines. Fresh DSR host health is0; the native
-    optimized runner is staged but waits for the actual successful full-QA ACK.
+    toolchain and existing deadlines. Fresh DSR host health is0. Its actual
+    completed native-QA report and exact daemon completion are bound by hashes;
+    the missing local ACK stays explicitly unavailable. Only hash-checked
+    read-only harness copies are used; no predecessor source/cache/output is
+    mutated. An initial failed receipt-staging attempt left an empty terminal
+    input, preserved and unused; the selected new runner reads the genuine
+    completion response instead of synthesizing an ACK.
+    DSR run `72a0d36f-101d-42a0-9afb-36eb572027f6` is running on native Linux,
+    all four storage checks0 and source-before verified 1,697/1,755 with the
+    same 58 allowed metadata omissions. Normal optimized dependencies are
+    compiling; tools and all three runtime results remain pending.
+  - [ ] Exercise the public `cargo rabs --rabs-canonical-local` launcher with
+    those exact DSR-built tools, separately from the native harness. Copy the
+    frozen hello-world fixture and launcher verbatim into a new private test
+    project; retain their source hashes and native operation profiles.
+    - [ ] Run the real fixture program and require its two original output lines
+      plus actual Cargo/native completion0. Closed stdin selects `/dev/null`;
+      keep full namespace/toolchain capture and advisory diagnostic policy explicit.
+    - [ ] Run `test --no-fail-fast -- --include-ignored --test-threads=1` and
+      require both original intentional failures, 11 passed/two failed/zero
+      ignored across the original 13 unit/integration cases, plus the one
+      passing doctest (12 passed/two failed in total), and Cargo exit101
+      preserved through the actual public launcher.
+    - [ ] Retrieve both raw streams, actual operation reports and source/tool
+      before/after hashes; retain the managed job's terminal receipt promptly.
+      These no-dependency cases prove launcher/run/exit behavior, not TLS,
+      dependency-cache serving, release authorization or fleet qualification.
   - [x] Read-only prerequisite inventory on distinct Linux hosts `trj`
     (`threadripperje`) and `ts1` (`thinkstation1`): bwrap, cc, ar and OpenSSL
     resolve on both; no RABS tools resolve on either login PATH. Actual basic
