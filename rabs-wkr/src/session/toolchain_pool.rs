@@ -158,12 +158,8 @@ impl VerificationOwner<'_> {
             .flight
             .result
             .lock()
-            .map_err(|_| invalid("toolchain verification result is poisoned"))? = Some(
-            result
-                .as_ref()
-                .map(|()| ())
-                .map_err(VerificationFailure::of),
-        );
+            .map_err(|_| invalid("toolchain verification result is poisoned"))? =
+            Some(result.as_ref().copied().map_err(VerificationFailure::of));
         self.finished = true;
         self.flight.changed.notify_all();
         Ok(())
@@ -505,9 +501,12 @@ impl ToolchainPool {
         self.changed.notify_all();
         Ok(())
     }
-    /// Lookup may reopen a published durable tree, but never creates a capture,
-    /// reservation or waiter. Hashing stays off the control reactor and outside
-    /// the admission lock. In-progress captures and partial disk trees miss.
+    /// Lookup may reopen a published durable tree, but never creates a capture
+    /// or waits for one. A bounded memory reservation lets a verified reopen
+    /// become a shared ready owner; misses and failures release that reservation.
+    /// Hashing stays off the control reactor and outside the admission lock.
+    /// In-progress captures and partial disk trees miss. Lookup never evicts an
+    /// existing owner: a full pool can still return a verified unpooled disk hit.
     pub(crate) fn lookup(
         &self,
         expected: &ToolchainIdentity,
@@ -518,6 +517,7 @@ impl ToolchainPool {
             return Ok(None);
         }
         let identity = key(expected);
+        let mut reservation = None;
         let dataset = {
             let mut state = self.lock()?;
             state.clock = state.clock.saturating_add(1);
@@ -531,13 +531,54 @@ impl ToolchainPool {
                     Some(Arc::clone(dataset))
                 }
                 Some(Slot::Capturing) => return Ok(None),
-                None => None,
+                None => {
+                    // Reserve only spare memory capacity. A speculative disk
+                    // miss must not evict a useful ready entry or create a new
+                    // dataset. Concurrent acquisitions can join this same
+                    // reservation; concurrent lookups remain nonblocking.
+                    if self.directory.1.is_some()
+                        && state.entries.len() < self.max_entries
+                        && state.reserved_bytes <= self.max_bytes - expected.bytes
+                    {
+                        state.entries.insert(identity, Slot::Capturing);
+                        state.reserved_bytes += expected.bytes;
+                        reservation = Some(Reservation {
+                            pool: self,
+                            key: identity,
+                            armed: true,
+                        });
+                    }
+                    None
+                }
             }
         };
         let dataset = match dataset {
             Some(dataset) => dataset,
             None => match Dataset::retained(&self.directory, expected, &stopped)? {
                 Some(dataset) => {
+                    checkpoint(&stopped)?;
+                    if let Some(reservation) = &mut reservation {
+                        let mut state = self.lock()?;
+                        if !matches!(state.entries.get(&identity), Some(Slot::Capturing)) {
+                            return Err(invalid("toolchain reopen lost its reservation"));
+                        }
+                        state.clock = state.clock.saturating_add(1);
+                        let touched = state.clock;
+                        state.entries.insert(
+                            identity,
+                            Slot::Ready {
+                                dataset: Arc::clone(&dataset),
+                                touched,
+                            },
+                        );
+                        reservation.armed = false;
+                        drop(state);
+                        self.changed.notify_all();
+                    }
+                    // Cancellation may arrive while publication waits for the
+                    // admission mutex. Keep the verified ready owner reusable,
+                    // but do not return a lease to that cancelled caller.
+                    checkpoint(&stopped)?;
                     return Ok(Some(ToolchainLease {
                         dataset,
                         disposition: "reused",

@@ -1,10 +1,11 @@
 //! Real filesystem, dataset verifier and pool tests. Reopening models restart;
 //! these fixtures are not power-loss, TLS, compiler-execution or speedup proof.
-use super::super::ToolchainPool;
+use super::super::{Slot, ToolchainPool, key};
 use super::*;
 use rabs_sandbox::canonical_namespace::{Bind, CanonicalNamespaceSpec};
 use rabs_sandbox::toolchain_dataset::fingerprint_toolchain;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+use std::sync::Arc;
 
 const BYTES: &[u8] = b"compiler\0\xff";
 
@@ -99,11 +100,23 @@ fn durable_pool_reopens_exact_inodes_without_the_original_installation() {
     assert!(root.join("lib/empty").is_dir());
     assert_eq!(f.objects(), vec![f.entry()]);
     assert_eq!(fs::read_dir(pool.directory.0.path()).unwrap().count(), 0);
+    {
+        let state = pool.lock().unwrap();
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.reserved_bytes, f.identity.bytes);
+        assert!(matches!(
+            state.entries.get(&key(&f.identity)),
+            Some(Slot::Ready { dataset, .. }) if Arc::ptr_eq(dataset, &lease.dataset)
+        ));
+    }
+    let next = pool.lookup(&f.identity, || false).unwrap().unwrap();
+    assert!(Arc::ptr_eq(&next.dataset, &lease.dataset));
     // Actual execution acquisition also finds the retained tree without having
     // to trust or reopen the vanished installation path supplied by a caller.
     let execution = pool
         .acquire(&f.source, Some(&f.identity), || false)
         .unwrap();
+    assert!(Arc::ptr_eq(&execution.dataset, &lease.dataset));
     assert_eq!(execution.root(), root);
     assert_eq!(
         fs::metadata(execution.root().join("bin/compiler"))
@@ -112,6 +125,274 @@ fn durable_pool_reopens_exact_inodes_without_the_original_installation() {
         inode
     );
     execution.verify(|| false).unwrap();
+}
+
+#[test]
+fn durable_lookup_miss_corruption_and_cancellation_release_memory_reservations() {
+    use std::cell::Cell;
+
+    for fault in 0..3 {
+        let f = Fixture::new();
+        let pool = f.pool();
+        drop(
+            pool.acquire(&f.source, Some(&f.identity), || false)
+                .unwrap(),
+        );
+        drop(pool);
+        let compiler = f.entry().join("tree/bin/compiler");
+        if fault == 1 {
+            fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::write(&compiler, vec![b'x'; BYTES.len()]).unwrap();
+            fs::set_permissions(&compiler, fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        let retained_bytes = fs::read(&compiler).unwrap();
+        let objects = f.objects();
+        let pool = f.pool();
+        let selected = if fault == 0 {
+            ToolchainIdentity {
+                sha256: [0x77; 32],
+                ..f.identity
+            }
+        } else {
+            f.identity
+        };
+        let saw_reservation = Cell::new(false);
+        let result = pool.lookup(&selected, || {
+            let reserved = matches!(
+                pool.lock().unwrap().entries.get(&key(&selected)),
+                Some(Slot::Capturing)
+            );
+            if reserved {
+                saw_reservation.set(true);
+            }
+            fault == 2 && reserved
+        });
+        match fault {
+            0 => assert!(result.unwrap().is_none()),
+            1 => assert_eq!(result.err().unwrap().kind(), io::ErrorKind::InvalidData),
+            _ => assert_eq!(result.err().unwrap().kind(), io::ErrorKind::Interrupted),
+        }
+        assert!(saw_reservation.get(), "fault {fault}");
+        {
+            let state = pool.lock().unwrap();
+            assert!(state.entries.is_empty(), "fault {fault}");
+            assert_eq!(state.reserved_bytes, 0, "fault {fault}");
+        }
+        assert_eq!(f.objects(), objects);
+        assert_eq!(fs::read(&compiler).unwrap(), retained_bytes);
+        assert_eq!(fs::read(f.source.join("bin/compiler")).unwrap(), BYTES);
+        if fault == 2 {
+            let recovered = pool.lookup(&f.identity, || false).unwrap().unwrap();
+            recovered.verify(|| false).unwrap();
+            assert_eq!(pool.lock().unwrap().reserved_bytes, f.identity.bytes);
+        }
+    }
+}
+
+#[test]
+fn cancellation_after_durable_publication_keeps_the_ready_owner_but_returns_no_lease() {
+    use std::cell::Cell;
+
+    let f = Fixture::new();
+    let pool = f.pool();
+    drop(
+        pool.acquire(&f.source, Some(&f.identity), || false)
+            .unwrap(),
+    );
+    drop(pool);
+    let pool = f.pool();
+    let objects = f.objects();
+    let saw_ready = Cell::new(false);
+    let error = pool
+        .lookup(&f.identity, || {
+            let ready = matches!(
+                pool.lock().unwrap().entries.get(&key(&f.identity)),
+                Some(Slot::Ready { .. })
+            );
+            saw_ready.set(saw_ready.get() || ready);
+            ready
+        })
+        .err()
+        .unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    assert!(saw_ready.get());
+    let retained = {
+        let state = pool.lock().unwrap();
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.reserved_bytes, f.identity.bytes);
+        match state.entries.get(&key(&f.identity)).unwrap() {
+            Slot::Ready { dataset, .. } => Arc::clone(dataset),
+            Slot::Capturing => panic!("verified reopen must be ready"),
+        }
+    };
+    let recovered = pool.lookup(&f.identity, || false).unwrap().unwrap();
+    assert!(Arc::ptr_eq(&retained, &recovered.dataset));
+    recovered.verify(|| false).unwrap();
+    assert_eq!(f.objects(), objects);
+    assert_eq!(fs::read(f.source.join("bin/compiler")).unwrap(), BYTES);
+    assert_eq!(
+        fs::read(f.entry().join("tree/bin/compiler")).unwrap(),
+        BYTES
+    );
+}
+
+#[test]
+fn unwinding_durable_lookup_releases_its_memory_reservation_without_poisoning_the_pool() {
+    let f = Fixture::new();
+    let pool = f.pool();
+    drop(
+        pool.acquire(&f.source, Some(&f.identity), || false)
+            .unwrap(),
+    );
+    drop(pool);
+    let pool = f.pool();
+    let objects = f.objects();
+    let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        pool.lookup(&f.identity, || {
+            let reserved = matches!(
+                pool.lock().unwrap().entries.get(&key(&f.identity)),
+                Some(Slot::Capturing)
+            );
+            assert!(!reserved, "interrupt the actual reserved disk reopen");
+            false
+        })
+    }));
+    assert!(interrupted.is_err());
+    {
+        let state = pool.lock().unwrap();
+        assert!(state.entries.is_empty());
+        assert_eq!(state.reserved_bytes, 0);
+    }
+    assert_eq!(f.objects(), objects);
+    assert_eq!(
+        fs::read(f.entry().join("tree/bin/compiler")).unwrap(),
+        BYTES
+    );
+    let recovered = pool.lookup(&f.identity, || false).unwrap().unwrap();
+    recovered.verify(|| false).unwrap();
+}
+
+#[test]
+fn concurrent_reopen_keeps_lookup_nonblocking_and_cancelled_acquisition_cannot_steal_it() {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    let f = Fixture::new();
+    let pool = f.pool();
+    drop(
+        pool.acquire(&f.source, Some(&f.identity), || false)
+            .unwrap(),
+    );
+    drop(pool);
+    fs::rename(&f.source, f.source.with_file_name("absent-installation")).unwrap();
+    let pool = Arc::new(f.pool());
+    let (reached_tx, reached_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    let loader_pool = Arc::clone(&pool);
+    let identity = f.identity;
+    thread::scope(|scope| {
+        let loader = scope.spawn(move || {
+            let paused = Cell::new(false);
+            loader_pool.lookup(&identity, || {
+                let reserved = matches!(
+                    loader_pool.lock().unwrap().entries.get(&key(&identity)),
+                    Some(Slot::Capturing)
+                );
+                if reserved && !paused.replace(true) {
+                    reached_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                }
+                false
+            })
+        });
+        reached_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(pool.lookup(&identity, || false).unwrap().is_none());
+        let checkpoints = AtomicUsize::new(0);
+        let cancelled = pool
+            .acquire(&f.source, Some(&identity), || {
+                checkpoints.fetch_add(1, Ordering::SeqCst) >= 2
+            })
+            .err()
+            .unwrap();
+        assert_eq!(cancelled.kind(), io::ErrorKind::Interrupted);
+        {
+            let state = pool.lock().unwrap();
+            assert_eq!(state.entries.len(), 1);
+            assert_eq!(state.reserved_bytes, identity.bytes);
+            assert!(matches!(
+                state.entries.get(&key(&identity)),
+                Some(Slot::Capturing)
+            ));
+        }
+        resume_tx.send(()).unwrap();
+        let reopened = loader.join().unwrap().unwrap().unwrap();
+        let execution = pool.acquire(&f.source, Some(&identity), || false).unwrap();
+        assert!(Arc::ptr_eq(&reopened.dataset, &execution.dataset));
+        execution.verify(|| false).unwrap();
+        assert_eq!(f.objects(), vec![f.entry()]);
+        assert_eq!(
+            fs::read(f.entry().join("tree/bin/compiler")).unwrap(),
+            BYTES
+        );
+    });
+}
+
+#[test]
+fn durable_lookup_at_memory_capacity_preserves_busy_and_idle_ready_owners() {
+    for by_bytes in [false, true] {
+        let f = Fixture::new();
+        let budget = if by_bytes { f.identity.bytes } else { 1024 };
+        let entries = if by_bytes { 8 } else { 1 };
+        let pool = ToolchainPool::with_directory(budget, entries, Some(&f.cache)).unwrap();
+        drop(
+            pool.acquire(&f.source, Some(&f.identity), || false)
+                .unwrap(),
+        );
+        drop(pool);
+
+        let other = Fixture::new();
+        fs::write(other.source.join("bin/compiler"), b"other!").unwrap();
+        let other_identity =
+            fingerprint_toolchain(&other.source, &ToolchainLimits::default(), || false).unwrap();
+        let pool = ToolchainPool::with_directory(budget, entries, Some(&f.cache)).unwrap();
+        let mut held = Some(
+            pool.acquire(&other.source, Some(&other_identity), || false)
+                .unwrap(),
+        );
+        let other_root = held.as_ref().unwrap().root().to_path_buf();
+        assert!(!other_root.starts_with(&f.cache));
+        for busy in [true, false] {
+            if !busy {
+                drop(held.take());
+            }
+            let old = pool.lookup(&f.identity, || false).unwrap().unwrap();
+            old.verify(|| false).unwrap();
+            assert_eq!(old.root(), f.entry().join("tree"));
+            {
+                let state = pool.lock().unwrap();
+                assert_eq!(state.entries.len(), 1);
+                assert_eq!(state.reserved_bytes, other_identity.bytes);
+                assert!(matches!(
+                    state.entries.get(&key(&other_identity)),
+                    Some(Slot::Ready { dataset, .. }) if dataset.toolchain.root() == other_root
+                ));
+                assert!(!state.entries.contains_key(&key(&f.identity)));
+            }
+            assert_eq!(
+                fs::read(other_root.join("bin/compiler")).unwrap(),
+                b"other!"
+            );
+            assert_eq!(f.objects(), vec![f.entry()]);
+            assert_eq!(fs::read(f.source.join("bin/compiler")).unwrap(), BYTES);
+            assert_eq!(
+                fs::read(other.source.join("bin/compiler")).unwrap(),
+                b"other!"
+            );
+        }
+    }
 }
 
 #[test]
