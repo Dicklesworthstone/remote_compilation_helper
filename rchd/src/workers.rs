@@ -875,6 +875,11 @@ pub(crate) struct WorkerEndpointSnapshot {
     incarnation: Option<Arc<WorkerEndpointIncarnation>>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct WorkerSlotAdmission {
+    pub disk_capacity: Option<DiskCapacityObservation>,
+}
+
 #[derive(Debug)]
 struct WorkerEndpointIncarnation {
     generation: AtomicU64,
@@ -1475,68 +1480,85 @@ impl WorkerState {
         self.disk_slot_policy.headroom(&assessment)
     }
 
-    /// Reserve slots for a job. Returns true if successful.
+    /// Reserve capacity without an await after ownership is committed.
     ///
-    /// Re-reads disk capacity on each CAS iteration and keeps the config and
-    /// pressure snapshot locked through the reservation to avoid overallocation.
-    ///
-    /// Also re-checks status on each iteration and refuses reservations on
-    /// workers that are `Draining`, `Drained`, or `Disabled`. The selector
-    /// filters by `healthy_workers()` up-front, but between that filter and
-    /// this CAS an operator may run `rch workers drain`, which would
-    /// otherwise let a new build land on a worker that was just asked to
-    /// stop accepting work — defeating the entire drain contract.
+    /// All admission evidence is collected before the CAS. Retaining the
+    /// config, pressure, and lifecycle read guards through the CAS prevents
+    /// administrative or capacity changes from racing that commit. Cancellation
+    /// while awaiting those guards never changes slot accounting.
     pub async fn reserve_slots(&self, count: u32) -> bool {
         if count == 0 {
             return false;
         }
+        let config = self.config.read().await;
+        let pressure = self.pressure_assessment.read().await;
+        let lifecycle = self.lifecycle.read().await;
+        if !lifecycle.is_schedulable() {
+            return false;
+        }
+        let total_slots = self.slots_for(config.total_slots, &pressure);
+        self.reserve_slots_accounting(count, total_slots)
+    }
 
+    /// Reserve slots against the exact endpoint selected for a build and carry
+    /// that endpoint's disk-capacity evidence across the durable-history handoff.
+    ///
+    /// There is no await after slot accounting succeeds. The caller can therefore
+    /// synchronously publish durable ownership before cancellation becomes
+    /// observable again. A retarget, retirement, stale lifecycle, or insufficient
+    /// capacity is refused before accounting changes.
+    pub(crate) async fn reserve_slots_for_endpoint(
+        &self,
+        count: u32,
+        endpoint: &WorkerEndpointSnapshot,
+    ) -> Option<WorkerSlotAdmission> {
+        if count == 0 {
+            return None;
+        }
+        let config = self.config.read().await;
+        let pressure = self.pressure_assessment.read().await;
+        let lifecycle = self.lifecycle.read().await;
+        let disk_capacity = self.disk_capacity_observation.read().await.clone();
+
+        let endpoint_current = !self.endpoint_incarnation.retired.load(Ordering::Acquire)
+            && endpoint
+                .incarnation
+                .as_ref()
+                .is_some_and(|incarnation| Arc::ptr_eq(incarnation, &self.endpoint_incarnation))
+            && endpoint.generation
+                == self.endpoint_incarnation.generation.load(Ordering::Acquire)
+            && same_endpoint(&config, &endpoint.config);
+        if !endpoint_current || !lifecycle.is_schedulable() {
+            return None;
+        }
+
+        let total_slots = self.slots_for(config.total_slots, &pressure);
+        self.reserve_slots_accounting(count, total_slots)
+            .then_some(WorkerSlotAdmission { disk_capacity })
+    }
+
+    /// Synchronous accounting boundary shared by ordinary and endpoint-bound
+    /// admission. Successful ownership is returned in the same poll that
+    /// changes the counter; there is no cancellable post-commit validation.
+    fn reserve_slots_accounting(&self, count: u32, total_slots: u32) -> bool {
         let mut current = self.used_slots.load(Ordering::Relaxed);
         loop {
-            // Re-read the lifecycle on each iteration so a concurrent `drain()`
-            // / `disable()` (admin axis) or a freshly-entered `TemporaryBypass`
-            // / `RecoveredPendingCanary` quarantine (eligibility axis) becomes
-            // authoritative as soon as it's written, not only on the next
-            // selection round.
-            if !self.connection_is_ready()
-                || !lifecycle_accepts_new_builds(*self.lifecycle.read().await)
-            {
+            if !self.connection_is_ready() {
                 return false;
             }
-            let config = self.config.read().await;
-            let pressure = self.pressure_assessment.read().await;
-            let total_slots = self.slots_for(config.total_slots, &pressure);
             let Some(next) = current.checked_add(count) else {
                 return false;
             };
             if next > total_slots {
                 return false;
             }
-            let reserved = self.used_slots.compare_exchange(
+            match self.used_slots.compare_exchange(
                 current,
                 next,
                 Ordering::SeqCst,
                 Ordering::Relaxed,
-            );
-            drop(pressure);
-            drop(config);
-            match reserved {
-                Ok(_) => {
-                    // TOCTOU defense: re-check the lifecycle after a successful
-                    // slot reservation. If a concurrent drain()/disable() or a
-                    // bypass quarantine landed between our initial read and the
-                    // CAS, roll the reservation back.
-                    if lifecycle_accepts_new_builds(*self.lifecycle.read().await)
-                        && self.connection_is_ready()
-                        && self.used_slots() <= self.effective_total_slots().await
-                    {
-                        return true;
-                    }
-                    // Roll back the reservation; release_slots also handles
-                    // transitioning Draining -> Drained if this was the last slot.
-                    self.release_slots(count).await;
-                    return false;
-                }
+            ) {
+                Ok(_) => return true,
                 Err(actual) => current = actual,
             }
         }
@@ -3198,6 +3220,76 @@ mod tests {
             tags: Vec::new(),
             tools: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn reservation_cancelled_while_waiting_does_not_consume_capacity() {
+        let worker = WorkerState::new(recovered_worker_config("cancel-wait", 8));
+        assert!(worker.reserve_slots(3).await);
+        let pressure = worker.pressure_assessment.write().await;
+        {
+            let pending = worker.reserve_slots(2);
+            tokio::pin!(pending);
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(pending.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            }).await;
+        }
+        drop(pressure);
+        assert_eq!(worker.used_slots(), 3);
+        assert!(worker.reserve_slots(5).await);
+        assert_eq!(worker.used_slots(), 8);
+    }
+
+    #[tokio::test]
+    async fn reservation_uses_current_lifecycle_and_preserves_existing_owner() {
+        let worker = WorkerState::new(recovered_worker_config("stale-selection", 8));
+        assert!(worker.reserve_slots(3).await);
+        worker.apply_health_status(WorkerStatus::Unreachable).await;
+        assert!(!worker.reserve_slots(2).await);
+        assert_eq!(worker.used_slots(), 3);
+        worker.apply_health_status(WorkerStatus::Healthy).await;
+        assert!(worker.reserve_slots(2).await);
+        worker.release_slots(2).await;
+        worker.disable(Some("operator maintenance".into())).await;
+        assert!(!worker.reserve_slots(1).await);
+        assert_eq!(worker.used_slots(), 3);
+    }
+
+    #[tokio::test]
+    async fn endpoint_bound_reservation_rejects_retarget_without_spending_slots() {
+        let pool = WorkerPool::new();
+        let original = recovered_worker_config("endpoint-bound-retarget", 8);
+        pool.add_worker(original.clone()).await;
+        let worker = pool.get(&original.id).await.unwrap();
+        assert!(worker.reserve_slots(3).await);
+        let selected = worker.endpoint_snapshot().await;
+
+        let mut replacement = original.clone();
+        replacement.host = "replacement.invalid".into();
+        worker.update_config(replacement).await;
+
+        assert!(
+            worker
+                .reserve_slots_for_endpoint(2, &selected)
+                .await
+                .is_none()
+        );
+        assert_eq!(worker.used_slots(), 3);
+    }
+
+    #[tokio::test]
+    async fn endpoint_bound_reservation_carries_same_generation_disk_evidence() {
+        let worker = WorkerState::new(recovered_worker_config("endpoint-bound-disk", 8));
+        let selected = worker.endpoint_snapshot().await;
+        let before = worker.disk_capacity_observation().await;
+        let admission = worker
+            .reserve_slots_for_endpoint(2, &selected)
+            .await
+            .expect("current healthy endpoint should reserve");
+        assert_eq!(admission.disk_capacity.is_some(), before.is_some());
+        assert_eq!(worker.used_slots(), 2);
+        worker.release_slots(2).await;
     }
 
     #[tokio::test]
