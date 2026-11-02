@@ -1805,9 +1805,12 @@ fn source_authority_lock_transport(
 /// source cleanup or terminate an independently launched activity.
 fn source_authority_live_session_command(remote_cmd: &str, idle: Duration) -> String {
     let holder = shell_escape::escape(SOURCE_AUTHORITY_LOCK_HOLDER.into());
+    // Keep heredoc writers parented to the delivery shell. Exec would let
+    // their normal exit reach the observer that must revoke on any SIGCHLD.
+    // The explicit exit also prevents shell tail-exec or another stdin read.
     format!(
         "set -eu\nexec 3<<'RCH_SOURCE_LOCK_SESSION_PROGRAM'\n{remote_cmd}\nRCH_SOURCE_LOCK_SESSION_PROGRAM\n\
-         exec sh -c {holder} {holder} --rch-session {seconds}",
+         sh -c {holder} {holder} --rch-session {seconds}\nexit $?",
         seconds = idle.as_secs(),
     )
 }
@@ -7179,7 +7182,12 @@ exec /bin/ln \"$@\"\n",
     async fn source_lock_lifecycle_supervised_claim_release_and_caller_loss() {
         use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
-        for release in [true, false] {
+        for (release, padding_bytes) in [
+            (true, 0),
+            (false, 0),
+            (true, 128 * 1024),
+            (false, 128 * 1024),
+        ] {
             let directory = tempfile::tempdir().unwrap().keep();
             let registry = directory.join("registry");
             let root = directory.join("source");
@@ -7197,6 +7205,7 @@ exec /bin/ln \"$@\"\n",
                 "SUPERVISED_READY",
             )
             .unwrap();
+            let script = format!("{}{script}", "#\n".repeat(padding_bytes / 2));
             let script = source_authority_live_session_command(&script, Duration::from_secs(90));
             let (child, bootstrap) = local_source_lock_transport(WorkerPlatform::Posix, &script);
             let mut guard = finish_source_authority_lock_acquisition(

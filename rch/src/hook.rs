@@ -7754,7 +7754,11 @@ pub(crate) fn add_cargo_isolation(command: &str, worker_id: &WorkerId) -> String
     let base_prelude = rch_common::remote_cargo_home_base_prelude();
     let base_var = rch_common::RCH_CARGO_HOME_BASE_VAR;
 
-    let escaped_command = shell_escape::escape(command.into());
+    // Select the opt-in worker preparer before this command becomes opaque
+    // inside the Cargo-home shell. Configuration guards prepare their own
+    // inner Cargo invocation; the matcher leaves those shells unchanged.
+    let prepared_command = rch_common::wrap_command_with_toolchain(command, None);
+    let escaped_command = shell_escape::escape(prepared_command.into());
     let script = format!(
         "{base_var}=\"${{1:-}}\"; if [ -z \"${{{base_var}}}\" ]; then {base_prelude}; fi; mkdir -p {cargo_home} || exit $?; touch {cargo_home} 2>/dev/null || true; for rch_cache_dir in registry git; do if [ -L {cargo_home}/$rch_cache_dir ] && [ ! -e {cargo_home}/$rch_cache_dir ]; then (cd {cargo_home} && mkdir -p -- \"$(readlink -- \"$rch_cache_dir\")\") || exit $?; fi; done; export CARGO_HOME={cargo_home}; if command -v git >/dev/null 2>&1; then export CARGO_NET_GIT_FETCH_WITH_CLI=true; fi; sh -c {command}",
         base_prelude = base_prelude,

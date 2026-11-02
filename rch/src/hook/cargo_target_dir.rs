@@ -1001,6 +1001,20 @@ fn cargo_subcommand_is_nextest(tokens: &[String], cargo_index: usize) -> bool {
     false
 }
 
+/// Bind opt-in preparation to Cargo before a configuration guard hides it
+/// inside an opaque shell. Prefix environment controls and the guard still
+/// execute before any installed launcher or Cargo code.
+pub(super) fn prepare_guarded_worker_cargo(tokens: &mut Vec<String>, cargo_index: usize) {
+    let command = join_exec_command(&tokens[cargo_index..]);
+    let prepared = rch_common::wrap_command_with_toolchain(&command, None);
+    if prepared != command {
+        tokens.splice(
+            cargo_index..,
+            ["/bin/sh".to_owned(), "-c".to_owned(), prepared],
+        );
+    }
+}
+
 /// Refuse unselected worker Cargo configuration immediately before Unix Cargo.
 /// The outer command prefixes run first, so the guard sees Cargo's effective
 /// environment. This checks ordinary filesystem state, not atomic protection
@@ -1060,6 +1074,7 @@ while [ "$rch_config_parent" != / ]; do # ubs:ignore — compares a directory pa
     fi
 done
 exec "$@""#;
+    prepare_guarded_worker_cargo(&mut tokens, cargo_index);
     tokens.splice(
         cargo_index..cargo_index,
         [

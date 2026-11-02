@@ -277,6 +277,10 @@ class Holder:
 @unittest.skipUnless(FLOCK, "real pair publication requires flock")
 class SourcePairCustodyTests(unittest.TestCase):
     def setUp(self):
+        # Positive records and their parent must satisfy the production
+        # custody boundary even under a group-writable login umask. Explicit
+        # unsafe-mode negatives below still set their original modes.
+        self.addCleanup(os.umask, os.umask(0o077))
         self.root = Path(tempfile.mkdtemp(prefix="rch-source-pair-custody-"))
 
     def paths(self, name):
@@ -1956,7 +1960,7 @@ class SourceLockHolderTests(unittest.TestCase):
         self.assertIn(b"RCH_SOURCE_LOCK_SUPERVISOR_TERMINATED", stderr)
         if hasattr(signal, "sigwaitinfo"):
             self.assertIn(("notification_pid=" + str(monitor)).encode(), stderr)
-            self.assertIn(("notification_code=" + str(signal.CLD_STOPPED)).encode(), stderr)
+            self.assertIn(("notification_code=" + str(os.CLD_STOPPED)).encode(), stderr)
             self.assertIn(("notification_status=" + str(signal.SIGSTOP)).encode(), stderr)
         self.assertEqual(claim.read_text(), "durable owner\n")
         self.assertTrue(available(lock), "stopped monitor stranded inherited source locks")

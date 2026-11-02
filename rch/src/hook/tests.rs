@@ -9161,6 +9161,69 @@ fn test_add_cargo_isolation_uses_durable_per_worker_cargo_home() {
     assert_eq!(isolated, again);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn test_worker_cache_preparation_survives_cargo_isolation_and_config_guards() {
+    const CHILD: &str = "RCH_TEST_WORKER_CACHE_WRAPPERS";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "hook::tests::test_worker_cache_preparation_survives_cargo_isolation_and_config_guards",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("RCH_RABS_WORKER_CACHE", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = tempfile::tempdir().unwrap().keep();
+    let bin = root.join("bin");
+    let source = root.join("source");
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::create_dir(&source).unwrap();
+    // Fixed routing fixtures prove bootstrap placement and single execution;
+    // they do not stand in for real RABS daemon/cache acceptance.
+    for (name, content) in [
+        (
+            "cargo",
+            "#!/bin/sh\nprintf 'cargo-body:%s:%s\\n' \"$1\" \"$2\"\nexit 37\n",
+        ),
+        (
+            "cargo-rabs",
+            "#!/usr/bin/env python3\nRCH_WORKER_PREPARATION_API = 1\ndef prepare(environment, no_start=False):\n    import sys\n    print('preparation-entered', file=sys.stderr)\n    return environment\n",
+        ),
+    ] {
+        let path = bin.join(name);
+        std::fs::write(&path, content).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let command = "cargo check --locked";
+    let clean =
+        cargo_target_dir::guard_clean_overlay_cargo_config(command, source.to_str().unwrap())
+            .unwrap();
+    let owned = source_fidelity::guard_owned_source_content_cargo_config(command, &[]).unwrap();
+    for command in [command, &clean, &owned] {
+        let isolated = add_cargo_isolation(command, &WorkerId::new("routing-test"));
+        assert_eq!(isolated.matches("rch-rabs-worker").count(), 1);
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &isolated])
+            .current_dir(&source)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("RCH_CH_BASE", &root)
+            .env_remove("RCH_RABS_WORKER_ACTIVE")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(37), "{output:?}");
+        assert_eq!(output.stdout, b"cargo-body:check:--locked\n");
+        assert_eq!(output.stderr, b"preparation-entered\n");
+    }
+}
+
 #[test]
 fn test_sanitize_cargo_home_token_collapses_unsafe_chars() {
     // Path-safe tokens pass through unchanged.

@@ -2418,6 +2418,158 @@ real Cargo serving, fleet performance or release qualification.
 - [ ] Diagnose the public source-supervisor failure with an actual failing
   reproduction before editing ownership or liveness code. Preserve synthetic
   SIGCHLD/stopped-monitor revocation, exact release and original deadlines.
+  - [x] Reproduce the same error with large real stdin/heredoc bootstraps.
+    Added optional non-reaping signal-origin diagnostics to the existing
+    error, with two original-code RED assertions and an exact-release fallback
+    test. The observed notification is a normal child exit (code1/status0),
+    followed by monitor SIGKILL/status9, before readiness. No SIGCHLD gate is
+    relaxed or ownership inferred from a numeric PID.
+  - [x] Manually retain the live transport's delivery shell, matching the
+    already-correct finite-RPC framing. Its heredoc writers no longer become
+    children of the observer. Explicit exit propagates status and prevents
+    tail-exec or another stdin read. Keep the original Rust release/caller-loss
+    cases and add both again with128KiB padding; their10s acquisition and90s
+    heartbeat limits remain unchanged. Compiled regression is still pending.
+  - [x] Execute paired real Linux login/stdin/kernel-lock probes at the
+    unchanged production90s idle and existing5s readiness limits. Old framing
+    passes1/2, fails1/2 with supervisor9; new framing passes2/2, including
+    exact release, durable claim preservation and available locks afterward.
+    The probe itself exits1 because it predeclared both old cases would fail;
+    retain that mismatch rather than reclassifying the whole invocation green.
+    This is a protocol reproduction, not compiled Rust/public RCH acceptance.
+  - [ ] Complete native Mac DSR development client
+    `2.1.34-rchframe.1ade3f8b`, source
+    `85dc06ed-overlay-source-framing-1ade3f8b9c271c0056e766ff4be44daf290c33eb819c7e0f7aea532c83bd9d68`.
+    Only holder diagnostics, SSH framing/regression and Python tests differ
+    from clean85dc. Use ordinary dirty development mode, not the copied
+    release contract that correctly refused the earlier untagged overlay.
+    Native-only, one Cargo job, original20GiB admission, no publication or
+    default installation. Engine409/409 reverified. Fresh private APFS build
+    root has37.91GiB free. No product release gate changed.
+  - [ ] Use the new client for same-ID recovery of
+    `rchw-d1d43a04-dc22-42e3-9707-8570843b916e`, build30091812672635114.
+    With pinned nightly2026-08-31, the public attempt acquires source authority,
+    transfers all6 fixture files and Cargo reports Finished in23.89s. Then
+    process/disk supervision refuses completion: background writers did not
+    stop, scoped completion unconfirmed, execution255 and CLI1. RABS activation
+    is unproven. Ownership remains retained: recovery30s times out; two further
+    attempts fail with source supervisor9. No command replay or manual lock
+    removal, daemon restart, cancellation of peers or fabricated ACK.
+  - [ ] Diagnose actual writer-closure failure after supported recovery.
+    Read-only complete procfs censuses on the busy Linux host take1.26/1.27/
+    3.42s; this observation does not prove which writer survived or justify
+    extending the original2s cleanup bound.
+  - [ ] Resolve or classify the complete holder suite's actual RED results:
+    90 tests ran,23 failures and4 errors (these include subtest counts).
+    Several pair fixtures are rejected for unsafe record/directory permissions;
+    other cases hit original timing bounds. The standalone SSH environment
+    selected `/scratch/tmp`, unlike the DSR acceptance runner's explicit `/tmp`.
+    Preserve raw results; no blanket green or unverified attribution to load.
+    Mac four-case probe has two passes/two failures; original85dc independently
+    reproduces normal-release killpg EPERM. No Darwin qualification claim.
+  - [ ] Run compiled framing regression and required workspace check, strict
+    Clippy and fmt on a complete cut including this fix. Current RABS272 run
+    does not contain these later RCH edits. UBS reports three pre-existing
+    critical findings in trusted test subprocesses and the intentional0666
+    rejection fixture; retain all negative assertions and do not suppress them
+    to manufacture a clean scanner result. No commit/promotion by this agent.
+  - [x] Isolate custody-fixture permissions with the original seven complete
+    cases, including malformed, writable, symlink and hard-link negatives:
+    all7 pass with private fixtures. Make that fixture's umask explicit and
+    restore it with addCleanup; production permission checks stay unchanged.
+    Correct the new diagnostic assertion to use os.CLD_STOPPED (the signal
+    module lacks it on this Python). Combined7 custody+18 session run has
+    24 passes/one BrokenPipe error while sending a partial heartbeat; unchanged
+    exact partial-heartbeat case then passes1/1 in1.616s. Preserve both results.
+  - [ ] Retire the first Mac DSR attempt honestly: its coordinator disappears
+    before the intended cancellation can run; the ownership assertion refuses
+    to signal a missing leader. State still says running, no terminal receipt,
+    and a local Bash descendant remains. No completed/cancelled native result
+    is asserted. Its sampled leaf is blocked writing a heredoc, before native
+    compilation. Preserve recipe/log/sample; no manual lock or state cleanup.
+  - [ ] Complete the shorter ordinary Mac DSR retry, run
+    `22004a69-367f-488e-9918-cef3607ab1e2`, same source1ade3f8b, private state
+    `/Users/jemanuel/.local/state/rch-source-framing-short-dsr-20261102/state`.
+    Native logs show actual compilation (fsqlite-core at22:04UTC), unlike the
+    abandoned orchestration attempt. Shortening this development recipe moves
+    smoke/audit outside the build command; it does not qualify product gates.
+    - [x] Actual DSR completed0 at22:09:15UTC; native target0 in713s,
+      Cargo release build11m32s and version0. Bundle5,969,698 bytes,
+      SHA07666c18e5b3c28d5c10878baf146a9c1d803d79d1eff2f95b8ea7a1e48be068.
+      Upload and build trees each match1,697/1,740 files with43 exact Beads/log
+      omissions; independent post-terminal build-tree audit matches again.
+      No source difference. The development purpose remains explicit despite
+      the ordinary engine's generic publishable metadata; no release dispatched.
+    - [x] Extract only the verified regular rch archive member into a fresh
+      private directory, leaving installed defaults alone. Binary10,980,112
+      bytes, SHA93dd9d2642ed4dca342344fa598fd4287ce0a1e08fc17f911483ac643d9f0e8c,
+      at `/Users/jemanuel/.local/state/rch-source-framing-client-20261102/bin/rch`.
+      Version and JSON config-get both0, empty stderr; hash unchanged afterward.
+    - [x] Use that actual compiled client for same-ID recovery, without replay.
+      `rchw-d1d43a04-dc22-42e3-9707-8570843b916e` / build30091812672635114
+      now recovers with exit255 preserved and terminal acknowledgement true.
+      Genuine journal is finished; sources_released/tree_retired/pair_released/
+      retired all true. Receipt
+      `/Volumes/trj-data/rabs-rch-cargo-readiness-framing-recovery-20261102.json`,
+      SHAac67105e33d7b5e07843b84652d18a171add46b2a42e7e211a77b6666df8d25d.
+      This proves useful real-path recovery through the framing repair. It
+      does not turn the original writer-closure failure into a Cargo/RABS pass.
+      Recovery logs retain daemon130 versus delivery255 disagreement and the
+      incompatible config-cache warning. No manual state or lock removal.
+
+**Worker-local RABS activation — concrete wiring gap, new45994eed cut.**
+
+- [x] Trace actual public command construction after the successful Cargo
+  foreground: `add_cargo_isolation` makes Cargo opaque inside sh-c before the
+  common opt-in matcher runs. Both source-content and clean-overlay guards
+  likewise hide literal Cargo. Thus the selected RCH_RABS_WORKER_CACHE flag
+  can silently miss preparation, even though its standalone builder tests pass.
+- [x] Manually bind preparation before ordinary Cargo isolation and at the
+  actual Cargo argv inside both configuration guards. Prefix controls, private
+  CARGO_HOME, toolchain selection and all configuration refusals remain ahead
+  of installed launcher/Cargo execution. Default/unsupported commands retain
+  existing behavior; existing bootstrap owns lifecycle, fallback and authority.
+- [x] Add a focused compiled Linux regression covering ordinary, clean-overlay
+  and owned-source paths. Explicit routing fixtures require preparation once,
+  Cargo once with exact argv/stdout, and nonzero37 propagation. They exercise
+  the real bootstrap/processes but are NOT real RABS daemon/cache evidence.
+- [x] Freeze separate full source
+  `85dc06ed-overlay-272b-worker-cache-wiring-45994eed4eb1624221b1cc512b98a8aa5203464c40fbb7ff3eb961ed6824cfa5`:
+  exactly seven RCH/test files differ from272;1,755/1,755 reverified, zero diff.
+  Manifest24078d0e3d3ceb5ad035082fa1227a79a706fcd56caa3a43f06fd64e9a7f7a18.
+  Workspace fmt check0 after manually applying only its reported formatting.
+- [ ] Finish native-only DSR toolrch_worker_cache_wiring,
+  version2.1.34-rchwiring.45994eed, session76253, private state
+  `/Users/jemanuel/.local/state/rabs-worker-cache-wiring-dsr-20261102/state`.
+  Source syncing at22:04UTC. Recipe runs the new routing test, strengthened
+  source-lock release/caller-loss case, original config guards, workspace
+  all-target check, strict Clippy and fmt, then builds rch. One Cargo job,
+  declared10,800s orchestration, original storage/product/test gates unchanged.
+  First failure stops the chain; later unrun commands must remain unrun.
+  Actual run50520372-7a9f-4824-a0d4-0c9931f4d1dc is managedrunning.
+  Both native storage guards0; Cargo test is active on the owned target and
+  retained private Cargo home. Independent synchronized-source audit during
+  preparation matches1,697/1,755 plus58 exact policy omissions, zero diff.
+  This audit is not retroactively called a pre-build check. Runtime result
+  and required QA remain pending. A read-only observation finds Cargo in
+  kernel wait; no lock-contention or scheduler-only cause is established.
+- [ ] Bind native source before/after and actual artifact identity. Then build
+  the matching private Mac client through DSR and prove real public opt-in
+  preparation with an actual installed private RABS toolset and real Cargo.
+  The currently compiling Mac1ade client repairs source framing only; it does
+  not contain this later worker-cache wiring fix. Current RABS272 acceptance
+  likewise excludes these seven later RCH edits. No combined-source claim.
+- [x] Probe mandatory same-filesystem reflink on healthy ZFS using a new
+  private retained data fixture: cp --reflink=always returns0. This establishes
+  filesystem capability only, no RABS clone/identity/performance result.
+- [ ] If current startup acceptance still fails, exercise the existing real
+  verified-reflink test and a full-toolchain deployment on that filesystem.
+  Production canonical ToolchainPool already accepts try_verified_reflink;
+  its current original service fixture uses a /tmp state root, so moving
+  only the source would still cross filesystems. Preserve that adverse
+  original fixture/result and unchanged deadlines. Practical profile placement
+  may be tested separately with equivalent complete bytes, not counted as
+  passing the unchanged service fixture or as a speed win without live stock.
 
 **Mac client build enabler — DSR only, separate clean source `85dc06ed`.**
 This unblocks development tooling; it is not the RABS `99d3bafa` runtime verdict

@@ -1657,6 +1657,7 @@ while :; do
 done
 exec "$@""#
     );
+    cargo_target_dir::prepare_guarded_worker_cargo(&mut tokens, cargo_index);
     tokens.splice(
         cargo_index..cargo_index,
         [
