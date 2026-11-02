@@ -587,6 +587,82 @@ mod tests {
         assert_eq!(toml_u32_field_or(&entry, "priority", 100), 100);
         Ok(())
     }
+
+    fn load_worker_fixture(contents: &str) -> Result<Vec<WorkerConfig>> {
+        let directory = tempfile::tempdir()?;
+        std::fs::write(directory.path().join("workers.toml"), contents)?;
+        let previous = TEST_CONFIG_DIR_OVERRIDE
+            .with(|path| path.replace(Some(directory.path().to_path_buf())));
+        let result = load_workers_from_config();
+        TEST_CONFIG_DIR_OVERRIDE.with(|path| *path.borrow_mut() = previous);
+        result
+    }
+
+    #[test]
+    fn load_workers_preserves_named_tools_and_os_fence() {
+        let workers = load_worker_fixture(
+            r#"
+[[workers]]
+id = "builder"
+host = "builder.example"
+os = "darwin"
+tags = ["fast", "os:darwin"]
+tools = [{ name = "clang", command = ["/opt/tool's bin/clang", "--version", 'a\b'] }]
+
+[[workers]]
+id = "parked"
+host = "parked.example"
+enabled = false
+tools = [{ name = "ld.lld", command = ["ld.lld", "--version"] }]
+"#,
+        )
+        .unwrap();
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].id.as_str(), "builder");
+        assert_eq!(workers[0].tags, ["fast", "os:darwin"]);
+        assert_eq!(
+            workers[0].tools,
+            vec![rch_common::types::WorkerToolProbe {
+                name: "clang".into(),
+                command: vec![
+                    "/opt/tool's bin/clang".into(),
+                    "--version".into(),
+                    r"a\b".into()
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn load_workers_preserves_default_and_explicitly_empty_tools() {
+        for declaration in ["", "tools = []\n"] {
+            let workers = load_worker_fixture(&format!(
+                "[[workers]]\nid = \"ordinary\"\nhost = \"builder.example\"\n{declaration}"
+            ))
+            .unwrap();
+            assert_eq!(workers.len(), 1);
+            assert!(workers[0].tools.is_empty());
+            assert!(rch_common::declared_os(&workers[0].tags).is_none());
+        }
+    }
+
+    #[test]
+    fn load_workers_refuses_malformed_or_unusable_tool_probes() {
+        for declaration in [
+            "'clang'",
+            "[{ name = 'clang' }]",
+            "[{ name = 'clang', command = ['clang', 1] }]",
+            "[{ name = 'bad name', command = ['clang'] }]",
+            "[{ name = 'clang', command = [] }]",
+        ] {
+            let error = load_worker_fixture(&format!(
+                "[[workers]]\nid = \"builder\"\nhost = \"builder.example\"\ntools = {declaration}\n"
+            ))
+            .unwrap_err();
+            assert!(error.to_string().contains("builder"), "{error:#}");
+            assert!(error.to_string().contains("tool probe"), "{error:#}");
+        }
+    }
 }
 
 // ============================================================================
@@ -700,6 +776,21 @@ pub fn load_workers_from_config() -> Result<Vec<WorkerConfig>> {
                 tags.push(tag);
             }
         }
+        let tools = entry
+            .get("tools")
+            .map(|value| {
+                value
+                    .clone()
+                    .try_into::<Vec<rch_common::types::WorkerToolProbe>>()
+            })
+            .transpose()
+            .with_context(|| format!("Invalid tool probes for worker {id:?} in {config_path:?}"))?
+            .unwrap_or_default();
+        for tool in &tools {
+            rch_common::capability_probe::NamedToolProbe::try_from(tool).with_context(|| {
+                format!("Worker {id:?} in {config_path:?} declares an unusable tool probe")
+            })?;
+        }
 
         workers.push(WorkerConfig {
             id: WorkerId::new(id),
@@ -709,7 +800,7 @@ pub fn load_workers_from_config() -> Result<Vec<WorkerConfig>> {
             total_slots,
             priority,
             tags,
-            tools: Vec::new(),
+            tools,
         });
     }
 

@@ -658,6 +658,7 @@ fn generate_workers_toml(workers: &[WizardWorker]) -> Result<String> {
                 total_slots: u32::from(worker.total_slots),
                 priority: u32::from(worker.priority),
                 tags: Vec::new(),
+                tools: Vec::new(),
                 // The wizard has no OS question; leaving it unset keeps the new
                 // worker a candidate for any job, which is the safe default.
                 os: None,
@@ -940,6 +941,8 @@ mod tests {
         );
         assert_eq!(parsed.workers[0].user, "ubuntu\"admin");
         assert_eq!(parsed.workers[0].identity_file, "/tmp/key\\with\"quote");
+        assert!(parsed.workers[0].tools.is_empty());
+        assert!(parsed.workers[0].os.is_none());
     }
 
     #[test]

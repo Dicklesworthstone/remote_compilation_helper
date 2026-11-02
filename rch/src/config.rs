@@ -2990,6 +2990,10 @@ pub struct WorkerEntry {
     /// Optional tags for filtering.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Operator-declared tool probes, preserving their exact argument vectors
+    /// when CLI commands load or rewrite the worker configuration.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<rch_common::types::WorkerToolProbe>,
     /// Operator-declared host OS (`linux`, `darwin`, `windows`), gating which
     /// commands may run here — see `rch_common::declared_os`.
     ///
@@ -3275,6 +3279,64 @@ tags = ["rust"]
             !rewritten.contains("os ="),
             "unexpected os key added on rewrite:\n{rewritten}"
         );
+    }
+
+    #[test]
+    fn test_workers_toml_roundtrip_preserves_named_tools_and_declared_os() {
+        let _guard = test_guard!();
+        let original = r#"
+[[workers]]
+id = "mac-builder"
+host = "builder.example"
+os = "darwin"
+tools = [
+    { name = "xcode", command = ["/Applications/Xcode Beta.app/Contents/Developer/usr/bin/xcodebuild", "-version"] },
+    { name = "custom", command = ["/opt/tool's bin/probe", 'a\b', '"quoted"'] },
+]
+"#;
+        let parsed: WorkersConfig = toml::from_str(original).unwrap();
+        let expected = vec![
+            rch_common::types::WorkerToolProbe {
+                name: "xcode".into(),
+                command: vec![
+                    "/Applications/Xcode Beta.app/Contents/Developer/usr/bin/xcodebuild".into(),
+                    "-version".into(),
+                ],
+            },
+            rch_common::types::WorkerToolProbe {
+                name: "custom".into(),
+                command: vec![
+                    "/opt/tool's bin/probe".into(),
+                    r"a\b".into(),
+                    "\"quoted\"".into(),
+                ],
+            },
+        ];
+        assert_eq!(parsed.workers[0].tools, expected);
+        assert_eq!(parsed.workers[0].os.as_deref(), Some("darwin"));
+        let rewritten = toml::to_string_pretty(&parsed).unwrap();
+        let reparsed: WorkersConfig = toml::from_str(&rewritten).unwrap();
+        assert_eq!(reparsed.workers[0].tools, expected);
+        assert_eq!(reparsed.workers[0].os.as_deref(), Some("darwin"));
+    }
+
+    #[test]
+    fn test_workers_toml_defaults_and_empty_tools_remain_empty() {
+        let _guard = test_guard!();
+        for declaration in ["", "tools = []\n"] {
+            let original = format!(
+                "[[workers]]\nid = \"ordinary\"\nhost = \"builder.example\"\n{declaration}"
+            );
+            let parsed: WorkersConfig = toml::from_str(&original).unwrap();
+            assert!(parsed.workers[0].tools.is_empty());
+            assert!(parsed.workers[0].os.is_none());
+            let rewritten = toml::to_string_pretty(&parsed).unwrap();
+            let raw: toml::Value = toml::from_str(&rewritten).unwrap();
+            assert!(raw["workers"][0].get("tools").is_none());
+            let reparsed: WorkersConfig = toml::from_str(&rewritten).unwrap();
+            assert!(reparsed.workers[0].tools.is_empty());
+            assert!(reparsed.workers[0].os.is_none());
+        }
     }
 
     #[test]

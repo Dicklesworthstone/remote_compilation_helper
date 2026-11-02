@@ -244,8 +244,8 @@ pub async fn workers_init(yes: bool, ctx: &OutputContext) -> Result<()> {
     let config_path = config_dir()
         .ok_or_else(|| anyhow::anyhow!("Could not determine config directory"))?
         .join("workers.toml");
-    // Work on the file itself, never on the loaded fleet: loading drops
-    // disabled workers and `tools` declarations, and a parse error used to
+    // Work on the file itself, never on the loaded fleet: loading filters out
+    // disabled workers, and a parse error used to
     // become an empty fleet that was then written over the operator's file.
     let existing = match std::fs::read_to_string(&config_path) {
         Ok(text) => Some(text),
@@ -404,12 +404,30 @@ fn upsert_worker_entry(existing: Option<&str>, worker: &WorkerConfig) -> Result<
             .filter(|slot| slot.get("id").and_then(toml::Value::as_str) == Some(worker.id.as_str()))
         {
             // Re-initialising a worker must not re-enable one an operator
-            // parked, nor drop its declared tool requirements.
+            // parked, nor drop its declared tool requirements or OS fence.
             let mut replacement = entry.clone();
-            for key in ["enabled", "tools"] {
+            for key in ["enabled", "tools", "os"] {
                 if let (Some(kept), Some(fields)) = (slot.get(key), replacement.as_table_mut()) {
                     fields.insert(key.to_owned(), kept.clone());
                 }
+            }
+            // Reserved OS tags take precedence over the explicit OS field
+            // when the daemon loads a worker. Keep that effective fence in
+            // the canonical `os` field without retaining descriptive tags.
+            let existing_tags = slot
+                .get("tags")
+                .and_then(toml::Value::as_array)
+                .map(|tags| {
+                    tags.iter()
+                        .filter_map(toml::Value::as_str)
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if let Some(os) = rch_common::declared_os(&existing_tags)
+                && let Some(fields) = replacement.as_table_mut()
+            {
+                fields.insert("os".into(), toml::Value::String(os));
             }
             *slot = replacement;
         }
@@ -465,6 +483,7 @@ fn serialize_workers_config(workers: &[WorkerConfig]) -> Result<String> {
                     .filter(|tag| !tag.starts_with(rch_common::OS_TAG_PREFIX))
                     .cloned()
                     .collect(),
+                tools: worker.tools.clone(),
                 enabled: true,
             })
             .collect(),
@@ -789,6 +808,97 @@ enabled = false
     }
 
     #[test]
+    fn upsert_worker_entry_preserves_named_tools_and_os_when_reinitializing() {
+        let _guard = test_guard!();
+        let original = r#"
+[[workers]]
+id = "mac-builder"
+host = "old.example"
+os = "darwin"
+enabled = false
+tools = [{ name = "xcode", command = ["/Applications/Xcode Beta.app/Contents/Developer/usr/bin/xcodebuild", "-version"] }]
+"#;
+        let before: WorkersConfig = toml::from_str(original).unwrap();
+        let rewritten = upsert_worker_entry(Some(original), &new_worker("mac-builder")).unwrap();
+        let after: WorkersConfig = toml::from_str(&rewritten).unwrap();
+        assert_eq!(after.workers.len(), 1);
+        assert_eq!(after.workers[0].host, "10.0.0.9");
+        assert_eq!(after.workers[0].tools, before.workers[0].tools);
+        assert_eq!(after.workers[0].os.as_deref(), Some("darwin"));
+        assert!(!after.workers[0].enabled);
+    }
+
+    #[test]
+    fn upsert_worker_entry_preserves_reserved_os_tags_through_cli_loading() {
+        let _guard = test_guard!();
+        for os in ["windows", "darwin"] {
+            for explicit in ["", "os = 'linux'\n"] {
+                let original = format!(
+                    "[[workers]]\nid = 'builder'\nhost = 'old.example'\n\
+                     tags = ['fast', 'os:{os}']\n{explicit}\
+                     tools = [{{ name = 'clang', command = ['clang', '--version'] }}]\n"
+                );
+                let before: WorkersConfig = toml::from_str(&original).unwrap();
+                let rewritten =
+                    upsert_worker_entry(Some(&original), &new_worker("builder")).unwrap();
+                let after: WorkersConfig = toml::from_str(&rewritten).unwrap();
+                assert_eq!(after.workers[0].os.as_deref(), Some(os));
+                assert!(after.workers[0].tags.is_empty());
+                assert_eq!(after.workers[0].tools, before.workers[0].tools);
+                assert!(after.workers[0].enabled);
+
+                let directory = tempfile::tempdir().unwrap();
+                std::fs::write(directory.path().join("workers.toml"), &rewritten).unwrap();
+                super::super::helpers::set_test_config_dir_override(Some(
+                    directory.path().to_path_buf(),
+                ));
+                let loaded = super::super::helpers::load_workers_from_config();
+                super::super::helpers::set_test_config_dir_override(None);
+                let loaded = loaded.unwrap();
+                assert_eq!(loaded.len(), 1);
+                assert_eq!(
+                    rch_common::declared_os(&loaded[0].tags).as_deref(),
+                    Some(os)
+                );
+                assert_eq!(loaded[0].tools, before.workers[0].tools);
+                assert_eq!(loaded[0].host, "10.0.0.9");
+            }
+        }
+    }
+
+    #[test]
+    fn upsert_worker_entry_serializes_new_named_tools_with_the_os_fence() {
+        let _guard = test_guard!();
+        let mut worker = new_worker("windows-builder");
+        worker.tags = vec!["fast".into(), rch_common::os_tag("windows")];
+        worker.tools = vec![rch_common::types::WorkerToolProbe {
+            name: "clang".into(),
+            command: vec![
+                "C:/Program Files/LLVM/bin/clang.exe".into(),
+                "--version".into(),
+            ],
+        }];
+        for existing in [None, Some(FLEET), Some("workers = []\n")] {
+            let rewritten = upsert_worker_entry(existing, &worker).unwrap();
+            // The retained FLEET has a historical opaque `probe` field. The
+            // initializer preserves it verbatim and parses only its own entry.
+            let raw: toml::Value = toml::from_str(&rewritten).unwrap();
+            let added = raw["workers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["id"].as_str() == Some("windows-builder"))
+                .unwrap()
+                .clone()
+                .try_into::<WorkerEntry>()
+                .unwrap();
+            assert_eq!(added.tools, worker.tools);
+            assert_eq!(added.os.as_deref(), Some("windows"));
+            assert_eq!(added.tags, ["fast"]);
+        }
+    }
+
+    #[test]
     fn upsert_worker_entry_adds_to_an_inline_workers_array() {
         let _guard = test_guard!();
         let inline = "workers = [{ id = \"a\", host = \"h\", user = \"u\", identity_file = \"~/.ssh/k\", total_slots = 2 }]\n";
@@ -880,7 +990,14 @@ enabled = false
             total_slots: 8,
             priority: 100,
             tags: vec!["rust\"fast".to_string(), "gpu\nprod".to_string()],
-            tools: Vec::new(),
+            tools: vec![rch_common::types::WorkerToolProbe {
+                name: "clang".into(),
+                command: vec![
+                    "/opt/tool's bin/clang".into(),
+                    "--version".into(),
+                    attempted_injection.into(),
+                ],
+            }],
         }];
 
         let rendered = serialize_workers_config(&workers).expect("serialize workers config");
@@ -899,5 +1016,18 @@ enabled = false
             parsed.workers[0].tags,
             vec!["rust\"fast".to_string(), "gpu\nprod".to_string()]
         );
+        assert_eq!(parsed.workers[0].tools, workers[0].tools);
+    }
+
+    #[test]
+    fn serialize_workers_config_omits_empty_tools_and_absent_os() {
+        let _guard = test_guard!();
+        let rendered = serialize_workers_config(&[new_worker("ordinary")]).unwrap();
+        let raw: toml::Value = toml::from_str(&rendered).unwrap();
+        assert!(raw["workers"][0].get("tools").is_none());
+        assert!(raw["workers"][0].get("os").is_none());
+        let parsed: WorkersConfig = toml::from_str(&rendered).unwrap();
+        assert!(parsed.workers[0].tools.is_empty());
+        assert!(parsed.workers[0].os.is_none());
     }
 }
