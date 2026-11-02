@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import fcntl
+import inspect
 import os
 from pathlib import Path
 import re
@@ -125,10 +126,41 @@ rch_policy_enter_scope() {
     rch_scope_cgroup="/fixture/$rch_scope_unit"
     rch_scope_bound=1
     RCH_TEST_SCOPE_KEY=$rch_pgid; export RCH_TEST_SCOPE_KEY
-    "$RCH_TEST_PYTHON" "$RCH_TEST_DRIVER" --backend bind "$RCH_TEST_ROOT" "$rch_pgid" "$rch_start"
+    "$RCH_TEST_PYTHON" -I -S -c "$RCH_TEST_BACKEND" bind "$RCH_TEST_ROOT" "$rch_pgid" "$rch_start"
 }
 rch_scope_operation() {
-    "$RCH_TEST_PYTHON" "$RCH_TEST_DRIVER" --backend "$1" "$RCH_TEST_ROOT" "$rch_pgid" "$rch_start"
+    # Explicit admission-observation fault injection. The real launcher still
+    # owns the gate, records, child birth checks, cancellation and retry cap.
+    # Keep cleanup on the ordinary backend so a failed admission can be
+    # distinguished from an unconfirmed stop of the setup process.
+    if [ "$1" = state ] && { [ "$0" = rch-build ] || [ "$0" = rch-process-health ]; } &&
+        [ "${__sl_admitted:-1}" = 0 ] && [ "${__sl_reason:-}" = setup ] &&
+        [ -n "${RCH_TEST_ADMISSION_FAILURES:-}" ]; then
+        rch_fixture_attempt=0
+        if [ -f "$RCH_TEST_ROOT/admission-attempts" ]; then
+            read -r rch_fixture_attempt < "$RCH_TEST_ROOT/admission-attempts"
+        fi
+        rch_fixture_attempt=$((rch_fixture_attempt + 1))
+        printf '%s\n' "$rch_fixture_attempt" > "$RCH_TEST_ROOT/admission-attempts"
+        if [ -e "$__sl_control/go" ]; then
+            printf 'gate opened before admission proof\n' > "$RCH_TEST_ROOT/unsafe-admission"
+        fi
+        if [ "$rch_fixture_attempt" -le "$RCH_TEST_ADMISSION_FAILURES" ]; then
+            # Cancellation and receipt corruption can race a failed probe;
+            # neither permits the subsequent retry to open the gate.
+            if [ "${RCH_TEST_ADMISSION_CANCEL:-0}" = 1 ]; then kill -TERM "$$"; fi
+            if [ "${RCH_TEST_ADMISSION_CORRUPT:-0}" = 1 ]; then
+                printf 'invalid record\n' > "$__sl_record"
+            fi
+            return "${RCH_TEST_ADMISSION_STATE:-2}"
+        fi
+    fi
+    "$RCH_TEST_PYTHON" -I -S -c "$RCH_TEST_BACKEND" "$1" "$RCH_TEST_ROOT" "$rch_pgid" "$rch_start"
+    rch_fixture_result=$?
+    if [ "$1:$rch_fixture_result" = state:1 ] && [ "${RCH_TEST_ADMISSION_EXPIRE:-0}" = 1 ]; then
+        : > "$RCH_TEST_ROOT/admission-observed"
+    fi
+    return "$rch_fixture_result"
 }
 '''
 
@@ -191,6 +223,18 @@ def resource_backend(operation: str, root: Path, pgid: int, start: int) -> int:
     except ProcessLookupError:
         pass
     return 0
+
+
+# Keep exactly the same backend logic while avoiding a fresh import of this
+# entire test module from disk on every scope observation. Under memory
+# pressure those repeated ext4 lookups stalled fixtures before their intended
+# boundary; they are not part of the production systemctl/cgroup exchange.
+BACKEND_PROGRAM = ("from __future__ import annotations\nimport os, signal, sys\n"
+                   "from pathlib import Path\n" +
+                   "\n".join(inspect.getsource(function) for function in
+                             (stat_process, alive, resource_backend)) +
+                   "\nsys.exit(resource_backend(sys.argv[1], Path(sys.argv[2]), "
+                   "int(sys.argv[3]), int(sys.argv[4])))\n")
 
 
 def protocol(instrument: bool = True, fixture: bool = True) -> str:
@@ -357,6 +401,8 @@ WORKLOAD = r'''
 import json, os, signal, subprocess, sys, time
 from pathlib import Path
 root = Path(sys.argv[1]); mode = sys.argv[2]; code = int(sys.argv[3])
+with (root/'executions').open('a') as output:
+    output.write(str(os.getpid()) + '\n')
 child_code = """
 import os, signal, sys, time
 from pathlib import Path
@@ -400,7 +446,7 @@ class ScopedLaunch(unittest.TestCase):
         self.policy.chmod(0o600)
         self.env = {**os.environ, "RCH_TEST_POLICY_FILE": str(self.policy),
                     "RCH_TEST_ROOT": str(self.root), "RCH_TEST_PYTHON": PYTHON,
-                    "RCH_TEST_DRIVER": str(THIS)}
+                    "RCH_TEST_BACKEND": BACKEND_PROGRAM}
 
     def cleanup_owned(self) -> None:
         for child in self.root.glob("*/child"):
@@ -469,6 +515,145 @@ class ScopedLaunch(unittest.TestCase):
                 self.assertEqual((job / "artifact").read_text(), "artifact-evidence")
                 self.assertTrue(record.read_text().startswith("RCH_REMOTE_PROCESS_V2:"))
                 self.assertNotIn("IDENTITY_UNAVAILABLE", (job / "stderr").read_text())
+
+    def test_transient_unknown_admission_retries_before_running_payload_once(self) -> None:
+        # Issue #129: most reported jobs never passed admission. A pair of
+        # unavailable scope observations must not abandon a healthy third
+        # observation or run the payload before the proof is available.
+        proc, job, record = self.start(code=23, env={
+            **self.env, "RCH_TEST_ADMISSION_FAILURES": "2",
+        })
+        self.finish(proc, job, 23)
+        self.assertEqual((self.root / "admission-attempts").read_text(), "3\n")
+        self.assertFalse((self.root / "unsafe-admission").exists())
+        self.assertEqual(len((job / "executions").read_text().splitlines()), 1)
+        self.assertEqual((job / "artifact").read_text(), "artifact-evidence")
+        self.assertTrue(record.read_text().startswith("RCH_REMOTE_PROCESS_V2:"))
+        self.assertEqual(self.recover(record).returncode, 0)
+
+    def test_persistent_unknown_admission_is_bounded_and_never_runs_payload(self) -> None:
+        proc, job, record = self.start(env={
+            **self.env, "RCH_TEST_ADMISSION_FAILURES": "99",
+        })
+        self.finish(proc, job, 255)
+        self.assertEqual((self.root / "admission-attempts").read_text(), "3\n")
+        self.assertFalse((self.root / "unsafe-admission").exists())
+        self.assertFalse((Path(str(record) + ".supervisor.v1") / "go").exists())
+        self.assertFalse((job / "executions").exists())
+        self.assertFalse((job / "artifact").exists())
+        self.assertIn("RCH_SCOPED_COMPLETION_UNCONFIRMED", (job / "stderr").read_text())
+        self.assertNotIn("IDENTITY_UNAVAILABLE", (job / "stderr").read_text())
+        # Preserve the one-shot claim and exact receipt for fresh-channel
+        # recovery. A failed observer must never authorize unsafe replay.
+        before = record.read_bytes()
+        self.assertEqual(self.recover(record).returncode, 0)
+        self.assertEqual(record.read_bytes(), before)
+        replay = subprocess.run(
+            [SHELL, "-c", protocol(), "rch-build", str(record), "0", "RCH_TEST_DEADLINE",
+             record.stem, SHELL, "-c", "printf unsafe-replay"],
+            env=self.env, capture_output=True, text=True, timeout=8)
+        self.assertEqual(replay.returncode, 255, replay.stderr)
+        self.assertEqual(replay.stdout, "")
+        self.assertIn("RCH_SCOPED_LAUNCH_ALREADY_OWNED", replay.stderr)
+
+    def test_known_empty_admission_is_not_retried_as_transient_unknown(self) -> None:
+        proc, job, record = self.start(env={
+            **self.env, "RCH_TEST_ADMISSION_FAILURES": "99", "RCH_TEST_ADMISSION_STATE": "0",
+        })
+        self.finish(proc, job, 255)
+        self.assertEqual((self.root / "admission-attempts").read_text(), "1\n")
+        self.assertFalse((job / "executions").exists())
+        self.assertFalse((Path(str(record) + ".supervisor.v1") / "go").exists())
+
+    def test_cancellation_between_admission_retries_starts_no_payload(self) -> None:
+        proc, job, record = self.start(env={
+            **self.env, "RCH_TEST_ADMISSION_FAILURES": "1", "RCH_TEST_ADMISSION_CANCEL": "1",
+        })
+        self.finish(proc, job, 143)
+        self.assertEqual((self.root / "admission-attempts").read_text(), "1\n")
+        self.assertFalse((job / "executions").exists())
+        self.assertFalse((Path(str(record) + ".supervisor.v1") / "go").exists())
+        self.assertEqual(self.recover(record).returncode, 0)
+
+    def test_admission_retry_revalidates_receipt_before_opening_gate(self) -> None:
+        proc, job, record = self.start(env={
+            **self.env, "RCH_TEST_ADMISSION_FAILURES": "1", "RCH_TEST_ADMISSION_CORRUPT": "1",
+        })
+        self.finish(proc, job, 255)
+        self.assertEqual((self.root / "admission-attempts").read_text(), "1\n")
+        self.assertFalse((job / "executions").exists())
+        self.assertFalse((Path(str(record) + ".supervisor.v1") / "go").exists())
+        self.assertEqual(record.read_text(), "invalid record\n")
+        self.assertNotEqual(self.recover(record).returncode, 0)
+
+    def test_successful_observation_after_setup_deadline_cannot_open_gate(self) -> None:
+        # Advance the observer's clock only after a successful state probe.
+        # This deterministically exercises a slow pre-admission operation
+        # crossing the absolute 60s cap, without a minute-long sleep.
+        launch = (SOURCE / "remote_scoped_launch.sh").read_text()
+        self.assertEqual(launch.count("rch_scope_launch_clock() {"), 1)
+        adapted = launch.replace("rch_scope_launch_clock() {", "rch_fixture_launch_clock() {") + r'''
+rch_scope_launch_clock() {
+    rch_fixture_launch_clock || return 1
+    if [ "$0" = rch-build ] && [ -e "$RCH_TEST_ROOT/admission-observed" ]; then
+        rch_launch_now=$((rch_launch_now + 6100))
+    fi
+}
+'''
+        proc, job, record = self.start(script=protocol().replace(launch, adapted), env={
+            **self.env, "RCH_TEST_ADMISSION_EXPIRE": "1",
+        })
+        self.finish(proc, job, 255)
+        self.assertTrue((self.root / "admission-observed").exists())
+        self.assertFalse((job / "executions").exists())
+        self.assertFalse((Path(str(record) + ".supervisor.v1") / "go").exists())
+        self.assertEqual(self.recover(record).returncode, 0)
+
+    def health_probe(self, env=None):
+        return subprocess.run([SHELL, "-c", protocol() + "\nrch_process_health_probe\n",
+                               "rch-health-observer"],
+                              env={**self.env, "TMPDIR": str(self.root), **(env or {})},
+                              capture_output=True, text=True, timeout=40)
+
+    def test_health_probe_requires_real_admission_execution_and_completion(self) -> None:
+        result = self.health_probe()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "RCH_PROCESS_HEALTH_V1\n")
+        self.assertEqual(list(self.root.glob("rch-process-health.*")), [],
+                         "confirmed probe should retire its private scratch receipts")
+
+    def test_health_probe_does_not_restore_capacity_after_failed_admission(self) -> None:
+        result = self.health_probe({"RCH_TEST_ADMISSION_FAILURES": "99"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("RCH_PROCESS_HEALTH_V1", result.stdout)
+        self.assertEqual((self.root / "admission-attempts").read_text(), "3\n")
+        retained = list(self.root.glob("rch-process-health.*/receipt"))
+        self.assertEqual(len(retained), 1)
+        self.assertFalse((Path(str(retained[0]) + ".supervisor.v1") / "go").exists())
+
+    def test_health_probe_retains_unknown_completion_until_fresh_recovery(self) -> None:
+        binaries = self.root / "fault-bin"
+        binaries.mkdir()
+        ps = binaries / "ps"
+        ps.write_text("#!/bin/sh\ncase \"$1\" in -e|-L) exit 124;; esac\nexec /bin/ps \"$@\"\n")
+        ps.chmod(0o700)
+        result = self.health_probe({"PATH": f"{binaries}:{os.environ['PATH']}"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("RCH_PROCESS_HEALTH_V1", result.stdout)
+        self.assertIn("RCH_SCOPED_COMPLETION_UNCONFIRMED", result.stderr)
+        retained = list(self.root.glob("rch-process-health.*/receipt"))
+        self.assertEqual(len(retained), 1)
+        control = Path(str(retained[0]) + ".supervisor.v1")
+        self.assertTrue((control / "go").exists(), "the probe must reach actual execution")
+        self.assertTrue((control / "result").exists(), "payload status alone is not completion")
+        before = retained[0].read_bytes()
+        recovery = subprocess.run(
+            [SHELL, "-c", protocol() + '\nrch_remote_cancel "$1" 0 kill\n',
+             "rch-recovery", str(retained[0])], env=self.env,
+            capture_output=True, text=True, timeout=40)
+        self.assertEqual(recovery.returncode, 0, recovery.stderr)
+        self.assertEqual(retained[0].read_bytes(), before)
+        self.assertEqual(self.health_probe().stdout, "RCH_PROCESS_HEALTH_V1\n")
 
     def test_streams_working_directory_and_priority(self) -> None:
         proc, job, _ = self.start(mode="hold")

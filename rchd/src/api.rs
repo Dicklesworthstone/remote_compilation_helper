@@ -204,6 +204,12 @@ enum ApiRequest {
         /// If true, drain existing jobs before fully disabling.
         drain_first: bool,
     },
+    /// Report loss of process observability without completing/releasing a job.
+    WorkerProcessObservationFailure {
+        worker_id: WorkerId,
+        build_id: u64,
+        local_wrapper_id: Option<String>,
+    },
     /// Get repo convergence status for all or a specific worker.
     RepoConvergenceStatus {
         worker_id: Option<WorkerId>,
@@ -1272,6 +1278,35 @@ async fn handle_connection_with_metrics(
             log_worker_admin_action("disable", &worker_id, &response.status, peer_pid).await;
             (serde_json::to_string(&response)?, "application/json")
         }
+        Ok(ApiRequest::WorkerProcessObservationFailure {
+            worker_id,
+            build_id,
+            local_wrapper_id,
+        }) => {
+            metrics::inc_requests("worker-process-observation-failure");
+            let response = match handle_process_observation_failure(
+                &ctx,
+                &worker_id,
+                build_id,
+                local_wrapper_id.as_deref(),
+            )
+            .await
+            {
+                Ok(()) => serde_json::json!({
+                    "status": "ok",
+                    "build_id": build_id,
+                    "ownership_retained": true,
+                    "slots_released": 0,
+                }),
+                Err(error) => serde_json::json!({
+                    "status": "error",
+                    "build_id": build_id,
+                    "slots_released": 0,
+                    "message": error.to_string(),
+                }),
+            };
+            (response.to_string(), "application/json")
+        }
         Ok(ApiRequest::RepoConvergenceStatus { worker_id }) => {
             metrics::inc_requests("repo-convergence-status");
             let response = handle_repo_convergence_status(&ctx, worker_id.as_ref()).await;
@@ -1908,6 +1943,30 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                         worker_id: WorkerId::new(worker_id),
                         reason,
                         drain_first,
+                    });
+                }
+                "process-observation-failure" => {
+                    let mut build_id = None;
+                    let mut local_wrapper_id = None;
+                    for param in query.split('&').filter(|value| !value.is_empty()) {
+                        let (key, value) = param.split_once('=').unwrap_or((param, ""));
+                        match key {
+                            "build_id" if build_id.is_none() => {
+                                build_id = Some(value.parse::<u64>().context("invalid build id")?);
+                            }
+                            "local_wrapper_id" if local_wrapper_id.is_none() => {
+                                let value = percent_unescape_query_value(value);
+                                anyhow::ensure!(!value.is_empty(), "empty wrapper identity");
+                                local_wrapper_id = Some(value);
+                            }
+                            _ => anyhow::bail!("unknown or repeated process-observation parameter"),
+                        }
+                    }
+                    anyhow::ensure!(!worker_id.is_empty(), "empty worker identity");
+                    return Ok(ApiRequest::WorkerProcessObservationFailure {
+                        worker_id: WorkerId::new(worker_id),
+                        build_id: build_id.context("missing build_id parameter")?,
+                        local_wrapper_id,
                     });
                 }
                 _ => {}
@@ -4230,6 +4289,60 @@ async fn handle_release_worker_from(
     // failed. Release its slots exactly once, but refuse acknowledgment until
     // the pending durable fault can be finished by retry or daemon startup.
     quarantine_result
+}
+
+/// This is health evidence, never a completion receipt. Require the admitted
+/// owner and its endpoint, and serialize against release/cancellation. An old
+/// job may not quarantine a different host that now uses the same worker ID.
+async fn handle_process_observation_failure(
+    ctx: &DaemonContext,
+    worker_id: &WorkerId,
+    build_id: u64,
+    local_wrapper_id: Option<&str>,
+) -> Result<()> {
+    let _release = ctx.history.lock_releases().await;
+    let build = ctx
+        .history
+        .active_build(build_id)
+        .context("process-observation report has no active build owner")?;
+    anyhow::ensure!(
+        build.worker_id == worker_id.as_str()
+            && build.local_wrapper_id.as_deref() == local_wrapper_id
+            && build.location == rch_common::BuildLocation::Remote,
+        "process-observation build ownership mismatch"
+    );
+    let endpoint = build
+        .worker_endpoint
+        .as_ref()
+        .context("process-observation report has no admitted worker endpoint")?;
+    anyhow::ensure!(
+        !rch_common::declared_os(&endpoint.config.tags)
+            .is_some_and(|os| os.eq_ignore_ascii_case("windows")),
+        "POSIX process-observation recovery is not supported for a Windows worker"
+    );
+    let worker = ctx
+        .pool
+        .get(worker_id)
+        .await
+        .context("process-observation worker is no longer in inventory")?;
+    let Some(store) = &ctx.bypass_store else {
+        let _endpoint = worker
+            .lock_current_endpoint(endpoint)
+            .await
+            .context("process-observation worker endpoint changed")?;
+        worker
+            .enter_bypass(rch_common::BypassFailureClass::ProcessObservation)
+            .await;
+        anyhow::bail!("process-observation quarantine requires durable bypass storage");
+    };
+    crate::bypass_recovery_service::record_process_observation_failure(
+        store,
+        &worker,
+        endpoint,
+        &format!("build:{build_id}:{}", build.started_at),
+        u64::try_from(Utc::now().timestamp_millis()).unwrap_or(0),
+    )
+    .await
 }
 
 async fn apply_pending_disk_fault(
@@ -9487,6 +9600,287 @@ mod tests {
             }
             _ => assert!(false, "expected cancel build request with force"),
         }
+    }
+
+    #[test]
+    fn process_observation_request_requires_exact_build_identity() {
+        match parse_request(
+            "POST /workers/worker%2Fone/process-observation-failure?build_id=42&local_wrapper_id=owner%26one",
+        )
+        .unwrap()
+        {
+            ApiRequest::WorkerProcessObservationFailure {
+                worker_id,
+                build_id,
+                local_wrapper_id,
+            } => {
+                assert_eq!(worker_id.as_str(), "worker/one");
+                assert_eq!(build_id, 42);
+                assert_eq!(local_wrapper_id.as_deref(), Some("owner&one"));
+            }
+            other => panic!("wrong report route: {other:?}"),
+        }
+        for request in [
+            "GET /workers/w/process-observation-failure?build_id=42",
+            "POST /workers/w/process-observation-failure",
+            "POST /workers/w/process-observation-failure?build_id=no",
+            "POST /workers/w/process-observation-failure?build_id=42&build_id=43",
+            "POST /workers/w/process-observation-failure?build_id=42&local_wrapper_id=",
+            "POST /workers/w/process-observation-failure?build_id=42&slots=1",
+        ] {
+            assert!(parse_request(request).is_err(), "{request}");
+        }
+    }
+
+    async fn process_observation_fixture() -> (
+        tempfile::TempDir,
+        DaemonContext,
+        Arc<crate::workers::WorkerState>,
+        u64,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+        let worker = pool.get(&WorkerId::new("worker1")).await.unwrap();
+        let mut ctx = make_test_context(pool);
+        replace_test_history(
+            &mut ctx,
+            BuildHistory::new(100).with_persistence(directory.path().join("history.jsonl")),
+        );
+        ctx.bypass_store = Some(Arc::new(tokio::sync::Mutex::new(
+            BypassRecordStore::with_path(directory.path().join("bypass.json")),
+        )));
+        let build = ctx
+            .history
+            .try_start_active_build_with_waiter(
+                "process-owner".into(),
+                "worker1".into(),
+                "cargo test".into(),
+                0,
+                Some("owner1".into()),
+                2,
+                rch_common::BuildLocation::Remote,
+                None,
+                crate::disk_pressure::DiskHeadroomAdmission::default(),
+                Some(worker.endpoint_snapshot().await),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(worker.reserve_slots(2).await);
+        (directory, ctx, worker, build.id)
+    }
+
+    #[tokio::test]
+    async fn process_observation_report_quarantines_without_releasing_or_completing() {
+        let (directory, ctx, worker, build_id) = process_observation_fixture().await;
+        let id = WorkerId::new("worker1");
+        for _ in 0..2 {
+            handle_process_observation_failure(&ctx, &id, build_id, Some("owner1"))
+                .await
+                .unwrap();
+        }
+        assert!(ctx.history.active_build(build_id).is_some());
+        assert!(!ctx.history.has_terminal_build(build_id));
+        assert_eq!(worker.used_slots(), 2);
+        assert!(!worker.reserve_slots(1).await);
+        assert_eq!(
+            worker.lifecycle().await.admin,
+            crate::workers::AdminIntent::Active
+        );
+        assert_eq!(worker.status().await, WorkerStatus::Unreachable);
+        let record = ctx
+            .bypass_store
+            .as_ref()
+            .unwrap()
+            .lock()
+            .await
+            .get("worker1")
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            record.failure_class,
+            rch_common::BypassFailureClass::ProcessObservation
+        );
+        assert_eq!(record.consecutive_failures, 1);
+        assert!(!record.local_fallback_allowed);
+        assert_eq!(
+            BypassRecordStore::load(directory.path().join("bypass.json")).get("worker1"),
+            Some(&record)
+        );
+        assert!(
+            BuildHistory::load_from_file(&directory.path().join("history.jsonl"), 100)
+                .unwrap()
+                .active_build(build_id)
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn process_observation_bypass_survives_safe_unstarted_release() {
+        let (directory, ctx, worker, build_id) = process_observation_fixture().await;
+        assert!(
+            !ctx.history
+                .active_build(build_id)
+                .unwrap()
+                .remote_command_started()
+        );
+        handle_process_observation_failure(
+            &ctx,
+            &WorkerId::new("worker1"),
+            build_id,
+            Some("owner1"),
+        )
+        .await
+        .unwrap();
+        let before = BypassRecordStore::load(directory.path().join("bypass.json"))
+            .get("worker1")
+            .cloned()
+            .unwrap();
+        let ApiRequest::ReleaseWorker(request) = parse_request(&format!(
+            "POST /release-worker?worker=worker1&build_id={build_id}&local_wrapper_id=owner1&exit_code=125"
+        ))
+        .unwrap()
+        else {
+            panic!("release request expected")
+        };
+        handle_release_worker(&ctx, request.clone()).await.unwrap();
+        handle_release_worker(&ctx, request).await.unwrap();
+        assert_eq!(worker.used_slots(), 0);
+        assert!(ctx.history.active_build(build_id).is_none());
+        assert!(ctx.history.has_terminal_build(build_id));
+        worker.record_success().await;
+        worker.apply_health_status(WorkerStatus::Healthy).await;
+        assert_eq!(worker.status().await, WorkerStatus::Unreachable);
+        assert!(!worker.reserve_slots(1).await);
+        assert!(!handle_ready(&ctx).await.workers_available);
+        assert_eq!(
+            BypassRecordStore::load(directory.path().join("bypass.json")).get("worker1"),
+            Some(&before),
+            "safe release and heartbeat cannot satisfy process-lifecycle recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_observation_report_rejects_wrong_owner_and_replaced_endpoint() {
+        for change in ["wrapper", "worker", "retarget", "aba"] {
+            let (_directory, ctx, worker, build_id) = process_observation_fixture().await;
+            let original = worker.config.read().await.clone();
+            if matches!(change, "retarget" | "aba") {
+                let mut replacement = original.clone();
+                replacement.host = "replacement.example".into();
+                worker.update_config(replacement).await;
+                if change == "aba" {
+                    worker.update_config(original).await;
+                }
+            }
+            let id = WorkerId::new(if change == "worker" {
+                "worker2"
+            } else {
+                "worker1"
+            });
+            let wrapper = if change == "wrapper" {
+                "owner2"
+            } else {
+                "owner1"
+            };
+            assert!(
+                handle_process_observation_failure(&ctx, &id, build_id, Some(wrapper))
+                    .await
+                    .is_err(),
+                "{change}"
+            );
+            assert!(
+                !ctx.bypass_store
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .await
+                    .contains("worker1")
+            );
+            assert_eq!(worker.used_slots(), 2);
+            assert!(ctx.history.active_build(build_id).is_some());
+            assert!(!matches!(
+                worker.eligibility().await,
+                crate::workers::EligibilityState::TemporaryBypass
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn process_observation_persistence_failure_excludes_but_never_acknowledges() {
+        let (directory, ctx, worker, build_id) = process_observation_fixture().await;
+        std::fs::create_dir(directory.path().join("bypass.json")).unwrap();
+        assert!(
+            handle_process_observation_failure(
+                &ctx,
+                &WorkerId::new("worker1"),
+                build_id,
+                Some("owner1")
+            )
+            .await
+            .is_err()
+        );
+        assert!(!worker.lifecycle().await.is_schedulable());
+        assert_eq!(worker.used_slots(), 2);
+        assert!(ctx.history.active_build(build_id).is_some());
+        std::fs::rename(
+            directory.path().join("bypass.json"),
+            directory.path().join("preserved-obstacle"),
+        )
+        .unwrap();
+        handle_process_observation_failure(
+            &ctx,
+            &WorkerId::new("worker1"),
+            build_id,
+            Some("owner1"),
+        )
+        .await
+        .unwrap();
+        assert!(BypassRecordStore::load(directory.path().join("bypass.json")).contains("worker1"));
+        assert_eq!(worker.used_slots(), 2);
+    }
+
+    #[tokio::test]
+    async fn process_observation_report_does_not_require_posix_recovery_on_windows() {
+        let (_directory, ctx, worker, original_build) = process_observation_fixture().await;
+        let mut config = worker.config.read().await.clone();
+        config.tags.push("os:windows".into());
+        worker.update_config(config).await;
+        let build = ctx
+            .history
+            .try_start_active_build_with_waiter(
+                "windows-project".into(),
+                "worker1".into(),
+                "cargo test".into(),
+                0,
+                Some("windows-owner".into()),
+                1,
+                rch_common::BuildLocation::Remote,
+                None,
+                crate::disk_pressure::DiskHeadroomAdmission::default(),
+                Some(worker.endpoint_snapshot().await),
+            )
+            .unwrap()
+            .unwrap();
+        let error = handle_process_observation_failure(
+            &ctx,
+            &WorkerId::new("worker1"),
+            build.id,
+            Some("windows-owner"),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("Windows worker"));
+        assert!(
+            !ctx.bypass_store
+                .as_ref()
+                .unwrap()
+                .lock()
+                .await
+                .contains("worker1")
+        );
+        assert!(ctx.history.active_build(original_build).is_some());
+        assert!(ctx.history.active_build(build.id).is_some());
     }
 
     #[test]

@@ -13,16 +13,51 @@ rch_valid_boot() {
     return 1
 }
 
-# /proc can belong to an ancestor PID namespace while kill uses ours. Never
-# interpret that foreign view as ownership, or as proof that a group is empty.
-# NSpid lists IDs from procfs's namespace through our active namespace. Require
-# exactly our own ID: equality with just the first ID can occur by coincidence.
-# Use builtin read so /proc/self describes this shell, not a spawned reader.
-# Missing namespace evidence (including older kernels) fails closed.
-# Inside ( ... ) $$ still names the invoking shell while /proc/self is this
-# subshell (the watchdog's timer is one), so compare with this process's own
-# ID: a command exec'd from a substitution reports it as its parent. Use an
-# absolute path: launch environments may carry a minimal PATH.
+# Cheap scheduling hints, never completion evidence: 3s + 1s/2048 tasks +
+# 1s/16 load units, capped at 8s. Issue #129 gets 7s for a measured 0.7--1.2s
+# census. Missing/malformed hints use 5s. No census is needed to size a census.
+rch_observation_budget() {
+    rch_observation_seconds=5
+    if read -r rch_load_one rch_load_five rch_load_fifteen rch_load_tasks rch_load_last \
+        2>/dev/null < /proc/loadavg; then
+        rch_load_whole=${rch_load_one%%.*}
+        rch_load_threads=${rch_load_tasks#*/}
+        case "$rch_load_one:$rch_load_tasks" in *.*:*/*) ;; *) return 0;; esac
+        case "${rch_load_one#*.}" in [0-9][0-9]) ;; *) return 0;; esac
+        for rch_load_value in "$rch_load_whole" "$rch_load_threads" "${rch_load_tasks%/*}"; do
+            case "$rch_load_value" in ''|*[!0-9]*|0[0-9]*) return 0;; esac
+            [ "${#rch_load_value}" -le 9 ] || return 0
+        done
+        rch_observation_seconds=$((3 + rch_load_threads / 2048 + rch_load_whole / 16))
+        [ "$rch_observation_seconds" -le 8 ] || rch_observation_seconds=8
+    fi
+}
+
+# Monotonic hundredths. No recursive rch_control_capture in the Darwin clock;
+# its one stdlib process has no pipe holders and is independently bounded.
+rch_observation_clock() {
+    if [ ! -r /proc/uptime ]; then
+        [ "$(uname -s)" = Darwin ] || return 1
+        rch_observation_now=$(rch_group_timeout --signal=KILL 5s python3 -I -S -c \
+            'import time; print(time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW) // 10000000)') || return 1
+        case "$rch_observation_now" in ''|*[!0-9]*|0[0-9]*) return 1;; esac
+        [ "${#rch_observation_now}" -le 15 ]
+        return $?
+    fi
+    read -r rch_observation_uptime rch_observation_idle < /proc/uptime || return 1
+    case "$rch_observation_uptime" in *.*) ;; *) return 1;; esac
+    rch_observation_secs=${rch_observation_uptime%%.*}
+    rch_observation_frac=${rch_observation_uptime#*.}
+    case "$rch_observation_secs" in ''|*[!0-9]*|0[0-9]*) return 1;; esac
+    [ "${#rch_observation_secs}" -le 12 ] || return 1
+    case "$rch_observation_frac" in [0-9][0-9]) ;; *) return 1;; esac
+    rch_observation_now=$((rch_observation_secs * 100 + 1$rch_observation_frac - 100))
+}
+
+# A foreign procfs view proves neither ownership nor absence. NSpid must have
+# exactly our own ID, not a coincidentally equal first ID in a namespace chain.
+# Builtin read observes this shell; exec under substitution supplies its PID
+# even in a subshell where $$ names the parent. Missing evidence fails closed.
 rch_check_procfs_namespace() {
     # Darwin has one PID view. Never infer this from missing Linux procfs:
     # Linux must still supply positive namespace evidence at every boundary.
@@ -39,11 +74,12 @@ rch_check_procfs_namespace() {
     return 1
 }
 
-# Native libproc birth time (microseconds), not ps lstart's rounded seconds.
+# Native libproc birth time (microseconds), not rounded ps lstart seconds.
 # The worker binary is required on Darwin; missing/old helpers fail closed.
 rch_darwin_process() {
     rch_darwin_helper=$(command -v rch-wkr) || return 1
-    rch_darwin_result=$(rch_control_capture 1s "$rch_darwin_helper" process-identity "$1") || return 1
+    rch_observation_budget
+    rch_darwin_result=$(rch_control_capture "${rch_observation_seconds}s" "$rch_darwin_helper" process-identity "$1") || return 1
     set -- $rch_darwin_result
     [ "$#" = 3 ] && rch_valid_boot "$1" && rch_valid_pgid "$3" || return 1
     case "$2" in ''|*[!0-9]*|0*) return 1;; esac
@@ -61,7 +97,8 @@ rch_read_boot() {
             # Require a successful, bounded, byte-validated observation BEFORE
             # normalization: a pipeline hides sysctl failure, and substitution
             # alone can discard NULs from otherwise plausible UUID output.
-            rch_boot_output=$(rch_control_capture 1s /usr/sbin/sysctl -n kern.bootsessionuuid) || return 1
+            rch_observation_budget
+            rch_boot_output=$(rch_control_capture "${rch_observation_seconds}s" /usr/sbin/sysctl -n kern.bootsessionuuid) || return 1
             printf '%s\n' "$rch_boot_output" | LC_ALL=C tr 'A-F' 'a-f';;
         *) return 1;;
     esac
@@ -76,11 +113,9 @@ rch_file_size() {
     esac
 }
 
-# Read a member of the bound group, including comm with spaces or parentheses.
-# A member may be a non-leader TID: /proc/<tid>/stat has the same birth/group
-# fields. This preserves escalation when a process leader is already a zombie
-# but another thread of that process is still running.
-# Function positional arguments do not replace the launcher's command arguments.
+# Read any bound member, including live TIDs behind a zombie leader. Parse
+# after the final comm delimiter; spaces/parentheses/newlines are legal in comm.
+# Function positional arguments leave the launcher command arguments intact.
 rch_read_process() {
     rch_valid_pgid "$1" && rch_check_procfs_namespace || return 1
     if [ "$(uname -s)" = Darwin ]; then
@@ -174,19 +209,17 @@ rch_read_record() {
     rch_valid_pgid "$rch_pgid" || return 42
 }
 
-# 0: no executing members; 1: live members; 2: observation unavailable.
-# kill -0 cannot distinguish ESRCH from EPERM, or live processes from zombies.
-# A zombie process leader does not prove its other threads have exited. Enumerate
-# LWPs, retaining their own IDs for live escalation witnesses. A terminal-only
-# snapshot must account for every reported thread; unsupported/incomplete thread
-# enumeration is unknown, never a fallback to a process-only empty-group claim.
+# 0: empty; 1: live; 2: unknown. kill -0 cannot separate ESRCH/EPERM or zombies.
+# A zombie leader can have live LWPs. Keep their TIDs for escalation; incomplete
+# thread accounting is unknown, never an empty-group proof.
 rch_group_state() {
     rch_check_procfs_namespace || return 2
+    rch_observation_budget
     if [ "$(uname -s)" = Darwin ]; then
-        # Darwin's process zombie state is terminal for the whole task. Linux
+        # Darwin process zombie state is terminal for the whole task. Linux
         # needs the separate LWP census below (a zombie leader can have LWPs).
         [ "${rch_scope_bound:-0}" != 1 ] || return 2
-        rch_snapshot=$(LC_ALL=C rch_control_capture 1s ps -axo pid=,pgid=,stat=) || return 2
+        rch_snapshot=$(LC_ALL=C rch_control_capture "${rch_observation_seconds}s" ps -axo pid=,pgid=,stat=) || return 2
         printf '%s\n' "$rch_snapshot" | LC_ALL=C awk -v group="$rch_pgid" -v observer="$$" '
             NF != 3 || $1 !~ /^[0-9]+$/ || $2 !~ /^[0-9]+$/ || $3 !~ /^[RSDTIUZE][A-Za-z0-9+<>-]*$/ { bad=1; next }
             seen_pid[$1]++ { bad=1 }
@@ -196,24 +229,31 @@ rch_group_state() {
         '
         return $?
     fi
-    # One deadline covers both exchanges and descendants holding stdout open;
-    # timeout kills the helper group and means unknown, never absence. Inspect
-    # all leaders, then group/observer LWPs (including zombie-leader siblings).
-    # Even the leader-only pass can exceed one second on a loaded worker. Give
-    # the whole exchange five seconds, retaining the selected-thread census
-    # and the same unknown result on timeout. Cancellation separately bounds
-    # its total retry time; this must not become twenty five-second waits.
-    rch_task_snapshot=$(LC_ALL=C rch_control_capture 5s \
+    # One deadline covers both exchanges and inherited pipe holders. Leaders
+    # suffice for single-threaded groups; otherwise inspect only group LWPs,
+    # including zombie-leader siblings. Never enumerate unrelated threads.
+    rch_task_snapshot=$(LC_ALL=C rch_control_capture "${rch_observation_seconds}s" \
         /bin/sh -c '
             leaders=$(ps -e -o pid= -o lwp= -o pgid= -o s= -o nlwp=) || exit 2
             selection=$(printf "%s\n" "$leaders" | awk -v group="$1" -v observer="$2" '\''
                 NF != 5 || $1 !~ /^[1-9][0-9]*$/ || $2 != $1 || $3 !~ /^[0-9]+$/ || $4 !~ /^[RSDTtKWPIXZx][A-Za-z0-9+<>-]*$/ || $5 !~ /^[1-9][0-9]*$/ { bad=1; next }
                 seen_pid[$1]++ { bad=1 }
                 $1 == observer { seen=1; if ($3 == group) bad=1 }
-                $3 == group || $1 == observer { ids=ids sep $1; sep="," }
+                $3 == group || $1 == observer {
+                    ids=ids sep $1; sep=","; rows=rows $0 "\n"
+                }
+                $3 == group && $5 != 1 { threaded=1 }
                 $3 == group && ($4 !~ /^[ZXx]/ || $5 != 1) { unsettled=1 }
-                END { if (bad || !seen) exit 2; print ids "|" (unsettled+0) }
+                END {
+                    if (bad || !seen) exit 2
+                    if (threaded) print "RCH_CENSUS_SELECTED:" ids "|" (unsettled+0)
+                    else { print "RCH_CENSUS_UNSETTLED 0"; printf "%s", rows }
+                }
             '\'') || exit 2
+            case "$selection" in
+                RCH_CENSUS_SELECTED:*) selection=${selection#RCH_CENSUS_SELECTED:};;
+                *) printf "%s\n" "$selection"; exit $?;;
+            esac
             pids=${selection%|*}
             [ -n "$pids" ] || exit 2
             printf "RCH_CENSUS_UNSETTLED %s\n" "${selection##*|}"
@@ -265,10 +305,8 @@ rch_group_state() {
     return "$rch_posix_state"
 }
 
-# Capture live members while the recorded leader still authenticates the group.
-# TERM can kill that leader before a child that ignores TERM. A surviving
-# member's birth identity lets THIS cancellation finish escalation without
-# treating a historical PGID as authority. These witnesses are never persisted.
+# Capture live birth witnesses while the leader still authenticates the group.
+# They authorize escalation after TERM kills the leader, only in THIS call.
 rch_capture_group_witnesses() {
     rch_witnesses=
     rch_witness_identity=
@@ -281,7 +319,8 @@ rch_capture_group_witnesses() {
     # One timed exchange bounds ALL witnesses using the same protocol. Partial
     # output grants no authority: 46 permits freshly authenticated KILL, not TERM.
     [ -n "${rch_launch_source:-}" ] || return 46
-    rch_collected=$(rch_control_capture 5s /bin/sh -c '
+    rch_observation_budget
+    rch_collected=$(rch_control_capture "${rch_observation_seconds}s" /bin/sh -c '
         command eval "$1" || exit 44
         rch_boot=$2; rch_pgid=$3; rch_start=$4; shift 4
         rch_remote_leader_matches || exit 43
@@ -313,7 +352,8 @@ rch_remote_witness_matches() {
     [ -n "${rch_launch_source:-}" ] || return 1
     # TERM can change a previously fast observer into a stalled one. Bound
     # revalidation too; a failed exchange is NOT permission to signal an orphan.
-    rch_matched=$(rch_control_capture 5s /bin/sh -c '
+    rch_observation_budget
+    rch_matched=$(rch_control_capture "${rch_observation_seconds}s" /bin/sh -c '
         command eval "$1" || exit 44
         rch_boot=$2; rch_pgid=$3; shift 3
         for witness in "$@"; do
@@ -329,11 +369,8 @@ rch_remote_witness_matches() {
     [ "$rch_matched" = RCH_WITNESS_MATCH_V1 ]
 }
 
-# Signal authority does not come from a system-wide census. Independently
-# prove that the observer is outside the target group in the same PID view,
-# then authenticate its live leader or THIS call's captured TERM witness.
-# Keep this guard at the signal boundary too: a failed census no longer supplies
-# its usual self-group check. A subshell must inspect its own PID, not just $$.
+# Independently fence signals by PID view, observer group and leader/current
+# TERM witness. Census failure supplies neither identity nor self-group proof.
 rch_posix_signal_authorized() (
     rch_requested_signal=$1
     [ "${rch_identified:-0}" = 1 ] || exit 43
@@ -366,7 +403,7 @@ rch_signal_group() {
                 rch_scope_operation kill
                 case $? in 0) return 0;; 3) return 43;; *) return 44;; esac;;
             TERM)
-                # Preserve the authenticated group's graceful TERM. Detached
+                # Preserve graceful TERM for the authenticated group. Detached
                 # groups are covered by the subsequent atomic cgroup.kill.
                 rch_scope_operation state
                 case $? in 0) return 0;; 1) ;; 3) return 43;; *) return 44;; esac
@@ -382,18 +419,15 @@ rch_signal_group() {
     kill -"$1" -"$rch_pgid" 2>/dev/null || :
 }
 
-# A retained identity from an earlier kernel boot cannot still execute. Check
-# this only on the fresh-channel recovery path, after parsing the exact build's
-# record. The live supervisor's in-memory cancellation path must never use a
-# changed receipt as an alternative to stopping its still-owned child.
-# 0: same boot; 1: previous boot is gone; 2: evidence unavailable. No signal,
-# cgroup operation, record mutation, or compiler-success claim occurs here.
+# Fresh-channel recovery only: 0 same boot, 1 earlier boot gone, 2 unknown.
+# No signal, mutation or success claim. A live supervisor cannot substitute a
+# changed receipt for stopping its still-owned child.
 rch_recovery_boot_state() (
     [ "${rch_identified:-0}" = 1 ] && rch_check_procfs_namespace || exit 2
     current=$(rch_read_boot 2>/dev/null) || exit 2
     for value in "$rch_boot" "$current"; do
         rch_valid_boot "$value" || exit 2
-        # The legacy shape check permits '-' in a UUID's hex groups. That is
+        # The legacy shape check permits hyphens within UUID hex groups. That is
         # not sufficient evidence to retire execution without a process census.
         compact=
         while :; do
@@ -428,34 +462,27 @@ rch_remote_cancel() {
     rch_remote_cancel_loaded "$3"
 }
 
-# Linux's monotonic uptime bounds the WHOLE recovery attempt, including the
-# initial census, graceful stop and witness collection. Builtin read avoids
-# spawning another all-process observer on the already loaded worker. The
-# hundredths keep a deadline from expiring early at a second boundary.
-rch_cancel_clock() {
-    read -r rch_cancel_uptime rch_cancel_idle < /proc/uptime || return 1
-    case "$rch_cancel_uptime" in *.*) ;; *) return 1;; esac
-    rch_cancel_secs=${rch_cancel_uptime%%.*}
-    rch_cancel_frac=${rch_cancel_uptime#*.}
-    rch_scope_uint "$rch_cancel_secs" && [ "${#rch_cancel_secs}" -le 12 ] || return 1
-    case "$rch_cancel_frac" in [0-9][0-9]) ;; *) return 1;; esac
-    rch_cancel_now=$((rch_cancel_secs * 100 + 1$rch_cancel_frac - 100))
-}
-
 # Operate on the already validated identity. The in-session supervisor has
 # additionally bound it to its direct child; rereading a mutable receipt here
 # could replace that authority between its check and the first scope operation.
-rch_remote_cancel_loaded() {
+rch_remote_cancel_loaded() (
+    # One 30s budget covers retries, witnesses and scope reads inside the 45s
+    # SSH channel. Subshell scope prevents deadline/authority leaks across calls.
+    rch_observation_clock || return 44
+    rch_cancel_deadline=$((rch_observation_now + 3000))
+    if [ -n "${rch_observation_deadline:-}" ]; then
+        case "$rch_observation_deadline" in ''|*[!0-9]*|0[0-9]*) return 44;; esac
+        [ "${#rch_observation_deadline}" -le 15 ] || return 44
+        [ "$rch_observation_deadline" -ge "$rch_cancel_deadline" ] || \
+            rch_cancel_deadline=$rch_observation_deadline
+    fi
+    rch_observation_deadline=$rch_cancel_deadline
+    [ "$rch_observation_now" -lt "$rch_observation_deadline" ] || return 44
+    rch_cancel_last_clock=$rch_observation_now
     rch_witnesses=
     rch_witness_identity=
     rch_term_sent=0
     rch_mode=$1
-    rch_cancel_deadline=
-    if [ "$(uname -s)" = Linux ]; then
-        rch_cancel_clock || return 44
-        rch_cancel_last_clock=$rch_cancel_now
-        rch_cancel_deadline=$((rch_cancel_now + 3000))
-    fi
     rch_group_state
     case $? in
         0) return 0;;
@@ -494,37 +521,34 @@ rch_remote_cancel_loaded() {
         esac
     fi
     # 43: the recorded leader no longer authenticates the group, so nothing may
-    # be signalled. The group's own deadline watchdog may already have killed
+    # be signalled. The group deadline watchdog may already have killed
     # it (the leader dies first, members a moment later): keep the census
     # running and confirm only if the group empties; otherwise still 43.
     rch_kill_status=0
     rch_signal_group KILL || rch_kill_status=$?
     case "$rch_kill_status" in 0|43) ;; *) return "$rch_kill_status";; esac
     rch_attempt=0
-    # Retain the quick-poll caps for ordinary exits, but stop starting Linux
-    # observations after 30 seconds since entry. A final census takes at most
-    # five seconds, plus V2's two one-second manager reads: 37 seconds leaves
-    # room inside the existing 45-second SSH budget. The pre-loop TERM path is
-    # bounded by 26 seconds (censuses, witnesses and grace), or 19 for V2.
-    # Darwin keeps its existing one-second census and retry caps.
-    rch_attempt_limit=20
-    [ "${rch_scope_bound:-0}" != 1 ] || rch_attempt_limit=8
+    rch_unknown_attempts=0
     rch_last_state=2
+    # Fast live observations may need a few settling polls; slow/unavailable
+    # observations get at most three retries, within the same overall budget.
+    rch_attempt_limit=20
     while [ "$rch_attempt" -lt "$rch_attempt_limit" ]; do
-        if [ -n "$rch_cancel_deadline" ]; then
-            rch_cancel_clock || return 44
-            [ "$rch_cancel_now" -ge "$rch_cancel_last_clock" ] || return 44
-            rch_cancel_last_clock=$rch_cancel_now
-            [ "$rch_cancel_now" -lt "$rch_cancel_deadline" ] || break
-        fi
+        rch_observation_clock || return 44
+        [ "$rch_observation_now" -ge "$rch_cancel_last_clock" ] || return 44
+        rch_cancel_last_clock=$rch_observation_now
+        [ "$rch_observation_now" -lt "$rch_observation_deadline" ] || return 44
         rch_group_state
         rch_last_state=$?
         # Without stop authority, an unavailable census keeps the refusal.
         # A between-pass exit needs another complete census, within this cap.
         case $rch_last_state in
             0) return 0;;
-            1) ;;
-            2) [ "$rch_kill_status" = 0 ] || return 43;;
+            1) rch_unknown_attempts=0;;
+            2)
+                [ "$rch_kill_status" = 0 ] || return 43
+                rch_unknown_attempts=$((rch_unknown_attempts + 1))
+                [ "$rch_unknown_attempts" -lt 3 ] || return 44;;
             *) return 44;;
         esac
         rch_attempt=$((rch_attempt + 1))
@@ -533,22 +557,17 @@ rch_remote_cancel_loaded() {
     [ "$rch_kill_status" = 0 ] || return "$rch_kill_status"
     [ $rch_last_state != 2 ] || return 44
     return 45
-}
+)
 
-# Optional receiver-side execution policy for tracked Linux build payloads.
-# These functions travel with the launch protocol; no worker launcher is needed.
-# Sync, pre-launch package bootstrap, and untracked execution are NOT confined
-# here. This is not by itself admission for a dual-role worker (GH #104).
-#
-# Configure ONE of /etc/rch/worker-execution.conf (root owned) or
-# $HOME/.config/rch/worker-execution.conf (owned by the SSH user or root):
+# Receiver policy confines tracked Linux payloads, not sync/bootstrap/untracked
+# work (GH #104). Configure ONE root-owned /etc/rch/worker-execution.conf or
+# SSH-user/root-owned $HOME/.config/rch/worker-execution.conf:
 #   version=1
 #   nice=10
 #   systemd_slice=jobs.slice
 #   systemd_manager=user
-# All specified settings are required. Missing policy preserves legacy behavior.
-# Unknown/duplicate keys, an unreadable file, or failed enforcement refuse setup.
-# No policy contents are ever evaluated as shell code.
+# All settings are required; missing policy preserves legacy behavior. Unknown,
+# duplicate, unreadable or unenforced settings refuse setup; never eval policy.
 
 rch_policy_refuse() {
     printf 'RCH_WORKER_POLICY_REFUSED:%s\n' "$1" >&2
@@ -651,18 +670,13 @@ rch_policy_read_file() {
     esac
 }
 
-# Bound the ENTIRE control exchange, not just the manager client's lifetime.
-# A plain `timeout Ns command` can wait forever after TERM, or finish while a
-# descendant still holds a capture pipe. Keep capture and response publication
-# inside timeout's private process group and kill that group at the deadline.
-# These are control helpers, never the workload or its supervisor. Failure is
-# unavailable evidence: no partial/failed stdout may authorize scope admission.
-# Capture stderr too, so it cannot keep the outer SSH pipe open independently.
-# Successful warnings become unrecognized response data (fail closed); failed
-# exchanges retain their diagnostic on stderr. No payload is evaluated as code.
+# Bound helpers AND pipe holders in one private group, killed at the deadline.
+# This never includes the workload/supervisor. Capture stderr too; failed output
+# is diagnostic only, never admission evidence. Successful output needs parsing:
+# warnings fail closed. No captured payload is evaluated as code.
 # GNU timeout kills its whole process group at the deadline; uutils timeout
 # (Ubuntu 25.10+ /usr/bin/timeout) kills only its direct child, so a pipe
-# holder survives. Ubuntu keeps GNU's as gnutimeout; Homebrew as gtimeout.
+# holder survives. Ubuntu ships GNU as gnutimeout; Homebrew as gtimeout.
 rch_group_timeout() {
     if command -v gnutimeout >/dev/null 2>&1; then
         gnutimeout "$@"
@@ -674,8 +688,8 @@ rch_group_timeout() {
         # The Darwin launcher already uses Python when setsid is unavailable.
         # Do not require Homebrew coreutils merely to observe a native identity.
         # Keep this monitor alive as its OWN session/group leader. On a deadline
-        # or interrupted observer, signal that group, never a reaped child's PID
-        # and never the caller's (possibly the compiler's) process group.
+        # or interrupted observer, signal that group, never a reaped child PID
+        # and never the calling process group (which may contain the compiler).
         command -v python3 >/dev/null 2>&1 || return 125
         # Isolated mode alone still imports installed .pth/sitecustomize hooks.
         # This monitor uses only stdlib: do not run unrelated startup code
@@ -686,7 +700,7 @@ import signal
 import subprocess
 import sys
 
-if len(sys.argv) < 4 or sys.argv[1] != "--signal=KILL" or sys.argv[2] not in ("1s", "5s"):
+if len(sys.argv) < 4 or sys.argv[1] != "--signal=KILL" or sys.argv[2] not in tuple(str(n) + "s" for n in range(1, 9)):
     sys.exit(125)
 try:
     os.setsid()
@@ -717,9 +731,19 @@ sys.exit(status if status >= 0 else 128 - status)
 }
 
 rch_control_capture() {
-    case "$1" in 1s|5s) ;; *) return 125;; esac
+    case "$1" in [1-8]s) ;; *) return 125;; esac
     rch_control_timeout=$1
     shift
+    # Nested captures and retries consume one admission/cancellation deadline.
+    if [ -n "${rch_observation_deadline:-}" ]; then
+        case "$rch_observation_deadline" in ''|*[!0-9]*|0[0-9]*) return 125;; esac
+        [ "${#rch_observation_deadline}" -le 15 ] || return 125
+        rch_observation_clock || return 125
+        rch_control_remaining=$(((rch_observation_deadline - rch_observation_now) / 100))
+        [ "$rch_control_remaining" -gt 0 ] || return 125
+        [ "$rch_control_remaining" -ge "${rch_control_timeout%s}" ] || \
+            rch_control_timeout=${rch_control_remaining}s
+    fi
     # Validate raw bytes before shell substitution can discard NUL. The private
     # bounded output file belongs to this observer, outside the timed group.
     rch_control_base=${TMPDIR:-/tmp}
@@ -748,7 +772,7 @@ rch_control_capture() {
 
     rm -f -- "$rch_control_pipe"
 
-    # Balance case-pattern parentheses for Darwin's bash 3.2 substitution parser.
+    # Balance case-pattern parentheses for the Darwin bash 3.2 parser.
     rch_control_metadata=$(
         case "$(uname -s)" in
             (Darwin) LC_ALL=C stat -f '%Lp:%l:%z' "$rch_control_file";;
@@ -769,7 +793,9 @@ rch_control_capture() {
         ''|*[!0-9]*) rm -f -- "$rch_control_file"; rmdir -- "$rch_control_dir" 2>/dev/null || :; return 125;;
     esac
     rch_control_limit=65536
-    [ "${1:-}" != ps ] || rch_control_limit=1048576
+    case "${1:-}:${4:-}" in
+        ps:*|/bin/sh:rch-group-census) rch_control_limit=1048576;;
+    esac
     if [ "$rch_control_size" -gt "$rch_control_limit" ] ||
         ! LC_ALL=C tr -cd '\11\12\40-\176' < "$rch_control_file" | cmp -s - "$rch_control_file"; then
         rm -f -- "$rch_control_file"
@@ -777,6 +803,11 @@ rch_control_capture() {
         return 125
     fi
 
+    if [ "$rch_control_status" = 0 ] && [ -n "${rch_observation_deadline:-}" ]; then
+        if ! rch_observation_clock || [ "$rch_observation_now" -ge "$rch_observation_deadline" ]; then
+            rch_control_status=125
+        fi
+    fi
     if [ "$rch_control_status" -ne 0 ]; then
         cat -- "$rch_control_file" >&2
         rch_control_output_status=$?
@@ -790,13 +821,19 @@ rch_control_capture() {
     rm -f -- "$rch_control_file"
     rmdir -- "$rch_control_dir" 2>/dev/null || :
     [ "$rch_control_output_status" -eq 0 ] || return 125
+    # Metadata/byte validation and publication also consume the shared budget.
+    # A late successful child never upgrades expired evidence to a valid read.
+    if [ -n "${rch_observation_deadline:-}" ]; then
+        rch_observation_clock || return 125
+        [ "$rch_observation_now" -lt "$rch_observation_deadline" ] || return 125
+    fi
 }
 
 rch_policy_systemctl() {
     rch_control_capture 5s systemctl "--$rch_policy_manager" --no-pager --no-ask-password "$@"
 }
 
-# Read the launcher's actual unified cgroup. A successful D-Bus job submission
+# Read the actual launcher unified cgroup. A successful D-Bus job submission
 # is not evidence that systemd moved it; cgroup v1/ambiguous evidence is refused.
 rch_policy_current_cgroup() (
     rch_policy_cgroup_count=0
@@ -859,11 +896,13 @@ rch_policy_enforce() {
     rch_remote_leader_matches || { rch_policy_refuse process_identity; return 125; }
     if [ -n "$rch_policy_nice" ]; then
         # util-linux -n becomes relative with POSIXLY_CORRECT. Clear that flag
-        # only in the helper process; never change the build's environment.
-        (unset POSIXLY_CORRECT; renice -n "$rch_policy_nice" -p "$rch_pgid") >/dev/null || {
+        # only in the helper process; leave the build environment unchanged.
+        (unset POSIXLY_CORRECT; rch_control_capture 5s renice -n "$rch_policy_nice" -p "$rch_pgid") >/dev/null || {
             rch_policy_refuse priority_change; return 125;
         }
-        rch_policy_observed_nice=$(LC_ALL=C ps -o ni= -p "$rch_pgid") || {
+        rch_observation_budget
+        rch_policy_observed_nice=$(LC_ALL=C rch_control_capture "${rch_observation_seconds}s" \
+            ps -o ni= -p "$rch_pgid") || {
             rch_policy_refuse priority_observation; return 125;
         }
         # ps pads the numeric field; splitting is safe after the numeric check.
@@ -890,14 +929,10 @@ rch_apply_configured_worker_policy() {
     rch_policy_enforce
 }
 
-# Scope-aware recovery (GH #104). RCH never reuses a scope name: it contains
-# boot UUID + leader birth identity. InvocationID and pinned cgroup inode add
-# independent fences against a removed/recreated unit or pathname. No signal
-# is ever sent to a unit by name; cgroup.kill is opened through a pinned parent.
-# This needs unified cgroups with a writable cgroup.kill (Linux 5.14+). A worker
-# able to create a scope but unable to reap it is refused before its payload.
-# This is lifecycle/resource containment, not a sandbox against a process with
-# permission to migrate itself out of the operator's resource hierarchy.
+# Scope recovery (GH #104) fences boot/birth, InvocationID and a pinned inode.
+# Never signal by unit name; open cgroup.kill through the pinned directory.
+# Unified cgroups and writable cgroup.kill (Linux 5.14+) are required BEFORE
+# payload admission. Privileged self-migration is outside this containment.
 
 rch_scope_reset() {
     rch_scope_bound=0
@@ -962,7 +997,8 @@ rch_scope_root() {
 # One manager snapshot, with a bounded wait. Missing/duplicate fields and
 # unknown states are unavailable evidence, not an inactive scope.
 rch_scope_snapshot() {
-    rch_scope_properties=$(LC_ALL=C rch_control_capture 1s systemctl "--$rch_scope_manager" \
+    rch_observation_budget
+    rch_scope_properties=$(LC_ALL=C rch_control_capture "${rch_observation_seconds}s" systemctl "--$rch_scope_manager" \
         --no-pager --no-ask-password show --all --property=LoadState \
         --property=ActiveState --property=InvocationID --property=ControlGroup \
         -- "$rch_scope_unit") || return 2
@@ -1062,7 +1098,8 @@ rch_scope_operation() (
         [ "$(stat -fLc '%T' /proc/self/fd/8)" = cgroup2fs ] || exit 3
     # Repeat generation evidence AFTER pinning the inode. Holding this directory
     # prevents inode reuse; subsequent opens never resolve its pathname again.
-    rch_scope_snapshot && rch_scope_snapshot_matches || exit 3
+    rch_scope_snapshot || exit 2
+    rch_scope_snapshot_matches || exit 3
     case "$1" in
         state)
             LC_ALL=C awk '
@@ -1095,6 +1132,27 @@ rch_scope_bind_created() {
     rch_scope_mount=$(rch_scope_root) || return 1
     rch_scope_root_id=$(stat -c '%d.%i' -- "$rch_scope_mount") || return 1
     rch_scope_node_id=$(stat -c '%d.%i' -- "$rch_scope_mount$rch_scope_cgroup") || return 1
-    rch_scope_binding_valid && rch_scope_operation probe || return 1
+    rch_scope_binding_valid || return 1
+    # Retry observations of this same binding, never scope creation or a
+    # changed identity. Keep the payload gate closed throughout the retries.
+    (
+        rch_observation_clock || exit 1
+        rch_probe_deadline=$((rch_observation_now + 3000))
+        if [ -n "${rch_observation_deadline:-}" ]; then
+            case "$rch_observation_deadline" in ''|*[!0-9]*|0[0-9]*) exit 1;; esac
+            [ "${#rch_observation_deadline}" -le 15 ] || exit 1
+            [ "$rch_observation_deadline" -ge "$rch_probe_deadline" ] || \
+                rch_probe_deadline=$rch_observation_deadline
+        fi
+        rch_observation_deadline=$rch_probe_deadline
+        rch_probe_attempt=0
+        while [ "$rch_probe_attempt" -lt 3 ]; do
+            rch_scope_operation probe
+            case $? in 0) exit 0;; 2) ;; *) exit 1;; esac
+            rch_probe_attempt=$((rch_probe_attempt + 1))
+            sleep 0.1 || exit 1
+        done
+        exit 1
+    ) || return 1
     rch_scope_bound=1
 }

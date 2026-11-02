@@ -473,7 +473,7 @@ impl HealthMonitor {
                     probes.spawn(async move {
                         let _fleet_permit =
                             permit.network.run(limit.acquire_owned()).await?.ok()?;
-                        let endpoint = worker.endpoint_snapshot().await;
+                        let endpoint = permit.endpoint.clone();
                         let result = permit
                             .network
                             .run(check_worker_health_for_endpoint(
@@ -545,13 +545,17 @@ impl HealthMonitor {
                     continue;
                 };
                 let previous_effective_status = worker.status().await;
-                let (was_down, transport_down) = worker
-                    .record_transport_result(
+                let Some((was_down, transport_down)) = worker
+                    .record_health_transport_result(
+                        &permit,
                         result.healthy || result.command_failure,
                         config.check_interval,
                         &config.circuit,
                     )
-                    .await;
+                    .await
+                else {
+                    continue;
+                };
 
                 // Record health check latency metric
                 if result.healthy {
@@ -855,6 +859,83 @@ async fn check_worker_health_for_endpoint(
     }
 }
 
+/// Prove only that the immutable historical endpoint can authenticate and run
+/// a harmless command. This does not inspect storage, kill work, settle a
+/// lease, close a scheduling circuit, or reopen a current worker's pools.
+/// One total deadline and one owned foreground process group cover the local
+/// client inspection, connection, command and cleanup; no pool is consulted.
+pub(crate) async fn probe_owned_recovery_transport(
+    config: &rch_common::WorkerConfig,
+    timeout: Duration,
+) -> bool {
+    use rch_common::ssh::{OwnedProcessGroup, configure_oneshot_ssh, ssh_can_disable_background};
+    use std::path::Path;
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
+
+    const COMMAND: &str = "echo RCH_TRANSPORT_READY_V1";
+    const SENTINEL: &str = "RCH_TRANSPORT_READY_V1";
+    const OUTPUT_LIMIT: u64 = 128;
+
+    tokio::time::timeout(timeout, async {
+        if mock::is_mock_enabled() {
+            let mut client = MockSshClient::new(config.clone(), MockConfig::from_env());
+            client.connect().await.ok()?;
+            let result = client.execute(COMMAND).await.ok()?;
+            let _ = client.disconnect().await;
+            return Some(result.success() && result.stdout.trim() == SENTINEL);
+        }
+        let foreground = ssh_can_disable_background(Path::new("ssh"), timeout)
+            .await
+            .ok()?;
+        let mut command = tokio::process::Command::new("ssh");
+        configure_oneshot_ssh(&mut command, foreground);
+        command
+            .args([
+                "-T",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+            ])
+            .arg(format!("ConnectTimeout={}", timeout.as_secs().max(1)))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        if !config.identity_file.is_empty() {
+            let identity = shellexpand::tilde(&config.identity_file);
+            command.arg("-i").arg(identity.as_ref());
+            if let Some(options) = rch_common::ssh::identities_only_args(identity.as_ref()) {
+                command.args(options);
+            }
+        }
+        command
+            .arg(format!("{}@{}", config.user, config.host))
+            .arg(COMMAND);
+        let mut child = OwnedProcessGroup::spawn(&mut command).ok()?;
+        let stdout = child.take_stdout()?;
+        let mut output = Vec::new();
+        stdout
+            .take(OUTPUT_LIMIT + 1)
+            .read_to_end(&mut output)
+            .await
+            .ok()?;
+        // Drain before reaping so the leader pins the process-group identity
+        // while timeout/administrative revocation may stop its descendants.
+        let status = child.wait().await.ok()?;
+        Some(
+            status.success()
+                && output.len() <= OUTPUT_LIMIT as usize
+                && std::str::from_utf8(&output).is_ok_and(|output| output.trim() == SENTINEL),
+        )
+    })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(false)
+}
+
 async fn check_worker_health_once(
     worker_config: &rch_common::WorkerConfig,
     mock_enabled: bool,
@@ -1071,7 +1152,7 @@ pub async fn probe_worker(worker: &WorkerState) -> HealthCheckResult {
             "Worker probe suppressed by lifecycle or recovery cadence".into(),
         );
     };
-    let endpoint = worker.endpoint_snapshot().await;
+    let endpoint = permit.endpoint.clone();
     permit
         .network
         .run(check_worker_health_for_endpoint(

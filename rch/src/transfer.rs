@@ -1000,7 +1000,8 @@ fn worker_tmp_guarded_prune_prefix(escaped_remote_path: &str) -> String {
 }
 
 /// Wall-clock budget for the whole post-timeout remote group-kill attempt
-/// (issue #62): SSH connect + kill + up-to-10s verification loop.
+/// (issues #62/#129): SSH connect + the remote 30s observation/cleanup budget
+/// + transport drain. Unknown state never proves completion at either deadline.
 const REMOTE_TIMEOUT_KILL_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
 
 /// Outcome of the best-effort remote process-group kill issued when the

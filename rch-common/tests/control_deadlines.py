@@ -5,13 +5,14 @@ Manager clients and selected ps failures are test executables. GNU timeout,
 pipes, process groups, signals, the policy gate and snapshot parsers are real.
 This suite does not claim a live systemd, cgroup or SSH fleet qualification.
 The Rust integration target supplies the compiled protocol; direct Python
-runs use the checked-out production shell file. Test evidence is retained.
+runs expand the same checked-out literal sources. Test evidence is retained.
 """
 from __future__ import annotations
 
 import json
 import os
 from pathlib import Path
+import re
 import select
 import signal
 import subprocess
@@ -20,10 +21,24 @@ import tempfile
 import time
 import unittest
 
-PROTOCOL = Path(os.environ.get(
-    "RCH_CONTROL_TEST_PROTOCOL",
-    str(Path(__file__).resolve().parents[1] / "src" / "remote_process.sh"),
-)).read_text()
+def checked_out_protocol() -> str:
+    # Witness collection evaluates rch_launch_source in its bounded helper.
+    # Reading remote_process.sh alone omits that shared source and silently
+    # turns TERM tests into the authenticated immediate-KILL fallback.
+    source = Path(__file__).resolve().parents[1] / "src"
+    expression = (source / "remote_scoped_launch.rs").read_text().split(
+        "= concat!(\n", 1)[1].split("\n);", 1)[0]
+    parts = []
+    for line in expression.splitlines():
+        item = line.strip().removesuffix(",")
+        include = re.fullmatch(r'include_str!\(("[^"\n]+")\)', item)
+        parts.append((source / json.loads(include[1])).read_text()
+                     if include else json.loads(item))
+    return "".join(parts)
+
+
+PROTOCOL = (Path(os.environ["RCH_CONTROL_TEST_PROTOCOL"]).read_text()
+            if "RCH_CONTROL_TEST_PROTOCOL" in os.environ else checked_out_protocol())
 SHELL = os.environ.get("RCH_CONTROL_TEST_SHELL", "/bin/sh")
 SNAPSHOT = "LoadState=loaded\nActiveState=active\nInvocationID=1234567890abcdef1234567890abcdef\nControlGroup=/jobs.slice/test.scope\n"
 SNAPSHOT_CALL = 'rch_scope_manager=user; rch_scope_unit=test.scope; rch_scope_snapshot'
@@ -45,8 +60,13 @@ class ControlDeadlines(unittest.TestCase):
         path.chmod(0o700)
 
     def run_shell(self, body: str, *args: str, stdin: bytes = b"",
-                  stalled: bool = False, budget: float = 4) -> subprocess.CompletedProcess[bytes]:
-        process = subprocess.Popen([SHELL, "-c", PROTOCOL + "\n" + body,
+                  stalled: bool = False, budget: float = 6) -> subprocess.CompletedProcess[bytes]:
+        # The production leaf budget adapts to the machine's current load.
+        # Fix this test's input to the documented 3s minimum so busy CI hosts
+        # do not unpredictably choose the 8s tier. The real timeout mechanism,
+        # capture pipe, failed-output handling and stop assertions stay intact.
+        fixed_budget = "\nrch_observation_budget() { rch_observation_seconds=3; }\n"
+        process = subprocess.Popen([SHELL, "-c", PROTOCOL + fixed_budget + body,
                                     "rch-control-test", *args], env=self.env,
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, start_new_session=True)
@@ -253,10 +273,12 @@ if fault == "slow" and "-e" in sys.argv:
     time.sleep(1.25)
 bad = (fault in ("failed", "malformed") and number == 1
        or fault == "persistent"
-       or fault == "thread-pass" and "-q" in sys.argv
+       or fault == "thread-pass" and ("-q" in sys.argv or (root / "thread-pass-failed").exists())
        or fault == "after-term" and number == 2
        or fault == "persistent-after-term" and number >= 2)
 if bad:
+    if fault == "thread-pass":
+        (root / "thread-pass-failed").touch()
     if fault == "malformed":
         print("not a process census")
         sys.exit(0)
@@ -288,10 +310,14 @@ kill() { printf '%s\\n' "$*" >> "$RCH_CENSUS_ROOT/signals"; command kill "$@"; }
         root.mkdir()
         record = root / "record"
         worker_code = '''
-import fcntl, os, signal, sys, time
+import fcntl, os, signal, sys, threading, time
 from pathlib import Path
 root = Path(sys.argv[1])
 signal.signal(signal.SIGTERM, signal.SIG_IGN)
+# Force a real multi-threaded target: optimized single-thread censuses no
+# longer need a selected LWP pass. The failed-pass test then keeps subsequent
+# observations unavailable instead of accidentally accepting a fresh proof.
+threading.Thread(target=lambda: time.sleep(60), daemon=True).start()
 lock = (root / "held.lock").open("a")
 fcntl.flock(lock, fcntl.LOCK_EX)
 (root / "worker").write_text(str(os.getpid()))
@@ -401,11 +427,11 @@ exec "$@"
         # KILL. The process, receipt and failed census remain native. No time
         # limit may turn missing death evidence into a completion receipt.
         clock = '''
-rch_cancel_clock() {
+rch_observation_clock() {
     if [ -f "$RCH_CENSUS_ROOT/signals" ]; then
-        rch_cancel_now=3100
+        rch_observation_now=3100
     else
-        rch_cancel_now=100
+        rch_observation_now=100
     fi
 }
 '''
@@ -417,17 +443,17 @@ rch_cancel_clock() {
         self.assertEqual(self.recover(group).returncode, 0)
 
     def test_missing_or_backwards_recovery_clock_cannot_confirm_cleanup(self):
-        for clock_failure in ("return 1", "rch_cancel_now=99"):
+        for clock_failure in ("return 1", "rch_observation_now=99"):
             with self.subTest(clock_failure=clock_failure):
                 group = self.group()
                 self.count.write_text("0")
                 self.trace.write_text("")
                 clock = '''
-rch_cancel_clock() {
+rch_observation_clock() {
     if [ -s "$RCH_CENSUS_ROOT/signals" ]; then
         ''' + clock_failure + '''
     else
-        rch_cancel_now=100
+        rch_observation_now=100
     fi
 }
 '''
@@ -455,6 +481,8 @@ rch_cancel_clock() {
     def test_failed_selected_thread_pass_cannot_confirm_cleanup(self):
         group = self.group()
         result = self.recover(group, "thread-pass")
+        self.assertTrue((self.root / "thread-pass-failed").exists(),
+                        "fixture must reach the selected live-thread census")
         self.assertEqual(result.returncode, 44, result.stderr)
         self.assert_stopped(group)
         self.assertEqual(self.recover(group).returncode, 0)

@@ -1379,6 +1379,15 @@ commit, and Git tree. Admission allows at most 1,024 submodules and 32 nesting
 levels, including queued descendants. Composed archives preserve executable
 permissions and symlinks and refuse case-aliased destination paths.
 
+Admission reads pinned symlink targets, Cargo metadata, and archive attributes
+in Git object batches per selected repository. Symlink resolution still uses
+the complete selected inventory, so a linked Cargo configuration is read from
+its pinned target even when that target has a different filename. Every batch
+response must match the requested object ID, blob type, and exact byte framing;
+missing objects, malformed responses, and bounded-resource failures refuse
+admission. This reduces Git process startup work without consulting dirty
+checkout contents or introducing a timestamp-based source cache.
+
 On Unix workers, pooled Cargo builds use a stable source path paired with a
 versioned target cache. Jobs sharing that pair wait until the preceding job
 has finished execution, artifact retrieval, and source retirement. Different
@@ -1388,9 +1397,12 @@ previous build; registry and Git dependency caches remain reusable.
 These paired builds also retain immutable Git archives in a private directory
 inside the owned target pool. Each selected repository has a separate slot, so
 primary and sibling dependency archives can stay warm together. Before reuse,
-the worker verifies the archive's length and SHA-256 against the archive
-constructed by the caller, then copies it into the fresh source tree for normal
-extraction. A verified hit skips the base archive upload; local archive creation
+the worker checks the bounded cache header against the caller's requested
+archive. A different identity is a miss without reading the old payload. A
+matching archive is copied into the fresh source tree while its length and
+SHA-256 are verified in one pass against the archive constructed by the caller;
+only a verified private copy can proceed to extraction. A verified hit skips
+the base archive upload; local archive creation
 and source-content verification still run. The cache admits at most 64 slots
 and 1 GiB including pending publications, and preserves the configured worker
 free-space reserve. Capacity limits or unavailable Python/layout support use

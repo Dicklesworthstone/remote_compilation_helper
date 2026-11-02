@@ -190,12 +190,14 @@ impl OwnedProcessGroup {
     /// Reap the child after stopping any remaining descendants in its group.
     ///
     /// # Errors
-    /// Returns an error if exit notification or waiting for the child fails.
+    /// Returns an error if inspecting or waiting for the child fails.
     pub async fn wait(&mut self) -> std::io::Result<ExitStatus> {
         // Inspect exit without reaping, then stop remaining group members
         // while the leader's unreaped PID still prevents reuse. SIGCHLD is
         // only a readiness hint: subscribe before checking to avoid losing a
-        // fast exit, and recheck after unrelated/coalesced child signals.
+        // fast exit, and recheck after unrelated/coalesced child signals. A
+        // caller can also inherit a blocked signal mask, so periodically
+        // inspect the kernel state even when no notification reaches Tokio.
         // rustix exposes waitid on Linux/macOS and the other Unix targets
         // except those below; their existing cancellation ownership remains.
         #[cfg(not(any(
@@ -207,7 +209,19 @@ impl OwnedProcessGroup {
         )))]
         if let Some(pid) = self.unreaped_pid() {
             use rustix::process::{WaitId, WaitIdOptions, waitid};
-            let mut exits = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())?;
+            const EXIT_RECHECK_INTERVAL: Duration = Duration::from_millis(100);
+            let mut exits = match tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::child(),
+            ) {
+                Ok(exits) => Some(exits),
+                Err(error) => {
+                    debug!(
+                        %error,
+                        "SSH child signal notification unavailable; inspecting exit periodically"
+                    );
+                    None
+                }
+            };
             loop {
                 match waitid(
                     WaitId::Pid(pid),
@@ -218,10 +232,20 @@ impl OwnedProcessGroup {
                         break;
                     }
                     Ok(None) => {
-                        if exits.recv().await.is_none() {
-                            return Err(std::io::Error::other(
-                                "SSH child exit notification closed",
-                            ));
+                        tokio::select! {
+                            notification = async {
+                                match exits.as_mut() {
+                                    Some(exits) => exits.recv().await,
+                                    None => std::future::pending().await,
+                                }
+                            } => {
+                                if notification.is_none() {
+                                    // Disable a closed receiver so it cannot
+                                    // spin and starve the periodic inspection.
+                                    exits = None;
+                                }
+                            }
+                            () = tokio::time::sleep(EXIT_RECHECK_INTERVAL) => {}
                         }
                     }
                     Err(rustix::io::Errno::INTR) => continue,
@@ -3852,6 +3876,208 @@ exit 37
         })
         .await
         .expect("an unexpected master exit must stop its still-live proxy descendant");
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn run_blocked_sigchld_fixture(mode: &str) {
+        // Block the signal before exec/runtime/test-thread creation. Only this
+        // disposable process inherits the mask; the shared test runner does not
+        // change its signal handlers, mask, or environment.
+        let mut command = tokio::process::Command::new("python3");
+        command
+            .args([
+                "-I",
+                "-S",
+                "-c",
+                "import os, signal, sys\nassert signal.getsignal(signal.SIGCHLD) != signal.SIG_IGN\nsignal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGCHLD})\nos.execv(sys.argv[1], sys.argv[1:])\n",
+            ])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ssh::ssh_connection_tests::owned_process_group_blocked_sigchld_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("RCH_TEST_BLOCKED_SIGCHLD_MODE", mode)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(20), command.output())
+            .await
+            .expect("isolated blocked-SIGCHLD fixture must finish")
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "blocked-SIGCHLD {mode} fixture failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("blocked-sigchld-verified"),
+            "the exact helper must run, not an empty filtered test suite"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn owned_process_group_reaps_with_blocked_sigchld() {
+        run_blocked_sigchld_fixture("exit").await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn owned_process_group_cancellation_reaps_with_blocked_sigchld() {
+        run_blocked_sigchld_fixture("cancel").await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn owned_process_group_wait_can_resume_with_blocked_sigchld() {
+        run_blocked_sigchld_fixture("resume").await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "invoked in an isolated process by the blocked-SIGCHLD tests"]
+    async fn owned_process_group_blocked_sigchld_child() {
+        use std::os::unix::process::ExitStatusExt;
+        use tokio::io::AsyncWriteExt;
+
+        fn assert_signal_blocked() {
+            let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+            let mask = status
+                .lines()
+                .find_map(|line| line.strip_prefix("SigBlk:"))
+                .unwrap();
+            let mask = u64::from_str_radix(mask.trim(), 16).unwrap();
+            let bit = 1_u64 << (rustix::process::Signal::CHILD.as_raw() - 1);
+            assert_ne!(
+                mask & bit,
+                0,
+                "the actual runtime thread must block SIGCHLD"
+            );
+        }
+
+        fn alive(pid: u32) -> bool {
+            match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Ok(stat) => !matches!(
+                    stat.rsplit_once(") ")
+                        .and_then(|(_, fields)| fields.chars().next()),
+                    Some('Z' | 'X')
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => panic!("inspect owned fixture process {pid}: {error}"),
+            }
+        }
+
+        let mode = std::env::var("RCH_TEST_BLOCKED_SIGCHLD_MODE").unwrap();
+        assert!(matches!(mode.as_str(), "exit" | "cancel" | "resume"));
+        assert_signal_blocked();
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args([
+                "-c",
+                "sleep 30 &\nprintf '%s\\n' \"$!\"\nIFS= read -r release\nprintf 'leader exited\\n'\nexit 37\n",
+            ])
+            .stdin(std::process::Stdio::piped())
+            // The descendant inherits this pipe. EOF requires its termination,
+            // not merely reaping the leader or observing an exit status.
+            .stdout(std::process::Stdio::piped());
+        let mut group = OwnedProcessGroup::spawn(&mut command).unwrap();
+        let leader = group.child.id().unwrap();
+        let mut input = group.take_stdin().unwrap();
+        let mut output = BufReader::new(group.take_stdout().unwrap());
+        let mut ready = String::new();
+        tokio::time::timeout(Duration::from_secs(3), output.read_line(&mut ready))
+            .await
+            .expect("owned descendant must announce its PID")
+            .unwrap();
+        let descendant = ready.trim().parse::<u32>().unwrap();
+        assert!(alive(leader) && alive(descendant));
+
+        if mode != "exit" {
+            // Dropping a pending wait future must retain ownership and leave a
+            // live workload alone across several periodic kernel inspections.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(350), group.wait())
+                    .await
+                    .is_err(),
+                "a healthy leader cannot complete without release"
+            );
+            assert_eq!(group.child.id(), Some(leader));
+            assert!(alive(leader) && alive(descendant));
+        }
+        let result = if mode == "cancel" {
+            group.start_kill().unwrap();
+            tokio::time::timeout(Duration::from_secs(3), group.wait()).await
+        } else {
+            let waiting = group.wait();
+            tokio::pin!(waiting);
+            // Keep this exact wait future pending before releasing the leader:
+            // the old signal-only implementation then hangs, whereas a fast
+            // exit before the first waitid would not exercise the defect.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(350), &mut waiting)
+                    .await
+                    .is_err(),
+                "periodic readiness checks must not kill a healthy process"
+            );
+            assert!(alive(leader) && alive(descendant));
+            assert_signal_blocked();
+            input.write_all(b"exit now\n").await.unwrap();
+            tokio::time::timeout(Duration::from_secs(3), &mut waiting).await
+        };
+        if !matches!(result.as_ref(), Ok(Ok(_))) {
+            // The baseline negative also reaches this cleanup: after its
+            // timeout a fresh WNOWAIT check can see the already-exited leader.
+            // Kill its still-owned group before reporting the assertion.
+            let _ = group.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(3), group.wait()).await;
+        }
+        let status = result
+            .expect("owned wait must progress without SIGCHLD delivery")
+            .unwrap();
+        if mode == "cancel" {
+            assert_eq!(
+                status.signal(),
+                Some(rustix::process::Signal::KILL.as_raw())
+            );
+        } else {
+            assert_eq!(
+                status.code(),
+                Some(37),
+                "preserve the leader's actual status"
+            );
+        }
+        assert!(group.child.id().is_none(), "the leader must be reaped");
+        assert!(!Path::new(&format!("/proc/{leader}")).try_exists().unwrap());
+        assert_eq!(
+            group.wait().await.unwrap(),
+            status,
+            "repeated wait is harmless"
+        );
+        let mut tail = String::new();
+        tokio::time::timeout(Duration::from_secs(3), output.read_to_string(&mut tail))
+            .await
+            .expect("the descendant must release its inherited output pipe")
+            .unwrap();
+        assert_eq!(
+            tail,
+            if mode == "cancel" {
+                ""
+            } else {
+                "leader exited\n"
+            }
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while alive(descendant) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("no live pipe-holding descendant may remain");
+        assert_signal_blocked();
+        println!("blocked-sigchld-verified {mode}");
     }
 
     #[tokio::test]

@@ -31,7 +31,7 @@ fn live_threads_behind_zombie_leaders_never_authorize_cleanup_success() {
     );
     assert!(
         String::from_utf8_lossy(&output.stdout)
-            .contains("PASS: 28 native process and snapshot cases"),
+            .contains("PASS: 34 native process and snapshot cases"),
         "native suite did not complete every case",
     );
 }

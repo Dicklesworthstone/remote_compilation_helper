@@ -95,6 +95,12 @@ pub enum ActionClassRisk {
     /// Workspace checks whose committed producer graph may include separately
     /// qualified immutable dependency DAGs. Requires its own class evidence.
     WorkspaceDagMetadata,
+    /// Exact selected binary/example or harness metadata checks with a proven
+    /// empty candidate inventory. Terminal outputs never authorize consumers.
+    WorkspaceTerminalLeafMetadata,
+    /// Exact selected terminal checks with complete committed producer ancestry.
+    /// Independent samples cannot be borrowed from leaf or library classes.
+    WorkspaceTerminalMetadata,
     /// Anything else: general workspace outputs, tool-generated code, unknown
     /// classes. Never sampled.
     Elevated,

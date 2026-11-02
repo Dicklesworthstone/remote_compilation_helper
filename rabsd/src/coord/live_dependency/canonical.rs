@@ -308,6 +308,14 @@ impl CanonicalPaths {
         &self,
         plan: &DependencyActionPlan,
     ) -> Result<(), String> {
+        self.require_workspace_execution_with_root(plan, false)
+    }
+
+    fn require_workspace_execution_with_root(
+        &self,
+        plan: &DependencyActionPlan,
+        root_required: bool,
+    ) -> Result<(), String> {
         use rabs_key::live_dependency::remote::{
             RemoteDependencyOutputClass, remote_dependency_output_class,
         };
@@ -339,6 +347,9 @@ impl CanonicalPaths {
             .iter()
             .any(|arg| arg == "--test");
         let selected = self.workspace_units.iter().any(|unit| {
+            if root_required && !unit.is_root() {
+                return false;
+            }
             // Cargo's unit graph serializes both Check { test: false } and
             // Check { test: true } as "check". Its target.test field states
             // eligibility, not which compiler invocation will run. For broad
@@ -436,7 +447,11 @@ impl CanonicalPaths {
             .validate_plan(plan)
             .map_err(|error| error.to_string())?;
         if plan.source_kind.is_workspace() {
-            self.require_workspace_execution(plan)?;
+            self.require_workspace_execution_with_root(
+                plan,
+                plan.source_kind
+                    == rabs_key::live_dependency::DependencySourceKind::WorkspaceTerminalMetadata,
+            )?;
             if self.closed_dependency_execution_required {
                 return Err(
                     "committed workspace caching requires a Cargo graph without project executors"

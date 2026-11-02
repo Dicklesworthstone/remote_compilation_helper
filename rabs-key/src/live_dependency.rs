@@ -425,6 +425,10 @@ pub enum DependencySourceKind {
     /// qualified canonical remote immutable dependency leaves. Every retained
     /// candidate still requires exact installed and current publication authority.
     WorkspaceMixedMetadata,
+    /// A selected binary/example or test/bench metadata check. Independent leaf
+    /// and committed-input policies share this complete workspace source scope;
+    /// terminal outputs never establish dependency-producer authority.
+    WorkspaceTerminalMetadata,
 }
 
 impl DependencySourceKind {
@@ -442,6 +446,7 @@ impl DependencySourceKind {
             Self::WorkspaceCommittedMetadata => "canonical-workspace-committed-metadata-v1",
             Self::WorkspaceMixedRlib => "canonical-workspace-committed-mixed-rlib-v1",
             Self::WorkspaceMixedMetadata => "canonical-workspace-committed-mixed-metadata-v1",
+            Self::WorkspaceTerminalMetadata => "canonical-workspace-terminal-metadata-v1",
         }
     }
 
@@ -458,6 +463,7 @@ impl DependencySourceKind {
                 | Self::WorkspaceCommittedMetadata
                 | Self::WorkspaceMixedRlib
                 | Self::WorkspaceMixedMetadata
+                | Self::WorkspaceTerminalMetadata
         )
     }
 }
@@ -657,12 +663,48 @@ pub struct ExternFact {
     pub content_digest: TypedDigest,
 }
 
+/// Whether an exact object is empty metadata that rustc's crate locator skips.
+///
+/// This is a byte/format classification, never an installation witness. Callers
+/// must keep the file in the keyed inventory and compiler-visible namespace,
+/// verify its original physical generation, and reject it when explicitly named
+/// by `--extern`. Nonempty metadata, archives and other digest domains never
+/// acquire this exemption from committed-producer provenance.
+#[must_use]
+pub fn is_empty_metadata_artifact(path: &str, content_digest: &TypedDigest) -> bool {
+    static EMPTY: std::sync::LazyLock<TypedDigest> =
+        std::sync::LazyLock::new(empty_metadata_object_digest);
+    path.rsplit('/').next().is_some_and(|name| {
+        safe_component(name) && name.starts_with("lib") && name.ends_with(".rmeta")
+    }) && content_digest == &*EMPTY
+}
+
+fn empty_metadata_object_digest() -> TypedDigest {
+    use rabs_protocol::result_identity::DigestAlgorithm;
+    use sha2::{Digest, Sha256};
+
+    // CAS object identities use a streaming domain-length prefix, not the
+    // length-framed descriptor/key encoding in typed_digest::compute.
+    const DOMAIN: &str = "rabs.object.sha256.v1";
+    let mut hash = Sha256::new();
+    hash.update((DOMAIN.len() as u64).to_be_bytes());
+    hash.update(DOMAIN.as_bytes());
+    TypedDigest {
+        algorithm: DigestAlgorithm::Sha256V1,
+        domain: DOMAIN,
+        bytes: hash.finalize().into(),
+    }
+}
+
 /// Complete crate-candidate inventory of one dependency search directory:
 /// exactly the files rustc's crate locator can open for a library compile.
 /// Entries the locator never opens (no `lib` prefix: codegen scratch, temp
 /// directories, dep-info, executables) and `.rlib`s shadowed by a non-empty
 /// same-stem `.rmeta` are not inputs and are not listed; the edge refuses
 /// any other `lib*` entry (dylibs, proc-macros, interfaces, static libs).
+/// Empty `.rmeta` files remain exact keyed and materialized inputs even though
+/// rustc skips them during crate discovery. Only producer-witness eligibility
+/// distinguishes those inert files from loadable metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DependencyDirectoryFact {
     /// Real absolute directory, in the plan's first-use order.
@@ -1225,6 +1267,11 @@ fn artifacts_component(
         }
     }
     for fact in facts {
+        if is_empty_metadata_artifact(&fact.path, &fact.content_digest) {
+            return Err(LiveRefusal::Extern(
+                "explicit extern metadata is empty".into(),
+            ));
+        }
         if !directories
             .iter()
             .flat_map(|directory| &directory.artifacts)
@@ -1505,6 +1552,7 @@ fn captured_action_key(
                             | DependencySourceKind::WorkspaceCommittedMetadata
                             | DependencySourceKind::WorkspaceMixedRlib
                             | DependencySourceKind::WorkspaceMixedMetadata
+                            | DependencySourceKind::WorkspaceTerminalMetadata
                     )
                     && input.virtual_path.as_bytes()[root.len()..]
                         .split(|byte| *byte == b'/')
@@ -1571,7 +1619,8 @@ fn captured_action_key(
             | DependencySourceKind::WorkspaceCommittedRlib
             | DependencySourceKind::WorkspaceCommittedMetadata
             | DependencySourceKind::WorkspaceMixedRlib
-            | DependencySourceKind::WorkspaceMixedMetadata => {
+            | DependencySourceKind::WorkspaceMixedMetadata
+            | DependencySourceKind::WorkspaceTerminalMetadata => {
                 enc.str("complete-canonical-workspace-execution-tree-v1")
                     .str(plan.source_kind.as_str())
                     .str(&plan.source_root)
@@ -1670,6 +1719,9 @@ fn captured_action_key(
                 }
                 DependencySourceKind::WorkspaceMixedMetadata => {
                     workspace_dependency_cache::MIXED_METADATA_ISOLATION_PROFILE
+                }
+                DependencySourceKind::WorkspaceTerminalMetadata => {
+                    workspace_dependency_cache::TERMINAL_METADATA_ISOLATION_PROFILE
                 }
             }
             .as_bytes(),
@@ -4357,6 +4409,63 @@ mod tests {
             )
             .as_bytes()
         );
+    }
+
+    #[test]
+    fn empty_metadata_is_retained_in_keys_but_cannot_be_an_explicit_extern() {
+        let plan = plan_for(OUT_A, &[], &[]).unwrap();
+        let mut direct = externs(&plan, 20);
+        let original = super::live_dependency_key(
+            &plan,
+            &toolchain(),
+            &direct,
+            &directory_facts(&plan, &direct),
+            None,
+            &inputs(&plan, 11),
+        )
+        .unwrap();
+        let mut candidates = directory_facts(&plan, &direct);
+        let empty = ExternFact {
+            path: format!("{}/libzzbinary.rmeta", plan.dependency_dirs[0]),
+            content_digest: empty_metadata_object_digest(),
+        };
+        assert!(is_empty_metadata_artifact(
+            &empty.path,
+            &empty.content_digest
+        ));
+        candidates[0].artifacts.push(empty.clone());
+        let with_empty = super::live_dependency_key(
+            &plan,
+            &toolchain(),
+            &direct,
+            &candidates,
+            None,
+            &inputs(&plan, 11),
+        )
+        .unwrap();
+        assert_ne!(with_empty.action_key, original.action_key);
+        for path in ["libbinary.rlib", "libbinary.so", "binary.rmeta"] {
+            assert!(!is_empty_metadata_artifact(path, &empty.content_digest));
+        }
+        let mut wrong_domain = empty.content_digest.clone();
+        wrong_domain.domain = "rabs.test.v1";
+        assert!(!is_empty_metadata_artifact(&empty.path, &wrong_domain));
+        let mut different = empty.content_digest.clone();
+        different.bytes[0] ^= 1;
+        assert!(!is_empty_metadata_artifact(&empty.path, &different));
+
+        direct[0].content_digest = empty_metadata_object_digest();
+        assert!(matches!(
+            super::live_dependency_key(
+                &plan,
+                &toolchain(),
+                &direct,
+                &directory_facts(&plan, &direct),
+                None,
+                &inputs(&plan, 11),
+            ),
+            Err(LiveRefusal::Extern(_))
+        ));
     }
 
     #[test]

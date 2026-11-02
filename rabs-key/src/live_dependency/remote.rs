@@ -903,17 +903,19 @@ pub(super) fn remote_extern_facts(
             {
                 return Err(RemoteDependencyRefusal::ExternInputs);
             }
-            directories
+            let fact = directories
                 .iter()
                 .flat_map(|directory| &directory.artifacts)
                 .find(|fact| &fact.path == path)
-                .cloned()
                 .ok_or_else(|| {
-                    LiveRefusal::Facts(
+                    RemoteDependencyRefusal::from(LiveRefusal::Facts(
                         "remote extern is missing from the complete candidate inventory".into(),
-                    )
-                    .into()
-                })
+                    ))
+                })?;
+            if super::is_empty_metadata_artifact(&fact.path, &fact.content_digest) {
+                return Err(RemoteDependencyRefusal::ExternInputs);
+            }
+            Ok(fact.clone())
         })
         .collect()
 }

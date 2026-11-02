@@ -56,6 +56,10 @@ impl ProducerPolicy {
             CommittedDependencyPolicy::ImmutableDagMetadata => (true, ProducerDomain::ImmutableDag),
             CommittedDependencyPolicy::WorkspaceDagRlib => (false, ProducerDomain::WorkspaceDag),
             CommittedDependencyPolicy::WorkspaceDagMetadata => (true, ProducerDomain::WorkspaceDag),
+            CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata
+            | CommittedDependencyPolicy::WorkspaceTerminalMetadata => {
+                (true, ProducerDomain::WorkspaceDag)
+            }
         };
         Self {
             metadata_allowed,
@@ -80,6 +84,9 @@ impl ProducerPolicy {
             ActionClassRisk::WorkspaceDagRlib => CommittedDependencyPolicy::WorkspaceDagRlib,
             ActionClassRisk::WorkspaceDagMetadata => {
                 CommittedDependencyPolicy::WorkspaceDagMetadata
+            }
+            ActionClassRisk::WorkspaceTerminalMetadata => {
+                CommittedDependencyPolicy::WorkspaceTerminalMetadata
             }
             _ => return None,
         };
@@ -114,6 +121,10 @@ impl ProducerPolicy {
             ActionClassRisk::WorkspaceDagMetadata => {
                 self.domain == ProducerDomain::WorkspaceDag && self.metadata_allowed
             }
+            // A successful terminal check never supplies a Rust dependency,
+            // even if a compiler emitted a nonempty metadata file for it.
+            ActionClassRisk::WorkspaceTerminalLeafMetadata
+            | ActionClassRisk::WorkspaceTerminalMetadata => false,
             _ => false,
         }
     }
@@ -225,7 +236,12 @@ impl CoordLive {
         consumer_policy: CommittedDependencyPolicy,
     ) -> Result<(), String> {
         let policy = ProducerPolicy::for_consumer(consumer_policy);
-        if dependencies.is_empty() || dependencies.len() > MAX_LINEAGE_EDGES {
+        let terminal_leaf =
+            consumer_policy == CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata;
+        if (terminal_leaf && !dependencies.is_empty())
+            || (!terminal_leaf && dependencies.is_empty())
+            || dependencies.len() > MAX_LINEAGE_EDGES
+        {
             return Err("committed workspace candidate count is outside its bound".into());
         }
         // Preserve the authority -> store lock order used during coordinator
@@ -350,9 +366,15 @@ pub(super) fn check_offer(
     epoch: u64,
     lease_now: &dyn Fn() -> u64,
 ) -> Result<(), String> {
-    let Some(policy) = ProducerPolicy::for_risk(
-        recorded_action_risk(store, &offer.manifest.action_key).map_err(store_error)?,
-    ) else {
+    let risk = recorded_action_risk(store, &offer.manifest.action_key).map_err(store_error)?;
+    if risk == ActionClassRisk::WorkspaceTerminalLeafMetadata {
+        return if offer.provisional_ancestors.is_empty() {
+            Ok(())
+        } else {
+            Err("terminal leaf offer contains unexpected producer ancestry".into())
+        };
+    }
+    let Some(policy) = ProducerPolicy::for_risk(risk) else {
         return Ok(());
     };
     if offer.provisional_ancestors.is_empty()
@@ -383,9 +405,19 @@ pub(super) fn check_serving(
     now: i64,
     epoch: u64,
 ) -> Result<(), String> {
-    let Some(policy) =
-        ProducerPolicy::for_risk(recorded_action_risk(store, action).map_err(store_error)?)
-    else {
+    let risk = recorded_action_risk(store, action).map_err(store_error)?;
+    if risk == ActionClassRisk::WorkspaceTerminalLeafMetadata {
+        return if store
+            .list_provisional_ancestors(&digest_key(action))
+            .map_err(store_error)?
+            .is_empty()
+        {
+            Ok(())
+        } else {
+            Err("terminal leaf publication contains unexpected producer ancestry".into())
+        };
+    }
+    let Some(policy) = ProducerPolicy::for_risk(risk) else {
         return Ok(());
     };
     let ancestors = store
@@ -1164,6 +1196,175 @@ pub(crate) mod tests {
         );
         fixture.commit(&c);
         [a, b, c]
+    }
+
+    #[test]
+    fn terminal_checks_replay_exact_outputs_without_producer_authority() {
+        for committed in [false, true] {
+            for bytes in [b"".as_slice(), b"nonempty terminal output".as_slice()] {
+                let fixture = WorkspaceLineageFixture::new();
+                let upstream = fixture.commit_metadata_leaf(
+                    70,
+                    &[(
+                        "libupstream.rmeta",
+                        OutputRole::ProvisionalMetadata,
+                        b"library metadata",
+                    )],
+                );
+                let terminal = fixture.prepare_class(
+                    71,
+                    if committed {
+                        vec![consumes(&upstream)]
+                    } else {
+                        Vec::new()
+                    },
+                    &[
+                        ("libterminal.rmeta", OutputRole::ProvisionalMetadata, bytes),
+                        (
+                            "terminal.d",
+                            OutputRole::DepInfo,
+                            b"/__rabs/out/libterminal.rmeta:\n",
+                        ),
+                    ],
+                    if committed {
+                        LIVE_WORKSPACE_TERMINAL_METADATA_CLASS
+                    } else {
+                        LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS
+                    },
+                );
+                fixture.commit(&terminal);
+                fixture.assert_unsampled(&terminal);
+                fixture.compare_twice(&terminal);
+                let destination = fixture.root.path().join("terminal-result");
+                assert!(matches!(
+                    fixture.replay(&terminal, &destination, None).unwrap(),
+                    ServeOutcome::Served { .. }
+                ));
+                assert_eq!(
+                    std::fs::read(destination.join("libterminal.rmeta")).unwrap(),
+                    bytes
+                );
+                assert!(destination.join("terminal.d").is_file());
+                // Terminal metadata never becomes a dependency, even when it
+                // is nonempty and its publication has earned replay samples.
+                assert!(
+                    fixture
+                        .coord
+                        .verify_committed_dependencies(
+                            &[witness(&terminal)],
+                            CommittedDependencyPolicy::WorkspaceDagMetadata,
+                        )
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_metadata_leaf_and_committed_ancestry_cannot_be_interchanged() {
+        let fixture = WorkspaceLineageFixture::new();
+        let producer = fixture.commit_metadata_leaf(
+            72,
+            &[(
+                "libproducer.rmeta",
+                OutputRole::ProvisionalMetadata,
+                b"producer metadata",
+            )],
+        );
+        let outputs = [(
+            "libterminal.rmeta",
+            OutputRole::ProvisionalMetadata,
+            b"".as_slice(),
+        )];
+        let invalid_leaf = fixture.prepare_class(
+            73,
+            vec![consumes(&producer)],
+            &outputs,
+            LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS,
+        );
+        let missing_producer = fixture.prepare_class(
+            74,
+            Vec::new(),
+            &outputs,
+            LIVE_WORKSPACE_TERMINAL_METADATA_CLASS,
+        );
+        for offer in [&invalid_leaf, &missing_producer] {
+            assert!(matches!(
+                fixture
+                    .coord
+                    .commit_offer(offer, &sample_expected_descriptor()),
+                Err(CommitRefusal::CommittedDependency(_))
+            ));
+            fixture.assert_unpublished(offer);
+        }
+        let leaf = fixture.prepare_class(
+            75,
+            Vec::new(),
+            &outputs,
+            LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS,
+        );
+        let dependent = fixture.prepare_class(
+            76,
+            vec![consumes(&producer)],
+            &outputs,
+            LIVE_WORKSPACE_TERMINAL_METADATA_CLASS,
+        );
+        for offer in [&leaf, &dependent] {
+            fixture.commit(offer);
+            fixture.compare_twice(offer);
+            super::check_serving(
+                &mut *fixture.cas.store().lock().unwrap(),
+                &offer.manifest.action_key,
+                now_micros(),
+                offer.manifest.key_epoch.into(),
+            )
+            .unwrap();
+        }
+        // A persisted-row fault must not turn a producer-bearing check into a
+        // leaf or let the leaf acquire invented ancestry on a later replay.
+        let mut engine = RusqliteEngine::open(&fixture.cas.cas_root().join("meta.sqlite")).unwrap();
+        assert_eq!(engine.execute(
+            "UPDATE provisional_ancestry SET consumer_action_key = ?1 WHERE consumer_action_key = ?2",
+            &[SqlValue::Text(digest_key(&leaf.manifest.action_key)),
+              SqlValue::Text(digest_key(&dependent.manifest.action_key))],
+        ).unwrap(), 1);
+        for (index, offer) in [&leaf, &dependent].into_iter().enumerate() {
+            let destination = fixture
+                .root
+                .path()
+                .join(format!("invalid-terminal-{index}"));
+            assert!(matches!(
+                fixture.replay(offer, &destination, None).unwrap(),
+                ServeOutcome::ExecutePrivately(ReplayRefusal::CommittedDependency(_))
+            ));
+            assert!(!destination.exists());
+        }
+    }
+
+    #[test]
+    fn terminal_metadata_rechecks_transitive_producer_revocation() {
+        let fixture = WorkspaceLineageFixture::new();
+        let [ancestor, _, parent] = metadata_chain(&fixture);
+        let terminal = fixture.prepare_class(
+            77,
+            vec![consumes(&parent)],
+            &[("libterminal.rmeta", OutputRole::ProvisionalMetadata, b"")],
+            LIVE_WORKSPACE_TERMINAL_METADATA_CLASS,
+        );
+        fixture.commit(&terminal);
+        fixture.compare_twice(&terminal);
+        let valid = fixture.root.path().join("terminal-valid");
+        assert!(matches!(
+            fixture.replay(&terminal, &valid, None).unwrap(),
+            ServeOutcome::Served { .. }
+        ));
+        fixture.quarantine(&ancestor.manifest.action_key);
+        let invalid = fixture.root.path().join("terminal-revoked");
+        assert!(matches!(
+            fixture.replay(&terminal, &invalid, None).unwrap(),
+            ServeOutcome::ExecutePrivately(ReplayRefusal::CommittedDependency(_))
+        ));
+        assert!(!invalid.exists());
     }
 
     #[test]

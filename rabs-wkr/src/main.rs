@@ -43,7 +43,7 @@ use rabs_wkr::result_spool::{RESULT_RETENTION, ResultRecipient, RetentionTarget}
 use rabs_wkr::session::{
     CanonicalExecRequest, ExecutionResources, execute_canonical_controlled,
     execute_uploaded_canonical_controlled, parse_command_context, parse_dependency_context,
-    probe_capability, sample_pressure,
+    probe_capability, sample_load_x100, sample_pressure,
 };
 use rabs_wkr::source_task::{SourceReply, SourceTransferTask};
 use rabs_wkr::source_transfer::{self, SourceCache, SourceOwner};
@@ -951,7 +951,7 @@ async fn wait_for_worker_admission<S: AsyncRead + AsyncWrite + Unpin>(
                     .map_err(|error| format!("worker standby ping: {error}"))?;
                 let pong = serde_json::json!({
                     "kind":"standby-pong", "version":worker_standby::VERSION,
-                    "sequence":sequence,
+                    "sequence":sequence, "load_x100":sample_load_x100(),
                 })
                 .to_string();
                 standby_io(pong_timeout, "pong write", write_frame(stream, &pong)).await?;
@@ -2007,6 +2007,7 @@ fn worker_hello(report: &rabs_wkr::session::CapabilityReport, journal: &WorkerJo
     serde_json::json!({
         "kind": "worker-hello", "worker_id": report.worker_id,
         "canonical": report.canonical_namespace, "slots": report.slots, "token_id": 1,
+        "load_x100": sample_load_x100(),
         "output_transfers": [OUTPUT_TRANSFER], "artifact_transfers": [ARTIFACT_TRANSFER],
         "output_previews": [OUTPUT_PREVIEW_VERSION],
         "metadata_prefetches": if cfg!(target_os = "linux") { vec![METADATA_PREFETCH_VERSION] } else { Vec::<&str>::new() },
@@ -3555,6 +3556,8 @@ mod tests {
                 assert_eq!(reply["kind"], "standby-pong");
                 assert_eq!(reply["version"], worker_standby::VERSION);
                 assert_eq!(reply["sequence"], index + 1);
+                assert!(reply.get("load_x100").is_some());
+                assert!(reply["load_x100"].is_null() || reply["load_x100"].as_u64().is_some());
             }
             assert_eq!(replies[2]["kind"], "heartbeat");
             assert_eq!(replies[3]["kind"], "error");
@@ -3730,7 +3733,7 @@ mod tests {
             for version in [
                 serde_json::Value::Null,
                 1.into(),
-                "worker-standby-v2".into(),
+                "worker-standby-v99".into(),
             ] {
                 let mut wrong = ready();
                 wrong["version"] = version.clone();

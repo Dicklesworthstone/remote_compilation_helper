@@ -39,6 +39,7 @@ use rabs_key::live_dependency::workspace_dependency_cache::{
     remote_committed_dependency_isolation_policy, remote_committed_dependency_key,
     remote_committed_dependency_shape, uses_committed_dependency_namespace,
     validate_committed_workspace_metadata_plan, validate_mixed_workspace_library_plan,
+    validate_terminal_workspace_metadata_plan,
 };
 #[cfg(test)]
 use rabs_key::live_dependency::workspace_dependency_cache::{
@@ -457,6 +458,48 @@ impl DependencyWorkerPool {
         self.probe_worker_excluding(&HashSet::new(), request)
     }
 
+    fn ready_worker_order(
+        &self,
+        start: usize,
+        attempted: &HashSet<String>,
+        request: Option<&Value>,
+        now: Instant,
+    ) -> Vec<(usize, PlacementReadiness)> {
+        let mut order: Vec<_> = (0..self.workers.len())
+            .map(|offset| {
+                let index = (start + offset) % self.workers.len();
+                (index, self.workers[index].placement_readiness(request))
+            })
+            .collect();
+        let mut measured: Vec<_> = order
+            .iter()
+            .enumerate()
+            .filter_map(|(position, &(index, readiness))| {
+                let PlacementReadiness::Ready(generation) = readiness else {
+                    return None;
+                };
+                let worker = &self.workers[index];
+                if attempted.contains(worker.worker()) {
+                    return None;
+                }
+                worker
+                    .placement_load(generation, now)
+                    .map(|load| (position, (index, readiness), load))
+            })
+            .collect();
+        // Unknown/expired measurements keep their original round-robin
+        // positions; they are neither idle scores nor exclusion evidence.
+        // Sort only the measured positions, stably, so equal normalized loads
+        // retain round-robin order. The saved connection generation is checked
+        // again when physical capacity is reserved.
+        let positions: Vec<_> = measured.iter().map(|(position, _, _)| *position).collect();
+        measured.sort_by(|(_, _, left), (_, _, right)| left.compare(*right));
+        for (position, (_, candidate, _)) in positions.into_iter().zip(measured) {
+            order[position] = candidate;
+        }
+        order
+    }
+
     fn probe_worker_excluding(
         &self,
         attempted: &HashSet<String>,
@@ -483,18 +526,25 @@ impl DependencyWorkerPool {
         let mut request_excluded = false;
         let mut request_candidate = false;
         let start = self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len();
+        let ready_order = self.ready_worker_order(start, attempted, request, observed);
         // Readiness is a preference, not execution authority. First try every
         // compatible live peer before assigning a job to an absent worker's
         // connection deadline. The second pass reobserves hints, preserving
         // the existing connection path when readiness is unknown or revoked.
         for ready_only in [true, false] {
             for offset in 0..self.workers.len() {
-                let worker = &self.workers[(start + offset) % self.workers.len()];
+                let (index, readiness) = if ready_only {
+                    ready_order[offset]
+                } else {
+                    let index = (start + offset) % self.workers.len();
+                    (index, self.workers[index].placement_readiness(request))
+                };
+                let worker = &self.workers[index];
                 if attempted.contains(worker.worker()) {
                     continue;
                 }
                 candidate = true;
-                let generation = match worker.placement_readiness(request) {
+                let generation = match readiness {
                     PlacementReadiness::Incompatible => {
                         request_excluded = true;
                         continue;
@@ -718,7 +768,13 @@ fn immutable_dependency_leaf_shape(
         || !plan.invocation.externs.is_empty()
         || directories
             .iter()
-            .any(|directory| !directory.artifacts.is_empty())
+            .flat_map(|directory| &directory.artifacts)
+            .any(|artifact| {
+                !rabs_key::live_dependency::is_empty_metadata_artifact(
+                    &artifact.path,
+                    &artifact.content_digest,
+                )
+            })
         || plan.generated_root.is_some()
         || !plan.native_roots.is_empty()
         || !plan.invocation.native_libs.is_empty()
@@ -938,6 +994,12 @@ impl RemoteValidation {
         };
         inputs.verify(request)?;
         let ancestors = inputs.ancestors();
+        if inputs.policy() == CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata {
+            if !ancestors.is_empty() || !inputs.dependencies().is_empty() {
+                return Err("terminal leaf acquired unexpected producer ancestry".into());
+            }
+            return Ok(ancestors);
+        }
         if ancestors.is_empty() {
             return Err("committed dependency has no producer ancestry".into());
         }
@@ -946,6 +1008,10 @@ impl RemoteValidation {
 }
 
 fn execution_mode(plan: &DependencyActionPlan) -> Result<DependencyExecutionMode, String> {
+    if plan.source_kind == DependencySourceKind::WorkspaceTerminalMetadata {
+        validate_terminal_workspace_metadata_plan(plan).map_err(|error| error.to_string())?;
+        return Ok(DependencyExecutionMode::ClosedMetadata);
+    }
     if matches!(
         plan.source_kind,
         DependencySourceKind::WorkspaceMixedRlib | DependencySourceKind::WorkspaceMixedMetadata
@@ -2420,6 +2486,9 @@ impl PendingRemoteInstall {
     /// affine execution custody. Neither grants unfinished-producer authority.
     #[must_use]
     pub fn supports_metadata(&self) -> bool {
+        if self.request.plan.source_kind == DependencySourceKind::WorkspaceTerminalMetadata {
+            return false;
+        }
         let owns_result = match &self.result {
             RemoteInstallAuthority::Published => !self.request.is_execution_only(),
             RemoteInstallAuthority::RequestOwned(_) => self.request.is_execution_only(),
@@ -2790,6 +2859,104 @@ mod worker_pool_tests {
     }
 
     #[test]
+    fn authenticated_pressure_prefers_lower_load_per_cpu_without_granting_extra_capacity() {
+        let state = crate::test_util::private_tempdir();
+        let pool = pool(state.path(), 2);
+        let request = scheduling_request(true);
+        let mut single_cpu = scheduling_hello();
+        single_cpu["slots"] = json!(1);
+        single_cpu["load_x100"] = json!(100);
+        let mut four_cpus = scheduling_hello();
+        four_cpus["load_x100"] = json!(200);
+        let first = pool.workers[0].advertise_for_test(&single_cpu);
+        let second = pool.workers[1].advertise_for_test(&four_cpus);
+        // The second worker has higher absolute load but half the load per
+        // advertised CPU. Plain round-robin would choose worker-1 first.
+        let (preferred, preferred_claim) = pool.try_reserve_for(&key(1), Some(&request)).unwrap();
+        assert_eq!(preferred.worker(), "worker-2");
+        let (other, other_claim) = pool.try_reserve_for(&key(2), Some(&request)).unwrap();
+        assert_eq!(other.worker(), "worker-1");
+        assert_eq!(
+            pool.try_reserve_for(&key(3), Some(&request))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(std::fs::read_dir(state.path()).unwrap().count(), 0);
+        drop((
+            preferred,
+            preferred_claim,
+            other,
+            other_claim,
+            first,
+            second,
+        ));
+        assert!(pool.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn equal_normalized_pressure_preserves_round_robin_and_failover_exclusions() {
+        let pool = pool(Path::new("/private/equal-load-worker-pool"), 2);
+        let request = scheduling_request(true);
+        let mut first_hello = scheduling_hello();
+        first_hello["slots"] = json!(1);
+        first_hello["load_x100"] = json!(50);
+        let mut second_hello = scheduling_hello();
+        second_hello["load_x100"] = json!(200);
+        let first = pool.workers[0].advertise_for_test(&first_hello);
+        let second = pool.workers[1].advertise_for_test(&second_hello);
+        for (index, expected) in ["worker-1", "worker-2", "worker-1", "worker-2"]
+            .into_iter()
+            .enumerate()
+        {
+            let (reserved, claim) = pool
+                .try_reserve_for(&key(u8::try_from(index).unwrap()), Some(&request))
+                .unwrap();
+            assert_eq!(reserved.worker(), expected);
+            drop((reserved, claim));
+        }
+        let excluded = HashSet::from(["worker-1".to_owned()]);
+        let reserved = pool
+            .try_reserve_worker_excluding_for(&excluded, Some(&request))
+            .unwrap();
+        assert_eq!(reserved.worker(), "worker-2");
+        drop((reserved, first, second));
+    }
+
+    #[test]
+    fn unknown_and_expired_pressure_keep_ready_workers_in_round_robin() {
+        for (sample, expired) in [
+            (Value::Null, false),
+            (json!("unknown"), false),
+            (json!(99999), true),
+        ] {
+            let pool = pool(Path::new("/private/unknown-load-worker-pool"), 2);
+            let request = scheduling_request(true);
+            let mut first_hello = scheduling_hello();
+            first_hello["load_x100"] = sample;
+            let mut second_hello = scheduling_hello();
+            second_hello["load_x100"] = json!(0);
+            let received = if expired {
+                Instant::now()
+                    - rabs_protocol::worker_standby::LOAD_MAX_AGE
+                    - std::time::Duration::from_secs(1)
+            } else {
+                Instant::now()
+            };
+            let first = pool.workers[0].advertise_at_for_test(&first_hello, received);
+            let second = pool.workers[1].advertise_for_test(&second_hello);
+            for (index, expected) in ["worker-1", "worker-2"].into_iter().enumerate() {
+                let (reserved, claim) = pool
+                    .try_reserve_for(&key(u8::try_from(index).unwrap()), Some(&request))
+                    .unwrap();
+                assert_eq!(reserved.worker(), expected);
+                drop((reserved, claim));
+            }
+            drop((first, second));
+        }
+    }
+
+    #[test]
     fn incompatible_authenticated_peers_do_not_hide_a_compatible_ready_worker() {
         let request = scheduling_request(false);
         for (field, incompatible) in [
@@ -2805,8 +2972,11 @@ mod worker_pool_tests {
             let pool = pool(Path::new("/private/compatible-worker-pool"), 2);
             let mut hello = scheduling_hello();
             hello[field] = incompatible;
+            hello["load_x100"] = json!(0);
             let unsuitable = pool.workers[0].advertise_for_test(&hello);
-            let suitable = pool.workers[1].advertise_for_test(&scheduling_hello());
+            let mut compatible = scheduling_hello();
+            compatible["load_x100"] = json!(u64::MAX);
+            let suitable = pool.workers[1].advertise_for_test(&compatible);
             assert_eq!(
                 pool.workers[0].placement_readiness(Some(&request)),
                 PlacementReadiness::Incompatible,
@@ -4010,6 +4180,11 @@ mod execution_resource_tests {
             assert!(plan.externs.is_empty());
             assert!(plan.invocation.externs.is_empty());
             assert_eq!(immutable_dependency_leaf_shape(plan, &implicit), None);
+            let mut inert = implicit.clone();
+            inert[0].artifacts[0].content_digest = super::super::object_id(b"").unwrap();
+            assert_eq!(immutable_dependency_leaf_shape(plan, &inert), Some(output));
+            inert[0].artifacts[0].path = format!("{}/libimplicit.rlib", plan.out_dir);
+            assert_eq!(immutable_dependency_leaf_shape(plan, &inert), None);
             for mutation in 0..12 {
                 let mut changed = plan.clone();
                 match mutation {

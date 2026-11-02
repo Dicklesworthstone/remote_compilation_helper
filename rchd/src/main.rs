@@ -1208,6 +1208,11 @@ async fn main() -> Result<()> {
             config::DaemonConfig::default()
         }
     };
+    let worker_pool = worker_pool.with_recovery_transport_policy(
+        rch_config.circuit.clone(),
+        Duration::from_secs(daemon_config.health_check_interval_secs.max(1)),
+        Duration::from_secs(daemon_config.worker_timeout_secs.max(1)),
+    );
     if !daemon_config.project_lanes.is_empty() {
         info!(
             "Project lanes (bd-sgvod): {:?}",

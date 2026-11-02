@@ -1204,7 +1204,7 @@ for this operation-owned coordinator.
 
 The dependency-worker pool binds each configured endpoint when the pool is
 created and keeps it bound through the pool's lifetime. Matching workers that
-advertise `worker-standby-v1` can stay connected between compiler requests. A
+advertise `worker-standby-v2` can stay connected between compiler requests. A
 direct invocation owns these listeners until its coordinator finishes; the
 shared service described below keeps them available between Cargo commands.
 Workers can therefore reconnect and become ready while the coordinator has no
@@ -1560,7 +1560,7 @@ cargo rabs --rabs-canonical-local ./canonical-compile.json -- check --workspace 
 The class requires the strict `closed-metadata` worker context and retains the
 complete captured workspace, directory listings, exact compiler environment,
 arguments, toolchain and runtime. It keys every explicit extern and every
-implicit retained candidate, together with the exact committed producer action,
+loadable implicit candidate, together with the exact committed producer action,
 descriptor, manifest, logical output and entire artifact identity. Producers
 must be closed workspace metadata or archive actions whose outputs were
 verified and installed by the same retained Cargo operation. External dependency
@@ -1577,10 +1577,59 @@ and replay even when the consumer already has passing comparisons.
 Metadata results earn their own independent samples and persistent class
 quarantine. A qualified hit restores `.rmeta`, dep-info and diagnostics through
 the existing verified installer. A chain of ordinary library checks can therefore
-reuse committed metadata while the final binary or test check retains its
-existing execution policy. Generated/native inputs, project executors, harness
+reuse committed metadata. Eligible final binary and test checks use the separate
+terminal metadata classes below. Generated/native inputs, project executors, harness
 outputs, incremental state and archive output remain outside this metadata
 class. The selected Cargo graph must still contain no project executors.
+
+### Cache binary, example and harness metadata checks
+
+Canonical `check` requests can qualify selected binary, example, standard test
+and benchmark harnesses, and custom `harness=false` test/benchmark roots for
+terminal metadata caching:
+
+```sh
+cargo rabs --rabs-canonical-local ./canonical-compile.json -- check --bin app
+cargo rabs --rabs-canonical-local ./canonical-compile.json -- check --example demo
+cargo rabs --rabs-canonical-local ./canonical-compile.json -- check --test integration
+```
+
+These actions cache compiler metadata, dep-info and diagnostics. They require
+the retained Cargo-selected source, crate type, target, features and exact
+harness invocation in a graph without project executors. Their keys retain the
+complete captured workspace and directory listings, exact compiler environment
+and arguments, output declarations, toolchain and measured `ClosedMetadata`
+runtime. Executable linking, test execution, generated/native inputs and
+incremental state remain outside these classes.
+
+Two independent policies distinguish the source of input authority:
+
+| Terminal class | Key epoch | Required input proof |
+| --- | --- | --- |
+| `rustc-workspace-terminal-leaf-metadata-v1` | 14 | Every retained candidate directory is observed and empty; durable producer ancestry stays empty. |
+| `rustc-workspace-terminal-metadata-v1` | 15 | Every loadable Rust candidate has an exact committed installation witness; the complete nonempty workspace/immutable dependency ancestry remains valid. Exact empty search metadata remains keyed and materialized without producer authority. |
+
+Each class earns its own independent comparison samples and retains separate
+quarantine and serving gates. Library samples cannot qualify a terminal action.
+A missing, changed or quarantined producer blocks the committed terminal class;
+missing ancestry cannot turn it into the dependency-free class.
+
+Rustc ordinarily emits an empty `.rmeta` for these terminal checks. Both worker
+completion and a qualified cache hit install that exact declared file through
+complete-result delivery and replay the validated compiler transcript. Terminal
+results never grant early metadata readiness or become reusable dependency
+producers, including when a compiler emits nonempty terminal metadata. Existing
+library and producer-witness nonempty checks are unchanged.
+
+Broad selections such as `check --all-targets` can leave earlier terminal
+outputs visible in later units' search directories. Exact empty metadata stays
+in the keyed and materialized input inventory without becoming a producer.
+The committed terminal class can retain those files alongside its independently
+verified loadable dependencies; explicit empty externs still refuse. The leaf
+class requires literally empty candidate directories, so a terminal root with
+only earlier empty candidates continues with fresh execution. Selecting an
+individual terminal root allows its independently qualified leaf action to
+replay in a fresh Cargo target.
 
 ### Cache workspace libraries using qualified immutable dependency leaves
 
@@ -1596,7 +1645,7 @@ cargo rabs --rabs-canonical-local ./canonical-compile.json -- check --workspace 
 
 The external producer must have run through the canonical remote lane, have a
 successful committed result, and have its actual output verified and installed
-by this Cargo operation. It must have no explicit externs, no retained Rust
+by this Cargo operation. It must have no explicit externs, no loadable Rust
 candidates (including unnamed alternatives), no generated or native inputs, and
 no recorded producer ancestry. An ordinary dependency-cache entry, a local
 compiler result, a copied artifact, a raw fallback or a request-owned result
@@ -1634,7 +1683,7 @@ dependencies before those outputs reach workspace libraries. For example,
 registry or vendored A can feed immutable B, which feeds workspace C and D.
 The commands and retained canonical mount layout remain the same.
 
-Each non-leaf external compiler request must bind every retained Rust candidate
+Each non-leaf external compiler request must bind every loadable Rust candidate
 to an exact producer installed by this Cargo operation. This includes candidates
 not named by an explicit `--extern`. The descriptor hashes the producer action,
 descriptor, committed manifest, output role and whole object identity together
@@ -1795,12 +1844,21 @@ The service's existing request queue continues to own work waiting for a slot.
 
 Standby first verifies the worker's TLS public-key pin, configured name and
 TLS-derived peer identity, then selects the explicitly advertised
-`worker-standby-v1` exchange. The coordinator sends a heartbeat every 15 seconds;
+`worker-standby-v2` exchange. The coordinator sends a heartbeat every 15 seconds;
 each ping and matching pong share a 10-second budget. The worker allows at most
 45 seconds for the next complete idle record. A failed heartbeat closes that
 connection so the worker's outward loop can reconnect to the same listener.
 Confirmed readiness also wakes queued placement and clears the endpoint's
 connection cooldown.
+
+Workers include their measured one-minute CPU load in the authenticated hello
+and refresh it in idle heartbeat replies. Among compatible ready workers, the
+pool prefers lower load per advertised CPU. Equal scores retain round-robin
+order. Unknown measurements and samples older than 30 seconds at the coordinator
+keep their round-robin positions; load never excludes a worker or grants another
+slot. A disconnected or replaced connection loses its pressure hint together
+with its readiness. Capability checks and ordinary execution admission still run
+after placement.
 
 An assigned request starts ordinary session admission with a fresh 10-second
 challenge budget. An outstanding heartbeat must finish before this transition.
@@ -2057,6 +2115,18 @@ metadata-check consumer can therefore use its committed-dependency cache after
 a source edit while unchanged parents remain Cargo-Fresh, subject to the usual
 sampling and input checks.
 
+Ordinary `check --workspace --lib --bins` and check-mode harnesses can leave
+empty `.rmeta` files in those same dependency directories. Rust's crate locator
+skips their metadata; RABS still hashes their exact paths and bytes, copies them
+into the worker's read-only input view, and rechecks their original file
+generations before upload and installation. These files require no committed
+producer witness and never become producer ancestry. Empty metadata explicitly
+named by `--extern`, an empty archive, an unqualified nonempty candidate, a
+symlink, or a previously known producer truncated to empty still refuses cache
+qualification. Removing or adding even an empty file changes the action key.
+The first cold compile and the first warm compile with a new binary placeholder
+therefore qualify separately under the existing comparison requirements.
+
 Restoring target bytes alone never grants committed authority. Ordinary local
 and request-owned results, unknown files and older seeds without recorded
 provenance add no installation witnesses. This does not narrow the
@@ -2066,6 +2136,18 @@ provenance checks, the operation fails before Cargo starts. Known producers are
 checked again at the end of a retainable run, before accepting completion or
 delivering retained build artifacts, so newly quarantined ancestry cannot become
 an optional save failure.
+
+The native tests
+`canonical_warm_workspace_metadata_with_bins_preserves_committed_provenance_across_restarts`
+and
+`canonical_warm_mixed_metadata_with_bins_preserves_committed_provenance_across_restarts`
+exercise this path with real Cargo, isolated workers and a separate stock
+control. They alternate two source variants, restart the coordinator for every
+operation, retain Cargo-Fresh parents, require the binary check to execute each
+time, and earn library replay from actual comparisons. They also quarantine a
+retained producer and require rejection before Cargo starts. They require the
+same full Linux namespace capability and matching binaries as the other native
+cache fixtures; their presence is not evidence that they have run.
 
 The persistent service serializes target-cache I/O around open/restore and around
 completed capture, releasing that lock while Cargo runs. Waiting for this lock,
@@ -2106,17 +2188,20 @@ for this operation. A failed optional snapshot restore keeps its partial copy
 unmounted and runs the current command cold, unless the operation was cancelled;
 an optional storage failure during save preserves Cargo's actual result. Both
 report a `canonical-target-state-unavailable` diagnostic. A new seed is saved only after
-complete compiler/session/coordinator drain and either successful Cargo execution
-or a normally exited Test, Run or Bench command. A failing test, program or
-benchmark may therefore retain its compiled artifacts for the next invocation;
-its body still executes again, and the previous success or failure is never
-served as the current command's result.
+complete compiler/session/coordinator drain and a normal Cargo exit below 128.
+An ordinary compiler or lint error can therefore retain successfully compiled
+dependencies, and a failing test, program or benchmark can retain its compiled
+artifacts. The next invocation still runs Cargo and reports the current outcome;
+failed units and requested program or test bodies execute again. No command
+failure becomes a cache result or successful build delivery. Retained committed
+producers still require current valid publication authority before saving and
+before a later Cargo invocation can use them as fresh inputs.
 That same successful cold command can replace a seed after a failed restore.
 An ineligible source edit or a failed private destination preserves a healthy
 committed seed until that replacement succeeds.
-Failed check/build commands, cancelled commands and incomplete process-group
-cleanup cannot replace a successful seed. Checks can also
-retain reusable state too. Successful build delivery still owns separate files,
+Cancelled commands, direct signal termination, exits of 128 or higher, and
+incomplete process-group cleanup cannot replace a seed. A failed optional
+capture preserves the previous healthy generation. Successful build delivery still owns separate files,
 so editing or running a previously delivered binary cannot alter the seed or
 another invocation's outputs.
 

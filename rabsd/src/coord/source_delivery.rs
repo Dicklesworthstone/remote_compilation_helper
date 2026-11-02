@@ -1558,18 +1558,34 @@ mod tests {
             fs::read(&original).unwrap(),
         ));
         let path = "dependencies/0000/liboriginal.rmeta";
+        let empty_path = "dependencies/0000/libchecked_binary.rmeta";
+        let empty = Arc::new(RetainedDependencyArtifact::from_bytes(Vec::new()));
         let raw = package
             .clone()
-            .with_dependency_artifacts(vec![(path.into(), bytes.clone())])
+            .with_dependency_artifacts(vec![
+                (path.into(), bytes.clone()),
+                (empty_path.into(), Vec::new()),
+            ])
             .unwrap();
         let upload = package
-            .with_retained_dependency_artifacts(vec![(path.into(), Arc::clone(&artifact))])
+            .with_retained_dependency_artifacts(vec![
+                (path.into(), Arc::clone(&artifact)),
+                (empty_path.into(), Arc::clone(&empty)),
+            ])
             .unwrap();
         assert_eq!(upload.wire_manifest(), raw.wire_manifest());
         let SourceLayout::Dependency { artifacts, .. } = &upload.layout else {
             panic!("typed artifacts lost their dependency layout");
         };
         assert!(Arc::ptr_eq(artifacts.get(path).unwrap(), &artifact));
+        assert!(Arc::ptr_eq(artifacts.get(empty_path).unwrap(), &empty));
+        let empty_manifest = upload
+            .manifest
+            .files()
+            .iter()
+            .find(|file| file.path == empty_path)
+            .unwrap();
+        assert_eq!(empty_manifest.len, 0);
         request["source_manifest"] = upload.wire_manifest();
         fs::write(&original, b"caller changed after byte retention").unwrap();
         fs::write(root.path().join("src/lib.rs"), b"caller changed package").unwrap();
@@ -1584,6 +1600,12 @@ mod tests {
         let second_root = second.receiver.as_ref().unwrap().sealed_root().unwrap();
         for received in [first_root, second_root] {
             assert_eq!(fs::read(received.join(path)).unwrap(), bytes);
+            assert!(
+                fs::symlink_metadata(received.join(empty_path))
+                    .unwrap()
+                    .is_file()
+            );
+            assert!(fs::read(received.join(empty_path)).unwrap().is_empty());
             assert_eq!(
                 fs::read(received.join("package/src/lib.rs")).unwrap(),
                 source_bytes
