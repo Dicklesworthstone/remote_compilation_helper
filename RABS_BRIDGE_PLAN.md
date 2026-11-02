@@ -2333,6 +2333,39 @@ real Cargo serving, fleet performance or release qualification.
     a qualifying real temporary/state filesystem before any such run; do not
     lower the guard. No daemon, slot, priority, active job or worker setting changed.
 
+**Same-commit runtime deduplication — A012 draft, separate from92 acceptance.**
+
+- [x] Identify two source identities for Asupersync0.5 and its three Franken
+  helper crates. Published provenance names the same exact78b64636 commit used
+  by RABS. Verify all published files against that checkout:967 Asupersync
+  files plus3/6/2 helper files match, including original manifests. Only
+  Cargo-generated package lockfiles and publish metadata differ; dependency
+  package lockfiles do not select this workspace's resolved versions.
+- [x] Manually patch the root manifest to use that existing exact Git revision
+  for all four crates. Generate Cargo.lock with Cargo. Restore four unrelated
+  patch-version upgrades Cargo proposed; no package/version is added. Remove
+  the four duplicate registry identities and now-unused itertools0.14 only.
+  Preserve every pre-existing working-tree change; primary Git index untouched.
+- [x] Freeze separate complete cut
+  `85dc06ed-overlay-92ab-unified-runtime-272b3ab0518d4c70546abeb3907b4036cf63debe6ac015e66375d46ffe797a5e`:
+  exactly Cargo.toml/Cargo.lock differ from92;1,755/1,755 files match in two
+  independent passes. Manifest
+  `8102ecddfb1cfb185ca37ee554814f4614b2bd867cdaa0628b08820ff7621d86`.
+- [ ] Validate actual Linux production graphs for daemon, worker and wrapper;
+  keep forbidden features absent. Mac offline probe lacks cc1.4.6; its Cargo
+  cache is below the storage floor, so no further downloads there. First native
+  metadata probe times out after50s with no graph result. A fresh private
+  download/index/Git cache on healthy ZFS avoids sharing active-build cache
+  ownership; no compiled target cache is copied. Full source audit and the
+  three actual graphs remain pending; metadata is not compiler/runtime proof.
+- [ ] Compile this new cut and run workspace all-target check, strict Clippy,
+  formatting and existing feature-profile/budget tests without changing caps.
+- [ ] Requalify matching tools with existing real Cargo/worker/service tests,
+  then the public real-repository canary and private opt-in installation.
+  Keep92's native run and all earlier adverse outcomes distinct. Deduplication
+  is maintenance until an unchanged same-invocation incumbent comparison shows
+  useful end-to-end improvement; no speed, release or A012 closure claim yet.
+
 **Mac client build enabler — DSR only, separate clean source `85dc06ed`.**
 This unblocks development tooling; it is not the RABS `99d3bafa` runtime verdict
 or delivery of the four RABS tools. Keep S7 open.

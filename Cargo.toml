@@ -168,6 +168,15 @@ rich_rust = { version = "0.2.3" }
 # Crates that need rich-ui should explicitly enable it via features = ["rich-ui"]
 rch-common = { path = "rch-common", version = "2.1.0", default-features = false }
 
+# RABS pins this release by revision while FrankenSQLite requests its published
+# crates. Both contain the same source; keep one runtime and one set of shared
+# kernel/evidence/decision types instead of compiling distinct source identities.
+[patch.crates-io]
+asupersync = { version = "=0.5.0", git = "https://github.com/Dicklesworthstone/asupersync.git", rev = "78b64636e99fea4ea2d868096576021dd3b8e519" }
+franken-kernel = { version = "=0.5.0", git = "https://github.com/Dicklesworthstone/asupersync.git", rev = "78b64636e99fea4ea2d868096576021dd3b8e519" }
+franken-evidence = { version = "=0.5.0", git = "https://github.com/Dicklesworthstone/asupersync.git", rev = "78b64636e99fea4ea2d868096576021dd3b8e519" }
+franken-decision = { version = "=0.5.0", git = "https://github.com/Dicklesworthstone/asupersync.git", rev = "78b64636e99fea4ea2d868096576021dd3b8e519" }
+
 [profile.release]
 opt-level = "z"
 lto = true
