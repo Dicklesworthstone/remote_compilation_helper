@@ -2171,7 +2171,17 @@ real Cargo serving, fleet performance or release qualification.
       for future reuse. Old compiled caches embed `/home/ubuntu/.cargo`; that
       filesystem now has10.19% free, below14%, so no writes are made there.
       Managed dependency copies stay on the healthy ZFS volume. Runtime and
-      workspace-check phases remain pending until their actual terminal results.
+      workspace-check phases did not run: this batch was deliberately retired
+      at20:11:32UTC after the same-commit duplicate-runtime repair below passed
+      its real production graphs. Managed FAILED20:11:33, frontend130/target130;
+      worker result receipt is missing/invalid, so no native terminal receipt
+      is invented. Four storage checks0; binary preparation interrupted; all10
+      worktrees and3 canonical cases UNRUN. Partial results retained in
+      `/Volumes/trj-data/rabs-current92-existing-runner-20261102/interrupted-results`.
+      Foreground-group ownership was verified before the supported SIGINT.
+      Fresh full `/proc` cache scan at20:16:48 finds no owned writer; retained
+      Cargo home is0700 with no ambient config/credentials. No peer, shared
+      daemon, slot, priority or pressure threshold was changed.
     - [ ] Rerun the unchanged service case with matching current tools; compare
       incumbent and candidate in the same invocation before claiming a speed
       benefit. Preserve losses. Source-cache warming by these diagnostics must
@@ -2351,20 +2361,63 @@ real Cargo serving, fleet performance or release qualification.
   exactly Cargo.toml/Cargo.lock differ from92;1,755/1,755 files match in two
   independent passes. Manifest
   `8102ecddfb1cfb185ca37ee554814f4614b2bd867cdaa0628b08820ff7621d86`.
-- [ ] Validate actual Linux production graphs for daemon, worker and wrapper;
-  keep forbidden features absent. Mac offline probe lacks cc1.4.6; its Cargo
+- [x] Validate actual Linux production graphs for daemon, worker and wrapper;
+  all three Cargo commands0. Daemon and worker resolve one exact78b64636
+  Asupersync identity with `proc-macros,tls` only; wrapper has no runtime.
+  All three helper crates resolve the same Git revision; forbidden features
+  remain absent. Source before/after1,755/1,755, zero differences. Actual graph
+  report SHA-256 `cbad054b58caa24bbe2998ea1d7d77f29084bbb1c5a5332a82e6bd678c9d907f`.
+  This is metadata/configuration proof, not compilation or runtime acceptance.
+  Mac offline probe lacks cc1.4.6; its Cargo
   cache is below the storage floor, so no further downloads there. First native
   metadata probe times out after50s with no graph result. A fresh private
   download/index/Git cache on healthy ZFS avoids sharing active-build cache
-  ownership; no compiled target cache is copied. Full source audit and the
-  three actual graphs remain pending; metadata is not compiler/runtime proof.
+  ownership; no compiled target cache is copied. The successful three graph
+  commands take353.59s/14.45s/3.88s including cold preparation; earlier losses
+  stay retained. XFS remains below its unchanged14% floor at13.8069%.
 - [ ] Compile this new cut and run workspace all-target check, strict Clippy,
   formatting and existing feature-profile/budget tests without changing caps.
 - [ ] Requalify matching tools with existing real Cargo/worker/service tests,
   then the public real-repository canary and private opt-in installation.
-  Keep92's native run and all earlier adverse outcomes distinct. Deduplication
+  Native-only DSR run `8611f202-a65c-459c-a42d-5d2daeba1d2e`, tool
+  `rabs_unified_runtime_development`, version `2.1.34-rabsunified.272b3ab0`,
+  session88582 is submitted after genuine predecessor terminal/cache quiescence.
+  Source1,755/1,755 and frozen engine409/409 reverified. Selected immutable
+  driver `b88909bb4e3ddb8c391b349d952a52e418f0f3ae5876da29e58ffa5eeb2aac72`
+  builds matching tools and runs all10 worktrees plus the original3 exact
+  canonical cases; all27 cohort/473 key/1,464 daemon/4 doctor cases, original
+  feature-profile/budget tests and workspace check/strict Clippy/fmt follow.
+  Same declared10,800s orchestration; original120s/300s product deadlines stay.
+  Reuse the retained owned private Cargo source cache, with no ambient config
+  or credentials; current `--locked` graph and actual artifact features remain
+  checked. No strict release cache-isolation claim. All execution results are
+  pending until actually observed. Keep92 and earlier adverse outcomes distinct.
+  Deduplication
   is maintenance until an unchanged same-invocation incumbent comparison shows
   useful end-to-end improvement; no speed, release or A012 closure claim yet.
+- [ ] Requalify the adapter contracts and CAS differential/migration/reopen
+  cases required by ADR007 after runtime unification. Equal published source
+  does not prove that merging formerly separate runtime globals/TLS is safe.
+  The selected native driver does not yet cover all of these targets; keep
+  this explicit follow-up before promotion or installation.
+- [x] Attempt the actual public strict-remote Cargo entry using the private
+  DSR-built Mac client and original no-dependency fixture. Wrapper
+  `rchw-16ce6041-ce7e-4e13-ac1b-afbecb429a6d`, build30091812672635086,
+  exits103 before Cargo: source supervisor terminates with status9 and no
+  completion receipt. No RABS body, worker execution or cache result exists.
+  Supported recovery returns0 and confirms terminal acknowledgement and
+  retired ownership; retain
+  `/Volumes/trj-data/rabs-rch-cargo-readiness-terminal-20261102.json`.
+- [x] Check the private client's source-holder and SSH acquisition code against
+  the working tree: both match clean85dc exactly. Rebuilding identical code
+  will not fix this failure. Original Linux heartbeat/exact-release test
+  passes1/1. A separate execution of the same original test through the
+  production framed stdin bootstrap (103,453 bytes) also passes1/1. This
+  bounded primitive/transport result does not qualify the compiled SSH path
+  or establish the cause of the observed supervisor termination.
+- [ ] Diagnose the public source-supervisor failure with an actual failing
+  reproduction before editing ownership or liveness code. Preserve synthetic
+  SIGCHLD/stopped-monitor revocation, exact release and original deadlines.
 
 **Mac client build enabler — DSR only, separate clean source `85dc06ed`.**
 This unblocks development tooling; it is not the RABS `99d3bafa` runtime verdict
