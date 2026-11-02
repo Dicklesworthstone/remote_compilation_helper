@@ -39,13 +39,55 @@ partial logs are retained in `/Volumes/trj-data/rabs-daemon-selector-timeout-res
   Fresh read-only preflight verifies all 21 executable hashes and enumerates
   the expected 33 canonical tests. The corrected DSR retry is submitted;
   enumeration is not test execution, and no runtime pass is claimed yet.
+  Corrected retry `695a9441-6a74-449d-848b-6b590b36e674` is now terminal:
+  runtime 101 / DSR six. Original overlap is **0/1**, 131.2866s; the daemon
+  reports `toolchain capture interrupted` before owned builds complete.
+  This does not test the later SDK-cleanup assertion. Full 33-case execution
+  is **UNRUN**, as required by the failed prerequisite. Original overhead is
+  **4/5**, with C010 p95 **116,266 us** against its unchanged 10,000-us gate.
+  Contention is plausible but not established as the cause of either loss;
+  no rerun, scheduling change or widened bound is used to replace the reds.
+  All 1,729 source members and 21 actual executable hashes match afterward.
+  Genuine results are `/Volumes/trj-data/rabs-dsr-retained404-runtime-results-20261102`;
+  run SHA-256 `9bfcfe43a4e2d3f228188f5dc6e6ff9fc3172e4a77bdae1a91b911d16ba3ddbd`.
 - [ ] After runtime termination, execute the prepared combined-source 5ab
   native run: full daemon/CAS/doctor targets, strict dependency guards,
   metadata, workspace/all-target check, strict Clippy and fmt. Preserve the
   four known budget overages rather than changing limits or hiding edges.
+  Submitted through strict one-slot RCH after DSR terminal six and a read-only
+  inventory found no process in that exact DSR source root. This is the
+  captured 5ab working cut; newer peer changes in the shared checkout are
+  preserved and are outside this invocation's qualification.
 - [ ] Diagnose actual new failures, re-run their original consumers, then
   re-audit what can be claimed. M6/S7/A012 remain in progress; multi-host
   authority, portable packaging, storm/performance and soak stay unqualified.
+- [x] Replace the sole `Cx::for_testing()` actor smoke input with a context
+  obtained inside a real `RuntimeBuilder::current_thread()` task. Retain the
+  same named test, both immediate `Poll::Ready` checks, both final actor-state
+  assertions and every byte outside that one test in the actor source file.
+  Remove only the now-unused daemon dev-dependency enabling Asupersync's
+  `test-internals`; the normal exact pin, runtime features, numeric budgets
+  and production code are unchanged. Scoped fmt/diff checks pass.
+  An actual locked metadata probe correctly refuses the stale lockfile.
+  Isolated Cargo regeneration removes four optional Asupersync edges and the
+  unused `visibility` package, with no version change. Apply exactly that
+  321-byte cleanup, retaining every other shared-lock byte. Final lock SHA-256
+  is `f38b930e9d5ceb13bddfcf098f13feabafccefee862dcb0cf4dff94723de3a20`.
+  Locked/offline metadata then exits zero; its pinned runtime feature set is
+  exactly `proc-macros,tls`. This is macOS graph resolution, not Linux build
+  or runtime proof. The unrun two-file capsule is superseded by the three-file
+  overlay including Cargo's lock update. An early metadata call during source
+  extraction refused a missing workspace manifest; it is retained separately
+  and does not count as a complete-input Cargo or product result.
+  This is test/build enablement, not a measured build speedup or product win.
+  - [ ] Compile this three-file overlay under the ordinary runtime feature set;
+    confirm actual Cargo artifact features omit `test-internals`.
+  - [ ] Run the unchanged named actor test and complete daemon library suite;
+    retain exact enumerated denominators and any real failures.
+  - [ ] Run workspace/all-target check, strict Clippy and fmt on that source.
+    The currently running predecessor 5ab results cannot qualify these edits.
+  - [ ] Revisit optimized DSR canonical compilation only on actual normal-
+    feature proof. The two original runtime/performance reds stay recorded.
 
 **Prior status, November 1 at 21:48 UTC:** controlled native RABS is working
 for real Cargo archive execution/delivery and five shared-service consumers.

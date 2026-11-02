@@ -2618,49 +2618,62 @@ mod tests {
 
     #[test]
     fn actor_shell_processes_messages_under_a_test_cx() {
-        let cx = Cx::for_testing();
-        let mut host = ActionActorHost {
-            core: ActionActor::new(
-                descriptor(),
-                &authority_under_test(),
-                "coord-shell-test",
-                1_000,
-            ),
-        };
-        let waker = std::task::Waker::noop();
-        let mut task = std::task::Context::from_waker(waker);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let handle = runtime.handle();
+        let host = runtime.block_on(async move {
+            handle
+                .spawn(async move {
+                    // Use a context owned by a real runtime task, as production
+                    // does; no all-capabilities test-only constructor is needed.
+                    let cx = Cx::current().expect("runtime task carries a Cx");
+                    let mut host = ActionActorHost {
+                        core: ActionActor::new(
+                            descriptor(),
+                            &authority_under_test(),
+                            "coord-shell-test",
+                            1_000,
+                        ),
+                    };
+                    let waker = std::task::Waker::noop();
+                    let mut task = std::task::Context::from_waker(waker);
 
-        // Scope each future: it borrows `host` until dropped, so the next
-        // handle() call and the state assertions must wait.
-        {
-            let opened = host.handle(
-                &cx,
-                ActionActorMsg::OpenGeneration {
-                    generation: generation(0x60),
-                },
-            );
-            let mut opened = std::pin::pin!(opened);
-            assert!(matches!(
-                opened.as_mut().poll(&mut task),
-                std::task::Poll::Ready(())
-            ));
-        }
-        {
-            let registered = host.handle(
-                &cx,
-                ActionActorMsg::RegisterAttempt(Box::new(registration(
-                    1,
-                    11,
-                    111,
-                    AttemptPurpose::Primary,
-                ))),
-            );
-            let mut registered = std::pin::pin!(registered);
-            assert!(matches!(
-                registered.as_mut().poll(&mut task),
-                std::task::Poll::Ready(())
-            ));
-        }
+                    // Scope each future: it borrows `host` until dropped, so the
+                    // next handle() call and the state assertions must wait.
+                    {
+                        let opened = host.handle(
+                            &cx,
+                            ActionActorMsg::OpenGeneration {
+                                generation: generation(0x60),
+                            },
+                        );
+                        let mut opened = std::pin::pin!(opened);
+                        assert!(matches!(
+                            opened.as_mut().poll(&mut task),
+                            std::task::Poll::Ready(())
+                        ));
+                    }
+                    {
+                        let registered = host.handle(
+                            &cx,
+                            ActionActorMsg::RegisterAttempt(Box::new(registration(
+                                1,
+                                11,
+                                111,
+                                AttemptPurpose::Primary,
+                            ))),
+                        );
+                        let mut registered = std::pin::pin!(registered);
+                        assert!(matches!(
+                            registered.as_mut().poll(&mut task),
+                            std::task::Poll::Ready(())
+                        ));
+                    }
+                    host
+                })
+                .await
+        });
         assert_eq!(host.core.slot(), PublicationSlotState::Executing);
         assert_eq!(host.core.attempts().count(), 1);
     }
