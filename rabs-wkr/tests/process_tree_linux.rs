@@ -704,7 +704,10 @@ pub const INCLUDED: &str = include_str!("message.txt");
                     ExecutionResources::new(4),
                     spills.path(),
                     &control,
-                    &source_owner,
+                    rabs_wkr::session::UploadedInputs {
+                        source: &source_owner,
+                        toolchain: None,
+                    },
                 )
             },
         )
@@ -1233,7 +1236,10 @@ pub const SOURCE: &str = file!();
                     ExecutionResources::new(4),
                     spills.path(),
                     &control,
-                    &source_owner,
+                    rabs_wkr::session::UploadedInputs {
+                        source: &source_owner,
+                        toolchain: None,
+                    },
                 )
             },
         )

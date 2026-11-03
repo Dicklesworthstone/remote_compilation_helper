@@ -1,4 +1,4 @@
-//! Bounded reuse of pinned, independently captured toolchains.
+//! Bounded reuse of pinned, privately owned toolchains.
 //!
 //! Only a complete ToolchainIdentity selects reuse. A pathname, compiler version,
 //! timestamp or cache hit never substitutes for content verification. Unpinned
@@ -29,6 +29,8 @@ use std::io;
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::Duration;
+
+use crate::toolchain_transfer::SealedToolchain;
 
 const MAX_POOL_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const MAX_POOL_ENTRIES: usize = 8;
@@ -304,6 +306,32 @@ impl Dataset {
             verification: Mutex::new(None),
         }))
     }
+
+    fn adopt(
+        pool: &Arc<PoolDirectory>,
+        upload: SealedToolchain,
+        stopped: &impl Fn() -> bool,
+    ) -> io::Result<Arc<Self>> {
+        checkpoint(stopped)?;
+        if pool.1.is_some() {
+            // Durable storage still requires its own bounded reservation,
+            // synchronous publication and reopen at the final stable name.
+            // Keep the upload owner alive throughout that existing capture.
+            return Self::capture(pool, upload.root(), Some(upload.identity()), stopped);
+        }
+        let (toolchain, directory) = upload.into_parts();
+        let dataset = Arc::new(Self {
+            toolchain,
+            _directory: Some(directory),
+            pool: Arc::clone(pool),
+            verification: Mutex::new(None),
+        });
+        // Sealing is not an execution acquisition. Recheck the exact retained
+        // generation and all bytes, without creating a second private tree.
+        dataset.verify(stopped)?;
+        checkpoint(stopped)?;
+        Ok(dataset)
+    }
 }
 
 /// Scope-owned execution input; nothing can evict its backing while it is used.
@@ -315,7 +343,7 @@ impl ToolchainLease {
     pub(crate) fn root(&self) -> &Path {
         self.dataset.toolchain.root()
     }
-    pub(super) fn identity(&self) -> &ToolchainIdentity {
+    pub(crate) fn identity(&self) -> &ToolchainIdentity {
         self.dataset.toolchain.identity()
     }
     pub(crate) fn entry_count(&self) -> io::Result<usize> {
@@ -324,7 +352,7 @@ impl ToolchainLease {
             .entries()
             .map(|entries| entries.len())
     }
-    pub(super) fn disposition(&self) -> &'static str {
+    pub(crate) fn disposition(&self) -> &'static str {
         self.disposition
     }
     pub(crate) fn verify(&self, stopped: impl Fn() -> bool) -> io::Result<()> {
@@ -337,7 +365,7 @@ impl ToolchainLease {
     /// cache storage, even when this particular lease is a private overflow copy.
     /// Host processes with our credentials remain outside this boundary; the
     /// existing inode/mutation verification still applies.
-    pub(super) fn validate_namespace(&self, spec: &CanonicalNamespaceSpec) -> io::Result<()> {
+    pub(crate) fn validate_namespace(&self, spec: &CanonicalNamespaceSpec) -> io::Result<()> {
         let visible = Path::new(rabs_sandbox::layout::TOOLCHAIN);
         self.validate_namespace_at(spec, visible)
     }
@@ -452,7 +480,7 @@ impl ToolchainPool {
         Self::with_directory(max_bytes, max_entries, None)
     }
 
-    fn with_directory(
+    pub(crate) fn with_directory(
         max_bytes: u64,
         max_entries: usize,
         directory: Option<&Path>,
@@ -476,17 +504,6 @@ impl ToolchainPool {
         self.state
             .lock()
             .map_err(|_| invalid("toolchain pool ownership is poisoned"))
-    }
-    fn private(
-        &self,
-        source: &Path,
-        expected: Option<&ToolchainIdentity>,
-        stopped: &impl Fn() -> bool,
-    ) -> io::Result<ToolchainLease> {
-        Dataset::capture(&self.directory, source, expected, stopped).map(|dataset| ToolchainLease {
-            dataset,
-            disposition: "private",
-        })
     }
     fn discard_failed(&self, identity: Key, failed: &Arc<Dataset>) -> io::Result<()> {
         let mut state = self.lock()?;
@@ -608,15 +625,49 @@ impl ToolchainPool {
         expected: Option<&ToolchainIdentity>,
         stopped: impl Fn() -> bool,
     ) -> io::Result<ToolchainLease> {
-        checkpoint(&stopped)?;
+        self.acquire_with(expected, &stopped, "captured", || {
+            Dataset::capture(&self.directory, source, expected, &stopped)
+        })
+    }
+
+    pub(crate) fn adopt(
+        &self,
+        upload: SealedToolchain,
+        stopped: impl Fn() -> bool,
+    ) -> io::Result<ToolchainLease> {
+        let expected = *upload.identity();
+        let disposition = if self.directory.1.is_some() {
+            "captured"
+        } else {
+            "adopted"
+        };
+        self.acquire_with(Some(&expected), &stopped, disposition, || {
+            Dataset::adopt(&self.directory, upload, &stopped)
+        })
+    }
+
+    /// Captures and owned uploads share admission, quota and cancellation. The
+    /// producer runs at most once, outside the pool lock, and is dropped outside
+    /// that lock when an already retained same-identity dataset wins instead.
+    fn acquire_with(
+        &self,
+        expected: Option<&ToolchainIdentity>,
+        stopped: &impl Fn() -> bool,
+        disposition: &'static str,
+        produce: impl FnOnce() -> io::Result<Arc<Dataset>>,
+    ) -> io::Result<ToolchainLease> {
+        checkpoint(stopped)?;
         let Some(expected) =
             expected.filter(|expected| self.max_bytes != 0 && expected.bytes <= self.max_bytes)
         else {
-            return self.private(source, expected, &stopped);
+            return produce().map(|dataset| ToolchainLease {
+                dataset,
+                disposition: "private",
+            });
         };
         let identity = key(expected);
         loop {
-            checkpoint(&stopped)?;
+            checkpoint(stopped)?;
             let mut state = self.lock()?;
             state.clock = state.clock.saturating_add(1);
             let touched = state.clock;
@@ -630,7 +681,7 @@ impl ToolchainPool {
                     drop(state);
                     // Never consult the mutable original installation on a hit:
                     // the request selected these exact bytes, not that pathname.
-                    if let Err(error) = dataset.verify(&stopped) {
+                    if let Err(error) = dataset.verify(stopped) {
                         if !stopped() {
                             self.discard_failed(identity, &dataset)?;
                         }
@@ -669,7 +720,10 @@ impl ToolchainPool {
                 let Some(victim) = victim else {
                     drop(state);
                     drop(retired);
-                    return self.private(source, Some(expected), &stopped);
+                    return produce().map(|dataset| ToolchainLease {
+                        dataset,
+                        disposition: "private",
+                    });
                 };
                 if let Some(Slot::Ready { dataset, .. }) = state.entries.remove(&victim) {
                     state.reserved_bytes -= victim.2;
@@ -687,8 +741,8 @@ impl ToolchainPool {
             // Potentially slow filesystem cleanup and capture never hold the
             // admission mutex or block hits for another retained identity.
             drop(retired);
-            let dataset = Dataset::capture(&self.directory, source, Some(expected), &stopped)?;
-            checkpoint(&stopped)?;
+            let dataset = produce()?;
+            checkpoint(stopped)?;
             let mut state = self.lock()?;
             if !matches!(state.entries.get(&identity), Some(Slot::Capturing)) {
                 return Err(invalid("toolchain capture lost its reservation"));
@@ -707,7 +761,7 @@ impl ToolchainPool {
             self.changed.notify_all();
             return Ok(ToolchainLease {
                 dataset,
-                disposition: "captured",
+                disposition,
             });
         }
     }
@@ -792,7 +846,7 @@ impl Drop for ToolchainReuseScope {
 
 /// Embedded callers without a worker scope retain the original private-capture
 /// behavior. A registered pool error fails; it never selects an unpinned lane.
-pub(super) fn prepare(
+pub(crate) fn prepare(
     source: &Path,
     expected: Option<&ToolchainIdentity>,
     stopped: impl Fn() -> bool,
@@ -805,6 +859,23 @@ pub(super) fn prepare(
     match pool {
         Some(pool) => pool.acquire(source, expected, stopped),
         None => ToolchainPool::new(0, MAX_POOL_ENTRIES)?.acquire(source, expected, stopped),
+    }
+}
+
+/// Consume an admitted upload's actual private owner. No registry or configured
+/// retention still permits private execution, without recapturing owned bytes.
+pub(crate) fn adopt(
+    upload: SealedToolchain,
+    stopped: impl Fn() -> bool,
+) -> io::Result<ToolchainLease> {
+    checkpoint(&stopped)?;
+    let pool = ACTIVE_POOL
+        .lock()
+        .map_err(|_| invalid("toolchain pool registry is poisoned"))?
+        .upgrade();
+    match pool {
+        Some(pool) => pool.adopt(upload, stopped),
+        None => ToolchainPool::new(0, MAX_POOL_ENTRIES)?.adopt(upload, stopped),
     }
 }
 

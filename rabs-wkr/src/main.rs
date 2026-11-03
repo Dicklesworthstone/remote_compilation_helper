@@ -41,7 +41,7 @@ use rabs_wkr::output::{CapturedOutputs, MAX_OUTPUT_CHUNK_BYTES};
 use rabs_wkr::request_journal::{RECOVERY_PROTOCOL, WorkerJournal};
 use rabs_wkr::result_spool::{RESULT_RETENTION, ResultRecipient, RetentionTarget};
 use rabs_wkr::session::{
-    CanonicalExecRequest, ExecutionResources, execute_canonical_controlled,
+    CanonicalExecRequest, ExecutionResources, UploadedInputs, execute_canonical_controlled,
     execute_uploaded_canonical_controlled, parse_command_context, parse_dependency_context,
     probe_capability, sample_load_x100, sample_pressure,
 };
@@ -2315,7 +2315,6 @@ async fn session_loop(
                 if metadata_prefetch {
                     control.request_metadata_prefetch();
                 }
-                let _toolchain_owner = toolchain;
                 let resources = ExecutionResources {
                     slots,
                     host_budget: host_budget.as_deref(),
@@ -2331,16 +2330,22 @@ async fn session_loop(
                         resources,
                         &spills,
                         &control,
-                        source,
+                        UploadedInputs { source, toolchain },
                     ),
-                    None => execute_canonical_controlled(
-                        &request,
-                        &cargo_home,
-                        &home,
-                        resources,
-                        &spills,
-                        &control,
-                    ),
+                    None => {
+                        // Admission excludes transferred toolchains without
+                        // source, but retain any input owner through cleanup
+                        // even if a future caller violates that selection.
+                        let _toolchain_owner = toolchain;
+                        execute_canonical_controlled(
+                            &request,
+                            &cargo_home,
+                            &home,
+                            resources,
+                            &spills,
+                            &control,
+                        )
+                    }
                 }
             };
             ExecutionTask::spawn_for_delivery_with_lease(

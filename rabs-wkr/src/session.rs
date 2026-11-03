@@ -10,6 +10,7 @@ use crate::artifacts::{ArtifactPlan, PreparedArtifacts};
 use crate::execution::{DEFAULT_EXECUTION_TIMEOUT, ExecutionControl};
 use crate::output::CapturedOutputs;
 use crate::source_transfer::SourceOwner;
+use crate::toolchain_transfer::ToolchainOwner;
 use rabs_protocol::capability_tokens::CapabilityToken;
 use rabs_sandbox::dependency_context::{
     CANONICAL_DEPENDENCY_CONTEXT_VERSION, CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION,
@@ -960,10 +961,19 @@ pub fn execute_canonical_controlled(
     result
 }
 
+/// Request-owned source and optional transferred compiler inputs. Source-only
+/// execution captures a worker-local toolchain; a transferred owner instead
+/// grants adoption of the exact sealed private image, subject to verification.
+pub struct UploadedInputs<'a> {
+    pub source: &'a SourceOwner,
+    pub toolchain: Option<ToolchainOwner>,
+}
+
 /// Execute an uploaded projection with kernel-enforced read-only source.
 /// The caller retains the verified source owner until this blocking call has
-/// drained and reaped the process. Neither a wire flag nor a pathname alone
-/// can enable this path; the owner must match the admitted request and mount.
+/// drained and reaped the process. Any transferred toolchain owner moves into
+/// the execution lease. Neither a wire flag nor a pathname alone can enable
+/// this path; each owner must match the admitted request and mount.
 /// HOME and declared artifact output mounts remain writable.
 #[must_use]
 pub fn execute_uploaded_canonical_controlled(
@@ -973,7 +983,7 @@ pub fn execute_uploaded_canonical_controlled(
     resources: ExecutionResources<'_>,
     spill_root: &std::path::Path,
     control: &ExecutionControl,
-    source: &SourceOwner,
+    inputs: UploadedInputs<'_>,
 ) -> ExecResult {
     let mut result = execute_canonical_inner(
         request,
@@ -982,7 +992,7 @@ pub fn execute_uploaded_canonical_controlled(
         resources,
         spill_root,
         control,
-        Some(source),
+        Some(inputs),
     );
     if let Some(reason) = control.finish() {
         result.exit_code = reason.exit_code();
@@ -1073,7 +1083,7 @@ fn execute_canonical_inner(
     resources: ExecutionResources<'_>,
     spill_root: &std::path::Path,
     control: &ExecutionControl,
-    source: Option<&SourceOwner>,
+    inputs: Option<UploadedInputs<'_>>,
 ) -> ExecResult {
     use rabs_asupersync::process_groups::ManagedProcessGroup;
     use rabs_asupersync::region_tree::Attribution;
@@ -1082,6 +1092,10 @@ fn execute_canonical_inner(
         HostIsolationSupport, build_canonical_argv, command_for,
     };
     use std::process::Stdio;
+    let (source, uploaded_toolchain) = match inputs {
+        Some(inputs) => (Some(inputs.source), inputs.toolchain),
+        None => (None, None),
+    };
     if control.reason().is_some() {
         return exec_error(request.request_id);
     }
@@ -1119,13 +1133,17 @@ fn execute_canonical_inner(
     }
 
     // The lease retains independent bytes until processes and drains resolve.
-    // Only an explicit complete content identity may reuse a captured dataset;
-    // an unpinned request never resolves a mutable pathname through the pool.
-    let toolchain = match toolchain_pool::prepare(
-        std::path::Path::new(&request.toolchain_backing),
-        request.toolchain_identity.as_ref(),
-        || control.reason().is_some(),
-    ) {
+    // A transferred owner must bind this exact request before the pool can adopt
+    // it. Source-only execution still captures the selected worker-local tree.
+    let acquired = match uploaded_toolchain {
+        Some(owner) => owner.into_lease(request, || control.reason().is_some()),
+        None => toolchain_pool::prepare(
+            std::path::Path::new(&request.toolchain_backing),
+            request.toolchain_identity.as_ref(),
+            || control.reason().is_some(),
+        ),
+    };
+    let toolchain = match acquired {
         Ok(toolchain) => toolchain,
         Err(error) => {
             let _ = control.retain_outputs(Err(format!("toolchain acquisition: {error}")));
