@@ -1401,6 +1401,20 @@ mod tests {
     use super::*;
     use std::collections::{BTreeMap, VecDeque};
 
+    #[test]
+    fn payload_hex_preserves_the_existing_lowercase_wire_encoding() {
+        assert_eq!(hex(&[]), "");
+        assert_eq!(hex(&[0, 1, 15, 16, 127, 128, 254, 255]), "00010f107f80feff");
+        // Include every byte, an entire transfer chunk, and a partial tail.
+        // The independent formatter is the original wire encoder, retained
+        // only as an oracle rather than sharing the implementation under test.
+        for size in [32, 256, MAX_SOURCE_CHUNK, MAX_SOURCE_CHUNK + 17] {
+            let bytes: Vec<_> = (0..size).map(|index| (index % 256) as u8).collect();
+            let original: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+            assert_eq!(hex(&bytes), original);
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires RABS_REFLINK_TEST_ROOT on a real reflink-capable filesystem"]
@@ -2155,6 +2169,15 @@ mod tests {
                 .count(),
             2
         );
+        for (frame, chunk) in peer
+            .sent
+            .iter()
+            .filter(|frame| frame["kind"] == "source-chunk")
+            .zip(bytes.chunks(MAX_SOURCE_CHUNK))
+        {
+            let original: String = chunk.iter().map(|byte| format!("{byte:02x}")).collect();
+            assert_eq!(frame["data_hex"], original);
+        }
         assert_eq!(peer.sent[0]["source_transfer"], SOURCE_TRANSFER);
         assert!(
             peer.sent

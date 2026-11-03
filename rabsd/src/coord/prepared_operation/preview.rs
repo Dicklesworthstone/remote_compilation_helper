@@ -248,12 +248,17 @@ fn reply(
     active: bool,
     segments: Vec<OutputPreview>,
 ) -> Value {
-    let segments: Vec<_> = segments.into_iter().map(|segment| json!({
-        "stream":segment.stream.name(), "offset":segment.offset,
-        "next_offset":segment.offset + segment.bytes.len() as u64,
-        "data_hex":rabs_protocol::raw_bytes::encode_hex(&segment.bytes),
-        "skipped_bytes":segment.skipped_bytes, "observed_bytes":segment.observed_bytes,
-    })).collect();
+    let segments: Vec<_> = segments
+        .into_iter()
+        .map(|segment| {
+            json!({
+                "stream":segment.stream.name(), "offset":segment.offset,
+                "next_offset":segment.offset + segment.bytes.len() as u64,
+                "data_hex":rabs_protocol::raw_bytes::encode_hex(&segment.bytes),
+                "skipped_bytes":segment.skipped_bytes, "observed_bytes":segment.observed_bytes,
+            })
+        })
+        .collect();
     json!({
         "kind":"prepared-preview", "operation_id":id, "request_sha256":fingerprint,
         "attempt":attempt, "available":reason.is_none(), "active":active, "reason":reason,

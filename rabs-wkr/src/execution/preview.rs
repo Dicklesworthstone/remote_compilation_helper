@@ -43,15 +43,20 @@ pub fn output_preview_reply(
         None if last_admitted != Some(id) => return Err("unknown-output-preview-request".into()),
         _ => {}
     }
-    let segments: Vec<_> = active.into_iter().flat_map(|task| {
-        [PreviewStream::Stdout, PreviewStream::Stderr].into_iter().filter_map(move |stream| {
-            task.control.preview.take(stream).map(|segment| json!({
+    let segments: Vec<_> = active
+        .into_iter()
+        .flat_map(|task| {
+            [PreviewStream::Stdout, PreviewStream::Stderr]
+                .into_iter()
+                .filter_map(move |stream| {
+                    task.control.preview.take(stream).map(|segment| json!({
                 "stream":stream.name(), "offset":segment.offset,
                 "data_hex":rabs_protocol::raw_bytes::encode_hex(&segment.bytes),
                 "skipped_bytes":segment.skipped_bytes, "observed_bytes":segment.observed_bytes,
             }))
+                })
         })
-    }).collect();
+        .collect();
     Ok(
         json!({"kind":"output-preview", "version":OUTPUT_PREVIEW_VERSION,
         "request_id":id, "active":active.is_some(), "segments":segments,

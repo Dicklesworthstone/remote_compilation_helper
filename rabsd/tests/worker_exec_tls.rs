@@ -2022,8 +2022,11 @@ fn actual_prepared_build_uploads_installs_and_replays_offline_after_ack_loss() {
     let received_source = root.join("worker-source");
     fs::set_permissions(&root, fs::Permissions::from_mode(0o770)).unwrap();
     assert!(
-        SourceReceiver::create(&received_source, request_manifest(&request).unwrap().unwrap())
-            .is_err()
+        SourceReceiver::create(
+            &received_source,
+            request_manifest(&request).unwrap().unwrap()
+        )
+        .is_err()
     );
     assert!(!received_source.exists());
     fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();

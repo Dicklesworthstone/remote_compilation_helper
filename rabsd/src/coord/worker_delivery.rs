@@ -308,6 +308,13 @@ pub trait WorkerPeer {
     fn send(&mut self, frame: &Value) -> io::Result<()>;
     fn receive(&mut self) -> io::Result<Value>;
 
+    /// Send a record already encoded for transfer accounting. The default
+    /// deliberately calls this adapter's normal send path: an optimization
+    /// must never bypass its admission, ownership or cancellation checks.
+    fn send_encoded(&mut self, frame: EncodedWorkerFrame<'_>) -> io::Result<()> {
+        self.send(frame.value())
+    }
+
     /// Complete transport-specific admission before the first execution write.
     /// The default is the explicitly unauthenticated loopback protocol. Secure
     /// transports must verify the hello against their authenticated peer and
@@ -351,6 +358,38 @@ pub trait WorkerPeer {
     /// work too. Cache copies must not bypass a transport's send/receive checks.
     fn checkpoint(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+/// One immutable message and the exact JSON record encoded from it.
+///
+/// Private fields prevent pairing validated semantics with different wire
+/// bytes. Holding the borrow also prevents changing the Value after encoding.
+/// This is byte preparation only; every send still requires the transport's
+/// ordinary authentication, phase, deadline and cancellation checks.
+pub struct EncodedWorkerFrame<'a> {
+    value: &'a Value,
+    bytes: Vec<u8>,
+}
+
+impl<'a> EncodedWorkerFrame<'a> {
+    pub fn new(value: &'a Value) -> io::Result<Self> {
+        let mut bytes = serde_json::to_vec(value)?;
+        bytes.push(b'\n');
+        Ok(Self { value, bytes })
+    }
+
+    pub fn value(&self) -> &'a Value {
+        self.value
+    }
+
+    /// Exact byte charge, including JSON escaping and the record delimiter.
+    pub fn encoded_len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        self.bytes
     }
 }
 
@@ -1422,6 +1461,19 @@ mod tests {
 
     use super::*;
     use std::collections::VecDeque;
+
+    #[test]
+    fn encoded_worker_frame_charges_exact_escaped_bytes_and_one_delimiter() {
+        let value = json!("\"\\\n\r\t\u{1}雪");
+        let expected = "\"\\\"\\\\\\n\\r\\t\\u0001雪\"\n".as_bytes();
+        let encoded = EncodedWorkerFrame::new(&value).unwrap();
+        assert!(std::ptr::eq(encoded.value(), &value));
+        assert_eq!(encoded.encoded_len(), expected.len());
+        let bytes = encoded.into_bytes();
+        assert_eq!(bytes, expected);
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), value);
+        assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 1);
+    }
 
     struct Script {
         replies: VecDeque<Value>,

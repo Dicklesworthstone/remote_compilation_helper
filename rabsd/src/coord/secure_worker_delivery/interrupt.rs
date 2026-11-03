@@ -10,7 +10,8 @@
 use super::lease::{ExecutionLease, Tick};
 use super::preview::PreviewSession;
 use super::{
-    Phase, RecordPeer, TRANSFER_BUDGET, WorkerPeer, read_record, require, worker_transport_error,
+    EncodedWorkerFrame, Phase, RecordPeer, TRANSFER_BUDGET, WorkerPeer, read_record, require,
+    worker_transport_error,
 };
 use asupersync::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use asupersync::signal::{Signal, sigint, sigterm};
@@ -250,7 +251,7 @@ impl<'a, S, I: Interrupts> OperatorPeer<'a, S, I> {
 impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> OperatorPeer<'_, S, I> {
     fn send_interruptibly(
         &mut self,
-        frame: &Value,
+        frame: EncodedWorkerFrame<'_>,
         lease_deadline: Option<Instant>,
     ) -> io::Result<()> {
         let bytes = self.inner.outbound(frame)?;
@@ -338,7 +339,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> OperatorPeer<'_, S, I> {
                 let deadline = lease.expires_at();
                 // Any failed/partial renewal write poisons the connection. A
                 // stop cannot append a cancel inside an incomplete JSON frame.
-                self.send_interruptibly(&frame, deadline)
+                self.inner.remaining()?;
+                self.send_interruptibly(EncodedWorkerFrame::new(&frame)?, deadline)
             }
         }
     }
@@ -368,7 +370,73 @@ impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> OperatorPeer<'_, S, I> {
             .map_or(Instant::now() + PREVIEW_WRITE_BUDGET, |wake| {
                 wake.min(Instant::now() + PREVIEW_WRITE_BUDGET)
             });
-        self.send_interruptibly(&frame, Some(deadline))
+        self.inner.remaining()?;
+        self.send_interruptibly(EncodedWorkerFrame::new(&frame)?, Some(deadline))
+    }
+
+    /// Both ordinary sends and already-encoded payloads pass this same state
+    /// machine. Encoding is deferred until the pre-write checks on ordinary
+    /// messages; pre-encoded messages cannot skip any of those checks.
+    fn send_with_encoding<'frame>(
+        &mut self,
+        frame: &'frame Value,
+        encode: impl FnOnce() -> io::Result<EncodedWorkerFrame<'frame>>,
+    ) -> io::Result<()> {
+        let result = (|| {
+            self.inner.remaining()?;
+            require(
+                frame["kind"] != "cancel"
+                    && frame["kind"] != "execution-lease-renew"
+                    && frame["kind"] != "output-preview",
+                "execution controls are owned by this authenticated connection",
+            )?;
+            if self.pending_interrupt()? {
+                self.interrupt()?;
+            }
+            if frame["kind"] == "session-ok" {
+                if let Some(preview) = &mut self.preview {
+                    preview.select(frame)?;
+                }
+                if let Some(grant) = frame.get("execution_lease") {
+                    require(
+                        self.lease.is_none() && self.execution.is_none(),
+                        "execution lease cannot be renegotiated",
+                    )?;
+                    self.lease = Some(ExecutionLease::parse(grant)?);
+                }
+            }
+            if frame["kind"] == "canonical-exec"
+                && let Some(lease) = &self.lease
+            {
+                lease.validate_request(frame)?;
+            }
+            let sent_at = Instant::now();
+            let encoded = encode()?;
+            // Before a complete dispatch, cancellation may abandon a partially
+            // written frame. Poison this connection; never insert a cancel
+            // record inside it or retry an uncertain canonical-exec. After a
+            // completed dispatch, the read path owns cancellation and drain.
+            if self.execution.is_none() && self.interrupts.finish_verified_delivery() {
+                self.send_interruptibly(encoded, None)?;
+            } else {
+                self.inner.send_encoded(encoded)?;
+            }
+            if frame["kind"] == "canonical-exec" {
+                let request_id = frame["request_id"]
+                    .as_u64()
+                    .ok_or_else(|| super::invalid("missing execution identity"))?;
+                self.execution = Some(request_id);
+                if let Some(lease) = &mut self.lease {
+                    lease.arm(sent_at);
+                }
+                if let Some(preview) = &mut self.preview {
+                    preview.arm(request_id);
+                }
+            }
+            Ok(())
+        })();
+        self.inner.failed |= result.is_err();
+        result
     }
 
     fn receive_inner(&mut self) -> io::Result<Value> {
@@ -489,60 +557,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> WorkerPeer for OperatorPe
     }
 
     fn send(&mut self, frame: &Value) -> io::Result<()> {
-        let result = (|| {
-            self.inner.remaining()?;
-            require(
-                frame["kind"] != "cancel"
-                    && frame["kind"] != "execution-lease-renew"
-                    && frame["kind"] != "output-preview",
-                "execution controls are owned by this authenticated connection",
-            )?;
-            if self.pending_interrupt()? {
-                self.interrupt()?;
-            }
-            if frame["kind"] == "session-ok" {
-                if let Some(preview) = &mut self.preview {
-                    preview.select(frame)?;
-                }
-                if let Some(grant) = frame.get("execution_lease") {
-                    require(
-                        self.lease.is_none() && self.execution.is_none(),
-                        "execution lease cannot be renegotiated",
-                    )?;
-                    self.lease = Some(ExecutionLease::parse(grant)?);
-                }
-            }
-            if frame["kind"] == "canonical-exec"
-                && let Some(lease) = &self.lease
-            {
-                lease.validate_request(frame)?;
-            }
-            let sent_at = Instant::now();
-            // Before a complete dispatch, cancellation may abandon a partially
-            // written frame. Poison this connection; never insert a cancel
-            // record inside it or retry an uncertain canonical-exec. After a
-            // completed dispatch, the read path owns cancellation and drain.
-            if self.execution.is_none() && self.interrupts.finish_verified_delivery() {
-                self.send_interruptibly(frame, None)?;
-            } else {
-                self.inner.send(frame)?;
-            }
-            if frame["kind"] == "canonical-exec" {
-                let request_id = frame["request_id"]
-                    .as_u64()
-                    .ok_or_else(|| super::invalid("missing execution identity"))?;
-                self.execution = Some(request_id);
-                if let Some(lease) = &mut self.lease {
-                    lease.arm(sent_at);
-                }
-                if let Some(preview) = &mut self.preview {
-                    preview.arm(request_id);
-                }
-            }
-            Ok(())
-        })();
-        self.inner.failed |= result.is_err();
-        result
+        self.send_with_encoding(frame, || EncodedWorkerFrame::new(frame))
+    }
+
+    fn send_encoded(&mut self, frame: EncodedWorkerFrame<'_>) -> io::Result<()> {
+        self.send_with_encoding(frame.value(), || Ok(frame))
     }
 
     fn receive(&mut self) -> io::Result<Value> {
@@ -713,6 +732,41 @@ mod tests {
             RecordPeer::new(runtime, Wire::new(trigger, frames), &request()),
             trigger.clone(),
         )
+    }
+
+    #[test]
+    fn encoded_frames_cannot_bypass_operator_controls_or_revive_an_expired_peer() {
+        let runtime = runtime();
+        for kind in ["cancel", "execution-lease-renew", "output-preview"] {
+            let trigger = Trigger::default();
+            let mut peer = peer(&runtime, &trigger, &[]);
+            let frame = json!({"kind":kind, "request_id":7});
+            assert!(
+                peer.send_encoded(EncodedWorkerFrame::new(&frame).unwrap())
+                    .is_err()
+            );
+            assert!(peer.inner.failed);
+            assert!(peer.inner.stream.sent.is_empty());
+            assert!(peer.execution.is_none());
+            assert!(
+                peer.send_encoded(EncodedWorkerFrame::new(&request()).unwrap())
+                    .is_err()
+            );
+            assert!(peer.inner.stream.sent.is_empty());
+        }
+
+        let trigger = Trigger::default();
+        let mut peer = peer(&runtime, &trigger, &[]);
+        peer.inner.until = Instant::now() - Duration::from_secs(1);
+        let until = peer.inner.until;
+        assert!(
+            peer.send_encoded(EncodedWorkerFrame::new(&request()).unwrap())
+                .is_err()
+        );
+        assert!(peer.inner.failed);
+        assert!(peer.inner.stream.sent.is_empty());
+        assert!(peer.execution.is_none());
+        assert_eq!(peer.inner.until, until);
     }
 
     #[test]
@@ -978,7 +1032,9 @@ mod tests {
         }
         let runtime = runtime();
         for frame in [request(), json!({"kind":"source-begin", "request_id":7})] {
-            for stage in 0..3 {
+            for (stage, pre_encoded) in
+                (0..3).flat_map(|stage| [false, true].map(|encoded| (stage, encoded)))
+            {
                 let token = super::super::OperationCancellation::default();
                 let stream = StalledWrite {
                     token: token.clone(),
@@ -989,7 +1045,12 @@ mod tests {
                     RecordPeer::new(&runtime, stream, &request()),
                     OperationInterrupts::new(token),
                 );
-                let error = peer.send(&frame).unwrap_err();
+                let error = if pre_encoded {
+                    peer.send_encoded(EncodedWorkerFrame::new(&frame).unwrap())
+                } else {
+                    peer.send(&frame)
+                }
+                .unwrap_err();
                 assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
                 assert!(
                     !super::super::transport_interrupted(&error),
@@ -1016,6 +1077,10 @@ mod tests {
                     }
                 );
                 assert!(peer.send(&request()).is_err());
+                assert!(
+                    peer.send_encoded(EncodedWorkerFrame::new(&request()).unwrap())
+                        .is_err()
+                );
                 assert_eq!(
                     peer.inner.stream.sent, sent,
                     "an interrupted write must never retry"
