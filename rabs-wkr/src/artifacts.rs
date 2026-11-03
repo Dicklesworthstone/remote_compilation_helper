@@ -189,12 +189,20 @@ impl ArtifactPlan {
 pub struct PreparedArtifacts {
     plan: ArtifactPlan,
     directory: tempfile::TempDir,
+    snapshot_directory: tempfile::TempDir,
 }
 
 impl PreparedArtifacts {
     /// Prepare fresh backing and declared parent directories. A later attempt
     /// cannot observe stale output files from an earlier successful compile.
     pub fn new(plan: ArtifactPlan) -> io::Result<Self> {
+        Self::new_in(plan, &std::env::temp_dir())
+    }
+
+    /// Prepare on an existing worker-owned storage root. Both compiler backing
+    /// and its eventual immutable snapshots stay on this selected storage; an
+    /// unavailable root is an error, never permission to use ambient TMPDIR.
+    pub fn new_in(plan: ArtifactPlan, parent: &Path) -> io::Result<Self> {
         let mut builder = tempfile::Builder::new();
         builder.prefix("rabs-artifacts-");
         #[cfg(unix)]
@@ -202,15 +210,35 @@ impl PreparedArtifacts {
             use std::os::unix::fs::PermissionsExt;
             builder.permissions(fs::Permissions::from_mode(0o700));
         }
-        let directory = builder.tempdir()?;
+        let directory = builder.tempdir_in(parent)?;
         Self::with_directory(plan, directory)
     }
 
     fn with_directory(plan: ArtifactPlan, directory: tempfile::TempDir) -> io::Result<Self> {
+        // Keep capture scratch outside the inventoried compiler output. Even a
+        // temporary create/unlink inside that tree can change a retained directory
+        // generation on filesystems without anonymous-file creation support.
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("rabs-artifact-snapshots-");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(fs::Permissions::from_mode(0o700));
+        }
+        let snapshot_directory = builder.tempdir_in(
+            directory
+                .path()
+                .parent()
+                .ok_or_else(|| invalid("artifact backing has no storage parent"))?,
+        )?;
         for relative in &plan.directories {
             fs::create_dir_all(directory.path().join(relative))?;
         }
-        Ok(Self { plan, directory })
+        Ok(Self {
+            plan,
+            directory,
+            snapshot_directory,
+        })
     }
 
     /// Stable physical fixture paths model canonical mount destinations without
@@ -447,12 +475,13 @@ impl PreparedArtifacts {
             };
             #[cfg(not(unix))]
             let executable = false;
-            let bytes = CapturedStream::from_reader(
+            let bytes = CapturedStream::from_reader_in(
                 CaptureReader {
                     file,
                     stopped: &stopped,
                 },
                 metadata.len(),
+                self.snapshot_directory.path(),
             )?;
             files.insert(name.clone(), CapturedArtifact { executable, bytes });
         }
@@ -533,12 +562,13 @@ impl PreparedArtifacts {
             // Retain the same inode for the post-read check even though the
             // copying reader owns its descriptor. No original output is linked.
             let witness = file.try_clone()?;
-            let bytes = CapturedStream::from_reader(
+            let bytes = CapturedStream::from_reader_in(
                 CaptureReader {
                     file,
                     stopped: &stopped,
                 },
                 metadata.len(),
+                self.snapshot_directory.path(),
             )?;
             inventory.verify_file(name, &witness)?;
             files.insert(
@@ -1177,6 +1207,57 @@ mod tests {
             plan(&["obj/a.rlib", "dep.d"]).virtual_root(),
             "/__rabs/out/dep"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn selected_storage_snapshots_do_not_mutate_the_output_inventory() {
+        let root = tempfile::tempdir().unwrap();
+        let bytes: Vec<u8> = (0..MAX_OUTPUT_CHUNK_BYTES + 19)
+            .map(|index| (index % 256) as u8)
+            .collect();
+        for tree in [false, true] {
+            let plan = if tree {
+                ArtifactPlan::new_tree("dep".into(), vec!["nested/a".into()]).unwrap()
+            } else {
+                plan(&["nested/a"])
+            };
+            let prepared = PreparedArtifacts::new_in(plan, root.path()).unwrap();
+            assert_eq!(prepared.backing().parent(), Some(root.path()));
+            assert_eq!(
+                prepared.snapshot_directory.path().parent(),
+                Some(root.path())
+            );
+            assert_ne!(prepared.backing(), prepared.snapshot_directory.path());
+            fs::write(prepared.backing().join("nested/a"), &bytes).unwrap();
+            let mut captured = prepared.capture(|| false).unwrap();
+            // Both private directories are gone; only anonymous readable copies
+            // remain, and the complete tree's generation checks succeeded.
+            assert!(fs::read_dir(root.path()).unwrap().next().is_none());
+            let mut restored = captured
+                .read_chunk("nested/a", 0, MAX_OUTPUT_CHUNK_BYTES)
+                .unwrap();
+            restored.extend(
+                captured
+                    .read_chunk("nested/a", restored.len() as u64, MAX_OUTPUT_CHUNK_BYTES)
+                    .unwrap(),
+            );
+            assert_eq!(restored, bytes);
+            assert_eq!(
+                captured.file_identity("nested/a").unwrap().1,
+                crate::session::sha256_hex(&bytes)
+            );
+        }
+    }
+
+    #[test]
+    fn selected_artifact_storage_failure_never_falls_back() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("not-a-directory");
+        fs::write(&file, b"owned").unwrap();
+        for directory in [file, root.path().join("missing")] {
+            assert!(PreparedArtifacts::new_in(plan(&["a"]), &directory).is_err());
+        }
     }
 
     #[test]

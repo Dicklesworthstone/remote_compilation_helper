@@ -436,7 +436,8 @@ pub fn validate_receipt(
 }
 
 /// Rehydrate off the reactor, while the exclusive worker journal lock is held.
-/// Private snapshots are recreated, so later reads do not reopen mutable names.
+/// Private snapshots are recreated on the journal's storage, so later reads do
+/// not reopen mutable names or depend on available space in ambient TMPDIR.
 pub fn load(
     journal_root: &Path,
     request_id: u64,
@@ -479,7 +480,7 @@ pub fn load(
             file.metadata()?.is_file() && file.metadata()?.len() == item.len,
             "retained file type/size mismatch",
         )?;
-        let snapshot = CapturedStream::from_reader(file, item.len)?;
+        let snapshot = CapturedStream::from_reader_in(file, item.len, journal_root)?;
         require(
             snapshot.sha256() == item.digest,
             "retained file content mismatch",
@@ -492,7 +493,7 @@ pub fn load(
     let artifacts = match plan {
         None => None,
         Some(plan) => {
-            let prepared = PreparedArtifacts::new(plan)?;
+            let prepared = PreparedArtifacts::new_in(plan, journal_root)?;
             for (item, mut snapshot) in items.iter().skip(2).zip(streams) {
                 let mut file = create_file(&prepared.backing().join(&item.name))?;
                 let mut offset = 0;
@@ -703,6 +704,141 @@ mod tests {
         assert!(artifacts.file_identity("nested/a").unwrap().2);
         assert!(load(root.path(), 2, &fingerprint, &digest).is_err());
         assert!(load(root.path(), 1, &"0".repeat(64), &digest).is_err());
+    }
+
+    #[test]
+    fn retained_result_recovers_without_ambient_temp_storage() {
+        const CHILD_ROOT: &str = "RABS_RESULT_STORAGE_TEST_ROOT";
+        const CHILD_DONE: &str = "rabs-result-storage-recovered";
+        const ID: u64 = 41;
+        let timeout = Duration::from_secs(5);
+        let request = json!({"kind":"canonical-exec","request_id":ID,"program":"rustc","args":[]});
+        let bytes: Vec<u8> = (0..MAX_OUTPUT_CHUNK_BYTES + 19)
+            .map(|index| (index % 256) as u8)
+            .collect();
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            // The parent changes only this child's environment. No unsafe
+            // process-global environment mutation can race parallel unit tests.
+            let root = PathBuf::from(root);
+            assert!(tempfile::tempfile().is_err());
+            let mut journal = WorkerJournal::open(&root, "worker", "coord").unwrap();
+            journal.authorize_result_recipient(ResultRecipient::TlsSpki([8; 32]));
+            assert!(journal.resume_result(&request, timeout, true).is_err());
+            journal.authorize_result_recipient(ResultRecipient::TlsSpki([7; 32]));
+            let mut changed = request.clone();
+            changed["args"] = json!(["--changed"]);
+            assert!(journal.resume_result(&changed, timeout, true).is_err());
+            assert!(journal.resume_result(&request, timeout, false).is_err());
+            let mut recovered = journal.resume_result(&request, timeout, true).unwrap();
+            assert_eq!(recovered.result.request_id, ID);
+            assert_eq!(recovered.result.exit_code, 0);
+            assert!(recovered.result.executed);
+            assert_eq!(recovered.result.residual_group_members, 0);
+            assert_eq!(recovered.stop_reason, None);
+            // Recovery still owns independent immutable copies, including the
+            // artifact reconstructed after its sealed bytes were verified.
+            let spool = root.join(DIRECTORY);
+            fs::write(data_path(&spool, 0), vec![0; bytes.len()]).unwrap();
+            fs::write(data_path(&spool, 2), vec![0; bytes.len()]).unwrap();
+            let outputs = recovered.outputs.as_mut().unwrap();
+            let expected_digest = sha256_hex(&bytes);
+            assert_eq!(outputs.stdout.sha256(), expected_digest);
+            assert!(outputs.stderr.is_empty());
+            let mut stdout = outputs
+                .stdout
+                .read_chunk(0, MAX_OUTPUT_CHUNK_BYTES)
+                .unwrap();
+            stdout.extend(
+                outputs
+                    .stdout
+                    .read_chunk(stdout.len() as u64, MAX_OUTPUT_CHUNK_BYTES)
+                    .unwrap(),
+            );
+            assert_eq!(stdout, bytes);
+            assert!(
+                outputs
+                    .stdout
+                    .read_chunk(bytes.len() as u64, 1)
+                    .unwrap()
+                    .is_empty()
+            );
+            let artifacts = recovered.artifacts.as_mut().unwrap();
+            assert_eq!(
+                artifacts.file_identity("nested/a").unwrap(),
+                (bytes.len() as u64, expected_digest.as_str(), true)
+            );
+            let mut artifact = artifacts
+                .read_chunk("nested/a", 0, MAX_OUTPUT_CHUNK_BYTES)
+                .unwrap();
+            artifact.extend(
+                artifacts
+                    .read_chunk("nested/a", artifact.len() as u64, MAX_OUTPUT_CHUNK_BYTES)
+                    .unwrap(),
+            );
+            assert_eq!(artifact, bytes);
+            println!("{CHILD_DONE}");
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let (mut journal, target, _) = target(root.path(), ID);
+        let mut original = completion(ID, false);
+        original.outputs.as_mut().unwrap().stdout =
+            CapturedStream::from_reader(bytes.as_slice(), bytes.len() as u64).unwrap();
+        original.result.stdout_sha256 = sha256_hex(&bytes);
+        let prepared = PreparedArtifacts::new(
+            ArtifactPlan::new("dep".into(), vec!["nested/a".into()]).unwrap(),
+        )
+        .unwrap();
+        fs::write(prepared.backing().join("nested/a"), &bytes).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                prepared.backing().join("nested/a"),
+                fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+        }
+        original.artifacts = Some(prepared.capture(|| false).unwrap());
+        let digest = target.seal(&mut original).unwrap();
+        journal
+            .finish(
+                ID,
+                &json!({"kind":"exec-result","request_id":ID,"exit_code":0,"executed":true,
+                    "residual_group_members":0,"stop_reason":null,
+                    "stdout_sha256":original.result.stdout_sha256,
+                    "stderr_sha256":original.result.stderr_sha256,
+                    "retained_result_sha256":digest}),
+                true,
+            )
+            .unwrap();
+        drop(original);
+        drop(journal);
+        let unavailable = root.path().join("ambient-tmp-is-a-file");
+        fs::write(&unavailable, b"not a temporary directory").unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "result_spool::tests::retained_result_recovers_without_ambient_temp_storage",
+                "--nocapture",
+            ])
+            .env(CHILD_ROOT, root.path())
+            .env("TMPDIR", &unavailable)
+            .env("TMP", &unavailable)
+            .env("TEMP", &unavailable)
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "recovery with unavailable ambient storage failed: {}\nstdout: {}\nstderr: {}",
+            child.status,
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&child.stdout).contains(CHILD_DONE),
+            "the recovery child did not execute its assertions"
+        );
     }
 
     #[test]

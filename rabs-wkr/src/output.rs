@@ -10,6 +10,7 @@ use rabs_asupersync::stream_drain::LaneDrain;
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::Path;
 
 /// Maximum raw bytes in one retrieval response (hex encoding doubles this).
 pub const MAX_OUTPUT_CHUNK_BYTES: usize = 64 * 1024;
@@ -29,14 +30,26 @@ impl CapturedStream {
     /// Copy exactly `len` bytes and refuse early EOF, surplus bytes or an
     /// excessive claim. Memory use is one fixed-size copy buffer. Call from
     /// the blocking execution owner, never the async control reactor.
-    pub fn from_reader(mut reader: impl Read, len: u64) -> io::Result<Self> {
+    pub fn from_reader(reader: impl Read, len: u64) -> io::Result<Self> {
+        Self::from_reader_in(reader, len, &std::env::temp_dir())
+    }
+
+    /// Retain a private anonymous copy on the owner's selected storage. The
+    /// directory must already exist; a failed allocation never falls back to
+    /// ambient temporary storage. Closing the snapshot releases its bytes.
+    pub fn from_reader_in(mut reader: impl Read, len: u64, directory: &Path) -> io::Result<Self> {
         if len > MAX_RETAINED_STREAM_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "output retention limit exceeded",
             ));
         }
-        let mut file = tempfile::tempfile()?;
+        let mut file = tempfile::tempfile_in(directory)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
         let mut hasher = Sha256::new();
         let mut remaining = len;
         let mut buffer = [0_u8; MAX_OUTPUT_CHUNK_BYTES];
@@ -72,6 +85,12 @@ impl CapturedStream {
     /// Snapshot the actual resident prefix followed by the entire spill tail.
     /// Recorded lengths must agree before a snapshot can become readable.
     pub fn from_lane(lane: &LaneDrain) -> io::Result<Self> {
+        Self::from_lane_in(lane, &std::env::temp_dir())
+    }
+
+    /// Preserve both drain tiers on the selected storage, including a fully
+    /// resident stream that never created a spill file of its own.
+    pub fn from_lane_in(lane: &LaneDrain, directory: &Path) -> io::Result<Self> {
         let expected = (lane.resident().len() as u64)
             .checked_add(lane.spilled_bytes())
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "output length overflow"))?;
@@ -83,7 +102,7 @@ impl CapturedStream {
         }
         // Retain the drain's descriptor through the entire handoff. A matching
         // pathname and length are not proof of the bytes the compiler emitted.
-        Self::from_reader(lane.reader()?, expected)
+        Self::from_reader_in(lane.reader()?, expected, directory)
     }
 
     /// Exact original stream length, including both drain tiers.
@@ -136,9 +155,19 @@ impl CapturedOutputs {
     /// Capture all-or-nothing: a failed stderr capture drops the stdout scratch
     /// snapshot too. Original drain spill files are left intact for diagnosis.
     pub fn from_lanes(stdout: &LaneDrain, stderr: &LaneDrain) -> io::Result<Self> {
+        Self::from_lanes_in(stdout, stderr, &std::env::temp_dir())
+    }
+
+    /// Capture both streams on the same execution-owned storage. Anonymous
+    /// files outlive the directory owner without reopening its mutable names.
+    pub fn from_lanes_in(
+        stdout: &LaneDrain,
+        stderr: &LaneDrain,
+        directory: &Path,
+    ) -> io::Result<Self> {
         Ok(Self {
-            stdout: CapturedStream::from_lane(stdout)?,
-            stderr: CapturedStream::from_lane(stderr)?,
+            stdout: CapturedStream::from_lane_in(stdout, directory)?,
+            stderr: CapturedStream::from_lane_in(stderr, directory)?,
         })
     }
 }
@@ -227,6 +256,37 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn selected_storage_keeps_private_anonymous_bytes_after_its_owner_drops() {
+        let root = tempfile::tempdir().unwrap();
+        let bytes = b"snapshot\0\xff";
+        let mut stream =
+            CapturedStream::from_reader_in(&bytes[..], bytes.len() as u64, root.path()).unwrap();
+        assert!(std::fs::read_dir(root.path()).unwrap().next().is_none());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let metadata = stream.file.metadata().unwrap();
+            assert_eq!(metadata.nlink(), 0);
+            assert_eq!(metadata.permissions().mode() & 0o077, 0);
+        }
+        drop(root);
+        assert_eq!(stream.read_chunk(0, bytes.len()).unwrap(), bytes);
+        assert_eq!(stream.sha256(), crate::session::sha256_hex(bytes));
+    }
+
+    #[test]
+    fn selected_storage_failure_never_falls_back_to_ambient_storage() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("not-a-directory");
+        std::fs::write(&file, b"owned").unwrap();
+        for directory in [file, root.path().join("missing")] {
+            assert!(CapturedStream::from_reader_in(&b"x"[..], 1, &directory).is_err());
+            assert!(CapturedStream::from_reader_in(io::empty(), 0, &directory).is_err());
+        }
+    }
+
     #[test]
     fn binary_ranges_are_replayable_bounded_and_hash_the_complete_stream() {
         let bytes: Vec<u8> = (0..MAX_OUTPUT_CHUNK_BYTES * 2 + 13)
@@ -299,7 +359,9 @@ mod tests {
         assert!(child.wait().unwrap().success());
         let stdout = join_lane(stdout.unwrap()).unwrap();
         let stderr = join_lane(stderr.unwrap()).unwrap();
-        let mut captured = CapturedOutputs::from_lanes(&stdout, &stderr).unwrap();
+        let unavailable = dir.path().join("missing");
+        assert!(CapturedOutputs::from_lanes_in(&stdout, &stderr, &unavailable).is_err());
+        let mut captured = CapturedOutputs::from_lanes_in(&stdout, &stderr, dir.path()).unwrap();
         std::fs::write(&stdout.spill().unwrap().path, b"replaced").unwrap();
         std::fs::write(&stderr.spill().unwrap().path, b"replaced").unwrap();
         assert_eq!(captured.stdout.read_chunk(0, 10).unwrap(), b"A\0\xffB");
@@ -308,6 +370,6 @@ mod tests {
             captured.stdout.sha256(),
             crate::session::sha256_hex(b"A\0\xffB")
         );
-        assert!(CapturedOutputs::from_lanes(&stdout, &stderr).is_err());
+        assert!(CapturedOutputs::from_lanes_in(&stdout, &stderr, dir.path()).is_err());
     }
 }

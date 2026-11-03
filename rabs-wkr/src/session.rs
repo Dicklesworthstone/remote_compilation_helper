@@ -1180,6 +1180,20 @@ fn execute_canonical_inner(
         let _ = control.retain_outputs(Err(error));
         return exec_error(request.request_id);
     }
+    // Snapshot storage belongs to the same worker-selected filesystem as the
+    // drain spools. Prepare it before execution, including fully resident output
+    // that will never cause a drain to create its lazy per-attempt spill path.
+    let capture_directory = match std::fs::create_dir_all(spill_root).and_then(|()| {
+        tempfile::Builder::new()
+            .prefix("rabs-output-")
+            .tempdir_in(spill_root)
+    }) {
+        Ok(directory) => directory,
+        Err(error) => {
+            let _ = control.retain_outputs(Err(format!("output storage preparation: {error}")));
+            return exec_error(request.request_id);
+        }
+    };
     let hot_inputs = if resources.target_cache.is_some()
         && request.dependency_context.is_none()
         && request.toolchain_identity.is_some()
@@ -1201,7 +1215,7 @@ fn execute_canonical_inner(
     };
     let mut artifacts = match artifact_plan
         .clone()
-        .map(PreparedArtifacts::new)
+        .map(|plan| PreparedArtifacts::new_in(plan, capture_directory.path()))
         .transpose()
     {
         Ok(artifacts) => artifacts,
@@ -1441,7 +1455,7 @@ fn execute_canonical_inner(
                         key,
                         compatible,
                         inputs.clone(),
-                        || PreparedArtifacts::new(plan.clone()),
+                        || PreparedArtifacts::new_in(plan.clone(), capture_directory.path()),
                         request.request_id,
                         &|| control.reason().is_some(),
                     )
@@ -1769,7 +1783,11 @@ fn execute_canonical_inner(
             #[cfg(not(unix))]
             let exit_code = output.status.code().unwrap_or(-1);
             let (stdout_sha256, stderr_sha256) = if control.output_capture_requested() {
-                let capture = CapturedOutputs::from_lanes(&output.stdout, &output.stderr);
+                let capture = CapturedOutputs::from_lanes_in(
+                    &output.stdout,
+                    &output.stderr,
+                    capture_directory.path(),
+                );
                 let digests = capture.as_ref().ok().map(|outputs| {
                     (
                         outputs.stdout.sha256().to_owned(),
