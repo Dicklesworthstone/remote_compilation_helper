@@ -12629,6 +12629,92 @@ fn test_dependency_runtime_plan_refuses_invalid_transitive_workspace_owners() {
 }
 
 #[test]
+fn test_dependency_runtime_plan_refuses_conflicting_automatic_workspace_owners() {
+    let _guard = test_guard!();
+    let (fixture, policy) = topology_tempdir();
+    let app = fixture.path().join("app");
+    let nested = app.join("nested");
+    let foreign = fixture.path().join("foreign");
+    for root in [&app, &nested, &foreign] {
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+    }
+    std::fs::write(
+        foreign.join("Cargo.toml"),
+        "[workspace]\nmembers=['../app/nested']\nresolver='2'\n",
+    )
+    .unwrap();
+    let reporter = HookReporter::new(OutputVisibility::None);
+    let mut incorrectly_admitted = Vec::new();
+    for (section, dependency) in [
+        ("dependencies", "{path='nested',optional=true}"),
+        ("dev-dependencies", "{path='nested'}"),
+        (
+            "target.'cfg(target_os = \"none\")'.dependencies",
+            "{path='nested'}",
+        ),
+    ] {
+        for (owner, declaration) in [
+            ("nested root", "[workspace]\n"),
+            ("foreign pointer", "workspace='../../foreign'\n"),
+        ] {
+            std::fs::write(
+                app.join("Cargo.toml"),
+                format!(
+                    "[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n[workspace]\nresolver='2'\n[{section}]\nnested={dependency}\n",
+                ),
+            )
+            .unwrap();
+            std::fs::write(
+                nested.join("Cargo.toml"),
+                format!(
+                    "[package]\nname='nested'\nversion='0.1.0'\nedition='2021'\n{declaration}",
+                ),
+            )
+            .unwrap();
+            let runtime = build_dependency_runtime_plan(
+                &app,
+                Some(CompilationKind::CargoBuild),
+                &reporter,
+                &policy,
+            );
+            let decision = runtime.fail_open_decision.as_ref();
+            if decision.map(|decision| decision.reason_code)
+                != Some(DEPENDENCY_PREFLIGHT_CODE_MATERIALIZATION)
+            {
+                incorrectly_admitted.push(format!("{section}/{owner}: {decision:?}"));
+            } else {
+                assert!(should_force_local_fallback_for_runtime_fail_open(
+                    decision.unwrap().reason_code
+                ));
+            }
+        }
+    }
+    // Exclusion deliberately keeps a nested dependency in its own workspace.
+    // It must not be rejected merely because the dependency is below the root.
+    std::fs::write(
+        app.join("Cargo.toml"),
+        "[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n[workspace]\nexclude=['nested']\nresolver='2'\n[dependencies]\nnested={path='nested',optional=true}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        nested.join("Cargo.toml"),
+        "[package]\nname='nested'\nversion='0.1.0'\nedition='2021'\n[workspace]\n",
+    )
+    .unwrap();
+    let excluded =
+        build_dependency_runtime_plan(&app, Some(CompilationKind::CargoBuild), &reporter, &policy);
+    assert!(excluded.fail_open_decision.is_none(), "{excluded:#?}");
+    assert!(excluded.sync_roots.contains(&nested));
+    assert!(
+        incorrectly_admitted.is_empty(),
+        "conflicting automatic workspace ownership must force E415 local fallback:\n{}",
+        incorrectly_admitted.join("\n")
+    );
+    assert!(!app.join("Cargo.lock").exists());
+}
+
+#[test]
 fn test_build_sync_closure_plan_collapses_intra_workspace_members() {
     let _guard = test_guard!();
     // rch#33: building AT a workspace root, its members arrive as separate sync

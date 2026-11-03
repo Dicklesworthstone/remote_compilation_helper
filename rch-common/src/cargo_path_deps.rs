@@ -2408,7 +2408,7 @@ fn prepare_manifest_traversal(
     let root = find_manifest_workspace(&entry_root, entry_manifest_path, policy, &mut cache)?
         .unwrap_or_else(|| entry_root.clone());
     if root != entry_root {
-        validate_workspace_entry_membership(&entry_root, &root, policy, &mut cache)?;
+        validate_workspace_membership(&root, Some(&entry_root), policy, &mut cache)?;
     }
     let manifest_path = root.join("Cargo.toml");
     let manifest = cached_manifest_document(&manifest_path, &mut cache)?.clone();
@@ -2505,6 +2505,14 @@ fn resolve_materialization_from_manifests(
         manifest: entry_manifest,
         cache: mut manifest_cache,
     } = prepare_manifest_traversal(entry_manifest_path, policy)?;
+
+    if entry_manifest.has_workspace {
+        // Cargo validates automatic membership through all declared local
+        // dependency sections, even when an edge is inactive for this build.
+        // Keep that proof separate from active graph roots and from the wider
+        // materialization traversal, which also follows foreign packages.
+        validate_workspace_membership(&entry_root, None, policy, &mut manifest_cache)?;
+    }
 
     let mut partial = PartialGraph::default();
     if entry_manifest.has_workspace {
@@ -3194,18 +3202,39 @@ fn find_manifest_workspace(
     // Search the package itself first, and never inspect ambient manifests
     // above the approved source topology. Parsed ancestors are reused across
     // dependency lookups and membership discovery.
+    let search_root = if normalized.used_alias_prefix() {
+        // Normalization has already verified this configured alias. Keep its
+        // logical namespace so the package's own workspace pointer is visible.
+        policy.alias_root()
+    } else if package_root.starts_with(policy.canonical_root()) {
+        // The configured canonical prefix may itself be a directory symlink.
+        // Its physical confinement was verified by the same normalization.
+        policy.canonical_root()
+    } else {
+        normalized.canonical_root()
+    };
     for ancestor in package_root
         .ancestors()
-        .take_while(|ancestor| ancestor.starts_with(normalized.canonical_root()))
+        .take_while(|ancestor| ancestor.starts_with(search_root))
     {
         let candidate_manifest = ancestor.join("Cargo.toml");
-        if !manifest_cache.contains_key(&candidate_manifest)
-            && matches!(
+        if !manifest_cache.contains_key(&candidate_manifest) {
+            // Logical membership paths may contain directory aliases. A safe
+            // canonical leaf does not authorize reading an intermediate
+            // ancestor that escaped the approved topology and linked back in.
+            normalize_path_for_policy(
+                ancestor,
+                policy,
+                Some(declaring_manifest),
+                None,
+                "normalize workspace search ancestor",
+            )?;
+            if matches!(
                 std::fs::symlink_metadata(&candidate_manifest),
                 Err(ref error) if error.kind() == std::io::ErrorKind::NotFound
-            )
-        {
-            continue;
+            ) {
+                continue;
+            }
         }
         let candidate = cached_manifest_document(&candidate_manifest, manifest_cache)?;
         if candidate.has_workspace {
@@ -3219,8 +3248,18 @@ fn find_manifest_workspace(
         if let Some(workspace_path) = &candidate.package_workspace {
             // Cargo also honors a pointer in an ancestor package. Its target
             // must itself declare a workspace; pointer chains are invalid.
-            let explicit_root = normalize_path_for_policy(
+            let explicit_path = SelectedCargoTree::normalized_literal(
                 &ancestor.join(workspace_path),
+            )
+            .map_err(|error| {
+                CargoPathDependencyError::new(
+                    CargoPathDependencyErrorKind::ManifestParseFailure,
+                    format!("invalid package.workspace path: {error}"),
+                )
+                .with_manifest_path(declaring_manifest)
+            })?;
+            let explicit_root = normalize_path_for_policy(
+                &explicit_path,
                 policy,
                 Some(declaring_manifest),
                 None,
@@ -3244,9 +3283,9 @@ fn find_manifest_workspace(
     Ok(None)
 }
 
-fn validate_workspace_entry_membership(
-    entry_root: &Path,
+fn validate_workspace_membership(
     workspace_root: &Path,
+    required_entry: Option<&Path>,
     policy: &PathTopologyPolicy,
     manifest_cache: &mut BTreeMap<PathBuf, ManifestDocument>,
 ) -> Result<(), CargoPathDependencyError> {
@@ -3257,36 +3296,75 @@ fn validate_workspace_entry_membership(
         &workspace.workspace_members,
         &workspace.workspace_excludes,
         &workspace_manifest,
-    )?;
+    )?
+    .into_iter()
+    .map(|manifest| (manifest, true))
+    .collect::<Vec<_>>();
     if workspace.package_name.is_some() {
-        pending.push(workspace_manifest.clone());
+        pending.push((workspace_manifest.clone(), true));
     }
-    let mut visited = BTreeSet::new();
+    let mut visited = BTreeMap::new();
     let no_patches = ManifestPathPatches::new();
-    while let Some(manifest_path) = pending.pop() {
+    while let Some((manifest_path, explicit_member)) = pending.pop() {
+        // Cargo discovers membership through logical paths. An in-workspace
+        // directory symlink must not hide a conflicting root outside it, and
+        // relative paths still resolve from the declared logical directory.
+        let manifest_path =
+            SelectedCargoTree::normalized_literal(&manifest_path).map_err(|error| {
+                CargoPathDependencyError::new(
+                    CargoPathDependencyErrorKind::ManifestParseFailure,
+                    format!("invalid workspace membership path: {error}"),
+                )
+                .with_manifest_path(&manifest_path)
+            })?;
+        let logical_root = manifest_path
+            .parent()
+            .expect("workspace member has a parent");
         let package_root = normalize_path_for_policy(
-            manifest_path
-                .parent()
-                .expect("workspace member has a parent"),
+            logical_root,
             policy,
             Some(&manifest_path),
             None,
             "normalize workspace membership candidate",
         )?;
-        if !visited.insert(package_root.clone())
-            || (package_root != workspace_root
-                && manifest_workspace_excludes(workspace_root, &workspace, &package_root)?)
+        if !explicit_member
+            && logical_root != workspace_root
+            && manifest_workspace_excludes(workspace_root, &workspace, logical_root)?
         {
             continue;
         }
-        let manifest_path = package_root.join("Cargo.toml");
-        if find_manifest_workspace(&package_root, &manifest_path, policy, manifest_cache)?
-            .as_deref()
+        if find_manifest_workspace(logical_root, &manifest_path, policy, manifest_cache)?.as_deref()
             != Some(workspace_root)
         {
+            if explicit_member || logical_root.starts_with(workspace_root) {
+                return Err(CargoPathDependencyError::new(
+                    CargoPathDependencyErrorKind::ManifestParseFailure,
+                    "workspace member is not owned by the selected workspace",
+                )
+                .with_manifest_path(manifest_path)
+                .with_dependency_path(workspace_root));
+            }
+            // External foreign packages do not confer membership on their
+            // descendants, including paths that re-enter this workspace. Do
+            // not mark them visited: a later explicit seed or logical alias
+            // must validate its owner rather than vanish behind this edge.
             continue;
         }
-        if package_root == entry_root {
+        if let Some(previous) = visited.insert(package_root.clone(), manifest_path.clone()) {
+            if previous != manifest_path {
+                // Cargo treats distinct logical paths as distinct members and
+                // rejects their duplicate package name. Refuse the alias rather
+                // than skip its different relative paths or expand indefinitely.
+                return Err(CargoPathDependencyError::new(
+                    CargoPathDependencyErrorKind::ManifestParseFailure,
+                    "workspace package is reached through multiple logical paths",
+                )
+                .with_manifest_path(manifest_path)
+                .with_dependency_path(previous));
+            }
+            continue;
+        }
+        if required_entry == Some(package_root.as_path()) {
             return Ok(());
         }
         let manifest = cached_manifest_document(&manifest_path, manifest_cache)?.clone();
@@ -3295,7 +3373,7 @@ fn validate_workspace_entry_membership(
         // workspace definitions, and foreign workspaces do not confer membership.
         for dependency in &manifest.materialization_path_dependencies {
             for candidate in resolve_manifest_dependency_candidates(
-                &package_root,
+                logical_root,
                 workspace_root,
                 dependency,
                 &no_patches,
@@ -3303,22 +3381,36 @@ fn validate_workspace_entry_membership(
                 policy,
                 manifest_cache,
             )? {
-                let (_, dependency_manifest) = resolve_materialization_dependency_manifest(
+                // Validate canonical scope and the manifest before retaining
+                // the incoming logical path for membership discovery.
+                let candidate =
+                    SelectedCargoTree::normalized_literal(&candidate).map_err(|error| {
+                        CargoPathDependencyError::new(
+                            CargoPathDependencyErrorKind::ManifestParseFailure,
+                            format!("invalid workspace membership dependency path: {error}"),
+                        )
+                        .with_manifest_path(&manifest_path)
+                        .with_dependency_name(&dependency.dependency_name)
+                    })?;
+                resolve_materialization_dependency_manifest(
                     &candidate,
                     policy,
                     &manifest_path,
                     &dependency.dependency_name,
                 )?;
-                pending.push(dependency_manifest);
+                pending.push((candidate.join("Cargo.toml"), false));
             }
         }
     }
-    Err(CargoPathDependencyError::new(
-        CargoPathDependencyErrorKind::ManifestParseFailure,
-        "owning workspace does not include the entry package",
-    )
-    .with_manifest_path(entry_root.join("Cargo.toml"))
-    .with_dependency_path(workspace_root))
+    if let Some(entry_root) = required_entry {
+        return Err(CargoPathDependencyError::new(
+            CargoPathDependencyErrorKind::ManifestParseFailure,
+            "owning workspace does not include the entry package",
+        )
+        .with_manifest_path(entry_root.join("Cargo.toml"))
+        .with_dependency_path(workspace_root));
+    }
+    Ok(())
 }
 
 fn read_manifest_document(
@@ -7359,6 +7451,467 @@ patched.workspace = true
             assert_eq!(graph.edges[0].from, app);
             assert_eq!(graph.edges[0].to, member);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialization_rejects_conflicting_automatic_workspace_owners() {
+        let fixture = TopologyFixture::new("automatic-workspace-owner-conflicts");
+        let workspace = fixture.canonical_root.join("workspace");
+        let nested = workspace.join("nested");
+        let foreign = fixture.canonical_root.join("foreign");
+        write_lib_crate(&workspace, "owner", &[]);
+        write_lib_crate(&nested, "nested", &[]);
+        fs::create_dir_all(&foreign).unwrap();
+        fs::write(
+            foreign.join("Cargo.toml"),
+            "[workspace]\nmembers=['../workspace/nested']\n",
+        )
+        .unwrap();
+        let mut unexpectedly_admitted = Vec::new();
+        for (owner_case, nested_owner) in [
+            ("nested-root", "\n[workspace]\n"),
+            ("foreign-pointer", "workspace='../../foreign'\n"),
+        ] {
+            fs::write(
+                nested.join("Cargo.toml"),
+                format!("[package]\nname='nested'\nversion='0.1.0'\n{nested_owner}"),
+            )
+            .unwrap();
+            for (edge_case, declaration) in [
+                ("normal", "[dependencies]\nnested={path='nested'}\n"),
+                (
+                    "inherited",
+                    "[workspace.dependencies]\nnested={path='nested'}\n[dependencies]\nnested.workspace=true\n",
+                ),
+                (
+                    "optional",
+                    "[dependencies]\nnested={path='nested',optional=true}\n",
+                ),
+                ("dev", "[dev-dependencies]\nnested={path='nested'}\n"),
+                (
+                    "target",
+                    "[target.'cfg(target_os = \"none\")'.build-dependencies]\nnested={path='nested'}\n",
+                ),
+            ] {
+                fs::write(
+                    workspace.join("Cargo.toml"),
+                    format!("[package]\nname='owner'\nversion='0.1.0'\n[workspace]\n{declaration}"),
+                )
+                .unwrap();
+                match resolve_cargo_path_materialization_closure_with_policy(
+                    &workspace,
+                    &fixture.policy(),
+                ) {
+                    Ok(_) => unexpectedly_admitted.push(format!("{owner_case}/{edge_case}")),
+                    Err(error) => {
+                        assert_eq!(
+                            error.kind(),
+                            &CargoPathDependencyErrorKind::ManifestParseFailure,
+                            "{owner_case}/{edge_case}: {error}"
+                        );
+                        assert_eq!(
+                            error.manifest_path(),
+                            Some(nested.join("Cargo.toml").as_path())
+                        );
+                        assert_eq!(error.dependency_path(), Some(workspace.as_path()));
+                    }
+                }
+            }
+        }
+        assert!(
+            unexpectedly_admitted.is_empty(),
+            "Cargo rejects these automatic members with conflicting owners: {unexpectedly_admitted:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialization_membership_preserves_excluded_standalone_and_foreign_bridges() {
+        let fixture = TopologyFixture::new("automatic-workspace-membership-boundaries");
+        for (case, workspace_table, bridge_table, use_bridge) in [
+            ("excluded", "[workspace]\nexclude=['nested']\n", "", false),
+            ("standalone", "", "", false),
+            ("standalone-bridge", "[workspace]\n", "", true),
+            ("foreign-bridge", "[workspace]\n", "[workspace]\n", true),
+        ] {
+            let scenario = fixture.canonical_root.join(case);
+            let workspace = scenario.join("owner");
+            let nested = workspace.join("nested");
+            let bridge = scenario.join("bridge");
+            write_lib_crate(&workspace, "owner", &[]);
+            write_lib_crate(&nested, "nested", &[]);
+            fs::write(
+                nested.join("Cargo.toml"),
+                "[package]\nname='nested'\nversion='0.1.0'\n[workspace]\n",
+            )
+            .unwrap();
+            let dependency = if use_bridge {
+                write_lib_crate(&bridge, "bridge", &[]);
+                fs::write(
+                    bridge.join("Cargo.toml"),
+                    format!("[package]\nname='bridge'\nversion='0.1.0'\n{bridge_table}[dependencies]\nnested={{path='../owner/nested'}}\n"),
+                )
+                .unwrap();
+                "bridge={path='../bridge'}"
+            } else {
+                "nested={path='nested'}"
+            };
+            fs::write(
+                workspace.join("Cargo.toml"),
+                format!("[package]\nname='owner'\nversion='0.1.0'\n{workspace_table}[dependencies]\n{dependency}\n"),
+            )
+            .unwrap();
+            let closure = resolve_cargo_path_materialization_closure_with_policy(
+                &workspace,
+                &fixture.policy(),
+            )
+            .unwrap_or_else(|error| panic!("{case}: {error}"));
+            let mut expected = BTreeSet::from([workspace.clone(), nested]);
+            if use_bridge {
+                expected.insert(bridge);
+            }
+            assert_eq!(
+                closure
+                    .packages
+                    .iter()
+                    .map(|package| package.package_root.clone())
+                    .collect::<BTreeSet<_>>(),
+                expected,
+                "{case}: foreign dependencies must still be materialized"
+            );
+            assert_eq!(closure.root_packages, vec![workspace], "{case}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialization_membership_does_not_activate_inactive_packages() {
+        let fixture = TopologyFixture::new("automatic-workspace-inactive-members");
+        let workspace = fixture.canonical_root.join("workspace");
+        write_lib_crate(&workspace, "owner", &[]);
+        for (location, raw_path, pointer) in [
+            (workspace.join("member"), "member", ""),
+            (
+                fixture.canonical_root.join("member"),
+                "../member",
+                "workspace='../workspace'\n",
+            ),
+        ] {
+            write_lib_crate(&location, "member", &[]);
+            fs::write(
+                location.join("Cargo.toml"),
+                format!("[package]\nname='member'\nversion='0.1.0'\n{pointer}"),
+            )
+            .unwrap();
+            for (section, optional) in
+                [("dependencies", ",optional=true"), ("dev-dependencies", "")]
+            {
+                fs::write(
+                    workspace.join("Cargo.toml"),
+                    format!("[package]\nname='owner'\nversion='0.1.0'\n[workspace]\n[{section}]\nmember={{path='{raw_path}'{optional}}}\n"),
+                )
+                .unwrap();
+                let graph = resolve_from_manifest_fallback(
+                    &workspace.join("Cargo.toml"),
+                    &fixture.policy(),
+                )
+                .unwrap();
+                let closure = resolve_cargo_path_materialization_closure_with_policy(
+                    &workspace,
+                    &fixture.policy(),
+                )
+                .unwrap();
+                assert_eq!(graph.packages.len(), 1, "{raw_path}/{section}");
+                assert!(graph.edges.is_empty());
+                assert_eq!(graph.root_packages, vec![workspace.clone()]);
+                assert_eq!(closure.root_packages, graph.root_packages);
+                assert_eq!(closure.packages.len(), 2);
+                assert!(
+                    closure
+                        .packages
+                        .iter()
+                        .any(|package| package.package_root == location)
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialization_membership_checks_transitive_inactive_paths() {
+        let fixture = TopologyFixture::new("automatic-workspace-transitive-conflict");
+        let workspace = fixture.canonical_root.join("workspace");
+        let member = workspace.join("member");
+        let nested = workspace.join("nested");
+        write_lib_crate(&workspace, "owner", &[]);
+        write_lib_crate(&member, "member", &[]);
+        write_lib_crate(&nested, "nested", &[]);
+        fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname='owner'\nversion='0.1.0'\n[workspace]\n[dependencies]\nmember={path='member',optional=true}\n",
+        )
+        .unwrap();
+        fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname='member'\nversion='0.1.0'\n[dev-dependencies]\nnested={path='../nested'}\n",
+        )
+        .unwrap();
+        fs::write(
+            nested.join("Cargo.toml"),
+            "[package]\nname='nested'\nversion='0.1.0'\n[workspace]\n",
+        )
+        .unwrap();
+        let error =
+            resolve_cargo_path_materialization_closure_with_policy(&workspace, &fixture.policy())
+                .expect_err(
+                    "every automatic member's declared local edges require ownership validation",
+                );
+        assert_eq!(
+            error.kind(),
+            &CargoPathDependencyErrorKind::ManifestParseFailure
+        );
+        assert_eq!(
+            error.manifest_path(),
+            Some(nested.join("Cargo.toml").as_path())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialization_membership_preserves_logical_directory_aliases() {
+        let fixture = TopologyFixture::new("automatic-workspace-logical-aliases");
+        let workspace = fixture.canonical_root.join("workspace");
+        let external = fixture.canonical_root.join("external");
+        write_lib_crate(&workspace, "owner", &[]);
+        write_lib_crate(&external, "shared", &[]);
+        symlink(&external, workspace.join("nested")).unwrap();
+        symlink(&external, workspace.join("second")).unwrap();
+        fs::write(
+            external.join("Cargo.toml"),
+            "[package]\nname='shared'\nversion='0.1.0'\n[workspace]\n",
+        )
+        .unwrap();
+        for (path, admitted) in [("../external", true), ("nested", false)] {
+            fs::write(
+                workspace.join("Cargo.toml"),
+                format!("[package]\nname='owner'\nversion='0.1.0'\n[workspace]\n[dependencies]\nshared={{path='{path}'}}\n"),
+            )
+            .unwrap();
+            let result = resolve_cargo_path_materialization_closure_with_policy(
+                &workspace,
+                &fixture.policy(),
+            );
+            if admitted {
+                result.expect("a direct external workspace remains a foreign dependency");
+            } else {
+                let error =
+                    result.expect_err("a logical in-workspace alias cannot hide a second root");
+                assert_eq!(
+                    error.kind(),
+                    &CargoPathDependencyErrorKind::ManifestParseFailure
+                );
+                assert_eq!(
+                    error.manifest_path(),
+                    Some(workspace.join("nested/Cargo.toml").as_path())
+                );
+            }
+        }
+
+        fs::write(
+            external.join("Cargo.toml"),
+            "[package]\nname='shared'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        resolve_cargo_path_materialization_closure_with_policy(&workspace, &fixture.policy())
+            .expect("a logical in-workspace alias to a plain package is a valid member");
+        fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname='owner'\nversion='0.1.0'\n[workspace]\n[dependencies]\nleft={package='shared',path='nested',optional=true}\nright={package='shared',path='second',optional=true}\n",
+        )
+        .unwrap();
+        let error =
+            resolve_cargo_path_materialization_closure_with_policy(&workspace, &fixture.policy())
+                .expect_err("Cargo rejects the same package as two distinct logical members");
+        assert_eq!(
+            error.kind(),
+            &CargoPathDependencyErrorKind::ManifestParseFailure
+        );
+        assert!(error.detail().contains("multiple logical paths"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_membership_accepts_verified_topology_aliases() {
+        let fixture = TopologyFixture::new("automatic-workspace-topology-aliases");
+        let mut refused = Vec::new();
+        for (case, explicit, canonical_alias) in [
+            ("explicit-alias", true, false),
+            ("automatic-alias", false, false),
+            ("explicit-configured-root", true, true),
+            ("automatic-configured-root", false, true),
+        ] {
+            let policy = if canonical_alias {
+                PathTopologyPolicy::new(fixture.alias_root.clone(), fixture.alias_root.clone())
+            } else {
+                fixture.policy()
+            };
+            let workspace = fixture.canonical_root.join(case).join("workspace");
+            let member = fixture.canonical_root.join(case).join("member");
+            let alias_member = fixture.alias_root.join(case).join("member");
+            write_lib_crate(&workspace, "owner", &[]);
+            write_lib_crate(&member, "member", &[]);
+            let declaration = if explicit {
+                format!("members=['../../../../dp/{case}/member']\n")
+            } else {
+                format!(
+                    "[dependencies]\nmember={{path='{}'}}\n",
+                    alias_member.display()
+                )
+            };
+            fs::write(
+                workspace.join("Cargo.toml"),
+                format!("[package]\nname='owner'\nversion='0.1.0'\n[workspace]\n{declaration}"),
+            )
+            .unwrap();
+            fs::write(
+                member.join("Cargo.toml"),
+                format!(
+                    "[package]\nname='member'\nversion='0.1.0'\nworkspace='{}'\n",
+                    workspace.display()
+                ),
+            )
+            .unwrap();
+            let owner = find_manifest_workspace(
+                &alias_member,
+                &alias_member.join("Cargo.toml"),
+                &policy,
+                &mut BTreeMap::new(),
+            )
+            .unwrap();
+            if owner.as_deref() != Some(workspace.as_path()) {
+                refused.push(format!("{case}: alias owner lookup returned {owner:?}"));
+            }
+            for entry in [&workspace, &alias_member] {
+                match resolve_cargo_path_materialization_closure_with_policy(entry, &policy) {
+                    Ok(closure) => {
+                        assert_eq!(closure.workspace_root, Some(workspace.clone()));
+                        assert_eq!(closure.packages.len(), 2);
+                    }
+                    Err(error) => refused.push(format!("{case}/{}: {error}", entry.display())),
+                }
+            }
+        }
+        assert!(
+            refused.is_empty(),
+            "approved alias membership must remain valid: {refused:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_membership_resolves_logical_alias_package_pointer() {
+        let fixture = TopologyFixture::new("automatic-workspace-alias-pointer");
+        let workspace = fixture.canonical_root.join("workspace");
+        let external = fixture.canonical_root.join("outside/member");
+        let logical_member = workspace.join("member");
+        write_lib_crate(&workspace, "owner", &[]);
+        write_lib_crate(&external, "member", &[]);
+        symlink(&external, &logical_member).unwrap();
+        fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname='owner'\nversion='0.1.0'\n[workspace]\n[dependencies]\nmember={path='member'}\n",
+        )
+        .unwrap();
+        fs::write(
+            external.join("Cargo.toml"),
+            "[package]\nname='member'\nversion='0.1.0'\nworkspace='..'\n",
+        )
+        .unwrap();
+        let mut cache = BTreeMap::new();
+        assert_eq!(
+            find_manifest_workspace(
+                &logical_member,
+                &logical_member.join("Cargo.toml"),
+                &fixture.policy(),
+                &mut cache,
+            )
+            .expect("package.workspace resolves from the logical manifest directory"),
+            Some(workspace.clone()),
+        );
+        validate_workspace_membership(&workspace, None, &fixture.policy(), &mut cache)
+            .expect("a logical member pointer must not resolve to the physical target's parent");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialization_membership_resolves_alias_children_logically() {
+        let fixture = TopologyFixture::new("automatic-workspace-alias-children");
+        let workspace = fixture.canonical_root.join("workspace");
+        let external = fixture.canonical_root.join("outside/member");
+        let physical_leaf = fixture.canonical_root.join("outside/leaf");
+        let logical_leaf = workspace.join("leaf");
+        write_lib_crate(&workspace, "owner", &[]);
+        write_lib_crate(&external, "member", &[("leaf", "../leaf")]);
+        write_lib_crate(&physical_leaf, "leaf", &[]);
+        write_lib_crate(&logical_leaf, "leaf", &[]);
+        symlink(&external, workspace.join("member")).unwrap();
+        fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname='owner'\nversion='0.1.0'\n[workspace]\n[dependencies]\nmember={path='member'}\n",
+        )
+        .unwrap();
+        fs::write(
+            logical_leaf.join("Cargo.toml"),
+            "[package]\nname='leaf'\nversion='0.1.0'\n[workspace]\n",
+        )
+        .unwrap();
+        let error =
+            resolve_cargo_path_materialization_closure_with_policy(&workspace, &fixture.policy())
+                .expect_err(
+                    "membership follows the alias-relative child, not the physical sibling",
+                );
+        assert_eq!(
+            error.kind(),
+            &CargoPathDependencyErrorKind::ManifestParseFailure
+        );
+        assert_eq!(
+            error.manifest_path(),
+            Some(logical_leaf.join("Cargo.toml").as_path())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialization_membership_refuses_escaped_intermediate_ancestors() {
+        let fixture = TopologyFixture::new("automatic-workspace-alias-escape");
+        let workspace = fixture.canonical_root.join("workspace");
+        let safe_leaf = fixture.canonical_root.join("safe-leaf");
+        let outside = fixture.root.join("outside");
+        write_lib_crate(&workspace, "owner", &[]);
+        write_lib_crate(&safe_leaf, "shared", &[]);
+        fs::create_dir_all(&outside).unwrap();
+        // If the lookup reads this unapproved manifest, it would return a TOML
+        // parse error. It must instead reject the ancestor's path before reading.
+        fs::write(outside.join("Cargo.toml"), "[unapproved malformed manifest").unwrap();
+        symlink(&outside, workspace.join("escape")).unwrap();
+        symlink(&safe_leaf, outside.join("back")).unwrap();
+        fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname='owner'\nversion='0.1.0'\n[workspace]\n[dependencies]\nshared={path='escape/back'}\n",
+        )
+        .unwrap();
+        let error =
+            resolve_cargo_path_materialization_closure_with_policy(&workspace, &fixture.policy())
+                .expect_err("a safe canonical leaf does not authorize an escaped ancestor");
+        assert_eq!(
+            error.kind(),
+            &CargoPathDependencyErrorKind::PathPolicyViolation
+        );
+        assert_eq!(
+            error.dependency_path(),
+            Some(workspace.join("escape").as_path())
+        );
     }
 
     #[cfg(unix)]
