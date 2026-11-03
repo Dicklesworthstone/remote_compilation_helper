@@ -2,6 +2,719 @@ use std::process::Command;
 
 use super::common::{assert_contains, init_test_logging};
 
+/// Actual CLI exits and IPC, with explicitly local SSH transport fixtures.
+/// Each worker has real, separate paths and executes the compiled namespace
+/// registry, path validator and admission retry script. This is not a live SSH
+/// fleet or controller-lifecycle qualification (source_namespace_control owns
+/// that suite). The compatible worker deliberately stops at source admission;
+/// no synthetic compiler success is asserted.
+#[cfg(target_os = "linux")]
+mod source_topology_cli {
+    use rch_common::{SourceTopology, SourceTopologyMismatch};
+    use serde_json::{Value, json};
+    use std::collections::BTreeMap;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
+    use std::process::{Command, Output};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Layout {
+        Conflict,
+        Busy,
+        Alternate,
+        AlternateBusy,
+    }
+
+    #[derive(Clone, Default)]
+    struct PeerState {
+        requests: Vec<String>,
+        selections: Vec<String>,
+        releases: Vec<Value>,
+        cached: Option<SourceTopologyMismatch>,
+        builds: BTreeMap<u64, (String, String)>,
+    }
+
+    struct Fixture {
+        root: tempfile::TempDir,
+        project: PathBuf,
+        topology: SourceTopology,
+        state: Arc<Mutex<PeerState>>,
+        stop: Arc<AtomicBool>,
+        server: Option<JoinHandle<()>>,
+    }
+
+    impl Fixture {
+        fn new(layout: Layout) -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let base = root.path().canonicalize().unwrap();
+            let project = base.join("projects/app");
+            for directory in ["home", "config", "state", "bin", "projects/app/src"] {
+                std::fs::create_dir_all(base.join(directory)).unwrap();
+            }
+            std::fs::write(
+                project.join("Cargo.toml"),
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            )
+            .unwrap();
+            std::fs::write(project.join("src/lib.rs"), "").unwrap();
+            symlink(base.join("projects"), base.join("alias")).unwrap();
+            let topology = SourceTopology {
+                canonical_root: base.join("projects").to_string_lossy().into_owned(),
+                alias_root: base.join("alias").to_string_lossy().into_owned(),
+            };
+            let socket = base.join("daemon.sock");
+            std::fs::write(
+                base.join("config/config.toml"),
+                format!(
+                    "[general]\nsocket_path = {:?}\nforce_remote = true\n\
+                 [self_healing]\nhook_starts_daemon = false\n\
+                 [compilation]\nallow_local_fallback = true\nlocal_slots = 0\n\
+                 [transfer]\nssh_control_persist_secs = 0\n\
+                 [path_topology]\ncanonical_root = {:?}\nalias_root = {:?}\n\
+                 [output]\nvisibility = \"none\"\n",
+                    socket.to_str().unwrap(),
+                    topology.canonical_root,
+                    topology.alias_root,
+                ),
+            )
+            .unwrap();
+            std::fs::write(base.join("config/workers.toml"), "workers = []\n").unwrap();
+            let local_command = base.join("bin/cargo");
+            std::fs::write(
+                &local_command,
+                // The real planner first tries read-only locked metadata,
+                // then parses these dependency-free manifests when Cargo
+                // refuses a missing lock. Only workload execution is forbidden.
+                "#!/bin/sh\n\
+                 if [ \"${1-}\" = metadata ] && [ \"${2-}\" = --locked ]; then exit 101; fi\n\
+                 printf 'local command ran\\n' > \"$RCH_TOPOLOGY_FIXTURE/local-ran\"\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&local_command, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let ssh = base.join("bin/ssh");
+            std::fs::write(&ssh, SSH_FIXTURE).unwrap();
+            std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::write(
+                base.join("paths.sh"),
+                include_str!("../../src/hook/source_namespace_paths.sh"),
+            )
+            .unwrap();
+            std::fs::write(
+                base.join("admission.sh"),
+                include_str!("../../src/hook/source_claim_admission.sh"),
+            )
+            .unwrap();
+            std::fs::write(
+                base.join("registry.sh"),
+                format!(
+                    "{}\n{}",
+                    rch_common::stale_target_reap::SOURCE_CLAIM_RECORD_HELPERS,
+                    include_str!("../../src/hook/source_claim_registry.sh")
+                ),
+            )
+            .unwrap();
+            for worker in ["bad", "good"] {
+                let directory = base.join(worker);
+                std::fs::create_dir_all(directory.join("canonical")).unwrap();
+                std::fs::write(directory.join("live-checkouts"), "").unwrap();
+                if worker == "bad" && layout != Layout::Busy {
+                    std::fs::create_dir_all(directory.join("physical")).unwrap();
+                    symlink(directory.join("physical"), directory.join("alias")).unwrap();
+                    std::fs::write(
+                        directory.join("physical/keep"),
+                        b"private worker source contents",
+                    )
+                    .unwrap();
+                } else if worker == "good" {
+                    symlink(directory.join("canonical"), directory.join("alias")).unwrap();
+                }
+            }
+            if layout == Layout::Busy {
+                std::fs::write(base.join("bad/hold-source"), "").unwrap();
+            }
+            let state = Arc::new(Mutex::new(PeerState::default()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let listener = UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let server_state = state.clone();
+            let server_stop = stop.clone();
+            let server_topology = topology.clone();
+            let server = thread::spawn(move || {
+                while !server_stop.load(Ordering::Acquire) {
+                    let (stream, _) = match listener.accept() {
+                        Ok(connection) => connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                            continue;
+                        }
+                        Err(error) => panic!("accept fixture connection: {error}"),
+                    };
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let route = line.trim_end().to_owned();
+                    let mut state = server_state.lock().unwrap();
+                    state.requests.push(route.clone());
+                    let reply = if route == "GET /restart-admission" {
+                        json!({"admission_closed": false})
+                    } else if route.starts_with("GET /select-worker") {
+                        let query = parameters(&route);
+                        let requested: SourceTopology =
+                            serde_json::from_str(&query["source_topology"]).unwrap();
+                        assert_eq!(requested, server_topology);
+                        let worker = query.get("worker").cloned().unwrap_or_else(|| {
+                            if state.cached.is_some()
+                                && matches!(layout, Layout::Alternate | Layout::AlternateBusy)
+                            {
+                                "good".into()
+                            } else {
+                                "bad".into()
+                            }
+                        });
+                        state.selections.push(worker.clone());
+                        if worker == "good" && layout == Layout::AlternateBusy {
+                            json!({"worker": null, "reason": "all_workers_busy"})
+                        } else if let Some(mismatch) =
+                            state.cached.as_ref().filter(|_| worker == "bad")
+                        {
+                            cached_refusal(mismatch)
+                        } else {
+                            let build = 40 + state.selections.len() as u64;
+                            state
+                                .builds
+                                .insert(build, (worker.clone(), query["local_wrapper_id"].clone()));
+                            json!({"worker": {
+                                "id": worker, "host": format!("fixture-{worker}.invalid"),
+                                "user": "fixture", "identity_file": "/fixture-key",
+                                "slots_available": 4, "speed_score": 80.0,
+                            }, "reason": "success", "build_id": build})
+                        }
+                    } else if route.starts_with("POST /release-worker?") {
+                        let query = parameters(&route);
+                        if let Some(encoded) = query.get("worker_source_topology_mismatch") {
+                            let mismatch: SourceTopologyMismatch =
+                                serde_json::from_str(encoded).unwrap();
+                            mismatch.validate().unwrap();
+                            assert_eq!(mismatch.topology, server_topology);
+                            state.cached = Some(mismatch);
+                        }
+                        state.releases.push(serde_json::to_value(query).unwrap());
+                        json!({"status": "ok"})
+                    } else if route.starts_with("GET /builds/") {
+                        let id = route["GET /builds/".len()..]
+                            .split('?')
+                            .next()
+                            .unwrap()
+                            .parse::<u64>()
+                            .unwrap();
+                        let (worker, wrapper) = &state.builds[&id];
+                        json!({"status": "completed", "local_wrapper_id": wrapper,
+                            "record": {"id": id, "worker_id": worker, "exit_code": 1}})
+                    } else if route == "POST /build-heartbeat" {
+                        let mut body = String::new();
+                        reader.read_line(&mut body).unwrap();
+                        let heartbeat: Value = serde_json::from_str(&body).unwrap();
+                        json!({"status": "ok", "build_id": heartbeat["build_id"],
+                            "worker_id": heartbeat["worker_id"], "phase": heartbeat["phase"]})
+                    } else if route == "GET /status" {
+                        status_reply(layout, state.cached.as_ref())
+                    } else if route == "GET /workers/capabilities" {
+                        json!({"workers": [{"id": "bad", "host": "fixture-bad.invalid",
+                            "user": "fixture", "capabilities": {},
+                            "source_topology_mismatches": state.cached.iter().collect::<Vec<_>>()
+                        }]})
+                    } else if route.starts_with("POST /workers/")
+                        && route.contains("process-observation")
+                    {
+                        json!({"status": "ok"})
+                    } else {
+                        panic!("unexpected fixture request {route}");
+                    };
+                    drop(state);
+                    write!(
+                        reader.get_mut(),
+                        "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{reply}\n"
+                    )
+                    .unwrap();
+                }
+            });
+            Self {
+                root,
+                project,
+                topology,
+                state,
+                stop,
+                server: Some(server),
+            }
+        }
+
+        fn command(&self) -> Command {
+            let base = self.root.path();
+            let path = std::env::join_paths([
+                base.join("bin"),
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/bin"),
+            ])
+            .unwrap();
+            let mut command = Command::new(env!("CARGO_BIN_EXE_rch"));
+            command
+                .env_clear()
+                .env("PATH", path)
+                .env("HOME", base.join("home"))
+                .env("RCH_CONFIG_DIR", base.join("config"))
+                .env("RCH_STATE_HOME", base.join("state"))
+                .env("XDG_CACHE_HOME", base.join("cache"))
+                .env("RCH_TOPOLOGY_FIXTURE", base)
+                .env("RCH_DISABLE_CONFIG_CACHE", "1")
+                .env("RCH_NO_UPDATE_CHECK", "1")
+                .env("RCH_QUEUE_WHEN_BUSY", "0")
+                .env("RCH_RESTART_ADMISSION_WAIT_SECS", "0")
+                .env("RUSTUP_TOOLCHAIN", "stable")
+                .env("NO_COLOR", "1")
+                .current_dir(&self.project)
+                .args(["--no-self-healing", "--json", "--format=json"]);
+            command
+        }
+
+        fn run(&self, pinned: bool, require_remote: bool) -> Output {
+            let mut command = self.command();
+            command
+                .env("RCH_REQUIRE_REMOTE", if require_remote { "1" } else { "0" })
+                .arg("exec");
+            if pinned {
+                command.args(["--worker", "bad"]);
+            }
+            command.args(["--", "cargo", "check"]).output().unwrap()
+        }
+
+        fn events(&self) -> Vec<Value> {
+            std::fs::read_to_string(self.root.path().join("ssh-events.jsonl"))
+                .unwrap_or_default()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        }
+
+        fn assert_no_local(&self) {
+            assert!(
+                !self.root.path().join("local-ran").exists(),
+                "workload ran locally"
+            );
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(server) = self.server.take() {
+                let result = server.join();
+                if !std::thread::panicking() {
+                    result.unwrap();
+                }
+            }
+        }
+    }
+
+    fn parameters(route: &str) -> BTreeMap<String, String> {
+        route
+            .split_once('?')
+            .unwrap()
+            .1
+            .split('&')
+            .map(|part| {
+                let (key, value) = part.split_once('=').unwrap();
+                (
+                    key.to_owned(),
+                    urlencoding::decode(value).unwrap().into_owned(),
+                )
+            })
+            .collect()
+    }
+
+    fn cached_refusal(mismatch: &SourceTopologyMismatch) -> Value {
+        json!({"worker": null, "reason": "source_topology_incompatible", "diagnostics": {
+            "required_runtime": "rust", "estimated_cores": 1, "min_success_rate": 0.0,
+            "fallback_min_success_rate": 0.0, "active_project_exclusion_count": 0,
+            "workers": [{"worker_id": "bad", "status": "healthy", "circuit_state": "closed",
+                "pressure_state": "healthy", "pressure_reason_code": "ok", "success_rate": 1.0,
+                "min_success_rate": 0.0, "fallback_min_success_rate": 0.0,
+                "required_runtime": "rust", "runtime_available": true, "available_slots": 4,
+                "total_slots": 4, "estimated_cores": 1, "active_project_excluded": false,
+                "final_decision": "deny", "final_reason": format!("{mismatch:?}"),
+                "reason_codes": ["topology.source_incompatible"]}]
+        }})
+    }
+
+    fn status_reply(layout: Layout, mismatch: Option<&SourceTopologyMismatch>) -> Value {
+        let ids = if matches!(layout, Layout::Alternate | Layout::AlternateBusy) {
+            vec!["bad", "good"]
+        } else {
+            vec!["bad"]
+        };
+        json!({"daemon": {"pid": 1, "uptime_secs": 1, "version": "fixture",
+            "socket_path": "fixture", "started_at": "fixture", "workers_total": ids.len(),
+            "workers_healthy": ids.len(), "slots_total": 8, "slots_available": 8},
+            "workers": ids.iter().map(|id| json!({"id": id, "host": format!("fixture-{id}.invalid"),
+                "user": "fixture", "status": "healthy", "circuit_state": "closed",
+                "used_slots": 0, "total_slots": 4, "speed_score": 80.0, "last_error": null,
+                "source_topology_mismatches": mismatch.filter(|_| *id == "bad").into_iter().collect::<Vec<_>>()
+            })).collect::<Vec<_>>(),
+            "active_builds": [], "recent_builds": [], "issues": [],
+            "stats": {"total_builds": 0, "success_count": 0, "failure_count": 0,
+                "remote_count": 0, "local_count": 0, "avg_duration_ms": 0}})
+    }
+
+    fn envelope(output: &Output) -> Value {
+        let text = String::from_utf8_lossy(&output.stdout);
+        serde_json::from_str(
+            text.lines()
+                .rev()
+                .find(|line| !line.is_empty())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing CLI result: stderr={}",
+                        String::from_utf8_lossy(&output.stderr)
+                    )
+                }),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn source_topology_cli_conflict_is_permanent_even_when_local_fallback_is_allowed() {
+        for (pinned, required) in [(true, true), (false, true), (false, false)] {
+            let fixture = Fixture::new(Layout::Conflict);
+            let output = fixture.run(pinned, required);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(1), "{stderr}");
+            let result = envelope(&output);
+            assert_eq!(result["outcome"], "refused", "{result}");
+            assert_eq!(result["worker_id"], "bad");
+            assert_eq!(result["error_code"], "RCH_SOURCE_TOPOLOGY_INCOMPATIBLE");
+            assert!(
+                stderr.contains("bad") && stderr.contains(&fixture.topology.alias_root),
+                "{stderr}"
+            );
+            assert!(
+                stderr.contains("physical") && stderr.contains("compatible"),
+                "{stderr}"
+            );
+            assert!(!stderr.contains("retryable"), "{stderr}");
+            assert!(
+                !stderr.contains("private worker source contents"),
+                "{stderr}"
+            );
+            fixture.assert_no_local();
+            let events = fixture.events();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["phase"] == "namespace")
+                    .count(),
+                1,
+                "{events:?}"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .find(|event| event["phase"] == "namespace")
+                    .unwrap()["status"],
+                73
+            );
+            assert_eq!(
+                std::fs::read_to_string(fixture.root.path().join("bad/attempts"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+            let state = fixture.state.lock().unwrap();
+            assert_eq!(state.selections, ["bad"]);
+            assert_eq!(state.releases.len(), 1);
+            assert!(state.releases[0]["worker_source_topology_mismatch"].is_string());
+            assert!(state.releases[0].get("worker_source_busy").is_none());
+        }
+    }
+
+    #[test]
+    fn source_topology_cli_cached_refusal_does_not_contact_incompatible_worker_again() {
+        let fixture = Fixture::new(Layout::Conflict);
+        let first = fixture.run(true, true);
+        assert_eq!(
+            first.status.code(),
+            Some(1),
+            "{}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        assert_eq!(
+            envelope(&first)["error_code"],
+            "RCH_SOURCE_TOPOLOGY_INCOMPATIBLE"
+        );
+        let events = fixture.events();
+        let second = fixture.run(true, true);
+        assert_eq!(
+            second.status.code(),
+            Some(1),
+            "{}",
+            String::from_utf8_lossy(&second.stderr)
+        );
+        assert_eq!(envelope(&second)["outcome"], "refused");
+        assert_eq!(
+            envelope(&second)["error_code"],
+            "RCH_SOURCE_TOPOLOGY_INCOMPATIBLE"
+        );
+        let diagnostic = String::from_utf8_lossy(&second.stderr);
+        assert!(diagnostic.contains("bad"), "{diagnostic}");
+        assert!(
+            diagnostic.contains(&fixture.topology.canonical_root),
+            "{diagnostic}"
+        );
+        assert_eq!(fixture.events(), events);
+        fixture.assert_no_local();
+        assert_eq!(fixture.state.lock().unwrap().selections, ["bad", "bad"]);
+
+        // Exercise the actual operator-facing CLI serialization of the same
+        // saved refusal. Durable daemon storage is covered by daemon tests.
+        let capabilities = fixture
+            .command()
+            .args(["workers", "capabilities"])
+            .output()
+            .unwrap();
+        assert!(
+            capabilities.status.success(),
+            "{}",
+            String::from_utf8_lossy(&capabilities.stderr)
+        );
+        let report: Value = serde_json::from_slice(&capabilities.stdout).unwrap();
+        assert_eq!(report["success"], true, "{report}");
+        let worker = &report["data"]["workers"][0];
+        assert_eq!(worker["id"], "bad", "{report}");
+        let saved = fixture.state.lock().unwrap().cached.clone().unwrap();
+        let reported: SourceTopologyMismatch =
+            serde_json::from_value(worker["source_topology_mismatches"][0].clone()).unwrap();
+        assert_eq!(reported, saved);
+        assert_eq!(reported.topology, fixture.topology);
+        assert!(reported.detail.contains("canonical_physical="));
+        assert!(reported.detail.contains("alias_physical="));
+        assert!(reported.detail.contains("/physical"));
+        assert!(
+            !report
+                .to_string()
+                .contains("private worker source contents")
+        );
+        assert_eq!(fixture.events(), events);
+        fixture.assert_no_local();
+    }
+
+    #[test]
+    fn source_topology_cli_temporary_ownership_keeps_retryable_exit_103() {
+        let fixture = Fixture::new(Layout::Busy);
+        let output = fixture.run(true, true);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(103), "{stderr}");
+        assert_eq!(envelope(&output)["outcome"], "refused");
+        assert!(stderr.contains("retryable"), "{stderr}");
+        let events = fixture.events();
+        assert_eq!(
+            events
+                .iter()
+                .find(|event| event["phase"] == "namespace")
+                .unwrap()["status"],
+            75
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.path().join("bad/attempts"))
+                .unwrap()
+                .lines()
+                .count(),
+            6
+        );
+        let state = fixture.state.lock().unwrap();
+        assert!(state.cached.is_none());
+        assert_eq!(state.releases[0]["worker_source_busy"], "1");
+        assert!(
+            state.releases[0]
+                .get("worker_source_topology_mismatch")
+                .is_none()
+        );
+        fixture.assert_no_local();
+    }
+
+    #[test]
+    fn source_topology_cli_failover_accepts_different_compatible_worker_layout() {
+        let fixture = Fixture::new(Layout::Alternate);
+        let output = fixture.run(false, true);
+        assert!(
+            !output.status.success(),
+            "fixture intentionally stops before source admission"
+        );
+        let events = fixture.events();
+        let namespaces = events
+            .iter()
+            .filter(|event| event["phase"] == "namespace")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            namespaces.len(),
+            2,
+            "stderr={} events={events:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(namespaces[0]["worker"], "bad");
+        assert_eq!(namespaces[0]["status"], 73);
+        assert_eq!(namespaces[1]["worker"], "good");
+        assert_eq!(namespaces[1]["status"], 0);
+        assert!(events.iter().any(
+            |event| event["worker"] == "good" && event["phase"] == "source_admission_boundary"
+        ));
+        assert_eq!(fixture.state.lock().unwrap().selections, ["bad", "good"]);
+        assert_eq!(
+            std::fs::canonicalize(fixture.root.path().join("good/alias")).unwrap(),
+            fixture.root.path().join("good/canonical")
+        );
+        fixture.assert_no_local();
+    }
+
+    #[test]
+    fn source_topology_cli_busy_alternative_retries_without_repeating_incompatible_worker() {
+        let fixture = Fixture::new(Layout::AlternateBusy);
+        for _ in 0..2 {
+            let output = fixture.run(false, true);
+            let diagnostic = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(103), "{diagnostic}");
+            assert_eq!(envelope(&output)["outcome"], "refused");
+            fixture.assert_no_local();
+        }
+        let events = fixture.events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["phase"] == "namespace")
+                .count(),
+            1,
+            "{events:?}"
+        );
+        let state = fixture.state.lock().unwrap();
+        assert_eq!(state.selections, ["bad", "good", "good"]);
+        assert!(state.cached.is_some());
+        assert_eq!(state.releases.len(), 1);
+        drop(state);
+
+        // A relocation attempt follows the same no-local rule even when the
+        // original invocation allowed ordinary local fallbacks.
+        let fixture = Fixture::new(Layout::AlternateBusy);
+        let output = fixture.run(false, false);
+        assert_eq!(
+            output.status.code(),
+            Some(103),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fixture.assert_no_local();
+    }
+
+    const SSH_FIXTURE: &str = r#"#!/usr/bin/env python3
+import hashlib, json, os, pathlib, shlex, subprocess, sys
+base = pathlib.Path(os.environ['RCH_TOPOLOGY_FIXTURE'])
+destination = next((arg for arg in sys.argv[1:] if arg.startswith('fixture@fixture-')), None)
+if destination not in ('fixture@fixture-bad.invalid', 'fixture@fixture-good.invalid'):
+    sys.exit('unexpected fixture SSH destination')
+worker = 'bad' if destination.endswith('-bad.invalid') else 'good'
+root = base / worker
+canonical, alias = root / 'canonical', root / 'alias'
+def event(phase, status):
+    with (base / 'ssh-events.jsonl').open('a') as stream:
+        stream.write(json.dumps(dict(worker=worker, phase=phase, status=status)) + '\n')
+first = sys.stdin.buffer.readline()
+if first == b'{\n':
+    # A source holder keeps stdin open for heartbeat/release frames. Identify
+    # its actual transport header without waiting for EOF or issuing a grant.
+    header = (sys.stdin.buffer.readline(), sys.stdin.buffer.readline())
+    assert header == (b'set -eu\n', b"exec 3<<'RCH_SOURCE_LOCK_SESSION_PROGRAM'\n"), header
+    event('source_admission_boundary', 73)
+    print('RCH fixture stopped after namespace: source admission intentionally unavailable', file=sys.stderr)
+    sys.exit(73)
+payload = first.decode() + sys.stdin.buffer.read().decode()
+if payload.startswith('(set -eu\nrch_destination='):
+    # Execute the production read-only guard against the worker's mapped
+    # fixture root and host marker, rather than accepting every control RPC.
+    assert 'RCH_SYNC_LIVE_CHECKOUT_REFUSED:' in payload
+    assert payload.count('/etc/rch/live-checkouts') == 1
+    lines = payload.splitlines(keepends=True)
+    destination = pathlib.Path(shlex.split(lines[1].split('=', 1)[1])[0])
+    relative = destination.relative_to(base / 'projects')
+    lines[1] = 'rch_destination=' + shlex.quote(str(canonical / relative)) + '\n'
+    guard = ''.join(lines).replace('/etc/rch/live-checkouts', shlex.quote(str(root / 'live-checkouts')))
+    result = subprocess.run(['sh', '-s'], input=guard.encode(), capture_output=True, timeout=5)
+    event('live_checkout_guard', result.returncode)
+    sys.stdout.buffer.write(result.stdout)
+    sys.stderr.buffer.write(result.stderr)
+    sys.exit(result.returncode)
+if 'RCH_TOPOLOGY_INITIALIZATION_REQUIRED' in payload:
+    present = all(os.path.lexists(path) for path in (canonical, alias))
+    print('RCH_TOPOLOGY_PATHS_PRESENT' if present else 'RCH_TOPOLOGY_INITIALIZATION_REQUIRED')
+    event('probe', 0)
+    sys.exit(0)
+if 'RCH_NAMESPACE_SCOPE' not in payload:
+    event('unexpected_control_command', 73)
+    sys.exit('unexpected fixture SSH control command')
+paths = (base / 'paths.sh').read_text()
+assert 'RCH_SOURCE_TOPOLOGY_INCOMPATIBLE' in payload, 'missing namespace refusal protocol'
+registry = root / 'registry'
+for name in ('', 'released', 'cancelled', 'quarantine'):
+    (registry / name).mkdir(parents=True, exist_ok=True)
+lock = registry / 'metadata.lock'
+lock.touch(exist_ok=True)
+roots = ('\n'.join(sorted(set(map(str, (canonical, alias))))) + '\n').encode()
+digest = hashlib.sha256(roots).hexdigest()
+program = (base / 'registry.sh').read_text()
+def command(operation, identity, *extra):
+    return ['flock', '-x', str(lock), 'sh', '-c', program, 'rch-fixture-registry',
+            str(registry), identity, digest, operation, *extra]
+if (root / 'hold-source').exists() and not (root / 'seeded').exists():
+    seeded = subprocess.run(command('acquire', 'a1'), input=roots, capture_output=True, timeout=5)
+    if seeded.returncode:
+        sys.stderr.buffer.write(seeded.stderr)
+        sys.exit(seeded.returncode)
+    (root / 'seeded').touch()
+arguments = ' '.join(shlex.quote(str(path)) for path in (canonical, alias))
+check = 'set -- check ' + arguments + '\n' + paths
+create = 'set -- create ' + arguments + '\n' + paths
+attempt = command('topology', 'b1', check, create)
+script = ('rch_source_attempt() { (\nset -eu\nprintf "attempt\\n" >> '
+          + shlex.quote(str(root / 'attempts')) + '\nexec ' + shlex.join(attempt)
+          + " <<'RCH_FIXTURE_ROOTS'\n" + roots.decode() + 'RCH_FIXTURE_ROOTS\n); }\n'
+          + 'rch_admission_attempts=6\n' + (base / 'admission.sh').read_text())
+result = subprocess.run(['sh', '-c', script], capture_output=True, timeout=10)
+event('namespace', result.returncode)
+sys.stdout.buffer.write(result.stdout)
+# The adapter maps one logical remote pathname namespace onto each local
+# worker directory. Translate only the validated logical labels in its real
+# path diagnostic; preserve the actual observed physical roots and verdict.
+for line in result.stderr.decode().splitlines():
+    if line.startswith('RCH_SOURCE_TOPOLOGY_PATHS '):
+        mapping = json.loads(line.removeprefix('RCH_SOURCE_TOPOLOGY_PATHS '))
+        assert mapping['canonical'] == str(canonical) and mapping['alias'] == str(alias)
+        mapping['canonical'] = str(base / 'projects')
+        mapping['alias'] = str(base / 'alias')
+        line = 'RCH_SOURCE_TOPOLOGY_PATHS ' + json.dumps(mapping, ensure_ascii=True)
+    print(line, file=sys.stderr)
+sys.exit(result.returncode)
+"#;
+}
+
 #[cfg(unix)]
 #[test]
 fn shim_status_reports_actual_path_interception_and_absolute_toolchain_gap() {

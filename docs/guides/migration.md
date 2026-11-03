@@ -197,13 +197,23 @@ During migration, mixed states are expected temporarily. Treat them explicitly:
 |---|---|---|
 | `projects_root_ok=true` | Topology healthy | Keep worker eligible |
 | `alias_missing` | `/dp` missing | Re-run setup, verify symlink creation |
-| `alias_wrong_target:*` | `/dp` points elsewhere | Repoint alias, re-run probe |
-| `alias_not_symlink` | `/dp` exists but wrong type | Manual repair (safe remove/recreate symlink) |
+| `alias_wrong_target:*` | `/dp` points elsewhere | Preserve both roots; select a compatible worker or have the operator reconcile the mapping after inspecting source owners |
+| `alias_not_symlink` | `/dp` exists but wrong type | Preserve the existing directory and its data; investigate its intended ownership before any operator repair |
+| `alias_not_directory` | The alias resolves to a file or another non-directory object | Preserve the existing object; select a compatible worker or have the operator correct the mapping safely |
 | `canonical_not_directory` | `/data/projects` exists but invalid type | Manual integrity remediation before retry |
 | `canonical_missing` | canonical root absent | Re-run setup, confirm directory creation |
+| `source_topology_incompatible` | This worker rejected the dispatcher's requested physical mapping | Select a compatible worker; after safe operator correction, run `rch workers capabilities --refresh` to revalidate the exact mapping |
 
 Workers with topology failures must remain excluded from remote scheduling until
 explicit revalidation confirms recovery.
+
+The worker's default `projects_root_ok` check does not prove compatibility with
+every dispatcher layout. A persisted `source_topology_mismatches` entry remains
+ineligible for its exact mapping even if the worker's default topology is healthy.
+Such permanent refusals exit 1; temporary source ownership contention retains
+the bounded retry policy and retryable exit 103. See the [configuration
+guide](configuration.md#worker-compatibility-and-permanent-namespace-refusals)
+for diagnostics and recovery without replacing existing aliases or source roots.
 
 ## Validation Checklist (Per Phase Gate)
 
