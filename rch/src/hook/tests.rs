@@ -10923,6 +10923,181 @@ fn test_should_force_local_fallback_for_unsafe_runtime_fail_open() {
 }
 
 #[test]
+fn test_root_workspace_inheritance_reaches_preflight_and_preserves_local_fallback() {
+    const CHILD_ENV: &str = "RCH_ROOT_WORKSPACE_PREFLIGHT_TEST";
+    let _guard = test_guard!();
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let name = concat!(
+            module_path!(),
+            "::test_root_workspace_inheritance_reaches_preflight_and_preserves_local_fallback"
+        );
+        let name = name.split_once("::").unwrap().1;
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .env("CARGO_NET_OFFLINE", "true")
+            .output()
+            .expect("run isolated offline preflight regression");
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed;"),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let (fixture, policy) = topology_tempdir();
+    let app = fixture.path().join("app");
+    let optional = fixture.path().join("optional");
+    for root in [&app, &optional] {
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+    }
+    std::fs::write(
+        optional.join("Cargo.toml"),
+        "[package]\nname = \"optional_dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    let manifest = |dependency_path: &str| {
+        format!(
+            r#"[package]
+name = "root_workspace_preflight"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde.workspace = true
+tokio.workspace = true
+optional_dep = {{ workspace = true, optional = true }}
+
+[workspace]
+members = ["."]
+resolver = "2"
+
+[workspace.dependencies]
+serde = {{ version = "1", features = ["derive"] }}
+tokio = {{ version = "1", features = ["full"] }}
+optional_dep = {{ path = "{dependency_path}" }}
+"#
+        )
+    };
+    std::fs::write(app.join("Cargo.toml"), manifest("../optional")).unwrap();
+    let reporter = HookReporter::new(OutputVisibility::None);
+    let runtime =
+        build_dependency_runtime_plan(&app, Some(CompilationKind::CargoBuild), &reporter, &policy);
+    assert!(runtime.fail_open_decision.is_none(), "{runtime:#?}");
+    assert_eq!(
+        runtime
+            .sync_roots
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([app.clone(), optional.clone()])
+    );
+    let transfers = build_sync_closure_plan(&runtime.sync_roots, &app, "fixture", &policy);
+    assert_eq!(transfers.len(), 2);
+    let worker = make_test_worker_config("root-workspace-preflight");
+
+    // Execute the production preflight shell program on physically staged
+    // fixture files. This exercises planning, remote-path mapping and evidence
+    // parsing without claiming that a test transport is a live worker build.
+    for missing in [false, true] {
+        let stage = fixture
+            .path()
+            .join(if missing { "missing" } else { "complete" });
+        let outcomes: Vec<_> = transfers
+            .iter()
+            .map(|entry| {
+                let remote_root =
+                    stage.join(entry.local_root.strip_prefix(fixture.path()).unwrap());
+                std::fs::create_dir_all(remote_root.join("src")).unwrap();
+                std::fs::copy(
+                    entry.local_root.join("Cargo.toml"),
+                    remote_root.join("Cargo.toml"),
+                )
+                .unwrap();
+                if !missing || entry.local_root != optional {
+                    std::fs::copy(
+                        entry.local_root.join("src/lib.rs"),
+                        remote_root.join("src/lib.rs"),
+                    )
+                    .unwrap();
+                }
+                let mut entry = entry.clone();
+                entry.remote_root = remote_root.to_string_lossy().into_owned();
+                (entry, SyncRootOutcome::Synced)
+            })
+            .collect();
+        let checks = synced_dependency_preflight_checks(&outcomes);
+        let probe = build_remote_dependency_preflight_command(&checks).unwrap();
+        let output = std::process::Command::new("sh")
+            .args(["-c", &probe])
+            .output()
+            .expect("execute generated dependency probe");
+        assert_eq!(output.status.code(), Some(if missing { 43 } else { 0 }));
+        let (present, absent) =
+            parse_dependency_preflight_probe_output(&String::from_utf8(output.stdout).unwrap());
+        let report = build_dependency_preflight_report(&worker, &outcomes, &present, &absent, None);
+        assert_eq!(report.verified, !missing, "{report:#?}");
+        if missing {
+            assert_eq!(report.reason_code, Some(DEPENDENCY_PREFLIGHT_CODE_MISSING));
+            assert_eq!(absent.len(), 1);
+            assert!(
+                absent.contains(
+                    &stage
+                        .join("optional/src/lib.rs")
+                        .to_string_lossy()
+                        .into_owned()
+                )
+            );
+            let error = anyhow::Error::new(DependencyPreflightFailure::from_report(report));
+            assert_eq!(
+                classify_remote_pipeline_failure(&error),
+                RemotePipelineFailurePolicy::AllowLocalFallback
+            );
+        } else {
+            assert!(absent.is_empty());
+            assert!(
+                report
+                    .evidence
+                    .iter()
+                    .all(|item| item.status == DependencyPreflightStatus::Present)
+            );
+        }
+    }
+
+    // The root-workspace fix must not let an incomplete inactive local path
+    // slip into the primary-root-only fallback or any remote Cargo execution.
+    std::fs::write(app.join("Cargo.toml"), manifest("../missing-dependency")).unwrap();
+    let incomplete =
+        build_dependency_runtime_plan(&app, Some(CompilationKind::CargoBuild), &reporter, &policy);
+    let decision = incomplete
+        .fail_open_decision
+        .expect("missing path must refuse");
+    assert_eq!(
+        decision.reason_code,
+        DEPENDENCY_PREFLIGHT_CODE_MATERIALIZATION
+    );
+    assert!(
+        decision.detail.contains("missing-dependency"),
+        "{decision:#?}"
+    );
+    assert!(should_force_local_fallback_for_runtime_fail_open(
+        decision.reason_code
+    ));
+    let report = build_dependency_runtime_fail_open_report(&worker, &app, &decision);
+    assert!(!report.verified);
+    let error = anyhow::Error::new(DependencyPreflightFailure::from_report(report));
+    assert_eq!(
+        classify_remote_pipeline_failure(&error),
+        RemotePipelineFailurePolicy::AllowLocalFallback
+    );
+    assert!(!app.join("Cargo.lock").exists());
+}
+
+#[test]
 fn test_e2e_dependency_preflight_verified_success_path() {
     let _guard = test_guard!();
     let worker = make_test_worker_config("worker-success");
