@@ -1462,7 +1462,7 @@ def canonical_toolchain_selection(profile, env, toolchain=None):
 def canonical_profile(path, required_tools=("cargo", "rustc"), env=None, toolchain=None):
     profile = canonical_profile_object(path)
     required = {"version", "source_root", "operation_root"}
-    optional = {"manifest", "vendor", "cargo_home_source", "jobserver_grant", "daemon_socket", "env", "incremental", "toolchain_root", "toolchain", "live_stderr"}
+    optional = {"manifest", "vendor", "cargo_home_source", "source_selection", "jobserver_grant", "daemon_socket", "env", "incremental", "toolchain_root", "toolchain", "live_stderr"}
     singular = {"listen", "worker", "worker_spki_sha256"}
     if "workers" in profile:
         required.add("workers")
@@ -1477,6 +1477,10 @@ def canonical_profile(path, required_tools=("cargo", "rustc"), env=None, toolcha
         raise SetupError("invalid canonical-cargo-v1 profile fields")
     if "vendor" in profile and "cargo_home_source" in profile:
         raise SetupError("canonical profile must select either vendor or cargo_home_source")
+    if "source_selection" in profile and profile["source_selection"] != "cargo-unit-graph-v1":
+        raise SetupError("canonical source_selection must be cargo-unit-graph-v1")
+    if "source_selection" in profile and "vendor" in profile:
+        raise SetupError("canonical source_selection cannot be combined with vendor")
     if "incremental" in profile and type(profile["incremental"]) is not bool:
         raise SetupError("canonical incremental must be a boolean")
     if "live_stderr" in profile:
@@ -1716,6 +1720,8 @@ def canonical_invocation(profile_path, args, env):
     clippy = cargo_args[0] == "clippy"
     required_tools = ("cargo", "rustc", "cargo-clippy", "clippy-driver") if clippy else ("cargo", "rustc")
     profile = canonical_profile(profile_path, required_tools, env, toolchain)
+    if "source_selection" in profile and cargo_args[0] not in ("build", "check"):
+        raise SetupError("cargo-unit-graph-v1 source preparation supports only build and check")
     incremental = profile.get("incremental", False)
     live_flags = ["--live-stderr"] if profile.get("live_stderr", False) else []
     daemon = executable("rabsd", "CARGO_RABS_DAEMON", env)
@@ -1755,6 +1761,8 @@ def canonical_invocation(profile_path, args, env):
         specification["cargo_source"]["vendor"] = profile["vendor"]
     if "cargo_home_source" in profile:
         specification["cargo_source"]["cargo_home_source"] = profile["cargo_home_source"]
+    if "source_selection" in profile:
+        specification["cargo_source"]["selection"] = profile["source_selection"]
     if "jobserver_grant" in profile:
         specification["jobserver_grant"] = profile["jobserver_grant"]
     encoded_specification = json.dumps(specification, ensure_ascii=True, separators=(",", ":")).encode("utf-8")

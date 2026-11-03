@@ -362,6 +362,104 @@ class CanonicalCargo(unittest.TestCase):
         self.assertEqual(record["request"]["artifacts"]["files"], [])
         self.assertEqual(record["request"]["artifacts"]["cargo"], "cargo-json-v1")
 
+    def test_selected_source_profile_preserves_the_actual_build_and_check_request(self):
+        self.profile["source_selection"] = "cargo-unit-graph-v1"
+        self.save()
+        original = self.profile_path.read_bytes()
+        for command in ("build", "check"):
+            with self.subTest(command=command):
+                args = [command, "--workspace", "--exclude", "unused", "--all-targets",
+                        "--features", "app/selected", "--no-default-features",
+                        "--target", "x86_64-unknown-linux-gnu"]
+                status, _, stderr, _ = self.invoke(args)
+                self.assertEqual(status, 0, stderr)
+                record = self.records()[-1]
+                request = record["request"]
+                self.assertEqual(request["args"][:len(args)], args)
+                self.assertEqual(request["cargo_source"], {
+                    "manifest": "Cargo.toml", "selection": "cargo-unit-graph-v1"})
+                self.assertEqual(request["command_context"]["cwd"], "/__rabs/workspace")
+                self.assertEqual(request["command_context"]["env"], {"CARGO_INCREMENTAL": "0"})
+                self.assertNotIn("source_selection", request)
+                self.assertEqual(self.profile_path.read_bytes(), original)
+        self.assertFalse(self.forbidden.exists())
+
+    def test_selected_source_profile_keeps_approved_cache_and_literal_environment(self):
+        cargo_home = self.root / "approved Cargo home"
+        cargo_home.mkdir(mode=0o700)
+        self.profile.update(source_selection="cargo-unit-graph-v1",
+                            cargo_home_source=str(cargo_home),
+                            env={"BUILD_LABEL": "selected '雪'", "SOURCE_DATE_EPOCH": "123"})
+        self.save()
+        status, _, stderr, _ = self.invoke(["check", "--lib"])
+        self.assertEqual(status, 0, stderr)
+        request = self.records()[-1]["request"]
+        self.assertEqual(request["cargo_source"], {
+            "manifest": "Cargo.toml", "cargo_home_source": str(cargo_home),
+            "selection": "cargo-unit-graph-v1"})
+        self.assertEqual(request["command_context"]["env"], {
+            "BUILD_LABEL": "selected '雪'", "SOURCE_DATE_EPOCH": "123", "CARGO_INCREMENTAL": "0"})
+
+    def test_selected_source_profile_rejects_unknown_markers_before_creating_an_operation(self):
+        for selection in (None, True, 1, [], {}, "", "metadata", "cargo-unit-graph-v2"):
+            with self.subTest(selection=selection):
+                self.profile["source_selection"] = selection
+                self.save()
+                self.assert_refused(["check"])
+                self.assertEqual(list(self.operations.iterdir()), [])
+                self.assertFalse(self.record.exists())
+
+    def test_selected_source_profile_refuses_unsupported_commands_without_fallback(self):
+        self.install_clippy()
+        self.profile["source_selection"] = "cargo-unit-graph-v1"
+        self.save()
+        for args in (["test", "--lib"], ["run", "--bin", "hello"],
+                     ["bench", "--bench", "measure"], ["clippy"]):
+            with self.subTest(args=args):
+                status, _, stderr, _ = self.invoke(args)
+                self.assertEqual(status, 2, stderr)
+                self.assertIn(b"supports only build and check", stderr)
+                self.assertEqual(list(self.operations.iterdir()), [])
+                self.assertFalse(self.record.exists())
+                self.assertFalse(self.forbidden.exists())
+
+    def test_source_selection_remains_absent_for_legacy_profiles(self):
+        status, _, stderr, _ = self.invoke(["check", "--lib"])
+        self.assertEqual(status, 0, stderr)
+        self.assertEqual(self.records()[-1]["request"]["cargo_source"], {"manifest": "Cargo.toml"})
+
+    def test_selected_source_profile_refuses_vendor_without_changing_legacy_vendor_profiles(self):
+        self.profile.update(source_selection="cargo-unit-graph-v1", vendor="vendor")
+        self.save()
+        status, _, stderr, _ = self.invoke(["check"])
+        self.assertEqual(status, 2, stderr)
+        self.assertIn(b"source_selection cannot be combined with vendor", stderr)
+        self.assertEqual(list(self.operations.iterdir()), [])
+        self.assertFalse(self.record.exists())
+        self.profile.pop("source_selection")
+        self.save()
+        status, _, stderr, _ = self.invoke(["check"])
+        self.assertEqual(status, 0, stderr)
+        self.assertEqual(self.records()[-1]["request"]["cargo_source"],
+                         {"manifest": "Cargo.toml", "vendor": "vendor"})
+
+    def test_selected_source_profile_uses_the_explicit_rustup_selection_once(self):
+        self.select_rustup()
+        self.profile["source_selection"] = "cargo-unit-graph-v1"
+        self.save()
+        env = dict(self.env, RUSTUP_TOOLCHAIN="unselected-ambient",
+                   TEST_RUSTUP_SELECTIONS=json.dumps({"selected": str(self.toolchain / "bin/rustc")}))
+        status, _, stderr, _ = self.invoke(["+selected", "check", "--lib"], env)
+        self.assertEqual(status, 0, stderr)
+        discovery, = [json.loads(line) for line in self.rustup_record.read_text().splitlines()]
+        self.assertEqual(discovery["argv"], ["which", "--toolchain", "selected", "rustc"])
+        request = self.records()[-1]["request"]
+        self.assertEqual(request["args"][:2], ["check", "--lib"])
+        self.assertNotIn("+selected", request["args"])
+        self.assertEqual(request["toolchain_source"], str(self.toolchain))
+        self.assertEqual(request["cargo_source"]["selection"], "cargo-unit-graph-v1")
+        self.assertFalse(self.forbidden.exists())
+
     def test_rustup_selection_uses_original_context_once_and_retains_physical_root(self):
         self.select_rustup()
         env = dict(self.env, RUSTUP_TOOLCHAIN="nightly-selected", RUSTUP_HOME=str(self.root / "rustup-home"),

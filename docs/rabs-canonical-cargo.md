@@ -569,8 +569,9 @@ remote execution.
 Manifests, lockfiles and captured project configuration retain their original
 bytes; no source replacement is synthesized for this mode.
 
-The cache must contain the locked graph, including optional and target-specific
-dependencies needed by the planner's `--all-features` metadata check. A successful
+By default, the cache must contain the locked graph, including optional and
+target-specific dependencies needed by the planner's `--all-features` metadata
+check. A successful
 default-feature build alone may not populate it. Prepare that cache explicitly
 with stock `cargo fetch --locked` before using this offline mode; the RABS
 preparer does not perform that network operation for you.
@@ -602,6 +603,56 @@ authentication-dependent indexes, source replacement configurations and Git
 graphs outside the locked-commit cache profile still require the supported
 approved vendor route. Cache capture does not authorize action
 cache publication or a compiler skip.
+
+### Prepare the selected Cargo dependency graph
+
+For `build` and `check`, a `canonical-cargo-v1` launcher profile can opt into
+command-specific dependency preparation with this field:
+
+```json
+"source_selection": "cargo-unit-graph-v1"
+```
+
+This mode accepts local source anchors and an approved `cargo_home_source`.
+It cannot be combined with `vendor`; existing vendor profiles continue to use
+the default preparer.
+
+The launcher passes that local intent as `cargo_source.selection`. The native
+preparer binds it to the actual validated Cargo request and asks the captured
+Cargo for its nonexecuting `--unit-graph -Z unstable-options` plan. Package,
+feature, target and profile selection must describe the command that the worker
+will run. Planning includes selected host build dependencies and procedural
+macros as well as target units; a target-filtered metadata result alone is not
+the dependency closure.
+
+Planning and execution use the same validated literal application environment.
+Overrides of Cargo, Rustup, compiler, loader, Git or RABS control variables are
+refused, apart from the existing explicit `CARGO_INCREMENTAL` control. The
+canonical Cargo program and the selected manifest's parent working directory
+must agree with the launcher request; direct native requests have the same
+requirements. Captured compiler flags must also be independent of the planning
+machine: `-C target-cpu=native` is refused in this mode because it can change
+conditional dependency selection on a worker with different hardware. Explicit
+CPU and target-feature settings remain supported.
+
+With `cargo_home_source`, absent sparse-registry archives are permitted only
+when Cargo does not select those packages. For example, a disabled optional
+dependency or a Windows-only dependency need not be downloaded for a Linux
+check that does not use it. Locked sparse-index records remain required, and
+every selected package must resolve to retained, verified source bytes. A
+missing selected archive, changed checksum, unsupported graph or unsupported
+command refuses preparation. The preparer does not fetch missing inputs or
+fall back to a different selection. Pinned Git capture retains its existing
+complete locked-revision contract. Selected Git packages also require an
+unambiguous source selector and one retained manifest for each package name in
+the selected commit; duplicate same-name manifests are refused.
+
+This option still captures the complete approved source anchor and retains its
+original manifests, lockfile and configuration. It changes dependency
+preparation, not the worker's artifact or cache-authority contract. Profiles
+without `source_selection` keep the existing complete-graph preparation.
+`test`, `run`, `bench` and `clippy` do not accept this opt-in marker; their
+existing profiles continue to use the default preparer.
 
 ### Captured compiler configuration
 
@@ -1052,10 +1103,13 @@ cycles, unreachable units and sources outside the retained inputs also refuse.
 This requires a nightly Cargo supporting the unit-graph interface; an unsupported
 toolchain does not fall back to a guessed package graph.
 
-The earlier source preparation still captures the complete approved anchor and
+The default source preparation still captures the complete approved anchor and
 uses locked all-features metadata to validate its dependency closure. Selecting
 fewer compilation units does not reduce the authorized upload/capture scope or make
-missing locked dependencies available offline.
+missing locked dependencies available offline. The `canonical-cargo-v1`
+launcher's explicit `source_selection` option described above changes the
+preparation graph for `build` and `check`; it does not narrow the approved source
+anchor or grant compiler-result authority.
 Workspace members and primary packages use the separately qualified workspace
 worker profiles described below; unsupported requests compile normally inside
 the namespace. Their results never enter the external-dependency cache class.

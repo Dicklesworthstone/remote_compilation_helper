@@ -20,6 +20,8 @@ use std::sync::Arc;
 pub(super) struct ControlInputs {
     /// Only the selected workspace's lockfile governs this resolution.
     pub(super) lock: String,
+    /// Reached manifest controls, excluding unrelated Cargo.toml fixture data.
+    pub(super) manifests: BTreeSet<String>,
 }
 
 /// Reading workspace inheritance does not resolve that workspace's members.
@@ -44,7 +46,7 @@ fn enqueue(
     pending.insert(path);
 }
 
-fn manifest_value(
+pub(super) fn manifest_value(
     image: &SealedSourceSnapshot,
     path: &str,
     parsed: &mut BTreeMap<String, Arc<toml::Value>>,
@@ -260,6 +262,7 @@ impl ControlInputs {
                 .to_str()
                 .ok_or_else(|| invalid("Cargo lock path is not UTF-8"))?
                 .to_owned(),
+            manifests: seen.into_keys().collect(),
         })
     }
 }
@@ -298,6 +301,30 @@ fn workspace_root(
     parsed: &mut BTreeMap<String, Arc<toml::Value>>,
     control: &PreparationControl<'_>,
 ) -> io::Result<String> {
+    retained_workspace_root(
+        path,
+        value,
+        pending,
+        &mut |candidate| {
+            if image.file_bytes("workspace", candidate).is_some() {
+                manifest_value(image, candidate, parsed).map(Some)
+            } else {
+                Ok(None)
+            }
+        },
+        control,
+    )
+}
+
+/// The same workspace lookup over retained manifests from either a source
+/// image or verified Git blob objects. A loader never reads mutable checkouts.
+pub(super) fn retained_workspace_root(
+    path: &str,
+    value: &toml::Value,
+    pending: &mut BTreeSet<String>,
+    load: &mut impl FnMut(&str) -> io::Result<Option<Arc<toml::Value>>>,
+    control: &PreparationControl<'_>,
+) -> io::Result<String> {
     if value.get("workspace").is_some() {
         return Ok(path.to_owned());
     }
@@ -316,8 +343,7 @@ fn workspace_root(
     for ancestor in base.ancestors().skip(1) {
         control.checkpoint()?;
         let candidate = manifest_path(ancestor)?;
-        if image.file_bytes("workspace", &candidate).is_some() {
-            let parent = manifest_value(image, &candidate, parsed)?;
+        if let Some(parent) = load(&candidate)? {
             if let Some(workspace) = parent.get("workspace") {
                 // Cargo skips an excluding workspace during ancestor search.
                 // Exclusions are literal prefixes, with explicit literal
@@ -341,6 +367,50 @@ fn workspace_root(
         }
     }
     Ok(path.to_owned())
+}
+
+/// Bind a unit to this manifest's version, including its exact workspace
+/// inheritance. A same-named package elsewhere in Cargo.lock cannot supply it.
+pub(super) fn retained_package_version(
+    path: &str,
+    value: &toml::Value,
+    load: &mut impl FnMut(&str) -> io::Result<Option<Arc<toml::Value>>>,
+    control: &PreparationControl<'_>,
+) -> io::Result<String> {
+    control.checkpoint()?;
+    let package = value
+        .get("package")
+        .or_else(|| value.get("project"))
+        .filter(|package| package.is_table())
+        .ok_or_else(|| invalid("selected manifest is not a package"))?;
+    let Some(version) = package.get("version") else {
+        // Cargo's omitted package.version has this exact default. It cannot
+        // borrow another same-named package's version from the lock.
+        return Ok("0.0.0".to_owned());
+    };
+    let version = if let Some(version) = version.as_str() {
+        version.to_owned()
+    } else {
+        require(
+            version.as_table().is_some_and(|fields| fields.len() == 1)
+                && version.get("workspace").and_then(toml::Value::as_bool) == Some(true),
+            "selected package version requires explicit workspace inheritance",
+        )?;
+        let root = retained_workspace_root(path, value, &mut BTreeSet::new(), load, control)?;
+        let root = load(&root)?
+            .ok_or_else(|| invalid("selected package version workspace is not retained"))?;
+        root.get("workspace")
+            .and_then(|value| value.get("package"))
+            .and_then(|value| value.get("version"))
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| invalid("selected package workspace version is not a retained literal"))?
+            .to_owned()
+    };
+    require(
+        !version.is_empty() && version.len() <= 128 && !version.chars().any(char::is_control),
+        "selected package version exceeds its bound or contains controls",
+    )?;
+    Ok(version)
 }
 
 fn dependency_manifests(

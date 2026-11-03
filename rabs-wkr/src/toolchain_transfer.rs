@@ -2171,10 +2171,7 @@ mod tests {
             fs::set_permissions(&pending, fs::Permissions::from_mode(0o700)).unwrap();
             fs::write(pending.join("receipt"), b"keep existing reservation").unwrap();
             let pending_inode = inode(&pending);
-            let error = pool
-                .adopt(sealed(owner, &request), || false)
-                .err()
-                .unwrap();
+            let error = pool.adopt(sealed(owner, &request), || false).err().unwrap();
             assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
             assert_eq!(inode(&pending), pending_inode);
             assert_eq!(
@@ -2306,8 +2303,7 @@ mod tests {
                     .tempdir_in(&alternate)
                     .unwrap();
                 let uploaded = directory.path().join("tree");
-                let mut receiver =
-                    ToolchainReceiver::create(&uploaded, identity, limits).unwrap();
+                let mut receiver = ToolchainReceiver::create(&uploaded, identity, limits).unwrap();
                 for entry in exported.entries().unwrap() {
                     let path = entry.path.clone();
                     let length = match &entry.kind {
@@ -2323,12 +2319,7 @@ mod tests {
                                 .unwrap();
                             assert!(!chunk.is_empty());
                             receiver
-                                .write_chunk(
-                                    &path,
-                                    offset,
-                                    &chunk,
-                                    Sha256::digest(&chunk).into(),
-                                )
+                                .write_chunk(&path, offset, &chunk, Sha256::digest(&chunk).into())
                                 .unwrap();
                             offset += chunk.len() as u64;
                         }

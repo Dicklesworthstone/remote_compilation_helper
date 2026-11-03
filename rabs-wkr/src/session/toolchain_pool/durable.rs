@@ -573,9 +573,7 @@ impl DurableCache {
         let child = children
             .next()
             .transpose()?
-            .ok_or_else(|| {
-                invalid("owned toolchain upload directory has no sealed tree")
-            })?;
+            .ok_or_else(|| invalid("owned toolchain upload directory has no sealed tree"))?;
         require(
             child.file_name() == "tree" && children.next().transpose()?.is_none(),
             "owned toolchain upload directory contains unrelated entries",
@@ -591,7 +589,9 @@ impl DurableCache {
     ) -> io::Result<(PreparedToolchain, &'static str)> {
         #[cfg(target_os = "linux")]
         {
-            use rustix::fs::{CWD, Mode, OFlags, RenameFlags, ResolveFlags, openat2, renameat_with};
+            use rustix::fs::{
+                CWD, Mode, OFlags, RenameFlags, ResolveFlags, openat2, renameat_with,
+            };
             use std::os::unix::fs::MetadataExt;
 
             let source = fs::canonicalize(upload.directory())?;
@@ -639,13 +639,9 @@ impl DurableCache {
                     // A failed cross-device rename leaves the actual upload
                     // owner in place through verified copy, sync and reopen.
                     return self
-                        .capture_source(
-                            upload.prepared().root(),
-                            expected,
-                            limits,
-                            stopped,
-                            || upload.prepared().verify_retained_generation(stopped),
-                        )
+                        .capture_source(upload.prepared().root(), expected, limits, stopped, || {
+                            upload.prepared().verify_retained_generation(stopped)
+                        })
                         .map(|toolchain| (toolchain, "captured"));
                 }
                 Err(error) => return Err(io::Error::from(error)),

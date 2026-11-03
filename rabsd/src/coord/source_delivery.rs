@@ -211,6 +211,11 @@ fn prepare_source_bundle_inner(
 ) -> io::Result<PreparedLocalBundle> {
     control.checkpoint()?;
     let inputs = preparation::SourcePreparation::parse(source_root, specification)?;
+    // Selected graph preparation must query the same captured Cargo/rustc that
+    // execution will receive, including public allocated-template preparation.
+    // The already parsed mode decides this; legacy preparation keeps its order.
+    let selected_planning_toolchain =
+        selected_planning_toolchain || inputs.requires_selected_toolchain();
     require(
         destination.is_absolute()
             && destination.file_name().is_some()
@@ -293,9 +298,9 @@ fn prepare_source_bundle_inner(
         }
     }
     control.checkpoint()?;
-    // The local canonical bridge must not run an ambient RUSTC/CARGO during
-    // source planning. Capture the selected dataset first and plan through its
-    // retained executable paths. Existing operator preparation keeps its
+    // Canonical local and selected-graph preparation must not run ambient
+    // RUSTC/CARGO. Capture the selected dataset first and plan through its
+    // retained executable paths. Legacy operator preparation keeps its
     // ordinary validate-before-destination behavior.
     let planning_toolchain = if selected_planning_toolchain {
         let source = toolchain_source
