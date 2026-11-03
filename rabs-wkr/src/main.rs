@@ -1336,7 +1336,7 @@ impl PendingOutput {
         let next_offset = offset
             .checked_add(bytes.len() as u64)
             .ok_or("output offset overflow")?;
-        let data_hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        let data_hex = rabs_protocol::raw_bytes::encode_hex(&bytes);
         Ok(serde_json::json!({
             "kind": "output-chunk", "request_id": self.identity.request_id, "stream": name,
             "offset": offset, "next_offset": next_offset, "total_bytes": stream.len(),

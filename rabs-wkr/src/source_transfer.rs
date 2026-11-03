@@ -38,9 +38,7 @@ fn check_cancelled(cancelled: &AtomicBool) -> Result<(), String> {
     Ok(())
 }
 
-pub fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
+pub use rabs_protocol::raw_bytes::encode_hex as hex;
 
 fn decode_hex(value: &str, maximum: usize) -> Result<Vec<u8>, String> {
     if !value.len().is_multiple_of(2)

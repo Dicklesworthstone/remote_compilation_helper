@@ -16,6 +16,23 @@
 
 use std::fmt;
 
+/// Encode arbitrary wire bytes as canonical lowercase hexadecimal, without a prefix.
+///
+/// Source, toolchain, artifact and diagnostic transfers already bound their
+/// input chunks. Reserve the complete output once instead of allocating a
+/// temporary formatted string for every input byte. This changes neither the
+/// wire representation nor the caller's size limits.
+#[must_use]
+pub fn encode_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for &byte in bytes {
+        encoded.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
 /// A canonical byte string: the exact bytes the OS handed us.
 ///
 /// Ordering/equality are plain byte comparisons, which is exactly what
@@ -127,6 +144,44 @@ pub struct RawSymlinkTarget(pub RawBytes);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hex_encodes_every_byte_with_canonical_lowercase_digits() {
+        let bytes: Vec<_> = (0_u8..=255).collect();
+        let expected = concat!(
+            "000102030405060708090a0b0c0d0e0f",
+            "101112131415161718191a1b1c1d1e1f",
+            "202122232425262728292a2b2c2d2e2f",
+            "303132333435363738393a3b3c3d3e3f",
+            "404142434445464748494a4b4c4d4e4f",
+            "505152535455565758595a5b5c5d5e5f",
+            "606162636465666768696a6b6c6d6e6f",
+            "707172737475767778797a7b7c7d7e7f",
+            "808182838485868788898a8b8c8d8e8f",
+            "909192939495969798999a9b9c9d9e9f",
+            "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+            "b0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+            "c0c1c2c3c4c5c6c7c8c9cacbcccdcecf",
+            "d0d1d2d3d4d5d6d7d8d9dadbdcdddedf",
+            "e0e1e2e3e4e5e6e7e8e9eaebecedeeef",
+            "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+        );
+        assert_eq!(encode_hex(&bytes), expected);
+        assert_eq!(encode_hex(&[]), "");
+        assert_eq!(encode_hex(b"\0\n\xff"), "000aff");
+    }
+
+    #[test]
+    fn hex_matches_existing_wire_format_across_transfer_chunk_boundaries() {
+        for len in [0, 1, 2, 31, 32, 255, 256, 65_535, 65_536, 65_537, 131_073] {
+            let bytes: Vec<_> = (0_u8..=255).cycle().take(len).collect();
+            // Keep the independent incumbent formatter as the wire oracle.
+            let expected: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+            assert_eq!(encode_hex(&bytes), expected, "payload length {len}");
+            let chunked: String = bytes.chunks(64 * 1024).map(encode_hex).collect();
+            assert_eq!(chunked, expected, "chunked payload length {len}");
+        }
+    }
 
     #[test]
     fn non_utf8_bytes_round_trip_exactly() {

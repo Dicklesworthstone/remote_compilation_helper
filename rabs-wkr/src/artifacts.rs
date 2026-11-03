@@ -865,7 +865,7 @@ impl ArtifactTransferState {
         let next_offset = offset
             .checked_add(bytes.len() as u64)
             .ok_or("artifact offset overflow")?;
-        let data_hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let data_hex = rabs_protocol::raw_bytes::encode_hex(&bytes);
         Ok(serde_json::json!({
             "kind": "artifact-chunk", "request_id": identity.request_id, "name": name,
             "offset": offset, "next_offset": next_offset, "total_bytes": total_bytes,

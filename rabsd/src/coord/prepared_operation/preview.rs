@@ -251,7 +251,7 @@ fn reply(
     let segments: Vec<_> = segments.into_iter().map(|segment| json!({
         "stream":segment.stream.name(), "offset":segment.offset,
         "next_offset":segment.offset + segment.bytes.len() as u64,
-        "data_hex":segment.bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+        "data_hex":rabs_protocol::raw_bytes::encode_hex(&segment.bytes),
         "skipped_bytes":segment.skipped_bytes, "observed_bytes":segment.observed_bytes,
     })).collect();
     json!({

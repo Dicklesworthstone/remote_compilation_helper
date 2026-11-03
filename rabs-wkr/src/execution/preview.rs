@@ -47,7 +47,7 @@ pub fn output_preview_reply(
         [PreviewStream::Stdout, PreviewStream::Stderr].into_iter().filter_map(move |stream| {
             task.control.preview.take(stream).map(|segment| json!({
                 "stream":stream.name(), "offset":segment.offset,
-                "data_hex":segment.bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+                "data_hex":rabs_protocol::raw_bytes::encode_hex(&segment.bytes),
                 "skipped_bytes":segment.skipped_bytes, "observed_bytes":segment.observed_bytes,
             }))
         })

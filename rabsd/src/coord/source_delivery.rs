@@ -15,6 +15,7 @@ use super::source_manifest::{digest, invalid, require};
 use super::worker_delivery::{MAX_FRAME_BYTES, WorkerAuthentication, WorkerPeer, validate_request};
 use crate::edge::live_facts::RetainedDependencyArtifact;
 use rabs_asupersync::worker_transport::MAX_JSON_RECORD;
+use rabs_protocol::raw_bytes::encode_hex as hex;
 use rabs_sandbox::cargo_home::ISOLATED_GIT_CARGO_HOME_SOURCE_VERSION;
 #[cfg(all(test, unix))]
 use rabs_sandbox::cargo_home::{CARGO_HOME_SOURCE_VERSION, CargoHomeProjection};
@@ -86,10 +87,6 @@ impl PreparedLocalBundle {
 pub const MAX_SOURCE_ROOTS: usize = 64;
 // Outstanding chunks, not concurrent filesystem writers on the worker.
 const SOURCE_WINDOW: usize = 4;
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
 
 fn manifest_value(manifest: &SourceManifest) -> Value {
     json!({"manifest_sha256":hex(&manifest.digest()),
