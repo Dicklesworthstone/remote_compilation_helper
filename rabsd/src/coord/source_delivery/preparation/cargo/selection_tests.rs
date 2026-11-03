@@ -53,7 +53,7 @@ fn selected_local_inheritance_skips_retained_excluding_ancestors() {
     let selection = SelectedCommand {
         manifest: "Cargo.toml".into(),
         command: CompilationCommand::Check,
-        arguments: Vec::new(),
+        selection: CompilationSelection::default(),
         environment: Vec::new(),
     };
     validate_selected_graph(&image, root, &selection, &metadata, &graph, None, &control).unwrap();
@@ -79,7 +79,11 @@ const DEPENDENCY_LIB: &str = "pub fn answer() -> u32 { 42 }\n";
 
 fn request(command: &str, extra: &[&str]) -> Value {
     let mut args = vec![command.to_owned()];
-    args.extend(extra.iter().map(|value| (*value).to_owned()));
+    let separator = extra
+        .iter()
+        .position(|value| *value == "--")
+        .unwrap_or(extra.len());
+    args.extend(extra[..separator].iter().map(|value| (*value).to_owned()));
     args.extend([
         "--locked".into(),
         "--offline".into(),
@@ -89,6 +93,7 @@ fn request(command: &str, extra: &[&str]) -> Value {
         "/__rabs/out/cargo".into(),
         "--message-format=json".into(),
     ]);
+    args.extend(extra[separator..].iter().map(|value| (*value).to_owned()));
     json!({
         "program":"/__rabs/toolchain/bin/cargo",
         "args":args,
@@ -128,7 +133,7 @@ fn selected_command_binds_build_check_features_profiles_and_target_to_actual_arg
             json!({"PROJECT_SETTING":"literal value","CARGO_INCREMENTAL":"0"});
         let selected = SelectedCommand::parse(&input, "Cargo.toml").unwrap();
         assert_eq!(
-            selected.arguments(),
+            selected.graph_arguments(&Value::Null, None).unwrap(),
             [
                 command,
                 "--workspace",
@@ -168,6 +173,131 @@ fn selected_command_binds_build_check_features_profiles_and_target_to_actual_arg
 }
 
 #[test]
+fn selected_harness_commands_preserve_selection_without_interpreting_runtime_arguments() {
+    for command in ["test", "bench"] {
+        let input = request(
+            command,
+            &[
+                "-p",
+                "app@0.1.0",
+                "--features=selected",
+                "--no-default-features",
+                "--target=x86_64-unknown-linux-gnu",
+                "--profile=ci",
+                "--no-fail-fast",
+                "needle=value",
+                "--",
+                "--no-run",
+                "--unit-graph",
+                "--target-dir",
+                "literal runtime path",
+                "",
+                "line\nvalue",
+            ],
+        );
+        let original = input.clone();
+        let selected = SelectedCommand::parse(&input, "Cargo.toml").unwrap();
+        assert_eq!(
+            selected.graph_arguments(&Value::Null, None).unwrap(),
+            [
+                command,
+                "--no-default-features",
+                "--no-fail-fast",
+                "--package",
+                "app@0.1.0",
+                "--features",
+                "selected",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+                "--profile",
+                "ci",
+                "needle=value",
+            ]
+        );
+        assert_eq!(input, original);
+        assert!(selected.run_package().is_none());
+        let no_run =
+            SelectedCommand::parse(&request(command, &["--no-run"]), "Cargo.toml").unwrap();
+        assert_eq!(
+            no_run.graph_arguments(&Value::Null, None).unwrap(),
+            [command, "--no-run"]
+        );
+    }
+    let docs = SelectedCommand::parse(&request("test", &["--doc"]), "Cargo.toml").unwrap();
+    assert_eq!(
+        docs.graph_arguments(&Value::Null, None).unwrap(),
+        ["test", "--doc"]
+    );
+}
+
+#[test]
+fn selected_run_queries_one_build_target_and_leaves_the_execution_request_intact() {
+    for target in ["--bin", "--example"] {
+        let input = request(
+            "run",
+            &[
+                "--package=app@0.1.0",
+                target,
+                "chosen",
+                "--release",
+                "--",
+                "--no-run",
+                "--manifest-path=literal",
+                "",
+                "line\nvalue",
+            ],
+        );
+        let original = input.clone();
+        let selected = SelectedCommand::parse(&input, "Cargo.toml").unwrap();
+        assert_eq!(selected.command, CompilationCommand::Run);
+        assert!(selected.run_package().is_none());
+        assert_eq!(
+            selected.graph_arguments(&Value::Null, None).unwrap(),
+            [
+                "build",
+                "--release",
+                "--package",
+                "app@0.1.0",
+                target,
+                "chosen"
+            ]
+        );
+        assert_eq!(input, original);
+    }
+    let selected =
+        SelectedCommand::parse(&request("run", &["--package=app@0.1.0"]), "Cargo.toml").unwrap();
+    assert_eq!(selected.run_package(), Some("app@0.1.0"));
+    assert!(selected.graph_arguments(&Value::Null, None).is_err());
+}
+
+#[test]
+fn selected_execution_refuses_conflicting_modes_and_transport_controls_hidden_in_tails() {
+    for (command, extra) in [
+        ("test", vec!["--no-run", "filter"]),
+        ("test", vec!["--no-run", "--doc"]),
+        ("test", vec!["--no-run", "--", "--exact"]),
+        ("test", vec!["first", "second"]),
+        ("bench", vec!["--doc"]),
+        ("bench", vec!["--release"]),
+        ("bench", vec!["--no-run", "--"]),
+        ("run", vec!["--no-run"]),
+        ("run", vec!["--workspace"]),
+        ("run", vec!["--all-targets"]),
+        ("run", vec!["-p", "first", "-p", "second"]),
+        ("run", vec!["--bin", "first", "--bin", "second"]),
+        ("run", vec!["--", "NUL\0value"]),
+    ] {
+        assert!(
+            SelectedCommand::parse(&request(command, &extra), "Cargo.toml").is_err(),
+            "{command} {extra:?}"
+        );
+    }
+    let mut input = request("test", &[]);
+    input["args"].as_array_mut().unwrap().insert(1, json!("--"));
+    assert!(SelectedCommand::parse(&input, "Cargo.toml").is_err());
+}
+
+#[test]
 fn selected_command_refuses_independent_resolution_and_execution_controls() {
     for extra in [
         vec!["--config", "build.target='outside'"],
@@ -195,7 +325,7 @@ fn selected_command_refuses_independent_resolution_and_execution_controls() {
             "{extra:?}"
         );
     }
-    for command in ["test", "run", "bench", "clippy", "metadata"] {
+    for command in ["clippy", "metadata", "install", "publish", "clean"] {
         assert!(SelectedCommand::parse(&request(command, &[]), "Cargo.toml").is_err());
     }
     let mut missing = request("check", &[]);
@@ -579,7 +709,7 @@ fn selected_graph_checks_host_sources_and_reached_manifests_inside_the_complete_
     let selection = SelectedCommand {
         manifest: "app/Cargo.toml".into(),
         command: CompilationCommand::Check,
-        arguments: Vec::new(),
+        selection: CompilationSelection::default(),
         environment: Vec::new(),
     };
     let app = unit(root, "app", "app", &[1]);
@@ -1014,6 +1144,334 @@ fn installed_cargo_prepares_with_absent_unselected_archives_and_keeps_host_build
 
 #[cfg(target_os = "linux")]
 #[test]
+fn installed_cargo_prepares_execution_commands_without_running_project_code() {
+    let fixture = tempfile::tempdir().unwrap();
+    let tools = fixture.path().join("tools");
+    fs::create_dir(&tools).unwrap();
+    let cargo = super::super::local_tool("cargo", &tools).unwrap();
+    let toolchain = cargo.parent().unwrap().parent().unwrap();
+    let workspace = fixture.path().join("workspace");
+    let seed = fixture.path().join("seed");
+    for directory in [
+        workspace.join("app/src/bin"),
+        workspace.join("app/examples"),
+        workspace.join("app/tests"),
+        workspace.join("app/benches"),
+        workspace.join("host-helper/src"),
+        workspace.join("dev-helper/src"),
+        workspace.join("unselected/src/bin"),
+        seed.join("home"),
+        seed.join("cargo-home"),
+    ] {
+        fs::create_dir_all(directory).unwrap();
+    }
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[workspace]\nmembers=['app','host-helper','dev-helper','unselected']\n\
+         default-members=['app']\nresolver='2'\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("app/Cargo.toml"),
+        "[package]\nname='selected-app'\nversion='0.1.0'\nedition='2021'\ndefault-run='chosen'\n\
+         [dependencies]\nrabs-selection-missing={version='=1.0.0',optional=true}\n\
+         [features]\nremote=['dep:rabs-selection-missing']\n\
+         [build-dependencies]\nhost-helper={path='../host-helper'}\n\
+         [dev-dependencies]\ndev-helper={path='../dev-helper'}\n\
+         [[bin]]\nname='chosen'\npath='src/main.rs'\n\
+         [[bin]]\nname='other'\npath='src/bin/other.rs'\nrequired-features=['remote']\n\
+         [[bench]]\nname='measure'\nharness=false\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("app/src/lib.rs"),
+        "/// A selected documentation test.\n/// ```\n/// assert_eq!(2 + 2, 4);\n/// ```\n\
+         pub fn ready() {}\n#[test] fn selected_test() { panic!(\"must not execute\"); }\n",
+    )
+    .unwrap();
+    for path in [
+        "app/src/main.rs",
+        "app/src/bin/other.rs",
+        "app/examples/demo.rs",
+        "app/benches/measure.rs",
+        "unselected/src/main.rs",
+        "unselected/src/bin/alternate.rs",
+    ] {
+        fs::write(
+            workspace.join(path),
+            "fn main() { panic!(\"planning must not execute a project program\"); }\n",
+        )
+        .unwrap();
+    }
+    fs::write(
+        workspace.join("app/tests/integration.rs"),
+        "#[test] fn selected_test() { panic!(\"planning must not execute tests\"); }\n",
+    )
+    .unwrap();
+    // Any attempt to compile, let alone execute, the selected build script
+    // fails. These successes therefore require Cargo's nonexecuting graph path.
+    fs::write(
+        workspace.join("app/build.rs"),
+        "compile_error!(\"planning must not compile project code\");\n\
+         fn main() { panic!(\"planning must not execute build scripts\"); }\n",
+    )
+    .unwrap();
+    for name in ["host-helper", "dev-helper"] {
+        fs::write(
+            workspace.join(name).join("Cargo.toml"),
+            format!("[package]\nname='{name}'\nversion='0.1.0'\nedition='2021'\n"),
+        )
+        .unwrap();
+        fs::write(
+            workspace.join(name).join("src/lib.rs"),
+            "pub fn ready() {}\n",
+        )
+        .unwrap();
+    }
+    fs::write(
+        workspace.join("unselected/Cargo.toml"),
+        "[package]\nname='unselected'\nversion='0.1.0'\nedition='2021'\n\
+         [dependencies]\nrabs-selection-missing='=1.0.0'\n",
+    )
+    .unwrap();
+    let approved = seed.join("cargo-home");
+    let archive = archive();
+    seed_index(&approved, &archive);
+    cargo_output(
+        &cargo,
+        toolchain,
+        &workspace,
+        &seed,
+        &["generate-lockfile", "--offline"],
+    )
+    .unwrap();
+    let metadata: Value = serde_json::from_slice(
+        &cargo_output(
+            &cargo,
+            toolchain,
+            &workspace,
+            &seed,
+            &[
+                "metadata",
+                "--format-version=1",
+                "--no-deps",
+                "--locked",
+                "--offline",
+            ],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let image = capture(&workspace);
+    for (command, extra) in [
+        ("test", vec![]),
+        ("test", vec!["--no-run", "--all-targets"]),
+        ("test", vec!["--doc"]),
+        (
+            "test",
+            vec![
+                "--test",
+                "integration",
+                "needle=value",
+                "--",
+                "--no-run",
+                "--unit-graph",
+                "",
+            ],
+        ),
+        (
+            "test",
+            vec!["--workspace", "--exclude", "unselected", "--no-run"],
+        ),
+        ("bench", vec![]),
+        ("bench", vec!["--no-run", "--bench", "measure"]),
+        (
+            "bench",
+            vec![
+                "--bench",
+                "measure",
+                "needle=value",
+                "--",
+                "--no-run",
+                "line\nvalue",
+            ],
+        ),
+        ("run", vec![]),
+        (
+            "run",
+            vec![
+                "--package",
+                "selected-app@0.1.0",
+                "--",
+                "--no-run",
+                "--unit-graph",
+                "",
+            ],
+        ),
+        ("run", vec!["--bin", "chosen"]),
+        (
+            "run",
+            vec![
+                "--package",
+                "selected-app",
+                "--example",
+                "demo",
+                "--",
+                "literal program argument",
+            ],
+        ),
+    ] {
+        let input = request(command, &extra);
+        let selected = CargoSource::parse_request(&source(&approved, true), &input).unwrap();
+        let (retained, files) = selected
+            .prepare(Arc::clone(&image), Some(toolchain))
+            .unwrap_or_else(|error| panic!("{command} {extra:?}: {error}"));
+        assert!(files.iter().all(|path| !path.ends_with(".crate")));
+        for path in [
+            "Cargo.toml",
+            "Cargo.lock",
+            "app/Cargo.toml",
+            "app/build.rs",
+            "app/src/lib.rs",
+            "app/src/main.rs",
+            "app/src/bin/other.rs",
+            "app/examples/demo.rs",
+            "app/tests/integration.rs",
+            "app/benches/measure.rs",
+            "host-helper/Cargo.toml",
+            "dev-helper/Cargo.toml",
+            "unselected/Cargo.toml",
+        ] {
+            assert_eq!(
+                retained.file_bytes("workspace", path),
+                image.file_bytes("workspace", path)
+            );
+        }
+        let selection = SelectedCommand::parse(&input, "Cargo.toml").unwrap();
+        let package_id = selection.run_package().map(|package| {
+            String::from_utf8(
+                cargo_output(
+                    &cargo,
+                    toolchain,
+                    &workspace,
+                    &seed,
+                    &["pkgid", "--package", package, "--locked", "--offline"],
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        });
+        let mut arguments = selection
+            .graph_arguments(&metadata, package_id.as_deref().map(str::trim))
+            .unwrap();
+        arguments.extend(
+            [
+                "--locked",
+                "--offline",
+                "--unit-graph",
+                "-Zunstable-options",
+            ]
+            .map(String::from),
+        );
+        let graph: Value = serde_json::from_slice(
+            &cargo_output(
+                &cargo,
+                toolchain,
+                &workspace,
+                &seed,
+                &arguments.iter().map(String::as_str).collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let units = selected_units(
+            &graph,
+            selection.command,
+            &PreparationControl::uncontrolled(),
+        )
+        .unwrap();
+        assert!(
+            units
+                .iter()
+                .any(|unit| unit["pkg_id"].as_str().unwrap().contains("host-helper"))
+        );
+        assert!(units.iter().any(|unit| unit["mode"] == "run-custom-build"));
+        assert!(
+            units
+                .iter()
+                .all(|unit| !unit["pkg_id"].as_str().unwrap().contains(DEPENDENCY))
+        );
+        if command == "run" {
+            let roots = graph["roots"].as_array().unwrap();
+            assert_eq!(roots.len(), 1);
+            let root = &graph["units"][roots[0].as_u64().unwrap() as usize];
+            assert_eq!(
+                root["target"]["name"],
+                if extra.contains(&"--example") {
+                    "demo"
+                } else {
+                    "chosen"
+                }
+            );
+        }
+        if matches!(command, "test" | "bench") || extra.contains(&"--example") {
+            assert!(
+                units
+                    .iter()
+                    .any(|unit| unit["pkg_id"].as_str().unwrap().contains("dev-helper"))
+            );
+        }
+    }
+    let selected_missing = [
+        ("test", vec!["--all-features"]),
+        ("bench", vec!["--all-features"]),
+        ("run", vec!["--bin", "other", "--features", "remote"]),
+        (
+            "run",
+            vec!["--package", "unselected", "--bin", "unselected"],
+        ),
+    ];
+    for (command, extra) in &selected_missing {
+        let selected =
+            CargoSource::parse_request(&source(&approved, true), &request(command, extra)).unwrap();
+        assert!(
+            selected
+                .prepare(Arc::clone(&image), Some(toolchain))
+                .is_err(),
+            "{command} {extra:?}"
+        );
+    }
+    let cache = approved.join("registry/cache").join(NAMESPACE);
+    fs::create_dir_all(&cache).unwrap();
+    fs::write(cache.join(format!("{DEPENDENCY}-1.0.0.crate")), archive).unwrap();
+    for (command, extra) in &selected_missing {
+        let selected =
+            CargoSource::parse_request(&source(&approved, true), &request(command, extra)).unwrap();
+        let (_, files) = selected
+            .prepare(Arc::clone(&image), Some(toolchain))
+            .unwrap();
+        assert!(
+            files
+                .iter()
+                .any(|path| path.ends_with("/rabs-selection-missing-1.0.0.crate"))
+        );
+    }
+    let ambiguous = CargoSource::parse_request(
+        &source(&approved, true),
+        &request("run", &["--package", "unselected"]),
+    )
+    .unwrap();
+    assert!(
+        ambiguous
+            .prepare(image, Some(toolchain))
+            .unwrap_err()
+            .to_string()
+            .contains("cannot determine one binary")
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn installed_cargo_selected_graph_retains_full_git_owners_and_checkouts() {
     let fixture = tempfile::tempdir().unwrap();
     let tools = fixture.path().join("tools");
@@ -1189,7 +1647,7 @@ fn selected_local_versions_bind_declared_inherited_and_default_manifest_identity
         let selection = SelectedCommand {
             manifest: "app/Cargo.toml".into(),
             command: CompilationCommand::Check,
-            arguments: Vec::new(),
+            selection: CompilationSelection::default(),
             environment: Vec::new(),
         };
         let app = unit(&root, "app", "app", &[1, 2]);

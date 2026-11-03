@@ -606,7 +606,7 @@ cache publication or a compiler skip.
 
 ### Prepare the selected Cargo dependency graph
 
-For `build` and `check`, a `canonical-cargo-v1` launcher profile can opt into
+For `build`, `check`, `test`, `run` and `bench`, a `canonical-cargo-v1` launcher profile can opt into
 command-specific dependency preparation with this field:
 
 ```json
@@ -624,6 +624,17 @@ feature, target and profile selection must describe the command that the worker
 will run. Planning includes selected host build dependencies and procedural
 macros as well as target units; a target-filtered metadata result alone is not
 the dependency closure.
+
+Test and benchmark planning preserves the selected targets, name filter,
+`--no-run`, `--doc` and `--no-fail-fast` where applicable. Harness and program
+arguments after `--` stay in the original execution request and are never
+passed to the graph query. Planning does not compile or run build scripts,
+tests, benchmarks or the requested program. For `run`, captured Cargo metadata
+and, when needed, `cargo pkgid` resolve the exact default binary; named binaries
+and examples retain their explicit selectors. The preparer queries a build
+graph for that one target because Cargo's run command may look for an executable
+even during graph-only planning. The worker still receives the original `run`
+command and its literal arguments. Ambiguous default binaries are refused.
 
 Planning and execution use the same validated literal application environment.
 Overrides of Cargo, Rustup, compiler, loader, Git or RABS control variables are
@@ -651,8 +662,9 @@ This option still captures the complete approved source anchor and retains its
 original manifests, lockfile and configuration. It changes dependency
 preparation, not the worker's artifact or cache-authority contract. Profiles
 without `source_selection` keep the existing complete-graph preparation.
-`test`, `run`, `bench` and `clippy` do not accept this opt-in marker; their
-existing profiles continue to use the default preparer.
+`clippy` does not yet accept this opt-in marker; its existing profiles continue
+to use the default preparer until selected preparation qualifies the captured
+Clippy companion and compiler environment.
 
 ### Captured compiler configuration
 

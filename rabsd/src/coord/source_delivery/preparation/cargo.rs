@@ -334,9 +334,41 @@ impl CargoSource {
         let metadata: Value = serde_json::from_slice(&output)
             .map_err(|error| invalid(&format!("invalid Cargo metadata JSON: {error}")))?;
         if let Some(selection) = &self.selection {
+            let package_id = if let Some(package) = selection.run_package() {
+                let mut package_command = planning_command(
+                    &cargo,
+                    &rustc,
+                    &root,
+                    &self.manifest,
+                    &planning_root,
+                    selected_toolchain,
+                )?;
+                selection.configure(&mut package_command);
+                package_command
+                    .args(["pkgid", "--locked", "--offline", "--package", package])
+                    .arg("--manifest-path")
+                    .arg(root.join(&self.manifest));
+                let output = bounded_command_controlled(
+                    package_command,
+                    &planning_root,
+                    METADATA_TIMEOUT,
+                    OUTPUT_LIMIT,
+                    control,
+                )?;
+                Some(
+                    std::str::from_utf8(&output)
+                        .map_err(|_| invalid("selected Cargo pkgid is not UTF-8"))?
+                        .trim_end_matches(['\n', '\r'])
+                        .to_owned(),
+                )
+            } else {
+                None
+            };
             // Cargo's native unit graph contains both target units and host
             // build-script/proc-macro units. Target-filtered metadata cannot
-            // stand in for that closure.
+            // stand in for that closure. Run planning resolves one exact
+            // binary/example without executing it; harness/program arguments
+            // remain exclusively in the original execution request.
             let mut graph = planning_command(
                 &cargo,
                 &rustc,
@@ -347,7 +379,7 @@ impl CargoSource {
             )?;
             selection.configure(&mut graph);
             graph
-                .args(selection.arguments())
+                .args(selection.graph_arguments(&metadata, package_id.as_deref())?)
                 .args([
                     "--locked",
                     "--offline",

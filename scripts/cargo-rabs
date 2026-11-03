@@ -1720,8 +1720,8 @@ def canonical_invocation(profile_path, args, env):
     clippy = cargo_args[0] == "clippy"
     required_tools = ("cargo", "rustc", "cargo-clippy", "clippy-driver") if clippy else ("cargo", "rustc")
     profile = canonical_profile(profile_path, required_tools, env, toolchain)
-    if "source_selection" in profile and cargo_args[0] not in ("build", "check"):
-        raise SetupError("cargo-unit-graph-v1 source preparation supports only build and check")
+    if "source_selection" in profile and cargo_args[0] == "clippy":
+        raise SetupError("cargo-unit-graph-v1 source preparation does not support Clippy")
     incremental = profile.get("incremental", False)
     live_flags = ["--live-stderr"] if profile.get("live_stderr", False) else []
     daemon = executable("rabsd", "CARGO_RABS_DAEMON", env)

@@ -9,7 +9,7 @@ use super::{
     MAX_PACKAGES, OUTPUT_LIMIT, PreparationControl, captured_metadata_path, graph, invalid,
     registry::RegistryCache, require, validate_metadata_packages_controlled,
 };
-use rabs_sandbox::cargo_check::{CompilationCommand, CompilationSelection};
+use rabs_sandbox::cargo_check::{CompilationCommand, CompilationSelection, run_build_selection};
 use rabs_sandbox::process_context::{COMMAND_CONTEXT_VERSION, CommandContext};
 use rabs_sandbox::snapshot_capture::SealedSourceSnapshot;
 use serde_json::Value;
@@ -24,7 +24,7 @@ pub(super) const VERSION: &str = "cargo-unit-graph-v1";
 pub(super) struct SelectedCommand {
     manifest: String,
     pub(super) command: CompilationCommand,
-    arguments: Vec<String>,
+    selection: CompilationSelection,
     environment: Vec<(String, String)>,
 }
 
@@ -85,16 +85,19 @@ impl SelectedCommand {
             .map(|value| {
                 value
                     .as_str()
-                    .filter(|value| value.len() <= 4096 && !value.chars().any(char::is_control))
+                    .filter(|value| value.len() <= 4096 && !value.contains('\0'))
                     .ok_or_else(|| invalid("invalid selected Cargo argument"))
             })
             .collect::<io::Result<Vec<_>>>()?;
         let command = match args[0] {
             "build" => CompilationCommand::Build,
             "check" => CompilationCommand::Check,
+            "test" => CompilationCommand::Test,
+            "run" => CompilationCommand::Run,
+            "bench" => CompilationCommand::Bench,
             _ => {
                 return Err(invalid(
-                    "selected Cargo preparation supports build and check only",
+                    "selected Cargo preparation supports build, check, test, run and bench",
                 ));
             }
         };
@@ -102,6 +105,36 @@ impl SelectedCommand {
         let mut controls = BTreeSet::new();
         let mut at = 1;
         while at < args.len() {
+            if args[at] == "--" {
+                require(
+                    matches!(
+                        command,
+                        CompilationCommand::Test
+                            | CompilationCommand::Run
+                            | CompilationCommand::Bench
+                    ) && !selection.no_run,
+                    "selected Cargo program arguments require test, run or bench execution",
+                )?;
+                // The remaining bounded argv belongs to the program or harness,
+                // including option-looking values and literal control bytes.
+                // Keep it in the original request, never pass it to planning:
+                // otherwise it could swallow the nonexecuting unit-graph switch.
+                break;
+            }
+            if !args[at].starts_with('-')
+                && matches!(
+                    command,
+                    CompilationCommand::Test | CompilationCommand::Bench
+                )
+            {
+                require(
+                    selection.test_filter.is_none(),
+                    "selected Cargo accepts one test or benchmark name filter",
+                )?;
+                selection.test_filter = Some(args[at].to_owned());
+                at += 1;
+                continue;
+            }
             let (option, inline) = args[at]
                 .split_once('=')
                 .map_or((args[at], None), |(option, value)| (option, Some(value)));
@@ -188,6 +221,9 @@ impl SelectedCommand {
                         "--benches" => &mut selection.benches,
                         "--all-targets" => &mut selection.all_targets,
                         "--release" | "-r" => &mut selection.release,
+                        "--doc" => &mut selection.doc,
+                        "--no-run" => &mut selection.no_run,
+                        "--no-fail-fast" => &mut selection.no_fail_fast,
                         _ => return Err(invalid("unsupported selected Cargo argument")),
                     };
                     require(!*flag, "duplicate selected Cargo flag")?;
@@ -205,11 +241,15 @@ impl SelectedCommand {
                     || (controls.contains("--locked") && controls.contains("--offline"))),
             "selected Cargo requires its exact locked offline transport controls",
         )?;
-        let arguments = selection.cargo_arguments(command)?;
+        require(
+            !selection.no_run || (!selection.doc && selection.test_filter.is_none()),
+            "selected Cargo filters and documentation tests require execution",
+        )?;
+        selection.cargo_arguments(command)?;
         Ok(Self {
             manifest: manifest.to_owned(),
             command,
-            arguments,
+            selection,
             environment: context.environment().to_vec(),
         })
     }
@@ -218,8 +258,32 @@ impl SelectedCommand {
         command.envs(self.environment.iter().map(|(name, value)| (name, value)));
     }
 
-    pub(super) fn arguments(&self) -> &[String] {
-        &self.arguments
+    /// `cargo run` does not reliably return a graph without looking for its
+    /// executable. Resolve only its planning target with Cargo's own metadata
+    /// and pkgid output, then query an exact build. The execution request stays
+    /// a run with its original argument tail.
+    pub(super) fn graph_arguments(
+        &self,
+        metadata: &Value,
+        package_id: Option<&str>,
+    ) -> io::Result<Vec<String>> {
+        if self.command == CompilationCommand::Run {
+            run_build_selection(&self.selection, metadata, package_id)?
+                .cargo_arguments(CompilationCommand::Build)
+        } else {
+            self.selection.cargo_arguments(self.command)
+        }
+    }
+
+    /// An explicit target already lets Cargo resolve its ordinary package
+    /// selector. A default-run target additionally needs the exact package ID;
+    /// its spelling comes from captured Cargo, never a second spec parser.
+    pub(super) fn run_package(&self) -> Option<&str> {
+        (self.command == CompilationCommand::Run
+            && self.selection.bin.is_empty()
+            && self.selection.example.is_empty())
+        .then(|| self.selection.packages.first().map(String::as_str))
+        .flatten()
     }
 }
 

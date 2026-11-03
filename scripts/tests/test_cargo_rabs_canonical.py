@@ -400,6 +400,45 @@ class CanonicalCargo(unittest.TestCase):
         self.assertEqual(request["command_context"]["env"], {
             "BUILD_LABEL": "selected '雪'", "SOURCE_DATE_EPOCH": "123", "CARGO_INCREMENTAL": "0"})
 
+    def test_selected_source_profile_preserves_execution_selection_and_opaque_tails(self):
+        self.profile["source_selection"] = "cargo-unit-graph-v1"
+        self.save()
+        tail = ["--", "--no-run", "--target-dir", "literal path", "--unit-graph", "", "line\n雪"]
+        cases = [
+            (["test", "--workspace", "--exclude=unused", "--all-features", "--no-fail-fast",
+              "needle=value"] + tail, "cargo-test-json-v1"),
+            (["test", "--doc", "--package=app@0.1.0"] + tail, "cargo-test-json-v1"),
+            (["test", "--no-run", "--test", "integration"], "cargo-json-v1"),
+            (["run"] + tail, "cargo-run-json-v1"),
+            (["run", "--package=app@0.1.0", "--features=selected", "--profile=ci"] + tail,
+             "cargo-run-json-v1"),
+            (["run", "--example", "demo", "--target=x86_64-unknown-linux-gnu"] + tail,
+             "cargo-run-json-v1"),
+            (["bench", "--bench", "measure", "--no-default-features", "needle=value"] + tail,
+             "cargo-bench-json-v1"),
+            (["bench", "--no-run", "--all-targets"], "cargo-json-v1"),
+        ]
+        for args, mode in cases:
+            with self.subTest(args=args):
+                status, _, stderr, _ = self.invoke(args, input=b"caller input\x00\xff")
+                self.assertEqual(status, 0, stderr)
+                record = self.records()[-1]
+                request = record["request"]
+                separator = args.index("--") if "--" in args else len(args)
+                self.assertEqual(request["args"][:separator], args[:separator])
+                generated = request["args"][separator:]
+                if "--" in args:
+                    self.assertEqual(generated[generated.index("--"):], args[separator:])
+                    generated = generated[:generated.index("--")]
+                self.assertIn("--locked", generated)
+                self.assertIn("--offline", generated)
+                self.assertIn("--message-format=json", generated)
+                self.assertEqual(request["cargo_source"], {
+                    "manifest": "Cargo.toml", "selection": "cargo-unit-graph-v1"})
+                self.assertEqual(request["artifacts"]["cargo"], mode)
+                self.assertEqual(record["input"], b"caller input\x00\xff".hex())
+        self.assertFalse(self.forbidden.exists())
+
     def test_selected_source_profile_rejects_unknown_markers_before_creating_an_operation(self):
         for selection in (None, True, 1, [], {}, "", "metadata", "cargo-unit-graph-v2"):
             with self.subTest(selection=selection):
@@ -409,19 +448,16 @@ class CanonicalCargo(unittest.TestCase):
                 self.assertEqual(list(self.operations.iterdir()), [])
                 self.assertFalse(self.record.exists())
 
-    def test_selected_source_profile_refuses_unsupported_commands_without_fallback(self):
+    def test_selected_source_profile_refuses_unqualified_clippy_without_fallback(self):
         self.install_clippy()
         self.profile["source_selection"] = "cargo-unit-graph-v1"
         self.save()
-        for args in (["test", "--lib"], ["run", "--bin", "hello"],
-                     ["bench", "--bench", "measure"], ["clippy"]):
-            with self.subTest(args=args):
-                status, _, stderr, _ = self.invoke(args)
-                self.assertEqual(status, 2, stderr)
-                self.assertIn(b"supports only build and check", stderr)
-                self.assertEqual(list(self.operations.iterdir()), [])
-                self.assertFalse(self.record.exists())
-                self.assertFalse(self.forbidden.exists())
+        status, _, stderr, _ = self.invoke(["clippy"])
+        self.assertEqual(status, 2, stderr)
+        self.assertIn(b"does not support Clippy", stderr)
+        self.assertEqual(list(self.operations.iterdir()), [])
+        self.assertFalse(self.record.exists())
+        self.assertFalse(self.forbidden.exists())
 
     def test_source_selection_remains_absent_for_legacy_profiles(self):
         status, _, stderr, _ = self.invoke(["check", "--lib"])
