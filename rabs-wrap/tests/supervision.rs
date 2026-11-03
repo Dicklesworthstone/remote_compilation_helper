@@ -3,11 +3,12 @@
 #![cfg(target_os = "linux")]
 
 use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Write};
+use std::ffi::OsStr;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -78,6 +79,7 @@ struct Fixture {
     root: tempfile::TempDir,
     socket: PathBuf,
     compiler: PathBuf,
+    wrapper: PathBuf,
 }
 
 impl Fixture {
@@ -95,6 +97,7 @@ impl Fixture {
             root,
             socket,
             compiler,
+            wrapper: PathBuf::from(env!("CARGO_BIN_EXE_rabs-wrap")),
         }
     }
 
@@ -106,6 +109,15 @@ impl Fixture {
         &self,
         pause: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
     ) -> std::thread::JoinHandle<Option<Value>> {
+        self.daemon_checked(pause, None)
+    }
+
+    fn daemon_checked(
+        &self,
+        pause: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+        compiler: Option<PathBuf>,
+    ) -> std::thread::JoinHandle<Option<Value>> {
+        let cancelled_reply = pause.is_some();
         let listener = UnixListener::bind(&self.socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         std::thread::spawn(move || {
@@ -135,6 +147,9 @@ impl Fixture {
             reader.read_line(&mut line).unwrap();
             let request: Value = serde_json::from_str(&line).unwrap();
             assert_eq!(request["kind"], "rustc-request");
+            if let Some(compiler) = compiler {
+                assert_eq!(request["argv"][0], compiler.to_str().unwrap());
+            }
             if let Some((arrived, release)) = pause {
                 arrived.send(()).unwrap();
                 release.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -143,7 +158,20 @@ impl Fixture {
                 "action_key":"fixture", "attempt":"supervised-attempt",
                 "capture_protocol":1, "compiler_skip_authorized":false,
                 "env":[["PATH","/usr/bin:/bin"],["EXACT","admitted value"]]});
-            writeln!(writer, "{reply}").unwrap();
+            if let Err(error) = writeln!(writer, "{reply}") {
+                // The paused case deliberately kills the original caller
+                // before releasing this reply. Closing before a late execute
+                // decision is valid cancellation, never compiler consent.
+                if cancelled_reply
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    )
+                {
+                    return None;
+                }
+                panic!("decision write: {error}");
+            }
             line.clear();
             match reader.read_line(&mut line) {
                 Ok(0) => None,
@@ -155,10 +183,17 @@ impl Fixture {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_rabs-wrap"));
+        self.command_for(
+            self.compiler.as_os_str(),
+            &["--crate-name", "demo", "lib.rs"],
+        )
+    }
+
+    fn command_for(&self, compiler: &OsStr, args: &[&str]) -> Command {
+        let mut command = Command::new(&self.wrapper);
         command
-            .arg(&self.compiler)
-            .args(["--crate-name", "demo", "lib.rs"])
+            .arg(compiler)
+            .args(args)
             .current_dir(self.root.path())
             .env("RABS_SOCKET_PATH", &self.socket)
             .env("RABS_BREAKER_FILE", self.root.path().join("breaker"))
@@ -208,6 +243,161 @@ impl Fixture {
         });
         pid.unwrap()
     }
+}
+
+#[derive(Debug)]
+struct ThreadedCompilerResult {
+    status: ExitStatus,
+    finished: bool,
+    observed_zombie_with_live_thread: bool,
+    stdout: Vec<u8>,
+}
+
+fn threaded_compiler_result(wrapper: &Path) -> ThreadedCompilerResult {
+    let mut fixture = Fixture::new("exec ./pthread-compiler");
+    fixture.wrapper = wrapper.to_path_buf();
+    // Native pthread behavior, rather than a fabricated procfs record: the
+    // leader exits while another thread still has three seconds of work.
+    // Both threads have a natural bound even against the old supervisor.
+    let source = br#"
+#define _GNU_SOURCE
+#include <pthread.h>
+#include <stdio.h>
+#include <sys/syscall.h>
+#include <time.h>
+#include <unistd.h>
+static int released(void) {
+    for (int i = 0; i < 800; ++i) {
+        if (access("release-main", F_OK) == 0) return 1;
+        struct timespec delay = {0, 10000000};
+        nanosleep(&delay, NULL);
+    }
+    return 0;
+}
+static void *work(void *unused) {
+    (void)unused;
+    FILE *ready = fopen("thread.pid", "w");
+    if (!ready) _exit(91);
+    fprintf(ready, "%ld\n", (long)syscall(SYS_gettid));
+    if (fclose(ready) || !released()) _exit(92);
+    struct timespec delay = {3, 0};
+    nanosleep(&delay, NULL);
+    FILE *finished = fopen("thread.finished", "w");
+    if (!finished) _exit(93);
+    if (fputs("done", finished) < 0 || fclose(finished)) _exit(94);
+    if (write(STDOUT_FILENO, "completed\n", 10) != 10) _exit(95);
+    return NULL;
+}
+int main(void) {
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, work, NULL) || !released()) return 96;
+    pthread_exit(NULL);
+}
+"#;
+    let mut cc = Command::new("/usr/bin/cc")
+        .args(["-std=c11", "-pthread", "-x", "c", "-", "-o"])
+        .arg(fixture.root.path().join("pthread-compiler"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    cc.stdin.take().unwrap().write_all(source).unwrap();
+    let built = cc.wait_with_output().unwrap();
+    assert!(built.status.success(), "native pthread fixture: {built:?}");
+    let daemon = fixture.daemon();
+    let mut child = Owned(fixture.command().stdout(Stdio::piped()).spawn().unwrap());
+    let compiler = fixture.pid("compiler.pid");
+    let thread = fixture.pid("thread.pid");
+    std::fs::write(fixture.root.path().join("release-main"), b"release").unwrap();
+    let mut status = None;
+    let mut observed_zombie_with_live_thread = false;
+    until(|| {
+        if PathBuf::from(format!("/proc/{compiler}/stat")).exists()
+            && stopped(compiler)
+            && !stopped(thread)
+        {
+            observed_zombie_with_live_thread = true;
+        }
+        status = child.0.try_wait().unwrap();
+        status.is_some()
+    });
+    let mut stdout = Vec::new();
+    child
+        .0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_end(&mut stdout)
+        .unwrap();
+    daemon.join().unwrap();
+    ThreadedCompilerResult {
+        status: status.unwrap(),
+        finished: std::fs::read(fixture.root.path().join("thread.finished"))
+            .is_ok_and(|bytes| bytes == b"done"),
+        observed_zombie_with_live_thread,
+        stdout,
+    }
+}
+
+#[test]
+fn zombie_compiler_leader_is_not_whole_process_completion() {
+    // Native qualification can run the byte-bound incumbent in this SAME
+    // invocation. Its failure remains separate from the repaired wrapper.
+    if let Some(incumbent) = std::env::var_os("RABS_SUPERVISION_INCUMBENT") {
+        let previous = threaded_compiler_result(Path::new(&incumbent));
+        assert!(
+            !previous.status.success() || !previous.finished,
+            "incumbent unexpectedly completed the adversarial workload: {previous:?}"
+        );
+        eprintln!("zombie-leader-incumbent: rejected {previous:?}");
+    }
+    let current = threaded_compiler_result(Path::new(env!("CARGO_BIN_EXE_rabs-wrap")));
+    assert!(current.status.success(), "{current:?}");
+    assert!(current.finished, "{current:?}");
+    assert!(current.observed_zombie_with_live_thread, "{current:?}");
+    assert_eq!(current.stdout, b"completed\n");
+    eprintln!("zombie-leader-current: completed");
+}
+
+#[test]
+fn bare_compiler_is_bound_before_the_admitted_environment_changes_path() {
+    let fixture = Fixture::new("printf 'selected compiler'; exit 7");
+    let selected = fixture.root.path().join("selected");
+    std::fs::create_dir(&selected).unwrap();
+    let compiler = selected.join("rustc");
+    std::os::unix::fs::symlink(&fixture.compiler, &compiler).unwrap();
+    let daemon = fixture.daemon_checked(None, Some(compiler));
+    let output = fixture
+        .command_for(OsStr::new("rustc"), &["--crate-name", "demo", "lib.rs"])
+        .env("PATH", &selected)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(7), "{:?}", output.stderr);
+    assert_eq!(output.stdout, b"selected compiler");
+    assert_eq!(daemon.join().unwrap().unwrap()["exit_code"], 7);
+}
+
+#[test]
+fn resolved_compiler_keeps_its_original_argv_zero_through_the_guard() {
+    let fixture = Fixture::new("exit 93");
+    let selected = fixture.root.path().join("selected");
+    std::fs::create_dir(&selected).unwrap();
+    let compiler = selected.join("sh");
+    std::os::unix::fs::symlink("/bin/sh", &compiler).unwrap();
+    let daemon = fixture.daemon_checked(None, Some(compiler));
+    let output = fixture
+        .command_for(OsStr::new("sh"), &["-c", "printf '%s' \"$0\"; exit 7"])
+        .env("PATH", &selected)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(7), "{:?}", output.stderr);
+    assert_eq!(output.stdout, b"sh");
+    assert_eq!(daemon.join().unwrap().unwrap()["exit_code"], 7);
 }
 
 #[test]

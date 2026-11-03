@@ -43,9 +43,11 @@ use std::ffi::{OsStr, OsString};
 #[cfg(test)]
 use std::io::BufRead;
 use std::io::{self, BufReader, Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// Minimal JSON string encoder (quotes + escapes; no serde by design).
@@ -365,6 +367,73 @@ fn shadow_argv(real_rustc: &OsStr, args: &[OsString]) -> Option<Vec<String>> {
         .chain(args.iter().map(OsString::as_os_str))
         .map(|arg| arg.to_str().map(str::to_owned))
         .collect()
+}
+
+/// Bind the executable selected by this caller's PATH, without resolving
+/// symlinks (rustup dispatches on their spelling). A later admitted environment
+/// must not choose a different executable. Unknown lookup errors stay local.
+fn compiler_for_observation(
+    compiler: &OsStr,
+    search: Option<&OsStr>,
+    cwd: &Path,
+) -> Option<PathBuf> {
+    use rustix::fs::{Access, AtFlags, CWD, accessat};
+
+    let program = Path::new(compiler);
+    if program.is_absolute() {
+        return Some(program.to_owned());
+    }
+    if compiler.is_empty() || !cwd.is_absolute() {
+        return None;
+    }
+    let executable = |path: &Path| -> io::Result<bool> {
+        let metadata = match std::fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound
+                        | io::ErrorKind::NotADirectory
+                        | io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        if !metadata.is_file() {
+            return Ok(false);
+        }
+        match accessat(CWD, path, Access::EXEC_OK, AtFlags::EACCESS) {
+            Ok(()) => Ok(true),
+            Err(error) => {
+                let error = io::Error::from(error);
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound
+                        | io::ErrorKind::NotADirectory
+                        | io::ErrorKind::PermissionDenied
+                ) {
+                    Ok(false)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    };
+    if compiler.as_bytes().contains(&b'/') {
+        let path = cwd.join(program);
+        return executable(&path).ok()?.then_some(path);
+    }
+    // An absent PATH has platform-specific exec defaults. Preserve the
+    // original direct exec instead of inventing an executable search policy.
+    for directory in std::env::split_paths(search?) {
+        let path = cwd.join(directory).join(program);
+        if executable(&path).ok()? {
+            return Some(path);
+        }
+    }
+    None
 }
 
 fn load_state(path: &str) -> BreakerState {
@@ -1121,10 +1190,13 @@ fn is_executable_file_busy(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::ExecutableFileBusy || error.raw_os_error() == Some(26)
 }
 
-fn exec_compiler(real_rustc: &OsStr, args: &[OsString]) -> ! {
+fn exec_compiler(real_rustc: &OsStr, argv0: &OsStr, args: &[OsString]) -> ! {
     let deadline = Instant::now() + Duration::from_millis(250);
     loop {
-        let error = std::process::Command::new(real_rustc).args(args).exec();
+        let error = std::process::Command::new(real_rustc)
+            .arg0(argv0)
+            .args(args)
+            .exec();
         if is_executable_file_busy(&error) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(1));
             continue;
@@ -1141,20 +1213,21 @@ fn exec_compiler(real_rustc: &OsStr, args: &[OsString]) -> ! {
 /// refuses an otherwise successful result. Nonzero compiler exits/signals win.
 fn run_attempt(
     real_rustc: &OsStr,
+    argv0: &OsStr,
     args: &[OsString],
     mut session: BufReader<ConsultStream>,
     attempt: &str,
     env: &[(String, String)],
     owner: supervision::Owner,
 ) -> ! {
-    let mut child = match supervision::spawn(real_rustc, args, env, owner) {
+    let mut child = match supervision::spawn(real_rustc, argv0, args, env, owner) {
         Ok(child) => child,
         Err(_) => {
             // No compiler started. Abandon admission and become the original
             // compiler, rather than leave an unsupervised observed child.
             drop(session);
             stop_if_caller_lost(Some(owner));
-            exec_compiler(real_rustc, args);
+            exec_compiler(real_rustc, argv0, args);
         }
     };
     let stdout = child.stdout.take();
@@ -1241,15 +1314,23 @@ fn main() {
     let args: Vec<OsString> = argv.collect();
 
     // Probes and unrepresentable argv: no state, no socket, no consult.
-    if let Some(consult_argv) = shadow_argv(&real_rustc, &args) {
+    let observation = shadow_argv(&real_rustc, &args).and_then(|mut argv| {
+        let selected = compiler_for_observation(
+            &real_rustc,
+            std::env::var_os("PATH").as_deref(),
+            &std::env::current_dir().ok()?,
+        )?;
+        argv[0] = selected.to_str()?.to_owned();
+        Some((selected, argv))
+    });
+    if let Some((selected, consult_argv)) = observation {
         let owner = supervision::Owner::capture().ok();
         stop_if_caller_lost(owner);
-        // The consult argv is the FULL command the compiler runs:
-        // argv[0] is the real tool (the daemon stats it for the
-        // toolchain-identity key component and records it as argv0),
-        // followed by every rustc argument. Sending only the args would
-        // leave the daemon statting `--crate-name` and mislabeling
-        // receipts.
+        // Name the selected executable before every original rustc argument.
+        // The daemon stats this absolute path for toolchain identity. The
+        // guard separately preserves Cargo's original argv[0] when executing
+        // that selected file. Sending only the rustc arguments would leave
+        // the daemon statting `--crate-name` and mislabeling receipts.
         let decision = observe_with_breaker(&socket_path(), &breaker_path(), &consult_argv, owner);
         if matches!(decision, Live::FailClosedSilently) {
             std::process::exit(1);
@@ -1274,7 +1355,15 @@ fn main() {
                 env,
             } => {
                 if let Some(owner) = owner {
-                    run_attempt(&real_rustc, &args, *session, &attempt, &env, owner);
+                    run_attempt(
+                        selected.as_os_str(),
+                        &real_rustc,
+                        &args,
+                        *session,
+                        &attempt,
+                        &env,
+                        owner,
+                    );
                 }
                 // No usable supervision evidence: drop the admission and exec
                 // normally. Never claim to have supervised or published it.
@@ -1292,7 +1381,7 @@ fn main() {
 
     // Become the compiler. On success this never returns; exit codes,
     // signals, and stdio semantics are the real chain's, exactly.
-    exec_compiler(&real_rustc, &args);
+    exec_compiler(&real_rustc, &real_rustc, &args);
 }
 
 #[cfg(test)]
@@ -1878,6 +1967,77 @@ mod tests {
             ])
         );
         assert!(shadow_argv(OsStr::new("rustc"), &["-vV".into()]).is_none());
+    }
+
+    #[test]
+    fn compiler_lookup_uses_path_order_and_effective_execute_permission() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        for directory in ["directory", "denied", "first", "second"] {
+            std::fs::create_dir(root.path().join(directory)).unwrap();
+        }
+        std::fs::create_dir(root.path().join("directory/rustc")).unwrap();
+        for directory in ["denied", "first", "second"] {
+            let path = root.path().join(directory).join("rustc");
+            std::fs::write(&path, b"compiler fixture").unwrap();
+            std::fs::set_permissions(
+                path,
+                std::fs::Permissions::from_mode(if directory == "denied" { 0o600 } else { 0o700 }),
+            )
+            .unwrap();
+        }
+        let lookup = |search: &str| {
+            compiler_for_observation(OsStr::new("rustc"), Some(OsStr::new(search)), root.path())
+        };
+        assert_eq!(
+            lookup("missing:directory:denied:first:second"),
+            Some(root.path().join("first/rustc"))
+        );
+        assert_eq!(
+            lookup("second:first"),
+            Some(root.path().join("second/rustc"))
+        );
+        assert!(lookup("missing:directory:denied").is_none());
+        assert!(compiler_for_observation(OsStr::new("rustc"), None, root.path()).is_none());
+    }
+
+    #[test]
+    fn compiler_lookup_preserves_relative_and_symlink_spelling() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("selected");
+        std::fs::write(&target, b"compiler fixture").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(&target, root.path().join("rustc")).unwrap();
+        for (program, search) in [("rustc", Some(OsStr::new(""))), ("./rustc", None)] {
+            let selected =
+                compiler_for_observation(OsStr::new(program), search, root.path()).unwrap();
+            assert_eq!(selected, root.path().join(program));
+            assert_ne!(
+                selected, target,
+                "a symlink basename must not become rustup"
+            );
+        }
+        let absolute = root.path().join("explicit/rustc");
+        assert_eq!(
+            compiler_for_observation(absolute.as_os_str(), None, root.path()),
+            Some(absolute)
+        );
+    }
+
+    #[test]
+    fn compiler_lookup_does_not_search_past_an_unknown_path_error() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("loop")).unwrap();
+        std::os::unix::fs::symlink("rustc", root.path().join("loop/rustc")).unwrap();
+        assert!(
+            compiler_for_observation(
+                OsStr::new("rustc"),
+                Some(OsStr::new("loop:/usr/bin:/bin")),
+                root.path(),
+            )
+            .is_none()
+        );
     }
 
     #[test]

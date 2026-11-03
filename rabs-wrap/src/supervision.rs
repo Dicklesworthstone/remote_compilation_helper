@@ -77,24 +77,14 @@ fn parse_stat(bytes: &[u8]) -> Option<Stat> {
 }
 
 fn read_stat_path(path: &Path, pid: u32) -> io::Result<Stat> {
-    // A full group census reads thousands of small procfs records twice.
-    // Keep the exact byte bound, including its overflow byte, with one fixed
-    // buffer instead of growing a heap buffer for every process identity.
-    let mut bytes = [0_u8; 8193];
-    let mut length = 0;
-    let mut file = std::fs::File::open(path)?;
-    while length < bytes.len() {
-        match file.read(&mut bytes[length..]) {
-            Ok(0) => break,
-            Ok(read) => length += read,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error),
-        }
-    }
-    if length > 8192 {
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(8193)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > 8192 {
         return Err(io::Error::other("oversized process identity"));
     }
-    parse_stat(&bytes[..length])
+    parse_stat(&bytes)
         .filter(|stat| stat.pid == pid)
         .ok_or_else(|| io::Error::other("invalid process identity"))
 }
@@ -107,6 +97,57 @@ fn process_disappeared(error: &io::Error) -> bool {
     // An already-open procfs descriptor can return ESRCH after its task exits.
     error.kind() == io::ErrorKind::NotFound
         || (cfg!(target_os = "linux") && error.raw_os_error() == Some(3))
+}
+
+fn kernel_process_group(pid: u32) -> io::Result<Option<u32>> {
+    let pid = i32::try_from(pid)
+        .ok()
+        .filter(|pid| *pid > 0)
+        .map(nix::unistd::Pid::from_raw)
+        .ok_or_else(|| io::Error::other("invalid process ID in compiler group scan"))?;
+    match nix::unistd::getpgid(Some(pid)) {
+        Ok(group) => u32::try_from(group.as_raw())
+            .map(Some)
+            .map_err(|_| io::Error::other("invalid kernel process group")),
+        Err(nix::errno::Errno::ESRCH) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// A zombie thread-group leader is not necessarily a waitable process: another
+/// thread may still be running or completing kernel exit work. Observe the
+/// kernel's whole-process exit without reaping our PID-reuse fence.
+fn compiler_waitable(pid: u32) -> io::Result<bool> {
+    #[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
+    {
+        use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid};
+        let pid = i32::try_from(pid)
+            .ok()
+            .filter(|pid| *pid > 0)
+            .map(nix::unistd::Pid::from_raw)
+            .ok_or_else(|| io::Error::other("invalid owned compiler PID"))?;
+        match waitid(
+            Id::Pid(pid),
+            WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+        ) {
+            Ok(WaitStatus::StillAlive) | Err(nix::errno::Errno::EINTR) => Ok(false),
+            Ok(WaitStatus::Exited(observed, _) | WaitStatus::Signaled(observed, _, _))
+                if observed == pid =>
+            {
+                Ok(true)
+            }
+            Ok(_) => Err(io::Error::other("unexpected owned compiler wait state")),
+            Err(error) => Err(error.into()),
+        }
+    }
+    #[cfg(not(all(target_os = "linux", not(target_env = "uclibc"))))]
+    {
+        let _ = pid;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "whole-process compiler observation requires Linux",
+        ))
+    }
 }
 
 fn scan_budget(entries: &mut usize, deadline: Instant) -> io::Result<()> {
@@ -139,6 +180,7 @@ fn quiescent_group_snapshot(
     leader: u32,
     parent: u32,
     deadline: Instant,
+    mut process_group: impl FnMut(u32) -> io::Result<Option<u32>>,
 ) -> io::Result<Option<Vec<(u32, u64)>>> {
     let mut entries = 0;
     scan_budget(&mut entries, deadline)?;
@@ -159,6 +201,15 @@ fn quiescent_group_snapshot(
         let Some(pid) = number::<u32>(entry.file_name().as_bytes()) else {
             continue;
         };
+        // Enumerate EVERY visible PID. The kernel can identify nonmembers
+        // without opening thousands of unrelated stat files. A failed query
+        // remains uncertain; only ESRCH is disappearance. Matching members
+        // still require their full identity and every thread below, including
+        // a zombie leader's live threads. PID reuse cannot replace the pinned,
+        // unreaped compiler leader, and both terminal sweeps remain required.
+        if process_group(pid)? != Some(leader) {
+            continue;
+        }
         let process_path = entry.path();
         let stat = match read_stat_path(&process_path.join("stat"), pid) {
             Ok(stat) => stat,
@@ -320,6 +371,7 @@ fn spawn_with_etxtbsy_retry(command: &mut Command) -> io::Result<Child> {
 /// through that ordinary fail-open error path and start an orphaned compiler.
 pub(super) fn spawn(
     compiler: &OsStr,
+    argv0: &OsStr,
     args: &[OsString],
     env: &[(String, String)],
     owner: Owner,
@@ -327,6 +379,7 @@ pub(super) fn spawn(
     if !cfg!(target_os = "linux") {
         return spawn_with_etxtbsy_retry(
             Command::new(compiler)
+                .arg0(argv0)
                 .args(args)
                 .env_clear()
                 .envs(env.iter().map(|(key, value)| (key, value)))
@@ -348,6 +401,7 @@ pub(super) fn spawn(
             .arg(owner.caller_start.to_string())
             .arg("--")
             .arg(compiler)
+            .arg(argv0)
             .args(args)
             .env_clear()
             .envs(env.iter().map(|(key, value)| (key, value)))
@@ -405,6 +459,7 @@ pub(super) fn run_if_guard() {
             return Err(invalid());
         }
         let compiler = args.next().ok_or_else(invalid)?;
+        let argv0 = args.next().ok_or_else(invalid)?;
         let own = Owner::capture()?;
         let stat = read_stat(own.pid)?;
         if stat.parent != owner.pid || stat.group != own.pid || !owner.alive() {
@@ -426,7 +481,12 @@ pub(super) fn run_if_guard() {
             ));
         }
         let kill = kill_program()?;
-        let child = spawn_with_etxtbsy_retry(Command::new(compiler).args(args).process_group(0))?;
+        let child = spawn_with_etxtbsy_retry(
+            Command::new(compiler)
+                .arg0(argv0)
+                .args(args)
+                .process_group(0),
+        )?;
         let mut owned = OwnedCompiler {
             child,
             kill,
@@ -444,7 +504,7 @@ pub(super) fn run_if_guard() {
                     "compiler wrapper or original caller disappeared",
                 ));
             }
-            if stat.exited() {
+            if compiler_waitable(owned.child.id())? {
                 return owned.finish();
             }
             std::thread::sleep(POLL);
@@ -515,6 +575,7 @@ impl OwnedCompiler {
                 self.child.id(),
                 std::process::id(),
                 deadline,
+                kernel_process_group,
             )?;
             if current.is_some() && current == previous {
                 // Keep the PID fence through two independent terminal sweeps.
@@ -671,7 +732,21 @@ mod tests {
     }
 
     fn snapshot(root: &Path) -> io::Result<Option<Vec<(u32, u64)>>> {
-        quiescent_group_snapshot(root, 123, 99, Instant::now() + Duration::from_secs(2))
+        quiescent_group_snapshot(
+            root,
+            123,
+            99,
+            Instant::now() + Duration::from_secs(2),
+            |pid| fixture_process_group(root, pid),
+        )
+    }
+
+    fn fixture_process_group(root: &Path, pid: u32) -> io::Result<Option<u32>> {
+        match read_stat_path(&root.join(pid.to_string()).join("stat"), pid) {
+            Ok(stat) => Ok(Some(stat.group)),
+            Err(error) if process_disappeared(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     #[test]
@@ -729,21 +804,126 @@ mod tests {
                 dir.path(),
                 123,
                 100,
-                Instant::now() + Duration::from_secs(2)
+                Instant::now() + Duration::from_secs(2),
+                |pid| fixture_process_group(dir.path(), pid),
             )
             .is_err()
         );
-        let error = quiescent_group_snapshot(dir.path(), 123, 99, Instant::now()).unwrap_err();
+        let error = quiescent_group_snapshot(dir.path(), 123, 99, Instant::now(), |pid| {
+            fixture_process_group(dir.path(), pid)
+        })
+        .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         let mut entries = MAX_SCAN_ENTRIES;
         assert!(scan_budget(&mut entries, Instant::now() + Duration::from_secs(2)).is_err());
     }
 
+    #[test]
+    fn failed_group_queries_and_an_absent_pinned_leader_cannot_confirm_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_process(dir.path(), 123, 123, 'Z');
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let error = quiescent_group_snapshot(dir.path(), 123, 99, deadline, |_| {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(quiescent_group_snapshot(dir.path(), 123, 99, deadline, |_| Ok(None)).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kernel_group_queries_keep_live_and_unreaped_members_distinct_from_disappearance() {
+        let mut child = Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let live = kernel_process_group(pid);
+        let other = kernel_process_group(std::process::id());
+        child.kill().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut terminal = false;
+        while Instant::now() < deadline {
+            if read_stat(pid).is_ok_and(Stat::exited) {
+                terminal = true;
+                break;
+            }
+            std::thread::sleep(POLL);
+        }
+        let unreaped = kernel_process_group(pid);
+        child.wait().unwrap();
+        let gone = kernel_process_group(pid);
+        assert_eq!(live.unwrap(), Some(pid));
+        assert_ne!(other.unwrap(), Some(pid));
+        assert!(terminal);
+        assert_eq!(unreaped.unwrap(), Some(pid));
+        assert_eq!(gone.unwrap(), None);
+        assert!(kernel_process_group(0).is_err());
+        assert!(kernel_process_group(u32::MAX).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kernel_group_queries_preserve_visible_zero_groups() {
+        let mut zero_groups = 0;
+        for entry in std::fs::read_dir("/proc").unwrap() {
+            let entry = entry.unwrap();
+            let Some(pid) = number::<u32>(entry.file_name().as_bytes()) else {
+                continue;
+            };
+            let before = match read_stat(pid) {
+                Ok(stat) => stat,
+                Err(error) if process_disappeared(&error) => continue,
+                Err(error) => panic!("cannot observe PID {pid}: {error}"),
+            };
+            let observed = kernel_process_group(pid).unwrap();
+            if before.group == 0
+                && read_stat(pid).is_ok_and(|after| after.start == before.start && after.group == 0)
+            {
+                assert_eq!(observed, Some(0), "kernel PID {pid}");
+                zero_groups += 1;
+            }
+        }
+        // Containers may expose no kernel threads. Native qualification on
+        // the host that exposed this bug must retain a NONZERO observation.
+        eprintln!("kernel-group-zero-observed: {zero_groups}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn whole_process_exit_observation_does_not_reap_the_pid_fence() {
+        let mut child = Command::new("/bin/true")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let until = Instant::now() + Duration::from_secs(5);
+        while !compiler_waitable(pid).unwrap() {
+            assert!(Instant::now() < until);
+            std::thread::sleep(POLL);
+        }
+        let before = read_stat(pid).unwrap();
+        assert!(before.exited());
+        assert!(compiler_waitable(pid).unwrap());
+        assert_eq!(read_stat(pid).unwrap().start, before.start);
+        assert!(child.wait().unwrap().success());
+        assert!(compiler_waitable(pid).is_err());
+        assert!(compiler_waitable(0).is_err());
+        assert!(compiler_waitable(u32::MAX).is_err());
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn successful_signal_helper_cannot_authorize_live_group_completion() {
-        let child = Command::new("/bin/sh")
-            .args(["-c", "exit 0"])
+        let child = Command::new("/bin/true")
             .process_group(0)
             .stdin(Stdio::null())
             .stdout(Stdio::null())

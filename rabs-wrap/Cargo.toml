@@ -13,10 +13,19 @@ publish = false
 
 # Tiny-wrapper profile discipline (A021): the workspace release profile
 # is already opt-level=z + LTO + panic=abort + strip. Dependency budget
-# is deliberately minimal — rabs-protocol only; no async runtime, no
+# is deliberately minimal — protocol + safe executable lookup; no async runtime, no
 # serde (hand-rolled frames): the p95 <10ms budget is the design.
 [dependencies]
 rabs-protocol = { path = "../rabs-protocol" }
+
+[target.'cfg(unix)'.dependencies]
+# Match execvp's effective-user executable search without unsafe code or a
+# helper process. Mode-bit guesses can select a compiler the caller cannot run.
+rustix = { version = "1.1.4", features = ["fs"] }
+# Kernel threads can have PGID 0. Rustix's Pid-returning getpgid cannot represent
+# that valid value; nix preserves it without unsafe code here. All visible PIDs
+# are still enumerated and matching members receive both full terminal sweeps.
+nix = { version = "0.31.3", default-features = false, features = ["process"] }
 
 [dev-dependencies]
 tempfile = "3.25.0"

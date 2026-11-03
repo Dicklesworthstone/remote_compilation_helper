@@ -5188,7 +5188,9 @@ dependencies = [
 name = "rabs-wrap"
 version = "2.1.34"
 dependencies = [
+ "nix",
  "rabs-protocol",
+ "rustix",
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
