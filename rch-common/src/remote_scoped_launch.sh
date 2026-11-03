@@ -490,27 +490,37 @@ rch_scope_launch_finish() {
         sleep 0.1 || { __sl_reason=unknown; break; }
     done
     __sl_cleanup=0
+    __sl_cleanup_status=0; __sl_record_status=0
     if [ "$__sl_admitted" = 1 ]; then
         # Revalidate signal authority and prove emptiness using admitted identity.
-        rch_remote_cancel_loaded kill || __sl_cleanup=1
+        rch_remote_cancel_loaded kill || {
+            __sl_cleanup_status=$?; __sl_cleanup=1;
+        }
         # Check record AFTER cleanup in a subshell; parsing cannot replace our
         # admitted identity. Record damage still forbids confirmed completion.
         (rch_scope_launch_read_owned_record &&
-            [ "$rch_record" = "$__sl_admission_record" ]) || __sl_cleanup=1
+            [ "$rch_record" = "$__sl_admission_record" ]) || {
+                __sl_record_status=$?; __sl_cleanup=1;
+            }
     else
-        rch_scope_launch_stop_setup || __sl_cleanup=1
+        rch_scope_launch_stop_setup || {
+            __sl_cleanup_status=$?; __sl_cleanup=1;
+        }
         # Reap before reading: setup publication cannot then race recovery.
         if [ "$__sl_cleanup" = 0 ]; then wait "$__sl_child"; __sl_wait=$?; fi
         if [ -e "$__sl_record" ] || [ -L "$__sl_record" ]; then
             if rch_scope_launch_read_owned_record; then
-                rch_remote_cancel_loaded kill || __sl_cleanup=1
+                rch_remote_cancel_loaded kill || {
+                    __sl_cleanup_status=$?; __sl_cleanup=1;
+                }
             else
-                __sl_cleanup=1
+                __sl_record_status=$?; __sl_cleanup=1
             fi
         fi
     fi
     if [ "$__sl_cleanup" != 0 ]; then
-        rch_scope_launch_message RCH_SCOPED_COMPLETION_UNCONFIRMED
+        rch_scope_launch_message "RCH_SCOPED_COMPLETION_UNCONFIRMED
+RCH_SCOPED_COMPLETION_DETAIL:reason=$__sl_reason,admitted=$__sl_admitted,cleanup=$__sl_cleanup_status,record=$__sl_record_status"
         return 255
     fi
     if [ "$__sl_admitted" = 1 ]; then wait "$__sl_child"; __sl_wait=$?; fi
@@ -522,7 +532,10 @@ rch_scope_launch_finish() {
     [ "$__sl_cancelled" = 0 ] || return 143
     case "$__sl_reason" in
         result) return "$__sl_status";;
-        unknown) rch_scope_launch_message RCH_SCOPED_COMPLETION_UNCONFIRMED; return 255;;
+        unknown)
+            rch_scope_launch_message "RCH_SCOPED_COMPLETION_UNCONFIRMED
+RCH_SCOPED_COMPLETION_DETAIL:reason=unknown,admitted=$__sl_admitted,cleanup=0,record=0"
+            return 255;;
         exited)
             if [ "$__sl_admitted" = 1 ]; then return "$__sl_wait"; fi;;
     esac
