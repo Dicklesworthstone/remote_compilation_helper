@@ -118,7 +118,14 @@ if mode == "error":
 if "TEST_RUSTUP_OUTPUT_HEX" in os.environ:
     sys.stdout.buffer.write(bytes.fromhex(os.environ["TEST_RUSTUP_OUTPUT_HEX"]))
 else:
-    print(os.environ["TEST_RUSTUP_COMPILER"])
+    if sys.argv[1:] == ["which", "rustc"]:
+        print(os.environ["TEST_RUSTUP_COMPILER"])
+    else:
+        assert sys.argv[1:3] == ["which", "--toolchain"] and sys.argv[4:] == ["rustc"], sys.argv
+        selected = json.loads(os.environ.get("TEST_RUSTUP_SELECTIONS", "{}"))
+        if sys.argv[3] not in selected:
+            sys.exit(1)
+        print(selected[sys.argv[3]])
 '''
 
 RECOVERY_DRIVER = r'''
@@ -357,6 +364,98 @@ class CanonicalCargo(unittest.TestCase):
         finally:
             os.close(read_fd)
             os.close(write_fd)
+
+    def test_rustup_cli_selector_overrides_ambient_selection_without_reaching_cargo(self):
+        self.select_rustup()
+        selected = self.root / "selected compiler"
+        (selected / "bin").mkdir(parents=True)
+        for name in ("cargo", "rustc"):
+            tool = selected / "bin" / name
+            tool.write_bytes((self.toolchain / "bin" / name).read_bytes())
+            tool.chmod(0o700)
+        original = self.profile_path.read_bytes()
+        env = dict(self.env, RUSTUP_TOOLCHAIN="ambient-nightly", RUSTUP_AUTO_INSTALL="1",
+                   TEST_RUSTUP_SELECTIONS=json.dumps({"nightly-command": str(selected / "bin/rustc")}))
+        args = ["+nightly-command", "run", "--bin", "hello", "--", "+program-argument", "--profile=literal"]
+        status, _, stderr, _ = self.invoke(args, env, input=b"program stdin\x00\xff")
+        self.assertEqual(status, 0, stderr)
+        discovery, = [json.loads(line) for line in self.rustup_record.read_text().splitlines()]
+        self.assertEqual(discovery["argv"], ["which", "--toolchain", "nightly-command", "rustc"])
+        self.assertEqual(discovery["cwd"], str(self.root))
+        self.assertEqual(discovery["env"]["RUSTUP_TOOLCHAIN"], "ambient-nightly")
+        self.assertEqual(discovery["env"]["RUSTUP_AUTO_INSTALL"], "0")
+        self.assertEqual(discovery["stdin"], "")
+        record, = self.records()
+        request = record["request"]
+        self.assertEqual(request["toolchain_source"], str(selected))
+        self.assertEqual(request["args"][0:3], ["run", "--bin", "hello"])
+        self.assertEqual(request["args"][-3:], ["--", "+program-argument", "--profile=literal"])
+        self.assertNotIn("+nightly-command", request["args"])
+        self.assertEqual(request["command_context"]["env"], {"CARGO_INCREMENTAL": "0"})
+        self.assertEqual(request["artifacts"]["cargo"], "cargo-run-json-v1")
+        self.assertEqual(record["input"], b"program stdin\x00\xff".hex())
+        self.assertEqual(self.profile_path.read_bytes(), original)
+        retained = json.loads((Path(record["operation"]) / "spec.json").read_bytes())
+        self.assertEqual(retained["toolchain_source"], str(selected))
+        self.assertNotIn("toolchain", retained)
+
+    def test_rustup_cli_selector_preserves_clippy_tools_and_native_environment(self):
+        self.select_rustup()
+        self.install_clippy()
+        env = dict(self.env, RUSTUP_TOOLCHAIN="ambient", RUSTUP_AUTO_INSTALL="1",
+                   TEST_RUSTUP_SELECTIONS=json.dumps({"selected": str(self.toolchain / "bin/rustc")}))
+        original = dict(env)
+        _, _, child_env = launcher.canonical_invocation(
+            str(self.profile_path), ["+selected", "clippy", "--", "-Dwarnings"], env)
+        self.assertEqual(env, original)
+        self.assertEqual(child_env["RUSTUP_TOOLCHAIN"], "ambient")
+        self.assertEqual(child_env["RUSTUP_AUTO_INSTALL"], "1")
+        self.assertEqual(len(self.rustup_record.read_text().splitlines()), 1)
+        operation, = self.operations.iterdir()
+        request = json.loads((operation / "spec.json").read_bytes())
+        self.assertEqual(request["program"], "/__rabs/toolchain/bin/cargo-clippy")
+        self.assertEqual(request["args"][0], "clippy")
+        self.assertEqual(request["args"][-2:], ["--", "-Dwarnings"])
+
+    def test_rustup_cli_selector_conflicts_with_explicit_root_before_discovery(self):
+        self.select_rustup()
+        self.profile.pop("toolchain")
+        self.profile["toolchain_root"] = str(self.toolchain)
+        self.save()
+        self.assert_refused(["+nightly", "check"])
+        self.assertFalse(self.rustup_record.exists())
+
+    def test_rustup_cli_selector_and_command_bounds_refuse_before_discovery(self):
+        self.select_rustup()
+        for args in (["+", "check"], ["+-nightly", "check"], ["++nightly", "check"],
+                     ["+night ly", "check"], ["+nightly\n", "check"], ["+nightly"],
+                     ["+" + "a" * 1025, "check"], ["+" + "雪" * 342, "check"],
+                     ["+nightly", "+stable", "check"], ["+nightly", "build", "--config=other"],
+                     ["+nightly", "check"] + ["--verbose"] * 256):
+            with self.subTest(args=args):
+                self.assert_refused(args)
+                self.assertFalse(self.rustup_record.exists())
+        for value in ("+night\0ly", "+\udcff"):
+            with self.subTest(value=value), self.assertRaises(launcher.SetupError):
+                launcher.canonical_invocation(str(self.profile_path), [value, "check"], self.env)
+        self.assertFalse(self.rustup_record.exists())
+        self.assertEqual(list(self.operations.iterdir()), [])
+
+    def test_missing_explicit_rustup_selection_never_uses_ambient_toolchain(self):
+        self.select_rustup()
+        env = dict(self.env, RUSTUP_TOOLCHAIN="ambient-installed", RUSTUP_AUTO_INSTALL="1")
+        self.assert_refused(["+missing-toolchain", "check"], env)
+        discovery, = [json.loads(line) for line in self.rustup_record.read_text().splitlines()]
+        self.assertEqual(discovery["argv"], ["which", "--toolchain", "missing-toolchain", "rustc"])
+        self.assertEqual(discovery["env"]["RUSTUP_AUTO_INSTALL"], "0")
+
+    def test_program_plus_argument_does_not_select_or_discover_rustup(self):
+        env = dict(self.env, CARGO_RABS_RUSTUP="/absent/rustup")
+        status, _, stderr, _ = self.invoke(["run", "--bin=hello", "--", "+nightly"], env)
+        self.assertEqual(status, 0, stderr)
+        record, = self.records()
+        self.assertEqual(record["request"]["toolchain_source"], str(self.toolchain))
+        self.assertEqual(record["request"]["args"][-2:], ["--", "+nightly"])
 
     def test_explicit_toolchain_root_never_runs_rustup(self):
         env = dict(self.env, CARGO_RABS_RUSTUP="/absent/rustup", RUSTUP_TOOLCHAIN="not-installed")

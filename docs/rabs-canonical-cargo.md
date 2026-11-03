@@ -65,6 +65,24 @@ caller's original working directory and environment. This honors the selected
 overrides and toolchain files at the invocation location. It does not select a
 different toolchain from the profile directory or captured `source_root`.
 
+With a `"toolchain": "rustup"` profile, a leading `+toolchain` before the Cargo
+command selects that installed toolchain explicitly:
+
+```sh
+cargo rabs --rabs-canonical PROFILE.json -- +nightly-2026-08-31 build --workspace
+cargo rabs --rabs-canonical-local LOCAL.json -- +nightly-2026-08-31 check --workspace
+```
+
+The launcher passes this selection to `rustup which --toolchain NAME rustc` in
+the original working directory. It takes precedence over `RUSTUP_TOOLCHAIN`,
+directory overrides and toolchain files without modifying the caller's
+environment. The selector is consumed before the captured Cargo runs. Exactly
+one nonempty UTF-8 selector of at most 1024 bytes is accepted, without whitespace
+or control characters; Rustup validates the installed toolchain name. A selector
+requires a following Cargo command and conflicts with an explicit
+`toolchain_root` profile. Either conflict refuses before discovery or operation
+creation. Arguments such as `run -- +nightly` remain literal program arguments.
+
 Discovery uses `RUSTUP_AUTO_INSTALL=0`, has a five-second deadline and a bounded
 path response, and requires an already installed toolchain with ordinary
 `bin/cargo` and `bin/rustc` executables. Symlinked toolchain ancestors and
@@ -719,11 +737,14 @@ not install a cross-compiler. Cargo remains responsible for package/feature
 resolution and may reject an otherwise syntactically supported request.
 
 The profile owns `--manifest-path`, `--target-dir` and `--message-format=json`.
-Target JSON, `--config`, unstable Cargo flags, `+toolchain`,
+Target JSON, `--config`, unstable Cargo flags,
 test-harness arguments on compilation-only commands, arguments other than the
 supported lint controls after Clippy's delimiter, and unknown Cargo options
 refuse before preparation. The selected toolchain also supplies local Cargo metadata probes; a
-`cargo +nightly rabs` launcher selection does not override that explicit dataset.
+`cargo +nightly rabs` launcher selection affects `"toolchain": "rustup"` profiles
+but does not override an explicit `toolchain_root`. A leading `+toolchain` after
+the profile's `--` delimiter is supported only with the Rustup selector described
+above; it never reaches the captured Cargo binary.
 Cargo is always locked/offline, without duplicating supplied flags.
 
 The worker receives its existing clear-environment canonical base, with
