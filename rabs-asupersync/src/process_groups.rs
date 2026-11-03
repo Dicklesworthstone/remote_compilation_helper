@@ -537,8 +537,7 @@ pub fn reap_residuals(pgid: u32) -> u32 {
 fn leader_in_own_pgrp(pgid: u32) -> Option<bool> {
     let stat = std::fs::read_to_string(format!("/proc/{pgid}/stat")).ok()?;
     let (_, rest) = split_stat_fields(&stat)?;
-    let fields: Vec<&str> = rest.split_whitespace().collect();
-    let member_pgrp = fields.get(2)?.parse::<u32>().ok()?;
+    let member_pgrp = rest.split_whitespace().nth(2)?.parse::<u32>().ok()?;
     Some(member_pgrp == pgid)
 }
 
@@ -565,27 +564,8 @@ pub fn members_from_proc(pgid: u32) -> Vec<GroupMember> {
         let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
             continue; // raced exit or permission
         };
-        let Some((comm, rest)) = split_stat_fields(&stat) else {
-            continue;
-        };
-        // rest: state(0) ppid(1) pgrp(2) …
-        let fields: Vec<&str> = rest.split_whitespace().collect();
-        if fields.len() < 3 {
-            continue;
-        }
-        let Ok(member_pgrp) = fields[2].parse::<u32>() else {
-            continue;
-        };
-        if member_pgrp == pgid {
-            let state = fields[0].chars().next().unwrap_or('?');
-            if state != 'Z' {
-                members.push(GroupMember {
-                    pid,
-                    ppid: fields[1].parse().unwrap_or(-1),
-                    state,
-                    comm,
-                });
-            }
+        if let Some(member) = group_member_from_stat(pid, pgid, &stat) {
+            members.push(member);
         }
     }
     members.sort_by_key(|m| m.pid);
@@ -602,13 +582,33 @@ pub fn members_from_proc(_pgid: u32) -> Vec<GroupMember> {
 
 /// Split `/proc/<pid>/stat` into `(comm, fields_after_comm)`.
 #[cfg(any(target_os = "linux", test))]
-fn split_stat_fields(stat: &str) -> Option<(String, &str)> {
+fn split_stat_fields(stat: &str) -> Option<(&str, &str)> {
     let open = stat.find('(')?;
     let close = stat.rfind(')')?;
     if close < open {
         return None;
     }
-    Some((stat[open + 1..close].to_owned(), &stat[close + 1..]))
+    Some((&stat[open + 1..close], &stat[close + 1..]))
+}
+
+/// Read only membership fields for unrelated processes. A complete census
+/// still visits every entry; only matching live members need an owned name.
+#[cfg(any(target_os = "linux", test))]
+fn group_member_from_stat(pid: i32, pgid: u32, stat: &str) -> Option<GroupMember> {
+    let (comm, rest) = split_stat_fields(stat)?;
+    let mut fields = rest.split_whitespace();
+    let state = fields.next()?.chars().next().unwrap_or('?');
+    let parent = fields.next()?;
+    let member_pgrp = fields.next()?.parse::<u32>().ok()?;
+    if member_pgrp != pgid || state == 'Z' {
+        return None;
+    }
+    Some(GroupMember {
+        pid,
+        ppid: parent.parse().unwrap_or(-1),
+        state,
+        comm: comm.to_owned(),
+    })
 }
 
 #[cfg(test)]
@@ -962,6 +962,28 @@ mod tests {
         assert_eq!(fields[0], "S");
         assert_eq!(fields[1], "1"); // ppid
         assert_eq!(fields[2], "123"); // pgrp == pid (group leader)
+    }
+
+    #[test]
+    fn group_member_parser_preserves_fields_and_refusals() {
+        let line = "123 ((weird) name) S 456 123 0 0 -1 4194560 ignored tail";
+        let member = group_member_from_stat(123, 123, line).expect("member");
+        assert_eq!((member.pid, member.ppid, member.state), (123, 456, 'S'));
+        assert_eq!(member.comm, "(weird) name");
+        assert!(group_member_from_stat(123, 999, line).is_none());
+        for invalid in [
+            "123 (rustc) Z 456 123 0",
+            "123 (rustc) S 456",
+            "123 (rustc) S 456 invalid 0",
+            "123 (rustc S 456 123 0",
+        ] {
+            assert!(group_member_from_stat(123, 123, invalid).is_none());
+        }
+        // Preserve existing treatment of an unparseable parent and terminal
+        // states other than Z; this change does not narrow the census policy.
+        let unknown_parent = group_member_from_stat(123, 123, "123 (x) X unknown 123")
+            .expect("existing membership semantics");
+        assert_eq!((unknown_parent.ppid, unknown_parent.state), (-1, 'X'));
     }
 
     #[test]
