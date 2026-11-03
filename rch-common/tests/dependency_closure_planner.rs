@@ -108,6 +108,7 @@ fn run_with_offline_cargo(test_name: &str) -> bool {
     fs::create_dir_all(&cargo_home).unwrap();
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", test_name, "--nocapture"])
+        .current_dir(&cargo_fixture.root)
         .env(CHILD_ENV, test_name)
         .env("CARGO_HOME", &cargo_home)
         .env("CARGO_NET_OFFLINE", "true")
@@ -219,6 +220,167 @@ fn planner_root_workspace_inheritance_preserves_successful_locked_metadata() {
     let plan = build_dependency_closure_plan_with_policy(&app, &fixture.policy());
     assert!(plan.is_ready(), "{plan:#?}");
     assert_eq!(plan.sync_roots(), vec![app.canonicalize().unwrap()]);
+    assert_eq!(fs::read(&lock_path).unwrap(), lock_bytes);
+    assert_eq!(
+        fs::metadata(&lock_path).unwrap().modified().unwrap(),
+        lock_modified
+    );
+}
+
+#[test]
+fn planner_materializes_all_patch_sources_without_changing_locked_selection() {
+    if !run_with_offline_cargo(
+        "planner_materializes_all_patch_sources_without_changing_locked_selection",
+    ) {
+        return;
+    }
+    let fixture = TopologyFixture::new("patch-source-materialization");
+    let app = fixture.canonical_root.join("app");
+    write_bin_crate(&app, "patch_source_app", &[]);
+    let mut expected_roots = std::collections::BTreeSet::from([app.canonicalize().unwrap()]);
+    for (directory, version, leaf_name) in [
+        ("active", "0.1.0", "active_leaf"),
+        ("newer", "0.2.0", "newer_leaf"),
+        ("first_source", "0.3.0", "first_leaf"),
+        ("last_source", "0.4.0", "last_leaf"),
+    ] {
+        let patch = fixture.canonical_root.join(directory);
+        let leaf = fixture.canonical_root.join(leaf_name);
+        write_lib_crate(&patch, "patched", &[]);
+        write_lib_crate(&leaf, leaf_name, &[]);
+        fs::write(
+            patch.join("Cargo.toml"),
+            format!(
+                "[package]\nname='patched'\nversion='{version}'\nedition='2021'\n[dependencies]\n{leaf_name}={{path='../{leaf_name}'}}\n"
+            ),
+        )
+        .unwrap();
+        expected_roots.extend([patch.canonicalize().unwrap(), leaf.canonicalize().unwrap()]);
+    }
+    fs::write(
+        app.join("Cargo.toml"),
+        r#"[package]
+name = "patch_source_app"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+resolver = "2"
+
+[workspace.dependencies]
+renamed = { package = "patched", version = "=0.1.0" }
+
+[dependencies]
+renamed.workspace = true
+
+[patch.crates-io]
+patched = { path = "../active" }
+patched_v2 = { package = "patched", path = "../newer" }
+
+[patch.'https://example.invalid/first']
+patched = { path = "../first_source" }
+
+[patch.'https://example.invalid/last']
+patched = { path = "../last_source" }
+"#,
+    )
+    .unwrap();
+
+    // All sources are local patches. The empty, offline Cargo home proves
+    // version/source selection without downloading registry or Git packages.
+    let lock = std::process::Command::new("cargo")
+        .args(["generate-lockfile", "--offline", "--manifest-path"])
+        .arg(app.join("Cargo.toml"))
+        .current_dir(&app)
+        .output()
+        .expect("generate lockfile from local patches");
+    assert!(
+        lock.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lock.stderr)
+    );
+    let lock_path = app.join("Cargo.lock");
+    let lock_bytes = fs::read(&lock_path).unwrap();
+    let lock_modified = fs::metadata(&lock_path).unwrap().modified().unwrap();
+    let metadata = std::process::Command::new("cargo")
+        .args([
+            "metadata",
+            "--locked",
+            "--offline",
+            "--format-version",
+            "1",
+            "--manifest-path",
+        ])
+        .arg(app.join("Cargo.toml"))
+        .current_dir(&app)
+        .output()
+        .expect("resolve local patches with locked Cargo metadata");
+    assert!(
+        metadata.status.success(),
+        "{}",
+        String::from_utf8_lossy(&metadata.stderr)
+    );
+    let document: serde_json::Value = serde_json::from_slice(&metadata.stdout).unwrap();
+    let active_roots = std::collections::BTreeSet::from([
+        app.canonicalize().unwrap(),
+        fixture
+            .canonical_root
+            .join("active")
+            .canonicalize()
+            .unwrap(),
+        fixture
+            .canonical_root
+            .join("active_leaf")
+            .canonicalize()
+            .unwrap(),
+    ]);
+    let metadata_roots = document["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|package| {
+            Path::new(package["manifest_path"].as_str().unwrap())
+                .parent()
+                .unwrap()
+                .canonicalize()
+                .unwrap()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(metadata_roots, active_roots);
+
+    let graph =
+        rch_common::resolve_cargo_path_dependency_graph_with_policy(&app, &fixture.policy())
+            .expect("preserve Cargo's active package selection");
+    assert_eq!(
+        graph
+            .packages
+            .iter()
+            .map(|package| package.package_root.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
+        active_roots,
+        "the unused patched version must not enter the active metadata graph"
+    );
+    let plan = build_dependency_closure_plan_with_policy(&app, &fixture.policy());
+    assert!(plan.is_ready(), "{plan:#?}");
+    assert_eq!(plan.sync_order.len(), expected_roots.len());
+    assert_eq!(
+        plan.sync_roots()
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        expected_roots,
+        "every source's patch and its transitive paths must be synchronized"
+    );
+    for action in &plan.sync_order {
+        assert_eq!(
+            action
+                .metadata
+                .notes
+                .iter()
+                .any(|note| note == "materialization_only=true"),
+            !active_roots.contains(&action.package_root),
+            "{action:#?}"
+        );
+    }
     assert_eq!(fs::read(&lock_path).unwrap(), lock_bytes);
     assert_eq!(
         fs::metadata(&lock_path).unwrap().modified().unwrap(),

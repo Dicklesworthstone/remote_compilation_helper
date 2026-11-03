@@ -12210,6 +12210,344 @@ fn test_explicit_workspace_owner_survives_staged_cargo_execution() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn test_foreign_workspace_metadata_survives_rsync_and_cargo_execution() {
+    use super::dependency_closure::{
+        build_owned_sync_closure_layout, workspace_metadata_sync_patterns,
+    };
+    use rch_common::cargo_path_deps::{SelectedCargoEntry, validate_selected_cargo_tree_at};
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::process::Command;
+
+    fn collect_inventory(
+        directory: &Path,
+        source_root: &Path,
+        inventory: &mut BTreeMap<PathBuf, SelectedCargoEntry>,
+    ) {
+        for entry in fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect_inventory(&path, source_root, inventory);
+            } else {
+                inventory.insert(
+                    path.strip_prefix(source_root).unwrap().to_path_buf(),
+                    SelectedCargoEntry::File(
+                        (path.file_name().unwrap() == "Cargo.toml")
+                            .then(|| fs::read_to_string(&path).unwrap()),
+                    ),
+                );
+            }
+        }
+    }
+
+    let _guard = test_guard!();
+    match Command::new("rsync").arg("--version").output() {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("skipping local rsync/Cargo regression: rsync is unavailable");
+            return;
+        }
+        result => assert!(result.unwrap().status.success(), "rsync must be executable"),
+    }
+    let (fixture, _) = topology_tempdir();
+    let projects = fixture.path().join("source/projects");
+    let app = projects.join("app");
+    let workspace = projects.join("foreign");
+    let member = workspace.join("crates/needed");
+    let helper = workspace.join("crates/helper");
+    let unrelated = workspace.join("crates/unrelated");
+    let owner_only = projects.join("owner-only");
+    let cargo_home = fixture.path().join("cargo-home");
+    let original_target = fixture.path().join("original-target");
+    let target = fixture.path().join("target");
+    for directory in [
+        app.join("src"),
+        member.join("src"),
+        helper.join("src"),
+        unrelated.join("src"),
+        owner_only.join("src"),
+        cargo_home.clone(),
+    ] {
+        fs::create_dir_all(directory).unwrap();
+    }
+    let files = [
+        (
+            app.join("Cargo.toml"),
+            "[package]\nname='foreign_owner_oracle'\nversion='0.1.0'\nedition='2021'\n[workspace]\n[dependencies]\nneeded={path='../foreign/crates/needed'}\n",
+        ),
+        (
+            app.join("src/main.rs"),
+            "fn main() { println!(\"{}\", needed::answer()); }\n",
+        ),
+        (
+            workspace.join("Cargo.toml"),
+            "[package]\nname='owner_root'\nversion='0.1.0'\nedition='2021'\nbuild='owner-build.rs'\n[lib]\npath='owner-lib.rs'\n[dependencies]\nowner-only={path='../owner-only'}\n[workspace]\nresolver='2'\nmembers=['crates/needed','crates/unrelated']\ndefault-members=['crates/unrelated']\n[workspace.package]\nversion='0.1.0'\nedition='2021'\n[workspace.dependencies]\nhelper={path='crates/helper'}\nunused={package='unrelated',path='crates/unrelated'}\n",
+        ),
+        (workspace.join("owner-build.rs"), "fn main() {}\n"),
+        (workspace.join("owner-lib.rs"), "pub fn owner() {}\n"),
+        (
+            member.join("Cargo.toml"),
+            "[package]\nname='needed'\nversion.workspace=true\nedition.workspace=true\n[dependencies]\nhelper={workspace=true,path='ignored-member-path'}\n",
+        ),
+        (
+            member.join("src/lib.rs"),
+            "pub fn answer() -> u32 { helper::answer() }\n",
+        ),
+        (
+            helper.join("Cargo.toml"),
+            "[package]\nname='helper'\nversion='0.1.0'\nedition='2021'\n",
+        ),
+        (helper.join("src/lib.rs"), "pub fn answer() -> u32 { 42 }\n"),
+        (
+            unrelated.join("Cargo.toml"),
+            "[package]\nname='unrelated'\nversion='0.1.0'\nedition='2021'\n",
+        ),
+        (unrelated.join("src/lib.rs"), "pub fn unrelated() {}\n"),
+        (
+            owner_only.join("Cargo.toml"),
+            "[package]\nname='owner-only'\nversion='0.1.0'\nedition='2021'\n",
+        ),
+        (owner_only.join("src/lib.rs"), "pub fn owner_only() {}\n"),
+    ];
+    for (path, contents) in &files {
+        fs::write(path, contents).unwrap();
+    }
+    let cargo = |directory: &Path, build_target: &Path| {
+        let mut command = Command::new("cargo");
+        command
+            .current_dir(directory)
+            .env("CARGO_HOME", &cargo_home)
+            .env("CARGO_NET_OFFLINE", "true")
+            .env("CARGO_TARGET_DIR", build_target)
+            .env("CARGO_BUILD_BUILD_DIR", build_target.join("build"))
+            .env("CARGO_INCREMENTAL", "0")
+            .env("CARGO_PROFILE_DEV_DEBUG", "0")
+            .env_remove("CARGO_BUILD_TARGET")
+            .env_remove("RUSTC_WRAPPER")
+            .env_remove("RUSTC_WORKSPACE_WRAPPER");
+        command
+    };
+    for args in [
+        vec!["generate-lockfile", "--offline"],
+        vec!["build", "--locked", "--offline"],
+    ] {
+        let output = cargo(&app, &original_target).args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let lock_path = app.join("Cargo.lock");
+    let lock_bytes = fs::read(&lock_path).unwrap();
+    let lock_modified = fs::metadata(&lock_path).unwrap().modified().unwrap();
+    let policy = PathTopologyPolicy::new(projects.clone(), projects);
+    let reporter = HookReporter::new(OutputVisibility::None);
+    let runtime =
+        build_dependency_runtime_plan(&app, Some(CompilationKind::CargoBuild), &reporter, &policy);
+    assert!(runtime.fail_open_decision.is_none(), "{runtime:#?}");
+    assert!(!runtime.sync_roots.contains(&unrelated));
+    assert!(!runtime.sync_roots.contains(&owner_only));
+    let sync = build_sync_closure_plan(&runtime.sync_roots, &app, "foreign-owner", &policy);
+    let layout = build_owned_sync_closure_layout(
+        &sync,
+        &policy,
+        fixture.path().join("worker/staging").to_str().unwrap(),
+        ".rch-target-foreign-owner-pool-0123456789abcdef0123456789abcdef",
+    )
+    .unwrap();
+    assert_eq!(layout.plan.len(), 4);
+    let primary = layout.plan.iter().find(|entry| entry.is_primary).unwrap();
+    let owner = layout
+        .plan
+        .iter()
+        .find(|entry| entry.local_root == workspace)
+        .unwrap();
+    assert_eq!(owner.mode, SyncClosureMode::WorkspaceMetadata);
+    for entry in &layout.plan {
+        fs::create_dir_all(&entry.remote_root).unwrap();
+        let mut rsync = Command::new("rsync");
+        rsync.arg("-a");
+        if entry.mode == SyncClosureMode::WorkspaceMetadata {
+            // Exercise real rsync selection with the production include list.
+            // No fixture path matches a priority or runtime exclusion; full
+            // roots contain only these source files and Cargo's lockfile.
+            rsync.arg("--prune-empty-dirs");
+            for pattern in workspace_metadata_sync_patterns() {
+                rsync.arg("--include").arg(pattern);
+            }
+            rsync.args(["--exclude", "*"]);
+        }
+        let output = rsync
+            .arg(format!("{}/", entry.local_root.display()))
+            .arg(format!("{}/", entry.remote_root))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(
+        !Path::new(&owner.remote_root)
+            .join("crates/unrelated")
+            .exists()
+    );
+    assert!(
+        !Path::new(&owner.remote_root)
+            .join("owner-build.rs")
+            .exists()
+    );
+    let mut inventory = BTreeMap::new();
+    collect_inventory(
+        Path::new(&layout.source_root),
+        Path::new(&layout.source_root),
+        &mut inventory,
+    );
+    let selected_manifest = Path::new(&primary.remote_root)
+        .join("Cargo.toml")
+        .strip_prefix(&layout.source_root)
+        .unwrap()
+        .to_path_buf();
+    let owner_manifest = Path::new(&owner.remote_root)
+        .join("Cargo.toml")
+        .strip_prefix(&layout.source_root)
+        .unwrap()
+        .to_path_buf();
+    validate_selected_cargo_tree_at(&inventory, &selected_manifest).unwrap();
+    assert!(
+        validate_selected_cargo_tree_at(&inventory, &owner_manifest).is_err(),
+        "selecting the owner workspace must require its complete member/source closure"
+    );
+    let mut owner_as_dependency = inventory.clone();
+    owner_as_dependency.insert(selected_manifest.clone(), SelectedCargoEntry::File(Some(
+        "[package]\nname='foreign_owner_oracle'\nversion='0.1.0'\n[workspace]\n[dependencies]\nowner_root={path='../foreign'}\n".into(),
+    )));
+    let error =
+        validate_selected_cargo_tree_at(&owner_as_dependency, &selected_manifest).unwrap_err();
+    assert!(error.detail().contains("owner-build.rs"));
+    assert!(error.detail().contains("owner-only"));
+    assert!(
+        !error.detail().contains("crates/unrelated"),
+        "reaching the owner package must not activate unrelated workspace members: {error}"
+    );
+    owner_as_dependency.insert(selected_manifest.clone(), SelectedCargoEntry::File(Some(
+        "[package]\nname='foreign_owner_oracle'\nversion='0.1.0'\n[workspace]\nmembers=['../foreign/crates/needed']\n[dependencies]\nowner_root={path='../foreign'}\n".into(),
+    )));
+    let error =
+        validate_selected_cargo_tree_at(&owner_as_dependency, &selected_manifest).unwrap_err();
+    assert!(
+        error.detail().contains("crates/unrelated"),
+        "a later workspace-role visit must upgrade a previously visited dependency: {error}"
+    );
+    let helper_manifest = inventory
+        .keys()
+        .find(|path| path.ends_with("foreign/crates/helper/Cargo.toml"))
+        .unwrap();
+    let member_manifest = inventory
+        .keys()
+        .find(|path| path.ends_with("foreign/crates/needed/Cargo.toml"))
+        .unwrap();
+    for (section, spec) in [
+        (
+            "dependencies",
+            "{workspace=true,optional=true,path='ignored-member-path'}",
+        ),
+        ("dev-dependencies", "{workspace=true}"),
+        ("build-dependencies", "{workspace=true}"),
+        (
+            "target.'cfg(target_os = \"none\")'.dependencies",
+            "{workspace=true}",
+        ),
+    ] {
+        let mut missing_helper = inventory.clone();
+        missing_helper.remove(helper_manifest);
+        missing_helper.insert(member_manifest.clone(), SelectedCargoEntry::File(Some(format!(
+            "[package]\nname='needed'\nversion.workspace=true\nedition.workspace=true\n[{section}]\nhelper={spec}\n",
+        ))));
+        let error =
+            validate_selected_cargo_tree_at(&missing_helper, &selected_manifest).unwrap_err();
+        assert!(
+            error
+                .detail()
+                .contains("workspace.dependencies.helper.path"),
+            "{error}"
+        );
+    }
+    for (replacement, expected) in [
+        (
+            "path='../../../../outside'",
+            "workspace.dependencies.helper.path",
+        ),
+        ("path=42", "workspace dependency 'helper'"),
+    ] {
+        let mut unsafe_helper = inventory.clone();
+        let Some(SelectedCargoEntry::File(Some(owner_text))) =
+            unsafe_helper.get_mut(&owner_manifest)
+        else {
+            panic!("selected owner manifest text must be available");
+        };
+        *owner_text = owner_text.replace("path='crates/helper'", replacement);
+        let error =
+            validate_selected_cargo_tree_at(&unsafe_helper, &selected_manifest).unwrap_err();
+        assert!(error.detail().contains(expected), "{error}");
+    }
+    let staged_lock = Path::new(&primary.remote_root).join("Cargo.lock");
+    let staged_lock_modified = fs::metadata(&staged_lock).unwrap().modified().unwrap();
+    let outcomes = layout
+        .plan
+        .iter()
+        .cloned()
+        .map(|entry| (entry, SyncRootOutcome::Synced))
+        .collect::<Vec<_>>();
+    let checks = synced_dependency_preflight_checks(&outcomes);
+    let probe = build_remote_dependency_preflight_command(&checks).unwrap();
+    let output = Command::new("sh").args(["-c", &probe]).output().unwrap();
+    assert!(output.status.success());
+    let (present, missing) =
+        parse_dependency_preflight_probe_output(&String::from_utf8(output.stdout).unwrap());
+    let report = build_dependency_preflight_report(
+        &make_test_worker_config("local-rsync-cargo-fixture"),
+        &outcomes,
+        &present,
+        &missing,
+        None,
+    );
+    assert!(report.verified, "{report:#?}");
+    let output = cargo(Path::new(&primary.remote_root), &target)
+        .args(["build", "--locked", "--offline"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let executable = Command::new(target.join("debug/foreign_owner_oracle"))
+        .output()
+        .unwrap();
+    assert!(executable.status.success());
+    assert_eq!(executable.stdout, b"42\n");
+    assert_eq!(fs::read(&lock_path).unwrap(), lock_bytes);
+    assert_eq!(
+        fs::metadata(&lock_path).unwrap().modified().unwrap(),
+        lock_modified
+    );
+    assert_eq!(fs::read(&staged_lock).unwrap(), lock_bytes);
+    assert_eq!(
+        fs::metadata(&staged_lock).unwrap().modified().unwrap(),
+        staged_lock_modified
+    );
+    for entry in &layout.plan {
+        assert_eq!(
+            fs::read(entry.local_root.join("Cargo.toml")).unwrap(),
+            fs::read(Path::new(&entry.remote_root).join("Cargo.toml")).unwrap()
+        );
+    }
+}
+
 #[test]
 fn test_dependency_runtime_plan_refuses_invalid_transitive_workspace_owners() {
     let _guard = test_guard!();
