@@ -470,11 +470,14 @@ if rch_remote_witness_matches; then exit 88; fi
         binaries = self.root / "slow-ps"
         binaries.mkdir()
         trace = self.root / "census-trace"
+        order = self.root / "cleanup-order"
         ps = binaries / "ps"
         ps.write_text(f"#!{sys.executable}\n" + f'''
 import os, sys, time
 if "-e" in sys.argv:
     with open({str(trace)!r}, "a") as output:
+        output.write("leader census\\n")
+    with open({str(order)!r}, "a") as output:
         output.write("leader census\\n")
     time.sleep(1.25)
 os.execv({real_ps!r}, ["ps", *sys.argv[1:]])
@@ -482,11 +485,20 @@ os.execv({real_ps!r}, ["ps", *sys.argv[1:]])
         ps.chmod(0o700)
         self.env["PATH"] = f"{binaries}:{self.env.get('PATH', os.defpath)}"
         late = self.root / "late-write"
+        signal_needle = '    kill -"$1" -"$rch_pgid" 2>/dev/null || :\n'
+        self.assertEqual(PROTOCOL.count(signal_needle), 1)
+        protocol = PROTOCOL.replace(
+            signal_needle,
+            signal_needle + '    [ "$1" != KILL ] || printf "authorized KILL\\n" >> '
+            + shlex.quote(str(order)) + '\n')
         payload = (f"(sleep 5; printf leaked > {shlex.quote(str(late))}) & "
                    "printf result; printf diagnostic >&2; exit 7")
-        out, err = self.finish(self.start(payload), 7)
+        out, err = self.finish(self.start(payload, protocol=protocol), 7)
         self.assertEqual((out, err), (b"result", b"diagnostic"))
         self.assertGreaterEqual(len(trace.read_text().splitlines()), 2)
+        events = order.read_text().splitlines()
+        self.assertEqual(events[0], "authorized KILL")
+        self.assertEqual(events.count("leader census"), len(trace.read_text().splitlines()))
         self.assertFalse(late.exists())
         self.assert_empty()
 

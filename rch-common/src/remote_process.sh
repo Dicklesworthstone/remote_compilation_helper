@@ -490,15 +490,30 @@ rch_remote_cancel_loaded() (
     rch_witness_identity=
     rch_term_sent=0
     rch_mode=$1
+    rch_kill_sent=0
+    # KILL already has live birth-fenced authority; stop its writers before
+    # a slow census. Completion still needs the full post-signal census.
+    if [ "$rch_mode" = kill ] && [ "${rch_scope_bound:-0}" != 1 ] &&
+        [ "${rch_identified:-0}" = 1 ] && [ "$(uname -s)" = Linux ]; then
+        rch_kill_status=0
+        rch_signal_group KILL || rch_kill_status=$?
+        case "$rch_kill_status" in
+            0) rch_kill_sent=1;;
+            43) ;; # Lost/reused identity grants nothing; observe as before.
+            *) return "$rch_kill_status";;
+        esac
+    fi
     rch_group_state
     case $? in
-        0) return 0;;
+        0) [ "$rch_kill_sent" = 1 ] || return 0;;
         1) ;;
         2)
             # Unknown is neither stop authority nor death proof. V2 binds its
             # scope; V1 needs a live leader for KILL. No witnesses means no TERM.
-            [ "${rch_identified:-0}" = 1 ] || return 43
-            [ "${rch_scope_bound:-0}" = 1 ] || rch_posix_signal_authorized KILL || return 44
+            if [ "$rch_kill_sent" = 0 ]; then
+                [ "${rch_identified:-0}" = 1 ] || return 43
+                [ "${rch_scope_bound:-0}" = 1 ] || rch_posix_signal_authorized KILL || return 44
+            fi
             rch_mode=kill;;
         *) return 44;;
     esac
@@ -527,7 +542,9 @@ rch_remote_cancel_loaded() (
     # Missing leader authority (43) forbids signals. A later complete census
     # can still confirm watchdog cleanup; otherwise preserve the refusal.
     rch_kill_status=0
-    rch_signal_group KILL || rch_kill_status=$?
+    if [ "$rch_kill_sent" = 0 ]; then
+        rch_signal_group KILL || rch_kill_status=$?
+    fi
     case "$rch_kill_status" in 0|43) ;; *) return "$rch_kill_status";; esac
     rch_attempt=0
     rch_unknown_attempts=0
