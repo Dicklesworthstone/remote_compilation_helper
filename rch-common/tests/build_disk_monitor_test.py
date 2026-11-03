@@ -29,6 +29,42 @@ MARKER = "RCH_TEST_ATTEMPT_DISK_BUDGET:"
 
 
 class DiskMonitorTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux procfs exit race")
+    def test_census_tolerates_real_procfs_exit_but_preserves_live_process(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.processes.append(child)
+        original = monitor.linux_process
+        with open(f"/proc/{child.pid}/stat", encoding="utf-8") as stale:
+            child.terminate()
+            child.wait(timeout=3)
+            # A retained procfs descriptor reproduces ESRCH from the kernel.
+            with self.assertRaises(ProcessLookupError):
+                stale.read()
+            injected = False
+            def read_record(path):
+                nonlocal injected
+                if not injected and path != f"/proc/{os.getpid()}/stat":
+                    injected = True
+                    stale.read()
+                return original(path)
+            with patch.object(monitor, "linux_process", side_effect=read_record):
+                snapshot = monitor.process_snapshot()
+            self.assertTrue(injected)
+            self.assertIn(os.getpid(), snapshot)
+            self.assertNotIn(child.pid, snapshot)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux owner exit race")
+    def test_owner_esrch_interrupts_and_permission_errors_remain_fail_closed(self):
+        value = monitor.Monitor.__new__(monitor.Monitor)
+        value.parent, value.group, value.start = os.getppid(), os.getpid(), "old"
+        with patch.object(monitor, "linux_process", side_effect=ProcessLookupError(3, "gone")):
+            with self.assertRaises(monitor.BudgetFailure) as failure:
+                value.check_owner()
+            self.assertEqual(failure.exception.reason, "interrupted")
+        with patch.object(monitor, "linux_process", side_effect=PermissionError(13, "denied")):
+            with self.assertRaises(PermissionError):
+                monitor.process_snapshot()
+
     @unittest.skipUnless(sys.platform == "darwin", "Darwin native identity")
     def test_darwin_owner_rejects_live_nonleader(self):
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
@@ -216,8 +252,9 @@ class DiskMonitorTests(unittest.TestCase):
                 gc.enable()
 
     def test_success_preserves_output_and_warm_total_highwater(self):
-        (self.target / "warm-cache").write_bytes(b"w" * 3 * MIB)
-        process, receipt = self.spawn(f"from pathlib import Path; Path({str(self.target / 'new')!r}).write_bytes(b'x'*4096); print('small-build-ok')", mode="tracked")
+        # Assert allocated-byte accounting even on compressed filesystems.
+        (self.target / "warm-cache").write_bytes(os.urandom(3 * MIB))
+        process, receipt = self.spawn(f"from pathlib import Path; import os; Path({str(self.target / 'new')!r}).write_bytes(os.urandom(4096)); print('small-build-ok')", mode="tracked")
         status, stdout, stderr = self.complete(process)
         self.assertEqual(status, 0, stderr)
         self.assertIn("small-build-ok", stdout)
@@ -347,7 +384,7 @@ m.supervise=killed_after_receipt"""
 
     def test_oversized_output_is_killed_and_artifacts_are_retained(self):
         output = self.target / "large"
-        process, receipt = self.spawn(f"from pathlib import Path; import time; Path({str(output)!r}).write_bytes(b'x'*{4*MIB}); time.sleep(20)", budget=2 * MIB)
+        process, receipt = self.spawn(f"from pathlib import Path; import os,time; Path({str(output)!r}).write_bytes(os.urandom({4*MIB})); time.sleep(20)", budget=2 * MIB)
         status, _, stderr = self.complete(process)
         self.assertNotEqual(status, 0, stderr)
         failure = self.failure(receipt)
@@ -360,7 +397,7 @@ m.supervise=killed_after_receipt"""
         temporary = self.root / "managed-tmp"
         temporary.mkdir()
         output = temporary / "linker-output"
-        process, receipt = self.spawn(f"from pathlib import Path; import time; Path({str(output)!r}).write_bytes(b'x'*{4*MIB}); time.sleep(20)", budget=2 * MIB, outputs=[self.target, temporary])
+        process, receipt = self.spawn(f"from pathlib import Path; import os,time; Path({str(output)!r}).write_bytes(os.urandom({4*MIB})); time.sleep(20)", budget=2 * MIB, outputs=[self.target, temporary])
         self.complete(process)
         self.assertEqual(self.failure(receipt)["reason"], "growth")
         self.assertTrue(output.exists())
@@ -583,7 +620,7 @@ m.filesystem_sample=blocked_sample"""
 from pathlib import Path
 if os.fork() == 0:
     time.sleep(0.3)
-    Path({str(output)!r}).write_bytes(b'x'*{4*MIB})
+    Path({str(output)!r}).write_bytes(os.urandom({4*MIB}))
     time.sleep(20)
 else:
     os.write(2,b'n'*{2*MIB})
@@ -654,7 +691,7 @@ else:
         inject = "m.persist_receipts=lambda *args: time.sleep(20)"
         ready = self.target / "writer"
         output = self.target / "large"
-        process, receipt = self.spawn(f"from pathlib import Path; import os,time; Path({str(ready)!r}).write_text(str(os.getpid())); Path({str(output)!r}).write_bytes(b'x'*{4*MIB}); time.sleep(20)", budget=2 * MIB, inject=inject)
+        process, receipt = self.spawn(f"from pathlib import Path; import os,time; Path({str(ready)!r}).write_text(str(os.getpid())); Path({str(output)!r}).write_bytes(os.urandom({4*MIB})); time.sleep(20)", budget=2 * MIB, inject=inject)
         status, _, stderr = self.complete(process)
         self.assertNotEqual(status, 0)
         failures = [json.loads(line[len(MARKER):]) for line in stderr.splitlines()
@@ -672,7 +709,7 @@ else:
 m.receipts_for_failure=broken_receipt"""
         ready = self.target / "writer"
         output = self.target / "large"
-        process, receipt = self.spawn(f"from pathlib import Path; import os,time; Path({str(ready)!r}).write_text(str(os.getpid())); Path({str(output)!r}).write_bytes(b'x'*{4*MIB}); time.sleep(20)", budget=2 * MIB, inject=inject)
+        process, receipt = self.spawn(f"from pathlib import Path; import os,time; Path({str(ready)!r}).write_text(str(os.getpid())); Path({str(output)!r}).write_bytes(os.urandom({4*MIB})); time.sleep(20)", budget=2 * MIB, inject=inject)
         self.complete(process)
         self.assertEqual(receipt.read_text(), "")
         record = monitor.process_snapshot().get(int(ready.read_text()))

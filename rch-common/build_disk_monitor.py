@@ -103,9 +103,11 @@ def process_snapshot(heartbeat=lambda: None):
                                 try:
                                     thread = linux_process(task.path + "/stat")
                                     result[thread["pid"]] = thread
-                                except FileNotFoundError:
+                                except (FileNotFoundError, ProcessLookupError):
                                     pass
-                except FileNotFoundError:
+                except (FileNotFoundError, ProcessLookupError):
+                    # An opened procfs record can return ESRCH when its task
+                    # exits before read, rather than ENOENT from open.
                     pass
     elif sys.platform == "darwin":
         census = subprocess.Popen(
@@ -417,7 +419,7 @@ class Monitor:
         if sys.platform.startswith("linux"):
             try:
                 snapshot = {self.group: linux_process("/proc/" + str(self.group) + "/stat")}
-            except FileNotFoundError:
+            except (FileNotFoundError, ProcessLookupError):
                 snapshot = {}
         else:
             snapshot = process_snapshot()
