@@ -2559,19 +2559,22 @@ real Cargo serving, fleet performance or release qualification.
     final source/binary audits are not reached. No speed win or useful-lane
     qualification. Full report and DSR state/result are retained under
     /Volumes/trj-data/rabs-wrapper-trace-20261103/bare-public-canary/.
-  - [x] Implement a bounded census improvement after that real failure: enumerate
+  - [x] TRY a bounded census improvement after that real failure: enumerate
     EVERY visible PID, query its kernel process group through existing locked
     Rustix, then read full procfs identity and every thread for matching members.
     Only ESRCH means disappearance; other query errors fail closed. Preserve
     pinned unreaped leader, original8192byte bound, entry cap, both complete
     terminal sweeps and original2s budget. Safe process feature adds no runtime
     dependency edge (wrapper2/3 unchanged). Add failed-query/missing-fence and
-    actual live/unreaped/disappeared-kernel controls. Native qualification is
-    still pending; no allocation-only retry or deadline extension.
-  - [ ] Compile that exact kernel-query source, run all original wrapper/integration
-    controls plus new negatives, source-after and required QA. Repeat the public
-    original5Cargo/11outputs/8dependency ladder, retaining prior failures and
-    every timing. Do not call cold8/8 evidence of replay or a performance win.
+    actual live/unreaped/disappeared-kernel controls. This attempt is REJECTED
+    by the actual PGID0 failure below; no public canary or speed claim.
+  - [x] Compile that exact Rustix kernel-query candidate and retain its failure:
+    compile0/5m54s, supervision10pass/1fail, wrapper111pass/1fail, integration
+    5pass/5fail,0ignored, component101. Rustix1.1.5 getpgid's nonzero Pid type
+    panics on actual Linux kernel threads with lawful process-group zero.
+    Source-after verifies; scoped check/strictClippy/fmt0, fullQA still pending.
+    The same primitive failure was already documented in source177 above;
+    repeating it was avoidable and earns no capability credit.
     Frozen source85dc06ed-overlay-861-kernel-group-query-bd90eee16f3667270348b50a7d9ea570ac355d68eb5b260d3aadec74749ec735,
     manifest68dc4c17119ff641ec7b06b59ced9b88cd51f0b7465230856d59cdf672a60937,
     full1,697/1,755+58 verified twice. DSR8eb2981f-ebd0-42f2-a379-9cf41d4fc619
@@ -2579,7 +2582,193 @@ real Cargo serving, fleet performance or release qualification.
     immutable9,667-byte driver54d52d67aef970337887841810316a8211a37fc263b4665c45d7123e1c73515a.
     Exact predeclared112wrapper units,11supervision subset,3lookup subset and
     10actual-wrapper integration cases; zero ignored cases required. UBS0,
-    0critical/66warnings/52info on these two changed files; fmt0. Native pending.
+    0critical/66warnings/52info on these two changed files; fmt0. Runtime RED.
+  - [x] Correct the primitive to preserve lawful PGID0 through already locked
+    Nix0.31.3; Rustix retains only its qualified effective-user fs lookup.
+    Normal runtime edges become3/3 under the ORIGINAL cap, no package/version
+    upgrade. Only ESRCH means disappearance; unknown errors still refuse
+    completion. Keep every PID/matching identity/thread/two sweeps/original2s
+    budget and byte/entry bounds. Add a real all-visible-PID regression whose
+    native qualification requires at least one observed kernel group zero.
+    Frozen source85dc06ed-overlay-bd90-kernel-zero-65385b80c93ec2f0db11cd4e0a4bb8fe93116aee49ca061a0d817c558eac2fcc,
+    manifest12795e60795e0afffdf1237cc64ddc81c53dbd1c8c3cdeee8802c58a363232c6,
+    exact1,697/1,755+58 audit twice. UBS0/0critical71warnings56info, fmt0.
+  - [x] Retain two CLI-only DSR diagnostic-native refusals: custom outputdir,
+    then no enabled strict release contract. Neither ran native compilation.
+    Do not fabricate a strict contract. Ordinary private DSR build submitted
+    04:59:32UTC, PID45502, version2.1.34-rabszero.65385b80; immutable10,045-byte
+    driverb967ed891568317d08c2678e661b095eafcb648bb6c500f872c2541f6267ae87.
+    Default DSR release/publishable metadata is not release qualification;
+    no upload/sign/release command is run.
+  - [x] Source6538 actual compile0/6m44s, full113/113 wrapper units and10/10
+    actual-wrapper integration cases,0ignored. Twelve supervision controls
+    pass2.84s, a subset; actual PGID0 observations1,848 focused/1,830 full.
+    Component-source-after verifies, component0. Original live-member,
+    cancellation, signal, exact byte/entry bounds and2s deadline remain.
+    Normal retained wrapper8,255,904 bytes SHA-256
+    5745077bd80cb8411654ccd64b423ad3175c269e739c5977bed7d43968048fd5.
+    Scoped all-target check0/344.49s, strict Clippy0/202.38s, fmt0/104.18s.
+  - [ ] Finish source6538 full workspace check/strict Clippy/final source audit.
+    At05:32UTC this job waits on the ordinary shared Cargo quality target lock;
+    sourcec356 owns the active first workspace check. No full-workspace green.
+  - [x] Submit unchanged public5Cargo/11outputs/8ladder test05:12:44UTC,
+    PID69189, DSR3ec460d3-bedf-4312-a440-d8ea01921406. Pinned pair-preflight
+    ddfa6df016431b036030d0df84f062b13489a269f218b27e61bf7288b6c4987f
+    binds source6538 wrapper and older source272 normal daemon separately.
+    Six bad preconditions refuse before Cargo, including failed component,
+    wrong unit denominator or missing actual PGID0 observation. Original
+    runtime assertions/deadlines, fresh targets and private breaker remain.
+  - [x] Retain this public test's FAILURE: DSR6/950s; stock0/237.358s and
+    wrapped cold0/483.429s, all11metadata byte-equal, exact8execute+8commit.
+    First verification typenum fails Cargo101/80.634s at the SAME original2s
+    compiler-group quiescence deadline. Later verify/serve rounds and final
+    source/binary-after checks are not reached. Full report SHA-256
+    80c857ae631d3579e45048d810b83255b9e1a7a7864a6df2a475bc1877953c05,
+    local /Volumes/trj-data/rabs-wrapper-trace-20261103/kernel-public-canary/terminal-run.json.
+    Nix fixes lawful PGID0, but does NOT establish a repair of practical replay
+    or a performance benefit. Preserve both public failures, not only units.
+  - [x] Stop speculative production changes and submit one focused observational
+    rerun05:43:56UTC, PID91497, DSRaace985b-a0f0-42d3-a6a1-0d6bbd5a76cb.
+    Immutable16,038-byte driver2a4b2ddaabbe8d11f5510158b647c65b028660a8643f51415963d0d3d795d470
+    executes ONE real Cargo dependency run against the failed private CAS after
+    clean socket retirement, same frozen root/pair and original deadlines.
+    It retains sequential guard/Rustc/thread state, CPU ticks and wait channels
+    in a bounded last400-sample window. Sampling may perturb timing and confers
+    NO cleanup authority, five-round qualification, stock timing or speed claim.
+    Full source/binary-after checks run even on failure. No cache reset, test
+    weakening, changed compiled code, elevated priority or capacity increase.
+  - [x] Read the observational failure: Cargo101/318.29s, full source/binary-after
+    checks verify, no observer errors. Forty-five retained snapshots show the
+    actual Rustc leader Z while another thread in its compiler group remains R,
+    spanning314.1567..317.2835s (3.127s). The guard is in do_wait. Report SHA-256
+    0d91da45aa84981d8228f888ff7a312198883963b8bcf7f462395d3c7294c8dd,
+    /Volumes/trj-data/rabs-wrapper-trace-20261103/supervision-diagnosis/terminal-run.json.
+    Sequential sampling can perturb timing, but this is an actual retained
+    thread-group counterexample to treating leader Z as whole-process exit.
+    Qualification correction: this diagnostic's typenum key62a198 differs from
+    the prior failed verification key7ac2b4; the context difference is not yet
+    explained. It proves a real compiler/process counterexample, not same-key
+    cache verification. Do not count it toward the public verification ladder.
+  - [x] Implement the targeted correction: WEXITED|WNOHANG|WNOWAIT observes
+    whole-process waitability before NORMAL completion. It does not reap the
+    compiler or authorize skipping either complete terminal sweep. Caller loss
+    still cancels immediately, and original2s termination/cleanup, byte/entry
+    limits and full thread checks remain. No dependency/cap/priority/profile
+    change. Formatting0 and scoped UBS0/0critical198warning96info.
+  - [x] Add actual native controls: one unit checks repeated WNOWAIT observations
+    leave the original zombie/PID fence intact until explicit wait. A pthread
+    compiler fixture deliberately exits its leader while a second thread must
+    work three more seconds and emit the required output. The SAME native test
+    invocation compares exact retained source6538 wrapper SHA5745077b with the
+    new normal Cargo-selected wrapper. Original ten process tests unchanged;
+    new integration denominator11, unit114, supervision13/lookup3 are subsets.
+    These are mechanism controls, not real Cargo/cache acceptance.
+  - [x] Freeze exact two-file followup
+    85dc06ed-overlay-6538-whole-process-22d4aae915d00b5e716d1b3f83e092fcf4b94f7d0f065e8d443729ee9f939a13,
+    manifestc08cbcf5f1e10b9d85b88c0ccfd98211733ccb89f535b3017c07bbc1ff7b6bb3,
+    1,697/1,755+58 verified twice. DSR rabs_whole_process submitted06:11:20UTC,
+    PID80595,version2.1.34-rabswhole.22d4aae9, immutable11,014-byte driver
+    5637320e5e60e5f1f7f53bab2320b52538eab8c28a0917a9324bc6cca3176a30.
+  - [x] Complete the native source22 component: same-invocation retained6538
+    incumbent fails the actual pthread workload and the candidate completes;
+    focused1/1, supervision13/13, lookup3/3, fullwrapper114/114 and actual
+    wrapper integration11/11, all0ignored/raw0. Subsets are nonadditive. The
+    actual kernel PGID0 observations are1,960 focused/1,923 full. Full selected
+    source-after1697matches+58declared exclusions verifies. Componentraw0;
+    retained normal wrapper8,265,632bytes SHA-256
+    ffa6e5004811684239c54fed139759ffae2316c6681dd93358f02f4f8de61b4d.
+  - [ ] Finish source22 scoped/full required QA and terminal DSR receipt.
+  - [x] Submit the ORIGINAL five-check public11metadata/8dependency ladder
+    06:25:43UTC, PID2887, DSRtoolrabs_whole_public_canary,
+    version2.1.34-rabswholepublic.22d4aae9. Actual source22 normal wrapper and
+    older source272 daemon are separately bound; pair-preflight SHA-256
+    708b7d7144510613bde850c1de13a6ce1d3717d03b348709d4383f3e74524659.
+    Seven invalid prerequisites refuse, including missing same-invocation
+    old/new thread controls. Immutable13,015-byte driver67c88e460438cee9da90851def6eb897358e57d5b2cdbe48e805a0dbe1b60b2a.
+    Fresh private state/breaker/targets, same-invocation stock, original2s
+    cleanup/30sready/60ssettle and all11output/8dependency assertions unchanged.
+  - [ ] Read all five Cargo terminal results, exact output/decision counts and
+    source/binary-after checks. Preserve failures. Native component is not
+    practical repair, current4tool, release, fleet or speed proof.
+    At06:59UTC: stockCargo0/11metadata; coldCargo0/14m50s, exact8execute+
+    8commit and11metadataequal. First verificationCargo0/5m21s, exact8more
+    execute+8verified and11metadataequal. This passes the original failed
+    round with unchanged bounds; second verification and final8served/
+    zeroexecute remain pending. No full ladder or speed win yet.
+  - [x] Source22 scoped all-target check0/338.6s, strict Clippy0/226.0s and
+    workspace formatting0. Full-workspace compiler/Clippy checks remain pending.
+  - [x] Submit a second independent native public experiment on hz3 via DSR,
+    06:36:17UTC PID92118, toolrabs_hz3_public_canary,
+    version2.1.34-rabshz3public.22d4aae9. Fresh SBH20G0 on separate /tmp tmpfs,
+    52,970,618,880bytes/51.388%free, MemAvailable184,581,852kB; same08-31
+    Rust compiler revision908501772, x86_64/glibc2.43. Private0700 source/tools/
+    targets/DSR root, no install or service/priority/capacity changes. Exact
+    source22 wrapper/older272 daemon copied byte-for-byte, fresh1697+58 source
+    audit verifies; native114/11 and same-invocation old/new thread controls
+    remain explicitly qualified on trj, NOT rerun on hz3. Pair-preflight
+    30a466634b8c317fdbd55eb09a9bd922eb6af682d6b36a78392db2211ae93ac7;
+    immutable13,378-byte driver9651f459f05af91f39e6ece62c47a5c4392028e7ec9bcd136f760ea75449fd95.
+    Same original5Cargo/11metadata/8dependency assertions, original deadlines,
+    same-invocation stock and explicit physical-compiler mode. The first trj
+    experiment continues unchanged. This is a second-machine local-cache
+    experiment, NOT distinct-host TLS/fleet or release qualification.
+  - [x] Preserve hz3 terminal PRE-BUILD refusal: DSR17010531-f477-4bc7-b033-f2f6b45d44ed,
+    raw6/9s (native staging inner4); DSR forbids RAM-backed build roots even
+    when SBH passes. ZERO Cargo runs, no native component/cache qualification.
+    Root disk96%used/~25.2GiB free fails the unchanged14% floor; /boot1.1GiB
+    and EFI504MiB do not meet20G. No acceptable disk-backed volume found, no
+    retry on tmpfs, gate weakening, root-disk build or deletion. Retain private
+    copied files and the refusal under local hz3-public-canary/build.log and
+    its DSR state. Planning correction: passing SBH/tmpfs namespace smoke was
+    insufficient to establish DSR staging admission; check both before future
+    deployment copies. The original trj experiment remains authoritative.
+  - [x] Find a genuinely admitted second disk-backed host: TS2 /build ZFS,
+    SBH20G0/1,513,802,039,296bytes/97.488%free, ONLINE buildpool backed by
+    physical /dev/disk/by-id/usb-Lexar_E300_000020251027-0:0-part1, no loop
+    image or root-disk capacity inference. Same08-31Rustc908501772. Read full
+    host guidance; preserve disabled CPU boost and all existing services/slots.
+    Initial unprivileged mkdir is denied; create ONLY the new private0700
+    /build/rabs-lilacshore-public-20261103 with sudo, assign its owner ubuntu,
+    and create owned0700 children. Existing mount/parent permissions unchanged.
+  - [x] Copy exact1697source+58declared exclusions and byte-bound22wrapper/
+    older272daemon to TS2; fresh full source/binary audits verify. Normal
+    daemon --version0. All source/targets/Cargo-home/state/build roots on the
+    actual ZFS filesystem. Original assertions/deadlines, same-invocation
+    stock and explicit physical compiler mode unchanged. Native114/11 and
+    old/new pthread evidence are from trj, NOT rerun on TS2.
+  - [x] Submit DSRtoolrabs_ts2_public_canary06:50:36UTC PID15285,
+    version2.1.34-rabsts2public.22d4aae9, preflight5a638e3df5f1ee8ab8eec875684d0fcc6a40c5de713a2ea593283214cb54a245,
+    immutable13,418-byte driver5a592b19f4c4e28be243167486b312fa2f2934d840bcdb785ca76999d4d8f137.
+  - [x] Preserve TS2 TERMINAL PRE-BUILD refusal DSR49a88c6f-ed7f-4477-8abc-9d90917ae641,
+    raw6/14s(inner4), native host not ready. Supported fresh --no-cache health
+    also fails SSH connectivity. A separately timed exact SSH probe returns0
+    but takes14.808s, outside the unchanged10s overall health bound. Configured
+    ssh_timeout20 does not replace host_health.sh's hard10s. No timeout increase,
+    DSR bypass or repeat before changed readiness evidence. ZERO Cargo runs/
+    nativecases on TS2; physical storage/toolchain/source/binary proof is not
+    complete host admission. Raw state/result/build log retained locally in
+    ts2-public-canary/. No cache/fleet/TLS/performance/release qualification.
+  - [ ] Retry second-host public5/11/8 only after the ORIGINAL DSR readiness
+    probe passes. If it succeeds, run actual Cargo/TLS worker acceptance with
+    source/profile-bound tools, unchanged300s/600s bounds and retained worker
+    streams. Keep distinct-host TLS/fleet/current4tools qualification separate.
+  - [ ] Probe the ordinary Rustup-proxy compiler PATH explicitly. The current
+    public canary prepends the physical toolchain bin and therefore proves only
+    that selected configuration. Source review shows the observer deliberately
+    refuses a compiler proxy resolving a different sysroot; do not present this
+    controlled physical-compiler experiment as default Rustup transparency.
+    A real `rustup run nightly-2026-08-31 python3` environment query on trj
+    resolves rustc to /home/ubuntu/.cargo/bin/rustc and Cargo to the RCH shim;
+    full toolchain selection alone does not prepend physical Rustc there.
+  - [x] Identify a preliminary second Linux test host without weakening storage
+    admission: hz3 /tmp is separate tmpfs, SBH20G0,53,549,895,680 bytes free,
+    51.95%; MemAvailable181,165,688kB and memory pressure averages0. Full
+    user/PID/network/UTS/IPC namespace smoke0 through existing bwrap. No actual
+    RABS tools deployed or worker/Cargo/TLS acceptance claimed. ovh-b alias
+    initially fails DNS; authoritative configured IP reaches its host, whose
+    /tmp guard fails with15,262,744,576 bytes against20G. No threshold lowered.
+    Mac /Volumes/trj-data's absolute20G check0 still reports only9.876% free,
+    below the unchanged14% floor: no Mac compilation admission from that probe.
   - [x] Complete source272 normal worker/root build through DSR8611 attempt3,
     Cargo0/84m02s. Actual normal worker713,197,968 bytes SHA-256
     8967a4eaa1e113df999b29ca80360204ea801f032c33ffe203c1fbb827c94a8f;
@@ -2595,9 +2784,30 @@ real Cargo serving, fleet performance or release qualification.
     Original assertions require three4-unit TLS rounds then two2-hit+2workspace
     rounds, released receipts/no residuals and relocated edit. No stub, key
     injection, timeout increase or current-harness/full-workspace claim.
-  - [ ] Observe that independent original1/1 native TLS case and exact worker/cache
-    assertions, raw exit, source/binary-after. Original source2729/10 and old
-    source813 worker0/4 remain RED; a successful new case cannot erase either.
+  - [x] Retain independent normal source272 TLS case0passed/1failed/0ignored,
+    raw101/619.88s at its unchanged600s outer deadline. DSRfab490e1 terminal6,
+    975s including orchestration. Full selected/staged source-before/after and
+    all four retained production binary hashes verify. Last live snapshots show
+    canonical bundle preparation and worker boot/reconnect, no execution receipt;
+    worker streams were removed by teardown, so an exact terminal execution
+    count is UNPROVED. No successful TLS/worker/cache claim. Local evidence:
+    /Volumes/trj-data/rabs-unified-retained-source-20261102/tls-consumer/.
+  - [x] Submit private DSR rabs_release_canonical05:00:22UTC, PID72965,
+    version2.1.34-rabsrelease.65385b80: build all FOUR normal production tools
+    from the same source6538 using the existing release profile, no override.
+    Immutable11,816-byte driverd86845e3d9483bc1305fb286ca03e2fc7692ce9c49745301c348e1fbc0700dba.
+    The original unchanged TLS case uses the separately bound older harness,
+    requires the new113/10 component0 first, and keeps300s/600s limits.
+    Hold only owned regular worker stdout/stderr descriptors across cleanup,
+    retain raw streams, latest observed journals and observer-error/truncation
+    flags. This prevents the observed evidence loss; it is no new authority or
+    substitute for native assertions. Source/binaries audit before/after.
+  - [ ] Complete the four-role release build and unchanged native TLS case.
+    Record actual12qualifying+4warm workspace executions and4dependency serves
+    only if original assertions and terminal evidence establish them. All prior
+    source2729/10, source8130/4, debugtimeout and Rustix candidate REDs remain.
+    Shipping profile alone is not fullworkspace, current-harness, useful-speed,
+    distinct-host/fleet, installer/release or sustained operational qualification.
   - [x] Finish the original worktree suite: **9 passed, 1 failed, 0 ignored**,
     raw101, libtest780.20s. Five real Cargo cases and four binary-integrity
     controls pass. Vendored dependencies fail at verify-1: expected3 verified
