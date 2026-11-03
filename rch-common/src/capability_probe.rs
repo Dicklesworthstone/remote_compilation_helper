@@ -135,6 +135,9 @@ pub struct ProbeSpec {
     pub cargo_path: Option<String>,
     /// Exact path to `rustup`, if known.
     pub rustup_path: Option<String>,
+    /// Collect per-toolchain installed components for component admission.
+    /// Consumers that do not assess components can omit this inventory.
+    pub rust_components: bool,
     /// Disk roots whose capacity to report (temp root, build roots, cargo home).
     pub disk_roots: Vec<String>,
     /// Operator-declared named tool probes for this worker.
@@ -150,6 +153,7 @@ impl ProbeSpec {
             rch_wkr_paths: vec![rch_wkr_path.into()],
             cargo_path: None,
             rustup_path: None,
+            rust_components: true,
             disk_roots: Vec::new(),
             tools: Vec::new(),
         }
@@ -302,14 +306,16 @@ pub fn build_capability_probe_script(spec: &ProbeSpec) -> String {
     // best-effort: a toolchain that cannot be queried simply contributes no
     // component facts, which reads downstream as "not known to have it" rather
     // than as "known to lack it".
-    s.push_str(&format!(
-        "for tc in $({rustup} toolchain list 2>/dev/null | awk '{{print $1}}'); do \
+    if spec.rust_components {
+        s.push_str(&format!(
+            "for tc in $({rustup} toolchain list 2>/dev/null | awk '{{print $1}}'); do \
            rh=$({rustup} run \"$tc\" rustc -vV 2>/dev/null | awk '$1 == \"host:\" {{print $2; exit}}'); \
            {rustup} component list --installed --toolchain \"$tc\" 2>/dev/null \
              | awk -v p=\"$P\" -v t=\"$tc\" -v h=\"$rh\" \
                  '{{n=$1; if (h != \"\") sub(\"-\" h \"$\", \"\", n); print p\"component=\"t\":\"n}}'; \
          done; "
-    ));
+        ));
+    }
     // JS runtimes (PATH-resolved is acceptable for these advisory facts).
     s.push_str("bv=$(bun --version 2>/dev/null) && printf '%sbun_version=%s\\n' \"$P\" \"$bv\"; ");
     s.push_str(

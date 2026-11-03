@@ -314,6 +314,11 @@ impl SshRecoveryProber {
         let declared_os = rch_common::declared_os(&config.tags);
         let mut spec = ProbeSpec::for_worker(&config.user, declared_os.as_deref());
         spec.disk_roots.clone_from(&self.config.disk_roots);
+        // Recovery assesses toolchains and targets, not installed components.
+        // Enumerating every toolchain's components can exhaust its capability
+        // budget before the required disk/load facts or lifecycle probe run.
+        // Ordinary component-aware admission keeps the full default inventory.
+        spec.rust_components = false;
         // Operator-declared tool probes are part of the worker's capability
         // facts, so a rejoining worker is measured on the same evidence
         // selection uses. Invalid entries were refused at config load.
@@ -3930,6 +3935,46 @@ mod tests {
     }
 
     #[test]
+    fn recovery_component_inventory_preserves_every_required_verdict() {
+        let config = BypassRecoveryConfig {
+            min_protocol: 1,
+            required_targets: vec!["wasm32-unknown-unknown".into()],
+            required_toolchains: vec!["nightly-2026-05-22".into()],
+            disk_roots: vec!["/tmp".into()],
+            ..BypassRecoveryConfig::default()
+        };
+        for violation in 0..=10 {
+            let mut facts = facts_all_good();
+            facts.rust.components = vec!["nightly-2026-05-22:clippy".into()];
+            let mut record = BypassRecord::new("worker", "h", "u", BypassFailureClass::Ssh, T0);
+            let mut load = Some(0.1);
+            let mut telemetry = true;
+            match violation {
+                0 => {}
+                1 => facts.worker = None,
+                2 => facts.worker.as_mut().unwrap().protocol_version = 0,
+                3 => facts.rust.rustc_version = None,
+                4 => facts.rust.targets.clear(),
+                5 => facts.rust.toolchains.clear(),
+                6 => facts.disk_roots[0].available_bytes = 0,
+                7 => load = Some(config.max_load_per_core + 1.0),
+                8 => telemetry = false,
+                9 => record.failure_class = BypassFailureClass::ProcessObservation,
+                _ => {
+                    facts.os = None;
+                    facts.arch = None;
+                    facts.probed_user = None;
+                }
+            }
+            let full = assess_recovery_probe_facts(&facts, load, telemetry, &config, &record);
+            facts.rust.components.clear();
+            let recovery = assess_recovery_probe_facts(&facts, load, telemetry, &config, &record);
+            assert_eq!(recovery, full, "required verdict changed: {violation}");
+            assert_eq!(recovery.fully_healthy(), violation == 0, "{violation}");
+        }
+    }
+
+    #[test]
     fn parse_load_per_core_divides_loadavg_by_cores() {
         let out = "incidental noise\nRCH_FACT loadavg1=2.0\nRCH_FACT nproc=4\nRCH_FACT os=linux\n";
         assert_eq!(SshRecoveryProber::parse_load_per_core(out), Some(0.5));
@@ -3963,6 +4008,10 @@ mod tests {
             let script = build_capability_probe_script(&spec);
             assert!(!script.contains("/home/"), "{user}: {script}");
             assert!(!script.contains("/root/"), "{user}: {script}");
+            assert!(!spec.rust_components);
+            assert!(!script.contains("component list --installed --toolchain"));
+            assert!(script.contains("toolchain list"));
+            assert!(script.contains("target list --installed"));
         }
     }
 
