@@ -11950,6 +11950,144 @@ edition = "2024"
 }
 
 #[test]
+fn test_explicit_workspace_owner_metadata_survives_member_collapse() {
+    let _guard = test_guard!();
+    let (fixture, policy) = topology_tempdir();
+    let repository = fixture.path().join("repo");
+    let member = repository.join("member");
+    let workspace = fixture.path().join("ws");
+    let dependency = fixture.path().join("dep");
+    for root in [&member, &dependency] {
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+    }
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(
+        workspace.join("Cargo.toml"),
+        "[workspace]\nmembers = ['../repo/member']\nresolver = '2'\n[workspace.package]\nedition = '2021'\n[workspace.dependencies]\ndep = { path = '../dep' }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dependency.join("Cargo.toml"),
+        "[package]\nname = 'dep'\nversion = '0.1.0'\nedition = '2021'\n",
+    )
+    .unwrap();
+
+    let reporter = HookReporter::new(OutputVisibility::None);
+    // The explicit path variant needs workspace metadata only for inherited
+    // package fields, so discovery cannot depend on workspace dependency specs.
+    for dependencies in ["dep.workspace = true", "dep = { path = '../../dep' }"] {
+        std::fs::write(
+            member.join("Cargo.toml"),
+            format!(
+                "[package]\nname = 'member'\nversion = '0.1.0'\nedition.workspace = true\nworkspace = '../../ws'\n[dependencies]\n{dependencies}\n"
+            ),
+        )
+        .unwrap();
+        let runtime = build_dependency_runtime_plan(
+            &member,
+            Some(CompilationKind::CargoBuild),
+            &reporter,
+            &policy,
+        );
+        assert!(
+            runtime.fail_open_decision.is_none(),
+            "{dependencies}: {runtime:#?}"
+        );
+        assert_eq!(
+            runtime
+                .sync_roots
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([member.clone(), dependency.clone()])
+        );
+        for primary in [&member, &repository] {
+            let plan = build_sync_closure_plan(&runtime.sync_roots, primary, "fixture", &policy);
+            assert_eq!(
+                plan.iter()
+                    .map(|entry| (entry.local_root.clone(), entry.mode))
+                    .collect::<std::collections::BTreeSet<_>>(),
+                std::collections::BTreeSet::from([
+                    (primary.clone(), SyncClosureMode::Full),
+                    (dependency.clone(), SyncClosureMode::Full),
+                    (workspace.clone(), SyncClosureMode::WorkspaceMetadata),
+                ]),
+                "the explicit owner must survive even when its member is covered by the primary tree"
+            );
+            assert!(plan.iter().any(|entry| entry.local_root == *primary
+                && entry.is_primary
+                && entry.mode == SyncClosureMode::Full));
+        }
+    }
+    assert!(!workspace.join("Cargo.lock").exists());
+}
+
+#[test]
+fn test_dependency_runtime_plan_refuses_invalid_transitive_workspace_owners() {
+    let _guard = test_guard!();
+    let (fixture, policy) = topology_tempdir();
+    let app = fixture.path().join("app");
+    let bridge = fixture.path().join("bridge");
+    let dependency = fixture.path().join("dep");
+    let ordinary_package = fixture.path().join("not-a-workspace");
+    for root in [&app, &bridge, &dependency, &ordinary_package] {
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+    }
+    std::fs::write(
+        app.join("Cargo.toml"),
+        "[package]\nname = 'app'\nversion = '0.1.0'\nedition = '2021'\n[dependencies]\nbridge = { path = '../bridge' }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        bridge.join("Cargo.toml"),
+        "[package]\nname = 'bridge'\nversion = '0.1.0'\nedition = '2021'\n[dependencies]\ndep = { path = '../dep' }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        ordinary_package.join("Cargo.toml"),
+        "[package]\nname = 'ordinary'\nversion = '0.1.0'\nedition = '2021'\n",
+    )
+    .unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+    let reporter = HookReporter::new(OutputVisibility::None);
+
+    // This transitive package has no inherited dependencies. Its invalid owner
+    // must still refuse remote execution before sync planning can omit metadata.
+    for (owner, expected_code) in [
+        (
+            ordinary_package.as_path(),
+            DEPENDENCY_PREFLIGHT_CODE_MATERIALIZATION,
+        ),
+        (outside.path(), DEPENDENCY_PREFLIGHT_CODE_POLICY),
+    ] {
+        std::fs::write(
+            dependency.join("Cargo.toml"),
+            format!(
+                "[package]\nname = 'dep'\nversion = '0.1.0'\nedition = '2021'\nworkspace = {:?}\n",
+                owner.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let runtime = build_dependency_runtime_plan(
+            &app,
+            Some(CompilationKind::CargoBuild),
+            &reporter,
+            &policy,
+        );
+        let decision = runtime
+            .fail_open_decision
+            .expect("an invalid transitive owner must refuse remote execution");
+        assert_eq!(decision.reason_code, expected_code, "{decision:#?}");
+        assert!(should_force_local_fallback_for_runtime_fail_open(
+            decision.reason_code
+        ));
+    }
+}
+
+#[test]
 fn test_build_sync_closure_plan_collapses_intra_workspace_members() {
     let _guard = test_guard!();
     // rch#33: building AT a workspace root, its members arrive as separate sync

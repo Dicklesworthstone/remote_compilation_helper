@@ -814,31 +814,17 @@ pub(super) fn canonicalize_sync_root_for_plan(root: &Path, policy: &PathTopology
         .unwrap_or_else(|| root.to_path_buf())
 }
 
-fn manifest_declares_workspace(manifest_path: &Path) -> bool {
-    let Ok(contents) = std::fs::read_to_string(manifest_path) else {
-        return false;
-    };
-    let Ok(table) = toml::from_str::<toml::Table>(&contents) else {
-        return false;
-    };
-    table.contains_key("workspace")
-}
-
 fn enclosing_workspace_root_for_sync_root(
     root: &Path,
     policy: &PathTopologyPolicy,
 ) -> Option<PathBuf> {
-    for candidate in root.ancestors() {
-        if !is_within_sync_topology(candidate, policy) {
-            break;
-        }
-        let manifest_path = candidate.join("Cargo.toml");
-        if manifest_path.is_file() && manifest_declares_workspace(&manifest_path) {
-            return (candidate != root).then(|| candidate.to_path_buf());
-        }
-    }
-
-    None
+    // Inheritance and transfer must agree on the owner, including an explicit
+    // package.workspace outside the member's ancestor chain. Otherwise the
+    // paths can resolve locally while the worker lacks Cargo.toml/Cargo.lock.
+    rch_common::cargo_path_deps::resolve_cargo_workspace_root_with_policy(root, policy)
+        .ok()
+        .flatten()
+        .filter(|workspace| workspace != root)
 }
 
 pub(super) fn workspace_metadata_sync_patterns() -> Vec<String> {
@@ -954,23 +940,21 @@ pub(super) fn build_sync_closure_plan(
             );
             continue;
         }
-        // Intra-workspace collapse (rch#33, restoring #8's behavior scoped so the
-        // #29d0d63 foreign-workspace metadata path is untouched): a member root
-        // physically inside the primary `Full` root is transferred as part of the
-        // primary tree, so its own `Full` entry — and the enclosing-workspace
-        // metadata entry, which is the primary itself — are pure redundancy that
-        // costs one SSH+rsync round-trip per member. Foreign-workspace path deps
-        // (outside the primary root) keep today's member-`Full` + workspace-
-        // metadata handling below.
-        if canonicalized != primary_root && canonicalized.starts_with(&primary_root) {
-            continue;
-        }
-        ordered_entries.insert((canonicalized.clone(), SyncClosureMode::Full));
+        // Discover ownership before collapsing a member's source into the
+        // primary tree: its explicit workspace may live outside that tree.
+        // Keep metadata entries until the existing source-fidelity coalescing
+        // checks prove coverage under the actual transfer filters.
         if let Some(workspace_root) =
             enclosing_workspace_root_for_sync_root(&canonicalized, topology_policy)
         {
             ordered_entries.insert((workspace_root, SyncClosureMode::WorkspaceMetadata));
         }
+        // Intra-workspace collapse (rch#33): a member physically inside the
+        // primary Full root is already transferred as part of that tree.
+        if canonicalized != primary_root && canonicalized.starts_with(&primary_root) {
+            continue;
+        }
+        ordered_entries.insert((canonicalized.clone(), SyncClosureMode::Full));
     }
 
     ordered_entries.insert((primary_root.clone(), SyncClosureMode::Full));

@@ -1213,6 +1213,37 @@ pub fn resolve_cargo_path_materialization_closure_with_policy(
     resolve_materialization_from_manifests(&entry_manifest, policy)
 }
 
+/// Discover the owning workspace using the same rules as manifest inheritance.
+/// This does not invoke Cargo or mutate the lockfile. The result is constrained
+/// to the source topology, including explicit out-of-tree workspace pointers.
+pub fn resolve_cargo_workspace_root_with_policy(
+    entrypoint: &Path,
+    policy: &PathTopologyPolicy,
+) -> Result<Option<PathBuf>, CargoPathDependencyError> {
+    let root = if entrypoint
+        .file_name()
+        .is_some_and(|name| name == "Cargo.toml")
+    {
+        entrypoint.parent().ok_or_else(|| {
+            CargoPathDependencyError::new(
+                CargoPathDependencyErrorKind::ManifestParseFailure,
+                "entry manifest has no parent",
+            )
+            .with_manifest_path(entrypoint)
+        })?
+    } else {
+        entrypoint
+    };
+    let root =
+        normalize_path_for_policy(root, policy, None, None, "normalize workspace search root")?;
+    find_manifest_workspace(
+        &root,
+        &root.join("Cargo.toml"),
+        policy,
+        &mut BTreeMap::new(),
+    )
+}
+
 fn resolve_cargo_path_dependency_graph_with_policy_and_provider<F>(
     entrypoint: &Path,
     policy: &PathTopologyPolicy,
@@ -2121,6 +2152,7 @@ where
 #[derive(Debug, Clone)]
 struct ManifestDocument {
     package_name: Option<String>,
+    package_workspace: Option<String>,
     has_workspace: bool,
     workspace_members: Vec<String>,
     workspace_excludes: Vec<String>,
@@ -2138,18 +2170,21 @@ struct ManifestDependency {
     uses_workspace_inheritance: bool,
 }
 
-fn resolve_from_manifest_fallback(
+struct ManifestTraversalRoot {
+    root: PathBuf,
+    manifest_path: PathBuf,
+    manifest: ManifestDocument,
+    cache: BTreeMap<PathBuf, ManifestDocument>,
+}
+
+fn prepare_manifest_traversal(
     entry_manifest_path: &Path,
     policy: &PathTopologyPolicy,
-) -> Result<CargoPathDependencyGraph, CargoPathDependencyError> {
-    let entry_manifest = read_manifest_document(entry_manifest_path)?;
+) -> Result<ManifestTraversalRoot, CargoPathDependencyError> {
     let entry_root = entry_manifest_path.parent().ok_or_else(|| {
         CargoPathDependencyError::new(
             CargoPathDependencyErrorKind::ManifestParseFailure,
-            format!(
-                "entry manifest has no parent: {}",
-                entry_manifest_path.display()
-            ),
+            "entry manifest has no parent",
         )
         .with_manifest_path(entry_manifest_path)
     })?;
@@ -2158,30 +2193,46 @@ fn resolve_from_manifest_fallback(
         policy,
         Some(entry_manifest_path),
         None,
-        "normalize fallback entry root",
+        "normalize manifest entry root",
     )?;
+    let mut cache = BTreeMap::new();
+    let root = find_manifest_workspace(&entry_root, entry_manifest_path, policy, &mut cache)?
+        .unwrap_or_else(|| entry_root.clone());
+    if root != entry_root {
+        validate_workspace_entry_membership(&entry_root, &root, policy, &mut cache)?;
+    }
+    let manifest_path = root.join("Cargo.toml");
+    let manifest = cached_manifest_document(&manifest_path, &mut cache)?.clone();
+    Ok(ManifestTraversalRoot {
+        root,
+        manifest_path,
+        manifest,
+        cache,
+    })
+}
+
+fn resolve_from_manifest_fallback(
+    entry_manifest_path: &Path,
+    policy: &PathTopologyPolicy,
+) -> Result<CargoPathDependencyGraph, CargoPathDependencyError> {
+    let ManifestTraversalRoot {
+        root: entry_root,
+        manifest_path: traversal_manifest,
+        manifest: entry_manifest,
+        cache: mut manifest_cache,
+    } = prepare_manifest_traversal(entry_manifest_path, policy)?;
 
     let mut partial = PartialGraph::default();
     if entry_manifest.has_workspace {
         partial.workspace_root = Some(entry_root.clone());
     }
-    let workspace_path_dependencies = entry_manifest.workspace_path_dependencies.clone();
     let patch_path_dependencies = entry_manifest.patch_path_dependencies.clone();
 
-    let workspace_member_manifests = expand_workspace_members(
-        &entry_root,
-        &entry_manifest.workspace_members,
-        &entry_manifest.workspace_excludes,
-        entry_manifest_path,
-    )?;
-    let workspace_member_set = workspace_member_manifests
-        .iter()
-        .cloned()
-        .collect::<BTreeSet<_>>();
+    let workspace_member_set =
+        canonical_workspace_members(&entry_root, &entry_manifest, &traversal_manifest, policy)?;
     let include_entry_manifest =
         entry_manifest.package_name.is_some() || workspace_member_set.is_empty();
 
-    let mut manifest_cache: BTreeMap<PathBuf, ManifestDocument> = BTreeMap::new();
     let mut states: BTreeMap<PathBuf, VisitState> = BTreeMap::new();
     let mut stack: Vec<PathBuf> = Vec::new();
 
@@ -2191,7 +2242,6 @@ fn resolve_from_manifest_fallback(
             policy,
             &entry_root,
             &workspace_member_set,
-            &workspace_path_dependencies,
             &patch_path_dependencies,
             true,
             &mut partial,
@@ -2202,11 +2252,28 @@ fn resolve_from_manifest_fallback(
     }
     if include_entry_manifest {
         visit_manifest_recursive(
+            &traversal_manifest,
+            policy,
+            &entry_root,
+            &workspace_member_set,
+            &patch_path_dependencies,
+            true,
+            &mut partial,
+            &mut manifest_cache,
+            &mut states,
+            &mut stack,
+        )?;
+    }
+
+    // An automatically included member may only be reachable through optional
+    // or development dependencies. When selected as the entrypoint it is an
+    // active root, independently of the owner's default dependency features.
+    if traversal_manifest.as_path() != entry_manifest_path {
+        visit_manifest_recursive(
             entry_manifest_path,
             policy,
             &entry_root,
             &workspace_member_set,
-            &workspace_path_dependencies,
             &patch_path_dependencies,
             true,
             &mut partial,
@@ -2223,24 +2290,12 @@ fn resolve_materialization_from_manifests(
     entry_manifest_path: &Path,
     policy: &PathTopologyPolicy,
 ) -> Result<CargoPathMaterializationClosure, CargoPathDependencyError> {
-    let entry_manifest = read_manifest_document(entry_manifest_path)?;
-    let entry_root = entry_manifest_path.parent().ok_or_else(|| {
-        CargoPathDependencyError::new(
-            CargoPathDependencyErrorKind::ManifestParseFailure,
-            format!(
-                "entry manifest has no parent: {}",
-                entry_manifest_path.display()
-            ),
-        )
-        .with_manifest_path(entry_manifest_path)
-    })?;
-    let entry_root = normalize_path_for_policy(
-        entry_root,
-        policy,
-        Some(entry_manifest_path),
-        None,
-        "normalize materialization entry root",
-    )?;
+    let ManifestTraversalRoot {
+        root: entry_root,
+        manifest_path: traversal_manifest,
+        manifest: entry_manifest,
+        cache: mut manifest_cache,
+    } = prepare_manifest_traversal(entry_manifest_path, policy)?;
 
     let mut partial = PartialGraph::default();
     if entry_manifest.has_workspace {
@@ -2248,20 +2303,11 @@ fn resolve_materialization_from_manifests(
     }
     let workspace_path_dependencies = entry_manifest.workspace_path_dependencies.clone();
     let patch_path_dependencies = entry_manifest.patch_path_dependencies.clone();
-    let workspace_member_manifests = expand_workspace_members(
-        &entry_root,
-        &entry_manifest.workspace_members,
-        &entry_manifest.workspace_excludes,
-        entry_manifest_path,
-    )?;
-    let workspace_member_set = workspace_member_manifests
-        .iter()
-        .cloned()
-        .collect::<BTreeSet<_>>();
+    let workspace_member_set =
+        canonical_workspace_members(&entry_root, &entry_manifest, &traversal_manifest, policy)?;
     let include_entry_manifest =
         entry_manifest.package_name.is_some() || workspace_member_set.is_empty();
 
-    let mut manifest_cache = BTreeMap::from([(entry_manifest_path.to_path_buf(), entry_manifest)]);
     let mut visited = BTreeSet::new();
 
     for manifest_path in &workspace_member_set {
@@ -2270,7 +2316,6 @@ fn resolve_materialization_from_manifests(
             policy,
             &entry_root,
             &workspace_member_set,
-            &workspace_path_dependencies,
             &patch_path_dependencies,
             true,
             &mut partial,
@@ -2280,11 +2325,24 @@ fn resolve_materialization_from_manifests(
     }
     if include_entry_manifest {
         visit_manifest_for_materialization(
+            &traversal_manifest,
+            policy,
+            &entry_root,
+            &workspace_member_set,
+            &patch_path_dependencies,
+            true,
+            &mut partial,
+            &mut manifest_cache,
+            &mut visited,
+        )?;
+    }
+
+    if traversal_manifest.as_path() != entry_manifest_path {
+        visit_manifest_for_materialization(
             entry_manifest_path,
             policy,
             &entry_root,
             &workspace_member_set,
-            &workspace_path_dependencies,
             &patch_path_dependencies,
             true,
             &mut partial,
@@ -2309,7 +2367,6 @@ fn resolve_materialization_from_manifests(
             policy,
             &entry_root,
             &workspace_member_set,
-            &workspace_path_dependencies,
             &patch_path_dependencies,
             false,
             &mut partial,
@@ -2330,7 +2387,6 @@ fn visit_manifest_for_materialization(
     policy: &PathTopologyPolicy,
     workspace_root: &Path,
     workspace_member_manifests: &BTreeSet<PathBuf>,
-    workspace_path_dependencies: &BTreeMap<String, String>,
     patch_path_dependencies: &BTreeMap<String, String>,
     mark_workspace_member: bool,
     partial: &mut PartialGraph,
@@ -2360,6 +2416,14 @@ fn visit_manifest_for_materialization(
         .with_manifest_path(canonical_manifest));
     }
 
+    validate_manifest_workspace_owner(
+        &package_root,
+        &canonical_manifest,
+        workspace_root,
+        workspace_member_manifests,
+        policy,
+        manifest_cache,
+    )?;
     if !visited.insert(package_root.clone()) {
         if mark_workspace_member {
             partial.add_root(package_root.clone());
@@ -2398,9 +2462,10 @@ fn visit_manifest_for_materialization(
             &package_root,
             workspace_root,
             dependency,
-            workspace_path_dependencies,
             patch_path_dependencies,
             &canonical_manifest,
+            policy,
+            manifest_cache,
         )?
         else {
             continue;
@@ -2422,7 +2487,6 @@ fn visit_manifest_for_materialization(
             policy,
             workspace_root,
             workspace_member_manifests,
-            workspace_path_dependencies,
             patch_path_dependencies,
             false,
             partial,
@@ -2525,7 +2589,6 @@ fn visit_manifest_recursive(
     policy: &PathTopologyPolicy,
     workspace_root: &Path,
     workspace_member_manifests: &BTreeSet<PathBuf>,
-    workspace_path_dependencies: &BTreeMap<String, String>,
     patch_path_dependencies: &BTreeMap<String, String>,
     mark_workspace_member: bool,
     partial: &mut PartialGraph,
@@ -2556,6 +2619,14 @@ fn visit_manifest_recursive(
         .with_manifest_path(canonical_manifest));
     }
 
+    validate_manifest_workspace_owner(
+        &package_root,
+        &canonical_manifest,
+        workspace_root,
+        workspace_member_manifests,
+        policy,
+        manifest_cache,
+    )?;
     if states.get(&package_root) == Some(&VisitState::Visiting) {
         let cycle = cycle_from_stack(stack, &package_root);
         return Err(CargoPathDependencyError::new(
@@ -2608,9 +2679,10 @@ fn visit_manifest_recursive(
             &package_root,
             workspace_root,
             dependency,
-            workspace_path_dependencies,
             patch_path_dependencies,
             &canonical_manifest,
+            policy,
+            manifest_cache,
         )?
         else {
             continue;
@@ -2666,7 +2738,6 @@ fn visit_manifest_recursive(
             policy,
             workspace_root,
             workspace_member_manifests,
-            workspace_path_dependencies,
             patch_path_dependencies,
             false,
             partial,
@@ -2705,9 +2776,10 @@ fn resolve_manifest_dependency_candidate(
     package_root: &Path,
     workspace_root: &Path,
     dependency: &ManifestDependency,
-    workspace_path_dependencies: &BTreeMap<String, String>,
     patch_path_dependencies: &BTreeMap<String, String>,
     declaring_manifest: &Path,
+    policy: &PathTopologyPolicy,
+    manifest_cache: &mut BTreeMap<PathBuf, ManifestDocument>,
 ) -> Result<Option<PathBuf>, CargoPathDependencyError> {
     if let Some(raw_dependency_path) = dependency.dependency_path.as_deref() {
         return Ok(Some(resolve_dependency_candidate(
@@ -2717,32 +2789,14 @@ fn resolve_manifest_dependency_candidate(
     }
 
     if dependency.uses_workspace_inheritance {
-        if let Some(raw_dependency_path) =
-            workspace_path_dependencies.get(&dependency.dependency_name)
+        // Resolve the declaring package's owner before looking up a name.
+        // Same-name paths from the entry workspace cannot shadow definitions
+        // in a foreign workspace, including registry and Git definitions.
+        if let Some(owning_root) =
+            find_manifest_workspace(package_root, declaring_manifest, policy, manifest_cache)?
         {
-            return Ok(Some(resolve_dependency_candidate(
-                workspace_root,
-                raw_dependency_path,
-            )));
-        }
-
-        // A direct path dependency can itself be a member of a different
-        // workspace. When cargo metadata is unavailable, its `{ workspace =
-        // true }` dependencies must be resolved against that enclosing
-        // workspace, not the entry package's workspace. Otherwise the fallback
-        // stops at the directly named member and omits active transitive local
-        // crates (for example fastapi -> fastapi-core).
-        for ancestor in package_root.ancestors() {
-            let candidate_manifest = ancestor.join("Cargo.toml");
-            // A root package can declare its own workspace. Its manifest is
-            // the first candidate, just as Cargo's workspace search requires.
-            if !candidate_manifest.is_file() {
-                continue;
-            }
-            let candidate = read_manifest_document(&candidate_manifest)?;
-            if !candidate.has_workspace {
-                continue;
-            }
+            let candidate_manifest = owning_root.join("Cargo.toml");
+            let candidate = cached_manifest_document(&candidate_manifest, manifest_cache)?;
             let Some(raw_dependency_path) = candidate
                 .workspace_path_dependencies
                 .get(&dependency.dependency_name)
@@ -2776,7 +2830,7 @@ fn resolve_manifest_dependency_candidate(
                 .with_dependency_name(dependency.dependency_name.clone()));
             };
             return Ok(Some(resolve_dependency_candidate(
-                ancestor,
+                &owning_root,
                 raw_dependency_path,
             )));
         }
@@ -2798,9 +2852,237 @@ fn resolve_manifest_dependency_candidate(
         }))
 }
 
+fn cached_manifest_document<'a>(
+    manifest_path: &Path,
+    cache: &'a mut BTreeMap<PathBuf, ManifestDocument>,
+) -> Result<&'a ManifestDocument, CargoPathDependencyError> {
+    use std::collections::btree_map::Entry;
+    Ok(match cache.entry(manifest_path.to_path_buf()) {
+        Entry::Occupied(entry) => entry.into_mut(),
+        Entry::Vacant(entry) => entry.insert(read_manifest_document(manifest_path)?),
+    })
+}
+
+fn manifest_workspace_excludes(
+    workspace_root: &Path,
+    workspace: &ManifestDocument,
+    package_root: &Path,
+) -> Result<bool, CargoPathDependencyError> {
+    let matches = |paths: &[String]| -> Result<bool, CargoPathDependencyError> {
+        for path in paths {
+            let prefix =
+                SelectedCargoTree::lexical_path(workspace_root, path).map_err(|error| {
+                    CargoPathDependencyError::new(
+                        CargoPathDependencyErrorKind::ManifestParseFailure,
+                        format!("invalid workspace selection path '{path}': {error}"),
+                    )
+                    .with_manifest_path(workspace_root.join("Cargo.toml"))
+                })?;
+            if package_root.starts_with(prefix) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    Ok(matches(&workspace.workspace_excludes)? && !matches(&workspace.workspace_members)?)
+}
+
+fn validate_manifest_workspace_owner(
+    package_root: &Path,
+    manifest_path: &Path,
+    workspace_root: &Path,
+    workspace_members: &BTreeSet<PathBuf>,
+    policy: &PathTopologyPolicy,
+    manifest_cache: &mut BTreeMap<PathBuf, ManifestDocument>,
+) -> Result<(), CargoPathDependencyError> {
+    // Validate owners even without inherited dependencies: edition and other
+    // package fields can require owner metadata too. Declared members must
+    // belong to this workspace, while foreign path dependencies need not.
+    let owner = find_manifest_workspace(package_root, manifest_path, policy, manifest_cache)?;
+    if workspace_members.contains(manifest_path) && owner.as_deref() != Some(workspace_root) {
+        return Err(CargoPathDependencyError::new(
+            CargoPathDependencyErrorKind::ManifestParseFailure,
+            "workspace member is not owned by the selected workspace",
+        )
+        .with_manifest_path(manifest_path)
+        .with_dependency_path(workspace_root));
+    }
+    Ok(())
+}
+
+fn find_manifest_workspace(
+    package_root: &Path,
+    declaring_manifest: &Path,
+    policy: &PathTopologyPolicy,
+    manifest_cache: &mut BTreeMap<PathBuf, ManifestDocument>,
+) -> Result<Option<PathBuf>, CargoPathDependencyError> {
+    let normalized = normalize_project_path_with_policy(package_root, policy).map_err(|error| {
+        CargoPathDependencyError::new(
+            CargoPathDependencyErrorKind::PathPolicyViolation,
+            format!("normalize workspace search boundary: {error}"),
+        )
+        .with_manifest_path(declaring_manifest)
+        .with_dependency_path(package_root)
+    })?;
+    // Search the package itself first, and never inspect ambient manifests
+    // above the approved source topology. Parsed ancestors are reused across
+    // dependency lookups and membership discovery.
+    for ancestor in package_root
+        .ancestors()
+        .take_while(|ancestor| ancestor.starts_with(normalized.canonical_root()))
+    {
+        let candidate_manifest = ancestor.join("Cargo.toml");
+        if !manifest_cache.contains_key(&candidate_manifest)
+            && matches!(
+                std::fs::symlink_metadata(&candidate_manifest),
+                Err(ref error) if error.kind() == std::io::ErrorKind::NotFound
+            )
+        {
+            continue;
+        }
+        let candidate = cached_manifest_document(&candidate_manifest, manifest_cache)?;
+        if candidate.has_workspace {
+            if ancestor != package_root
+                && manifest_workspace_excludes(ancestor, candidate, package_root)?
+            {
+                continue;
+            }
+            return Ok(Some(ancestor.to_path_buf()));
+        }
+        if let Some(workspace_path) = &candidate.package_workspace {
+            // Cargo also honors a pointer in an ancestor package. Its target
+            // must itself declare a workspace; pointer chains are invalid.
+            let explicit_root = normalize_path_for_policy(
+                &ancestor.join(workspace_path),
+                policy,
+                Some(declaring_manifest),
+                None,
+                "normalize explicit workspace root",
+            )?;
+            let explicit_manifest = explicit_root.join("Cargo.toml");
+            if !cached_manifest_document(&explicit_manifest, manifest_cache)?.has_workspace {
+                return Err(CargoPathDependencyError::new(
+                    CargoPathDependencyErrorKind::ManifestParseFailure,
+                    format!(
+                        "package.workspace in {} does not identify a workspace: {}",
+                        candidate_manifest.display(),
+                        explicit_manifest.display()
+                    ),
+                )
+                .with_manifest_path(declaring_manifest));
+            }
+            return Ok(Some(explicit_root));
+        }
+    }
+    Ok(None)
+}
+
+fn validate_workspace_entry_membership(
+    entry_root: &Path,
+    workspace_root: &Path,
+    policy: &PathTopologyPolicy,
+    manifest_cache: &mut BTreeMap<PathBuf, ManifestDocument>,
+) -> Result<(), CargoPathDependencyError> {
+    let workspace_manifest = workspace_root.join("Cargo.toml");
+    let workspace = cached_manifest_document(&workspace_manifest, manifest_cache)?.clone();
+    let mut pending = expand_workspace_members(
+        workspace_root,
+        &workspace.workspace_members,
+        &workspace.workspace_excludes,
+        &workspace_manifest,
+    )?;
+    if workspace.package_name.is_some() {
+        pending.push(workspace_manifest.clone());
+    }
+    let mut visited = BTreeSet::new();
+    let no_patches = BTreeMap::new();
+    while let Some(manifest_path) = pending.pop() {
+        let package_root = normalize_path_for_policy(
+            manifest_path
+                .parent()
+                .expect("workspace member has a parent"),
+            policy,
+            Some(&manifest_path),
+            None,
+            "normalize workspace membership candidate",
+        )?;
+        if !visited.insert(package_root.clone())
+            || (package_root != workspace_root
+                && manifest_workspace_excludes(workspace_root, &workspace, &package_root)?)
+        {
+            continue;
+        }
+        let manifest_path = package_root.join("Cargo.toml");
+        if find_manifest_workspace(&package_root, &manifest_path, policy, manifest_cache)?
+            .as_deref()
+            != Some(workspace_root)
+        {
+            continue;
+        }
+        if package_root == entry_root {
+            return Ok(());
+        }
+        let manifest = cached_manifest_document(&manifest_path, manifest_cache)?.clone();
+        // Cargo's automatic membership follows declared local dependencies,
+        // including optional/dev/target edges. Patch-only packages, unused
+        // workspace definitions, and foreign workspaces do not confer membership.
+        for dependency in &manifest.materialization_path_dependencies {
+            let Some(candidate) = resolve_manifest_dependency_candidate(
+                &package_root,
+                workspace_root,
+                dependency,
+                &no_patches,
+                &manifest_path,
+                policy,
+                manifest_cache,
+            )?
+            else {
+                continue;
+            };
+            let (_, dependency_manifest) = resolve_materialization_dependency_manifest(
+                &candidate,
+                policy,
+                &manifest_path,
+                &dependency.dependency_name,
+            )?;
+            pending.push(dependency_manifest);
+        }
+    }
+    Err(CargoPathDependencyError::new(
+        CargoPathDependencyErrorKind::ManifestParseFailure,
+        "owning workspace does not include the entry package",
+    )
+    .with_manifest_path(entry_root.join("Cargo.toml"))
+    .with_dependency_path(workspace_root))
+}
+
 fn read_manifest_document(
     manifest_path: &Path,
 ) -> Result<ManifestDocument, CargoPathDependencyError> {
+    let metadata = std::fs::symlink_metadata(manifest_path).map_err(|error| {
+        CargoPathDependencyError::new(
+            CargoPathDependencyErrorKind::ManifestParseFailure,
+            format!(
+                "failed to inspect manifest {}: {error}",
+                manifest_path.display()
+            ),
+        )
+        .with_manifest_path(manifest_path)
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(CargoPathDependencyError::new(
+            CargoPathDependencyErrorKind::PathPolicyViolation,
+            "manifest must not be a symlink",
+        )
+        .with_manifest_path(manifest_path));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(CargoPathDependencyError::new(
+            CargoPathDependencyErrorKind::ManifestParseFailure,
+            "manifest must be a regular file",
+        )
+        .with_manifest_path(manifest_path));
+    }
     let contents = std::fs::read_to_string(manifest_path).map_err(|error| {
         CargoPathDependencyError::new(
             CargoPathDependencyErrorKind::ManifestParseFailure,
@@ -2822,15 +3104,35 @@ fn read_manifest_document(
         .with_manifest_path(manifest_path)
     })?;
 
-    let package_name = table
+    let package = table
         .get("package")
         .or_else(|| table.get("project"))
-        .and_then(toml::Value::as_table)
+        .and_then(toml::Value::as_table);
+    let package_name = package
         .and_then(|package| package.get("name"))
         .and_then(toml::Value::as_str)
         .map(ToOwned::to_owned);
     let has_workspace = table.contains_key("workspace");
     let workspace = table.get("workspace").and_then(toml::Value::as_table);
+    let package_workspace = package
+        .and_then(|package| package.get("workspace"))
+        .map(|value| {
+            value.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                CargoPathDependencyError::new(
+                    CargoPathDependencyErrorKind::ManifestParseFailure,
+                    "package.workspace must be a directory path string",
+                )
+                .with_manifest_path(manifest_path)
+            })
+        })
+        .transpose()?;
+    if has_workspace && (workspace.is_none() || package_workspace.is_some()) {
+        return Err(CargoPathDependencyError::new(
+            CargoPathDependencyErrorKind::ManifestParseFailure,
+            "a workspace must be a table and cannot also specify package.workspace",
+        )
+        .with_manifest_path(manifest_path));
+    }
     let workspace_strings = |key: &str| {
         workspace
             .and_then(|workspace| workspace.get(key))
@@ -2850,12 +3152,8 @@ fn read_manifest_document(
         .get("workspace")
         .and_then(toml::Value::as_table)
         .and_then(|workspace| workspace.get("dependencies"));
-    if workspace_dependencies.is_some_and(|dependencies| !dependencies.is_table()) {
-        return Err(CargoPathDependencyError::new(
-            CargoPathDependencyErrorKind::ManifestParseFailure,
-            "workspace.dependencies must be a table",
-        )
-        .with_manifest_path(manifest_path));
+    if let Some(dependencies) = workspace_dependencies {
+        validate_workspace_dependency_shapes(dependencies, manifest_path)?;
     }
     // Only usable source definitions can satisfy inheritance. Unused
     // source-less declarations stay inert, as they do in Cargo; inheriting
@@ -2951,6 +3249,7 @@ fn read_manifest_document(
 
     Ok(ManifestDocument {
         package_name,
+        package_workspace,
         has_workspace,
         workspace_members,
         workspace_excludes,
@@ -2960,6 +3259,46 @@ fn read_manifest_document(
         path_dependencies,
         materialization_path_dependencies,
     })
+}
+
+fn validate_workspace_dependency_shapes(
+    dependencies: &toml::Value,
+    manifest_path: &Path,
+) -> Result<(), CargoPathDependencyError> {
+    let Some(dependencies) = dependencies.as_table() else {
+        return Err(CargoPathDependencyError::new(
+            CargoPathDependencyErrorKind::ManifestParseFailure,
+            "workspace.dependencies must be a table",
+        )
+        .with_manifest_path(manifest_path));
+    };
+    for (name, value) in dependencies {
+        // Cargo rejects malformed field types and optional/public workspace
+        // definitions eagerly, even when unused. Source presence and ambiguity
+        // are checked lazily by workspace_dependency_source_is_valid instead.
+        let valid = match value {
+            toml::Value::String(_) => true,
+            toml::Value::Table(spec) => {
+                ["path", "git", "version"]
+                    .iter()
+                    .all(|key| spec.get(*key).is_none_or(toml::Value::is_str))
+                    && ["optional", "public"].iter().all(|key| {
+                        spec.get(*key)
+                            .is_none_or(|value| value.as_bool() == Some(false))
+                    })
+            }
+            _ => false,
+        };
+        if !valid {
+            return Err(CargoPathDependencyError::new(
+                CargoPathDependencyErrorKind::ManifestParseFailure,
+                format!("workspace dependency '{name}' has an invalid field specification"),
+            )
+            .with_manifest_path(manifest_path)
+            .with_dependency_name(name));
+        }
+    }
+    Ok(())
 }
 
 fn workspace_dependency_source_is_valid(value: &toml::Value) -> bool {
@@ -3061,6 +3400,32 @@ fn workspace_manifest_candidate(candidate: PathBuf) -> PathBuf {
     } else {
         candidate.join("Cargo.toml")
     }
+}
+
+fn canonical_workspace_members(
+    workspace_root: &Path,
+    workspace: &ManifestDocument,
+    manifest_path: &Path,
+    policy: &PathTopologyPolicy,
+) -> Result<BTreeSet<PathBuf>, CargoPathDependencyError> {
+    expand_workspace_members(
+        workspace_root,
+        &workspace.workspace_members,
+        &workspace.workspace_excludes,
+        manifest_path,
+    )?
+    .into_iter()
+    .map(|member| {
+        normalize_path_for_policy(
+            member.parent().expect("workspace member has a parent"),
+            policy,
+            Some(manifest_path),
+            None,
+            "normalize declared workspace member",
+        )
+        .map(|root| root.join("Cargo.toml"))
+    })
+    .collect()
 }
 
 fn expand_workspace_members(
@@ -6432,12 +6797,394 @@ patched.workspace = true
                 resolve_cargo_path_materialization_closure_with_policy(&root, &fixture.policy())
                     .map(|_| ()),
             ] {
-                let error = result.expect_err("invalid sources must not be treated as registry deps");
+                let error =
+                    result.expect_err("invalid sources must not be treated as registry deps");
                 assert_eq!(
                     error.kind(),
                     &CargoPathDependencyErrorKind::ManifestParseFailure
                 );
                 assert_eq!(error.dependency_name(), Some("dep"), "{source}: {error}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn manifest_resolution_errors(
+        root: &Path,
+        policy: &PathTopologyPolicy,
+    ) -> [CargoPathDependencyError; 2] {
+        [
+            resolve_from_manifest_fallback(&root.join("Cargo.toml"), policy)
+                .expect_err("active fallback must refuse"),
+            resolve_cargo_path_materialization_closure_with_policy(root, policy)
+                .expect_err("materialization must refuse"),
+        ]
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_inheritance_preserves_explicit_member_ownership() {
+        let fixture = TopologyFixture::new("explicit-workspace-owner");
+        let workspace = fixture.canonical_root.join("workspace");
+        let member = fixture.canonical_root.join("member");
+        let dep = fixture.canonical_root.join("dep");
+        fs::create_dir_all(&workspace).unwrap();
+        write_lib_crate(&member, "member", &[]);
+        write_lib_crate(&dep, "dep", &[]);
+        fs::write(
+            workspace.join("Cargo.toml"),
+            "[workspace]\nmembers=['../member']\n[workspace.dependencies]\ndep={path='../dep'}\n",
+        )
+        .unwrap();
+        fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname='member'\nversion='0.1.0'\nworkspace='../workspace'\n[dependencies]\ndep.workspace=true\n",
+        )
+        .unwrap();
+        let expected = vec![CargoPathDependencyEdge {
+            from: member.canonicalize().unwrap(),
+            to: dep.canonicalize().unwrap(),
+            dependency_name: "dep".into(),
+        }];
+        for entry in [&workspace, &member] {
+            let graph =
+                resolve_from_manifest_fallback(&entry.join("Cargo.toml"), &fixture.policy())
+                    .unwrap();
+            let closure =
+                resolve_cargo_path_materialization_closure_with_policy(entry, &fixture.policy())
+                    .unwrap();
+            assert_eq!(graph.edges, expected);
+            assert_eq!(closure.edges, expected);
+            assert_eq!(
+                graph.workspace_root,
+                Some(workspace.canonicalize().unwrap())
+            );
+            assert_eq!(closure.workspace_root, graph.workspace_root);
+            assert_eq!(graph.entry_manifest_path, entry.join("Cargo.toml"));
+            assert_eq!(closure.entry_manifest_path, graph.entry_manifest_path);
+            assert!(
+                graph
+                    .packages
+                    .iter()
+                    .any(|package| { package.package_root == member && package.workspace_member })
+            );
+        }
+        assert_eq!(
+            resolve_cargo_workspace_root_with_policy(&member, &fixture.policy()).unwrap(),
+            Some(workspace.canonicalize().unwrap())
+        );
+
+        // Explicit targets must be workspaces themselves, not pointer chains.
+        let proxy = fixture.canonical_root.join("proxy");
+        write_lib_crate(&proxy, "proxy", &[]);
+        fs::write(
+            proxy.join("Cargo.toml"),
+            "[package]\nname='proxy'\nversion='0.1.0'\nworkspace='../workspace'\n",
+        )
+        .unwrap();
+        for pointer in ["../proxy", ".", "../dep"] {
+            fs::write(
+                member.join("Cargo.toml"),
+                format!("[package]\nname='member'\nversion='0.1.0'\nworkspace='{pointer}'\n"),
+            )
+            .unwrap();
+            for error in manifest_resolution_errors(&member, &fixture.policy()) {
+                assert_eq!(
+                    error.kind(),
+                    &CargoPathDependencyErrorKind::ManifestParseFailure
+                );
+                assert!(error.detail().contains("does not identify a workspace"));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_entry_membership_includes_optional_dev_and_target_paths() {
+        let fixture = TopologyFixture::new("automatic-workspace-members");
+        let workspace = fixture.canonical_root.join("workspace");
+        let member = fixture.canonical_root.join("member");
+        let leaf = fixture.canonical_root.join("leaf");
+        write_lib_crate(&workspace, "owner", &[]);
+        write_lib_crate(&member, "member", &[]);
+        write_lib_crate(&leaf, "leaf", &[]);
+        fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname='member'\nversion='0.1.0'\nworkspace='../workspace'\nedition.workspace=true\n[dependencies]\nleaf={path='../leaf'}\n",
+        )
+        .unwrap();
+        for (section, optional) in [
+            ("dependencies", ",optional=true"),
+            ("dev-dependencies", ""),
+            ("target.'cfg(windows)'.build-dependencies", ""),
+        ] {
+            fs::write(
+                workspace.join("Cargo.toml"),
+                format!("[package]\nname='owner'\nversion='0.1.0'\n[workspace]\n[workspace.package]\nedition='2021'\n[{section}]\nmember={{path='../member'{optional}}}\n"),
+            )
+            .unwrap();
+            let graph =
+                resolve_from_manifest_fallback(&member.join("Cargo.toml"), &fixture.policy())
+                    .unwrap_or_else(|error| panic!("{section}: {error}"));
+            let closure =
+                resolve_cargo_path_materialization_closure_with_policy(&member, &fixture.policy())
+                    .unwrap();
+            assert!(graph.root_packages.contains(&member), "{section}");
+            assert!(closure.root_packages.contains(&member), "{section}");
+            assert!(graph.edges.contains(&CargoPathDependencyEdge {
+                from: member.clone(),
+                to: leaf.clone(),
+                dependency_name: "leaf".into(),
+            }));
+            assert_eq!(graph.workspace_root, Some(workspace.clone()));
+            assert_eq!(closure.workspace_root, graph.workspace_root);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_entry_membership_does_not_follow_patches_unused_paths_or_foreign_roots() {
+        let fixture = TopologyFixture::new("workspace-membership-boundaries");
+        let workspace = fixture.canonical_root.join("workspace");
+        let member = fixture.canonical_root.join("member");
+        let app = fixture.canonical_root.join("app");
+        let foreign = fixture.canonical_root.join("foreign");
+        write_lib_crate(&workspace, "owner", &[]);
+        write_lib_crate(&member, "member", &[]);
+        write_lib_crate(&app, "app", &[("member", "../member")]);
+        write_lib_crate(&foreign, "foreign", &[]);
+        fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname='member'\nversion='0.1.0'\nworkspace='../workspace'\n[dependencies]\nregistry_dep.workspace=true\n",
+        )
+        .unwrap();
+        fs::write(
+            foreign.join("Cargo.toml"),
+            "[package]\nname='foreign'\nversion='0.1.0'\n[workspace]\n[dependencies]\nmember={path='../member'}\n",
+        )
+        .unwrap();
+        for owner in [
+            "[workspace]\nexclude=['../member']\n[dependencies]\nmember={path='../member'}\n[workspace.dependencies]\nregistry_dep='1'\n",
+            "[workspace]\n[workspace.dependencies]\nmember={path='../member'}\nregistry_dep='1'\n",
+            "[workspace]\n[dependencies]\nmember='0.1'\n[patch.crates-io]\nmember={path='../member'}\n[workspace.dependencies]\nregistry_dep='1'\n",
+            "[workspace]\n[dependencies]\nforeign={path='../foreign'}\n[workspace.dependencies]\nregistry_dep='1'\n",
+        ] {
+            fs::write(
+                workspace.join("Cargo.toml"),
+                format!("[package]\nname='owner'\nversion='0.1.0'\n{owner}"),
+            )
+            .unwrap();
+            for error in manifest_resolution_errors(&member, &fixture.policy()) {
+                assert_eq!(
+                    error.kind(),
+                    &CargoPathDependencyErrorKind::ManifestParseFailure
+                );
+                assert!(
+                    error
+                        .detail()
+                        .contains("does not include the entry package")
+                );
+            }
+            // The same nonmember is a valid foreign dependency and still
+            // inherits from its explicit owner, including when excluded there.
+            let graph =
+                resolve_from_manifest_fallback(&app.join("Cargo.toml"), &fixture.policy()).unwrap();
+            let closure =
+                resolve_cargo_path_materialization_closure_with_policy(&app, &fixture.policy())
+                    .unwrap();
+            assert_eq!(graph.packages.len(), 2);
+            assert_eq!(closure.packages, graph.packages);
+            assert_eq!(graph.edges.len(), 1);
+            assert_eq!(graph.edges[0].from, app);
+            assert_eq!(graph.edges[0].to, member);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_lookup_skips_excluding_roots_and_resolves_ancestor_pointers() {
+        let fixture = TopologyFixture::new("workspace-ancestor-selection");
+        let outer = fixture.canonical_root.join("outer");
+        let inner = outer.join("inner");
+        let child = inner.join("child");
+        let dep = fixture.canonical_root.join("dep");
+        write_lib_crate(&child, "child", &[]);
+        write_lib_crate(&dep, "dep", &[]);
+        fs::write(
+            outer.join("Cargo.toml"),
+            "[workspace]\nmembers=['inner/child']\n[workspace.dependencies]\ndep={path='../dep'}\n",
+        )
+        .unwrap();
+        fs::write(
+            child.join("Cargo.toml"),
+            "[package]\nname='child'\nversion='0.1.0'\n[dependencies]\ndep.workspace=true\n",
+        )
+        .unwrap();
+        for parent in [
+            "[workspace]\nexclude=['child']\n[workspace.dependencies]\ndep={path='missing'}\n",
+            "[package]\nname='parent'\nversion='0.1.0'\nworkspace='..'\n",
+        ] {
+            fs::write(inner.join("Cargo.toml"), parent).unwrap();
+            assert_eq!(
+                resolve_cargo_workspace_root_with_policy(&child, &fixture.policy()).unwrap(),
+                Some(outer.clone())
+            );
+            let graph =
+                resolve_from_manifest_fallback(&child.join("Cargo.toml"), &fixture.policy())
+                    .unwrap();
+            let closure =
+                resolve_cargo_path_materialization_closure_with_policy(&child, &fixture.policy())
+                    .unwrap();
+            assert_eq!(
+                graph.edges,
+                vec![CargoPathDependencyEdge {
+                    from: child.clone(),
+                    to: dep.clone(),
+                    dependency_name: "dep".into(),
+                }]
+            );
+            assert_eq!(closure.edges, graph.edges);
+            assert_eq!(graph.workspace_root, Some(outer.clone()));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_rejects_invalid_unused_field_shapes_without_rejecting_lazy_sources() {
+        let fixture = TopologyFixture::new("workspace-unused-shapes");
+        let root = fixture.canonical_root.join("app");
+        write_lib_crate(&root, "app", &[]);
+        for source in [
+            "123",
+            "{path=123}",
+            "{version=123}",
+            "{git=123}",
+            "{path='missing',optional=true}",
+            "{path='missing',optional='false'}",
+            "{version='1',public=true}",
+        ] {
+            fs::write(
+                root.join("Cargo.toml"),
+                format!("[package]\nname='app'\nversion='0.1.0'\n[workspace.dependencies]\nunused={source}\n"),
+            )
+            .unwrap();
+            for error in manifest_resolution_errors(&root, &fixture.policy()) {
+                assert_eq!(
+                    error.kind(),
+                    &CargoPathDependencyErrorKind::ManifestParseFailure
+                );
+                assert_eq!(error.dependency_name(), Some("unused"));
+            }
+        }
+        for source in [
+            "{}",
+            "{features=['derive']}",
+            "{path='missing',git='https://example.invalid/unused'}",
+        ] {
+            fs::write(
+                root.join("Cargo.toml"),
+                format!("[package]\nname='app'\nversion='0.1.0'\n[workspace.dependencies]\nunused={source}\n"),
+            )
+            .unwrap();
+            let graph = resolve_from_manifest_fallback(&root.join("Cargo.toml"), &fixture.policy())
+                .unwrap();
+            let closure =
+                resolve_cargo_path_materialization_closure_with_policy(&root, &fixture.policy())
+                    .unwrap();
+            assert_eq!(graph.packages.len(), 1);
+            assert_eq!(closure.packages, graph.packages);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_owner_rejects_manifest_links_and_stays_inside_topology() {
+        let fixture = TopologyFixture::new("workspace-manifest-links");
+        let owner = fixture.canonical_root.join("owner");
+        let outside = fixture.canonical_root.parent().unwrap().join("outside");
+        fs::create_dir_all(&owner).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(owner.join("Cargo.toml"), "[workspace]\n").unwrap();
+        fs::write(outside.join("Cargo.toml"), "[workspace]\n").unwrap();
+        for (name, target) in [
+            ("internal", owner.join("Cargo.toml")),
+            ("escape", outside.join("Cargo.toml")),
+            ("dangling", outside.join("missing.toml")),
+        ] {
+            let linked = fixture.canonical_root.join(name);
+            let member = linked.join("member");
+            write_lib_crate(&member, "member", &[]);
+            std::os::unix::fs::symlink(target, linked.join("Cargo.toml")).unwrap();
+            for error in manifest_resolution_errors(&member, &fixture.policy()) {
+                assert_eq!(
+                    error.kind(),
+                    &CargoPathDependencyErrorKind::PathPolicyViolation
+                );
+            }
+            fs::write(
+                member.join("Cargo.toml"),
+                "[package]\nname='member'\nversion='0.1.0'\nworkspace='..'\n",
+            )
+            .unwrap();
+            for error in manifest_resolution_errors(&member, &fixture.policy()) {
+                assert_eq!(
+                    error.kind(),
+                    &CargoPathDependencyErrorKind::PathPolicyViolation
+                );
+            }
+        }
+        let standalone = fixture.canonical_root.join("standalone");
+        write_lib_crate(&standalone, "standalone", &[]);
+        // A malformed ambient manifest outside the source topology is inert.
+        fs::write(
+            fixture.canonical_root.parent().unwrap().join("Cargo.toml"),
+            "not valid TOML [[[",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_cargo_workspace_root_with_policy(&standalone, &fixture.policy()).unwrap(),
+            None
+        );
+        resolve_cargo_path_materialization_closure_with_policy(&standalone, &fixture.policy())
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_rejects_declared_members_with_a_missing_or_different_owner() {
+        let fixture = TopologyFixture::new("workspace-declared-owner");
+        let root = fixture.canonical_root.join("workspace");
+        let member = fixture.canonical_root.join("member");
+        let foreign = fixture.canonical_root.join("foreign");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&foreign).unwrap();
+        write_lib_crate(&member, "member", &[]);
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers=['../member']\n",
+        )
+        .unwrap();
+        fs::write(
+            foreign.join("Cargo.toml"),
+            "[workspace]\nmembers=['../member']\n",
+        )
+        .unwrap();
+        for pointer in ["", "workspace='../foreign'\n"] {
+            fs::write(
+                member.join("Cargo.toml"),
+                format!("[package]\nname='member'\nversion='0.1.0'\n{pointer}"),
+            )
+            .unwrap();
+            for error in manifest_resolution_errors(&root, &fixture.policy()) {
+                assert_eq!(
+                    error.kind(),
+                    &CargoPathDependencyErrorKind::ManifestParseFailure
+                );
+                assert!(
+                    error
+                        .detail()
+                        .contains("not owned by the selected workspace")
+                );
             }
         }
     }
@@ -6515,8 +7262,12 @@ shared_dep = { path = "../shared/shared_dep" }
         let foreign_workspace = scenario_root.join("foreign");
         let api_root = foreign_workspace.join("crates/api");
         let core_root = foreign_workspace.join("crates/core");
+        let unrelated_core = scenario_root.join("unrelated_core");
+        let unrelated_registry = scenario_root.join("unrelated_registry");
 
         write_lib_crate(&core_root, "foreign_core", &[]);
+        write_lib_crate(&unrelated_core, "foreign_core", &[]);
+        write_lib_crate(&unrelated_registry, "asupersync", &[]);
         std::fs::create_dir_all(api_root.join("src")).expect("create foreign api src");
         std::fs::write(
             api_root.join("Cargo.toml"),
@@ -6550,6 +7301,14 @@ asupersync = "0.3.9"
             "foreign_workspace_app",
             &[("foreign_api", "../foreign/crates/api")],
         );
+        // Same-name entries in the entry workspace cannot override the
+        // foreign workspace's local path or its registry dependency.
+        let app_manifest = app_root.join("Cargo.toml");
+        let mut contents = fs::read_to_string(&app_manifest).unwrap();
+        contents.push_str(
+            "\n[workspace]\n[workspace.dependencies]\nforeign_core={path='../unrelated_core'}\nasupersync={path='../unrelated_registry'}\n",
+        );
+        fs::write(app_manifest, contents).unwrap();
 
         let graph = resolve_cargo_path_dependency_graph_with_policy_and_provider(
             &app_root,
