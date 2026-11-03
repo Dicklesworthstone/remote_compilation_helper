@@ -138,6 +138,7 @@ enum UnitSelectionReasonWire {
     AllWorkersBusy,
     NoWorkersPassedHealth,
     AllWorkersFailedPreflight,
+    SourceTopologyIncompatible,
     AllWorkersFailedConvergence,
     NoMatchingWorkers,
     AffinityPinned,
@@ -156,6 +157,7 @@ impl From<UnitSelectionReasonWire> for SelectionReason {
             UnitSelectionReasonWire::AllWorkersBusy => Self::AllWorkersBusy,
             UnitSelectionReasonWire::NoWorkersPassedHealth => Self::NoWorkersPassedHealth,
             UnitSelectionReasonWire::AllWorkersFailedPreflight => Self::AllWorkersFailedPreflight,
+            UnitSelectionReasonWire::SourceTopologyIncompatible => Self::SourceTopologyIncompatible,
             UnitSelectionReasonWire::AllWorkersFailedConvergence => {
                 Self::AllWorkersFailedConvergence
             }

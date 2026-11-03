@@ -65,6 +65,10 @@ pub struct WorkerStatusFromApi {
     pub total_slots: u32,
     pub speed_score: f64,
     pub last_error: Option<String>,
+    /// Confirmed exclusions for particular source-root mappings. Other
+    /// topologies can still use this worker's healthy capacity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_topology_mismatches: Vec<rch_common::SourceTopologyMismatch>,
     /// Consecutive failure count.
     #[serde(default)]
     pub consecutive_failures: u32,
@@ -127,6 +131,8 @@ pub struct WorkerCapabilitiesFromApi {
     pub host: String,
     pub user: String,
     pub capabilities: WorkerCapabilities,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_topology_mismatches: Vec<rch_common::SourceTopologyMismatch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh: Option<WorkerCapabilitiesRefreshFromApi>,
 }
@@ -555,11 +561,36 @@ pub struct RemediationHint {
     pub worker_id: Option<String>,
 }
 
-/// Generate remediation hints for workers with non-healthy states.
+/// Describe a mapping-specific exclusion without changing global worker health.
+pub fn source_topology_remediation(
+    worker_id: &str,
+    mismatch: &rch_common::SourceTopologyMismatch,
+) -> RemediationHint {
+    RemediationHint {
+        reason_code: "source_topology_incompatible".into(),
+        severity: "warning".into(),
+        message: format!(
+            "Worker {} is excluded for source topology (canonical {:?}, alias {:?}): {}",
+            worker_id.escape_debug(),
+            mismatch.topology.canonical_root,
+            mismatch.topology.alias_root,
+            mismatch.detail.escape_debug(),
+        ),
+        suggested_action: "Choose a compatible worker, or safely correct the reported mapping and run `rch workers capabilities --refresh`; existing aliases and source directories must be preserved".into(),
+        worker_id: Some(worker_id.to_owned()),
+    }
+}
+
+/// Generate remediation hints for worker health and mapping-specific exclusions.
 pub fn generate_worker_remediations(workers: &[WorkerStatusFromApi]) -> Vec<RemediationHint> {
     let mut hints = Vec::new();
 
     for w in workers {
+        hints.extend(
+            w.source_topology_mismatches
+                .iter()
+                .map(|mismatch| source_topology_remediation(&w.id, mismatch)),
+        );
         // Circuit breaker issues
         match w.circuit_state.as_str() {
             "open" => {
@@ -1827,6 +1858,7 @@ mod tests {
 
     fn make_worker(id: &str, status: &str, circuit: &str) -> WorkerStatusFromApi {
         WorkerStatusFromApi {
+            source_topology_mismatches: Vec::new(),
             id: id.to_string(),
             host: "10.0.0.1".to_string(),
             user: "ubuntu".to_string(),
@@ -1995,6 +2027,86 @@ mod tests {
         let w = make_worker("w7", "healthy", "closed");
         let hints = generate_worker_remediations(&[w]);
         assert!(hints.is_empty(), "healthy worker should produce no hints");
+    }
+
+    #[test]
+    fn source_topology_status_retains_mapping_and_action_without_global_disable() {
+        let mismatch = serde_json::json!({
+            "topology": {
+                "canonical_root": "/Users/dispatcher/projects",
+                "alias_root": "/dp"
+            },
+            "detail": "canonical resolves to /Users/dispatcher/projects; alias resolves to /data/projects"
+        });
+        let worker: WorkerStatusFromApi = serde_json::from_value(serde_json::json!({
+            "id": "different-layout",
+            "host": "worker.example",
+            "user": "builder",
+            "status": "healthy",
+            "circuit_state": "closed",
+            "used_slots": 0,
+            "total_slots": 8,
+            "speed_score": 1.0,
+            "last_error": null,
+            "source_topology_mismatches": [mismatch.clone()]
+        }))
+        .unwrap();
+        let json = serde_json::to_value(&worker).unwrap();
+        assert_eq!(json["source_topology_mismatches"][0], mismatch);
+        assert!(worker_has_remote_admission_capacity(&worker));
+        let hints = generate_worker_remediations(&[worker]);
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].worker_id.as_deref(), Some("different-layout"));
+        assert_eq!(hints[0].reason_code, "source_topology_incompatible");
+        for path in ["/Users/dispatcher/projects", "/dp", "/data/projects"] {
+            assert!(hints[0].message.contains(path));
+        }
+        assert!(hints[0].message.contains("is excluded for source topology"));
+        assert!(
+            hints[0]
+                .suggested_action
+                .contains("Choose a compatible worker")
+        );
+        assert!(
+            hints[0]
+                .suggested_action
+                .contains("rch workers capabilities --refresh")
+        );
+        assert!(hints[0].suggested_action.contains("must be preserved"));
+    }
+
+    #[test]
+    fn source_topology_capabilities_roundtrip_and_older_response_default() {
+        let mut wire = serde_json::json!({
+            "id": "different-layout", "host": "worker.example", "user": "builder",
+            "capabilities": {}
+        });
+        let older: WorkerCapabilitiesFromApi = serde_json::from_value(wire.clone()).unwrap();
+        assert!(older.source_topology_mismatches.is_empty());
+        wire["source_topology_mismatches"] = serde_json::json!([{
+            "topology": {"canonical_root": "/Users/dispatcher/projects", "alias_root": "/dp"},
+            "detail": "conflicting physical directories"
+        }]);
+        let current: WorkerCapabilitiesFromApi = serde_json::from_value(wire.clone()).unwrap();
+        let rendered = serde_json::to_value(current).unwrap();
+        assert_eq!(
+            rendered["source_topology_mismatches"],
+            wire["source_topology_mismatches"]
+        );
+    }
+
+    #[test]
+    fn source_topology_remediation_escapes_terminal_controls() {
+        let mismatch = rch_common::SourceTopologyMismatch {
+            topology: rch_common::SourceTopology {
+                canonical_root: "/Users/dispatcher/projects".into(),
+                alias_root: "/dp".into(),
+            },
+            detail: "path diagnostic\n\u{1b}[31m".into(),
+        };
+        let hint = source_topology_remediation("worker\u{1b}[31m", &mismatch);
+        assert!(!hint.message.chars().any(char::is_control));
+        assert!(hint.message.contains("path diagnostic\\n"));
     }
 
     #[test]

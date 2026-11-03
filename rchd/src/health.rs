@@ -1947,6 +1947,7 @@ mod tests {
 
         fn make_request(project: &str, cores: u32) -> SelectionRequest {
             SelectionRequest {
+                source_topology: None,
                 job_mode: false,
                 project: project.to_string(),
                 command: None,

@@ -156,6 +156,72 @@ canonical_root = "/Users/me/Projects"
 alias_root = "/Users/me/p"
 ```
 
+#### Worker compatibility and permanent namespace refusals
+
+For ordinary source mirrors, each selected worker must resolve the configured
+canonical and alias roots to **the same physical directory**. The worker may
+use a different symlink layout: both roots can be symlinks to one directory.
+However, `/dp -> /data/projects` and a separate real `/Users/me/Projects`
+directory are incompatible with a request for `/Users/me/Projects` plus `/dp`.
+The initializer refuses that mapping before taking source authority or copying
+sources. It never replaces an existing alias or merges distinct source trees.
+
+A confirmed `RCH_SOURCE_TOPOLOGY_INCOMPATIBLE` refusal is permanent for that
+worker endpoint and requested mapping. After acknowledging the failed
+reservation, `rch exec` may select a different eligible worker within the
+caller's requested worker set. A pinned incompatible worker, or a pool containing
+only workers known to reject that mapping, exits **1**, including when
+`RCH_REQUIRE_REMOTE=1`. It does not exit 103 or execute the command locally.
+JSON reports `outcome: "refused"`,
+`fallback_reason: "source_topology_incompatible"`, and the stable error marker;
+the initialization failure identifies the worker and the configured/physical
+paths. No compiler exit is invented for a command that never started.
+
+The daemon saves namespace-initialization refusals across restarts. It excludes only the
+recorded endpoint/mapping pair: another worker, or a different compatible mapping
+on the same worker, remains eligible. Last-success affinity cannot override this
+exclusion. Isolated overlays, source-content receipt jobs, and off-root staging
+use their staging namespace as the placement key. A transient overlapping source
+owner remains separately classified and may still produce retryable exit 103.
+If another compatible worker is temporarily busy, the normal capacity retry
+policy still applies to that worker.
+
+Worker capability reports also identify the roots they actually checked. A
+confirmed physical conflict for those exact roots can prevent selection before
+namespace initialization. A probe for different roots cannot prove the requested
+mapping incompatible; namespace initialization still validates it before source
+authority is acquired. Missing paths and failed probes are not classified as
+confirmed physical conflicts. These capability observations are updated by the
+worker probe; they cannot clear a saved namespace-initialization refusal.
+
+Inspect the exact refusals with:
+
+```bash
+rch workers list --json
+rch workers capabilities --json
+rch status --workers --json
+```
+
+Each affected worker exposes `source_topology_mismatches` with its requested
+mapping and diagnostic detail. To continue immediately, select a compatible
+worker, for example `rch exec --worker compatible-builder -- cargo check`, or
+remove an unnecessary pin so RCH can select an eligible peer. To restore an
+excluded mapping, have the operator reconcile its physical layout safely after
+checking existing source owners and the contents of both trees. Do not replace
+an existing alias, remove a real directory, or change dispatcher topology merely
+to suppress the refusal. Once the mapping actually resolves to one directory:
+
+```bash
+rch workers capabilities --refresh
+```
+
+Refresh performs a read-only check of saved namespace refusals. Only a complete,
+successful check of the exact mapping and current endpoint clears the saved exclusion;
+failed probes, ordinary healthy-worker reports, elapsed time, and daemon restarts
+do not clear it. Refresh does not create directories, replace links, or release
+source ownership. Existing ownership and execution-recovery uncertainty always
+retain their stricter no-replay rules.
+
 ### `[api]` — daemon status API over the tailnet
 
 `rchd`'s rich state (`/status`, `/workers/capabilities`) lives on a `0600` Unix

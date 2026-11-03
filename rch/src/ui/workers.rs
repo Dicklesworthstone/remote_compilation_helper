@@ -331,6 +331,7 @@ mod tests {
     fn sample_workers() -> Vec<WorkerStatusFromApi> {
         vec![
             WorkerStatusFromApi {
+                source_topology_mismatches: Vec::new(),
                 id: "worker-1".to_string(),
                 host: "192.168.1.10".to_string(),
                 user: "ubuntu".to_string(),
@@ -359,6 +360,7 @@ mod tests {
                 bypass: None,
             },
             WorkerStatusFromApi {
+                source_topology_mismatches: Vec::new(),
                 id: "worker-2".to_string(),
                 host: "192.168.1.11".to_string(),
                 user: "ubuntu".to_string(),

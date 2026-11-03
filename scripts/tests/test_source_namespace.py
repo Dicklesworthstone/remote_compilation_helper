@@ -6,6 +6,7 @@ SSH fleet. Rust's source_namespace unit test additionally executes its actual
 command builder; the Cargo integration target supplies compiled shell bytes.
 """
 from pathlib import Path
+import json
 import os
 import shlex
 import subprocess
@@ -57,6 +58,94 @@ class ProductionNamespaceTests(base.SourceTopologyTests):
         self.assertEqual(evidence.read_bytes(), b"unfinished source evidence")
         self.assertEqual(list(self.alias.iterdir()), [evidence])
         self.assertEqual(set(self.inventory()), {"metadata.lock"})
+
+    def test_conflicting_worker_symlink_identifies_both_physical_roots_without_source_contents(self):
+        # Issue #130: the dispatcher's canonical root is a real, separate
+        # directory while /dp already names the worker's own project root.
+        physical = self.base / "data/projects"
+        physical.mkdir(parents=True)
+        self.canonical.mkdir()
+        self.alias.symlink_to(physical, target_is_directory=True)
+        canonical_data = self.canonical / "keep"
+        worker_data = physical / "keep"
+        canonical_data.write_bytes(b"private canonical source contents")
+        worker_data.write_bytes(b"private worker source contents")
+        before = self.inventory()
+        alias_inode = self.alias.lstat().st_ino
+        result = self.topology()
+        self.assertEqual(result.returncode, 73, result.stderr)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(b"RCH_SOURCE_TOPOLOGY_INCOMPATIBLE: conflicting_alias_base\n", result.stderr)
+        mappings = [line.removeprefix("RCH_SOURCE_TOPOLOGY_PATHS ")
+                    for line in result.stderr.decode().splitlines()
+                    if line.startswith("RCH_SOURCE_TOPOLOGY_PATHS ")]
+        self.assertEqual(len(mappings), 1)
+        self.assertEqual(json.loads(mappings[0]), {
+            "canonical": str(self.canonical),
+            "canonical_physical": str(self.canonical.resolve()),
+            "alias": str(self.alias),
+            "alias_physical": str(physical.resolve()),
+        })
+        self.assertNotIn(b"private", result.stderr)
+        self.assertEqual(canonical_data.read_bytes(), b"private canonical source contents")
+        self.assertEqual(worker_data.read_bytes(), b"private worker source contents")
+        self.assertEqual(self.alias.lstat().st_ino, alias_inode)
+        self.assertEqual(os.readlink(self.alias), str(physical))
+        self.assertEqual(before, self.inventory())
+
+    def test_two_compatible_aliases_to_one_physical_root_are_preserved(self):
+        physical = self.base / "data/projects"
+        physical.mkdir(parents=True)
+        self.canonical.symlink_to(physical, target_is_directory=True)
+        self.alias.symlink_to(physical, target_is_directory=True)
+        original_inodes = [path.lstat().st_ino for path in self.scope]
+        self.initialize()
+        self.assertEqual([path.lstat().st_ino for path in self.scope], original_inodes)
+        self.assertEqual(list(physical.iterdir()), [])
+
+    def test_physical_mapping_diagnostic_quotes_control_and_shell_characters(self):
+        physical = self.base / "other\t\x1b[31m' $(touch BAD)"
+        physical.mkdir()
+        self.canonical.mkdir()
+        self.alias.symlink_to(physical, target_is_directory=True)
+        result = self.topology()
+        self.assertEqual(result.returncode, 73, result.stderr)
+        self.assertNotIn(b"\x1b", result.stderr)
+        self.assertNotIn(b"\t", result.stderr)
+        self.assertFalse((self.base / "BAD").exists())
+        mapping_line = next(line for line in result.stderr.decode().splitlines()
+                            if line.startswith("RCH_SOURCE_TOPOLOGY_PATHS "))
+        mapping = json.loads(mapping_line.removeprefix("RCH_SOURCE_TOPOLOGY_PATHS "))
+        self.assertEqual(mapping["alias_physical"], str(physical))
+
+    def test_non_directory_canonical_is_permanent_and_never_replaced(self):
+        self.canonical.write_bytes(b"keep canonical file")
+        result = self.topology()
+        self.assertEqual(result.returncode, 73, result.stderr)
+        self.assertIn(b"RCH_SOURCE_TOPOLOGY_INCOMPATIBLE: canonical_not_directory\n", result.stderr)
+        self.assertEqual(self.canonical.read_bytes(), b"keep canonical file")
+        self.assertFalse(self.alias.exists())
+
+    def test_conflicting_topology_never_retries_the_same_worker(self):
+        physical = self.base / "other/projects"
+        physical.mkdir(parents=True)
+        self.canonical.mkdir()
+        self.alias.symlink_to(physical, target_is_directory=True)
+        command, data = self.command("topology", "b1", self.scope, *self.topology_commands())
+        counter = self.base / "conflict-attempts"
+        script = (
+            "rch_source_attempt() { (\nset -eu\n"
+            + "printf 'attempt\\n' >> " + shlex.quote(str(counter)) + "\n"
+            + "exec " + shlex.join(command) + " <<'RCH_NAMESPACE_SCOPE'\n"
+            + data.decode() + "RCH_NAMESPACE_SCOPE\n); }\n"
+            + "rch_admission_attempts=6\n" + base.RETRY.read_text()
+        )
+        result = subprocess.run([base.SHELL, "-c", script], capture_output=True,
+                                timeout=5, env=self.env)
+        self.assertEqual(result.returncode, 73, result.stderr)
+        self.assertEqual(counter.read_text().splitlines(), ["attempt"])
+        self.assertEqual(self.alias.resolve(), physical)
+        self.assertEqual(list(self.registry.glob("*.claim")), [])
 
     def test_conflicting_dangling_alias_does_not_create_either_target(self):
         elsewhere = self.base / "elsewhere"

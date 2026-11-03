@@ -473,6 +473,18 @@ fn remote_failure_exit_code(error: &anyhow::Error) -> i32 {
         )
 }
 
+fn source_topology_preflight_failure<'a>(
+    error: &'a anyhow::Error,
+    worker_id: &WorkerId,
+) -> Option<&'a transfer_orchestration::SourceTopologyIncompatible> {
+    if requires_recovery_before_release(error) || !error.is::<SourceNamespacePreflightFailure>() {
+        return None;
+    }
+    error
+        .downcast_ref::<transfer_orchestration::SourceTopologyIncompatible>()
+        .filter(|failure| &failure.worker_id == worker_id)
+}
+
 /// Keep failure evidence tied to the selected worker and the transfer's
 /// direction. An unresolved source/execution owner still takes precedence:
 /// its reservation cannot be completed merely because disk exhaustion was
@@ -488,11 +500,19 @@ fn remote_release_faults<'a>(
             worker_disk_roots: &result.disk_roots,
             live_checkout_refused: false,
             source_busy: false,
+            source_topology_mismatch: None,
             disk_peak_output_bytes: result.disk_peak_output_bytes,
         },
         Err(error) if !requires_recovery_before_release(error) => {
             let live_checkout_refused = crate::transfer::sync_refused_by_live_checkout(error);
             let source_busy = crate::transfer::source_authority_busy(error);
+            if let Some(failure) = source_topology_preflight_failure(error, worker_id) {
+                return daemon_ipc::ReleaseFaults {
+                    worker_fault: true,
+                    source_topology_mismatch: Some(failure.mismatch()),
+                    ..Default::default()
+                };
+            }
             if let Some(failure) = error
                 .downcast_ref::<crate::transfer::RemoteBuildDiskBudgetExceeded>()
                 .filter(|failure| failure.worker_id == worker_id.as_str())
@@ -514,6 +534,7 @@ fn remote_release_faults<'a>(
                     worker_disk_roots: &fault.roots,
                     live_checkout_refused,
                     source_busy,
+                    source_topology_mismatch: None,
                     disk_peak_output_bytes: None,
                 },
                 None => daemon_ipc::ReleaseFaults {
@@ -1218,6 +1239,39 @@ fn remote_required_refusal_summary(reason: &str) -> String {
     }
 }
 
+/// A stored mapping refusal is permanent for this worker/topology pair. Keep
+/// its diagnostics through requested-worker handling and never route it into
+/// the generic local-fallback classifier, which describes transient capacity.
+fn source_topology_selection_refusal(response: &SelectionResponse) -> Option<String> {
+    if response.worker.is_some() || response.reason != SelectionReason::SourceTopologyIncompatible {
+        return None;
+    }
+    let details = response
+        .diagnostics
+        .as_ref()
+        .into_iter()
+        .flat_map(|diagnostics| &diagnostics.workers)
+        .filter(|worker| {
+            worker
+                .reason_codes
+                .iter()
+                .any(|reason| reason == "topology.source_incompatible")
+        })
+        .map(|worker| format!("{}: {}", worker.worker_id, worker.final_reason))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(format!(
+        "[RCH] source topology incompatible; no command was executed. {} \
+         Choose a compatible worker or correct the worker mapping without replacing existing \
+         source roots, then run `rch workers capabilities --refresh` to revalidate.",
+        if details.is_empty() {
+            "Inspect `rch status --workers --json` for the rejected mappings."
+        } else {
+            &details
+        },
+    ))
+}
+
 /// A config-driven reason to run locally instead of offloading.
 ///
 /// Issue #55: `general.enabled`, `general.force_local` and
@@ -1743,6 +1797,10 @@ struct RetryableRemoteFault {
 
 /// Terminal action taken once capacity-aware retries are exhausted.
 enum RemoteFaultExhaustAction {
+    /// No source or execution grant was issued, and this worker cannot satisfy
+    /// the requested mapping. Another eligible worker may serve the request;
+    /// repeating this topology on the same worker or running locally may not.
+    RefuseSourceTopology { summary: String },
     /// Surface the remote failure by exiting with this code. Used for OOM /
     /// signal kills: a crate that OOMs every worker must NOT then be run on (and
     /// likely OOM) the orchestrator, so this never falls back to local.
@@ -1766,10 +1824,21 @@ enum RemoteFaultExhaustAction {
     },
 }
 
+enum RetryWorkerSelection {
+    Selected {
+        response: Box<SelectionResponse>,
+        worker_id: WorkerId,
+    },
+    TemporarilyUnavailable {
+        worker_ids: Vec<WorkerId>,
+    },
+    Exhausted,
+}
+
 /// Fetch daemon status, rank the remaining workers by capacity, and re-query the
 /// daemon pinned to each untried worker, biggest first, until one is admitted.
-/// Returns the fresh selection response plus the chosen worker id, or `None`
-/// when no untried worker can serve.
+/// Keep a confirmed capacity refusal separate from incompatible layouts so a
+/// permanent refusal on one worker cannot hide a recoverable alternative.
 #[allow(clippy::too_many_arguments)]
 async fn try_retry_on_bigger_worker(
     socket_path: &str,
@@ -1784,10 +1853,11 @@ async fn try_retry_on_bigger_worker(
     worker_pin: &[WorkerId],
     job_mode: bool,
     required_tools: &[String],
+    source_topology: &rch_common::SourceTopology,
     durable_lease: &DurableLeaseWriter,
     release_acknowledged: bool,
     reporter: &HookReporter,
-) -> anyhow::Result<Option<(SelectionResponse, WorkerId)>> {
+) -> anyhow::Result<RetryWorkerSelection> {
     let status = match crate::status_display::query_daemon_full_status_at_socket(socket_path).await
     {
         Ok(status) => status,
@@ -1795,13 +1865,14 @@ async fn try_retry_on_bigger_worker(
             reporter.verbose(&format!(
                 "[RCH] retry: could not fetch worker status ({e}); no bigger worker to try"
             ));
-            return Ok(None);
+            return Ok(RetryWorkerSelection::Exhausted);
         }
     };
     let snapshots = build_capacity_snapshots(&status);
     // The biggest candidate may be full right now. Walk down the capacity
     // order rather than ending retries while smaller workers sit idle.
     let mut passed_over = tried_workers.to_vec();
+    let mut busy_workers = Vec::new();
     while let Some(chosen) = pick_bigger_worker(snapshots.as_slice(), &passed_over, worker_pin) {
         let preferred = vec![chosen.clone()];
         let wrapper_id = durable_lease.wrapper_id();
@@ -1822,6 +1893,7 @@ async fn try_retry_on_bigger_worker(
                 &preferred,
                 job_mode,
                 required_tools,
+                Some(source_topology),
             )
             .await
         })
@@ -1830,9 +1902,15 @@ async fn try_retry_on_bigger_worker(
             Some(response)
                 if response.worker.is_some() || selection_cancelled_before_start(&response) =>
             {
-                return Ok(Some((response, chosen)));
+                return Ok(RetryWorkerSelection::Selected {
+                    response: Box::new(response),
+                    worker_id: chosen,
+                });
             }
-            Some(_) => {
+            Some(response) => {
+                if response.reason == SelectionReason::AllWorkersBusy {
+                    busy_workers.push(chosen.clone());
+                }
                 reporter.verbose(&format!(
                     "[RCH] retry: worker {chosen} is not currently admissible; trying the next"
                 ));
@@ -1842,11 +1920,17 @@ async fn try_retry_on_bigger_worker(
                 reporter.verbose(&format!(
                     "[RCH] retry: re-query for {chosen} failed before dispatch; ending retries"
                 ));
-                return Ok(None);
+                break;
             }
         }
     }
-    Ok(None)
+    Ok(if busy_workers.is_empty() {
+        RetryWorkerSelection::Exhausted
+    } else {
+        RetryWorkerSelection::TemporarilyUnavailable {
+            worker_ids: busy_workers,
+        }
+    })
 }
 
 /// Persist the new admission intent before the actual query can be polled.
@@ -4947,6 +5031,12 @@ pub async fn run_exec(
     // Build path topology policy from loaded config so that any normalization
     // warnings reference the configured roots rather than compiled-in defaults.
     let topology_policy = config.path_topology.to_policy();
+    let source_topology = rch_common::SourceTopology::for_worker_namespace(
+        &topology_policy,
+        clean_overlay || source_content_receipt,
+        &config.transfer.remote_base,
+    )
+    .map_err(anyhow::Error::msg)?;
 
     // bd-raobv: transfer cannot mirror a project outside the canonical root.
     // Decide that before a worker slot is reserved, with a reason an operator
@@ -5158,6 +5248,7 @@ pub async fn run_exec(
         &preferred_workers,
         classification.kind == Some(CompilationKind::Job),
         &required_tools,
+        Some(&source_topology),
     )
     .await
     {
@@ -5224,6 +5315,7 @@ pub async fn run_exec(
                     &preferred_workers,
                     classification.kind == Some(CompilationKind::Job),
                     &required_tools,
+                    Some(&source_topology),
                 )
                 .await
                 {
@@ -5337,6 +5429,7 @@ pub async fn run_exec(
             &preferred_workers,
             classification.kind == Some(CompilationKind::Job),
             &required_tools,
+            Some(&source_topology),
         )
         .await
         {
@@ -5353,6 +5446,25 @@ pub async fn run_exec(
             std::process::exit(130);
         }
         let Some(worker) = response.worker.clone() else {
+            if let Some(summary) = source_topology_selection_refusal(&response) {
+                durable_lease.confirm_failed_before_admission()?;
+                reporter.summary_critical(&summary);
+                emit_exec_envelope(&ExecResultEnvelope {
+                    api_version: "1.0",
+                    command: &remote_command,
+                    outcome: "refused",
+                    location: "remote",
+                    fallback_reason: Some("source_topology_incompatible"),
+                    worker_id: None,
+                    remote_exit_code: None,
+                    duration_ms: None,
+                    timing: None,
+                    result_dirs: None,
+                    error_code: Some("RCH_SOURCE_TOPOLOGY_INCOMPATIBLE"),
+                    admission: None,
+                });
+                std::process::exit(EXIT_BUILD_ERROR);
+            }
             let requested_refusal = requested_worker_refusal(&preferred_workers, &response);
             // A pin that could not be honored is the exact failure the allow-set fix
             // exists for; record a durable incident row so postmortems have a trace
@@ -6150,7 +6262,15 @@ pub async fn run_exec(
                 // (tried_workers), mirroring the E104 failover semantics
                 // instead of dying inside the sync leg or falling straight to
                 // local.
-                if let Some(failure) =
+                if let Some(failure) = source_topology_preflight_failure(&e, &worker.id) {
+                    let summary = format!("[RCH] {failure}");
+                    reporter.summary_critical(&summary);
+                    RetryableRemoteFault {
+                        log_reason: "source topology incompatible".to_string(),
+                        failed_worker: worker.id.clone(),
+                        on_exhaust: RemoteFaultExhaustAction::RefuseSourceTopology { summary },
+                    }
+                } else if let Some(failure) =
                     e.downcast_ref::<crate::transfer::RemoteBuildDiskBudgetExceeded>()
                 {
                     // Only a confirmed pre-start refusal reaches this branch.
@@ -6219,8 +6339,8 @@ pub async fn run_exec(
             .ensure_released_for_retry()
             .context(crate::transfer::RemoteExecutionUnconfirmed)?;
         // Worker-fault failure: try a bigger/different worker before going terminal.
-        if attempt < max_attempts
-            && let Some((next_response, next_worker)) = try_retry_on_bigger_worker(
+        let retry_selection = if attempt < max_attempts {
+            try_retry_on_bigger_worker(
                 &config.general.socket_path,
                 &selection_project,
                 estimated_cores,
@@ -6233,28 +6353,95 @@ pub async fn run_exec(
                 &preferred_workers,
                 classification.kind == Some(CompilationKind::Job),
                 &required_tools,
+                &source_topology,
                 &durable_lease,
                 release_acknowledged,
                 &reporter,
             )
             .await?
-        {
-            attempt += 1;
-            warn!(
-                "Remote build {} on {}; retrying on higher-capacity worker {} (attempt {}/{})",
-                fault.log_reason, fault.failed_worker, next_worker, attempt, max_attempts
-            );
-            reporter.summary(&format!(
-                "[RCH] retry on bigger worker {} (attempt {}/{}) after {} on {}",
-                next_worker, attempt, max_attempts, fault.log_reason, fault.failed_worker
-            ));
-            current_query_preferred = vec![next_worker];
-            response = next_response;
-            continue;
+        } else {
+            RetryWorkerSelection::Exhausted
+        };
+        match retry_selection {
+            RetryWorkerSelection::Selected {
+                response: next_response,
+                worker_id: next_worker,
+            } => {
+                attempt += 1;
+                warn!(
+                    "Remote build {} on {}; retrying on higher-capacity worker {} (attempt {}/{})",
+                    fault.log_reason, fault.failed_worker, next_worker, attempt, max_attempts
+                );
+                reporter.summary(&format!(
+                    "[RCH] retry on bigger worker {} (attempt {}/{}) after {} on {}",
+                    next_worker, attempt, max_attempts, fault.log_reason, fault.failed_worker
+                ));
+                current_query_preferred = vec![next_worker];
+                response = *next_response;
+                continue;
+            }
+            RetryWorkerSelection::TemporarilyUnavailable { worker_ids }
+                if matches!(
+                    &fault.on_exhaust,
+                    RemoteFaultExhaustAction::RefuseSourceTopology { .. }
+                ) =>
+            {
+                durable_lease.acknowledge_terminal()?;
+                let workers = worker_ids
+                    .iter()
+                    .map(WorkerId::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                reporter.summary_critical(&format!(
+                    "[RCH] incompatible worker {} remains excluded for this mapping; \
+                     other workers are temporarily busy ({workers}); remote admission is retryable",
+                    fault.failed_worker
+                ));
+                emit_exec_envelope(&ExecResultEnvelope {
+                    api_version: "1.0",
+                    command: &remote_command,
+                    outcome: "refused",
+                    location: "remote",
+                    fallback_reason: Some("compatible_workers_busy"),
+                    worker_id: None,
+                    remote_exit_code: None,
+                    duration_ms: Some(exec_start.elapsed().as_millis() as u64),
+                    timing: exec_timing.as_ref(),
+                    result_dirs: exec_dir_stats.as_deref(),
+                    error_code: None,
+                    admission: None,
+                });
+                std::process::exit(EXIT_REMOTE_REQUIRED_REFUSED);
+            }
+            RetryWorkerSelection::TemporarilyUnavailable { .. }
+            | RetryWorkerSelection::Exhausted => {}
         }
 
         // Retries exhausted (or no bigger worker available): terminal action.
         match fault.on_exhaust {
+            RemoteFaultExhaustAction::RefuseSourceTopology { summary } => {
+                reporter.summary_critical(&summary);
+                durable_lease.acknowledge_terminal()?;
+                emit_exec_envelope(&ExecResultEnvelope {
+                    api_version: "1.0",
+                    command: &remote_command,
+                    outcome: "refused",
+                    location: "remote",
+                    fallback_reason: Some("source_topology_incompatible"),
+                    worker_id: Some(fault.failed_worker.as_str()),
+                    remote_exit_code: None,
+                    duration_ms: Some(exec_start.elapsed().as_millis() as u64),
+                    timing: exec_timing.as_ref(),
+                    result_dirs: exec_dir_stats.as_deref(),
+                    error_code: Some("RCH_SOURCE_TOPOLOGY_INCOMPATIBLE"),
+                    admission: durable_lease.machine_admission_reference(
+                        &wrapper_id,
+                        remote_build_id,
+                        &fault.failed_worker,
+                    )?,
+                });
+                std::process::exit(EXIT_BUILD_ERROR);
+            }
             RemoteFaultExhaustAction::ExitWithCode {
                 code,
                 summary,
@@ -6944,6 +7131,10 @@ async fn handle_selection_response(
         reporter.summary("[RCH] cancelled before remote admission");
         return HookOutput::allow_with_modified_command("exit 130".to_owned());
     }
+    if let Some(summary) = source_topology_selection_refusal(&response) {
+        reporter.summary_critical(&summary);
+        return HookOutput::allow_with_modified_command(format!("exit {EXIT_BUILD_ERROR}"));
+    }
     // Check if a worker was assigned
     let Some(worker) = response.worker else {
         // No worker available - graceful fallback to local execution
@@ -7340,6 +7531,11 @@ async fn handle_selection_response(
                     "exit {}",
                     EXIT_BUILD_ERROR
                 ));
+            }
+
+            if let Some(failure) = source_topology_preflight_failure(&e, &worker.id) {
+                reporter.summary_critical(&format!("[RCH] {failure}"));
+                return HookOutput::allow_with_modified_command(format!("exit {EXIT_BUILD_ERROR}"));
             }
 
             // Pipeline failed - fall back to local execution
