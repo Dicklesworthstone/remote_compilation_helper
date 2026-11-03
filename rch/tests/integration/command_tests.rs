@@ -246,8 +246,8 @@ mod source_topology_cli {
                         }
                         state.releases.push(serde_json::to_value(query).unwrap());
                         json!({"status": "ok"})
-                    } else if route.starts_with("GET /builds/") {
-                        let id = route["GET /builds/".len()..]
+                    } else if let Some(build_route) = route.strip_prefix("GET /builds/") {
+                        let id = build_route
                             .split('?')
                             .next()
                             .unwrap()
