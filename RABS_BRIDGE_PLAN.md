@@ -2,6 +2,35 @@
 
 ## Reality check and execution order — updated November 3, 2026
 
+**Active recovery qualification, November3 at20:01UTC:** native DSR
+`rch_recovery_combined` is running sourcee3c8c584, exactly the qualified7bfb
+1694-file snapshot plus four explicit recovery/supervisor files. The direct
+native same-invocation lifecycle comparison now records incumbent raw1/13.268s
+with `RCH_PROCESS_HEALTH_DEADLINE`, candidate raw0/16.657s with the exact healthy
+sentinel and empty stderr. This is a functional repair, NOT a latency win or
+compiled/public-route proof. Requested LinuxV1 KILL now reaches the existing
+birth/namespace-fenced signal helper before a slow global census; full
+post-signal emptiness proof and bounded rechecking remain required. TERM/V2,
+unknown/damaged-record refusals and original5s/30s/120s budgets are unchanged.
+
+- [x] Inventory-only corrected source0c11 completed capability33/33, recovery59/59,
+  normal RCH client/daemon and full workspace check/strictClippy/fmt, all raw0;
+  all1694 source/incoming before/after audits match. DSR target completed0 and
+  collected artifacts, but its outer wrapper was interrupted while superseding
+  it, so aggregate state `targets-complete` is not called a complete DSR pass.
+- [x] Capture the independent lifecycle failure on the actual worker PATH/TMPDIR;
+  retain the real exit0 payload receipt plus deadline failure. Run incumbent and
+  repaired production shell sources in the SAME native DSR invocation, unchanged
+  deadlines; retain both outcomes. No quarantine record was cleared.
+- [ ] Finish combined native27 real-process cases (including stronger real-census
+  ordering), compiled protocol3, prelisted capability33/recovery59, both normal
+  tools, full workspace QA and DSR collection. Driver and source are frozen.
+- [ ] Require the compiled daemon to recover the original quarantine through its
+  real consecutive probes and canary, then complete stock plus all four public
+  cache rounds with acknowledged exact-build metadata evidence. No Cargo has run
+  in this combined attempt. Shared TRJ is enabled; private pool is stopped and
+  active[]/queued[]. Reserve it only after fresh supported idle/drain evidence.
+
 **Public-route blocker and next repair, November3 at18:58UTC:** DSRa788d108
 finished FAILED6 before Cargo. Storage/config/SSH probe pass and truthful Rust
 capabilities publish, but the private daemon retains the original RCH-I004
@@ -13,7 +42,7 @@ cleared/changed. Private daemon326607 stopped0/PIDabsent, active[]/queued[] and
 unchanged fixtures; shared TRJ restored and independently healthy/used0.
 
 - [x] Isolate the actual capability-stage failure from the later lifecycle gate.
-- [ ] Qualify corrected source0c11a7ab: generic component-aware admission remains complete
+- [x] Qualify corrected source0c11a7ab: generic component-aware admission remains complete
   by default; recovery skips only component inventory its predicates do not
   consume. All SSH/protocol/target/toolchain/disk/load/telemetry/lifecycle/canary
   gates,25s/120s budgets and durable quarantine remain unchanged. New regression
@@ -24,8 +53,9 @@ unchanged fixtures; shared TRJ restored and independently healthy/used0.
   then failed recovery test compilation (E0609: my extra `.rust` in a new
   test field access). Failed source/audits/receipt retained. Only that access
   is corrected; all assertions and production changes remain. Corrected native
-  DSRrch_recovery_components_field is running the same whole qualification.
-  Recovery body, normal binaries and full workspace QA remain pending.
+  DSRrch_recovery_components_field completed the same whole native qualification.
+  Recovery59/59, normal binaries and full workspace QA passed; aggregate wrapper
+  settlement is qualified separately above.
   UBS candidate/baseline both
   retain the same5 critical shell-in-test findings/raw1; no suppression.
 - [x] Observe incumbent and component-free command experiment in the SAME native
@@ -51,7 +81,7 @@ build0/464.54s and their actual CLI smokes0; full workspace/all-target
 check0/672.92s, strictClippy0/660.27s and fmt0/17.86s. All1694 source/incoming
 before/after audits match; native overall0. Report18522B
 SHA98873a86344dde45b0732daf2571390b33185ecbea1499d22088f34a1f50af83.
-DSR collection remains pending. Peer cfd81d0a contains the exact tested timer bytes.
+DSR0b17d24a finished SUCCESS and collected both binaries. Peer cfd81d0a contains the exact tested timer bytes.
 The corrected driver exports BOTH binaries to DSR.
 Shared TRJ entered supported drain at18:02, independently observed draining
 with peer build30093284437131371 still holding six of eight slots. No peer
@@ -133,7 +163,7 @@ Current highest-value TODO, in execution order:
   ownership of completed timer futures, repeated predeadline polling and a
   same-poll clock-crossing assertion, plus manual fixture formatting.
   Its native continuation passed all162 test bodies, normal RCH rebuild and
-  full workspace QA as above. Complete DSR collection is still pending.
+  full workspace QA as above. DSR0b17d24a finished SUCCESS with both artifacts.
 - [x] Run original full-SDK TRJ compiler consumer with3f7 shipping tools.
   DSRrabs_tls_nodelay_trj_runtime started14:33:09UTC, original300s Cargo/600s
   helper, full installed SDK and original byte-bound older harness. Prior0fb
