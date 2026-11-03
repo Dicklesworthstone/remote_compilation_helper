@@ -2570,6 +2570,29 @@ real Cargo serving, fleet performance or release qualification.
   - [ ] Finish candidate workspace check, strict Clippy, fmt and both source
     audits. Combine only supported changes with the corrected capture fixture
     in a subsequent source-bound qualification; never edit an active frozen cut.
+    - [x] Candidate wrapper/harness build0,874.474s; trace-off/on smokes0/0.
+      Wrapper14,832,320 bytes, SHA-256
+      `be6bac66b7d38267d483bad00a3f93b9c6526c923a8a15aad285718912a97603`.
+      Actual wrapper units106passed/1failed/0ignored; new byte-bound controls
+      pass, original8MiB capture fixture still fails. No green aggregate.
+    - [x] Finish all four predeclared comparison attempts, all raw101.
+      Both incumbent attempts refuse before a daemon starts: my manifest
+      incorrectly names a private wrapper copy instead of this harness's
+      exact Cargo-built path. These are setup refusals, not incumbent product
+      failures. Do not weaken the existing path/hash/source guard to admit them.
+    - [x] Observe both actual candidate Cargo cases fail: first refuses
+      toolchain identity after the original shared10s probe deadline expires;
+      second fails original2s compiler-group quiescence for side and leaf.
+      Candidate runtime0/2; incumbent runtime unrun0/2. This is no valid
+      comparative speed/reliability result and no repair of the original miss.
+    - [x] Reject b362 as a repair and manually restore only its production
+      read_stat_path hunk02:01UTC. Keep the useful byte-bound regression test,
+      original guards, all immutable source/binary/log receipts and queued QA.
+      No file deletion, active-input mutation, timeout increase or history edit.
+    - [ ] Diagnose actual toolchain-probe/group-census cost and original
+      missing-verification cause. Future comparisons must use each compiled
+      harness's exact Cargo wrapper path and validate it before spending on
+      runtime cases; never manufacture a matching source label for a copy.
   - [ ] Finish the original three canonical service/worker cases. The worker
     build currently changes the transitive feature union and recompiles
     Asupersync; normal Cargo freshness decides reuse. No forced-Fresh metadata,
