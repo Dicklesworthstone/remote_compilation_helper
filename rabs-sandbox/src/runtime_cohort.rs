@@ -211,6 +211,26 @@ impl RetainedRuntime {
             ))
         }
     }
+
+    /// Launch strict namespaces through the compiler's measured ELF interpreter.
+    /// Glibc otherwise needs /proc/self/exe to resolve the main ELF's $ORIGIN.
+    /// This preserves the exact environment and keeps procfs outside that view.
+    pub(crate) fn append_interpreter(
+        &self,
+        args: &mut Vec<OsString>,
+    ) -> Result<(), RuntimeCohortError> {
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.append_interpreter(args)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = args;
+            Err(RuntimeCohortError::Unsupported(
+                "Linux ELF runtime required",
+            ))
+        }
+    }
 }
 
 /// Measure and retain the selected ELF runtime in a new private child.
@@ -267,7 +287,7 @@ mod linux {
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::fs::{self, File, FileTimes, OpenOptions};
-    use std::io::{Read, Write};
+    use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::path::Component;
     use std::process::{Command, Stdio};
@@ -505,6 +525,7 @@ mod linux {
     #[derive(Default)]
     struct RuntimeTree {
         entries: BTreeMap<PathBuf, RuntimeEntry>,
+        interpreter: Option<PathBuf>,
     }
 
     impl RuntimeTree {
@@ -628,6 +649,19 @@ mod linux {
     }
 
     impl RuntimeSnapshot {
+        pub(super) fn append_interpreter(
+            &self,
+            args: &mut Vec<OsString>,
+        ) -> Result<(), RuntimeCohortError> {
+            let interpreter = self
+                .tree
+                .interpreter
+                .as_ref()
+                .ok_or_else(|| invalid("runtime lacks its measured ELF interpreter"))?;
+            args.push(interpreter.as_os_str().to_owned());
+            Ok(())
+        }
+
         pub(super) fn verify(
             &self,
             cancelled: &dyn Fn() -> bool,
@@ -800,6 +834,65 @@ mod linux {
             search.push(path.clone());
         }
         Ok(search)
+    }
+
+    fn elf_interpreter(file: &mut File) -> Result<PathBuf, RuntimeCohortError> {
+        let size = file.metadata()?.len();
+        let mut header = [0_u8; 64];
+        file.rewind()?;
+        file.read_exact(&mut header)?;
+        if &header[..7] != b"\x7fELF\x02\x01\x01" {
+            return Err(invalid("runtime requires a little-endian ELF64 compiler"));
+        }
+        let table = u64::from_le_bytes(header[32..40].try_into().unwrap());
+        let width = u16::from_le_bytes(header[54..56].try_into().unwrap());
+        let count = u16::from_le_bytes(header[56..58].try_into().unwrap());
+        if width != 56
+            || !(1..=128).contains(&count)
+            || table < 64
+            || table
+                .checked_add(u64::from(width) * u64::from(count))
+                .is_none_or(|end| end > size)
+        {
+            return Err(invalid("invalid or excessive ELF program header table"));
+        }
+        let mut interpreter = None;
+        for index in 0..count {
+            file.seek(SeekFrom::Start(table + u64::from(index) * 56))?;
+            let mut program = [0_u8; 56];
+            file.read_exact(&mut program)?;
+            if u32::from_le_bytes(program[..4].try_into().unwrap()) != 3 {
+                continue;
+            }
+            let offset = u64::from_le_bytes(program[8..16].try_into().unwrap());
+            let bytes = u64::from_le_bytes(program[32..40].try_into().unwrap());
+            if interpreter.is_some()
+                || !(2..=4096).contains(&bytes)
+                || offset.checked_add(bytes).is_none_or(|end| end > size)
+            {
+                return Err(invalid("invalid or duplicate ELF interpreter"));
+            }
+            file.seek(SeekFrom::Start(offset))?;
+            let mut path = vec![0_u8; usize::try_from(bytes).unwrap()];
+            file.read_exact(&mut path)?;
+            if path.pop() != Some(0) {
+                return Err(invalid("ELF interpreter lacks its terminator"));
+            }
+            let path =
+                std::str::from_utf8(&path).map_err(|_| invalid("ELF interpreter is not UTF-8"))?;
+            if !path.starts_with('/')
+                || path[1..]
+                    .split('/')
+                    .any(|part| part.is_empty() || matches!(part, "." | ".."))
+                || path
+                    .bytes()
+                    .any(|byte| byte == 0 || byte.is_ascii_whitespace())
+            {
+                return Err(invalid("ELF interpreter is not a normalized absolute path"));
+            }
+            interpreter = Some(PathBuf::from(path));
+        }
+        interpreter.ok_or_else(|| invalid("compiler has no ELF interpreter"))
     }
 
     fn probe_targets(compiler: &Path, root: &Path) -> Result<Vec<PathBuf>, RuntimeCohortError> {
@@ -1732,6 +1825,7 @@ mod linux {
                 "compiler is not an ELF binary",
             ));
         }
+        let interpreter = elf_interpreter(&mut executable)?;
         let preload =
             OptionalFile::read(Path::new("/etc/ld.so.preload"), MAX_PROBE_BYTES, cancelled)?;
         if preload.bytes.iter().any(|byte| !byte.is_ascii_whitespace()) {
@@ -1751,6 +1845,15 @@ mod linux {
         let search = validated_search_paths(loader_search_paths)?;
         let targets = probe_targets(&compiler, &root)?;
         let libraries = libraries(&probe(&targets, &search)?, Some(&root))?;
+        if !libraries
+            .iter()
+            .any(|library| Path::new(&library.name) == interpreter && library.path == interpreter)
+        {
+            return Err(invalid(
+                "ELF interpreter is absent from the measured runtime",
+            ));
+        }
+        measurement.tree.interpreter = Some(interpreter.clone());
         check_cancelled(cancelled)?;
         preload.verify()?;
         cache.verify()?;
@@ -1776,6 +1879,9 @@ mod linux {
         records.sort();
         let mut observed = Vec::new();
         append(&mut observed, b"elf-host-cohort-v2");
+        // Changing launch semantics must not reuse a previously qualified key.
+        append(&mut observed, b"explicit-elf-interpreter-v1");
+        append(&mut observed, interpreter.as_os_str().as_encoded_bytes());
         for record in records {
             append(&mut observed, &record);
         }
@@ -1862,6 +1968,56 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn elf_interpreter_refuses_malformed_tables_and_paths() {
+            let owner = tempfile::tempdir().unwrap();
+            let path = owner.path().join("compiler");
+            let valid = |name: &[u8]| {
+                let mut bytes = vec![0_u8; 120];
+                bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+                bytes[32..40].copy_from_slice(&64_u64.to_le_bytes());
+                bytes[54..56].copy_from_slice(&56_u16.to_le_bytes());
+                bytes[56..58].copy_from_slice(&1_u16.to_le_bytes());
+                bytes[64..68].copy_from_slice(&3_u32.to_le_bytes());
+                bytes[72..80].copy_from_slice(&120_u64.to_le_bytes());
+                bytes[96..104].copy_from_slice(&(name.len() as u64).to_le_bytes());
+                bytes.extend_from_slice(name);
+                bytes
+            };
+            let good = valid(b"/lib64/ld-linux-x86-64.so.2\0");
+            fs::write(&path, &good).unwrap();
+            assert_eq!(
+                elf_interpreter(&mut File::open(&path).unwrap()).unwrap(),
+                Path::new("/lib64/ld-linux-x86-64.so.2")
+            );
+            let mut bad_header = good.clone();
+            bad_header[4] = 1;
+            let mut overflow = good.clone();
+            overflow[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
+            let mut excessive = good.clone();
+            excessive[56..58].copy_from_slice(&129_u16.to_le_bytes());
+            let mut duplicate = good[..120].to_vec();
+            duplicate[56..58].copy_from_slice(&2_u16.to_le_bytes());
+            duplicate[72..80].copy_from_slice(&176_u64.to_le_bytes());
+            duplicate.extend_from_within(64..120);
+            duplicate.extend_from_slice(&good[120..]);
+            for bytes in [
+                bad_header,
+                overflow,
+                excessive,
+                duplicate,
+                good[..good.len() - 1].to_vec(),
+                valid(b"relative/loader\0"),
+                valid(b"/lib/../loader\0"),
+                valid(b"/lib//loader\0"),
+                valid(b"/lib/loader"),
+                valid(b"/lib/loader\0extra\0"),
+            ] {
+                fs::write(&path, bytes).unwrap();
+                assert!(elf_interpreter(&mut File::open(&path).unwrap()).is_err());
+            }
+        }
 
         #[test]
         fn loader_addresses_are_ignored_but_unresolved_and_relative_paths_are_refused() {

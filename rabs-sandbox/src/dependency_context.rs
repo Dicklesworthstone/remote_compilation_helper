@@ -1477,7 +1477,15 @@ fn build_dependency_argv_with_package_anchor(
     push_binds(&mut argv, &ro, &rw);
     output_inputs.sort_by(|left, right| left.visible.cmp(&right.visible));
     push_binds(&mut argv, &output_inputs, &[]);
-    argv.extend(["--chdir", context.cwd.as_str(), "--", program].map(OsString::from));
+    argv.extend(["--chdir", context.cwd.as_str(), "--"].map(OsString::from));
+    if context.execution_mode() != DependencyExecutionMode::Metadata {
+        runtime
+            .append_interpreter(&mut argv)
+            .map_err(|error| IsolationError::InvalidSpec {
+                reason: format!("retained dependency interpreter cannot be launched: {error}"),
+            })?;
+    }
+    argv.push(OsString::from(program));
     argv.extend(args.iter().map(OsString::from));
     Ok(NamespaceLaunch {
         argv,
@@ -1500,6 +1508,16 @@ fn build_dependency_argv_with_package_anchor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    fn private_runtime_owner() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap()
+    }
 
     #[test]
     fn dependency_execution_host_keeps_native_isa_separate_from_compiler_libc() {
@@ -2775,7 +2793,7 @@ mod tests {
             spec: &mut CanonicalNamespaceSpec,
             executable: &Path,
         ) -> Self {
-            let root = tempfile::tempdir().unwrap();
+            let root = private_runtime_owner();
             let toolchain = root.path().join("toolchain");
             std::fs::create_dir_all(toolchain.join("bin")).unwrap();
             std::fs::create_dir(toolchain.join("lib")).unwrap();
@@ -3424,7 +3442,7 @@ mod tests {
                 .expect("set RABS_TEST_TOOLCHAIN_ROOT to the installed toolchain root"),
         );
         assert!(toolchain.is_absolute());
-        let owner = tempfile::tempdir().unwrap();
+        let owner = private_runtime_owner();
         let source = owner.path().join("source");
         let output = owner.path().join("output");
         for directory in [&source, &output] {
@@ -3527,7 +3545,7 @@ mod tests {
         let mode = DependencyExecutionMode::ClosedMetadata;
         let support = DependencyIsolationSupport::probe(mode);
         assert!(support.is_supported(), "{support:?}");
-        let owner = tempfile::tempdir().unwrap();
+        let owner = private_runtime_owner();
         let source = owner.path().join("package");
         let output = owner.path().join("output");
         let home = owner.path().join("home");
@@ -3680,7 +3698,7 @@ mod tests {
     #[test]
     #[ignore = "requires bubblewrap and RABS_TEST_TOOLCHAIN_ROOT naming an installed rustc toolchain"]
     fn real_rustc_archive_view_closes_assembler_inputs_missing_from_dep_info() {
-        assert_real_archive_view_closes_assembler_inputs(false);
+        assert_real_archive_view_closes_assembler_inputs(false, false);
     }
 
     #[cfg(target_os = "linux")]
@@ -3694,7 +3712,7 @@ mod tests {
         assert!(toolchain.is_absolute());
         let support = DependencyIsolationSupport::probe(DependencyExecutionMode::Metadata);
         assert!(support.is_supported(), "{support:?}");
-        let owner = tempfile::tempdir().unwrap();
+        let owner = private_runtime_owner();
         let source = owner.path().join("bundle/package");
         let output = owner.path().join("outputs");
         let home = owner.path().join("home");
@@ -3855,11 +3873,18 @@ mod tests {
     #[test]
     #[ignore = "requires bubblewrap and RABS_TEST_TOOLCHAIN_ROOT naming an installed rustc toolchain"]
     fn real_canonical_rustc_archive_view_closes_assembler_inputs_missing_from_dep_info() {
-        assert_real_archive_view_closes_assembler_inputs(true);
+        assert_real_archive_view_closes_assembler_inputs(true, false);
     }
 
     #[cfg(target_os = "linux")]
-    fn assert_real_archive_view_closes_assembler_inputs(canonical: bool) {
+    #[test]
+    #[ignore = "requires bubblewrap and RABS_TEST_TOOLCHAIN_ROOT; real compiler RPATH loading without procfs or LD_LIBRARY_PATH"]
+    fn real_canonical_archive_uses_elf_interpreter_without_loader_environment_or_procfs() {
+        assert_real_archive_view_closes_assembler_inputs(true, true);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_real_archive_view_closes_assembler_inputs(canonical: bool, rpath_only: bool) {
         let toolchain = PathBuf::from(
             std::env::var_os("RABS_TEST_TOOLCHAIN_ROOT")
                 .expect("set RABS_TEST_TOOLCHAIN_ROOT to the installed toolchain root"),
@@ -3867,7 +3892,7 @@ mod tests {
         assert!(toolchain.is_absolute());
         let support = DependencyIsolationSupport::probe(DependencyExecutionMode::Rlib);
         assert!(support.is_supported(), "{support:?}");
-        let owner = tempfile::tempdir().unwrap();
+        let owner = private_runtime_owner();
         let source = owner.path().join("source");
         let output = owner.path().join("output");
         let home = owner.path().join("home");
@@ -3879,15 +3904,32 @@ mod tests {
         std::fs::write(source.join("payload.bin"), marker).unwrap();
         let host_only = owner.path().join("host-only.bin");
         std::fs::write(&host_only, b"unkeyed-host-input").unwrap();
+        let search = if rpath_only {
+            Vec::new()
+        } else {
+            vec![toolchain.join("lib")]
+        };
         let runtime = crate::runtime_cohort::retain_runtime_cohort(
             &toolchain.join("bin/rustc"),
             &toolchain,
-            &[toolchain.join("lib")],
+            &search,
             &output,
             owner.path(),
             || false,
         )
         .unwrap();
+        let loader_env = if rpath_only {
+            Vec::new()
+        } else {
+            vec![(
+                "LD_LIBRARY_PATH".into(),
+                if canonical {
+                    "/__rabs/toolchain/lib".into()
+                } else {
+                    "/toolchains/pinned/lib".into()
+                },
+            )]
+        };
         let context = if canonical {
             DependencyExecContext::new_canonical_cargo(
                 DependencyExecutionMode::Rlib,
@@ -3901,8 +3943,10 @@ mod tests {
                     ("HOME".into(), layout::HOME.into()),
                     ("CARGO_HOME".into(), layout::CARGO_HOME.into()),
                     ("CARGO_MANIFEST_DIR".into(), CANONICAL_SOURCE.into()),
-                    ("LD_LIBRARY_PATH".into(), "/__rabs/toolchain/lib".into()),
-                ],
+                ]
+                .into_iter()
+                .chain(loader_env)
+                .collect(),
                 runtime.cohort().bytes,
             )
             .unwrap()
@@ -3914,7 +3958,7 @@ mod tests {
                 "/toolchains/pinned/bin/rustc".into(),
                 "/target/output".into(),
                 Vec::new(),
-                vec![("LD_LIBRARY_PATH".into(), "/toolchains/pinned/lib".into())],
+                loader_env,
                 runtime.cohort().bytes,
             )
             .unwrap()
@@ -3924,6 +3968,9 @@ mod tests {
         let spec = context
             .namespace(&source, &toolchain, &output, &empty, &home)
             .unwrap();
+        if rpath_only {
+            assert!(!spec.env.iter().any(|(name, _)| name == "LD_LIBRARY_PATH"));
+        }
         let compile = |path: &str, name: &str| {
             // LLVM's assembler reads .incbin itself. Rustc's dep-info does not
             // list this file, so success must depend on the enforced view.
@@ -3981,6 +4028,7 @@ mod tests {
         );
         for (index, denied) in [
             host_only.to_str().unwrap(),
+            "/proc/self/exe",
             "/proc/version",
             "/proc/sys/kernel/random/uuid",
             "/dev/urandom",
@@ -4032,7 +4080,7 @@ mod tests {
         let support = DependencyIsolationSupport::probe(DependencyExecutionMode::Rlib);
         assert!(support.is_supported(), "{support:?}");
         for workspace in [false, true] {
-            let owner = tempfile::tempdir().unwrap();
+            let owner = private_runtime_owner();
             let source = owner.path().join("bundle/package");
             let generated = owner.path().join(if foreign {
                 "bundle/native/0000/native"
