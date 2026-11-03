@@ -2485,6 +2485,22 @@ real Cargo serving, fleet performance or release qualification.
     detached coordinator19571. Immutable9,989-byte driver SHA-256
     `e18c64eeee1abb2e7333ef55ba0a95958e8ac831b0ff4549c4def6768c33a6c7`.
     New isolated development target; original active tools are untouched.
+  - [x] Retain diagnostic DSR `4b0f0c26-2899-4857-afbf-782829c6a20e`
+    attempt1 as failed before compilation: the source audit catches missing
+    Cargo.lock and three tracked-but-ignored inputs. My isolated
+    `clone --no-checkout` left no index, so source sync treated those paths as
+    ignored. Populate only that private clone's index with `git read-tree HEAD`;
+    all1,755 source bytes/sizes/executable bits stay unchanged. No source-audit
+    exclusion or assertion is relaxed. The blocked dynamic Git inspection was
+    replaced by explicit read-only Git commands; no guard override was used.
+  - [x] Resume the same diagnostic run01:01:26UTC, coordinator11638, with
+    separate `job-wrapper-trace-20261103-source-complete` outputs and immutable
+   10,166-byte driver
+    `e231fe182d5da1e52b820768804f7e9efa80b8197dd770e241c0f7c74f3baad2`.
+    Full actual execution-source audit passes1,697/1,755 plus58 declared
+    exclusions, zero differences; four storage guards0. Wrapper/harness are
+    actually compiling. All three diagnostic trials and required QA remain
+    pending. Failed source audits are now saved before asserting.
   - [ ] Compile the diagnostic wrapper and harness; check trace-off silence
     and trace-on missing-daemon stderr with real executables. Reuse only the
     explicitly named source272 daemon bytes, not a claimed matching new toolset.
@@ -2495,6 +2511,65 @@ real Cargo serving, fleet performance or release qualification.
   - [ ] Run wrapper unit tests, workspace all-target check, strict Clippy,
     fmt and source-after audit for the diagnostic cut. These are pending;
     the local formatting result is not compiler or runtime qualification.
+    - [x] Compile diagnostic wrapper/harness: Cargo0,471.196s. Actual trace-off
+      executable smoke0 with empty stdout/stderr; trace-on0 emits the expected
+      missing-daemon diagnostic on stderr only. Wrapper SHA-256
+      `f9201963a1b363fbd8f19706511cce5608d6a74f2dd915c36d3949dd55ba6820`,
+     14,824,208 bytes; harness
+      `ecd75ffab3c774ef922e51a629bf634d6cc18c6502f28a3fa3fdacd4918fc6ca`.
+    - [x] Complete all three declared diagnostic trials: **2 pass,1 fail**,
+      raw101/0/0. First fails during cold leaf execution because compiler
+      group quiescence is not confirmed before its unchanged2s deadline;
+     0passed/1failed at147.87s. Its daemon log is retained, SHA-256
+      `5b61440e74e48f7d10ed4fea71634bf25b91fc6f65798a014bdfdc254220fd8e`.
+      This is distinct from the original Cargo-success/missing-verification
+      failure; do not silently assign both to the same cause.
+    - [x] Finish original wrapper units: **105 passed,1 failed,0 ignored**,
+      raw101,8.31s. The backpressured completion-report cancellation case
+      receives a complete report. All original assertions are retained.
+    - [x] Measure the fixture's actual host socket: SO_SNDBUF16,777,216 bytes,
+     16,399,104 queued before WouldBlock; the old8,388,608-byte report fits.
+      This explains a defective backpressure premise, not a failed production
+      publication/ACK fence. Existing caller-loss and receipt controls remain.
+    - [x] Prepare a fixture-only correction in capture.rs: measure/drain the
+      actual pair before the test, bound that probe to64MiB, then exceed its
+      observed capacity (at least the original8MiB). Keep every partial-report,
+      no-newline, caller-loss and5s/10s assertion/deadline. Local fmt0.
+    - [ ] Compile and execute that corrected fixture with the original
+      cancellation/receipt negatives; publish the admit/reject split. It is
+      absent from the already frozen diagnostic and bounded-read cuts, and
+      remains unqualified until included in a new source-bound validation.
+    - [ ] Finish diagnostic workspace check, strict Clippy, fmt and source-after.
+      Unit/trial failures remain red even if those later commands pass.
+  - [x] Prepare a bounded-read production candidate for the observed compiler
+    census timeout: fixed8,193-byte stack buffer instead of a growing Vec,
+    retaining exact8,192-byte maximum, EINTR handling, PID/start/parent/group
+    checks, complete enumeration, two independent sweeps and the original2s
+    deadline. Add exact-bound, overflow, wrong-PID and empty-file controls;
+    local fmt0. This is a candidate, not an established fix or speed win.
+  - [x] Freeze the one-file change relative to trace9872:
+    `85dc06ed-overlay-9872-supervisor-stat-buffer-b36202608a058b5c6a3f128ef2d9f08c321cc095060a499489c16601e09f8045`,
+    full1,755-file audit twice, manifest
+    `91b8ec081b3cbd131da913cc3e0c82a9e344982008ab99f99841058e31429888`.
+    New clone index is populated before transfer. DSR tool
+    `rabs_supervisor_stat_buffer`, version2.1.34-rabsstat.b3620260,
+    coordinator31244 submitted01:25:52UTC. Immutable12,773-byte driver
+    `0e481b21f8e950ac964cda04209176069182dd77805ccccb1ed699a4c28d3583`.
+    Actual execution audit1,697/1,755 plus58 exclusions,0diff; four storage
+    checks0. New isolated target is compiling; active earlier targets untouched.
+  - [ ] Compile and run all bounded-read wrapper units, including the added
+    byte-bound controls. The frozen cut still includes the old8MiB capture
+    fixture; any such failure must remain separate and red.
+  - [ ] Run one fixed-order incumbent/candidate/candidate/incumbent comparison:
+    two fresh original vendored cases per arm, original assertions, exact
+    private executable copies, each arm's real source-root/harness binding,
+    same unchanged source272 daemon. Retain every raw outcome, elapsed time
+    and owned daemon log. Any candidate quiescence failure rejects this as a
+    repair. No claim that this diagnoses the original missing action, proves
+    sustained reliability, or qualifies throughput/release/fleet performance.
+  - [ ] Finish candidate workspace check, strict Clippy, fmt and both source
+    audits. Combine only supported changes with the corrected capture fixture
+    in a subsequent source-bound qualification; never edit an active frozen cut.
   - [ ] Finish the original three canonical service/worker cases. The worker
     build currently changes the transitive feature union and recompiles
     Asupersync; normal Cargo freshness decides reuse. No forced-Fresh metadata,
@@ -2661,7 +2736,7 @@ real Cargo serving, fleet performance or release qualification.
   CARGO_HOME, toolchain selection and all configuration refusals remain ahead
   of installed launcher/Cargo execution. Default/unsupported commands retain
   existing behavior; existing bootstrap owns lifecycle, fallback and authority.
-- [x] Add a focused compiled Linux regression covering ordinary, clean-overlay
+- [x] Add a focused Linux regression for native compilation, covering ordinary, clean-overlay
   and owned-source paths. Explicit routing fixtures require preparation once,
   Cargo once with exact argv/stdout, and nonzero37 propagation. They exercise
   the real bootstrap/processes but are NOT real RABS daemon/cache evidence.
@@ -2678,17 +2753,38 @@ real Cargo serving, fleet performance or release qualification.
   all-target check, strict Clippy and fmt, then builds rch. One Cargo job,
   declared10,800s orchestration, original storage/product/test gates unchanged.
   First failure stops the chain; later unrun commands must remain unrun.
-  Actual run50520372-7a9f-4824-a0d4-0c9931f4d1dc is managedrunning.
+  Actual run50520372-7a9f-4824-a0d4-0c9931f4d1dc was managedrunning.
   Both native storage guards0; Cargo test is active on the owned target and
   retained private Cargo home. Independent synchronized-source audit during
   preparation matches1,697/1,755 plus58 exact policy omissions, zero diff.
   This audit is not retroactively called a pre-build check. Runtime result
   and required QA remain pending. A read-only observation finds Cargo in
   kernel wait; no lock-contention or scheduler-only cause is established.
+- [x] Observe attempt1 terminal timeout at the original host deadline:
+  target status timeout/exit5,10,924s including orchestration; aggregatefailed.
+  No unit test ran. Preserve terminal state/result, original recipe and native
+  log; this is neither a product assertion failure nor a successful build.
+- [x] Use the existing source-bound thread-aware process snapshot after
+  timeout:2,420 records, no member of native group244998, original Cargo247963
+  absent. This is original-group closure, not arbitrary system-wide cache
+  holder proof. Keep ordinary-development cache reuse distinct from strict
+  release admission.
+- [x] Resume the original DSR run01:08:44UTC, detached coordinator10465,
+  using the exact retained execution source and target. New immutable6,570-byte
+  driver `567841287d02a8aef5303a485fd57e1caadedb9bb72d19b1d1cbba6746d7444a`
+  repeats the group check and full retained/new-upload source audits, then the
+  same test and QA chain with the original product gates. Normal Cargo owns
+  artifact freshness; there is no forced Fresh or live deadline extension.
+- [ ] Observe routing, source-lock and config-guard test denominators; require
+  actual nonzero test counts as well as raw exits. Finish workspace check,
+  strict Clippy, fmt, rch build and both source-after audits. Retain the first
+  failure and mark later commands unrun. The inherited manifest description
+  still names an older two-file cut; its complete file map binds the actual
+  seven-file RCH overlay, and the descriptor text is not used as byte evidence.
 - [ ] Bind native source before/after and actual artifact identity. Then build
   the matching private Mac client through DSR and prove real public opt-in
   preparation with an actual installed private RABS toolset and real Cargo.
-  The currently compiling Mac1ade client repairs source framing only; it does
+  The retained compiled Mac1ade client repairs source framing only; it does
   not contain this later worker-cache wiring fix. Current RABS272 acceptance
   likewise excludes these seven later RCH edits. No combined-source claim.
   Further Mac builds on the image are held by the physical-admission gap

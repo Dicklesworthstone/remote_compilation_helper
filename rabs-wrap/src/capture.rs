@@ -458,7 +458,34 @@ mod tests {
     fn caller_loss_interrupts_a_backpressured_completion_report() {
         let owned = Arc::new(AtomicBool::new(true));
         let server_owned = Arc::clone(&owned);
-        let (client, mut server) = UnixStream::pair().unwrap();
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        // Do not assume the host's socket queue is smaller than 8 MiB. The
+        // real Linux run accepted the entire old report into a 16 MiB queue,
+        // so that fixture never exercised a backpressured write. Measure this
+        // exact pair, drain only the probe, then exceed its observed capacity.
+        client.set_nonblocking(true).unwrap();
+        let padding = [b'x'; 16 * 1024];
+        let mut queued = 0_usize;
+        loop {
+            match client.write(&padding) {
+                Ok(0) => panic!("socket capacity probe stopped accepting bytes"),
+                Ok(written) => queued += written,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("socket capacity probe failed: {error}"),
+            }
+            assert!(queued <= 64 * 1024 * 1024, "unbounded fixture socket queue");
+        }
+        assert!(queued > 0);
+        client.set_nonblocking(false).unwrap();
+        let mut remaining = queued;
+        let mut drained = [0; 16 * 1024];
+        while remaining > 0 {
+            let length = remaining.min(drained.len());
+            server.read_exact(&mut drained[..length]).unwrap();
+            assert!(drained[..length].iter().all(|byte| *byte == b'x'));
+            remaining -= length;
+        }
         let (release, released) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
             server
@@ -476,7 +503,11 @@ mod tests {
         });
         let report = format!(
             "{{\"kind\":\"rustc-complete\",\"padding\":\"{}\"}}\n",
-            "x".repeat(8 * 1024 * 1024)
+            "x".repeat((queued * 2).max(8 * 1024 * 1024))
+        );
+        eprintln!(
+            "capture backpressure fixture: queued {queued} bytes; report {} bytes",
+            report.len()
         );
         let mut client = session(client);
         let result = finish_with_budget(

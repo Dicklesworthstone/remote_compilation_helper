@@ -77,14 +77,24 @@ fn parse_stat(bytes: &[u8]) -> Option<Stat> {
 }
 
 fn read_stat_path(path: &Path, pid: u32) -> io::Result<Stat> {
-    let mut bytes = Vec::new();
-    std::fs::File::open(path)?
-        .take(8193)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > 8192 {
+    // A full group census reads thousands of small procfs records twice.
+    // Keep the exact byte bound, including its overflow byte, with one fixed
+    // buffer instead of growing a heap buffer for every process identity.
+    let mut bytes = [0_u8; 8193];
+    let mut length = 0;
+    let mut file = std::fs::File::open(path)?;
+    while length < bytes.len() {
+        match file.read(&mut bytes[length..]) {
+            Ok(0) => break,
+            Ok(read) => length += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    if length > 8192 {
         return Err(io::Error::other("oversized process identity"));
     }
-    parse_stat(&bytes)
+    parse_stat(&bytes[..length])
         .filter(|stat| stat.pid == pid)
         .ok_or_else(|| io::Error::other("invalid process identity"))
 }
@@ -563,6 +573,28 @@ mod tests {
         ] {
             assert!(parse_stat(&input).is_none());
         }
+    }
+
+    #[test]
+    fn stat_file_reads_keep_the_exact_bound_and_identity_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stat");
+        let mut bytes = stat(b"rustc", "Z", "456");
+        bytes.resize(8192, b' ');
+        std::fs::write(&path, &bytes).unwrap();
+        let record = read_stat_path(&path, 123).unwrap();
+        assert_eq!((record.pid, record.start), (123, 456));
+        assert!(record.exited());
+        assert!(read_stat_path(&path, 124).is_err());
+
+        bytes.push(b' ');
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            read_stat_path(&path, 123).unwrap_err().to_string(),
+            "oversized process identity"
+        );
+        std::fs::write(&path, b"").unwrap();
+        assert!(read_stat_path(&path, 123).is_err());
     }
 
     #[cfg(target_os = "linux")]
