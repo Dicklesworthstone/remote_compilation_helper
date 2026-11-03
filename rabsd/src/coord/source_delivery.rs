@@ -15,6 +15,7 @@ use super::source_manifest::{digest, invalid, require};
 use super::worker_delivery::{MAX_FRAME_BYTES, WorkerAuthentication, WorkerPeer, validate_request};
 use crate::edge::live_facts::RetainedDependencyArtifact;
 use rabs_asupersync::worker_transport::MAX_JSON_RECORD;
+use rabs_protocol::raw_bytes::encode_hex as hex;
 use rabs_sandbox::cargo_home::ISOLATED_GIT_CARGO_HOME_SOURCE_VERSION;
 #[cfg(all(test, unix))]
 use rabs_sandbox::cargo_home::{CARGO_HOME_SOURCE_VERSION, CargoHomeProjection};
@@ -86,10 +87,6 @@ impl PreparedLocalBundle {
 pub const MAX_SOURCE_ROOTS: usize = 64;
 // Outstanding chunks, not concurrent filesystem writers on the worker.
 const SOURCE_WINDOW: usize = 4;
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
 
 fn manifest_value(manifest: &SourceManifest) -> Value {
     json!({"manifest_sha256":hex(&manifest.digest()),
@@ -1404,6 +1401,20 @@ mod tests {
     use super::*;
     use std::collections::{BTreeMap, VecDeque};
 
+    #[test]
+    fn payload_hex_preserves_the_existing_lowercase_wire_encoding() {
+        assert_eq!(hex(&[]), "");
+        assert_eq!(hex(&[0, 1, 15, 16, 127, 128, 254, 255]), "00010f107f80feff");
+        // Include every byte, an entire transfer chunk, and a partial tail.
+        // The independent formatter is the original wire encoder, retained
+        // only as an oracle rather than sharing the implementation under test.
+        for size in [32, 256, MAX_SOURCE_CHUNK, MAX_SOURCE_CHUNK + 17] {
+            let bytes: Vec<_> = (0..size).map(|index| (index % 256) as u8).collect();
+            let original: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+            assert_eq!(hex(&bytes), original);
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires RABS_REFLINK_TEST_ROOT on a real reflink-capable filesystem"]
@@ -2158,6 +2169,15 @@ mod tests {
                 .count(),
             2
         );
+        for (frame, chunk) in peer
+            .sent
+            .iter()
+            .filter(|frame| frame["kind"] == "source-chunk")
+            .zip(bytes.chunks(MAX_SOURCE_CHUNK))
+        {
+            let original: String = chunk.iter().map(|byte| format!("{byte:02x}")).collect();
+            assert_eq!(frame["data_hex"], original);
+        }
         assert_eq!(peer.sent[0]["source_transfer"], SOURCE_TRANSFER);
         assert!(
             peer.sent

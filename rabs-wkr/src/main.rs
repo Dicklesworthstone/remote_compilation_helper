@@ -41,7 +41,7 @@ use rabs_wkr::output::{CapturedOutputs, MAX_OUTPUT_CHUNK_BYTES};
 use rabs_wkr::request_journal::{RECOVERY_PROTOCOL, WorkerJournal};
 use rabs_wkr::result_spool::{RESULT_RETENTION, ResultRecipient, RetentionTarget};
 use rabs_wkr::session::{
-    CanonicalExecRequest, ExecutionResources, execute_canonical_controlled,
+    CanonicalExecRequest, ExecutionResources, UploadedInputs, execute_canonical_controlled,
     execute_uploaded_canonical_controlled, parse_command_context, parse_dependency_context,
     probe_capability, sample_load_x100, sample_pressure,
 };
@@ -1336,7 +1336,7 @@ impl PendingOutput {
         let next_offset = offset
             .checked_add(bytes.len() as u64)
             .ok_or("output offset overflow")?;
-        let data_hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        let data_hex = rabs_protocol::raw_bytes::encode_hex(&bytes);
         Ok(serde_json::json!({
             "kind": "output-chunk", "request_id": self.identity.request_id, "stream": name,
             "offset": offset, "next_offset": next_offset, "total_bytes": stream.len(),
@@ -2315,7 +2315,6 @@ async fn session_loop(
                 if metadata_prefetch {
                     control.request_metadata_prefetch();
                 }
-                let _toolchain_owner = toolchain;
                 let resources = ExecutionResources {
                     slots,
                     host_budget: host_budget.as_deref(),
@@ -2331,16 +2330,22 @@ async fn session_loop(
                         resources,
                         &spills,
                         &control,
-                        source,
+                        UploadedInputs { source, toolchain },
                     ),
-                    None => execute_canonical_controlled(
-                        &request,
-                        &cargo_home,
-                        &home,
-                        resources,
-                        &spills,
-                        &control,
-                    ),
+                    None => {
+                        // Admission excludes transferred toolchains without
+                        // source, but retain any input owner through cleanup
+                        // even if a future caller violates that selection.
+                        let _toolchain_owner = toolchain;
+                        execute_canonical_controlled(
+                            &request,
+                            &cargo_home,
+                            &home,
+                            resources,
+                            &spills,
+                            &control,
+                        )
+                    }
                 }
             };
             ExecutionTask::spawn_for_delivery_with_lease(
@@ -4308,6 +4313,51 @@ mod tests {
         serde_json::json!({"kind": "output-ack", "request_id": id, "stdout_sha256": rabs_wkr::session::sha256_hex(b"A\0\xffB"),
             "stderr_sha256": rabs_wkr::session::sha256_hex(b""), "stdout_bytes": 4, "stderr_bytes": 0})
     }
+
+    #[test]
+    fn full_output_chunks_keep_exact_wire_bytes_retries_and_empty_streams() {
+        let bytes: Vec<u8> = (0..=u8::MAX)
+            .cycle()
+            .take(2 * MAX_OUTPUT_CHUNK_BYTES + 19)
+            .collect();
+        let outputs = CapturedOutputs {
+            stdout: rabs_wkr::output::CapturedStream::from_reader(
+                bytes.as_slice(),
+                bytes.len() as u64,
+            )
+            .unwrap(),
+            stderr: rabs_wkr::output::CapturedStream::from_reader(&b""[..], 0).unwrap(),
+        };
+        let mut pending = PendingOutput::new(42, outputs);
+        for (name, payload) in [("stdout", bytes.as_slice()), ("stderr", &b""[..])] {
+            let digest = rabs_wkr::session::sha256_hex(payload);
+            for offset in [
+                0,
+                MAX_OUTPUT_CHUNK_BYTES,
+                2 * MAX_OUTPUT_CHUNK_BYTES,
+                payload.len(),
+            ] {
+                if offset > payload.len() {
+                    continue;
+                }
+                let request = output_read(42, name, offset as u64, MAX_OUTPUT_CHUNK_BYTES);
+                let end = (offset + MAX_OUTPUT_CHUNK_BYTES).min(payload.len());
+                let chunk = &payload[offset..end];
+                let original_hex: String = chunk.iter().map(|byte| format!("{byte:02x}")).collect();
+                let expected = serde_json::json!({
+                    "kind":"output-chunk", "request_id":42, "stream":name,
+                    "offset":offset, "next_offset":end, "total_bytes":payload.len(),
+                    "eof":end == payload.len(), "data_hex":original_hex,
+                    "sha256":digest, "chunk_sha256":rabs_wkr::session::sha256_hex(chunk),
+                })
+                .to_string();
+                assert_eq!(pending.read_frame(&request).unwrap(), expected);
+                assert_eq!(pending.read_frame(&request).unwrap(), expected);
+            }
+        }
+        assert_eq!(pending.identity, OutputIdentity::new(42, &pending.outputs));
+    }
+
     fn pump<F: Future>(mut driver: Pin<&mut F>, peer: &Wire, count: usize) {
         let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
         let mut cx = Context::from_waker(&waker);

@@ -5,8 +5,8 @@
 //! identity before durable execution admission. Work stays off the reactor, and
 //! cancellation revokes readiness even when a filesystem operation completes late.
 
-use crate::session::parse_toolchain_identity;
 use crate::session::toolchain_pool::{self, ToolchainLease};
+use crate::session::{CanonicalExecRequest, parse_toolchain_identity};
 use crate::source_transfer::hex;
 use rabs_sandbox::toolchain_dataset::{PreparedToolchain, ToolchainIdentity, ToolchainLimits};
 use rabs_sandbox::toolchain_transfer::{
@@ -129,6 +129,52 @@ struct UploadedToolchain {
     _directory: tempfile::TempDir,
 }
 
+/// A consumed receiver's complete private image. Only this module can construct
+/// the handoff: neither a pathname nor a separately opened inventory owns its
+/// backing directory. The pool must still verify it before granting a lease.
+pub(crate) struct SealedToolchain {
+    prepared: PreparedToolchain,
+    directory: tempfile::TempDir,
+}
+
+impl SealedToolchain {
+    pub(crate) fn identity(&self) -> &ToolchainIdentity {
+        self.prepared.identity()
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        self.prepared.root()
+    }
+
+    pub(crate) fn into_parts(self) -> (PreparedToolchain, tempfile::TempDir) {
+        (self.prepared, self.directory)
+    }
+}
+
+impl UploadedToolchain {
+    fn into_sealed(self, expected: &ToolchainIdentity) -> io::Result<SealedToolchain> {
+        let Self {
+            prepared,
+            receiver,
+            _directory: directory,
+        } = self;
+        let prepared = prepared.ok_or_else(|| io::Error::other("toolchain is not sealed"))?;
+        if prepared.identity() != expected
+            || prepared.root() != std::fs::canonicalize(directory.path())?.join("dataset")
+        {
+            return Err(io::Error::other(
+                "sealed toolchain differs from its owned image",
+            ));
+        }
+        // No transfer descriptor or operation survives the ownership handoff.
+        drop(receiver);
+        Ok(SealedToolchain {
+            prepared,
+            directory,
+        })
+    }
+}
+
 enum ToolchainBacking {
     Uploaded(Box<UploadedToolchain>),
     Reused(ToolchainLease),
@@ -144,8 +190,8 @@ impl ToolchainBacking {
 }
 
 /// Moved into the blocking execution owner before its lease can be armed. The
-/// executor captures or leases the same verified identity through its existing
-/// toolchain pool; this owner keeps either input backing alive through cleanup.
+/// executor consumes the same verified identity through its toolchain pool;
+/// an uploaded image can become the execution lease without another byte copy.
 pub struct ToolchainOwner {
     backing: ToolchainBacking,
     request_id: u64,
@@ -156,6 +202,48 @@ pub struct ToolchainOwner {
 }
 
 impl ToolchainOwner {
+    fn into_execution_backing(
+        self,
+        request: &CanonicalExecRequest,
+    ) -> io::Result<ToolchainBacking> {
+        if self.failed
+            || request.request_id != self.request_id
+            || request.toolchain_identity.as_ref() != Some(&self.identity)
+            || self.backing.prepared_root() != Some(Path::new(&request.toolchain_backing))
+        {
+            return Err(io::Error::other(
+                "execution differs from its owned toolchain identity",
+            ));
+        }
+        Ok(self.backing)
+    }
+
+    /// Input deadlines were checked before durable execution admission. From
+    /// this handoff onward the blocking executor's cancellation/lease controls
+    /// acquisition and every consumer verification, including reused images.
+    pub(crate) fn into_lease(
+        self,
+        request: &CanonicalExecRequest,
+        stopped: impl Fn() -> bool,
+    ) -> io::Result<ToolchainLease> {
+        let expected = self.identity;
+        match self.into_execution_backing(request)? {
+            ToolchainBacking::Uploaded(upload) => {
+                toolchain_pool::adopt(upload.into_sealed(&expected)?, stopped)
+            }
+            ToolchainBacking::Reused(lease) => {
+                if lease.identity() != &expected {
+                    return Err(io::Error::other(
+                        "retained lease differs from its request identity",
+                    ));
+                }
+                // Keep the selected lease alive while the existing acquisition
+                // path verifies it and applies the active pool's failure policy.
+                toolchain_pool::prepare(lease.root(), Some(&expected), stopped)
+            }
+        }
+    }
+
     fn check(&self, cancelled: &AtomicBool) -> Result<(), String> {
         if self.failed {
             return Err("toolchain upload failed".to_owned());
@@ -814,7 +902,7 @@ mod tests {
         use super::*;
         use rabs_sandbox::toolchain_dataset::fingerprint_toolchain;
         use std::fs;
-        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
         use std::task::Wake;
         use std::time::Duration;
 
@@ -917,6 +1005,324 @@ mod tests {
                 entry("rustc", json!({"kind":"symlink", "target":"bin/compiler"})),
                 json!({"kind":"toolchain-seal", "request_id":id, "sha256":digest}),
             ]
+        }
+
+        fn upload(
+            pool: &Arc<toolchain_pool::ToolchainPool>,
+            request: &Value,
+        ) -> (ToolchainOwner, CanonicalExecRequest) {
+            let mut task = task(pool, false);
+            assert_eq!(
+                exchange(&mut task, &begin(request)).unwrap()["sealed"],
+                false
+            );
+            for frame in transfer_frames(request) {
+                exchange(&mut task, &frame).unwrap();
+            }
+            let root = task.prepared_path(request, true).unwrap().unwrap();
+            let owner = task.take_prepared(request).unwrap().unwrap();
+            drop(task);
+            let request = CanonicalExecRequest {
+                request_id: request["request_id"].as_u64().unwrap(),
+                program: "/__rabs/toolchain/bin/compiler".into(),
+                args: Vec::new(),
+                toolchain_backing: root,
+                toolchain_identity: parse_toolchain_identity(request).unwrap(),
+                workspace_backing: "/unused-source-fixture".into(),
+                dependency_context: None,
+                jobserver_grant: None,
+                command_context: Default::default(),
+            };
+            (owner, request)
+        }
+
+        fn sealed(owner: ToolchainOwner, request: &CanonicalExecRequest) -> SealedToolchain {
+            let expected = owner.identity;
+            let ToolchainBacking::Uploaded(upload) = owner.into_execution_backing(request).unwrap()
+            else {
+                panic!("fixture must own an actual received image");
+            };
+            upload.into_sealed(&expected).unwrap()
+        }
+
+        fn inode(path: &Path) -> (u64, u64) {
+            let metadata = fs::symlink_metadata(path).unwrap();
+            (metadata.dev(), metadata.ino())
+        }
+
+        #[test]
+        fn sealed_upload_becomes_the_same_private_tree_until_its_last_lease_drops() {
+            for budget in [0, 1024] {
+                let (_source, pool, wire) = fixture(budget, false);
+                let (owner, request) = upload(&pool, &wire);
+                let root = Path::new(&request.toolchain_backing).to_path_buf();
+                let directory_inode = inode(&root);
+                let compiler_inode = inode(&root.join("bin/compiler"));
+                let lease = pool.adopt(sealed(owner, &request), || false).unwrap();
+                assert_eq!(
+                    lease.disposition(),
+                    if budget == 0 { "private" } else { "adopted" }
+                );
+                assert_eq!(lease.root(), root);
+                assert_eq!(inode(lease.root()), directory_inode);
+                assert_eq!(inode(&lease.root().join("bin/compiler")), compiler_inode);
+                assert_eq!(fs::read(lease.root().join("rustc")).unwrap(), CONTENTS);
+                lease.verify(|| false).unwrap();
+                let retained = pool.lookup(lease.identity(), || false).unwrap();
+                assert_eq!(retained.is_some(), budget != 0);
+                if let Some(retained) = retained {
+                    assert_eq!(retained.root(), root);
+                    drop(retained);
+                }
+                drop(pool);
+                assert!(
+                    root.is_dir(),
+                    "execution lease must own the original upload"
+                );
+                lease.verify(|| false).unwrap();
+                drop(lease);
+                assert!(!root.exists(), "last owner must release private storage");
+            }
+        }
+
+        #[test]
+        fn execution_handoff_without_a_supervisor_adopts_the_received_owner() {
+            let (_source, pool, wire) = fixture(0, false);
+            let (owner, request) = upload(&pool, &wire);
+            let root = Path::new(&request.toolchain_backing).to_path_buf();
+            let compiler_inode = inode(&root.join("bin/compiler"));
+            let lease = owner.into_lease(&request, || false).unwrap();
+            assert_eq!(lease.root(), root);
+            assert_eq!(inode(&lease.root().join("bin/compiler")), compiler_inode);
+            lease.verify(|| false).unwrap();
+            drop(lease);
+            assert!(!root.exists());
+        }
+
+        #[test]
+        fn adopted_root_and_parent_cannot_be_exposed_through_a_writable_mount() {
+            use rabs_sandbox::canonical_namespace::{Bind, CanonicalNamespaceSpec};
+            let (_source, pool, wire) = fixture(1024, false);
+            let (owner, request) = upload(&pool, &wire);
+            let lease = pool.adopt(sealed(owner, &request), || false).unwrap();
+            let child = lease.root().join("bin");
+            for writable in [
+                lease.root(),
+                lease.root().parent().unwrap(),
+                child.as_path(),
+            ] {
+                let mut spec = CanonicalNamespaceSpec::new();
+                spec.ro_binds
+                    .push(Bind::new(lease.root(), rabs_sandbox::layout::TOOLCHAIN));
+                spec.rw_binds
+                    .push(Bind::new(writable, rabs_sandbox::layout::WORKSPACE));
+                assert!(
+                    lease.validate_namespace(&spec).is_err(),
+                    "{}",
+                    writable.display()
+                );
+            }
+            let workspace = tempfile::tempdir().unwrap();
+            let mut spec = CanonicalNamespaceSpec::new();
+            spec.ro_binds
+                .push(Bind::new(lease.root(), rabs_sandbox::layout::TOOLCHAIN));
+            spec.rw_binds
+                .push(Bind::new(workspace.path(), rabs_sandbox::layout::WORKSPACE));
+            lease.validate_namespace(&spec).unwrap();
+        }
+
+        #[test]
+        fn full_or_small_pool_executes_the_upload_privately_without_an_extra_copy() {
+            for busy in [false, true] {
+                let budget = CONTENTS.len() as u64 - u64::from(!busy);
+                let (source, pool, wire) = fixture(budget, false);
+                let other = if busy {
+                    fs::write(
+                        source.path().join("bin/compiler"),
+                        vec![b'x'; CONTENTS.len()],
+                    )
+                    .unwrap();
+                    let other_identity =
+                        fingerprint_toolchain(source.path(), &ToolchainLimits::default(), || false)
+                            .unwrap();
+                    Some(
+                        pool.acquire(source.path(), Some(&other_identity), || false)
+                            .unwrap(),
+                    )
+                } else {
+                    None
+                };
+                let (owner, request) = upload(&pool, &wire);
+                let root = Path::new(&request.toolchain_backing).to_path_buf();
+                let compiler_inode = inode(&root.join("bin/compiler"));
+                let lease = pool.adopt(sealed(owner, &request), || false).unwrap();
+                assert_eq!(lease.disposition(), "private");
+                assert_eq!(lease.root(), root);
+                assert_eq!(inode(&lease.root().join("bin/compiler")), compiler_inode);
+                assert!(pool.lookup(lease.identity(), || false).unwrap().is_none());
+                if let Some(other) = other {
+                    other.verify(|| false).unwrap();
+                    assert_ne!(other.identity(), lease.identity());
+                }
+                drop(lease);
+                assert!(!root.exists());
+            }
+        }
+
+        #[test]
+        fn same_identity_ready_owner_wins_without_retaining_a_redundant_upload() {
+            let (_source, pool, wire) = fixture(1024, false);
+            let (owner, request) = upload(&pool, &wire);
+            let first = pool.adopt(sealed(owner, &request), || false).unwrap();
+            let (owner, request) = upload(&pool, &wire);
+            let redundant = Path::new(&request.toolchain_backing).to_path_buf();
+            assert_ne!(first.root(), redundant);
+            let second = pool.adopt(sealed(owner, &request), || false).unwrap();
+            assert_eq!(first.root(), second.root());
+            assert_eq!(second.disposition(), "reused");
+            assert!(!redundant.exists());
+            first.verify(|| false).unwrap();
+            second.verify(|| false).unwrap();
+        }
+
+        #[test]
+        fn durable_upload_capture_survives_restart_and_reuses_the_published_image() {
+            use std::cell::Cell;
+
+            let (_source, initial_pool, wire) = fixture(1024, false);
+            drop(initial_pool);
+            let cache_parent = tempfile::tempdir().unwrap();
+            let cache_root = cache_parent.path().join("durable");
+            let pool = Arc::new(
+                toolchain_pool::ToolchainPool::with_directory(1024, 2, Some(&cache_root)).unwrap(),
+            );
+            let identity = parse_toolchain_identity(&wire).unwrap().unwrap();
+            let (owner, request) = upload(&pool, &wire);
+            let uploaded = Path::new(&request.toolchain_backing).to_path_buf();
+            let uploaded_inode = inode(&uploaded.join("bin/compiler"));
+            let published = cache_root
+                .join("toolchains-v1")
+                .join(format!(
+                    "v1-{}-{}-{}",
+                    hex(&identity.sha256),
+                    identity.files,
+                    identity.bytes
+                ))
+                .join("tree");
+            let observed_upload = Cell::new(false);
+            let observed_publication = Cell::new(false);
+            let lease = pool
+                .adopt(sealed(owner, &request), || {
+                    if uploaded.exists() {
+                        observed_upload.set(true);
+                    } else {
+                        // Acquisition checks again after its producer returns.
+                        // The upload must survive every capture step until the
+                        // stable durable image has been published and reopened.
+                        assert_eq!(fs::read(published.join("rustc")).unwrap(), CONTENTS);
+                        observed_publication.set(true);
+                    }
+                    false
+                })
+                .unwrap();
+            assert!(observed_upload.get() && observed_publication.get());
+            assert_eq!(lease.disposition(), "captured");
+            assert_eq!(lease.root(), published);
+            assert!(!uploaded.exists());
+            let published_inode = inode(&published.join("bin/compiler"));
+            assert_ne!(published_inode, uploaded_inode);
+            lease.verify(|| false).unwrap();
+
+            // Supervisor shutdown does not release durable ownership while an
+            // execution still holds the lease, nor remove a published image.
+            drop(pool);
+            assert!(published.is_dir());
+            assert!(
+                toolchain_pool::ToolchainPool::with_directory(1024, 2, Some(&cache_root)).is_err()
+            );
+            drop(lease);
+            assert!(published.is_dir());
+            let reopened = Arc::new(
+                toolchain_pool::ToolchainPool::with_directory(1024, 2, Some(&cache_root)).unwrap(),
+            );
+            let retained = reopened.lookup(&identity, || false).unwrap().unwrap();
+            assert_eq!(retained.root(), published);
+            assert_eq!(
+                inode(&retained.root().join("bin/compiler")),
+                published_inode
+            );
+            retained.verify(|| false).unwrap();
+
+            let mut warm = task(&reopened, true);
+            assert_eq!(exchange(&mut warm, &begin(&wire)).unwrap()["sealed"], true);
+            assert_eq!(
+                Path::new(&warm.prepared_path(&wire, true).unwrap().unwrap()),
+                published
+            );
+            drop(warm.take_prepared(&wire).unwrap().unwrap());
+            drop(warm);
+
+            // A peer that uploads again still resolves through the ready pool
+            // owner; its redundant temporary image must not become retained.
+            let (owner, request) = upload(&reopened, &wire);
+            let redundant = Path::new(&request.toolchain_backing).to_path_buf();
+            let reused = reopened.adopt(sealed(owner, &request), || false).unwrap();
+            assert_eq!(reused.disposition(), "reused");
+            assert_eq!(reused.root(), published);
+            assert!(!redundant.exists());
+            assert_eq!(inode(&reused.root().join("bin/compiler")), published_inode);
+            reused.verify(|| false).unwrap();
+        }
+
+        #[test]
+        fn execution_handoff_requires_the_original_request_and_complete_identity() {
+            let (_source, pool, wire) = fixture(1024, false);
+            for changed in ["request_id", "sha256", "files", "bytes", "missing", "root"] {
+                let (owner, mut request) = upload(&pool, &wire);
+                let root = Path::new(&request.toolchain_backing).to_path_buf();
+                match changed {
+                    "request_id" => request.request_id += 1,
+                    "sha256" => request.toolchain_identity.as_mut().unwrap().sha256[0] ^= 1,
+                    "files" => request.toolchain_identity.as_mut().unwrap().files += 1,
+                    "bytes" => request.toolchain_identity.as_mut().unwrap().bytes += 1,
+                    "missing" => request.toolchain_identity = None,
+                    "root" => request.toolchain_backing.push_str("/bin"),
+                    _ => unreachable!(),
+                }
+                assert!(owner.into_lease(&request, || false).is_err(), "{changed}");
+                assert!(!root.exists());
+            }
+        }
+
+        #[test]
+        fn changed_or_cancelled_upload_never_becomes_a_retained_lease() {
+            let (_source, pool, wire) = fixture(1024, false);
+            let identity = parse_toolchain_identity(&wire).unwrap().unwrap();
+            let (owner, request) = upload(&pool, &wire);
+            let root = Path::new(&request.toolchain_backing).to_path_buf();
+            let compiler = root.join("bin/compiler");
+            fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755)).unwrap();
+            // Even restored bytes and final modes cannot refresh the sealed
+            // inode's mutation witness into a newly admitted generation.
+            fs::write(&compiler, CONTENTS).unwrap();
+            fs::set_permissions(&compiler, fs::Permissions::from_mode(0o555)).unwrap();
+            assert!(pool.adopt(sealed(owner, &request), || false).is_err());
+            assert!(!root.exists());
+            assert!(pool.lookup(&identity, || false).unwrap().is_none());
+
+            let (owner, request) = upload(&pool, &wire);
+            let root = Path::new(&request.toolchain_backing).to_path_buf();
+            let error = pool.adopt(sealed(owner, &request), || true).err().unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+            assert!(!root.exists());
+            assert!(pool.lookup(&identity, || false).unwrap().is_none());
+
+            // A refused owner must release its reservation, so a fresh exact
+            // upload can occupy the same bounded slot without a copied tree.
+            let (owner, request) = upload(&pool, &wire);
+            let lease = pool.adopt(sealed(owner, &request), || false).unwrap();
+            assert_eq!(lease.root(), Path::new(&request.toolchain_backing));
+            assert!(pool.lookup(&identity, || false).unwrap().is_some());
         }
 
         #[test]

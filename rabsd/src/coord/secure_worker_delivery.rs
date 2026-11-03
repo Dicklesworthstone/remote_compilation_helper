@@ -17,10 +17,10 @@ use super::delivery_ack::PendingAcknowledgment;
 use super::source_delivery::SourceUpload;
 use super::worker_delivery::{
     ArtifactByteCache, DEFAULT_ARTIFACT_CACHE_BYTES, DEFAULT_ARTIFACT_CACHE_ENTRIES, Delivery,
-    DeliveryFailure, DeliveryMode, MAX_ARTIFACT_CACHE_BYTES, MAX_ARTIFACT_CACHE_ENTRIES,
-    ResumePeer, ResumeSource, SealedResult, WorkerAuthentication, WorkerPeer,
-    negotiated_dependency_context, receive_operation, transport_interrupted, validate_request,
-    worker_transport_error,
+    DeliveryFailure, DeliveryMode, EncodedWorkerFrame, MAX_ARTIFACT_CACHE_BYTES,
+    MAX_ARTIFACT_CACHE_ENTRIES, ResumePeer, ResumeSource, SealedResult, WorkerAuthentication,
+    WorkerPeer, negotiated_dependency_context, receive_operation, transport_interrupted,
+    validate_request, worker_transport_error,
 };
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use asupersync::runtime::Runtime;
@@ -1278,16 +1278,14 @@ impl<'a, S> RecordPeer<'a, S> {
         Ok(())
     }
 
-    fn outbound(&mut self, frame: &Value) -> io::Result<Vec<u8>> {
+    fn outbound(&mut self, frame: EncodedWorkerFrame<'_>) -> io::Result<Vec<u8>> {
         self.remaining()?;
-        let mut bytes = serde_json::to_vec(frame)?;
         require(
-            bytes.len() <= MAX_JSON_RECORD,
+            frame.encoded_len() <= MAX_JSON_RECORD + 1,
             "worker record exceeds ATP limit",
         )?;
-        self.begin_frame(frame["kind"].as_str())?;
-        bytes.push(b'\n');
-        Ok(bytes)
+        self.begin_frame(frame.value()["kind"].as_str())?;
+        Ok(frame.into_bytes())
     }
 }
 
@@ -1307,6 +1305,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WorkerPeer for RecordPeer<'_, S> {
     }
 
     fn send(&mut self, frame: &Value) -> io::Result<()> {
+        self.remaining()?;
+        self.send_encoded(EncodedWorkerFrame::new(frame)?)
+    }
+
+    fn send_encoded(&mut self, frame: EncodedWorkerFrame<'_>) -> io::Result<()> {
         let bytes = self.outbound(frame)?;
         let budget = self.remaining()?;
         let stream = &mut self.stream;
@@ -2381,6 +2384,11 @@ mod tests {
             let mut changed = selected.clone();
             changed["extension"]["preserve"] = json!(["changed", 17]);
             assert!(peer.send(&changed).is_err());
+            assert!(
+                peer.send_encoded(EncodedWorkerFrame::new(&changed).unwrap())
+                    .is_err(),
+                "pre-encoding cannot bypass the selected-operation binding"
+            );
             peer.send(&selected).unwrap();
             assert_eq!(peer.inner.sent[2], selected);
             assert_eq!(
@@ -2390,6 +2398,11 @@ mod tests {
             assert_eq!(serde_json::to_vec(&selected).unwrap(), original_bytes);
             assert!(peer.inner.sent[2].get("execution_lease").is_none());
             assert!(peer.send(&selected).is_err());
+            assert!(
+                peer.send_encoded(EncodedWorkerFrame::new(&selected).unwrap())
+                    .is_err(),
+                "pre-encoding cannot dispatch the selected operation twice"
+            );
         }
     }
 
@@ -4270,6 +4283,74 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(sent.last().unwrap()["kind"], "toolchain-begin");
         assert!(!sent.iter().any(|frame| frame["kind"] == "canonical-exec"));
+    }
+
+    #[test]
+    fn encoded_upload_records_keep_exact_wire_bytes_phase_limits_and_deadlines() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let mut peer = RecordPeer::new(&runtime, RecordWire::new(Vec::new(), 97), &request());
+        let chunk = json!({"kind":"toolchain-chunk", "request_id":7,
+            "path":"lib/quoted\"雪", "data_hex":"00ff".repeat(32_768)});
+        assert!(
+            peer.send_encoded(EncodedWorkerFrame::new(&chunk).unwrap())
+                .is_err(),
+            "encoded payloads still require their upload phase"
+        );
+        assert!(peer.stream.written.is_empty());
+
+        let source = json!({"kind":"source-begin", "request_id":7});
+        let toolchain = json!({"kind":"toolchain-begin", "request_id":7});
+        for frame in [&source, &toolchain] {
+            peer.send_encoded(EncodedWorkerFrame::new(frame).unwrap())
+                .unwrap();
+        }
+        let until = peer.until;
+        peer.send_encoded(EncodedWorkerFrame::new(&chunk).unwrap())
+            .unwrap();
+        assert_eq!(
+            peer.until, until,
+            "an encoded chunk cannot renew its budget"
+        );
+        assert_eq!(
+            peer.stream.written,
+            format!("{source}\n{toolchain}\n{chunk}\n").into_bytes()
+        );
+
+        let mut exact = json!({"kind":"toolchain-chunk", "data_hex":""});
+        let overhead = serde_json::to_vec(&exact).unwrap().len();
+        exact["data_hex"] = json!("0".repeat(MAX_JSON_RECORD - overhead));
+        let encoded = EncodedWorkerFrame::new(&exact).unwrap();
+        assert_eq!(encoded.encoded_len(), MAX_JSON_RECORD + 1);
+        let before_exact = peer.stream.written.len();
+        peer.send_encoded(encoded).unwrap();
+        assert_eq!(
+            peer.stream.written.len() - before_exact,
+            MAX_JSON_RECORD + 1
+        );
+        assert_eq!(peer.until, until);
+
+        let written = peer.stream.written.len();
+        let oversized = json!({"kind":"toolchain-chunk", "data_hex":"0".repeat(MAX_JSON_RECORD)});
+        assert!(
+            peer.send_encoded(EncodedWorkerFrame::new(&oversized).unwrap())
+                .is_err()
+        );
+        assert_eq!(peer.stream.written.len(), written);
+        assert!(peer.phase == Phase::ToolchainUpload);
+        assert_eq!(peer.until, until);
+
+        peer.until = Instant::now() - Duration::from_secs(1);
+        let expired = peer.until;
+        assert!(
+            peer.send_encoded(EncodedWorkerFrame::new(&request()).unwrap())
+                .is_err(),
+            "expired upload cannot obtain execution time through an encoded record"
+        );
+        assert_eq!(peer.stream.written.len(), written);
+        assert!(peer.phase == Phase::ToolchainUpload);
+        assert_eq!(peer.until, expired);
     }
 
     #[test]

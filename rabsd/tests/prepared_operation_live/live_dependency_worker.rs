@@ -1519,8 +1519,8 @@ fn actual_cargo_pool_bypasses_occupied_worker_and_reuses_both_slots() {
             .collect();
         assert_eq!(
             acquisitions,
-            ["captured", "reused", "reused"],
-            "each worker must retain and revalidate its complete compiler across sessions"
+            ["adopted", "reused", "reused"],
+            "each worker must adopt the complete upload, then retain and revalidate it across sessions"
         );
     }
     live.daemon.terminate();

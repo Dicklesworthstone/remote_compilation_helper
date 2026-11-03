@@ -5,6 +5,7 @@
 //! flight while the sender refills that space, instead of draining each burst.
 
 use super::{CHUNK_WINDOW, WorkerPeer, digest, invalid, require};
+use crate::coord::worker_delivery::EncodedWorkerFrame;
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::io;
@@ -93,15 +94,16 @@ impl<'peer, 'paths, P: WorkerPeer + ?Sized> UploadWindow<'peer, 'paths, P> {
         // cannot reuse this window after a failed send, read or acknowledgment.
         self.failed = true;
         expected.check_request(frame, self.request_id, &self.identity)?;
-        let bytes = serde_json::to_vec(frame)?
-            .len()
-            .checked_add(1)
-            .filter(|bytes| *bytes <= MAX_IN_FLIGHT_BYTES)
-            .ok_or_else(|| invalid("toolchain control exceeds its byte window"))?;
+        let frame = EncodedWorkerFrame::new(frame)?;
+        let bytes = frame.encoded_len();
+        require(
+            bytes <= MAX_IN_FLIGHT_BYTES,
+            "toolchain control exceeds its byte window",
+        )?;
         while self.pending_bytes > MAX_IN_FLIGHT_BYTES - bytes {
             self.acknowledge_one()?;
         }
-        self.peer.send(frame)?;
+        self.peer.send_encoded(frame)?;
         self.pending.push_back((expected, bytes));
         self.pending_bytes += bytes;
         if self.pending.len() == CHUNK_WINDOW {

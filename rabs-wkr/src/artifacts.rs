@@ -865,7 +865,7 @@ impl ArtifactTransferState {
         let next_offset = offset
             .checked_add(bytes.len() as u64)
             .ok_or("artifact offset overflow")?;
-        let data_hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let data_hex = rabs_protocol::raw_bytes::encode_hex(&bytes);
         Ok(serde_json::json!({
             "kind": "artifact-chunk", "request_id": identity.request_id, "name": name,
             "offset": offset, "next_offset": next_offset, "total_bytes": total_bytes,
@@ -1343,6 +1343,53 @@ mod tests {
             assert!(state.read_frame(&bad).is_err());
         }
         assert!(state.read_frame(&read).is_ok());
+    }
+
+    #[test]
+    fn full_artifact_chunks_keep_exact_wire_bytes_retries_and_empty_eof() {
+        let bytes: Vec<u8> = (0..=u8::MAX)
+            .cycle()
+            .take(2 * MAX_OUTPUT_CHUNK_BYTES + 19)
+            .collect();
+        let prepared = PreparedArtifacts::new(plan(&["libpayload.rlib"])).unwrap();
+        fs::write(prepared.backing().join("libpayload.rlib"), &bytes).unwrap();
+        let captured = prepared.capture(|| false).unwrap();
+        let manifest = captured.manifest_sha256().to_owned();
+        let digest = crate::session::sha256_hex(&bytes);
+        let mut state = ArtifactTransferState::default();
+        state.retain(42, captured).unwrap();
+
+        for offset in [
+            0,
+            MAX_OUTPUT_CHUNK_BYTES,
+            2 * MAX_OUTPUT_CHUNK_BYTES,
+            bytes.len(),
+        ] {
+            let request = serde_json::json!({
+                "request_id":42, "name":"libpayload.rlib", "offset":offset,
+                "max_bytes":MAX_OUTPUT_CHUNK_BYTES,
+            });
+            let end = (offset + MAX_OUTPUT_CHUNK_BYTES).min(bytes.len());
+            let chunk = &bytes[offset..end];
+            let original_hex: String = chunk.iter().map(|byte| format!("{byte:02x}")).collect();
+            let expected = serde_json::json!({
+                "kind":"artifact-chunk", "request_id":42, "name":"libpayload.rlib",
+                "offset":offset, "next_offset":end, "total_bytes":bytes.len(),
+                "eof":end == bytes.len(), "data_hex":original_hex, "sha256":digest,
+                "executable":false, "chunk_sha256":crate::session::sha256_hex(chunk),
+                "manifest_sha256":manifest,
+            })
+            .to_string();
+            assert_eq!(state.read_frame(&request).unwrap(), expected);
+            assert_eq!(state.read_frame(&request).unwrap(), expected);
+        }
+        assert_eq!(state.pending_request_id(), Some(42));
+        state
+            .acknowledge(&serde_json::json!({
+                "request_id":42, "manifest_sha256":manifest, "total_bytes":bytes.len(),
+            }))
+            .unwrap();
+        assert!(!state.is_pending());
     }
 
     #[test]

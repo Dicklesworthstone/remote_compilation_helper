@@ -13,6 +13,7 @@ struct TracedPeer {
     last_ack: Option<Value>,
     fail_send: bool,
     attempted: usize,
+    encoded_controls: usize,
     depth_at_ack: Vec<usize>,
 }
 
@@ -27,12 +28,26 @@ impl TracedPeer {
             last_ack: None,
             fail_send: false,
             attempted: 0,
+            encoded_controls: 0,
             depth_at_ack: Vec::new(),
         }
     }
 }
 
 impl WorkerPeer for TracedPeer {
+    fn send_encoded(
+        &mut self,
+        frame: crate::coord::worker_delivery::EncodedWorkerFrame<'_>,
+    ) -> io::Result<()> {
+        let value = frame.value();
+        let mut expected = serde_json::to_vec(value)?;
+        expected.push(b'\n');
+        assert_eq!(frame.encoded_len(), expected.len());
+        assert_eq!(frame.into_bytes(), expected);
+        self.encoded_controls += 1;
+        self.send(value)
+    }
+
     fn send(&mut self, frame: &Value) -> io::Result<()> {
         let kind = frame["kind"].as_str().unwrap();
         if kind == "toolchain-seal" {
@@ -114,6 +129,7 @@ fn the_first_cold_burst_spans_metadata_and_file_bytes_before_waiting() {
     assert!(peer.bursts.iter().all(|burst| burst.len() <= CHUNK_WINDOW));
     assert_eq!(peer.receiver.maximum_pending, CHUNK_WINDOW);
     assert_eq!(peer.control_acks, peer.attempted);
+    assert_eq!(peer.encoded_controls, peer.attempted);
     assert!(peer.receiver.replies.is_empty());
     let received = peer.receiver.sealed.as_ref().unwrap();
     received.verify(|| false).unwrap();
@@ -153,6 +169,7 @@ fn empty_files_share_windows_and_the_final_short_batch_is_drained() {
         upload.transmit(&mut peer, &request, false).unwrap();
         let entries = count + 1; // the root is an identity-bearing entry too
         assert_eq!(peer.attempted, entries);
+        assert_eq!(peer.encoded_controls, entries);
         assert_eq!(peer.control_acks, entries);
         assert_eq!(peer.bursts.len(), 1 + entries.saturating_sub(CHUNK_WINDOW));
         assert_eq!(peer.bursts[0].len(), entries.min(CHUNK_WINDOW));
