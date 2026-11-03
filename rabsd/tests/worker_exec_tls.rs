@@ -1422,6 +1422,9 @@ fn actual_tls_receiver_persists_boot_high_water_and_rejects_pin_reset() {
 /// path. The later upload must use the retained projection, never the changed
 /// checkout or its unselected private file. The scripted peer still runs no tool.
 fn prepared_build_bundle(root: &Path) -> (PathBuf, Value, Vec<u8>) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
     let checkout = root.join("checkout");
     fs::create_dir(&checkout).unwrap();
     fs::create_dir(checkout.join("src")).unwrap();
@@ -2009,7 +2012,7 @@ fn actual_prepared_toolchain_rejects_forged_seal_without_dispatch_or_output_inst
 
 #[test]
 fn actual_prepared_build_uploads_installs_and_replays_offline_after_ack_loss() {
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let certificates = Certificates::new();
     let owner = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(owner.path()).unwrap();
@@ -2017,6 +2020,13 @@ fn actual_prepared_build_uploads_installs_and_replays_offline_after_ack_loss() {
     let delivery = root.join("delivery");
     let outputs = root.join("outputs");
     let received_source = root.join("worker-source");
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o770)).unwrap();
+    assert!(
+        SourceReceiver::create(&received_source, request_manifest(&request).unwrap().unwrap())
+            .is_err()
+    );
+    assert!(!received_source.exists());
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
     let pin = certificates.pin();
     let mut receiver = Receiver::spawn_build(
         &root,
@@ -2292,6 +2302,16 @@ fn actual_prepared_build_preserves_failed_compiler_exit_and_diagnostics_without_
                 "stdout_bytes":0, "stdout_sha256":hash(b""),
                 "stderr_bytes":diagnostic.len(), "stderr_sha256":hash(diagnostic),
                 "artifact_ack_required":false, "artifact_manifest":null})).await.unwrap();
+            // Even an empty, newly delivered stream has an exact range frame;
+            // the existing pipeline may request stderr before its reply arrives.
+            let empty = receive(&mut peer.stream).await.unwrap();
+            assert_eq!(empty["kind"], "output-read");
+            assert_eq!(empty["stream"], "stdout");
+            assert_eq!(empty["offset"], 0);
+            send(&mut peer.stream, &json!({"kind":"output-chunk", "request_id":7,
+                "stream":"stdout", "offset":0, "next_offset":0, "total_bytes":0,
+                "eof":true, "data_hex":"", "chunk_sha256":hash(b""),
+                "sha256":hash(b"")})).await.unwrap();
             let query = receive(&mut peer.stream).await.unwrap();
             assert_eq!(query["kind"], "output-read");
             assert_eq!(query["stream"], "stderr");
@@ -2304,6 +2324,7 @@ fn actual_prepared_build_preserves_failed_compiler_exit_and_diagnostics_without_
                 "stdout_bytes":0, "stdout_sha256":hash(b""),
                 "stderr_bytes":diagnostic.len(), "stderr_sha256":hash(diagnostic)}));
             assert_eq!(fs::read(delivery.join("diagnostics/stderr")).unwrap(), diagnostic);
+            assert_eq!(fs::read(delivery.join("diagnostics/stdout")).unwrap(), b"");
             assert!(!outputs.exists());
             send(&mut peer.stream, &json!({"kind":"output-acknowledged", "request_id":7,
                 "already_released":false})).await.unwrap();
