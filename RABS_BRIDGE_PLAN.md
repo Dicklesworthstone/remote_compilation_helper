@@ -2593,10 +2593,87 @@ real Cargo serving, fleet performance or release qualification.
       missing-verification cause. Future comparisons must use each compiled
       harness's exact Cargo wrapper path and validate it before spending on
       runtime cases; never manufacture a matching source label for a copy.
-  - [ ] Finish the original three canonical service/worker cases. The worker
-    build currently changes the transitive feature union and recompiles
-    Asupersync; normal Cargo freshness decides reuse. No forced-Fresh metadata,
-    deadline extension or active-source edit is permitted to bypass that work.
+  - [ ] Finish the original three canonical service/worker cases. DSR8611
+    attempt2 reached its unchanged10,800s host deadline during preparation:
+    native status timeout/raw5,10,902s; aggregate failed. The saved driver
+    report is partial, not terminal success. All three canonical cases,
+    including four actual TLS worker executions, remain UNRUN. Retain the
+    original9/10 worktree result. Terminal result/state are saved under
+    `/Volumes/trj-data/rabs-unified-retained-source-20261102/attempt-2-terminal-*`.
+    No forced-Fresh metadata, live deadline extension or active-source edit.
+    - [x] Take a fresh existing thread-aware process_snapshot after attempt2:
+      2,548 records, zero readable argv references to the retained source,
+      read-ahead-dev target or prior driver, zero permission denials. Retain
+      `job-unified-runtime-retained-source/attempt-2-post-deadline-processes.json`.
+      This bounded argv check is not a complete cache-holder census or strict
+      release admission; normal Cargo locking remains mandatory.
+    - [x] Submit supported SAME-RUN resume02:45:44UTC, PID74024, keeping source272
+      and the original10,800s host deadline; original TLS worker case runs
+      FIRST, then service overlap, cross-worktree, components and QA.
+      Immutable10,857-byte driver013977095cfba3974522458684cc94b06c82cc72f25ad0bfdf709e59994d4ec5,
+      `job-unified-tls-first-20261103/run-carried-red.py`. Full source and four
+      storage checks pass; preparation continues at the retained dependency
+      progress. The earlier9/10 worktrees failure is carried as aggregate101
+      even if every deferred case passes. No erased failure or release claim.
+    - [ ] Collect each original canonical case's actual raw result and the
+      four real TLS executions/replay count; preparation remains UNRUN proof.
+  - [x] Run a bounded retained-binary diagnostic: physical rustc -vV0/0.599s
+    and --print sysroot0/0.446s; the unchanged older managed-probe identity
+    test1passed/0failed/0ignored, raw0,5.940s external. These controls differ
+    (real compiler versus controlled query fixture), so they suggest overhead
+    but establish neither causality nor a current-source performance win.
+  - [x] Prepare the common process-group parser allocation candidate: borrow
+    comm/tail, read only state/parent/group and allocate a name only for an
+    actual member. Keep full /proc enumeration, existing raced/denied-read
+    behavior, membership outputs, signaling, deadlines and cleanup policy.
+    Add parent/group/state/truncation/nested-name controls; local fmt0.
+  - [x] Freeze Linux-only source272 plus this one file, two complete passes:
+    `85dc06ed-overlay-272b-process-group-parse-71765bb3a3d07d661f027c3078cf82902c0d7c4b3d972a9f55dc916c96b74d82`,
+    manifest559bb9a6c363971e6db7cffc96e41a670b77481f2c10621a08f10e5b100c3d0c,
+    1,697 matches plus58 original exclusions. Mac source allocation refused
+    its storage guard; no local clone was made. The initial clone/read-tree
+    ordering and controller timeout were corrected by waiting for clone0,
+    read-tree0 and exclusively creating only absent verified files. No source
+    overwrite, new exclusions or caller-local synchronization claim.
+  - [x] Submit bounded native DSR component run02:39:37UTC, coordinator97295,
+    tool rabs_process_group_component/version2.1.34-rabspgrp.71765bb3.
+    Immutable5,630-byte driver7b62ee9f6d3b3961dbf40a8e6385f9dc80332e2cb4efe9528ae47c13f5a936b4.
+    Normal Cargo freshness on the retained development target, explicitly
+    line-tables-only debug profile. The artifact is a test executable, never
+    a claimed daemon/worker. Actual native source is audited before/after;
+    pre-staged Linux source differs from caller-local source by the declared
+    file, so this is not strict release or caller-local sync provenance.
+  - [ ] Compile and run every listed process_groups test, including ignored
+    original controls and the new parser case; require a nonzero enumerated
+    denominator, exact matching counts and source-after. No performance win
+    or quiescence repair is established by a component pass.
+    - [x] Run UBS on process_groups.rs: raw1,2critical/184warning/46info.
+      Both critical patterns are unchanged in the frozen source272 baseline:
+      the generic configured process executable and fixed shell process-tree
+      fixture. No suppression, changed allowlist or clean-scan claim. They
+      are outside the parser diff; full compiler/runtime qualification remains
+      pending. Startup spent time on normal package-cache locking and actual
+      disk reads; native compilation has now begun.
+  - [ ] Freeze and compile the measured-capacity capture fixture correction,
+    run original receipt/cancellation positives and negatives, then complete
+    workspace all-target check, strict Clippy and fmt for supported changes.
+    Rejected b362 production code stays reverted. No complete current toolset,
+    practical frontdoor, TLS worker or release pass is implied by these runs.
+    - [x] Freeze trace9872 plus capture.rs only on admitted Linux ZFS:
+      `85dc06ed-overlay-9872-capture-capacity-52a668d8683e1fcbf20ddc72888154e3783899ecdd1ef12af3aa18f1df511a2e`,
+      manifest5fbd9652957566c0f123728649349936c8d3542ff131b7e3b284b28ce38bed0a,
+      1,697 matches/58 original exclusions, two complete passes. No parser
+      candidate or reverted fixed-stat-buffer runtime change is included.
+    - [x] Submit DSR rabs_capture_capacity_component02:42:35UTC, PID34126,
+      version2.1.34-rabscapture.52a668d8. Immutable6,058-byte driver
+      9a8031ef28e8e866cb407a33afb85b24d90fc0e5c0650086e4a96509cb392792.
+      Predeclared actual listed capture cases (at least12), all wrapper
+      units (at least100), wrapper all-target check/strict Clippy, workspace
+      fmt and source-after; no zero-run green. Linux pre-staged source and
+      a clearly named test executable, not caller-local sync/release proof.
+    - [ ] Collect raw corrected-fixture positive/negative counts and every
+      full-unit failure; compare to the original105/106 RED without erasing
+      it. A pass establishes a valid fixture, not a production capture fix.
   - [x] Bound alternate-capacity probes: ts1 has the pinned toolchain and a
     healthy mounted NAS, but root and/tmp fail14% (tmp also fails20G).
     No build was launched there. Earlier be324 retains a verified daemon,
