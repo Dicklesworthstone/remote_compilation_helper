@@ -16,6 +16,7 @@
 //! calls are not claimed interruptible. No state or directories are deleted here.
 
 use super::{MAX_POOL_BYTES, MAX_POOL_ENTRIES, checkpoint, invalid};
+use crate::toolchain_transfer::SealedToolchain;
 use rabs_cas::materialization::publish_new_directory;
 use rabs_sandbox::toolchain_dataset::{
     PreparedToolchain, ToolchainIdentity, ToolchainLimits, capture_toolchain, open_toolchain,
@@ -45,6 +46,14 @@ pub(super) struct DurableCache {
 struct Catalogue {
     entries: usize,
     bytes: u64,
+}
+
+pub(super) enum UploadedCapture {
+    Retained {
+        toolchain: PreparedToolchain,
+        disposition: &'static str,
+    },
+    Declined(SealedToolchain),
 }
 
 fn require(condition: bool, detail: &str) -> io::Result<()> {
@@ -439,30 +448,51 @@ impl DurableCache {
         expected: &ToolchainIdentity,
         stopped: &impl Fn() -> bool,
     ) -> io::Result<Option<PreparedToolchain>> {
-        self.capture_with(source, expected, stopped, || Ok(()))
+        self.capture_with(expected, stopped, |limits| {
+            self.capture_source(source, expected, limits, stopped, || Ok(()))
+                .map(|toolchain| (toolchain, "captured"))
+        })
+        .map(|captured| captured.map(|(toolchain, _)| toolchain))
     }
 
-    /// A sealed upload owns its original generation witness. Preserve that
-    /// witness across a new durable capture, even if a mutation restores the
-    /// same bytes and modes. A verified existing durable image remains an
-    /// independent source and need not consult the redundant uploaded tree.
-    pub(super) fn capture_prepared(
+    /// Retain the actual sealed upload when admission permits. A same-filesystem
+    /// parent move preserves every dataset inode and generation; EXDEV alone
+    /// selects the verified capture path. A declined reservation returns the
+    /// original owner, and a verified durable hit ignores a redundant upload.
+    pub(super) fn capture_upload(
         &self,
-        source: &PreparedToolchain,
+        upload: SealedToolchain,
         stopped: &impl Fn() -> bool,
-    ) -> io::Result<Option<PreparedToolchain>> {
-        self.capture_with(source.root(), source.identity(), stopped, || {
-            source.verify_retained_generation(stopped)
-        })
+    ) -> io::Result<UploadedCapture> {
+        let expected = *upload.identity();
+        let mut owner = Some(upload);
+        let captured = self.capture_with(&expected, stopped, |limits| {
+            self.capture_owned(
+                owner
+                    .take()
+                    .ok_or_else(|| invalid("durable upload producer lost its owner"))?,
+                &expected,
+                limits,
+                stopped,
+            )
+        })?;
+        match captured {
+            Some((toolchain, disposition)) => Ok(UploadedCapture::Retained {
+                toolchain,
+                disposition,
+            }),
+            None => Ok(UploadedCapture::Declined(owner.ok_or_else(|| {
+                invalid("declined durable upload lost its private owner")
+            })?)),
+        }
     }
 
     fn capture_with(
         &self,
-        source: &Path,
         expected: &ToolchainIdentity,
         stopped: &impl Fn() -> bool,
-        verify_source: impl Fn() -> io::Result<()>,
-    ) -> io::Result<Option<PreparedToolchain>> {
+        produce: impl FnOnce(&ToolchainLimits) -> io::Result<(PreparedToolchain, &'static str)>,
+    ) -> io::Result<Option<(PreparedToolchain, &'static str)>> {
         checkpoint(stopped)?;
         if expected.bytes > self.max_bytes {
             return Ok(None);
@@ -475,7 +505,7 @@ impl DurableCache {
             }
         };
         if let Some(prepared) = self.load(expected, stopped)? {
-            return Ok(Some(prepared));
+            return Ok(Some((prepared, "captured")));
         }
         let used = self.catalogue(stopped)?;
         if used.entries >= self.max_entries || expected.bytes > self.max_bytes - used.bytes {
@@ -489,6 +519,17 @@ impl DurableCache {
             expected.files <= limits.max_entries as u64 && expected.bytes <= limits.max_bytes,
             "persistent toolchain capture exceeds dataset bounds",
         )?;
+        produce(&limits).map(Some)
+    }
+
+    fn capture_source(
+        &self,
+        source: &Path,
+        expected: &ToolchainIdentity,
+        limits: &ToolchainLimits,
+        stopped: &impl Fn() -> bool,
+        verify_source: impl Fn() -> io::Result<()>,
+    ) -> io::Result<PreparedToolchain> {
         verify_source()?;
         let objects = self.root.join(OBJECTS);
         // The pending name records the COMPLETE reservation before any copy.
@@ -502,30 +543,170 @@ impl DurableCache {
             builder.permissions(fs::Permissions::from_mode(0o700));
         }
         let staging = builder.tempdir_in(&objects)?.keep();
-        let result = (|| -> io::Result<Option<PreparedToolchain>> {
+        let result = (|| -> io::Result<PreparedToolchain> {
             let prepared = capture_toolchain(
                 source,
                 &staging.join("tree"),
                 Some(expected),
-                &limits,
+                limits,
                 stopped,
             )?;
             verify_source()?;
-            prepared.sync(stopped)?;
-            File::open(&staging)?.sync_all()?;
-            checkpoint(stopped)?;
-            drop(prepared); // Reopen the inventory at its new stable name.
-            publish_new_directory(&staging, &objects.join(name(expected)))?;
-            checkpoint(stopped)?;
-            let prepared = self
-                .load(expected, stopped)?
-                .ok_or_else(|| invalid("published persistent toolchain disappeared"))?;
-            Ok(Some(prepared))
+            self.publish(prepared, &staging, expected, stopped)
         })();
-        result.map_err(|error| io::Error::new(error.kind(), format!(
-            "persistent toolchain capture failed; inspect retained staging {} and final entry: {error}",
-            staging.display(),
-        )))
+        result.map_err(|error| Self::capture_error(&staging, error))
+    }
+
+    fn capture_error(staging: &Path, error: io::Error) -> io::Error {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "persistent toolchain capture failed; inspect retained staging {} and final entry: {error}",
+                staging.display(),
+            ),
+        )
+    }
+
+    fn upload_directory(path: &Path) -> io::Result<()> {
+        private_directory(path)?;
+        let mut children = fs::read_dir(path)?;
+        let child = children
+            .next()
+            .transpose()?
+            .ok_or_else(|| {
+                invalid("owned toolchain upload directory has no sealed tree")
+            })?;
+        require(
+            child.file_name() == "tree" && children.next().transpose()?.is_none(),
+            "owned toolchain upload directory contains unrelated entries",
+        )
+    }
+
+    fn capture_owned(
+        &self,
+        upload: SealedToolchain,
+        expected: &ToolchainIdentity,
+        limits: &ToolchainLimits,
+        stopped: &impl Fn() -> bool,
+    ) -> io::Result<(PreparedToolchain, &'static str)> {
+        #[cfg(target_os = "linux")]
+        {
+            use rustix::fs::{CWD, Mode, OFlags, RenameFlags, ResolveFlags, openat2, renameat_with};
+            use std::os::unix::fs::MetadataExt;
+
+            let source = fs::canonicalize(upload.directory())?;
+            require(
+                upload.prepared().root() == source.join("tree"),
+                "durable upload differs from its owned directory",
+            )?;
+            Self::upload_directory(&source)?;
+            let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+            let resolve = ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_SYMLINKS;
+            let held = File::from(openat2(CWD, &source, flags, Mode::empty(), resolve)?);
+            let metadata = held.metadata()?;
+            upload.prepared().verify_retained_generation(stopped)?;
+            let parent = source
+                .parent()
+                .ok_or_else(|| invalid("owned toolchain directory has no parent"))?;
+            let parent = File::from(openat2(CWD, parent, flags, Mode::empty(), resolve)?);
+            let source_name = source
+                .file_name()
+                .ok_or_else(|| invalid("owned toolchain directory has no name"))?;
+            // The live directory's inode is unique on this filesystem. The
+            // bounded suffix is only a reservation name, never content evidence.
+            let pending = format!(
+                "{PENDING}{}-{:016x}{:016x}",
+                name(expected),
+                metadata.dev(),
+                metadata.ino(),
+            );
+            let staging = self.root.join(OBJECTS).join(&pending);
+            self.check_root()?;
+            require(
+                same_file(&metadata, &fs::symlink_metadata(&source)?),
+                "owned toolchain directory was replaced before relocation",
+            )?;
+            checkpoint(stopped)?;
+            match renameat_with(
+                &parent,
+                source_name,
+                &self.objects_handle,
+                pending.as_str(),
+                RenameFlags::NOREPLACE,
+            ) {
+                Ok(()) => {}
+                Err(error) if error == rustix::io::Errno::XDEV => {
+                    // A failed cross-device rename leaves the actual upload
+                    // owner in place through verified copy, sync and reopen.
+                    return self
+                        .capture_source(
+                            upload.prepared().root(),
+                            expected,
+                            limits,
+                            stopped,
+                            || upload.prepared().verify_retained_generation(stopped),
+                        )
+                        .map(|toolchain| (toolchain, "captured"));
+                }
+                Err(error) => return Err(io::Error::from(error)),
+            }
+            // The atomic move establishes the complete charged reservation.
+            // No fallible operation or cancellation may remove it from now on.
+            let (prepared, directory) = upload.into_parts();
+            let _ = directory.keep();
+            let result = (|| -> io::Result<PreparedToolchain> {
+                // Attempt both sides of the cross-directory durability barrier
+                // before observing cancellation. An I/O error remains uncertain
+                // custody, never permission to erase the moved pending image.
+                let source_sync = parent.sync_all();
+                let destination_sync = self.objects_handle.sync_all();
+                source_sync?;
+                destination_sync?;
+                self.check_root()?;
+                require(
+                    same_file(&metadata, &fs::symlink_metadata(&staging)?),
+                    "relocated toolchain directory differs from its held owner",
+                )?;
+                Self::upload_directory(&staging)?;
+                let prepared = prepared.rebind_root(&staging.join("tree"), stopped)?;
+                prepared.verify(stopped)?;
+                self.publish(prepared, &staging, expected, stopped)
+            })();
+            result
+                .map(|toolchain| (toolchain, "adopted"))
+                .map_err(|error| Self::capture_error(&staging, error))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (upload, expected, limits, stopped);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "owned durable toolchain relocation requires Linux",
+            ))
+        }
+    }
+
+    fn publish(
+        &self,
+        prepared: PreparedToolchain,
+        staging: &Path,
+        expected: &ToolchainIdentity,
+        stopped: &impl Fn() -> bool,
+    ) -> io::Result<PreparedToolchain> {
+        prepared.sync(stopped)?;
+        File::open(staging)?.sync_all()?;
+        checkpoint(stopped)?;
+        let published = self.root.join(OBJECTS).join(name(expected));
+        publish_new_directory(staging, &published)?;
+        // Keep the original retained witness across BOTH parent moves and the
+        // mandatory durable reopen. A new inventory must not refresh a changed
+        // generation into a successful acquisition, even with restored bytes.
+        let prepared = prepared.rebind_root(&published.join("tree"), stopped)?;
+        let reopened = self
+            .load(expected, stopped)?
+            .ok_or_else(|| invalid("published persistent toolchain disappeared"))?;
+        prepared.verify_retained_generation(stopped)?;
+        Ok(reopened)
     }
 }
 

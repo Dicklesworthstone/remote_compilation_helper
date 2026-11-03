@@ -313,22 +313,27 @@ impl Dataset {
         stopped: &impl Fn() -> bool,
     ) -> io::Result<(Arc<Self>, &'static str)> {
         checkpoint(stopped)?;
-        if let Some(cache) = &pool.1
-            && let Some(toolchain) = cache.capture_prepared(upload.prepared(), stopped)?
-        {
-            // Durable storage still requires its own bounded reservation,
-            // synchronous publication and reopen at the final stable name.
-            // Keep the upload owner alive throughout that existing capture.
-            return Ok((
-                Arc::new(Self {
+        let upload = if let Some(cache) = &pool.1 {
+            match cache.capture_upload(upload, stopped)? {
+                durable::UploadedCapture::Retained {
                     toolchain,
-                    _directory: None,
-                    pool: Arc::clone(pool),
-                    verification: Mutex::new(None),
-                }),
-                "captured",
-            ));
-        }
+                    disposition,
+                } => {
+                    return Ok((
+                        Arc::new(Self {
+                            toolchain,
+                            _directory: None,
+                            pool: Arc::clone(pool),
+                            verification: Mutex::new(None),
+                        }),
+                        disposition,
+                    ));
+                }
+                durable::UploadedCapture::Declined(upload) => upload,
+            }
+        } else {
+            upload
+        };
         // Capacity or writer contention can decline durable retention. The
         // sealed upload already owns independent bytes: retain that image rather
         // than copying the complete SDK into another temporary tree. Errors from
