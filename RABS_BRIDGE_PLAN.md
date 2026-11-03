@@ -2527,9 +2527,18 @@ real Cargo serving, fleet performance or release qualification.
     full1,697/1,755+58 audit twice. DSR rabs_cancelled_decision submitted
     04:14:49UTC,PID23187,version2.1.34-rabscancel.861f3a5c;
     immutable9,481-byte driver98c1d21bd94cc3e8d75740c5485c09a5e51b1d86de6d3537335deea82cc0e496.
-  - [ ] Finish corrected-fixture original10 integration cases, full110 units,
-    source-after, scoped/full workspace check, strict Clippy and fmt. Preserve
-    the original9/10; never substitute a retry for that RED or close M6 on units.
+  - [x] Finish corrected-fixture source861 component qualification: original10
+    actual-wrapper integration cases all pass, full110 wrapper units all pass,
+    no ignored cases. Nine supervision and three lookup controls are subsets.
+    Compile0/177.88s; integration0/8.96s; component-source-after verified and
+    component_raw_exit0. Retained normal wrapper8,162,024 bytes, SHA-256
+    13230e439f3ff6dee2d57aff5984491c25a94b18e4e3bfec1ccd1f9fc6f2bff0.
+    Scoped all-target check0/146.18s, strict Clippy0/137.37s, workspace fmt0.
+    Original sourcec356 integration9/10 remains RED; this is not public replay,
+    TLS, full-workspace or release qualification.
+  - [ ] Finish source861 full workspace check/strict Clippy and final source
+    audit. At04:26UTC workspace check waits on the normal Cargo target lock;
+    no full-workspace pass or closure is claimed from the component checkpoint.
   - [x] Launch independent public runtime retest using compiled c356 wrapper
     plus unchanged source272 daemon, each bound to its own source/hash. No
     claim of a newly matching4tool/current-main toolset; the known integration
@@ -2541,11 +2550,54 @@ real Cargo serving, fleet performance or release qualification.
     and original deadlines stay. DSR rabs_bare_public_canary submitted04:04:23UTC,
     PID40325,version2.1.34-rabsbarepublic.c356a023; immutable11,562-byte driver
     e19267025c0abd59aced09ece9851a42587dfd35aaf821703557aefb0273ddc0.
-  - [ ] Observe ALL public candidate rounds and exact11/8 counts, retain every
-    timing/result and source/binary-after. Initial actual commits/verifications
-    are progress, not a terminal pass. A pass establishes this bounded opt-in
-    local lane only; original9/10, canonical/TLS worker, RCH frontdoor, fleet,
-    performance and release acceptance stay separately open.
+  - [x] Retain public candidate terminal failure, DSR80a0a494 raw6/809s, native
+    rabs-1 Cargo101. Same-invocation stock0/231.024s and first wrapped cold
+    round0/366.149s, all11metadata byte-equal, exact8executes/8commits. The first
+    verification round fails at cpufeatures: compiler-group quiescence was not
+    confirmed before the original2s deadline. This is progress from all-shadow
+    behavior but NOT working replay. Remaining verification/serve rounds and
+    final source/binary audits are not reached. No speed win or useful-lane
+    qualification. Full report and DSR state/result are retained under
+    /Volumes/trj-data/rabs-wrapper-trace-20261103/bare-public-canary/.
+  - [x] Implement a bounded census improvement after that real failure: enumerate
+    EVERY visible PID, query its kernel process group through existing locked
+    Rustix, then read full procfs identity and every thread for matching members.
+    Only ESRCH means disappearance; other query errors fail closed. Preserve
+    pinned unreaped leader, original8192byte bound, entry cap, both complete
+    terminal sweeps and original2s budget. Safe process feature adds no runtime
+    dependency edge (wrapper2/3 unchanged). Add failed-query/missing-fence and
+    actual live/unreaped/disappeared-kernel controls. Native qualification is
+    still pending; no allocation-only retry or deadline extension.
+  - [ ] Compile that exact kernel-query source, run all original wrapper/integration
+    controls plus new negatives, source-after and required QA. Repeat the public
+    original5Cargo/11outputs/8dependency ladder, retaining prior failures and
+    every timing. Do not call cold8/8 evidence of replay or a performance win.
+    Frozen source85dc06ed-overlay-861-kernel-group-query-bd90eee16f3667270348b50a7d9ea570ac355d68eb5b260d3aadec74749ec735,
+    manifest68dc4c17119ff641ec7b06b59ced9b88cd51f0b7465230856d59cdf672a60937,
+    full1,697/1,755+58 verified twice. DSR8eb2981f-ebd0-42f2-a379-9cf41d4fc619
+    submitted04:37:26UTC, PID5835, version2.1.34-rabskernel.bd90eee1;
+    immutable9,667-byte driver54d52d67aef970337887841810316a8211a37fc263b4665c45d7123e1c73515a.
+    Exact predeclared112wrapper units,11supervision subset,3lookup subset and
+    10actual-wrapper integration cases; zero ignored cases required. UBS0,
+    0critical/66warnings/52info on these two changed files; fmt0. Native pending.
+  - [x] Complete source272 normal worker/root build through DSR8611 attempt3,
+    Cargo0/84m02s. Actual normal worker713,197,968 bytes SHA-256
+    8967a4eaa1e113df999b29ca80360204ea801f032c33ffe203c1fbb827c94a8f;
+    root companion681,525,336 bytes
+    caf2339ebc82db3b8f182621273df0b1ad3307106c64204114ce68e0032dea3e.
+    Actual CargoJSON binds these, daemon and wrapper to the same source272.
+    This is four normal executables compiled, not actual worker execution.
+  - [x] Submit DSR rabs_retained_canonical_consumer04:33:58UTC, PID92707,
+    version2.1.34-rabstlsconsumer.272b3ab0. Unchanged canonical TLS test source
+    is byte-identical to retained sourcebe324 harness3dad0977; explicitly bind
+    its older linked dependencies/profile separately from the four source272
+    production roles. Private copies preserve worker/root sibling relationship.
+    Original assertions require three4-unit TLS rounds then two2-hit+2workspace
+    rounds, released receipts/no residuals and relocated edit. No stub, key
+    injection, timeout increase or current-harness/full-workspace claim.
+  - [ ] Observe that independent original1/1 native TLS case and exact worker/cache
+    assertions, raw exit, source/binary-after. Original source2729/10 and old
+    source813 worker0/4 remain RED; a successful new case cannot erase either.
   - [x] Finish the original worktree suite: **9 passed, 1 failed, 0 ignored**,
     raw101, libtest780.20s. Five real Cargo cases and four binary-integrity
     controls pass. Vendored dependencies fail at verify-1: expected3 verified
@@ -2985,6 +3037,20 @@ real Cargo serving, fleet performance or release qualification.
   repeats the group check and full retained/new-upload source audits, then the
   same test and QA chain with the original product gates. Normal Cargo owns
   artifact freshness; there is no forced Fresh or live deadline extension.
+- [x] Retain attempt2 terminal timeout/raw5,10,900s; no native routing unit
+  executed. Separate state/result/recipe are preserved under the same local
+  worker-cache-wiring evidence directory. Post-deadline thread-aware snapshot
+  finds no member of native group2614742 and Cargo2621664 absent; this proves
+  that original group's closure, not all cache holders.
+- [x] Resume the SAME50520372 DSR run04:19:54UTC, coordinator47585, with exact
+  source459 and its retained ordinary-development target. New immutable7,409-byte
+  driver a644c5bd16f12a356f0a0985707d74bf85e58a11fdf88dd30f7b7bbadcdf9383
+  keeps all three original focused patterns, nonzero denominators, source audits
+  and mandatory workspace QA. Build/retain the normal client after those tests
+  and before broader QA, so runtime experiments need not wait on unrelated
+  checks; overall qualification still needs every required check. Original
+  product budgets and10,800s host deadline stay. At04:26UTC fsqlite-core is
+  compiling; no new routing pass or current client exists yet.
 - [ ] Observe routing, source-lock and config-guard test denominators; require
   actual nonzero test counts as well as raw exits. Finish workspace check,
   strict Clippy, fmt, rch build and both source-after audits. Retain the first
