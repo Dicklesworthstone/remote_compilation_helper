@@ -332,10 +332,13 @@ fn prepare_from_arguments_with(
     )
 }
 
-fn prepare_template_from_arguments(args: &[String]) -> std::io::Result<serde_json::Value> {
+fn prepare_template_from_arguments(
+    args: &[String],
+    before_capture: impl FnOnce(&mut serde_json::Value) -> std::io::Result<()>,
+) -> std::io::Result<serde_json::Value> {
     prepare_from_arguments_using(
         args,
-        |_| Ok(()),
+        before_capture,
         rabsd::coord::source_delivery::prepare_source_template,
     )
 }
@@ -481,8 +484,8 @@ fn main() {
                  It durably reserves a worker ID under RABS_STATE_DIR and holds admission through dispatch.\n\
                  Direct build bundles and result recovery keep their original assigned numeric request IDs.\n\
                  DAEMON JOB: rabsd --job-submit <id32hex> <listen-IP:port> <worker> <pin> <bundle> <delivery> <outputs>\n\
-                 CAPTURE AND QUEUE: rabsd --job-build --prepare-from <source-root> <spec.json> <id32hex> <listen-IP:port> <worker> <pin> <bundle> <delivery> <outputs>\n\
-                 POOL: rabsd --job-build --prepare-from <source-root> <spec.json> <id32hex> --worker-pool <pool.json> <bundle> <delivery> <outputs>\n\
+                 CAPTURE AND QUEUE: rabsd --job-build [--live-stderr] --prepare-from <source-root> <spec.json> <id32hex> <listen-IP:port> <worker> <pin> <bundle> <delivery> <outputs>\n\
+                 POOL: rabsd --job-build [--live-stderr] --prepare-from <source-root> <spec.json> <id32hex> --worker-pool <pool.json> <bundle> <delivery> <outputs>\n\
                  pool.json is an ordered array of {{address, worker, worker_spki_sha256}} for 1..32 pinned workers.\n\
                  The daemon selects the least queued/running load once; recovery stays with that worker.\n\
                  --job-build requires request_id: \"allocate\", captures immutable inputs, queues once, then replays verified diagnostics.\n\
@@ -490,7 +493,9 @@ fn main() {
                  Retry admission of that SAME saved template/ID: --job-submit-allocated <id32hex> <listen-IP:port> <worker> <pin> <bundle> <delivery> <outputs>\n\
                  Retry the SAME pool intent: --job-submit-pool <id32hex> <pool.json> <bundle> <delivery> <outputs>\n\
                  Inspect/cancel: --job-status <id32hex> | --job-cancel <id32hex>\n\
-                 Wait and replay diagnostics: --job-wait <id32hex> [timeout-seconds]\n\
+                 Wait and replay diagnostics: --job-wait [--live-stderr] <id32hex> [timeout-seconds]\n\
+                 --live-stderr shows a bounded whole-Cargo stderr prefix while running, then verifies it before replaying the exact suffix.\n\
+                 Cargo stdout and artifact readiness remain withheld until verified completion and installation. A gap defers stderr; a failed console write never retries.\n\
                  Follow live NDJSON previews: --job-follow <id32hex> [timeout-seconds]\n\
                  Recover: --job-resume <id32hex> <new-delivery> [old-prefix-directory]\n\
                  Confirm release: --job-acknowledge <id32hex> <owned-delivery>\n\

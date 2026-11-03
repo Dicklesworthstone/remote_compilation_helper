@@ -280,6 +280,15 @@ class CanonicalLocalCargo(unittest.TestCase):
         self.assertEqual(record["profile"]["toolchain_root"], str(self.tools))
         self.assertEqual(record["profile"]["selection"]["run_args"], ["+nightly"])
 
+    def test_live_stderr_is_not_a_local_profile_field_and_refuses_before_discovery(self):
+        self.select_rustup()
+        for value in (True, False, None, 1):
+            with self.subTest(value=value):
+                self.profile["live_stderr"] = value
+                self.save()
+                self.assert_refused(["check"])
+                self.assertFalse(self.rustup_record.exists())
+
     def test_local_toolchain_selectors_are_exclusive_and_explicit_root_never_probes(self):
         env = dict(self.env, CARGO_RABS_RUSTUP="/absent/rustup", RUSTUP_TOOLCHAIN="not-installed")
         self.assertEqual(self.invoke(["check"], env)[0], 0)

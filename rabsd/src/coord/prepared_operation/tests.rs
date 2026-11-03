@@ -87,6 +87,65 @@ fn allocation_template(fixture: &Fixture, sequence: u64, worker: u16) -> Prepare
 }
 
 #[test]
+fn live_stderr_capability_comes_only_from_the_saved_native_cargo_contract() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    let ordinary = fixture.spec(1, 1);
+    assert!(
+        store
+            .submit(ordinary.clone())
+            .unwrap()
+            .live_stderr
+            .is_none()
+    );
+    let cargo = fixture.spec(2, 2);
+    let mut request = prepared_request(&cargo);
+    request["program"] = json!("/__rabs/toolchain/bin/cargo");
+    request["args"] = json!([
+        "check",
+        "--message-format=json",
+        "--target-dir",
+        "/__rabs/out/cargo"
+    ]);
+    request["artifacts"] = json!({
+        "unit":"cargo", "tree":"tree-files-v1", "files":[], "cargo":"cargo-json-v1"
+    });
+    fs::write(
+        cargo.bundle.join("request.json"),
+        serde_json::to_vec(&request).unwrap(),
+    )
+    .unwrap();
+    let submitted = store.submit(cargo.clone()).unwrap();
+    assert_eq!(submitted.live_stderr, Some(CARGO_STDERR_PREVIEW_VERSION));
+
+    // Presentation is bound to the saved request, not a mutable bundle path or
+    // client-chosen mode. These tests do not start a compiler or claim readiness.
+    fs::write(
+        cargo.bundle.join("request.json"),
+        b"changed after admission",
+    )
+    .unwrap();
+    assert_eq!(
+        store.status(&cargo.id).unwrap().unwrap().live_stderr,
+        Some(CARGO_STDERR_PREVIEW_VERSION)
+    );
+    let state = store.lock_state().unwrap();
+    let record = store.read_record(&state, &cargo.id).unwrap().unwrap();
+    for changed in [
+        json!({"program":"/__rabs/toolchain/bin/rustc"}),
+        json!({"args":["check", "--message-format=human", "--target-dir", "/__rabs/out/cargo"]}),
+        json!({"artifacts":{"unit":"cargo", "tree":"tree-files-v1", "files":[]}}),
+        json!({"dependency_context":{}}),
+    ] {
+        let mut refused = record.clone();
+        for (key, value) in changed.as_object().unwrap() {
+            refused.request[key] = value.clone();
+        }
+        assert!(refused.status().live_stderr.is_none());
+    }
+}
+
+#[test]
 fn configured_concurrency_refuses_zero_and_unbounded_executor_counts() {
     assert_eq!(PreparedConcurrency::default().get(), 4);
     for value in [1, 4, 8, 32] {

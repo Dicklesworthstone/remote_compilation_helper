@@ -9,7 +9,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Component, Path};
 
-const USAGE: &str = "usage: rabsd --job-build --prepare-from <source-root> <spec.json> <id32hex> (<listen-IP:port> <worker> <pin> | --worker-pool <pool.json>) <bundle> <delivery> <outputs>";
+const USAGE: &str = "usage: rabsd --job-build [--live-stderr] --prepare-from <source-root> <spec.json> <id32hex> (<listen-IP:port> <worker> <pin> | --worker-pool <pool.json>) <bundle> <delivery> <outputs>";
 const MAX_POOL_FILE_BYTES: u64 = 16 * 1024;
 
 enum Submission {
@@ -139,15 +139,17 @@ pub(super) fn pool_request(args: &[String]) -> io::Result<Value> {
     Ok(Submission::Pool(spec).request())
 }
 
-fn arguments(args: &[String]) -> io::Result<(&str, &str, Submission)> {
-    if args.first().map(String::as_str) != Some("--job-build")
-        || args.get(1).map(String::as_str) != Some("--prepare-from")
-    {
+fn arguments(args: &[String]) -> io::Result<(&str, &str, Submission, bool)> {
+    if args.first().map(String::as_str) != Some("--job-build") {
+        return Err(invalid(USAGE));
+    }
+    let live_stderr = args.get(1).is_some_and(|flag| flag == "--live-stderr");
+    let args = &args[if live_stderr { 2 } else { 1 }..];
+    if args.first().map(String::as_str) != Some("--prepare-from") {
         return Err(invalid(USAGE));
     }
     let (source, specification, submission) = match args {
         [
-            _,
             _,
             source,
             specification,
@@ -172,8 +174,8 @@ fn arguments(args: &[String]) -> io::Result<(&str, &str, Submission)> {
                 Submission::Pool(serde_json::from_value(request["operation"].clone())?),
             )
         }
-        [_, _, source, specification, _, _, _, _, _, _, _] => {
-            if args[4..]
+        [_, source, specification, _, _, _, _, _, _, _] => {
+            if args[3..]
                 .iter()
                 .any(|value| value.is_empty() || value.starts_with("--"))
             {
@@ -181,7 +183,7 @@ fn arguments(args: &[String]) -> io::Result<(&str, &str, Submission)> {
             }
             // Reuse the ordinary client's exact job-ID and positional contract.
             let mut submit = vec!["--job-submit".to_owned()];
-            submit.extend_from_slice(&args[4..]);
+            submit.extend_from_slice(&args[3..]);
             let request = super::request(&submit).map_err(invalid)?;
             (
                 source,
@@ -197,7 +199,7 @@ fn arguments(args: &[String]) -> io::Result<(&str, &str, Submission)> {
     {
         return Err(invalid(USAGE));
     }
-    Ok((source, specification, submission))
+    Ok((source, specification, submission, live_stderr))
 }
 
 fn admission_reply(reply: &Value, submission: &Submission) -> io::Result<()> {
@@ -217,7 +219,7 @@ fn admission_reply(reply: &Value, submission: &Submission) -> io::Result<()> {
 }
 
 pub(super) fn run(args: &[String], socket: &str) -> i32 {
-    let (source, specification, submission) = match arguments(args) {
+    let (source, specification, submission, live_stderr) = match arguments(args) {
         Ok(parsed) => parsed,
         Err(error) => {
             eprintln!("rabsd: {error}");
@@ -239,7 +241,8 @@ pub(super) fn run(args: &[String], socket: &str) -> i32 {
                 "job ID already exists; use --job-status or --job-wait without recapturing",
             ));
         }
-        let prepared = crate::worker_exec::prepare_daemon_build(&spec, source, specification)?;
+        let prepared =
+            crate::worker_exec::prepare_daemon_build(&spec, source, specification, live_stderr)?;
         if prepared["kind"] != "prepared-source-template" || prepared["request_id"] != "allocate" {
             return Err(invalid(
                 "source preparation did not retain allocation intent",
@@ -274,10 +277,14 @@ pub(super) fn run(args: &[String], socket: &str) -> i32 {
         );
         return 1;
     }
-    // This existing native path verifies both complete retained streams before
-    // emitting either, preserves the worker's exit status, and never reconnects
-    // to a worker or repeats a compiler execution.
-    wait::run(&["--job-wait".to_owned(), spec.id], socket)
+    // The optional presentation mode follows the same admitted job. Neither
+    // waiting mode reconnects to a worker or repeats a compiler execution.
+    let mut wait_args = vec!["--job-wait".to_owned()];
+    if live_stderr {
+        wait_args.push("--live-stderr".to_owned());
+    }
+    wait_args.push(spec.id);
+    wait::run(&wait_args, socket)
 }
 
 #[cfg(test)]
@@ -306,7 +313,8 @@ mod tests {
     #[test]
     fn combined_build_requires_explicit_new_preparation_and_retained_job_identity() {
         let values = args();
-        let (source, specification, submission) = arguments(&values).unwrap();
+        let (source, specification, submission, live_stderr) = arguments(&values).unwrap();
+        assert!(!live_stderr);
         assert_eq!((source, specification), ("/source", "/spec.json"));
         assert_eq!(submission.preparation().id, values[4]);
         for at in [0, 1, 4] {
@@ -321,9 +329,26 @@ mod tests {
     }
 
     #[test]
+    fn live_stderr_build_flag_preserves_the_exact_submission_and_requires_its_own_position() {
+        let original = args();
+        let (_, _, expected, _) = arguments(&original).unwrap();
+        let mut live = original.clone();
+        live.insert(1, "--live-stderr".into());
+        let (source, specification, actual, selected) = arguments(&live).unwrap();
+        assert!(selected);
+        assert_eq!((source, specification), ("/source", "/spec.json"));
+        assert_eq!(actual.request(), expected.request());
+        live.insert(1, "--live-stderr".into());
+        assert!(arguments(&live).is_err());
+        let mut trailing = original;
+        trailing.push("--live-stderr".into());
+        assert!(arguments(&trailing).is_err());
+    }
+
+    #[test]
     fn admission_is_bound_to_the_original_job_and_has_no_publication_authority() {
         let values = args();
-        let (_, _, submission) = arguments(&values).unwrap();
+        let (_, _, submission, _) = arguments(&values).unwrap();
         let id = &values[4];
         let good = json!({"kind":"prepared-operation", "operation":{
             "id":id, "request_id":null, "request_sha256":"ab".repeat(32),
@@ -369,7 +394,8 @@ mod tests {
     fn pool_build_and_explicit_retry_carry_the_same_ordered_placement_intent() {
         let root = tempfile::tempdir().unwrap();
         let (values, workers) = pool_values(root.path());
-        let (source, specification, submission) = arguments(&values).unwrap();
+        let (source, specification, submission, live_stderr) = arguments(&values).unwrap();
+        assert!(!live_stderr);
         assert_eq!((source, specification), ("/source", "/spec.json"));
         let request = submission.request();
         assert_eq!(request["kind"], "prepared-submit-pool");

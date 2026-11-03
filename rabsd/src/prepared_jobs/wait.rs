@@ -14,11 +14,17 @@ const DEFAULT_WAIT_SECONDS: u64 = 3600;
 const MAX_WAIT_SECONDS: u64 = 86400;
 const COMPLETION_BUDGET: Duration = Duration::from_secs(300);
 
-fn arguments(args: &[String]) -> Result<(&str, Duration), &'static str> {
-    if !matches!(args.len(), 2 | 3) || args[0] != "--job-wait" {
-        return Err("usage: rabsd --job-wait <id32hex> [timeout-seconds]");
+fn arguments(args: &[String]) -> Result<(&str, Duration, bool), &'static str> {
+    const USAGE: &str = "usage: rabsd --job-wait [--live-stderr] <id32hex> [timeout-seconds]";
+    if args.first().map(String::as_str) != Some("--job-wait") {
+        return Err(USAGE);
     }
-    let id = &args[1];
+    let live_stderr = args.get(1).is_some_and(|flag| flag == "--live-stderr");
+    let args = &args[if live_stderr { 2 } else { 1 }..];
+    if !matches!(args.len(), 1 | 2) {
+        return Err(USAGE);
+    }
+    let id = &args[0];
     if id.len() != 32
         || !id
             .bytes()
@@ -26,7 +32,7 @@ fn arguments(args: &[String]) -> Result<(&str, Duration), &'static str> {
     {
         return Err("job ID must be exactly 32 lowercase hexadecimal digits");
     }
-    let seconds = match args.get(2) {
+    let seconds = match args.get(1) {
         None => DEFAULT_WAIT_SECONDS,
         Some(value) if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) => {
             value.parse::<u64>().map_err(|_| "invalid wait timeout")?
@@ -36,7 +42,7 @@ fn arguments(args: &[String]) -> Result<(&str, Duration), &'static str> {
     if seconds == 0 || seconds > MAX_WAIT_SECONDS {
         return Err("wait timeout must be between 1 and 86400 seconds");
     }
-    Ok((id, Duration::from_secs(seconds)))
+    Ok((id, Duration::from_secs(seconds), live_stderr))
 }
 
 #[derive(Debug)]
@@ -188,13 +194,16 @@ fn follow(
 }
 
 pub(super) fn run(args: &[String], socket: &str) -> i32 {
-    let (id, budget) = match arguments(args) {
+    let (id, budget, live_stderr) = match arguments(args) {
         Ok(parsed) => parsed,
         Err(detail) => {
             eprintln!("rabsd: {detail}");
             return 2;
         }
     };
+    if live_stderr {
+        return super::live::run(id, budget, socket);
+    }
     let until = Instant::now() + budget;
     let mut exposed = false;
     let result = (|| -> io::Result<i32> {
@@ -277,6 +286,25 @@ mod tests {
             vec!["--job-wait", ID, "1.0"],
             vec!["--job-wait", ID, "--job-resume"],
             vec!["--job-wait", ID, "10", "extra"],
+        ] {
+            assert!(arguments(&args(&values)).is_err(), "{values:?}");
+        }
+    }
+
+    #[test]
+    fn live_stderr_wait_is_explicit_and_keeps_the_same_identity_and_deadline_bounds() {
+        let values = args(&["--job-wait", "--live-stderr", ID, "23"]);
+        let (id, budget, live) = arguments(&values).unwrap();
+        assert_eq!(id, ID);
+        assert_eq!(budget, Duration::from_secs(23));
+        assert!(live);
+        assert!(!arguments(&args(&["--job-wait", ID])).unwrap().2);
+        for values in [
+            vec!["--job-wait", "--live-stderr"],
+            vec!["--job-wait", "--live-stderr", "--live-stderr", ID],
+            vec!["--job-wait", "--live-stderr", ID, "0"],
+            vec!["--job-wait", "--live-stderr", ID, "86401"],
+            vec!["--job-wait", ID, "--live-stderr"],
         ] {
             assert!(arguments(&args(&values)).is_err(), "{values:?}");
         }

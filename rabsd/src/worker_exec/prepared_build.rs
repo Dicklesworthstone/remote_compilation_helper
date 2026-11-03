@@ -658,6 +658,7 @@ pub fn prepare_daemon_build(
     spec: &rabsd::coord::prepared_operation::PreparedOperationSpec,
     source: &str,
     specification: &str,
+    live_stderr: bool,
 ) -> io::Result<Value> {
     let build = PreparedBuild {
         address: &spec.address,
@@ -670,14 +671,27 @@ pub fn prepare_daemon_build(
         resume_from: None,
     };
     build.validate_preparation(source)?;
-    crate::prepare_template_from_arguments(&[
-        source.to_owned(),
-        specification.to_owned(),
-        spec.bundle
-            .to_str()
-            .ok_or_else(|| invalid("bundle path must be UTF-8"))?
-            .to_owned(),
-    ])
+    crate::prepare_template_from_arguments(
+        &[
+            source.to_owned(),
+            specification.to_owned(),
+            spec.bundle
+                .to_str()
+                .ok_or_else(|| invalid("bundle path must be UTF-8"))?
+                .to_owned(),
+        ],
+        |request| {
+            // Use the exact bounded specification which capture will consume.
+            // Unsupported live presentation must refuse before even a source
+            // bundle is produced, and therefore before daemon submission.
+            if live_stderr && rabs_sandbox::cargo_artifacts::requested(request)?.is_none() {
+                return Err(invalid(
+                    "live stderr requires the native whole-Cargo diagnostics contract",
+                ));
+            }
+            Ok(())
+        },
+    )
 }
 
 /// Run one durable daemon claim without writing CLI output or subscribing to
@@ -930,6 +944,49 @@ mod tests {
             mode: DeliveryMode::Execute,
             resume_from: None,
         }
+    }
+
+    #[test]
+    fn live_stderr_refuses_non_cargo_before_capture_without_changing_default_preparation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let (source, specification) = preparation_fixture(&root);
+        let mut request: Value =
+            serde_json::from_slice(&fs::read(&specification).unwrap()).unwrap();
+        request["request_id"] = json!("allocate");
+        fs::write(&specification, serde_json::to_vec(&request).unwrap()).unwrap();
+        let spec = rabsd::coord::prepared_operation::PreparedOperationSpec {
+            id: "0123456789abcdef0123456789abcdef".into(),
+            address: "127.0.0.1:0".into(),
+            worker: "worker".into(),
+            worker_spki_sha256: "01".repeat(32),
+            bundle: root.join("bundle"),
+            delivery: root.join("delivery"),
+            output: root.join("output"),
+        };
+        let error = prepare_daemon_build(
+            &spec,
+            source.to_str().unwrap(),
+            specification.to_str().unwrap(),
+            true,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("whole-Cargo"));
+        assert!(!spec.bundle.exists() && !spec.delivery.exists() && !spec.output.exists());
+        let prepared = prepare_daemon_build(
+            &spec,
+            source.to_str().unwrap(),
+            specification.to_str().unwrap(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(prepared["kind"], "prepared-source-template");
+        assert_eq!(prepared["request_id"], "allocate");
+        assert_eq!(
+            fs::read(spec.bundle.join("source/lib.rs")).unwrap(),
+            fs::read(source.join("lib.rs")).unwrap()
+        );
+        assert!(!spec.delivery.exists() && !spec.output.exists());
     }
 
     #[test]

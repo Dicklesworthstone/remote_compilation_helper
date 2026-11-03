@@ -4,6 +4,7 @@
 
 mod build;
 mod follow;
+mod live;
 mod wait;
 
 use asupersync::io::{AsyncReadExt, AsyncWriteExt};
@@ -392,7 +393,7 @@ pub(crate) fn run(args: &[String], socket: &str) -> i32 {
                 --job-submit-allocated <id32hex> <listen-IP:port> <worker> <pin> <template-bundle> <delivery> <output>\n\
                 --job-submit-pool <id32hex> <pool.json> <template-bundle> <delivery> <output>\n\
                 --job-status <id32hex>\n\
-                --job-wait <id32hex> [timeout-seconds]\n\
+                --job-wait [--live-stderr] <id32hex> [timeout-seconds]\n\
                 --job-follow <id32hex> [timeout-seconds]\n\
                 --job-cancel <id32hex>\n\
                 --job-resume <id32hex> <new-delivery> [old-prefix-directory]\n\

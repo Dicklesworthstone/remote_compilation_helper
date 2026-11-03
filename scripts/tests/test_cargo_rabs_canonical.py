@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import selectors
 import signal
 import socket
 import stat
@@ -31,7 +32,11 @@ import json, os, pathlib, signal, sys
 args = sys.argv[1:]
 job_id = None
 pool, pool_file = None, None
+live_stderr = False
 if args[0] == "--job-build":
+    if args[1:2] == ["--live-stderr"]:
+        live_stderr = True
+        args = args[:1] + args[2:]
     assert args[0:2] == ["--job-build", "--prepare-from"], args
     if args[5] == "--worker-pool":
         source, specification, job_id, selector, pool_file, bundle, delivery, output = args[2:]
@@ -64,9 +69,15 @@ else:
 assert cargo_args.count("--message-format=json") == 1
 assert request["toolchain_source"] + "/bin/cargo" == os.environ["CARGO"]
 assert request["toolchain_source"] + "/bin/rustc" == os.environ["RUSTC"]
+if live_stderr and os.environ.get("TEST_LIVE_STDERR_PREFIX"):
+    # Presentation fixture only. The production native client owns prefix
+    # verification and stdout withholding; this tests unbuffered exec handoff.
+    sys.stderr.buffer.write(b"fixture live stderr\x00\xfe\n")
+    sys.stderr.buffer.flush()
 record = {"pid":os.getpid(), "argv":sys.argv, "request":request,
           "cwd":os.getcwd(), "tls":os.environ.get("RABS_COORD_TLS_KEY"),
           "job_id":job_id, "socket":os.environ.get("RABS_SOCKET_PATH"),
+          "live_stderr":live_stderr,
           "worker_pool":pool, "pool_file":pool_file,
           "operation":str(operation), "input":sys.stdin.buffer.read().hex()}
 fd = os.environ.get("TEST_INHERITED_FD")
@@ -164,9 +175,14 @@ sys.exit(int(os.environ.get("TEST_EXIT", "0")))
 JOB_RECOVERY_DRIVER = r'''
 # Executable handoff double; the actual daemon owns all completion verification.
 import json, os, signal, sys
-assert len(sys.argv) == 3 and sys.argv[1] == "--job-wait", sys.argv
-assert len(sys.argv[2]) == 32 and all(c in "0123456789abcdef" for c in sys.argv[2])
+args = sys.argv[1:]
+live_stderr = args[1:2] == ["--live-stderr"]
+if live_stderr:
+    args = args[:1] + args[2:]
+assert len(args) == 2 and args[0] == "--job-wait", sys.argv
+assert len(args[1]) == 32 and all(c in "0123456789abcdef" for c in args[1])
 record = {"pid": os.getpid(), "argv": sys.argv, "socket": os.environ.get("RABS_SOCKET_PATH"),
+          "live_stderr": live_stderr,
           "state": os.environ.get("RABS_STATE_DIR"), "input": sys.stdin.buffer.read().hex()}
 with open(os.environ["TEST_DRIVER_RECORD"], "a") as result:
     result.write(json.dumps(record) + "\n")
@@ -280,6 +296,26 @@ class CanonicalCargo(unittest.TestCase):
              "worker_spki_sha256": format(index + 1, "064x")}
             for index in range(count)
         ]
+        self.save()
+        return endpoint
+
+    def select_daemon_socket_metadata(self, worker_pool=False):
+        """Real private socket inode, with no listening or emulated daemon.
+
+        These tests hand off to an explicit executable double, which never
+        connects. Only endpoint metadata validation and process/argv custody
+        are tested. Existing listener-based tests retain their real bindings.
+        """
+        endpoint = self.root / "daemon-intent.sock"
+        os.mknod(endpoint, stat.S_IFSOCK | 0o600)
+        self.profile["daemon_socket"] = str(endpoint)
+        if worker_pool:
+            for field in ("listen", "worker", "worker_spki_sha256"):
+                self.profile.pop(field)
+            self.profile["workers"] = [
+                {"listen": "127.0.0.1:45123", "worker": "worker-a", "worker_spki_sha256": "ab" * 32},
+                {"listen": "127.0.0.1:45124", "worker": "worker-b", "worker_spki_sha256": "cd" * 32},
+            ]
         self.save()
         return endpoint
 
@@ -798,6 +834,122 @@ class CanonicalCargo(unittest.TestCase):
         self.assertEqual(len({record["job_id"] for record in records}), 4)
         self.assertTrue(all(record["request"]["request_id"] == "allocate" for record in records))
         self.assertTrue(all(record["argv"][1] == "--job-build" for record in records))
+
+    def test_live_stderr_exec_handoff_preserves_early_bytes_and_one_native_result(self):
+        endpoint = self.select_daemon_socket_metadata()
+        self.profile["live_stderr"] = True
+        self.save()
+        env = dict(self.env, TEST_EXIT="101", TEST_LIVE_STDERR_PREFIX="1",
+                   RABS_SOCKET_PATH="/wrong/ambient.sock")
+        command = [sys.executable, "-I", "-S", str(LAUNCHER), "rabs", "--rabs-canonical",
+                   str(self.profile_path), "--", "check", "--workspace"]
+        child = subprocess.Popen(command, env=env, cwd=self.root, stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        early = bytearray()
+        prefix = b"fixture live stderr\x00\xfe\n"
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(child.stderr, selectors.EVENT_READ)
+                deadline = time.monotonic() + 5
+                while prefix not in early:
+                    remaining = deadline - time.monotonic()
+                    self.assertGreater(remaining, 0, early)
+                    self.assertTrue(selector.select(remaining), early)
+                    chunk = os.read(child.stderr.fileno(), 4096)
+                    self.assertTrue(chunk, early)
+                    early.extend(chunk)
+                    self.assertLessEqual(len(early), 16384)
+                self.assertIsNone(child.poll(), "fixture must still own its open stdin")
+                selector.unregister(child.stderr)
+                selector.register(child.stdout, selectors.EVENT_READ)
+                self.assertEqual(selector.select(0), [], "launcher must not manufacture early stdout")
+            stdout, stderr = child.communicate(b"native stdin\x00\xff", timeout=5)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=3)
+        self.assertEqual(child.returncode, 101, bytes(early) + stderr)
+        self.assertEqual(stdout, b"fixture Cargo stdout\x00\xff\n")
+        self.assertEqual((bytes(early) + stderr).count(prefix), 1)
+        record, = self.records()
+        self.assertEqual(record["pid"], child.pid)
+        self.assertTrue(record["live_stderr"])
+        self.assertEqual(record["socket"], str(endpoint))
+        self.assertEqual(record["input"], b"native stdin\x00\xff".hex())
+        self.assertEqual(record["argv"][1:4], ["--job-build", "--live-stderr", "--prepare-from"])
+        self.assertEqual(record["argv"].count("--live-stderr"), 1)
+        self.assertNotIn("live_stderr", record["request"])
+        self.assertEqual(record["request"]["command_context"]["env"], {"CARGO_INCREMENTAL": "0"})
+        operation = Path(record["operation"])
+        metadata = json.loads((operation / "operation.json").read_bytes())
+        self.assertIs(metadata["live_stderr"], True)
+        self.assertEqual(metadata["job_wait_argv"],
+                         [str(self.driver), "--job-wait", "--live-stderr", record["job_id"]])
+        for action in ("submit", "status", "cancel"):
+            self.assertNotIn("--live-stderr", metadata["job_" + action + "_argv"])
+        self.assertEqual(list(self.operations.iterdir()), [operation])
+        self.assertFalse(self.forbidden.exists())
+
+    def test_live_stderr_pool_handoff_and_false_default_keep_existing_native_placement(self):
+        endpoint = self.select_daemon_socket_metadata(worker_pool=True)
+        for live in (True, False, None):
+            with self.subTest(live_stderr=live):
+                if live is None:
+                    self.profile.pop("live_stderr", None)
+                else:
+                    self.profile["live_stderr"] = live
+                self.save()
+                status, _, stderr, _ = self.invoke(["test", "--workspace"], input=b"pool input")
+                self.assertEqual(status, 0, stderr)
+                record = self.records()[-1]
+                operation = Path(record["operation"])
+                flags = ["--live-stderr"] if live else []
+                self.assertEqual(record["argv"], [str(self.driver), "--job-build"] + flags + [
+                    "--prepare-from", str(self.source), str(operation / "spec.json"), record["job_id"],
+                    "--worker-pool", str(operation / "pool.json"), str(operation / "bundle"),
+                    str(operation / "delivery"), str(operation / "outputs")])
+                self.assertEqual(record["socket"], str(endpoint))
+                self.assertEqual(record["live_stderr"], bool(live))
+                self.assertEqual(record["request"]["artifacts"]["cargo"], "cargo-test-json-v1")
+                self.assertNotIn("live_stderr", record["request"])
+                metadata = json.loads((operation / "operation.json").read_bytes())
+                self.assertEqual(metadata["job_wait_argv"],
+                                 [str(self.driver), "--job-wait"] + flags + [record["job_id"]])
+                if live is None:
+                    self.assertNotIn("live_stderr", metadata)
+                else:
+                    self.assertIs(metadata["live_stderr"], live)
+                self.assertEqual(metadata["job_submit_argv"], [str(self.driver), "--job-submit-pool",
+                    record["job_id"], str(operation / "pool.json"), str(operation / "bundle"),
+                    str(operation / "delivery"), str(operation / "outputs")])
+        self.assertEqual(len(self.records()), 3)
+
+    def test_live_stderr_profile_refuses_invalid_types_before_rustup_discovery(self):
+        self.select_rustup()
+        self.select_daemon_socket_metadata()
+        for value in (None, 0, 1, "true", "false", [], {}):
+            with self.subTest(value=value):
+                self.profile["live_stderr"] = value
+                self.save()
+                self.assert_refused(["check"])
+                self.assertFalse(self.rustup_record.exists())
+
+    def test_live_stderr_profile_requires_explicit_valid_daemon_before_discovery_or_writes(self):
+        self.select_rustup()
+        endpoint = self.select_daemon_socket_metadata()
+        self.profile.pop("daemon_socket")
+        for value in (True, False):
+            with self.subTest(live_stderr=value):
+                self.profile["live_stderr"] = value
+                self.save()
+                self.assert_refused(["check"], dict(self.env, RABS_SOCKET_PATH=str(endpoint)))
+                self.assertFalse(self.rustup_record.exists())
+        for value in (None, "", str(self.root / "missing.sock"), str(self.profile_path)):
+            with self.subTest(daemon_socket=value):
+                self.profile["daemon_socket"] = value
+                self.save()
+                self.assert_refused(["check"])
+                self.assertFalse(self.rustup_record.exists())
 
     def test_worker_pool_handoff_retains_ordered_private_intent_and_native_ownership(self):
         endpoint = self.select_worker_pool()
@@ -1761,6 +1913,135 @@ sys.exit(2)
         (bundle / "request.json").chmod(0o600)
         self.driver.write_text("#!" + sys.executable + " -S\n" + JOB_RECOVERY_DRIVER)
         return operation, endpoint
+
+    def retained_presentation_operation(self, live_stderr=True, worker_pool=False):
+        endpoint = self.select_daemon_socket_metadata(worker_pool)
+        self.profile["live_stderr"] = live_stderr
+        self.save()
+        _, command, _ = launcher.canonical_invocation(str(self.profile_path), ["check"], self.env)
+        specification = command[command.index("--prepare-from") + 2]
+        operation = Path(specification).parent
+        self.driver.write_text("#!" + sys.executable + " -S\n" + JOB_RECOVERY_DRIVER)
+        return operation, endpoint
+
+    def test_live_stderr_recovery_retains_mode_and_reconstructs_current_driver_without_inputs(self):
+        operation, endpoint = self.retained_presentation_operation(worker_pool=True)
+        path = operation / "operation.json"
+        metadata = json.loads(path.read_bytes())
+        # The stored executable path remains descriptive intent. Recovery must
+        # invoke the installed driver even when all original inputs are gone.
+        for action in ("submit", "status", "wait", "cancel"):
+            metadata["job_" + action + "_argv"][0] = str(self.toolchain / "bin/cargo")
+        path.write_text(json.dumps(metadata))
+        before = path.read_bytes()
+        for original, name in ((self.source, "retired-source"), (self.toolchain, "retired-toolchain"),
+                               (self.profile_path, "retired-profile"), (operation / "pool.json", "retired-pool")):
+            original.rename(self.root / name)
+        env = dict(self.env, TEST_EXIT="101", CARGO_RABS_RUSTUP="/absent/rustup",
+                   RABS_SOCKET_PATH="/wrong/ambient.sock")
+        for _ in range(2):
+            code, stdout, stderr, pid = self.recover(operation, env=env, input=b"recovery stdin\x00\xff")
+            self.assertEqual(code, 101, stderr)
+            self.assertEqual(stdout, b"verified job stdout\x00\xff\n")
+            self.assertIn(b"verified job stderr\x00\xfe\n", stderr)
+            record = self.records()[-1]
+            self.assertEqual(record["argv"],
+                             [str(self.driver), "--job-wait", "--live-stderr", metadata["job_id"]])
+            self.assertTrue(record["live_stderr"])
+            self.assertEqual(record["pid"], pid)
+            self.assertEqual(record["socket"], str(endpoint))
+            self.assertEqual(record["input"], b"recovery stdin\x00\xff".hex())
+            self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(len(self.records()), 2, "each explicit wait has its own presentation invocation")
+        self.assertEqual(sorted(p.name for p in operation.iterdir()), ["operation.json", "spec.json"])
+        self.assertEqual(list(self.operations.iterdir()), [operation])
+
+    def test_live_stderr_false_and_legacy_recovery_records_use_ordinary_wait(self):
+        operation, _ = self.retained_presentation_operation(live_stderr=False)
+        path = operation / "operation.json"
+        metadata = json.loads(path.read_bytes())
+        self.assertIs(metadata["live_stderr"], False)
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                if legacy:
+                    metadata.pop("live_stderr")
+                    path.write_text(json.dumps(metadata))
+                before = path.read_bytes()
+                code, stdout, stderr, _ = self.recover(operation)
+                self.assertEqual(code, 0, stderr)
+                self.assertEqual(stdout, b"verified job stdout\x00\xff\n")
+                record = self.records()[-1]
+                self.assertEqual(record["argv"], [str(self.driver), "--job-wait", metadata["job_id"]])
+                self.assertFalse(record["live_stderr"])
+                self.assertEqual(path.read_bytes(), before)
+
+    def test_live_stderr_recovery_rejects_tampered_presentation_or_fixed_argv_before_execution(self):
+        operation, _ = self.retained_presentation_operation()
+        path = operation / "operation.json"
+        original = json.loads(path.read_bytes())
+        for value in (None, 0, 1, "true", [], {}, False):
+            with self.subTest(live_stderr=value):
+                path.write_text(json.dumps(dict(original, live_stderr=value)))
+                self.assert_recovery_refused(operation)
+        missing = dict(original)
+        missing.pop("live_stderr")
+        path.write_text(json.dumps(missing))
+        self.assert_recovery_refused(operation)
+        job_id = original["job_id"]
+        for args in (["--job-wait", job_id], ["--job-wait", job_id, "--live-stderr"],
+                     ["--job-wait", "--live-stderr", "--live-stderr", job_id],
+                     ["--job-wait", "--live-stdout", job_id],
+                     ["--job-wait", "--live-stderr", "00" * 16],
+                     ["--job-wait", "--live-stderr", job_id, "10"],
+                     ["--job-build", "--live-stderr", job_id]):
+            with self.subTest(args=args):
+                changed = dict(original, job_wait_argv=[str(self.driver)] + args)
+                path.write_text(json.dumps(changed))
+                self.assert_recovery_refused(operation)
+        for action in ("submit", "status", "cancel"):
+            changed = json.loads(json.dumps(original))
+            changed["job_" + action + "_argv"].insert(2, "--live-stderr")
+            path.write_text(json.dumps(changed))
+            self.assert_recovery_refused(operation)
+        path.write_text(json.dumps(original))
+        self.assert_recovery_refused(operation, "--live-stderr")
+        self.assertFalse(self.record.exists())
+
+    def test_live_stderr_recovery_controls_preserve_mode_without_implicit_wait_or_retry(self):
+        operation, endpoint = self.retained_presentation_operation()
+        path = operation / "operation.json"
+        before = path.read_bytes()
+        metadata = json.loads(before)
+        for action in ("status", "cancel"):
+            _, command, env = launcher.canonical_recovery_invocation([str(operation), "--" + action], self.env)
+            self.assertEqual(command, [str(self.driver), "--job-" + action, metadata["job_id"]])
+            self.assertEqual(env["RABS_SOCKET_PATH"], str(endpoint))
+        self.driver.write_text("#!" + sys.executable + " -S\n" + JOB_CONTROL_DRIVER)
+        destination = operation / "new-delivery"
+        code, stdout, stderr, _ = self.recover(operation, "--resume-to", str(destination))
+        self.assertEqual(code, 0, stderr)
+        self.assertIsNone(json.loads(stdout)["compiler_success"])
+        record, = self.records()
+        self.assertEqual(record["argv"], [str(self.driver), "--job-resume", metadata["job_id"], str(destination)])
+        self.assertNotIn("--live-stderr", record["argv"])
+        self.assertFalse(destination.exists())
+        self.assertEqual(path.read_bytes(), before)
+        self.driver.write_text("#!" + sys.executable + " -S\n" + JOB_RECOVERY_DRIVER)
+        code, _, stderr, _ = self.recover(operation, env=dict(self.env, TEST_EXIT="101"))
+        self.assertEqual(code, 101, stderr)
+        self.assertEqual(self.records()[-1]["argv"],
+                         [str(self.driver), "--job-wait", "--live-stderr", metadata["job_id"]])
+        self.assertEqual(len(self.records()), 2)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_live_stderr_cannot_be_added_to_direct_recovery_records(self):
+        operation = self.retained_operation()
+        path = operation / "operation.json"
+        original = json.loads(path.read_bytes())
+        for value in (True, False):
+            path.write_text(json.dumps(dict(original, live_stderr=value)))
+            self.assert_recovery_refused(operation)
+        self.assertFalse(self.record.exists())
 
     def test_daemon_recovery_rejoins_saved_job_without_original_inputs_or_bundle(self):
         operation, endpoint = self.retained_daemon_operation()

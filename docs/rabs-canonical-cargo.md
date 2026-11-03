@@ -200,13 +200,42 @@ RABS_SOCKET_PATH=/home/builder/.cache/rch/rabsd.sock rabsd --job-wait JOB_ID
 RABS_SOCKET_PATH=/home/builder/.cache/rch/rabsd.sock rabsd --job-cancel JOB_ID
 ```
 
+To see stderr progress while a daemon-backed canonical build runs, add this
+Boolean field to its profile:
+
+```json
+"live_stderr": true
+```
+
+The launcher selects `rabsd --job-build --live-stderr --prepare-from ...` for
+either a single worker or a worker pool. The native client displays a contiguous
+stderr prefix in bounded chunks, then verifies the bytes already shown against
+the final transcript before printing the remaining stderr. A gap in the live
+preview stops early presentation; the verified result supplies the unseen
+suffix. **Stdout remains behind verified completion and artifact installation**,
+because Cargo's stdout can announce artifact readiness. Early diagnostics do not
+establish build success or authorize another execution.
+
+`live_stderr` accepts only `true` or `false` and requires an explicit, valid
+`daemon_socket`, even when set to `false`. Direct worker profiles and local
+canonical profiles refuse this field before preparation. Omission or `false`
+retains ordinary completed-result replay. The selected mode is presentation
+intent in `operation.json`; it is not copied into the worker command, its
+environment or the Cargo artifact contract. An older daemon without the native
+whole-Cargo diagnostics capability refuses an explicit live request.
+
 The ordinary recovery frontend also recognizes a saved daemon operation:
 
 ```sh
 cargo rabs --rabs-recover /home/builder/.cache/rch/operations/cargo-JOB_ID
 ```
 
-It uses the saved job ID and private daemon socket to invoke `--job-wait` once.
+It uses the saved job ID and private daemon socket to invoke `--job-wait` once,
+including `--live-stderr` when the retained operation requested it. Recovery
+validates the saved mode against the fixed wait command and reconstructs the
+invocation using the installed driver. Status, cancellation and result-control
+commands keep their existing semantics and do not implicitly wait or show a
+diagnostic stream.
 The original profile, checkout, toolchain and captured bundle are not needed for
 this read-only wait/replay path. It does not resubmit the job. For a daemon-owned
 operation, `--status` and `--cancel` also address that same job. Result controls
@@ -215,6 +244,14 @@ operation, `--status` and `--cancel` also address that same job. Result controls
 recovery, and release commands. They preserve its selected worker and request
 identity. Wait on the original job afterward to replay a verified compiler
 result.
+
+Each later explicit recovery or `rabsd --job-wait --live-stderr JOB_ID` starts a
+new presentation cursor and may replay the whole retained diagnostic transcript.
+There is no durable console-position checkpoint across client processes.
+Within one waiting invocation, the native client retains its already displayed
+stderr prefix through result-only recovery and prints the verified suffix once.
+A lost or failed wait never causes the launcher to fall back to local compilation
+or submit another execution.
 
 Waiting again is a read-only operation and replays a verified completed result.
 If the initial submission response was lost, inspect the same job first. The
