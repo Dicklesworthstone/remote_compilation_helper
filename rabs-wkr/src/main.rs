@@ -222,10 +222,10 @@ impl InputDeadline {
         self.check()
     }
 
-    fn toolchain_submitted(&mut self, frame: &serde_json::Value, started: Instant) {
+    fn toolchain_submitted(&mut self, begins_toolchain: bool, started: Instant) {
         if let Some(upload) = self.upload.as_mut()
             && !upload.toolchain_started
-            && frame["kind"] == "toolchain-begin"
+            && begins_toolchain
         {
             upload.pending_toolchain_begin = Some(started);
         }
@@ -1717,7 +1717,7 @@ where
                             // from submission, not from a later ready response.
                             let started = Instant::now();
                             match input_deadline.source_request(request_id).and_then(|()|
-                                source_transfer.submit(&value, source_transfer_enabled,
+                                source_transfer.submit_owned(value, source_transfer_enabled,
                                     active.is_some() || pending_output.is_some() || artifact_transfer.is_pending()))
                             {
                                 Ok(()) => {
@@ -1730,15 +1730,16 @@ where
                         }
                         Some("toolchain-begin" | "toolchain-entry" | "toolchain-chunk" | "toolchain-seal") => {
                             let started = Instant::now();
+                            let begins_toolchain = value["kind"] == "toolchain-begin";
                             let ready = if toolchain_transfer_enabled {
                                 input_deadline.toolchain_request(request_id)
                             } else { Err("toolchain transfer not negotiated".to_owned()) };
                             match ready.and_then(|()|
-                                toolchain_transfer.submit(&value, toolchain_transfer_enabled,
+                                toolchain_transfer.submit_owned(value, toolchain_transfer_enabled,
                                     active.is_some() || pending_output.is_some() || artifact_transfer.is_pending()))
                             {
                                 Ok(()) => {
-                                    input_deadline.toolchain_submitted(&value, started);
+                                    input_deadline.toolchain_submitted(begins_toolchain, started);
                                     continue;
                                 }
                                 Err(reason) => request_error(request_id, &reason),

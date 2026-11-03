@@ -14,6 +14,7 @@ use rabs_sandbox::toolchain_transfer::{
     TOOLCHAIN_UPLOAD_BUDGET, ToolchainEntry, ToolchainEntryKind, ToolchainReceiver,
 };
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -582,7 +583,12 @@ impl ToolchainTransferTask {
         }
     }
 
-    fn start_worker(&mut self) -> io::Result<()> {
+    fn start_worker(
+        &mut self,
+        mut handle: impl FnMut(&mut TransferState, &Value, &AtomicBool) -> Result<Value, String>
+        + Send
+        + 'static,
+    ) -> io::Result<()> {
         let (sender, receiver) = mpsc::sync_channel::<Job>(1);
         let shared = Arc::clone(&self.shared);
         let cancelled = Arc::clone(&self.cancelled);
@@ -591,7 +597,7 @@ impl ToolchainTransferTask {
             .spawn(move || {
                 while let Ok(mut job) = receiver.recv() {
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        job.state.handle(&job.frame, &cancelled)
+                        handle(&mut job.state, &job.frame, &cancelled)
                     }));
                     let fatal = outcome.is_err();
                     let result = match outcome {
@@ -621,6 +627,21 @@ impl ToolchainTransferTask {
     }
 
     pub fn submit(&mut self, frame: &Value, enabled: bool, busy: bool) -> Result<(), String> {
+        self.submit_frame(Cow::Borrowed(frame), enabled, busy)
+    }
+
+    /// Move the reactor's parsed frame into its filesystem job without copying
+    /// the encoded toolchain payload. Admission and ownership match borrowed submit.
+    pub fn submit_owned(&mut self, frame: Value, enabled: bool, busy: bool) -> Result<(), String> {
+        self.submit_frame(Cow::Owned(frame), enabled, busy)
+    }
+
+    fn submit_frame(
+        &mut self,
+        frame: Cow<'_, Value>,
+        enabled: bool,
+        busy: bool,
+    ) -> Result<(), String> {
         if !enabled {
             return Err("toolchain transfer not negotiated".to_owned());
         }
@@ -646,7 +667,7 @@ impl ToolchainTransferTask {
             .as_u64()
             .ok_or("toolchain request_id must be unsigned")?;
         if self.sender.is_none() {
-            self.start_worker()
+            self.start_worker(|state, frame, cancelled| state.handle(frame, cancelled))
                 .map_err(|error| format!("start toolchain filesystem worker: {error}"))?;
         }
         let sender = self
@@ -656,7 +677,7 @@ impl ToolchainTransferTask {
         let state = self.state.take().ok_or("toolchain-operation-pending")?;
         match sender.try_send(Job {
             state,
-            frame: frame.clone(),
+            frame: frame.into_owned(),
         }) {
             Ok(()) => {
                 self.pending_id = Some(id);
@@ -890,6 +911,23 @@ mod tests {
         assert!(task.submit(&frame, false, false).is_err());
         assert!(task.submit(&frame, true, true).is_err());
         assert!(task.submit(&request(), true, false).is_err());
+        assert_eq!(
+            task.submit_owned(frame.clone(), false, false).unwrap_err(),
+            "toolchain transfer not negotiated"
+        );
+        assert_eq!(
+            task.submit_owned(frame, true, true).unwrap_err(),
+            "worker-busy-or-result-pending"
+        );
+        assert_eq!(
+            task.submit_owned(request(), true, false).unwrap_err(),
+            "unknown toolchain operation"
+        );
+        assert_eq!(
+            task.submit_owned(json!({"kind":"toolchain-begin"}), true, false)
+                .unwrap_err(),
+            "toolchain request_id must be unsigned"
+        );
         assert!(task.thread.is_none());
         assert!(task.sender.is_none());
         assert!(!task.is_pending());
@@ -1005,6 +1043,70 @@ mod tests {
                 entry("rustc", json!({"kind":"symlink", "target":"bin/compiler"})),
                 json!({"kind":"toolchain-seal", "request_id":id, "sha256":digest}),
             ]
+        }
+
+        #[test]
+        fn owned_toolchain_frames_reach_the_receiver_without_copying_payloads() {
+            let (_source, pool, request) = fixture(0, false);
+            let reactor = std::thread::current().id();
+            let (observed_tx, observed_rx) = mpsc::channel();
+            let mut task = task(&pool, false);
+            task.start_worker(move |state, frame, cancelled| {
+                if let Some(payload) = frame["data_hex"].as_str() {
+                    observed_tx
+                        .send((std::thread::current().id(), payload.as_ptr() as usize))
+                        .unwrap();
+                }
+                state.handle(frame, cancelled)
+            })
+            .unwrap();
+            let id = &request["request_id"];
+            let digest = &request["toolchain_identity"]["sha256"];
+            for frame in std::iter::once(begin(&request)).chain(transfer_frames(&request)) {
+                let expected = match frame["kind"].as_str().unwrap() {
+                    "toolchain-begin" | "toolchain-seal" => json!({
+                        "kind":"toolchain-ready", "request_id":id, "sha256":digest,
+                        "sealed":frame["kind"] == "toolchain-seal",
+                    }),
+                    "toolchain-entry" => json!({
+                        "kind":"toolchain-entry-accepted", "request_id":id, "sha256":digest,
+                        "path":frame["path"],
+                    }),
+                    "toolchain-chunk" => json!({
+                        "kind":"toolchain-chunk-accepted", "request_id":id, "sha256":digest,
+                        "path":frame["path"], "next_offset":CONTENTS.len(),
+                    }),
+                    _ => unreachable!(),
+                };
+                let payload = frame["data_hex"]
+                    .as_str()
+                    .map(|text| text.as_ptr() as usize);
+                task.submit_owned(frame, true, false).unwrap();
+                assert_eq!(
+                    task.submit_owned(begin(&request), true, false).unwrap_err(),
+                    "toolchain-operation-pending"
+                );
+                if let Some(payload) = payload {
+                    let (worker, received) =
+                        observed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    assert_ne!(worker, reactor);
+                    assert_eq!(received, payload, "the encoded chunk allocation must move");
+                }
+                let reply = wait(|cx| task.poll_completion(cx)).unwrap();
+                assert_eq!(Some(reply.request_id), id.as_u64());
+                assert_eq!(reply.response.unwrap(), expected);
+            }
+            let root =
+                Path::new(&task.prepared_path(&request, true).unwrap().unwrap()).to_path_buf();
+            let owner = task.take_prepared(&request).unwrap().unwrap();
+            drop(task);
+            assert_eq!(fs::read(root.join("rustc")).unwrap(), CONTENTS);
+            let ToolchainBacking::Uploaded(upload) = &owner.backing else {
+                panic!("fixture must retain the uploaded image");
+            };
+            upload.prepared.as_ref().unwrap().verify(|| false).unwrap();
+            drop(owner);
+            assert!(!root.exists());
         }
 
         fn upload(
@@ -1523,6 +1625,12 @@ mod tests {
             assert_eq!(reply.response.unwrap_err(), "toolchain upload cancelled");
             assert!(cancelled.prepared_path(&request, true).is_err());
             assert!(cancelled.take_prepared(&request).is_err());
+            assert_eq!(
+                cancelled
+                    .submit_owned(begin(&request), true, false)
+                    .unwrap_err(),
+                "toolchain upload cancelled"
+            );
             let mut expired = task(&pool, true);
             assert_eq!(
                 exchange(&mut expired, &begin(&request)).unwrap()["sealed"],

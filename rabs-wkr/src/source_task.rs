@@ -13,6 +13,7 @@
 
 use crate::source_transfer::{SourceCache, SourceOwner, SourceTransferState};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -143,6 +144,21 @@ impl SourceTransferTask {
     /// Refusals before submission do not move, poison or replace the receiver.
     /// A second source frame must wait for the first one's completion.
     pub fn submit(&mut self, frame: &Value, enabled: bool, busy: bool) -> Result<(), String> {
+        self.submit_frame(Cow::Borrowed(frame), enabled, busy)
+    }
+
+    /// Move the reactor's parsed frame into its filesystem job without copying
+    /// the encoded source payload. Admission and ownership match borrowed submit.
+    pub fn submit_owned(&mut self, frame: Value, enabled: bool, busy: bool) -> Result<(), String> {
+        self.submit_frame(Cow::Owned(frame), enabled, busy)
+    }
+
+    fn submit_frame(
+        &mut self,
+        frame: Cow<'_, Value>,
+        enabled: bool,
+        busy: bool,
+    ) -> Result<(), String> {
         if !enabled {
             return Err("source transfer not negotiated".to_owned());
         }
@@ -178,7 +194,7 @@ impl SourceTransferTask {
         let source = self.source.take().ok_or("source-operation-pending")?;
         match sender.try_send(Job {
             source,
-            frame: frame.clone(),
+            frame: frame.into_owned(),
         }) {
             Ok(()) => {
                 self.pending_id = Some(id);
@@ -326,17 +342,21 @@ mod tests {
     const BYTES: &[u8] = b"source\0\xff";
 
     fn request() -> Value {
+        request_for(BYTES)
+    }
+
+    fn request_for(bytes: &[u8]) -> Value {
         let manifest = SourceManifest::new(vec![SourceFile {
             path: "lib.rs".to_owned(),
-            len: BYTES.len() as u64,
-            sha256: Sha256::digest(BYTES).into(),
+            len: bytes.len() as u64,
+            sha256: Sha256::digest(bytes).into(),
             executable: false,
         }])
         .unwrap();
         json!({"kind":"canonical-exec", "request_id":7, "source_manifest":{
             "manifest_sha256":hex(&manifest.digest()), "files":[{
-                "path":"lib.rs", "bytes":BYTES.len(),
-                "sha256":hex(&Sha256::digest(BYTES)), "executable":false,
+                "path":"lib.rs", "bytes":bytes.len(),
+                "sha256":hex(&Sha256::digest(bytes)), "executable":false,
             }],
         }})
     }
@@ -427,6 +447,71 @@ mod tests {
     }
 
     #[test]
+    fn owned_source_chunks_reach_the_filesystem_thread_without_copying_payloads() {
+        use rabs_sandbox::source_transfer::MAX_SOURCE_CHUNK;
+        let bytes: Vec<_> = (0_u8..=255).cycle().take(MAX_SOURCE_CHUNK + 17).collect();
+        let request = request_for(&bytes);
+        let identity = &request["source_manifest"]["manifest_sha256"];
+        let reactor = std::thread::current().id();
+        let (observed_tx, observed_rx) = mpsc::channel();
+        let mut task = SourceTransferTask::default();
+        task.start_worker(move |source, frame| {
+            if let Some(payload) = frame["data_hex"].as_str() {
+                observed_tx
+                    .send((std::thread::current().id(), payload.as_ptr() as usize))
+                    .unwrap();
+            }
+            source.handle(frame, true, false)
+        })
+        .unwrap();
+        task.submit_owned(begin(&request), true, false).unwrap();
+        let ready = finish(&mut task).unwrap();
+        assert_eq!(ready.request_id, 7);
+        let ready = ready.response.unwrap();
+        assert_eq!(ready["kind"], "source-ready");
+        assert_eq!(ready["manifest_sha256"], *identity);
+        assert_eq!(ready["sealed"], false);
+        for (index, chunk) in bytes.chunks(MAX_SOURCE_CHUNK).enumerate() {
+            let offset = index * MAX_SOURCE_CHUNK;
+            let frame = json!({"kind":"source-chunk", "request_id":7,
+                "manifest_sha256":identity, "path":"lib.rs", "offset":offset,
+                "data_hex":hex(chunk), "chunk_sha256":hex(&Sha256::digest(chunk))});
+            let payload = frame["data_hex"].as_str().unwrap().as_ptr() as usize;
+            task.submit_owned(frame, true, false).unwrap();
+            let (worker, received) = observed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_ne!(worker, reactor);
+            assert_eq!(received, payload, "the encoded chunk allocation must move");
+            let reply = finish(&mut task).unwrap();
+            assert_eq!(reply.request_id, 7);
+            assert_eq!(
+                reply.response.unwrap(),
+                json!({
+                    "kind":"source-chunk-accepted", "request_id":7,
+                    "manifest_sha256":identity, "path":"lib.rs", "next_offset":offset + chunk.len(),
+                })
+            );
+        }
+        task.submit_owned(
+            json!({"kind":"source-seal", "request_id":7, "manifest_sha256":identity}),
+            true,
+            false,
+        )
+        .unwrap();
+        let sealed = finish(&mut task).unwrap();
+        assert_eq!(sealed.request_id, 7);
+        let sealed = sealed.response.unwrap();
+        assert_eq!(sealed["kind"], "source-ready");
+        assert_eq!(sealed["manifest_sha256"], *identity);
+        assert_eq!(sealed["sealed"], true);
+        let path = std::path::PathBuf::from(task.prepared_path(&request, true).unwrap().unwrap());
+        let owner = task.take_prepared(&request).unwrap().unwrap();
+        drop(task);
+        assert_eq!(std::fs::read(path.join("lib.rs")).unwrap(), bytes);
+        drop(owner);
+        assert!(!path.exists());
+    }
+
+    #[test]
     fn blocked_filesystem_work_is_pending_and_wakes_without_holding_the_reactor() {
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -455,6 +540,10 @@ mod tests {
         assert!(task.take_prepared(&request).is_err());
         assert_eq!(
             task.submit(&begin(&request), true, false).unwrap_err(),
+            "source-operation-pending"
+        );
+        assert_eq!(
+            task.submit_owned(begin(&request), true, false).unwrap_err(),
             "source-operation-pending"
         );
         release_tx.send(()).unwrap();
@@ -501,6 +590,10 @@ mod tests {
         assert!(task.prepared_path(&request, true).is_err());
         assert!(task.take_prepared(&request).is_err());
         assert!(task.submit(&begin(&request), true, false).is_err());
+        assert_eq!(
+            task.submit_owned(begin(&request), true, false).unwrap_err(),
+            "source upload cancelled"
+        );
     }
 
     #[test]
@@ -571,6 +664,23 @@ mod tests {
         let mut missing = begin(&request);
         missing["request_id"] = Value::Null;
         assert!(task.submit(&missing, true, false).is_err());
+        assert_eq!(
+            task.submit_owned(begin(&request), false, false)
+                .unwrap_err(),
+            "source transfer not negotiated"
+        );
+        assert_eq!(
+            task.submit_owned(begin(&request), true, true).unwrap_err(),
+            "worker-busy-or-result-pending"
+        );
+        assert_eq!(
+            task.submit_owned(request.clone(), true, false).unwrap_err(),
+            "unknown source operation"
+        );
+        assert_eq!(
+            task.submit_owned(missing, true, false).unwrap_err(),
+            "source request_id must be unsigned"
+        );
         assert!(task.thread.is_none());
         assert!(!task.is_pending());
         upload(&mut task, &request);
@@ -587,6 +697,10 @@ mod tests {
         assert!(task.prepared_path(&request, true).is_err());
         assert!(task.take_prepared(&request).is_err());
         assert!(task.submit(&begin(&request), true, false).is_err());
+        assert_eq!(
+            task.submit_owned(begin(&request), true, false).unwrap_err(),
+            "source filesystem worker failed"
+        );
     }
 
     #[test]
