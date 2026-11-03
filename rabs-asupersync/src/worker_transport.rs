@@ -101,7 +101,7 @@ fn check_task_cancellation() -> io::Result<()> {
 /// not inside the boxed async body, so its first poll cannot restart the clock (bead J011).
 struct FrameDeadline {
     until: TransportInstant,
-    wake: Pin<Box<dyn Future<Output = ()> + Send>>,
+    wake: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
 }
 
 impl FrameDeadline {
@@ -122,7 +122,7 @@ impl FrameDeadline {
         let until = TransportInstant(now.as_nanos().saturating_add(budget_nanos));
         Self {
             until,
-            wake: Self::wake_after(budget),
+            wake: Some(Self::wake_after(budget)),
         }
     }
 
@@ -134,14 +134,23 @@ impl FrameDeadline {
         // The runtime timer wakes this task; only the selected clock can
         // establish expiry. An injected clock may have a different epoch or
         // advance more slowly. Re-arm its remaining budget, never its deadline.
-        if self.wake.as_mut().poll(cx).is_ready() {
+        if self
+            .wake
+            .as_mut()
+            .is_none_or(|wake| wake.as_mut().poll(cx).is_ready())
+        {
+            // A completed async timer must never be polled a second time,
+            // including another check_live call in this same stream poll.
+            self.wake = None;
             let now = TransportInstant(clock().as_nanos());
             if now >= self.until {
                 return true;
             }
-            self.wake = Self::wake_after(self.until.duration_since(now));
-            if self.wake.as_mut().poll(cx).is_ready() {
+            let mut wake = Self::wake_after(self.until.duration_since(now));
+            if wake.as_mut().poll(cx).is_ready() {
                 cx.waker().wake_by_ref();
+            } else {
+                self.wake = Some(wake);
             }
         }
         false
@@ -1121,7 +1130,7 @@ mod tests {
 
         // A native wake is not authority to expire an injected clock. Keep
         // the original absolute boundary even when its wake has already fired.
-        stream.read_deadline.as_mut().unwrap().wake = Box::pin(std::future::ready(()));
+        stream.read_deadline.as_mut().unwrap().wake = Some(Box::pin(std::future::ready(())));
 
         // Advance virtual time to 1ns before FRAME_IO_TIMEOUT (10s): still live!
         VIRTUAL_CLOCK_NANOS.store(
@@ -1130,6 +1139,7 @@ mod tests {
         );
         assert!(read_once(&mut stream).is_pending());
         assert!(!stream.failed);
+        assert!(read_once(&mut stream).is_pending());
 
         // Advance virtual time by 1ns to cross FRAME_IO_TIMEOUT: expires deterministically!
         VIRTUAL_CLOCK_NANOS.fetch_add(1, Ordering::SeqCst);
@@ -1145,10 +1155,10 @@ mod tests {
         raced.io.input.extend(&bytes[..4]);
         assert!(read_once(&mut raced).is_pending());
         let until = raced.read_deadline.as_ref().unwrap().until.as_nanos();
-        raced.read_deadline.as_mut().unwrap().wake = Box::pin(poll_fn(move |_| {
+        raced.read_deadline.as_mut().unwrap().wake = Some(Box::pin(poll_fn(move |_| {
             VIRTUAL_CLOCK_NANOS.store(until, Ordering::SeqCst);
             Poll::Ready(())
-        }));
+        })));
         assert!(
             matches!(read_once(&mut raced), Poll::Ready(Err(err)) if err.kind() == io::ErrorKind::TimedOut)
         );
