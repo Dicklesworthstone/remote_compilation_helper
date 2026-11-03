@@ -56,6 +56,29 @@ Clippy program directly and binds its Cargo and rustc companions to the captured
 absolute paths, so dispatcher or worker PATH entries cannot select a different
 Clippy installation.
 
+For an installed Rustup toolchain, either canonical **launcher** profile can
+replace `"toolchain_root": "/absolute/toolchain"` with `"toolchain": "rustup"`.
+Specify exactly one of these fields. `cargo rabs --rabs-canonical ...` and
+`cargo rabs --rabs-canonical-local ...` resolve `rustup which rustc` once in the
+caller's original working directory and environment. This honors the selected
+`RUSTUP_TOOLCHAIN`, including `cargo +nightly rabs`, and Rustup's directory
+overrides and toolchain files at the invocation location. It does not select a
+different toolchain from the profile directory or captured `source_root`.
+
+Discovery uses `RUSTUP_AUTO_INSTALL=0`, has a five-second deadline and a bounded
+path response, and requires an already installed toolchain with ordinary
+`bin/cargo` and `bin/rustc` executables. Symlinked toolchain ancestors and
+non-regular compiler paths are refused. `CARGO_RABS_RUSTUP` can name the installed
+Rustup executable; otherwise it is found on the caller's `PATH`. The caller's environment is not
+modified by discovery. The native driver then captures and verifies the full
+physical toolchain through the existing preparation contract.
+
+Only that resolved `toolchain_root` is retained in the native profile or request.
+Queued work, execution and recovery do not rediscover Rustup. Direct native
+`rabsd --canonical-compile-local` profiles still require `toolchain_root`; the
+`toolchain` selector is a launcher input. The ordinary live wrapper and
+`--rabs-remote` retain their existing toolchain behavior.
+
 Worker capability probing executes a no-op inside the same canonical base
 namespace used for builds, including private `/proc`, `/dev`, temporary storage
 and isolated networking. An installed bubblewrap and a successful basic user/PID

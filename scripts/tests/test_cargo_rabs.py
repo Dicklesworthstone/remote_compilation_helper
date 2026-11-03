@@ -1606,6 +1606,24 @@ os.execvpe(sys.argv[2], sys.argv[2:], os.environ)
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_worker_import_accepts_shipping_launcher_and_bounds_source_before_execution(self):
+        loader = importlib.machinery.SourceFileLoader("worker_cache_import_test", str(WORKER_ADAPTER))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        adapter = importlib.util.module_from_spec(spec)
+        loader.exec_module(adapter)
+        self.assertLessEqual(LAUNCHER.stat().st_size, adapter.MAX_LAUNCHER_BYTES)
+        self.assertTrue(callable(adapter.load_prepare(str(LAUNCHER))))
+        with tempfile.TemporaryDirectory(prefix="rabs-import-bound-") as directory:
+            root = Path(directory)
+            marker = root / "unexpected-import"
+            oversized = root / "cargo-rabs"
+            code = ("open(" + repr(str(marker)) + ", 'w').write('executed')\n" +
+                    "RCH_WORKER_PREPARATION_API = 1\ndef prepare(env, no_start):\n    return env\n").encode()
+            oversized.write_bytes(code + b" " * (adapter.MAX_LAUNCHER_BYTES + 1 - len(code)))
+            with self.assertRaisesRegex(RuntimeError, "source bound"):
+                adapter.load_prepare(str(oversized))
+            self.assertFalse(marker.exists())
+
     def test_dependency_worker_configuration_normalizes_only_socket_address_spelling(self):
         settings = {
             "RABS_DEPENDENCY_WORKER_LISTEN": "[0:0:0:0:0:0:0:1]:09443",

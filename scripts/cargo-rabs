@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import selectors
 import shutil
+import signal
 import socket
 import stat
 import struct
@@ -33,6 +34,8 @@ MAX_FRAME = 64 * 1024
 MAX_STATUS_FRAME = 128 * 1024
 DEFAULT_STARTUP_MS = 5000
 MAX_STARTUP_MS = 30000
+RUSTUP_DISCOVERY_SECONDS = 5.0
+MAX_RUSTUP_PATH_BYTES = 4097
 OWNER_RECEIPT = "daemon-owner.json"
 MAX_OWNER_RECEIPT = 2048
 DEPENDENCY_CONTEXT = "dependency-exec-v8"
@@ -130,6 +133,12 @@ Cargo's artifact reports identify the required real outputs in the captured tree
 Execution success requires Cargo's final exit, never build-finished alone.
 Profiles may select an existing vendor tree or an explicit cargo_home_source
 for checksum-verified, locked crates.io dependencies from the offline cache.
+Both canonical modes accept either an explicit toolchain_root or
+"toolchain": "rustup". The latter resolves the installed selection once in the
+invocation's original working directory and environment, with automatic
+installation disabled. The resolved physical root is then captured normally;
+retained operations never resolve Rustup again. CARGO_RABS_RUSTUP can select
+the installed Rustup executable. No compiler-wrapper semantics are changed.
 An optional env object supplies literal build-script, env!/option_env! and test
 inputs. Values are strings (including empty strings), not shell expressions or
 names to inherit from the dispatcher. They are retained in the private request
@@ -1330,10 +1339,100 @@ def canonical_profile_object(path):
     return decode_object(data)
 
 
-def canonical_profile(path, required_tools=("cargo", "rustc")):
+def canonical_rustup_toolchain(env):
+    """Resolve selection, never compiler execution or its effective environment.
+
+    Canonical execution already supplies its own captured toolchain and exact
+    environment. Keep the invoking cwd and Rustup controls for discovery only;
+    neither the captured checkout nor a later daemon may select another SDK.
+    """
+    if signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL:
+        raise SetupError("Rustup discovery requires an owned child exit status")
+    rustup = (env["CARGO_RABS_RUSTUP"] if "CARGO_RABS_RUSTUP" in env else
+              shutil.which("rustup", path=env.get("PATH", os.defpath)))
+    if not rustup or not os.path.isfile(rustup) or not os.access(rustup, os.X_OK):
+        raise SetupError("Rustup is not installed (or CARGO_RABS_RUSTUP is not executable)")
+    rustup = os.path.abspath(rustup)
+    if os.path.samefile(rustup, __file__):
+        raise SetupError("CARGO_RABS_RUSTUP resolves to cargo-rabs itself")
+    discovery_env = dict(env, RUSTUP_AUTO_INSTALL="0")
+    deadline = time.monotonic() + RUSTUP_DISCOVERY_SECONDS
+    process = subprocess.Popen(
+        [rustup, "which", "rustc"], env=discovery_env, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, close_fds=True,
+        start_new_session=True,
+    )
+    data = bytearray()
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            while True:
+                duration = deadline - time.monotonic()
+                if duration <= 0 or not selector.select(duration):
+                    raise SetupError("Rustup toolchain discovery timed out")
+                chunk = os.read(process.stdout.fileno(), min(4096, MAX_RUSTUP_PATH_BYTES + 1 - len(data)))
+                if not chunk:
+                    break
+                data.extend(chunk)
+                if len(data) > MAX_RUSTUP_PATH_BYTES:
+                    raise SetupError("Rustup toolchain path exceeds its output bound")
+        # Keep the exited leader unreaped until group cleanup. Its child identity
+        # still owns the numeric process-group ID, including after pipe EOF.
+        while os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None:
+            duration = deadline - time.monotonic()
+            if duration <= 0:
+                raise SetupError("Rustup toolchain discovery did not exit")
+            time.sleep(min(0.01, duration))
+    finally:
+        try:
+            process.stdout.close()
+        finally:
+            try:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            finally:
+                try:
+                    status = process.wait(timeout=0.25)
+                except subprocess.TimeoutExpired as error:
+                    raise SetupError("Rustup discovery cleanup could not be confirmed") from error
+    if status != 0:
+        raise SetupError("Rustup could not resolve an installed rustc; run rustup which rustc or select toolchain_root")
+    try:
+        value = data.decode("utf-8")
+    except UnicodeError as error:
+        raise SetupError("Rustup toolchain path must be UTF-8") from error
+    if value.endswith("\n"):
+        value = value[:-1]
+    compiler = Path(canonical_path(value, absolute=True))
+    if compiler.name != "rustc" or compiler.parent.name != "bin":
+        raise SetupError("Rustup must select a physical toolchain bin/rustc")
+    for directory in reversed(compiler.parents):
+        if not stat.S_ISDIR(directory.lstat().st_mode):
+            raise SetupError("Rustup toolchain requires ordinary directory ancestors")
+    for name in ("cargo", "rustc"):
+        tool = compiler.parent / name
+        if not stat.S_ISREG(tool.lstat().st_mode) or not os.access(tool, os.X_OK):
+            raise SetupError("Rustup toolchain requires ordinary executable " + name)
+    return str(compiler.parent.parent)
+
+
+def canonical_toolchain_selection(profile, env):
+    if ("toolchain" in profile) == ("toolchain_root" in profile):
+        raise SetupError("canonical profile requires exactly one of toolchain_root or toolchain")
+    if "toolchain" in profile:
+        if profile["toolchain"] != "rustup":
+            raise SetupError('canonical toolchain must be "rustup" or use an explicit toolchain_root')
+        root = canonical_rustup_toolchain(os.environ if env is None else env)
+        del profile["toolchain"]
+        profile["toolchain_root"] = root
+
+
+def canonical_profile(path, required_tools=("cargo", "rustc"), env=None):
     profile = canonical_profile_object(path)
-    required = {"version", "source_root", "toolchain_root", "operation_root"}
-    optional = {"manifest", "vendor", "cargo_home_source", "jobserver_grant", "daemon_socket", "env", "incremental"}
+    required = {"version", "source_root", "operation_root"}
+    optional = {"manifest", "vendor", "cargo_home_source", "jobserver_grant", "daemon_socket", "env", "incremental", "toolchain_root", "toolchain"}
     singular = {"listen", "worker", "worker_spki_sha256"}
     if "workers" in profile:
         required.add("workers")
@@ -1376,6 +1475,7 @@ def canonical_profile(path, required_tools=("cargo", "rustc")):
                 or not isinstance(profile["worker_spki_sha256"], str)
                 or re.fullmatch(r"[0-9a-f]{64}", profile["worker_spki_sha256"]) is None):
             raise SetupError("canonical worker identity and lowercase SHA-256 pin are required")
+    canonical_toolchain_selection(profile, env)
     roots = ("source_root", "toolchain_root", "operation_root")
     if "cargo_home_source" in profile:
         roots += ("cargo_home_source",)
@@ -1578,7 +1678,7 @@ def canonical_invocation(profile_path, args, env):
     execution = cargo_args[0] if cargo_args[0] in ("test", "run", "bench") and "--no-run" not in cargo_args else None
     clippy = cargo_args[0] == "clippy"
     required_tools = ("cargo", "rustc", "cargo-clippy", "clippy-driver") if clippy else ("cargo", "rustc")
-    profile = canonical_profile(profile_path, required_tools)
+    profile = canonical_profile(profile_path, required_tools, env)
     incremental = profile.get("incremental", False)
     daemon = executable("rabsd", "CARGO_RABS_DAEMON", env)
     if os.path.samefile(daemon, __file__):
@@ -1843,11 +1943,11 @@ def canonical_local_selection(args):
     return selection
 
 
-def canonical_local_profile(path):
+def canonical_local_profile(path, env=None):
     """Validate retained intent before writing; the native driver checks it again."""
     profile = canonical_profile_object(path)
-    required = {"version", "source_root", "toolchain_root", "state_root", "operation_root", "wrapper"}
-    optional = {"manifest", "vendor", "cargo_home_source", "jobs", "timeout_seconds", "command", "selection", "target_cache", "service_socket", "env"}
+    required = {"version", "source_root", "state_root", "operation_root", "wrapper"}
+    optional = {"manifest", "vendor", "cargo_home_source", "jobs", "timeout_seconds", "command", "selection", "target_cache", "service_socket", "env", "toolchain_root", "toolchain"}
     if (not required <= profile.keys() or profile.keys() - required - optional
             or profile["version"] != "canonical-compile-local-v1"):
         raise SetupError("invalid canonical-compile-local-v1 profile fields")
@@ -1882,6 +1982,7 @@ def canonical_local_profile(path):
         vendor = canonical_path(profile["vendor"])
         if len(vendor) > 1024:
             raise SetupError("local canonical vendor path is too long")
+    canonical_toolchain_selection(profile, env)
     roots = ["source_root", "toolchain_root", "state_root", "operation_root"]
     if profile.get("cargo_home_source") is not None:
         roots.append("cargo_home_source")
@@ -1985,7 +2086,7 @@ def canonical_local_invocation(profile_path, args, env):
     )):
         raise SetupError("nested canonical/remote dispatch is not supported")
     selection = canonical_local_selection(args)
-    profile = canonical_local_profile(profile_path)
+    profile = canonical_local_profile(profile_path, env)
     daemon = executable("rabsd", "CARGO_RABS_DAEMON", env)
     if os.path.samefile(daemon, __file__):
         raise SetupError("CARGO_RABS_DAEMON resolves to cargo-rabs itself")

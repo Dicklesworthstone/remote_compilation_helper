@@ -36,7 +36,9 @@ import time
 
 
 ACTIVE = "RCH_RABS_WORKER_ACTIVE"
-MAX_LAUNCHER_BYTES = 128 * 1024
+# The shared launcher also owns canonical toolchain selection. Keep modest
+# headroom for that installed API while still bounding parsing before execution.
+MAX_LAUNCHER_BYTES = 160 * 1024
 MAX_PREPARE_BYTES = 1024 * 1024
 MAX_PREPARE_LOG_BYTES = 16 * 1024
 MAX_PREPARE_MS = 35_000

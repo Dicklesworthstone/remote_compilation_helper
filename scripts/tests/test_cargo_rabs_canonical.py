@@ -15,6 +15,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -80,6 +81,44 @@ print(json.dumps({"kind":"fixture-worker-build", "pid":os.getpid()}), file=sys.s
 if os.environ.get("TEST_SIGNAL"):
     os.kill(os.getpid(), signal.SIGTERM)
 sys.exit(int(os.environ.get("TEST_EXIT", "0")))
+'''
+
+RUSTUP = r'''
+# Discovery double: record selection inputs and return a selected physical path.
+# Real installed Rustup selection is covered separately, never claimed here.
+import json, os, pathlib, sys, time
+record = {"argv": sys.argv[1:], "cwd": os.getcwd(), "pid": os.getpid(),
+          "stdin": sys.stdin.buffer.read().hex(),
+          "env": {name: os.environ.get(name) for name in (
+              "RUSTUP_TOOLCHAIN", "RUSTUP_HOME", "CARGO_HOME", "RUSTUP_AUTO_INSTALL")}}
+if "TEST_RUSTUP_FD" in os.environ:
+    try:
+        os.fstat(int(os.environ["TEST_RUSTUP_FD"]))
+        record["inherited_fd"] = True
+    except OSError:
+        record["inherited_fd"] = False
+with open(os.environ["TEST_RUSTUP_RECORD"], "a") as output:
+    output.write(json.dumps(record) + "\n")
+mode = os.environ.get("TEST_RUSTUP_MODE", "ok")
+if mode == "stderr":
+    os.write(2, b"diagnostic" * 32768)
+if mode == "hang":
+    time.sleep(3)
+if mode == "closed-pipe":
+    os.close(1)
+    time.sleep(3)
+if mode == "inherited-pipe":
+    child = os.fork()
+    if child == 0:
+        time.sleep(3)
+        os._exit(0)
+    pathlib.Path(os.environ["TEST_RUSTUP_CHILD"]).write_text(str(child))
+if mode == "error":
+    sys.exit(1)
+if "TEST_RUSTUP_OUTPUT_HEX" in os.environ:
+    sys.stdout.buffer.write(bytes.fromhex(os.environ["TEST_RUSTUP_OUTPUT_HEX"]))
+else:
+    print(os.environ["TEST_RUSTUP_COMPILER"])
 '''
 
 RECOVERY_DRIVER = r'''
@@ -201,6 +240,19 @@ class CanonicalCargo(unittest.TestCase):
             tool.write_text("#!/bin/sh\nprintf unexpected >> '" + str(self.forbidden) + "'\nexit 98\n")
             tool.chmod(0o700)
 
+    def select_rustup(self):
+        self.profile.pop("toolchain_root")
+        self.profile["toolchain"] = "rustup"
+        self.save()
+        rustup = self.root / "rustup"
+        rustup.write_text("#!" + sys.executable + " -S\n" + RUSTUP)
+        rustup.chmod(0o700)
+        self.rustup_record = self.root / "rustup.ndjson"
+        self.env.update(CARGO_RABS_RUSTUP=str(rustup),
+                        TEST_RUSTUP_RECORD=str(self.rustup_record),
+                        TEST_RUSTUP_COMPILER=str(self.toolchain / "bin/rustc"))
+        return rustup
+
     def select_daemon(self):
         endpoint = self.root / "rabsd.sock"
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -266,6 +318,164 @@ class CanonicalCargo(unittest.TestCase):
         self.assertEqual(record["request"]["command_context"]["env"], {"CARGO_INCREMENTAL":"0"})
         self.assertEqual(record["request"]["artifacts"]["files"], [])
         self.assertEqual(record["request"]["artifacts"]["cargo"], "cargo-json-v1")
+
+    def test_rustup_selection_uses_original_context_once_and_retains_physical_root(self):
+        self.select_rustup()
+        env = dict(self.env, RUSTUP_TOOLCHAIN="nightly-selected", RUSTUP_HOME=str(self.root / "rustup-home"),
+                   CARGO_HOME=str(self.root / "cargo-home"), RUSTUP_AUTO_INSTALL="1")
+        status, _, stderr, _ = self.invoke(env=env, input=b"native stdin\x00\xff")
+        self.assertEqual(status, 0, stderr)
+        discovery, = [json.loads(line) for line in self.rustup_record.read_text().splitlines()]
+        self.assertEqual(discovery["argv"], ["which", "rustc"])
+        self.assertEqual(discovery["cwd"], str(self.root))
+        self.assertNotEqual(discovery["cwd"], self.profile["source_root"])
+        self.assertEqual(discovery["stdin"], "")
+        self.assertEqual(discovery["env"], {name: "0" if name == "RUSTUP_AUTO_INSTALL" else env[name]
+                                           for name in discovery["env"]})
+        record, = self.records()
+        self.assertEqual(record["request"]["toolchain_source"], str(self.toolchain))
+        self.assertNotIn("toolchain", record["request"])
+        self.assertEqual(record["request"]["command_context"]["env"], {"CARGO_INCREMENTAL": "0"})
+        self.assertEqual(record["input"], b"native stdin\x00\xff".hex())
+        self.assertEqual(json.loads(self.profile_path.read_text())["toolchain"], "rustup")
+
+    def test_rustup_discovery_preserves_caller_environment_and_jobserver_descriptor(self):
+        self.select_rustup()
+        read_fd, write_fd = os.pipe()
+        try:
+            os.set_inheritable(read_fd, True)
+            os.write(write_fd, b"+")
+            env = dict(self.env, RUSTUP_TOOLCHAIN="nightly-selected", RUSTUP_AUTO_INSTALL="1",
+                       TEST_RUSTUP_FD=str(read_fd))
+            original = dict(env)
+            _, _, child_env = launcher.canonical_invocation(str(self.profile_path), ["check"], env)
+            self.assertEqual(env, original)
+            self.assertEqual(child_env["RUSTUP_AUTO_INSTALL"], "1")
+            discovery = json.loads(self.rustup_record.read_text())
+            self.assertFalse(discovery["inherited_fd"])
+            self.assertEqual(os.read(read_fd, 1), b"+")
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+
+    def test_explicit_toolchain_root_never_runs_rustup(self):
+        env = dict(self.env, CARGO_RABS_RUSTUP="/absent/rustup", RUSTUP_TOOLCHAIN="not-installed")
+        self.assertEqual(self.invoke(env=env)[0], 0)
+
+    def test_rustup_discovery_uses_caller_path_without_bundled_tool_search(self):
+        self.select_rustup()
+        env = dict(self.env, PATH=str(self.root))
+        env.pop("CARGO_RABS_RUSTUP")
+        status, _, stderr, _ = self.invoke(env=env)
+        self.assertEqual(status, 0, stderr)
+        self.assertEqual(len(self.rustup_record.read_text().splitlines()), 1)
+
+    def test_rustup_discovery_does_not_inherit_missing_caller_controls(self):
+        self.select_rustup()
+        env = {name: self.env[name] for name in (
+            "CARGO_RABS_RUSTUP", "TEST_RUSTUP_RECORD", "TEST_RUSTUP_COMPILER")}
+        with patch.dict(os.environ, RUSTUP_TOOLCHAIN="must-not-leak", RUSTUP_AUTO_INSTALL="1"):
+            self.assertEqual(launcher.canonical_rustup_toolchain(env), str(self.toolchain))
+        discovery = json.loads(self.rustup_record.read_text())
+        self.assertEqual(discovery["env"], {"RUSTUP_TOOLCHAIN": None, "RUSTUP_HOME": None,
+                                           "CARGO_HOME": None, "RUSTUP_AUTO_INSTALL": "0"})
+
+    def test_rustup_selector_requires_exactly_one_supported_choice_before_discovery(self):
+        self.select_rustup()
+        for selection in ({}, {"toolchain": None}, {"toolchain": "stable"}, {"toolchain": True},
+                          {"toolchain": []}, {"toolchain": {}},
+                          {"toolchain": "rustup", "toolchain_root": str(self.toolchain)},
+                          {"toolchain": None, "toolchain_root": str(self.toolchain)}):
+            with self.subTest(selection=selection):
+                self.profile.pop("toolchain", None)
+                self.profile.pop("toolchain_root", None)
+                self.profile.update(selection)
+                self.save()
+                self.assert_refused()
+                self.assertFalse(self.rustup_record.exists())
+
+    def test_rustup_refuses_unavailable_selection_and_nonliteral_or_excessive_output(self):
+        self.select_rustup()
+        self.assert_refused(env=dict(self.env, TEST_RUSTUP_MODE="error"))
+        path = str(self.toolchain / "bin/rustc").encode()
+        for output in (b"", b"\xff\n", b"relative/bin/rustc\n", path + b"\nextra\n",
+                       path + b"\n\n", path + b"\x00\n", b"x" * (launcher.MAX_RUSTUP_PATH_BYTES + 1),
+                       str(self.toolchain / "bin/cargo").encode() + b"\n"):
+            with self.subTest(output=output[:120]):
+                self.assert_refused(env=dict(self.env, TEST_RUSTUP_OUTPUT_HEX=output.hex()))
+
+    def test_rustup_discovery_discards_stderr_without_blocking_or_replaying_it(self):
+        self.select_rustup()
+        status, _, stderr, _ = self.invoke(env=dict(self.env, TEST_RUSTUP_MODE="stderr"))
+        self.assertEqual(status, 0, stderr)
+        self.assertNotIn(b"diagnosticdiagnostic", stderr)
+
+    def test_rustup_refuses_aliased_or_incomplete_physical_toolchains(self):
+        self.select_rustup()
+        alias = self.root / "toolchain-link"
+        alias.symlink_to(self.toolchain, target_is_directory=True)
+        incomplete = self.root / "incomplete"
+        (incomplete / "bin").mkdir(parents=True)
+        rustc = incomplete / "bin/rustc"
+        rustc.write_text("#!/bin/sh\nexit 98\n")
+        rustc.chmod(0o700)
+        for path in (alias / "bin/rustc", incomplete / "bin/rustc"):
+            with self.subTest(path=path):
+                self.assert_refused(env=dict(self.env, TEST_RUSTUP_COMPILER=str(path)))
+        self.assert_refused(["clippy"])
+
+    def test_rustup_discovery_bounds_waits_and_closes_its_process_group(self):
+        self.select_rustup()
+        for mode in ("hang", "closed-pipe", "inherited-pipe"):
+            with self.subTest(mode=mode):
+                child_record = self.root / (mode + "-child")
+                env = dict(self.env, TEST_RUSTUP_MODE=mode, TEST_RUSTUP_CHILD=str(child_record))
+                before = time.monotonic()
+                with patch.object(launcher, "RUSTUP_DISCOVERY_SECONDS", 0.15):
+                    with self.assertRaisesRegex(launcher.SetupError, "Rustup.*(timed out|did not exit)"):
+                        launcher.canonical_profile(str(self.profile_path), env=env)
+                self.assertLess(time.monotonic() - before, 1.0)
+                pid = json.loads(self.rustup_record.read_text().splitlines()[-1])["pid"]
+                self.assertTrue(launcher.pid_exited(pid))
+                if child_record.exists():
+                    child = int(child_record.read_text())
+                    until = time.monotonic() + 0.5
+                    while not launcher.pid_exited(child) and time.monotonic() < until:
+                        time.sleep(0.01)
+                    self.assertTrue(launcher.pid_exited(child))
+                self.assertEqual(list(self.operations.iterdir()), [])
+                self.assertFalse(self.record.exists())
+
+    def test_rustup_discovery_refuses_without_child_exit_ownership(self):
+        self.select_rustup()
+        previous = signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+        try:
+            with self.assertRaisesRegex(launcher.SetupError, "owned child exit status"):
+                launcher.canonical_profile(str(self.profile_path), env=self.env)
+        finally:
+            signal.signal(signal.SIGCHLD, previous)
+        self.assertFalse(self.rustup_record.exists())
+        self.assertEqual(list(self.operations.iterdir()), [])
+
+    def test_rustup_discovery_reaps_its_owned_child_even_if_group_cleanup_errors(self):
+        self.select_rustup()
+        children = []
+        spawn = launcher.subprocess.Popen
+
+        def retain_child(*args, **kwargs):
+            child = spawn(*args, **kwargs)
+            children.append(child)
+            return child
+
+        with patch.object(launcher.subprocess, "Popen", side_effect=retain_child):
+            with patch.object(launcher.os, "killpg", side_effect=PermissionError("fixture signal failure")):
+                with self.assertRaises(PermissionError):
+                    launcher.canonical_rustup_toolchain(self.env)
+        child, = children
+        self.assertEqual(child.returncode, 0)
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(child.pid, os.WNOHANG)
+        self.assertEqual(list(self.operations.iterdir()), [])
 
     def test_binary_release_target_and_feature_intent_is_exact_without_guessing_paths(self):
         args = ["build", "--release", "--bin=one", "--bin", "two", "-p", "app",
