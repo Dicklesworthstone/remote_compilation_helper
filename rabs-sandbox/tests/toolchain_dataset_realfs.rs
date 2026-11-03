@@ -123,6 +123,243 @@ fn copied_dataset_is_complete_and_independent_of_source_inodes() {
 }
 
 #[test]
+fn moved_enclosing_owner_rebinds_without_copying_or_refreshing_any_witness() {
+    let source = private();
+    fixture(source.path());
+    let parent = private();
+    let incoming = parent.path().join("incoming");
+    fs::create_dir(&incoming).unwrap();
+    fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700)).unwrap();
+    let retained = capture_toolchain(
+        source.path(),
+        &incoming.join("tree"),
+        None,
+        &ToolchainLimits::default(),
+        || false,
+    )
+    .unwrap();
+    let identity = *retained.identity();
+    let entries = retained.entries().unwrap();
+    let root_inode = fs::metadata(retained.root()).unwrap().ino();
+    let compiler_inode = fs::metadata(retained.root().join("bin/rustc"))
+        .unwrap()
+        .ino();
+    let pending = parent.path().join("pending");
+    fs::rename(&incoming, &pending).unwrap();
+    assert!(!incoming.exists());
+    assert!(retained.verify_retained_generation(|| false).is_err());
+    let retained = retained
+        .rebind_root(&pending.join("tree"), || false)
+        .unwrap();
+    assert_eq!(retained.root(), pending.join("tree"));
+    assert_eq!(*retained.identity(), identity);
+    assert_eq!(retained.entries().unwrap(), entries);
+    assert_eq!(fs::metadata(retained.root()).unwrap().ino(), root_inode);
+    assert_eq!(
+        fs::metadata(retained.root().join("bin/rustc"))
+            .unwrap()
+            .ino(),
+        compiler_inode
+    );
+    assert_eq!(
+        retained.read_chunk("bin/rustc", 0, 4096, || false).unwrap(),
+        b"fixture compiler bytes"
+    );
+    retained.verify(|| false).unwrap();
+    retained.sync(|| false).unwrap();
+    retained
+        .verify_source_unchanged(source.path(), || false)
+        .unwrap();
+
+    let published = parent.path().join("published");
+    fs::rename(&pending, &published).unwrap();
+    let retained = retained
+        .rebind_root(&published.join("tree"), || false)
+        .unwrap();
+    assert_eq!(fs::metadata(retained.root()).unwrap().ino(), root_inode);
+    retained.verify(|| false).unwrap();
+    fs::write(source.path().join("bin/rustc"), b"changed original source").unwrap();
+    assert!(
+        retained
+            .verify_source_unchanged(source.path(), || false)
+            .is_err()
+    );
+    retained.verify(|| false).unwrap();
+}
+
+#[test]
+fn rebind_refuses_an_equal_copy_and_aliased_or_nonordinary_paths() {
+    for change in [
+        "copy",
+        "root-link",
+        "parent-link",
+        "relative",
+        "traversal",
+        "missing",
+    ] {
+        let source = private();
+        fixture(source.path());
+        let parent = private();
+        let incoming = parent.path().join("incoming");
+        fs::create_dir(&incoming).unwrap();
+        fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700)).unwrap();
+        let retained = capture_toolchain(
+            source.path(),
+            &incoming.join("tree"),
+            None,
+            &ToolchainLimits::default(),
+            || false,
+        )
+        .unwrap();
+        let published = parent.path().join("published");
+        fs::rename(&incoming, &published).unwrap();
+        let candidate = match change {
+            "copy" => {
+                let copy = capture_toolchain(
+                    source.path(),
+                    &parent.path().join("equal-copy"),
+                    Some(retained.identity()),
+                    &ToolchainLimits::default(),
+                    || false,
+                )
+                .unwrap();
+                assert_eq!(copy.identity(), retained.identity());
+                copy.root().to_path_buf()
+            }
+            "root-link" => {
+                let link = parent.path().join("root-link");
+                symlink(published.join("tree"), &link).unwrap();
+                link
+            }
+            "parent-link" => {
+                let link = parent.path().join("parent-link");
+                symlink(&published, &link).unwrap();
+                link.join("tree")
+            }
+            "relative" => "published/tree".into(),
+            "traversal" => published.join("../published/tree"),
+            "missing" => parent.path().join("missing"),
+            _ => unreachable!(),
+        };
+        assert!(
+            retained.rebind_root(&candidate, || false).is_err(),
+            "rebind admitted {change}"
+        );
+        assert_eq!(
+            fs::read(published.join("tree/bin/rustc")).unwrap(),
+            b"fixture compiler bytes"
+        );
+    }
+}
+
+#[test]
+fn rebind_rejects_restored_content_and_transient_namespace_mutations() {
+    for change in [
+        "content",
+        "mode",
+        "root-membership",
+        "nested-membership",
+        "alias",
+    ] {
+        let source = private();
+        fixture(source.path());
+        let parent = private();
+        let incoming = parent.path().join("incoming");
+        fs::create_dir(&incoming).unwrap();
+        fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700)).unwrap();
+        let retained = capture_toolchain(
+            source.path(),
+            &incoming.join("tree"),
+            None,
+            &ToolchainLimits::default(),
+            || false,
+        )
+        .unwrap();
+        let identity = *retained.identity();
+        let published = parent.path().join("published");
+        fs::rename(&incoming, &published).unwrap();
+        let root = published.join("tree");
+        match change {
+            "content" | "mode" => {
+                let compiler = root.join("bin/rustc");
+                fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755)).unwrap();
+                if change == "content" {
+                    fs::write(&compiler, b"fixture compiler bytes").unwrap();
+                }
+                fs::set_permissions(&compiler, fs::Permissions::from_mode(0o555)).unwrap();
+            }
+            "root-membership" | "nested-membership" => {
+                let transient = if change == "root-membership" {
+                    root.join("transient")
+                } else {
+                    root.join("empty/transient")
+                };
+                fs::write(&transient, b"").unwrap();
+                fs::rename(&transient, published.join("transient-outside-tree")).unwrap();
+            }
+            "alias" => {
+                fs::rename(root.join("bin/runtime"), published.join("old-alias")).unwrap();
+                symlink("../lib/runtime.so", root.join("bin/runtime")).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            fingerprint_toolchain(&root, &ToolchainLimits::default(), || false).unwrap(),
+            identity
+        );
+        assert!(
+            retained.rebind_root(&root, || false).is_err(),
+            "rebind refreshed the {change} witness"
+        );
+        assert!(root.is_dir());
+    }
+}
+
+#[test]
+fn rebind_refuses_a_renamed_root_generation_and_cancellation_without_removing_bytes() {
+    for cancelled in [false, true] {
+        let source = private();
+        fixture(source.path());
+        let parent = private();
+        let incoming = parent.path().join("incoming");
+        fs::create_dir(&incoming).unwrap();
+        fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700)).unwrap();
+        let retained = capture_toolchain(
+            source.path(),
+            &incoming.join("tree"),
+            None,
+            &ToolchainLimits::default(),
+            || false,
+        )
+        .unwrap();
+        let destination = if cancelled {
+            let published = parent.path().join("published");
+            fs::rename(&incoming, &published).unwrap();
+            published.join("tree")
+        } else {
+            let renamed = incoming.join("renamed-tree");
+            fs::rename(incoming.join("tree"), &renamed).unwrap();
+            renamed
+        };
+        let error = retained
+            .rebind_root(&destination, || cancelled)
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            if cancelled {
+                io::ErrorKind::Interrupted
+            } else {
+                io::ErrorKind::InvalidData
+            }
+        );
+        assert_eq!(
+            fs::read(destination.join("bin/rustc")).unwrap(),
+            b"fixture compiler bytes"
+        );
+    }
+}
+
+#[test]
 fn read_ahead_preserves_complete_wide_and_empty_file_datasets() {
     let source = private();
     for number in 0_u8..19 {
@@ -954,4 +1191,47 @@ fn installed_rustc_executes_and_compiles_from_retained_toolchain() {
     assert!(status.success(), "{}", String::from_utf8_lossy(&error));
     assert!(fs::metadata(output).unwrap().len() > 0);
     retained.verify(|| false).unwrap();
+
+    let root_inode = fs::metadata(retained.root()).unwrap().ino();
+    let compiler_inode = fs::metadata(retained.root().join("bin/rustc"))
+        .unwrap()
+        .ino();
+    let destination = private();
+    let moved_owner = destination.path().join("moved-owner");
+    fs::rename(parent.path(), &moved_owner).unwrap();
+    let retained = retained
+        .rebind_root(&moved_owner.join("toolchain"), || false)
+        .unwrap();
+    assert_eq!(fs::metadata(retained.root()).unwrap().ino(), root_inode);
+    assert_eq!(
+        fs::metadata(retained.root().join("bin/rustc"))
+            .unwrap()
+            .ino(),
+        compiler_inode
+    );
+    let compiler = retained.root().join("bin/rustc");
+    let (status, output, error) = run(
+        Command::new(&compiler).args(["--print", "sysroot"]),
+        &moved_owner,
+    );
+    assert!(status.success(), "{}", String::from_utf8_lossy(&error));
+    assert_eq!(
+        Path::new(String::from_utf8(output).unwrap().trim()),
+        retained.root()
+    );
+    let output = moved_owner.join("moved-fixture.rmeta");
+    let (status, _, error) = run(
+        Command::new(compiler)
+            .arg(moved_owner.join("fixture.rs"))
+            .args(["--crate-type=lib", "--emit=metadata"])
+            .arg("-o")
+            .arg(&output),
+        &moved_owner,
+    );
+    assert!(status.success(), "{}", String::from_utf8_lossy(&error));
+    assert!(fs::metadata(output).unwrap().len() > 0);
+    retained.verify(|| false).unwrap();
+    retained
+        .verify_source_unchanged(Path::new(&root), || false)
+        .unwrap();
 }

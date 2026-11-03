@@ -74,6 +74,33 @@ impl PreparedToolchain {
         &self.identity
     }
 
+    /// Rebind the same retained image after its enclosing owned directory moves.
+    ///
+    /// This performs no filesystem move and refreshes no inode or mutation
+    /// stamp. The new ordinary absolute path must name the original anchored
+    /// root, and every original file, directory and alias generation must still
+    /// match. Moving the dataset root itself can change its generation and is
+    /// deliberately not repaired here; move its enclosing owner instead.
+    ///
+    /// The caller retains ownership of the backing directory on both success
+    /// and error. Its content identity and original-source witness are unchanged.
+    /// Rebinding is not a byte verification or permission to publish a result;
+    /// consumers must still perform their normal full verification and sync.
+    pub fn rebind_root(self, new_root: &Path, stopped: impl Fn() -> bool) -> io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            let mut rebound = self;
+            rebound.inventory.rebind_root(new_root, &stopped)?;
+            rebound.root = new_root.to_path_buf();
+            Ok(rebound)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (self, new_root, stopped);
+            Err(unsupported())
+        }
+    }
+
     /// Validate the complete original source generation without rereading bytes.
     ///
     /// A captured toolchain retains the source inventory that produced its
@@ -404,6 +431,45 @@ mod linux {
     }
 
     impl Inventory {
+        pub(super) fn rebind_root(
+            &mut self,
+            new_root: &Path,
+            stopped: &impl Fn() -> bool,
+        ) -> io::Result<()> {
+            checkpoint(stopped)?;
+            absolute(new_root)?;
+            let original = &self
+                .entries
+                .get("")
+                .ok_or_else(|| invalid("missing toolchain root stamp"))?
+                .stamp;
+            let open_root = || -> io::Result<File> {
+                Ok(File::from(openat2(
+                    CWD,
+                    new_root,
+                    OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                    ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+                )?))
+            };
+            require(
+                Stamp::of(&self.root.metadata()?) == *original
+                    && Stamp::of(&open_root()?.metadata()?) == *original,
+                "rebound toolchain root differs from its retained generation",
+            )?;
+            // Only the pathname changes. All original descriptors, stamps,
+            // contents and alias text remain the verification authority.
+            self.root_path = new_root.to_path_buf();
+            self.verify_source(new_root, stopped)?;
+            // Do not admit a final or ancestor symlink introduced during the
+            // complete generation walk, even when it resolves to the same inode.
+            require(
+                Stamp::of(&open_root()?.metadata()?) == *original,
+                "rebound toolchain path changed during verification",
+            )?;
+            checkpoint(stopped)
+        }
+
         pub(super) fn sync(&self, stopped: &impl Fn() -> bool) -> io::Result<()> {
             self.verify(stopped)?;
             for (path, entry) in &self.entries {
