@@ -2,7 +2,75 @@
 
 ## Reality check and execution order — updated November 3, 2026
 
-**Current execution checkpoint, November3 at16:10UTC:** the ordinary RCH stock
+**Public-route blocker and next repair, November3 at18:58UTC:** DSRa788d108
+finished FAILED6 before Cargo. Storage/config/SSH probe pass and truthful Rust
+capabilities publish, but the private daemon retains the original RCH-I004
+process-observation quarantine. Recovery failed its capability-stage25s SSH
+command BEFORE reaching the required lifecycle probe. Native DSR diagnosis of
+the exact logged5268B script reproduced raw124/25.177s while still enumerating
+components, before disk/load facts. No quarantine, threshold or budget was
+cleared/changed. Private daemon326607 stopped0/PIDabsent, active[]/queued[] and
+unchanged fixtures; shared TRJ restored and independently healthy/used0.
+
+- [x] Isolate the actual capability-stage failure from the later lifecycle gate.
+- [ ] Qualify corrected source0c11a7ab: generic component-aware admission remains complete
+  by default; recovery skips only component inventory its predicates do not
+  consume. All SSH/protocol/target/toolchain/disk/load/telemetry/lifecycle/canary
+  gates,25s/120s budgets and durable quarantine remain unchanged. New regression
+  compares the healthy decision plus ten separate failures with/without unused
+  component facts. Full capability/recovery modules, normal client+daemon and
+  full workspace QA run through DSRrch_recovery_components on exactly7bfb plus
+  those two files. Original74c64f run passed formatting and capability33/33,
+  then failed recovery test compilation (E0609: my extra `.rust` in a new
+  test field access). Failed source/audits/receipt retained. Only that access
+  is corrected; all assertions and production changes remain. Corrected native
+  DSRrch_recovery_components_field is running the same whole qualification.
+  Recovery body, normal binaries and full workspace QA remain pending.
+  UBS candidate/baseline both
+  retain the same5 critical shell-in-test findings/raw1; no suppression.
+- [x] Observe incumbent and component-free command experiment in the SAME native
+  DSR invocation with unchanged25s caps. This runtime-command experiment is NOT
+  compiled-production generation, full recovery or a RABS/performance pass.
+  Incumbent raw124/25.124s with118 partial facts; component-free raw0/12.007s
+  with35 facts including all three disk roots and actual load/core count.
+  Experimental command SHA36ce67b067bae6e31ab8fb42010cf178aff173a10fccfb0ce42389bdbd9b0471.
+- [ ] Require the subsequently compiled daemon's actual command to match that
+  experiment and prove all consecutive healthy probes plus canary before any
+  public Cargo admission. Then retry the original four independent cache rounds.
+
+**Current qualification checkpoint, November3 at18:32UTC:** source7bfb1352 has
+completed its native driver through DSR with the final consumed-timer repair and committed
+bb9d9817 disk-ledger change. The first driver stopped before compilation on its
+incorrect zero-platform-skip assumption: disk tests discovered50, passed47 and
+skipped exactly the three Darwin-only cases on Linux; fmt0. That failed receipt
+72dbc06d is retained. The corrected driver records those exact skip identities;
+it changes no source, test, compiler profile, deadline or product gate. It then
+runs all four full transport suites: PASS162/162, no failures or ignores
+(adapter128, delivery26, interrupt5, resume3). Normal-dev RCH client/daemon
+build0/464.54s and their actual CLI smokes0; full workspace/all-target
+check0/672.92s, strictClippy0/660.27s and fmt0/17.86s. All1694 source/incoming
+before/after audits match; native overall0. Report18522B
+SHA98873a86344dde45b0732daf2571390b33185ecbea1499d22088f34a1f50af83.
+DSR collection remains pending. Peer cfd81d0a contains the exact tested timer bytes.
+The corrected driver exports BOTH binaries to DSR.
+Shared TRJ entered supported drain at18:02, independently observed draining
+with peer build30093284437131371 still holding six of eight slots. No peer
+job was cancelled and no new private pool has started. Require drained/used0/
+active[] before private admission and restore shared scheduling at the end.
+Its peer still held6/8 slots beyond one hour. Supported `workers enable trj`
+restored shared scheduling at18:10, ending this bounded window without private
+admission. Idle hz4 and vmi1149989 alternatives failed unchanged SBH14%
+physical-root threshold (2.92% and4.21% free); no staging, build or pool was
+started there. hz4 /tmp is RAM-backed and also refused by SBH; no RAM staging.
+Fresh18:11:14 shared status became healthy/used0/active[] without a peer
+cancellation. Immediately requested supported drain again; immutable receipt
+at18:11:47 and independent18:16 observation both show drained/used0/active[].
+Guarded DSR public probe a788d108 is queued behind final producer0b17d24a on
+concurrency1. It requires producer full QA0 and reobserves shared idle/drained
+before private daemon admission. The public cache probe remains UNRUN and
+M6/S7/A012 remain in_progress. Restore shared TRJ after private ownership settles.
+
+**Public execution checkpoint, November3 at16:10UTC:** the ordinary RCH stock
 baseline actually compiled on TRJ (Cargo0/38.91s), but its supervising client
 returned255/213.7s with `RCH_SCOPED_COMPLETION_UNCONFIRMED`. No public RABS
 round ran. Build30093651321290753, wrapper
@@ -47,21 +115,25 @@ Current highest-value TODO, in execution order:
   raw exits all0, report54070de88c7b837aef70d3ea0b967b3329b3db22997f79f2ce51e34da2c513a0.
 - [x] Retain TRJ native TLS component DSR32f84979 terminalTIMEOUT5/3677s.
   Zero test bodies ran; compiler processes are absent. No blind compile retry.
-- [ ] Run full adapter unit and original TLS/delivery/interrupt/resume suites
+- [x] Run full adapter unit and original TLS/delivery/interrupt/resume suites
   on admitted faster capacity after the current RCH job; preserve normal profile.
   Original3f7 now actually ran through DSR70fd7ee1 on TS2:158passed/3failed/
   0ignored across161 tests (adapter126/1, delivery24/2, interrupt5/0, resume3/0).
   Scoped check, strictClippy and fmt all0; DSR terminalFAILED6. Retain the three
   failures: J011 injected-clock/native-wake mismatch; prepared source fixture
   parent not private; scripted failed-compiler peer omits empty stdout range.
-- [ ] Qualify the clock/fixture repair against all four full suites and FULL
+- [x] Qualify the clock/fixture repair against all four full suites and FULL
   workspace QA, preserving every original assertion, timeout and privacy gate.
-  DSR7b05b9f9 sourceb678f970 is queued behind the RCH diagnostic job. It adds
+  DSR7b05b9f9 sourceb678f970 finished FAILED6. It adds
   an early-wake regression, private fixture setup plus explicit0770 refusal,
   exact empty stdout framing and unchanged diagnostic/ACK/offline checks.
-  The working tree additionally rechecks the selected clock after a native
-  wake and tests a clock crossing during that poll; this stronger final change
-  is NOT included in frozenb678 and requires its own qualified continuation.
+  Full suites: adapter127/1/0 (completed timer was incorrectly polled again),
+  delivery26/0/0, interrupt5/0/0, resume3/0/0. Full check0/493.26s,
+  strictClippy0/532.12s, fmt1 solely test-call wrapping. Final7bfb adds Option
+  ownership of completed timer futures, repeated predeadline polling and a
+  same-poll clock-crossing assertion, plus manual fixture formatting.
+  Its native continuation passed all162 test bodies, normal RCH rebuild and
+  full workspace QA as above. Complete DSR collection is still pending.
 - [x] Run original full-SDK TRJ compiler consumer with3f7 shipping tools.
   DSRrabs_tls_nodelay_trj_runtime started14:33:09UTC, original300s Cargo/600s
   helper, full installed SDK and original byte-bound older harness. Prior0fb
@@ -135,11 +207,16 @@ Current highest-value TODO, in execution order:
   artifact collection because the diagnostic did not produce its configured
   binary. This is native supervisor proof, not RCH/RABS success. Earlier
   DSRb1ff26ec failed its source guard before any payload; retain both outcomes.
-- [ ] Qualify bounded failure-only RCH completion details with unchanged exact
+- [x] Qualify bounded failure-only RCH completion details with unchanged exact
   uncertainty marker/status255, ownership retention and cleanup conditions.
   Sourcec5299732, DSRd2f7fa98: all27 native process cases and all3 compiled
-  shell parse/quoting cases pass. Normal client/daemon rebuild and full required
-  check/strictClippy/fmt are pending. UBS candidate and baseline both retain
+  shell parse/quoting cases pass. Normal client/daemon rebuild0/366.61s,
+  full check0/606.30s, strictClippy0/603.75s and fmt0/15.59s; source audits match.
+  Peer commit be4c0e41 contains the exact qualified script/test bytes, so no
+  duplicate commit was created. DSR aggregate remains FAILED/partial despite
+  native raw0: the driver exported only rch while its recipe required rchd too.
+  Both native tools are retained; final7bfb producer corrects that export.
+  UBS candidate and baseline both retain
   the same16 critical fixture/eval findings,24warnings,141info; raw1 is not green.
   This diagnostic change does not fix or reproduce the original stock failure.
 - [ ] Correct the public canary's metadata collector before its next run:
