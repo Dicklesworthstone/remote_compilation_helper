@@ -2395,6 +2395,84 @@ real Cargo serving, fleet performance or release qualification.
   Deduplication
   is maintenance until an unchanged same-invocation incumbent comparison shows
   useful end-to-end improvement; no speed, release or A012 closure claim yet.
+  - [x] At23:11UTC, confirm managed8611 is still running and actual Cargo has
+    passed Asupersync and fsqlite-core. All10 worktrees and3 canonical cases
+    remain unrun; compilation progress is not an acceptance result.
+  - [x] Stage an immutable continuation without touching active inputs:
+    `job-unified-runtime-retained-source/run.py`, SHA-256
+    `a0ff40043e879bef4d014038930699eee3c1ce45021d860eea12d15728b2ceb4`.
+    It audits both the newly DSR-uploaded source and the exact retained
+    execution root `dsr-build-rabs_unified_runtime_development-linux-amd64-a29e06f655c64f9a8691b1f2a6286b3f/source`,
+    reuses the admitted development target/source cache, and keeps every
+    original test and deadline. The ordinary-development DSR dry-run exits0;
+    this is preparation only, not a launched or passing retry.
+  - [x] Observe8611 attempt1's host-side10,800s deadline diagnostic23:21UTC.
+    The coordinator is gone and the aggregate remains stale running; there
+    is no DSR terminal result or child raw exit to invent. Preserve original
+    state, native log and partial run.json (SHA-256
+    `b098c45eb671ae8646afdd0a4f19677ce6a63596552ba4eb3723d91053a44f7e`):
+    four storage commands only, no runtime case, aggregate or source-after.
+  - [x] Independently audit retained execution source after the deadline:
+    1,697/1,755 files plus58 exact exclusions, zero differences. First census
+    times out60s; next421-process kernel cwd/target-FD census finds no visible
+    user but exits1 on33 denied reads. Separate kernel readback classifies
+    every denial as old systemd/PAM/agent, root-parented SSH server or gone;
+    no compiler denial remains unclassified. Keep the raw failure and denied
+    descriptors explicit. Witness SHA-256
+    `e449e816f760ac002ee61dff143b6d2b91a400d3ac9db8d6e3333732992c8dbb`
+    binds these records and does not fabricate an original terminal receipt.
+    **Correction00:04UTC:** that custom census skipped Z/X main threads and
+    therefore did not cover live sibling threads under a dead main. Complete
+    pre-resume quiescence was not proved. Do not silently repair the original
+    witness or active driver. The existing repository thread-aware snapshot,
+    run23:57:35UTC, finds2,355 records and only two source/target matches, both
+    born in attempt2; no old holder is observed then. This is during-attempt
+    evidence, not retroactive admission. Protected process reads remain denied.
+    Keep this development-cache admission gap explicit; use existing closure
+    helpers rather than invent another process-authority mechanism.
+  - [x] Start the supported original-run DSR resume23:29:55UTC; coordinator
+    PID44879 and its birth/PPID1 verified. DSR itself recognizes dead lock
+    owner77196; no manual lock or state edit. New immutable driver
+    `1c9402771ee27acf338f8b0a8d80f5b1626683cd638b88c0698cb8b2f6b02dcd`
+    uses the exact retained source/target, audits the new upload too, and
+    writes new results in `job-unified-runtime-retained-source`.
+    Original tests/deadlines stay; same10,800s operational budget. Detached
+    ordinary CLI prevents a chat/tool lifecycle from owning the coordinator.
+    Earlier prepared separate-tool dry-run/driver remain unlaunched and
+    superseded. No old partial report or active input was overwritten.
+  - [ ] Observe actual test denominators in this resumed attempt,
+    and qualify only its exact source/artifacts. Keep the original failed
+    host-deadline observation and missing terminal receipt separate. The
+    normal Cargo build, not forced Fresh metadata, decides which retained
+    artifacts can be reused. Do not infer an active coordinator from saved
+    running state alone; check its exact process identity as well.
+  - [x] Complete the normal dev daemon/wrapper build in attempt2: Cargo0,
+    22m05s. Actual daemon788,702,408 bytes, SHA-256
+    `965ae3d492b54f85ca3db68b0bd36a694fc60a1586cf724d15fa2b3c51420d4e`;
+    wrapper14,805,144 bytes,
+    `b0c86bb2a73d1ac9bc698f01e2c36e65f2c8833f0f57447cbbe052ecfeab6d86`.
+    Actual version and true/-vV passthrough each exit0 with empty stderr;
+    hashes stay stable. Actual Cargo artifact graph is one Git78 Asupersync,
+    proc-macros/tls only. Retain compiled-pair-smoke.json. This is compile and
+    launch proof only; the worktree test harness is still compiling, all
+    cache/TLS/worker/performance and release acceptance remains unproved.
+  - [x] Bound alternate-capacity probes: ts1 has the pinned toolchain and a
+    healthy mounted NAS, but root and/tmp fail14% (tmp also fails20G).
+    No build was launched there. Earlier be324 retains a verified daemon,
+    but its old source/global Cargo cache are on below-floor filesystems;
+    no new writes or mixed older worker/wrapper qualification were attempted.
+  - [x] Probe S7's named deployment targets23:46UTC, using the fresh
+    authoritative worker list. Both hz2 and vmi1149989 are reachable, have
+    glibc2.43 and bwrap, and lack rabs-wkr on PATH. Presence of bwrap is not
+    a namespace or RABS execution pass. hz2/data has18,791,071,744 bytes free
+    (2.914%); vmi1149989/data28,959,752,192 (3.485%). Both SBH guards exit1;
+    tmp volumes also fail20G at5,494,403,072 and17,986,084,864 bytes free.
+    No deploy/install/cleanup/threshold change. SSH's configured new-host
+    bookkeeping warning is retained. Continue actual runtime validation on
+    admitted ZFS; S7's clean deployment/doctor/uninstall acceptance stays open.
+  - [ ] Re-probe S7 storage and actual namespace capability before deployment
+    once those named targets can be admitted. Do not substitute another host's
+    positive result, a bwrap executable path, or old free-space numbers.
 - [ ] Requalify the adapter contracts and CAS differential/migration/reopen
   cases required by ADR007 after runtime unification. Equal published source
   does not prove that merging formerly separate runtime globals/TLS is safe.
