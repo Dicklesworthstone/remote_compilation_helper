@@ -2,7 +2,78 @@
 
 ## Reality check and execution order — updated November 3, 2026
 
-**Current execution checkpoint, November3 at12:44UTC:** corrected source0fb4cf2d
+**Current execution checkpoint, November3 at14:36UTC:** actual generated-input
+consumer PASS1/1 with the current normal-dev harness and four normal0fb tools:
+six delivered programs print the expected42/43, dependency archives replay
+across relocated worktrees, changed generator input invalidates the consumer,
+and the selected failing build-script negative remains intact. Thirteen real
+worker executions complete; the last receipt has exit0, residual0 and released/
+resolved true. DSR270f3101 is terminalSUCCESS; report
+8ecacb649136cd0819a1195b2d8cc958ab7911c6c43cf7e5d9a308189eef0b27.
+This is functional explicit-Linux/physical-compiler proof, not default RCH,
+distinct-host authority, a paired speed win or release qualification.
+
+Current highest-value TODO, in execution order:
+
+- [x] Commit the qualified captured-image ownership repair3d0b7840, retained
+  ELF interpreter repair7e2246db, and compiler-selection/whole-process repair
+  4d4e1db9. Preserve the shared Git index byte-identically; no push or release.
+- [x] Compile current normal-dev canonical harness, sourceb3e963b0, DSRf4e29dbb
+  terminal0/613s. Compile, scoped strict Clippy and fmt all0; source binding holds.
+- [x] Reproduce original plain archive assertion unchanged and take independent
+  read-only CAS snapshot. It remains RED0/1/raw101: the rejected action has the
+  already-supported committed-DAG class, not an established execution-only leak.
+- [ ] Resolve that assertion against the original class contract and legitimate
+  gate-fix evidence standard; do not weaken acceptance merely to get green.
+- [x] Run the stronger existing committed mixed-archive case unchanged:
+  PASS1/1, nine worker executions and six later cache serves with exact bytes.
+- [x] Run existing generated-input case unchanged: six actual returned programs,
+  mutation, cache reuse, relocation and negative control all pass as above.
+- [x] Compile candidate3f7 TCP_NODELAY normal four shipping tools and run full
+  workspace/all-target check, strict Clippy and fmt. DSR8e5c6ee5 terminalSUCCESS;
+  raw exits all0, report54070de88c7b837aef70d3ea0b967b3329b3db22997f79f2ce51e34da2c513a0.
+- [x] Retain TRJ native TLS component DSR32f84979 terminalTIMEOUT5/3677s.
+  Zero test bodies ran; compiler processes are absent. No blind compile retry.
+- [ ] Run full adapter unit and original TLS/delivery/interrupt/resume suites
+  on admitted faster capacity after the current RCH job; preserve normal profile.
+- [x] Run original full-SDK TRJ compiler consumer with3f7 shipping tools.
+  DSRrabs_tls_nodelay_trj_runtime started14:33:09UTC, original300s Cargo/600s
+  helper, full installed SDK and original byte-bound older harness. Prior0fb
+  timeout remains independently RED. New result RED0/1/raw101/535.694s,
+  DSRfa40bc83 terminalFAILED6/711s. Full source/incoming/binary/harness-after
+  audits verify; report has no worker execution receipt, journal lastnull,
+  worker stderr8873B SHAea7a45bcdb11132a1aea8fc0d4443843f42db56698b024e59a8dfdb84eeef94d.
+  TCP_NODELAY does not close this gap and earns no speed/fix credit. Repeated
+  connection-refused hashes occur before the listener becomes ready; later
+  standby dispatch and remote admission DO succeed. The canonical trace spends
+  repeated requests warming toolchain facts, then times out after admission.
+  Do not mistake those initial refusals for a proven coordinator failure.
+- [ ] Measure the remaining cold toolchain-fact/upload work on the complete
+  installed SDK before selecting another implementation change. No SDK trimming,
+  timeout increase, source-key relaxation or synthetic pass.
+- [x] Run original current-tree Linux RCH focused tests, sourcee792e4ba:
+  worker-cache wiring1/1, source-lock lifecycle1/1, config guards8/8, all raw0.
+- [ ] Complete current-tree RCH client/daemon compile and full workspace
+  check/strictClippy/fmt. DSRrch_current_tree_wiring started13:59:31UTC;
+  source is whole main4d4e1db9 plus frozen working bytes,1694 selected files.
+  Older459/116e preparations remain UNRUN/superseded; no topology downgrade.
+- [x] Verify real existing TS2-to-TRJ strict-host-key SSH and authoritative
+  worker row (eight real slots). No new credentials or private-key copying.
+- [ ] With task-private client/daemon/config/state and real worker tools, run
+  ordinary public cargo-rabs --rabs-remote through RCH. Require source receipt,
+  actual worker-local RABS activity, correct returned outputs and terminal ACK.
+- [ ] Test cold independent targets, independent qualification, warm cache serve,
+  changed-input invalidation and ordinary Rustup separately; fallback is not a hit.
+- [x] Retain Mac RCH459 DSR0190c286 terminalTIMEOUT5/4620s, no binaries/tests.
+  Both known Mac alternatives fail original storage guards; no floor exceptions.
+- [ ] Close the S7 DSR archive producer/installer member mismatch, then prove
+  private install/doctor/uninstall on actual matching bytes and admitted hosts.
+- [ ] Distinct-host shared authority/cancellation/restart, fifteen-agent storm,
+  paired current-RCH/stock performance and sustained rollout remain UNRUN.
+- [ ] Keep M6/S7/A012 in_progress until their own acceptance probes complete;
+  update this TODO and cited Beads receipts after each terminal result.
+
+**Earlier checkpoint, November3 at12:44UTC:** corrected source0fb4cf2d
 has a terminal native DSR pass:455 sandbox tests pass,0 fail,10 original ignored;
 each of the four explicitly selected REAL compiler/negative-boundary cases
 passes1/1. Scoped check/strict Clippy/fmt all0, source/harness-after audits verify;
