@@ -322,14 +322,28 @@ class Registry:
         return entries
 
     def admit(self, monitor):
-        # Recursive scans happen before this lock. Hold it only for a process
-        # census, fresh free-space check, and atomic reservation publication.
+        # Counting every reservation is conservative and avoids a whole-host
+        # process census on the common path. Retire records only when capacity
+        # or the ledger limit requires it, using the authoritative census.
         with self.locked():
-            groups = alive_groups(process_snapshot())
-            records = [entry for entry in self.read() if reservation_alive(entry, monitor.boot, groups)]
+            records = self.read()
             free = monitor.sample()
             if set(free) != monitor.devices:
                 raise BudgetFailure("monitor_unavailable", detail="filesystem changed before admission")
+
+            def fits():
+                return all(available >= max([monitor.floor] + [entry["floor"] for entry in records if device in entry["devices"]])
+                           + monitor.budget + sum(entry["budget"] for entry in records if device in entry["devices"])
+                           for device, available in free.items())
+
+            if len(records) >= 4096 or not fits():
+                groups = alive_groups(process_snapshot())
+                records = [entry for entry in records if reservation_alive(entry, monitor.boot, groups)]
+                free = monitor.sample()
+                if set(free) != monitor.devices:
+                    raise BudgetFailure("monitor_unavailable", detail="filesystem changed before admission")
+            if len(records) >= 4096:
+                raise BudgetFailure("monitor_unavailable", detail="worker disk ledger reservation limit")
             floors = {}
             for device, available in free.items():
                 same_device = [entry for entry in records if device in entry["devices"]]

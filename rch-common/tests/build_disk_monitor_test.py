@@ -209,6 +209,42 @@ class DiskMonitorTests(unittest.TestCase):
         # Leader absence/reuse deliberately does not appear in the decision:
         # living group members keep the entire reservation.
 
+    def test_admission_keeps_all_records_when_capacity_covers_them(self):
+        registry = monitor.Registry(str(self.registry))
+        record = dict(boot=monitor.boot_identity(), group=os.getpgrp(),
+                      leader_start="retained", devices=[1], budget=7 * GIB, floor=10 * GIB)
+        monitor.atomic_json(str(self.registry / "ledger.json"), {"version": 1, "entries": [record]})
+        value = SimpleNamespace(boot=monitor.boot_identity(), group=os.getpgrp(), start="new",
+                                budget=4 * GIB, floor=2 * GIB, devices={1}, sample=lambda: {1: 21 * GIB})
+        with patch.object(monitor, "process_snapshot", side_effect=AssertionError("unnecessary census")):
+            free, floors = registry.admit(value)
+        self.assertEqual((free, floors), ({1: 21 * GIB}, {1: 10 * GIB}))
+        self.assertEqual(registry.read()[0], record)
+        self.assertEqual(len(registry.read()), 2)
+
+    def test_admission_fallback_resamples_after_real_census(self):
+        registry = monitor.Registry(str(self.registry))
+        value = SimpleNamespace(boot=monitor.boot_identity(), group=os.getpgrp(), start="new",
+                                budget=4 * GIB, floor=2 * GIB, devices={1})
+        samples = iter(({1: 5 * GIB}, {2: 20 * GIB}))
+        value.sample = lambda: next(samples)
+        with self.assertRaises(monitor.BudgetFailure) as caught:
+            registry.admit(value)
+        self.assertEqual(caught.exception.reason, "monitor_unavailable")
+        self.assertEqual(registry.read(), [])
+
+    def test_full_live_ledger_does_not_publish_unreadable_extra_record(self):
+        registry = monitor.Registry(str(self.registry))
+        record = dict(boot=monitor.boot_identity(), group=os.getpgrp(),
+                      leader_start="retained", devices=[1], budget=1, floor=0)
+        monitor.atomic_json(str(self.registry / "ledger.json"), {"version": 1, "entries": [record] * 4096})
+        value = SimpleNamespace(boot=monitor.boot_identity(), group=os.getpgrp(), start="new",
+                                budget=1, floor=0, devices={1}, sample=lambda: {1: GIB})
+        with self.assertRaises(monitor.BudgetFailure) as caught:
+            registry.admit(value)
+        self.assertEqual(caught.exception.reason, "monitor_unavailable")
+        self.assertEqual(len(registry.read()), 4096)
+
     def test_free_bytes_use_unprivileged_available_blocks(self):
         with patch.object(monitor.os, "fstatvfs", return_value=SimpleNamespace(f_bavail=7, f_bfree=99, f_frsize=4096)):
             self.assertEqual(list(monitor.filesystem_sample([str(self.target)]).values()), [7 * 4096])
