@@ -51,8 +51,41 @@ mod source_topology_cli {
 
     impl Fixture {
         fn new(layout: Layout) -> Self {
-            let root = tempfile::tempdir().unwrap();
+            // Offloaded tests set TMPDIR inside the synced Git checkout. This
+            // fixture executes the real live-checkout guard, so its worker
+            // paths must live outside that checkout rather than inherit it.
+            // An OS temp directory may itself be Git-marked on a shared host.
+            let temporary_parent = ["/tmp", "/var/tmp"]
+                .into_iter()
+                .filter_map(|path| std::fs::canonicalize(path).ok())
+                .find(|parent| {
+                    parent.ancestors().all(|ancestor| {
+                        matches!(
+                            std::fs::symlink_metadata(ancestor.join(".git")),
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                        )
+                    })
+                })
+                .expect("source topology CLI fixture needs an OS temp directory outside Git");
+            let root = tempfile::Builder::new()
+                .prefix("rch-source-topology-")
+                .tempdir_in(temporary_parent)
+                .expect("create source topology CLI fixture outside the synced checkout");
             let base = root.path().canonicalize().unwrap();
+            for ancestor in base.ancestors() {
+                match std::fs::symlink_metadata(ancestor.join(".git")) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Ok(_) => panic!(
+                        "source topology CLI fixture has Git checkout ancestor {}; \
+                         the real live-checkout guard must remain enabled",
+                        ancestor.display()
+                    ),
+                    Err(error) => panic!(
+                        "cannot verify source topology CLI fixture ancestor {}: {error}",
+                        ancestor.display()
+                    ),
+                }
+            }
             let project = base.join("projects/app");
             for directory in ["home", "config", "state", "bin", "projects/app/src"] {
                 std::fs::create_dir_all(base.join(directory)).unwrap();

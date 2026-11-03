@@ -99,6 +99,7 @@ async fn confirmed_busy_and_cancellation_results_remain_ordinary_responses() {
     for reason in [
         SelectionReason::AllWorkersBusy,
         SelectionReason::NoWorkersConfigured,
+        SelectionReason::SourceTopologyIncompatible,
         SelectionReason::SelectionError("job_cancelled_before_start".into()),
     ] {
         let reply = format!(
@@ -460,6 +461,10 @@ async fn resuming_query_fixture(
         WorkerId::new("worker-alternate"),
     ];
     let tools = ["tool+one&check".into(), "tool-two".into()];
+    let topology = rch_common::SourceTopology {
+        canonical_root: "/Users/dispatcher/projects & shared".into(),
+        alias_root: "/dp".into(),
+    };
     let client = query_daemon_with_mode(
         path.to_str().unwrap(),
         "queued project&variant=one",
@@ -477,7 +482,7 @@ async fn resuming_query_fixture(
         true,
         &tools,
         dry_run,
-        None,
+        Some(&topology),
     );
     let result = timeout(Duration::from_secs(3), async {
         tokio::join!(client, server)
@@ -520,6 +525,7 @@ async fn transport_loss_resumes_the_exact_original_queued_selection() {
     for required in [
         "project=queued%20project%26variant%3Done&cores=4",
         "&command=cargo%20%2Bnightly-2026-09-01%20test%20--features%20%27a%26b%27",
+        "&source_topology=",
         "&toolchain=",
         "&runtime=rust",
         "&priority=high",
@@ -533,6 +539,17 @@ async fn transport_loss_resumes_the_exact_original_queued_selection() {
     }
     assert!(original_query.contains(&format!("&local_wrapper_id={RESUMING_WRAPPER}")));
     assert!(original_query.contains(&format!("&hook_pid={}", std::process::id())));
+    let encoded_topology = original_query
+        .split('&')
+        .find_map(|parameter| parameter.strip_prefix("source_topology="))
+        .unwrap();
+    let topology: rch_common::SourceTopology =
+        serde_json::from_str(&urlencoding::decode(encoded_topology).unwrap()).unwrap();
+    assert_eq!(
+        topology.canonical_root,
+        "/Users/dispatcher/projects & shared"
+    );
+    assert_eq!(topology.alias_root, "/dp");
     assert!(!original_query.contains("dry_run"));
 }
 

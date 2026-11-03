@@ -186,6 +186,20 @@ owner remains separately classified and may still produce retryable exit 103.
 If another compatible worker is temporarily busy, the normal capacity retry
 policy still applies to that worker.
 
+The admitted reservation records the exact requested roots. A refusal report
+cannot exclude a different mapping, and final admission checks the saved
+exclusions again in case another attempt reported a conflict during selection.
+Jobs admitted before this scope was recorded can complete normally; their late
+reports do not create new exclusions for unproven mappings.
+
+If startup quarantines contradictory ownership records, it preserves every
+independently validated topology exclusion and archives the original snapshot
+before replacing it. If the snapshot is truncated, malformed, or has invalid
+topology records, startup retains the original file and stops with its path and
+repair instructions. An unreadable snapshot cannot establish that no permanent
+exclusions existed. Restore a valid ownership snapshot instead of deleting it to
+make an incompatible worker eligible again.
+
 Worker capability reports also identify the roots they actually checked. A
 confirmed physical conflict for those exact roots can prevent selection before
 namespace initialization. A probe for different roots cannot prove the requested

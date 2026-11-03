@@ -53,6 +53,46 @@ pub(crate) struct SourceTopologyFence {
     pub build_id: u64,
 }
 
+/// Validate the complete durable topology obligation set independently of
+/// active ownership recovery. Returns the largest originating build ID so a
+/// recovered ledger cannot reuse it after terminal history has been pruned.
+pub(crate) fn validate_source_topology_fences(
+    fences: &[SourceTopologyFence],
+) -> std::io::Result<u64> {
+    if fences.len() > SOURCE_FENCE_LIMIT {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "source topology refusal capacity exceeded",
+        ));
+    }
+    let mut topology_keys = HashSet::new();
+    let mut max_id = 0;
+    for fence in fences {
+        fence
+            .mismatch
+            .validate()
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        if fence.endpoint.id.as_str().is_empty()
+            || fence.endpoint.host.is_empty()
+            || fence.build_id == 0
+            || fence.build_id >= QUEUE_ID_NAMESPACE
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid source topology fence identity",
+            ));
+        }
+        if !topology_keys.insert((fence.endpoint.clone(), fence.mismatch.topology.clone())) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "duplicate source topology refusal identity",
+            ));
+        }
+        max_id = max_id.max(fence.build_id);
+    }
+    Ok(max_id)
+}
+
 /// Cancellation and admission compete under the same ownership lock.
 pub enum WrapperCancellation {
     BeforeStart,
@@ -231,6 +271,11 @@ pub struct ActiveBuildState {
     /// retargeted while the build runs; missing legacy coordinates stay unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) worker_endpoint: Option<WorkerEndpointSnapshot>,
+    /// Exact namespace required at admission, including the resolved default
+    /// for older clients. Missing pre-upgrade scope cannot authorize a new
+    /// fleet-wide topology exclusion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) requested_source_topology: Option<rch_common::SourceTopology>,
     /// Pre-execution refusal published before release, retained even if an
     /// explicit revalidation repairs the mapping before completion is retried.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -600,6 +645,7 @@ impl BuildHistory {
             worker_id,
             command,
             worker_endpoint: None,
+            requested_source_topology: None,
             source_topology_mismatch: None,
             started_at: started_at.clone(),
             hook_process_identity: process_identity(hook_pid),
@@ -709,6 +755,7 @@ impl BuildHistory {
             waiter,
             disk,
             worker_endpoint,
+            None,
             1,
         )
     }
@@ -729,6 +776,7 @@ impl BuildHistory {
         waiter: Option<&QueuedWaiterClaim>,
         disk: DiskHeadroomAdmission,
         worker_endpoint: Option<WorkerEndpointSnapshot>,
+        requested_source_topology: Option<rch_common::SourceTopology>,
         project_lanes: u32,
     ) -> std::io::Result<Option<ActiveBuildState>> {
         if worker_endpoint.as_ref().is_some_and(|endpoint| {
@@ -738,6 +786,17 @@ impl BuildHistory {
                 std::io::ErrorKind::InvalidInput,
                 "active build endpoint does not match its remote worker",
             ));
+        }
+        if let Some(topology) = &requested_source_topology {
+            topology
+                .validate()
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+            if location != BuildLocation::Remote || worker_endpoint.is_none() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "source topology admission requires the remote worker endpoint",
+                ));
+            }
         }
         let id = self.next_id();
         if id >= QUEUE_ID_NAMESPACE {
@@ -760,6 +819,7 @@ impl BuildHistory {
             worker_id,
             command,
             worker_endpoint,
+            requested_source_topology,
             started_at: started_at.clone(),
             source_topology_mismatch: None,
             hook_process_identity: process_identity(hook_pid),
@@ -796,6 +856,25 @@ impl BuildHistory {
 
         let mut active = self.active.write().unwrap_or_else(|e| e.into_inner());
         if self.ownership_failed() {
+            return Ok(None);
+        }
+        // Selection is advisory until this ownership commit. A refusing
+        // attempt may have published a permanent exclusion while this caller
+        // awaited a worker slot. Report publication takes this same active
+        // lock, so a known-incompatible mapping cannot win that race.
+        if let (Some(topology), Some(endpoint)) = (
+            state.requested_source_topology.as_ref(),
+            state.worker_endpoint.as_ref(),
+        ) && self
+            .source_topology_fences
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .any(|fence| {
+                fence.endpoint.matches_config(&endpoint.config)
+                    && &fence.mismatch.topology == topology
+            })
+        {
             return Ok(None);
         }
         // Completion publishes its terminal disk intent under this same
@@ -1490,6 +1569,16 @@ impl BuildHistory {
                 "durable ownership uncertain; restart required",
             ));
         }
+        if state
+            .requested_source_topology
+            .as_ref()
+            .is_some_and(|topology| topology != &mismatch.topology)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "source topology report differs from the admitted namespace",
+            ));
+        }
         if let Some(original) = &state.source_topology_mismatch {
             return if original == mismatch {
                 Ok(())
@@ -1500,12 +1589,28 @@ impl BuildHistory {
                 ))
             };
         }
+        if state.requested_source_topology.is_none() {
+            // An older admitted row has no scope proof and may predate saved
+            // endpoint coordinates too. Retain its refusal for truthful
+            // completion and duplicate release, without granting new authority
+            // to exclude any mapping or endpoint.
+            state.source_topology_mismatch = Some(mismatch.clone());
+            return self.persist_ownership(&active, None);
+        }
         let endpoint = state.worker_endpoint.as_ref().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "source topology refusal requires the admitted worker endpoint",
             )
         })?;
+        if endpoint.source_was_retargeted() {
+            // A known retarget invalidates this runtime observation even if
+            // the coordinates later return (ABA). Retain the refusal before
+            // restart can lose that evidence, so completion and duplicate
+            // release stay truthful without excluding a replacement endpoint.
+            state.source_topology_mismatch = Some(mismatch.clone());
+            return self.persist_ownership(&active, None);
+        }
         let fence = SourceTopologyFence {
             endpoint: WorkerEndpointIdentity::from_config(&endpoint.config),
             mismatch: mismatch.clone(),
@@ -2317,37 +2422,9 @@ impl BuildHistory {
             Ok(file) => {
                 ownership_existed = true;
                 let snapshot: DurableOwnership = serde_json::from_reader(file)?;
-                if snapshot.source_topology_fences.len() > SOURCE_FENCE_LIMIT {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "source topology refusal capacity exceeded",
-                    ));
-                }
-                let mut topology_keys = HashSet::new();
-                for fence in &snapshot.source_topology_fences {
-                    fence.mismatch.validate().map_err(|error| {
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, error)
-                    })?;
-                    if fence.endpoint.id.as_str().is_empty()
-                        || fence.endpoint.host.is_empty()
-                        || fence.build_id == 0
-                        || fence.build_id >= QUEUE_ID_NAMESPACE
-                    {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "invalid source topology fence identity",
-                        ));
-                    }
-                    if !topology_keys
-                        .insert((fence.endpoint.clone(), fence.mismatch.topology.clone()))
-                    {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "duplicate source topology refusal identity",
-                        ));
-                    }
-                    max_id = max_id.max(fence.build_id);
-                }
+                max_id = max_id.max(validate_source_topology_fences(
+                    &snapshot.source_topology_fences,
+                )?);
                 source_topology_fences = snapshot.source_topology_fences;
                 queued = match (snapshot.version, snapshot.queued) {
                     (1, None) => VecDeque::new(),
@@ -2384,13 +2461,29 @@ impl BuildHistory {
                 // contradictory evidence into an apparently valid snapshot.
                 let mut active_wrappers = HashSet::new();
                 for mut state in snapshot.active {
+                    if let Some(topology) = &state.requested_source_topology {
+                        topology.validate().map_err(|error| {
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                        })?;
+                        if state.location != BuildLocation::Remote
+                            || state.worker_endpoint.is_none()
+                        {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "invalid source topology admission scope",
+                            ));
+                        }
+                    }
                     if let Some(mismatch) = &state.source_topology_mismatch {
                         mismatch.validate().map_err(|error| {
                             std::io::Error::new(std::io::ErrorKind::InvalidData, error)
                         })?;
                         if state.location != BuildLocation::Remote
                             || state.remote_command_started()
-                            || state.worker_endpoint.is_none()
+                            || state
+                                .requested_source_topology
+                                .as_ref()
+                                .is_some_and(|topology| topology != &mismatch.topology)
                         {
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::InvalidData,
@@ -3367,6 +3460,19 @@ mod tests {
         history: &BuildHistory,
         owner: &str,
     ) -> ActiveBuildState {
+        source_topology_test_admission_for(
+            history,
+            owner,
+            Some(source_topology_test_mismatch().topology),
+        )
+        .await
+    }
+
+    async fn source_topology_test_admission_for(
+        history: &BuildHistory,
+        owner: &str,
+        topology: Option<rch_common::SourceTopology>,
+    ) -> ActiveBuildState {
         let worker = crate::workers::WorkerState::new(rch_common::WorkerConfig {
             id: WorkerId::new("layout-worker"),
             host: "layout-host".into(),
@@ -3378,7 +3484,7 @@ mod tests {
             tools: vec![],
         });
         history
-            .try_start_active_build_with_waiter(
+            .try_start_active_build_in_lanes(
                 format!("project-{owner}"),
                 "layout-worker".into(),
                 "cargo check".into(),
@@ -3389,6 +3495,8 @@ mod tests {
                 None,
                 DiskHeadroomAdmission::default(),
                 Some(worker.endpoint_snapshot().await),
+                topology,
+                1,
             )
             .unwrap()
             .unwrap()
@@ -3411,19 +3519,25 @@ mod tests {
         let history = BuildHistory::new(10).with_persistence(path.clone());
         let mismatch = source_topology_test_mismatch();
         let first = source_topology_test_admission(&history, "first").await;
+        // Both attempts were admitted before either reported its refusal.
+        let second = source_topology_test_admission(&history, "second").await;
         history
             .record_source_topology_mismatch(first.id, "layout-worker", Some("first"), &mismatch)
             .unwrap();
         let observed = history.source_topology_fences().pop().unwrap();
-        let second = source_topology_test_admission(&history, "second").await;
         history
             .record_source_topology_mismatch(second.id, "layout-worker", Some("second"), &mismatch)
             .unwrap();
         let mut observations = vec![observed];
         for owner in ["third", "fourth"] {
-            let admitted = source_topology_test_admission(&history, owner).await;
             let mut other_mapping = mismatch.clone();
             other_mapping.topology.alias_root = format!("/alias-{owner}");
+            let admitted = source_topology_test_admission_for(
+                &history,
+                owner,
+                Some(other_mapping.topology.clone()),
+            )
+            .await;
             history
                 .record_source_topology_mismatch(
                     admitted.id,
@@ -3515,6 +3629,18 @@ mod tests {
         let snapshot: serde_json::Value =
             serde_json::from_reader(File::open(path.with_extension("ownership.json")).unwrap())
                 .unwrap();
+        let mut corrupted = snapshot.clone();
+        corrupted["active"][0]["requested_source_topology"]["alias_root"] =
+            serde_json::json!("/different-admitted-alias");
+        std::fs::write(
+            path.with_extension("ownership.json"),
+            serde_json::to_vec(&corrupted).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            BuildHistory::load_from_file(&path, 10).is_err(),
+            "refusal must match its durable admission scope"
+        );
         let mut corrupted = snapshot.clone();
         corrupted["source_topology_fences"][0]["mismatch"]["topology"]["alias_root"] =
             serde_json::json!("/dp/../other");
@@ -3728,6 +3854,7 @@ mod tests {
                     BuildLocation::Remote,
                     None,
                     DiskHeadroomAdmission::default(),
+                    None,
                     None,
                     lanes,
                 )

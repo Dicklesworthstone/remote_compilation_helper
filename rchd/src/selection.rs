@@ -682,7 +682,7 @@ impl WorkerSelector {
         self.default_source_topology = topology;
     }
 
-    fn source_topology_for<'a>(
+    pub(crate) fn source_topology_for<'a>(
         &'a self,
         request: &'a SelectionRequest,
     ) -> &'a rch_common::SourceTopology {
@@ -788,9 +788,20 @@ impl WorkerSelector {
         request: &SelectionRequest,
     ) -> bool {
         let mut considered = false;
+        let required_os = required_os_for_request(request);
         for worker in pool.all_workers().await {
-            let id = worker.config.read().await.id.clone();
+            let (id, declared_os) = {
+                let config = worker.config.read().await;
+                (config.id.clone(), rch_common::declared_os(&config.tags))
+            };
             if !request.preferred_workers.is_empty() && !request.preferred_workers.contains(&id) {
+                continue;
+            }
+            // A worker configured for another platform cannot become a peer
+            // for this request by draining capacity or recovering transport.
+            // Do not let it hide permanent topology refusal on the entire
+            // platform-appropriate pool. Dynamic health/capacity still count.
+            if !os_gate_admits(declared_os.as_deref(), required_os.as_deref()) {
                 continue;
             }
             considered = true;
@@ -7288,6 +7299,20 @@ mod tests {
                 .await
                 .is_none()
         );
+        let windows = make_worker("windows-peer", 8, 80.0);
+        windows.config.write().await.tags.push("os:windows".into());
+        pool.add_worker_state(windows).await;
+        request.preferred_workers = vec![
+            WorkerId::new("active-project"),
+            WorkerId::new("windows-peer"),
+        ];
+        let platform_refusal = selector.select(&pool, &request).await;
+        assert_eq!(
+            platform_refusal.reason,
+            SelectionReason::SourceTopologyIncompatible,
+            "an unrelated OS cannot make the Linux topology refusal retryable"
+        );
+        assert!(platform_refusal.worker.is_none());
         request.preferred_workers.clear();
         let compatible = pool.get(&WorkerId::new("free-small")).await.unwrap();
         assert!(compatible.reserve_slots(3).await);
@@ -7325,7 +7350,7 @@ mod tests {
 
         let history = Arc::new(crate::history::BuildHistory::new(10));
         let admitted = history
-            .try_start_active_build_with_waiter(
+            .try_start_active_build_in_lanes(
                 "namespace-attempt".into(),
                 "active-project".into(),
                 "cargo check".into(),
@@ -7336,6 +7361,8 @@ mod tests {
                 None,
                 crate::disk_pressure::DiskHeadroomAdmission::default(),
                 Some(worker.endpoint_snapshot().await),
+                request.source_topology.clone(),
+                1,
             )
             .unwrap()
             .unwrap();

@@ -433,6 +433,7 @@ mod tests {
                     capacity: None,
                 },
                 None,
+                None,
                 ctx.pool.project_lanes(worker_id),
             )
             .unwrap()

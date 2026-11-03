@@ -320,14 +320,13 @@ enum BindAttempt {
     SocketHeld,
 }
 
-/// Load durable build history. An ownership snapshot that cannot be trusted,
-/// because it is contradictory (057bb508's validation), malformed or truncated,
-/// is moved aside and the daemon starts without it (bd-tqmak). Refusing to
-/// start turned one bad file into a systemd/launchd restart loop that refused
-/// every build on the dispatcher. Correctness does not rest on this snapshot
-/// alone: workers keep their own source-authority claims, which fence
-/// overlapping builds, and client leases are recovered separately (bd-nalyr).
-/// The rejected file is kept for diagnosis. Any other error still fails startup.
+/// Load durable build history, retaining independently valid topology refusals
+/// when contradictory ownership rows must be quarantined (bd-tqmak, #130).
+/// Workers' source claims and separate client leases still protect the dropped
+/// owners, but cannot reconstruct permanent dispatcher topology exclusions.
+/// Malformed/truncated JSON, or an invalid topology set, therefore cannot be
+/// replaced by an empty ledger: leave that evidence intact and fail startup.
+/// A readable legacy snapshot without topology records can still be recovered.
 fn load_history_quarantining_invalid_ownership(
     history_path: &Path,
     capacity: usize,
@@ -349,24 +348,132 @@ fn load_history_quarantining_invalid_ownership(
         return Err(error).with_context(context);
     }
     let snapshot = history_path.with_extension("ownership.json");
+    let original = std::fs::read(&snapshot).with_context(context)?;
+    // Decode this field directly, ignoring only the other ownership fields.
+    // A Value round trip would collapse duplicate keys and could accidentally
+    // accept a later empty topology set after an earlier nonempty one.
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct RecoverableTopology {
+        version: u32,
+        #[serde(rename = "active")]
+        _active: serde::de::IgnoredAny,
+        #[serde(rename = "completed")]
+        _completed: serde::de::IgnoredAny,
+        #[serde(default, rename = "cancelled_wrappers")]
+        _cancelled_wrappers: Option<serde::de::IgnoredAny>,
+        #[serde(default, rename = "next_queue_id")]
+        _next_queue_id: Option<serde::de::IgnoredAny>,
+        #[serde(default, rename = "queued")]
+        _queued: Option<serde::de::IgnoredAny>,
+        #[serde(default)]
+        source_topology_fences: Vec<history::SourceTopologyFence>,
+    }
+    let retained: RecoverableTopology = serde_json::from_slice(&original).with_context(|| {
+        format!(
+            "{}; cannot establish the complete source-topology exclusion set. \
+             Original snapshot retained at {}. Restore a valid ownership snapshot \
+             before restarting; do not discard it to retry an incompatible worker",
+            context(),
+            snapshot.display()
+        )
+    })?;
+    anyhow::ensure!(
+        matches!(retained.version, 1 | 2),
+        "{}; unsupported ownership version {}. Original snapshot retained at {}. \
+         Use a compatible daemon or restore a valid ownership snapshot before restarting",
+        context(),
+        retained.version,
+        snapshot.display()
+    );
+    history::validate_source_topology_fences(&retained.source_topology_fences).with_context(
+        || {
+            format!(
+                "{}; source-topology exclusions are invalid. Original snapshot retained at {}. \
+             Repair or restore its topology records before restarting; existing worker \
+             mappings must be revalidated before an exclusion is removed",
+                context(),
+                snapshot.display()
+            )
+        },
+    )?;
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
+        .as_nanos();
     let rejected = snapshot.with_extension(format!("json.rejected-{stamp}"));
-    std::fs::rename(&snapshot, &rejected)
-        .with_context(|| format!("{}; also could not set the snapshot aside", context()))?;
+    retain_topology_when_quarantining_ownership(
+        &snapshot,
+        &rejected,
+        &original,
+        &retained.source_topology_fences,
+    )
+    .with_context(|| format!("{}; could not safely retain topology exclusions", context()))?;
     error!(
         snapshot = %snapshot.display(),
         rejected = %rejected.display(),
         reason = %error,
+        retained_source_topologies = retained.source_topology_fences.len(),
         untracked_builds = %untracked_active_builds(&rejected),
-        "Durable ownership snapshot rejected and set aside; starting without it. \
+        "Durable ownership rows rejected; source-topology exclusions retained. \
          The builds it recorded as active are no longer tracked by this daemon \
          (worker-side source claims still fence them); recover or cancel them \
          from their clients. Inspect the rejected file."
     );
     BuildHistory::load_from_file(history_path, capacity).with_context(context)
+}
+
+/// Keep the original inode in place until a complete replacement is durable.
+/// Renaming it away first would leave a crash window where restart saw no
+/// snapshot and silently reopened every excluded worker/mapping pair.
+fn retain_topology_when_quarantining_ownership(
+    snapshot: &Path,
+    rejected: &Path,
+    original: &[u8],
+    fences: &[history::SourceTopologyFence],
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Ownership rows may include private command arguments. Copying
+            // a 0600 snapshot must not expose its archive under a loose umask.
+            options.mode(0o600);
+        }
+        options.open(path)
+    }
+
+    let parent = snapshot
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut archived = create_private(rejected)?;
+    archived.write_all(original)?;
+    archived.sync_all()?;
+    std::fs::File::open(parent)?.sync_all()?;
+
+    // Version 1 represents no durable queue. The normal loader validates the
+    // exact fences, derives its ID high-water mark from them, and publishes the
+    // current version before serving requests. No rejected owner is replayed.
+    let recovered = serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "active": [],
+        "completed": [],
+        "source_topology_fences": fences,
+    }))?;
+    let mut temporary_name = rejected.as_os_str().to_os_string();
+    temporary_name.push(".recovered.tmp");
+    let temporary = PathBuf::from(temporary_name);
+    let mut replacement = create_private(&temporary)?;
+    replacement.write_all(&recovered)?;
+    replacement.sync_all()?;
+    std::fs::rename(&temporary, snapshot)?;
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 /// Best-effort summary of the active builds in a rejected ownership snapshot
@@ -2093,35 +2200,140 @@ mod tests {
         assert!(untracked.contains(&format!("{}@worker-b[owner-1]", original.id + 1)));
     }
 
-    /// Malformed or truncated snapshots are set aside too. Only a readable,
-    /// valid snapshot, or none at all, loads without quarantine.
+    fn startup_source_topology_fence() -> history::SourceTopologyFence {
+        history::SourceTopologyFence {
+            endpoint: workers::WorkerEndpointIdentity {
+                id: rch_common::WorkerId::new("layout-worker"),
+                host: "layout-worker.example".into(),
+                user: "builder".into(),
+                identity_file: "/keys/build-worker".into(),
+                declared_os: Some("linux".into()),
+            },
+            mismatch: rch_common::SourceTopologyMismatch {
+                topology: rch_common::SourceTopology {
+                    canonical_root: "/Users/dispatcher/projects".into(),
+                    alias_root: "/dp".into(),
+                },
+                detail: "conflicting alias base: /dp -> /data/projects".into(),
+            },
+            // Above the clock-derived sequence, below the queue namespace.
+            build_id: (1 << 62) + 7,
+        }
+    }
+
     #[test]
-    fn malformed_ownership_snapshot_is_set_aside() {
-        for body in [&b"{\"version\": 2, \"active\": ["[..], &b"not json"[..]] {
+    fn startup_quarantine_preserves_source_topology_fences_and_high_water() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("history.jsonl");
+        let snapshot_path = path.with_extension("ownership.json");
+        let fence = startup_source_topology_fence();
+        // This valid topology record is independent of the invalid v2 queue.
+        let original = serde_json::to_vec(&serde_json::json!({
+            "version": 2,
+            "active": [],
+            "completed": [],
+            "queued": null,
+            "source_topology_fences": [&fence],
+        }))
+        .unwrap();
+        std::fs::write(&snapshot_path, &original).unwrap();
+        assert!(BuildHistory::load_from_file(&path, 10).is_err());
+
+        let history = load_history_quarantining_invalid_ownership(&path, 10).unwrap();
+        assert!(history.active_builds().is_empty());
+        assert_eq!(history.source_topology_fences(), vec![fence.clone()]);
+        assert!(history.next_id() > fence.build_id);
+        drop(history);
+
+        let restored = load_history_quarantining_invalid_ownership(&path, 10).unwrap();
+        assert_eq!(restored.source_topology_fences(), vec![fence]);
+        let rejected: Vec<_> = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|p| p.to_string_lossy().contains(".ownership.json.rejected-"))
+            .collect();
+        assert_eq!(
+            rejected.len(),
+            1,
+            "a clean restart must not quarantine again"
+        );
+        assert_eq!(std::fs::read(&rejected[0]).unwrap(), original);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&rejected[0])
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o077,
+                0
+            );
+        }
+    }
+
+    /// A truncated legacy file and a truncated file carrying topology fences
+    /// cannot be distinguished. Empty-ledger recovery would erase a permanent
+    /// exclusion, so the original bytes must remain the authoritative evidence.
+    #[test]
+    fn ambiguous_or_invalid_source_topology_snapshot_is_retained() {
+        let fence = serde_json::to_value(startup_source_topology_fence()).unwrap();
+        let mut invalid_fence = fence.clone();
+        invalid_fence["mismatch"]["topology"]["alias_root"] = serde_json::json!("relative");
+        let bodies = [
+            r#"{"version": 2, "active": ["#.to_owned(),
+            "not json".to_owned(),
+            r#"{"version": 2, "source_topology_fences": ["#.to_owned(),
+            serde_json::json!({"version": 2, "active": [], "completed": [], "source_topology_fences": [invalid_fence]}).to_string(),
+            serde_json::json!({"version": 2, "active": [], "completed": [], "source_topology_fences": [&fence, &fence]}).to_string(),
+            serde_json::json!({"version": 2, "active": [], "completed": [], "source_topology_fences": null}).to_string(),
+            serde_json::json!({"version": 3, "active": [], "completed": [], "source_topology_fences": [&fence]}).to_string(),
+            serde_json::json!({"version": 2, "active": [], "completed": [], "source_topology_fences": [&fence], "unknown_authority": []}).to_string(),
+            format!(r#"{{"version":2,"active":[],"completed":[],"source_topology_fences":[{fence}],"source_topology_fences":[]}}"#),
+        ];
+        for body in bodies {
             let root = tempfile::tempdir().unwrap();
             let path = root.path().join("history.jsonl");
-            std::fs::write(path.with_extension("ownership.json"), body).unwrap();
-            load_history_quarantining_invalid_ownership(&path, 10)
-                .expect("startup proceeds past a malformed snapshot");
-            assert!(!path.with_extension("ownership.json").exists());
-            let rejected = std::fs::read_dir(root.path())
-                .unwrap()
-                .filter(|entry| {
-                    entry
-                        .as_ref()
-                        .unwrap()
-                        .file_name()
-                        .to_string_lossy()
-                        .contains("rejected-")
-                })
-                .count();
-            assert_eq!(rejected, 1);
+            let snapshot = path.with_extension("ownership.json");
+            std::fs::write(&snapshot, &body).unwrap();
+            let error = load_history_quarantining_invalid_ownership(&path, 10)
+                .err()
+                .expect("ambiguous topology obligations must not be erased");
+            assert!(format!("{error:#}").contains("Original snapshot retained"));
+            assert_eq!(std::fs::read(&snapshot).unwrap(), body.as_bytes());
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
         }
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("history.jsonl");
         load_history_quarantining_invalid_ownership(&path, 10)
             .expect("no snapshot is a clean start");
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn source_topology_quarantine_publication_failure_keeps_original_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let snapshot = root.path().join("history.ownership.json");
+        let rejected = root.path().join("history.ownership.json.rejected-test");
+        let temporary = root
+            .path()
+            .join("history.ownership.json.rejected-test.recovered.tmp");
+        let fence = startup_source_topology_fence();
+        let original = serde_json::to_vec(&serde_json::json!({
+            "version": 2, "active": [], "completed": [], "queued": null,
+            "source_topology_fences": [&fence],
+        }))
+        .unwrap();
+        std::fs::write(&snapshot, &original).unwrap();
+        // Force failure after the original is archived, before replacement.
+        std::fs::write(&temporary, b"occupied temporary path").unwrap();
+        let error =
+            retain_topology_when_quarantining_ownership(&snapshot, &rejected, &original, &[fence])
+                .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&snapshot).unwrap(), original);
+        assert_eq!(std::fs::read(&rejected).unwrap(), original);
+        assert!(BuildHistory::load_from_file(&root.path().join("history.jsonl"), 10).is_err());
     }
 
     #[test]

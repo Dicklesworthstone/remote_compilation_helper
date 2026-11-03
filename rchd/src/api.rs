@@ -2867,6 +2867,8 @@ async fn handle_select_worker_mode(
         local_wrapper_id: Option<String>,
         waiter: Option<&QueuedWaiterClaim>,
     ) -> Result<SelectionResponse> {
+        let source_topology = ctx.worker_selector.source_topology_for(request);
+        source_topology.validate().map_err(anyhow::Error::msg)?;
         if local_wrapper_id
             .as_deref()
             .is_some_and(|id| ctx.history.wrapper_cancelled(id))
@@ -3017,6 +3019,7 @@ async fn handle_select_worker_mode(
                         waiter,
                         disk,
                         Some(selected_endpoint.clone()),
+                        Some(source_topology.clone()),
                         ctx.pool.project_lanes(id.as_str()),
                     );
                     let state = match admission {
@@ -11185,6 +11188,7 @@ mod tests {
                     None,
                     crate::disk_pressure::DiskHeadroomAdmission::default(),
                     None,
+                    None,
                     ctx.pool.project_lanes("worker1"),
                 )
                 .unwrap()
@@ -11264,6 +11268,41 @@ mod tests {
         let mut wrong_owner = release.clone();
         wrong_owner.local_wrapper_id = Some("wrong-owner".into());
         assert!(handle_release_worker(&ctx, wrong_owner).await.is_err());
+        assert!(ctx.history.source_topology_fences().is_empty());
+        let mut wrong_mapping = release.clone();
+        wrong_mapping
+            .worker_source_topology_mismatch
+            .as_mut()
+            .unwrap()
+            .topology
+            .alias_root = "/unrelated-alias".into();
+        assert!(
+            handle_release_worker(&ctx, wrong_mapping.clone())
+                .await
+                .is_err()
+        );
+        assert!(ctx.history.source_topology_fences().is_empty());
+        assert_eq!(
+            ctx.history
+                .active_build(build_id)
+                .unwrap()
+                .requested_source_topology
+                .as_ref(),
+            Some(&topology)
+        );
+        replace_test_history(
+            &mut ctx,
+            BuildHistory::load_from_file(&history_path, 100).unwrap(),
+        );
+        assert_eq!(
+            ctx.history
+                .active_build(build_id)
+                .unwrap()
+                .requested_source_topology
+                .as_ref(),
+            Some(&topology)
+        );
+        assert!(handle_release_worker(&ctx, wrong_mapping).await.is_err());
         assert!(ctx.history.source_topology_fences().is_empty());
         handle_release_worker(&ctx, release.clone()).await.unwrap();
         handle_release_worker(&ctx, release.clone()).await.unwrap();
@@ -11440,6 +11479,329 @@ mod tests {
             BuildHistory::load_from_file(&history_path, 100).unwrap(),
         );
         assert!(ctx.history.source_topology_fences().is_empty());
+    }
+
+    #[tokio::test]
+    async fn source_topology_final_admission_rechecks_refusal_published_after_selection() {
+        let _guard = test_guard!();
+        for add_compatible_peer in [false, true] {
+            let pool = WorkerPool::new();
+            pool.add_worker(make_test_worker("worker1", 8)).await;
+            set_test_build_disk(&pool, "worker1", 100.0).await;
+            let ctx = make_test_context(pool.clone());
+            let topology = rch_common::SourceTopology {
+                canonical_root: "/Users/dispatcher/projects".into(),
+                alias_root: "/dp".into(),
+            };
+            let mismatch = rch_common::SourceTopologyMismatch {
+                topology: topology.clone(),
+                detail: "conflicting alias base".into(),
+            };
+            let ApiRequest::SelectWorker { mut request, .. } = parse_request(&format!(
+                "GET /select-worker?project=refusing-owner&cores=1&source_topology={}",
+                urlencoding_encode(&serde_json::to_string(&topology).unwrap()),
+            ))
+            .unwrap() else {
+                panic!("selection expected");
+            };
+            let first_wrapper = format!("rchw-{}", Uuid::new_v4());
+            let first = handle_select_worker_with_wrapper(
+                &ctx,
+                request.clone(),
+                false,
+                None,
+                Some(first_wrapper.clone()),
+            )
+            .await
+            .unwrap();
+            let first_id = first.build_id.unwrap();
+            request.project = "concurrent-new-owner".into();
+            let next_wrapper = format!("rchw-{}", Uuid::new_v4());
+
+            // The audit is published after the selector has chosen worker1.
+            // Hold only that final publication to expose the real asynchronous
+            // gap between choosing a candidate and committing its ownership.
+            let audit = ctx.worker_selector.audit_log.write().await;
+            let selecting = handle_select_worker_with_wrapper(
+                &ctx,
+                request,
+                false,
+                None,
+                Some(next_wrapper.clone()),
+            );
+            tokio::pin!(selecting);
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(selecting.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            let ApiRequest::ReleaseWorker(release) = parse_request(&format!(
+                "POST /release-worker?worker=worker1&build_id={first_id}&local_wrapper_id={first_wrapper}&exit_code=1&worker_source_topology_mismatch={}",
+                urlencoding_encode(&serde_json::to_string(&mismatch).unwrap()),
+            )).unwrap() else { panic!("release expected"); };
+            tokio::time::timeout(Duration::from_secs(5), handle_release_worker(&ctx, release))
+                .await
+                .unwrap()
+                .unwrap();
+            if add_compatible_peer {
+                pool.add_worker(make_test_worker("worker2", 8)).await;
+                set_test_build_disk(&pool, "worker2", 100.0).await;
+            }
+            drop(audit);
+            let response = tokio::time::timeout(Duration::from_secs(5), selecting)
+                .await
+                .unwrap()
+                .unwrap();
+            let attempts: Vec<_> = ctx
+                .worker_selector
+                .get_audit_log(None)
+                .await
+                .into_iter()
+                .filter(|entry| entry.project == "concurrent-new-owner")
+                .collect();
+            assert_eq!(
+                attempts.len(),
+                2,
+                "stale selection must be reconsidered after final admission refuses it"
+            );
+            assert_eq!(
+                attempts[0].selected_worker_id.as_deref(),
+                Some("worker1"),
+                "the paused request must have selected worker1 before the refusal was published"
+            );
+            assert_eq!(
+                attempts[1].selected_worker_id.as_deref(),
+                add_compatible_peer.then_some("worker2")
+            );
+            let worker1 = pool.get(&WorkerId::new("worker1")).await.unwrap();
+            assert_eq!(
+                worker1.used_slots(),
+                0,
+                "stale candidate reservation must be returned"
+            );
+            if add_compatible_peer {
+                assert_eq!(response.worker.unwrap().id.as_str(), "worker2");
+                assert!(response.build_id.is_some());
+                assert_eq!(ctx.history.active_builds().len(), 1);
+            } else {
+                assert_eq!(response.reason, SelectionReason::SourceTopologyIncompatible);
+                assert!(response.worker.is_none());
+                assert!(response.build_id.is_none());
+                assert!(ctx.history.active_builds().is_empty());
+            }
+            assert!(
+                !ctx.history
+                    .active_builds()
+                    .iter()
+                    .any(|build| build.worker_id == "worker1")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn source_topology_retargeted_report_stays_diagnostic_after_aba_and_restart() {
+        let _guard = test_guard!();
+        for restore_original_endpoint in [false, true] {
+            let temporary = tempfile::tempdir().unwrap();
+            let path = temporary.path().join("history.jsonl");
+            let pool = WorkerPool::new();
+            pool.add_worker(make_test_worker("worker1", 8)).await;
+            set_test_build_disk(&pool, "worker1", 100.0).await;
+            let worker = pool.get(&WorkerId::new("worker1")).await.unwrap();
+            let mut ctx = make_test_context(pool.clone());
+            replace_test_history(
+                &mut ctx,
+                BuildHistory::new(100).with_persistence(path.clone()),
+            );
+            let mismatch = rch_common::SourceTopologyMismatch {
+                topology: rch_common::SourceTopology {
+                    canonical_root: "/Users/dispatcher/projects".into(),
+                    alias_root: "/dp".into(),
+                },
+                detail: "conflicting alias base".into(),
+            };
+            let ApiRequest::SelectWorker { request, .. } = parse_request(&format!(
+                "GET /select-worker?project=retargeted-owner&cores=1&source_topology={}",
+                urlencoding_encode(&serde_json::to_string(&mismatch.topology).unwrap()),
+            ))
+            .unwrap() else {
+                panic!("selection expected");
+            };
+            let wrapper = format!("rchw-{}", Uuid::new_v4());
+            let selected = handle_select_worker_with_wrapper(
+                &ctx,
+                request,
+                false,
+                None,
+                Some(wrapper.clone()),
+            )
+            .await
+            .unwrap();
+            let build_id = selected.build_id.unwrap();
+            let original = worker.config.read().await.clone();
+            let mut replacement = original.clone();
+            replacement.host = "replacement.example".into();
+            assert!(worker.update_config(replacement).await);
+            if restore_original_endpoint {
+                assert!(worker.update_config(original).await);
+            }
+            assert!(
+                ctx.history
+                    .active_build(build_id)
+                    .unwrap()
+                    .worker_endpoint
+                    .unwrap()
+                    .source_was_retargeted()
+            );
+
+            // Crash after recording the refusal but before completion. The
+            // report-only decision must survive loss of the runtime generation
+            // even when the current endpoint has returned to its old identity.
+            ctx.history
+                .record_source_topology_mismatch(build_id, "worker1", Some(&wrapper), &mismatch)
+                .unwrap();
+            assert!(ctx.history.source_topology_fences().is_empty());
+            replace_test_history(&mut ctx, BuildHistory::load_from_file(&path, 100).unwrap());
+            assert_eq!(
+                ctx.history
+                    .active_build(build_id)
+                    .unwrap()
+                    .source_topology_mismatch,
+                Some(mismatch.clone())
+            );
+            let ApiRequest::ReleaseWorker(release) = parse_request(&format!(
+                "POST /release-worker?worker=worker1&build_id={build_id}&local_wrapper_id={wrapper}&exit_code=1&worker_source_topology_mismatch={}",
+                urlencoding_encode(&serde_json::to_string(&mismatch).unwrap()),
+            )).unwrap() else { panic!("release expected"); };
+            handle_release_worker(&ctx, release.clone()).await.unwrap();
+            assert_eq!(worker.used_slots(), 0);
+            assert!(ctx.history.active_builds().is_empty());
+            assert!(ctx.history.source_topology_fences().is_empty());
+            assert_eq!(
+                ctx.history
+                    .terminal_build(build_id, &wrapper)
+                    .unwrap()
+                    .exit_code,
+                1
+            );
+            replace_test_history(&mut ctx, BuildHistory::load_from_file(&path, 100).unwrap());
+            handle_release_worker(&ctx, release).await.unwrap();
+            assert!(ctx.history.source_topology_fences().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn source_topology_legacy_row_completes_without_poisoning_an_unbound_mapping() {
+        let _guard = test_guard!();
+        for has_endpoint in [false, true] {
+            let temporary = tempfile::tempdir().unwrap();
+            let path = temporary.path().join("history.jsonl");
+            let pool = WorkerPool::new();
+            pool.add_worker(make_test_worker("worker1", 8)).await;
+            set_test_build_disk(&pool, "worker1", 100.0).await;
+            let worker = pool.get(&WorkerId::new("worker1")).await.unwrap();
+            let mut ctx = make_test_context(pool.clone());
+            replace_test_history(
+                &mut ctx,
+                BuildHistory::new(100).with_persistence(path.clone()),
+            );
+            let wrapper = format!("rchw-{}", Uuid::new_v4());
+            assert!(worker.reserve_slots(1).await);
+            // Pre-upgrade rows retain their wrapper but may also predate saved
+            // endpoint coordinates. Neither shape proves a requested topology.
+            let old = ctx
+                .history
+                .try_start_active_build_with_waiter(
+                    "legacy-project".into(),
+                    "worker1".into(),
+                    "cargo check".into(),
+                    std::process::id(),
+                    Some(wrapper.clone()),
+                    1,
+                    rch_common::BuildLocation::Remote,
+                    None,
+                    crate::disk_pressure::DiskHeadroomAdmission::default(),
+                    if has_endpoint {
+                        Some(worker.endpoint_snapshot().await)
+                    } else {
+                        None
+                    },
+                )
+                .unwrap()
+                .unwrap();
+            assert!(
+                serde_json::to_value(&old)
+                    .unwrap()
+                    .get("requested_source_topology")
+                    .is_none()
+            );
+            replace_test_history(&mut ctx, BuildHistory::load_from_file(&path, 100).unwrap());
+            let mismatch = rch_common::SourceTopologyMismatch {
+                topology: rch_common::SourceTopology {
+                    canonical_root: "/configured/projects".into(),
+                    alias_root: "/dp".into(),
+                },
+                detail: "conflicting alias base".into(),
+            };
+            let ApiRequest::ReleaseWorker(release) = parse_request(&format!(
+            "POST /release-worker?worker=worker1&build_id={}&local_wrapper_id={wrapper}&exit_code=1&worker_source_topology_mismatch={}",
+            old.id, urlencoding_encode(&serde_json::to_string(&mismatch).unwrap()),
+        )).unwrap() else { panic!("release expected"); };
+            ctx.history
+                .record_source_topology_mismatch(old.id, "worker1", Some(&wrapper), &mismatch)
+                .unwrap();
+            replace_test_history(&mut ctx, BuildHistory::load_from_file(&path, 100).unwrap());
+            handle_release_worker(&ctx, release.clone()).await.unwrap();
+            assert_eq!(worker.used_slots(), 0);
+            assert!(ctx.history.active_builds().is_empty());
+            assert!(ctx.history.source_topology_fences().is_empty());
+            assert_eq!(
+                ctx.history
+                    .terminal_build(old.id, &wrapper)
+                    .unwrap()
+                    .exit_code,
+                1
+            );
+            replace_test_history(&mut ctx, BuildHistory::load_from_file(&path, 100).unwrap());
+            handle_release_worker(&ctx, release.clone()).await.unwrap();
+            assert!(ctx.history.source_topology_fences().is_empty());
+
+            // A new admission from a legacy client still receives the daemon's
+            // configured scope atomically; only pre-upgrade rows lack this proof.
+            Arc::make_mut(&mut ctx.worker_selector)
+                .set_default_source_topology(mismatch.topology.clone());
+            let ApiRequest::SelectWorker { request, .. } =
+                parse_request("GET /select-worker?project=legacy-client&cores=1").unwrap()
+            else {
+                panic!("selection expected");
+            };
+            assert!(request.source_topology.is_none());
+            let new_wrapper = format!("rchw-{}", Uuid::new_v4());
+            let selected = handle_select_worker_with_wrapper(
+                &ctx,
+                request,
+                false,
+                None,
+                Some(new_wrapper.clone()),
+            )
+            .await
+            .unwrap();
+            let new_id = selected.build_id.unwrap();
+            assert_eq!(
+                ctx.history
+                    .active_build(new_id)
+                    .unwrap()
+                    .requested_source_topology,
+                Some(mismatch.topology.clone())
+            );
+            let mut bound_release = release.clone();
+            bound_release.build_id = Some(new_id);
+            bound_release.local_wrapper_id = Some(new_wrapper);
+            handle_release_worker(&ctx, bound_release).await.unwrap();
+            handle_release_worker(&ctx, release).await.unwrap();
+            assert_eq!(ctx.history.source_topology_fences().len(), 1);
+            assert_eq!(ctx.history.source_topology_fences()[0].build_id, new_id);
+        }
     }
 
     #[tokio::test]
