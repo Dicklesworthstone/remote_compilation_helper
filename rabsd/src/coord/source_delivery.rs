@@ -41,7 +41,7 @@ use std::sync::Arc;
 use control::PreparationControl;
 
 enum PreparationToolchain {
-    Captured(Box<PreparedToolchain>),
+    Captured(Arc<PreparedToolchain>),
     Retained(Arc<RetainedToolchain>),
 }
 
@@ -59,9 +59,26 @@ impl PreparationToolchain {
 
     fn attach(self, upload: SourceUpload, request: &Value) -> io::Result<SourceUpload> {
         match self {
-            Self::Captured(image) => upload.with_toolchain(*image, request),
+            Self::Captured(image) => upload.with_shared_toolchain(image, request),
             Self::Retained(owner) => upload.with_retained_toolchain(owner, request),
         }
+    }
+}
+
+/// The canonical operation owns the destination directory and keeps this exact
+/// captured compiler image through planning, keying and worker upload.
+pub(crate) struct PreparedLocalBundle {
+    pub report: Value,
+    pub source: SourceReceiver,
+    pub toolchain: Option<Arc<PreparedToolchain>>,
+}
+
+impl PreparedLocalBundle {
+    fn into_report(self) -> Value {
+        // Public preparation leaves the durable bundle with its caller; only
+        // the local driver keeps these in-process filesystem capabilities.
+        drop((self.source, self.toolchain));
+        self.report
     }
 }
 
@@ -127,7 +144,7 @@ pub fn prepare_source_bundle(
         None,
         &PreparationControl::uncontrolled(),
     )
-    .map(|(report, _source)| report)
+    .map(PreparedLocalBundle::into_report)
 }
 
 /// Retain the selected service-owned compiler image while preparing independent
@@ -140,7 +157,7 @@ pub(crate) fn prepare_local_bundle_controlled(
     destination: &Path,
     toolchain: Option<Arc<RetainedToolchain>>,
     control: &PreparationControl<'_>,
-) -> io::Result<(Value, SourceReceiver)> {
+) -> io::Result<PreparedLocalBundle> {
     prepare_source_bundle_inner(
         source_root,
         specification,
@@ -183,7 +200,7 @@ pub fn prepare_source_template(
         None,
         &PreparationControl::uncontrolled(),
     )
-    .map(|(report, _source)| report)
+    .map(PreparedLocalBundle::into_report)
 }
 
 fn prepare_source_bundle_inner(
@@ -194,7 +211,7 @@ fn prepare_source_bundle_inner(
     selected_planning_toolchain: bool,
     retained_toolchain: Option<Arc<RetainedToolchain>>,
     control: &PreparationControl<'_>,
-) -> io::Result<(Value, SourceReceiver)> {
+) -> io::Result<PreparedLocalBundle> {
     control.checkpoint()?;
     let inputs = preparation::SourcePreparation::parse(source_root, specification)?;
     require(
@@ -306,7 +323,7 @@ fn prepare_source_bundle_inner(
                 rabs_cas::materialization::try_verified_reflink,
             )?;
             prepared.sync(|| control.is_cancelled())?;
-            Some(PreparationToolchain::Captured(Box::new(prepared)))
+            Some(PreparationToolchain::Captured(Arc::new(prepared)))
         }
     } else {
         None
@@ -365,7 +382,7 @@ fn prepare_source_bundle_inner(
                     rabs_cas::materialization::try_verified_reflink,
                 )?;
                 prepared.sync(|| control.is_cancelled())?;
-                Ok::<_, io::Error>(PreparationToolchain::Captured(Box::new(prepared)))
+                Ok::<_, io::Error>(PreparationToolchain::Captured(Arc::new(prepared)))
             })
             .transpose()?
     };
@@ -411,6 +428,10 @@ fn prepare_source_bundle_inner(
     // preserves argv, output declarations, timeouts, and unknown extensions.
     validate_request(&request)?;
     let prepared_toolchain_root = toolchain.as_ref().map(|owner| owner.root().to_path_buf());
+    let captured_toolchain = match &toolchain {
+        Some(PreparationToolchain::Captured(image)) => Some(Arc::clone(image)),
+        _ => None,
+    };
     if let Some(toolchain) = toolchain {
         upload = toolchain.attach(upload, &request)?;
     }
@@ -467,8 +488,8 @@ fn prepare_source_bundle_inner(
     output.sync_all()?;
     File::open(&destination)?.sync_all()?;
     File::open(&parent)?.sync_all()?;
-    Ok((
-        json!({"kind":if allocation_intent {"prepared-source-template"} else {"prepared-source-bundle"}, "directory":destination,
+    Ok(PreparedLocalBundle {
+        report: json!({"kind":if allocation_intent {"prepared-source-template"} else {"prepared-source-bundle"}, "directory":destination,
         "source_root":source, "request_path":request_path, "request_id":request["request_id"],
         "request_sha256":hex(&Sha256::digest(&request_bytes)),
         "manifest_sha256":hex(&upload.manifest.digest()), "source_roots":inputs.root_count(),
@@ -477,8 +498,9 @@ fn prepare_source_bundle_inner(
         "toolchain_root":prepared_toolchain_root,
         "toolchain_transfer":request.get("toolchain_transfer"),
         "executed":false, "publication_authorized":false}),
-        receiver,
-    ))
+        source: receiver,
+        toolchain: captured_toolchain,
+    })
 }
 
 #[derive(Debug, Clone)]

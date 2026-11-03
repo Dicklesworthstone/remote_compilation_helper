@@ -1180,13 +1180,15 @@ fn run_operation(
             .tempdir_in(&profile.operation_root)?,
     );
     let bundle = owner.path().join("bundle");
-    let (_report, source) = super::source_delivery::prepare_local_bundle_controlled(
+    let prepared = super::source_delivery::prepare_local_bundle_controlled(
         &profile.source_root,
         &profile.source_specification()?,
         &bundle,
         retained_toolchain.clone(),
         &preparation,
     )?;
+    let source = prepared.source;
+    let captured_toolchain = prepared.toolchain;
     let (_, request_bytes) = read_stable(
         &bundle.join("request.json"),
         super::worker_delivery::MAX_FRAME_BYTES as u64,
@@ -1291,6 +1293,7 @@ fn run_operation(
         ],
         retained_toolchain.clone(),
     )
+    .and_then(|paths| paths.with_captured_toolchain(captured_toolchain.clone()))
     .map_err(io::Error::other)?;
     if profile.command == CompilationCommand::Clippy {
         for program in [CARGO_CLIPPY, CLIPPY_DRIVER] {
@@ -1307,6 +1310,9 @@ fn run_operation(
     preparation.checkpoint()?;
     if let Some(retained) = &retained_toolchain {
         retained.image().verify_retained_generation(cancelled)?;
+    }
+    if let Some(captured) = &captured_toolchain {
+        captured.verify_retained_generation(cancelled)?;
     }
     let compilation_args = profile.compilation_args()?;
     // Ask the captured Cargo for the exact units this command would compile.
@@ -1472,6 +1478,7 @@ fn run_operation(
         ],
         retained_toolchain.clone(),
     )
+    .and_then(|paths| paths.with_captured_toolchain(captured_toolchain.clone()))
     .map_err(io::Error::other)?;
     let paths = paths
         .with_workspace_units(graph.workspace_units(), profile.selection.as_ref())
@@ -1660,6 +1667,9 @@ fn run_operation(
         preparation.checkpoint()?;
         if let Some(retained) = &retained_toolchain {
             retained.image().verify_retained_generation(cancelled)?;
+        }
+        if let Some(captured) = &captured_toolchain {
+            captured.verify_retained_generation(cancelled)?;
         }
         if let Some(Err(CommittedOutputExportError::InvalidProducer(reason))) = &target_provenance {
             return Err(io::Error::other(format!(

@@ -13,6 +13,7 @@ use rabs_key::live_dependency::{
 };
 use rabs_sandbox::cargo_check::{CompilationSelection, CompilationUnit};
 use rabs_sandbox::toolchain_cache::RetainedToolchain;
+use rabs_sandbox::toolchain_dataset::PreparedToolchain;
 use std::collections::BTreeSet;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -47,6 +48,8 @@ struct Mount {
 /// path supplied by a wrapper cannot select a coordinator filesystem root.
 #[derive(Debug)]
 pub struct CanonicalPaths {
+    // Close captured filesystem descriptors before the operation directory.
+    captured_toolchain: Option<Arc<PreparedToolchain>>,
     _owner: Arc<tempfile::TempDir>,
     shared_toolchain: Option<Arc<RetainedToolchain>>,
     mounts: Vec<Mount>,
@@ -227,6 +230,7 @@ impl CanonicalPaths {
         Ok(Arc::new(Self {
             _owner: owner,
             shared_toolchain,
+            captured_toolchain: None,
             mounts,
             closed_dependency_execution_required: false,
             workspace_units: Vec::new(),
@@ -239,6 +243,36 @@ impl CanonicalPaths {
 
     pub(crate) fn retained_toolchain(&self) -> Option<&Arc<RetainedToolchain>> {
         self.shared_toolchain.as_ref()
+    }
+
+    /// Reuse the standalone driver's already captured compiler tree. The
+    /// ordinary mount checks above keep this image under the operation owner;
+    /// neither a wrapper path nor a second capture can select its generation.
+    pub(crate) fn with_captured_toolchain(
+        mut self: Arc<Self>,
+        toolchain: Option<Arc<PreparedToolchain>>,
+    ) -> Result<Arc<Self>, String> {
+        let Some(toolchain) = toolchain else {
+            return Ok(self);
+        };
+        if self.shared_toolchain.is_some()
+            || self.captured_toolchain.is_some()
+            || self.physical(Path::new("/__rabs/toolchain"))? != toolchain.root()
+            || !toolchain.root().starts_with(self._owner.path())
+        {
+            return Err("captured compiler differs from its owned canonical mount".into());
+        }
+        toolchain
+            .verify_retained_generation(|| false)
+            .map_err(|error| error.to_string())?;
+        let paths = Arc::get_mut(&mut self)
+            .ok_or("canonical compiler image must be bound before sharing the operation")?;
+        paths.captured_toolchain = Some(toolchain);
+        Ok(self)
+    }
+
+    pub(crate) fn captured_toolchain(&self) -> Option<&Arc<PreparedToolchain>> {
+        self.captured_toolchain.as_ref()
     }
 
     /// Original operation identity retained by remote keying. This owner is
@@ -806,6 +840,125 @@ mod tests {
         ] {
             assert!(paths.physical(Path::new(path)).is_err(), "{path}");
         }
+    }
+
+    fn captured_mount_fixture() -> (
+        Arc<tempfile::TempDir>,
+        Arc<CanonicalPaths>,
+        tempfile::TempDir,
+        Arc<PreparedToolchain>,
+    ) {
+        use rabs_sandbox::toolchain_dataset::{ToolchainLimits, capture_toolchain};
+        use std::os::unix::fs::PermissionsExt;
+
+        // Real filesystem capture/ownership checks, never compiler execution.
+        let source = crate::test_util::private_tempdir();
+        std::fs::create_dir(source.path().join("bin")).unwrap();
+        let compiler = source.path().join("bin/rustc");
+        std::fs::write(&compiler, b"standalone captured compiler bytes").unwrap();
+        std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let owner = Arc::new(crate::test_util::private_tempdir());
+        let image = Arc::new(
+            capture_toolchain(
+                source.path(),
+                &owner.path().join("2"),
+                None,
+                &ToolchainLimits::default(),
+                || false,
+            )
+            .unwrap(),
+        );
+        let mappings = ROOTS
+            .iter()
+            .enumerate()
+            .map(|(index, logical)| {
+                let backing = owner.path().join(index.to_string());
+                if *logical != "/__rabs/toolchain" {
+                    std::fs::DirBuilder::new()
+                        .mode(0o700)
+                        .create(&backing)
+                        .unwrap();
+                }
+                (PathBuf::from(logical), backing)
+            })
+            .collect();
+        let paths = CanonicalPaths::new(Arc::clone(&owner), mappings).unwrap();
+        (owner, paths, source, image)
+    }
+
+    #[test]
+    fn captured_compiler_mount_reuses_the_original_image_and_owns_its_lifetime() {
+        let (owner, paths, source, image) = captured_mount_fixture();
+        let compiler = image.root().join("bin/rustc");
+        let inode = std::fs::metadata(&compiler).unwrap().ino();
+        let weak_image = Arc::downgrade(&image);
+        let paths = paths.with_captured_toolchain(Some(image)).unwrap();
+        std::fs::write(
+            source.path().join("bin/rustc"),
+            b"later original generation",
+        )
+        .unwrap();
+        drop(owner);
+        assert!(weak_image.upgrade().is_some());
+        assert_eq!(
+            paths
+                .physical(Path::new("/__rabs/toolchain/bin/rustc"))
+                .unwrap(),
+            compiler
+        );
+        assert_eq!(std::fs::metadata(&compiler).unwrap().ino(), inode);
+        assert_eq!(
+            std::fs::read(&compiler).unwrap(),
+            b"standalone captured compiler bytes"
+        );
+        paths
+            .captured_toolchain()
+            .unwrap()
+            .verify_retained_generation(|| false)
+            .unwrap();
+        drop(paths);
+        assert!(weak_image.upgrade().is_none());
+        assert!(!compiler.exists());
+    }
+
+    #[test]
+    fn captured_compiler_mount_rejects_foreign_or_changed_images() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_owner, paths, _source, image) = captured_mount_fixture();
+        let (_other_owner, _other_paths, _other_source, other_image) = captured_mount_fixture();
+        assert!(
+            Arc::clone(&paths)
+                .with_captured_toolchain(Some(other_image))
+                .unwrap_err()
+                .contains("differs from its owned canonical mount")
+        );
+        // Captured files are read-only. Model a same-user host mutation by
+        // explicitly changing this owned fixture's permissions first.
+        std::fs::set_permissions(
+            image.root().join("bin/rustc"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        std::fs::write(
+            image.root().join("bin/rustc"),
+            b"changed retained generation",
+        )
+        .unwrap();
+        assert!(paths.with_captured_toolchain(Some(image)).is_err());
+    }
+
+    #[test]
+    fn captured_compiler_mount_cannot_be_rebound_after_the_operation_is_shared() {
+        let (_owner, paths, _source, image) = captured_mount_fixture();
+        let shared = Arc::clone(&paths);
+        assert!(
+            paths
+                .with_captured_toolchain(Some(image))
+                .unwrap_err()
+                .contains("before sharing the operation")
+        );
+        assert!(shared.captured_toolchain().is_none());
     }
 
     struct RetainedMountFixture {

@@ -628,13 +628,18 @@ enum RetainedToolchainBacking {
         image: Arc<PreparedToolchain>,
         _directory: tempfile::TempDir,
     },
+    CanonicalCaptured {
+        image: Arc<PreparedToolchain>,
+        _owner: Arc<tempfile::TempDir>,
+    },
     Shared(Arc<SharedToolchain>),
 }
 
 impl RetainedToolchain {
     fn image(&self) -> &PreparedToolchain {
         match &self.backing {
-            RetainedToolchainBacking::Captured { image, .. } => image,
+            RetainedToolchainBacking::Captured { image, .. }
+            | RetainedToolchainBacking::CanonicalCaptured { image, .. } => image,
             RetainedToolchainBacking::Shared(owner) => owner.image(),
         }
     }
@@ -643,6 +648,14 @@ impl RetainedToolchain {
         match &self.backing {
             RetainedToolchainBacking::Captured { image, .. } => {
                 image.verify_source_unchanged(source, || false)
+            }
+            RetainedToolchainBacking::CanonicalCaptured { image, .. } => {
+                if source != image.root() {
+                    return Err(invalid(
+                        "remote compiler differs from its captured canonical image",
+                    ));
+                }
+                image.verify_retained_generation(|| false)
             }
             RetainedToolchainBacking::Shared(owner) => {
                 if source != owner.root() {
@@ -659,7 +672,8 @@ impl RetainedToolchain {
 
     fn attach(&self, upload: SourceUpload, request: &Value) -> io::Result<SourceUpload> {
         match &self.backing {
-            RetainedToolchainBacking::Captured { image, .. } => {
+            RetainedToolchainBacking::Captured { image, .. }
+            | RetainedToolchainBacking::CanonicalCaptured { image, .. } => {
                 upload.with_shared_toolchain(Arc::clone(image), request)
             }
             RetainedToolchainBacking::Shared(owner) => {
@@ -1462,6 +1476,21 @@ impl RemoteDependencies {
                 .map_err(|error| error.to_string())?;
             // Do not pin these leases in the separate remote memo. Otherwise
             // its idle entries could consume every service-pool slot forever.
+            return Ok(Some(retained));
+        }
+        if let Some(paths) = canonical
+            && let Some(image) = paths.captured_toolchain()
+        {
+            let retained = Arc::new(RetainedToolchain {
+                guard: guard.clone(),
+                backing: RetainedToolchainBacking::CanonicalCaptured {
+                    image: Arc::clone(image),
+                    _owner: Arc::clone(paths.operation_owner()),
+                },
+            });
+            retained
+                .verify_source(guard.sysroot())
+                .map_err(|error| error.to_string())?;
             return Ok(Some(retained));
         }
         let key = (compiler.to_path_buf(), guard.sysroot().to_path_buf());
