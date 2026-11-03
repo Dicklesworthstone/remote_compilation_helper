@@ -515,6 +515,12 @@ impl ToolchainPool {
             changed: Condvar::new(),
         })
     }
+    /// Early upload retention uses only the supervisor's existing opt-in and
+    /// byte bound. Admission still applies entry limits, live leases and the
+    /// existing private fallback; this does not reserve or create a dataset.
+    pub(crate) fn retention_enabled(&self, expected: &ToolchainIdentity) -> bool {
+        self.max_bytes != 0 && expected.bytes <= self.max_bytes
+    }
     fn lock(&self) -> io::Result<MutexGuard<'_, State>> {
         self.state
             .lock()
@@ -887,6 +893,45 @@ pub(crate) fn adopt(
         Some(pool) => pool.adopt(upload, stopped),
         None => ToolchainPool::new(0, MAX_POOL_ENTRIES)?.adopt(upload, stopped),
     }
+}
+
+/// Select an already configured owner for a completed upload. A disabled,
+/// undersized or absent pool leaves upload ownership private until execution.
+pub(crate) fn retention_pool(
+    expected: &ToolchainIdentity,
+) -> io::Result<Option<Arc<ToolchainPool>>> {
+    Ok(ACTIVE_POOL
+        .lock()
+        .map_err(|_| invalid("toolchain pool registry is poisoned"))?
+        .upgrade()
+        .filter(|pool| pool.retention_enabled(expected)))
+}
+
+/// A seal-time lease is already the owned execution image. Revalidate that
+/// exact generation and every byte instead of recapturing its pathname or
+/// selecting a replacement from a later pool. Preserve its original capture /
+/// adoption / private disposition. Only a matching failed ready owner is retired;
+/// a replacement with the same identity belongs to its own acquisition.
+pub(crate) fn revalidate_retained_upload(
+    lease: ToolchainLease,
+    pool: &Weak<ToolchainPool>,
+    expected: &ToolchainIdentity,
+    stopped: impl Fn() -> bool,
+) -> io::Result<ToolchainLease> {
+    checkpoint(&stopped)?;
+    if lease.identity() != expected {
+        return Err(invalid("retained upload differs from its request identity"));
+    }
+    if let Err(error) = lease.dataset.verify(&stopped) {
+        if !stopped()
+            && let Some(pool) = pool.upgrade()
+        {
+            pool.discard_failed(key(expected), &lease.dataset)?;
+        }
+        return Err(error);
+    }
+    checkpoint(&stopped)?;
+    Ok(lease)
 }
 
 /// Reuse only an already retained, verified dataset from the active supervisor.
@@ -1621,6 +1666,42 @@ mod tests {
                 1,
                 "late failure cannot retire a replacement"
             );
+        }
+
+        #[test]
+        fn late_retained_upload_failure_cannot_retire_a_replacement_dataset() {
+            let (source, identity) = source(b"compiler");
+            let pool = Arc::new(pool(1024, 2));
+            let lease = pool
+                .acquire(source.path(), Some(&identity), || false)
+                .unwrap();
+            let compiler = lease.root().join("bin/compiler");
+            fs::set_permissions(&compiler, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::write(&compiler, b"tampered").unwrap();
+            assert!(pool.lookup(&identity, || false).is_err());
+            let replacement = pool
+                .acquire(source.path(), Some(&identity), || false)
+                .unwrap();
+            let replacement_root = replacement.root().to_path_buf();
+            assert_ne!(lease.root(), replacement.root());
+            assert!(
+                revalidate_retained_upload(lease, &Arc::downgrade(&pool), &identity, || false)
+                    .is_err()
+            );
+            let retained = pool.lookup(&identity, || false).unwrap().unwrap();
+            assert_eq!(retained.root(), replacement_root);
+            assert!(Arc::ptr_eq(&retained.dataset, &replacement.dataset));
+            assert_eq!(pool.lock().unwrap().reserved_bytes, identity.bytes);
+
+            // Cancellation refuses this caller while leaving the verified owner
+            // available to another independent request.
+            let error =
+                revalidate_retained_upload(retained, &Arc::downgrade(&pool), &identity, || true)
+                    .err()
+                    .unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+            let retained = pool.lookup(&identity, || false).unwrap().unwrap();
+            assert!(Arc::ptr_eq(&retained.dataset, &replacement.dataset));
         }
 
         #[test]
