@@ -4590,9 +4590,10 @@ fn assert_fresh_workspace_execution(
         rabsd::janitor::store::mount_and_reconcile(&root.join("state/canonical-compile-v1/cas"))
             .unwrap();
     let mut store = cas.store().lock().unwrap();
+    let published = store.published_manifest_key_str(&key).unwrap();
     assert!(
-        store.published_manifest_key_str(&key).unwrap().is_none(),
-        "workspace result was published"
+        published.is_none(),
+        "workspace result was published: key={key}, manifest={published:?}\n{output}"
     );
     assert!(
         !store.has_serving_state_key(&key).unwrap(),

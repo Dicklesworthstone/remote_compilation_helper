@@ -1,11 +1,282 @@
 # RABS Bridge Plan — From Proven Library to Living System
 
-## Reality check and execution order — updated November 1, 2026
+## Reality check and execution order — updated November 3, 2026
+
+**Current execution checkpoint, November3 at12:44UTC:** corrected source0fb4cf2d
+has a terminal native DSR pass:455 sandbox tests pass,0 fail,10 original ignored;
+each of the four explicitly selected REAL compiler/negative-boundary cases
+passes1/1. Scoped check/strict Clippy/fmt all0, source/harness-after audits verify;
+reportc9993742bfe8368b28142782b25c0abdcdf672543276e0991d857963d0b57c01,
+DSRa3afdca4 terminal0/196s. Its four NORMAL shipping tools compile0/395s,
+DSR9868e083 terminal0/412s, reportdea7f9cf84b5ac86db6b7a616afa3d652c42a17f9126ca0fc18775a65fffbfd2.
+The original metadata/TLS consumer now passes1/1/raw0/769.238s with those four
+tools:20 real worker executions,4 dependency serves, relocation/mutation checks,
+exact42/43 answers and the selected failing-build-script negative. No speed win
+is claimed from comparing separate runs. The original returned-binary consumer
+remains RED0/1/raw101/267.637s: all THREE archive worker executions now complete0
+and its first delivered executable prints42, then the unchanged fresh-workspace
+assertion rejects an action publication. Only its first of six positive builds
+ran. The loader blocker is fixed for those actual remote units; the publication
+failure is unresolved. The older retained harness links older dependencies and
+uses its original profile. A current-source normal-dev canonical harness is
+prepared, UNRUN, adding only the exact failing key/manifest/output to that same
+assertion; it does not alter acceptance. Read-only CAS evidence and the existing
+stronger committed-archive consumer must adjudicate the publication failure.
+Full0fb workspace/all-target check is0/592.689s, strict Clippy0/629.889s and
+fmt0/15.207s. DSR1f9d37eb is terminalFAILED6/2300s with runtime raw101; final
+source/incoming/binary/harness audits verify. The two-file explicit-ELF fix is
+committed on main as7e2246db with the entire shared Git index byte-identical.
+UBS retains one reviewed preexisting native-fixture dynamic-executable finding;
+no suppression. M6/S7/A012 remain in_progress.
+
+**Mac capacity checkpoint:** native RCH459 normal-release build is admitted and
+staging through DSR0190c286 on a private0700 export of the existing physical ZFS
+bulk pool, mounted at /Volumes/rabs-mac-native-20261103 with uid501/gid20 retained.
+The default storage policy passes with the APFS-home warning visible and about
+9.5TB free on the actual build backing store. A real independent-process POSIX
+lock probe rejects acquisition while held and succeeds after release. No floor,
+percentage guard, SDK contents, build profile, job count or timeout was changed.
+Compilation is not yet complete. The original three Linux-only wiring tests
+remain UNRUN; a Mac binary cannot qualify them. No global client installation,
+fleet deployment, release or GitHub Actions operation occurred.
+
+Current next actions, preserving all original losing receipts and assertions:
+
+- [x] Run all four source0fb real compiler cases and full sandbox library;
+  retain source9ff's443/12failed/10ignored adverse result independently.
+- [x] Rebuild all four source0fb normal shipping tools with actual Cargo artifact
+  and complete source/binary-after binding.
+- [x] Run original metadata consumer with source0fb tools;20 worker units and4
+  serves pass with the original relocation/mutation/negative checks.
+- [x] Run original delivered-binary consumer with source0fb tools; retain its
+  new publication failure despite three actual worker successes and output42.
+- [x] Finish full0fb workspace strict Clippy/fmt and retrieve terminal DSR state,
+  result, source/binary-after audits and worker receipts; keep overall101.
+- [ ] Compile current-source canonical harness through DSR after the current
+  TS2 job is terminal; normal dev profile/linked dependencies, original cases.
+  Started12:46UTC, sourceb3e963b0, version2.1.34-rabscurrentharness.b3e963b0.
+  Actual harness compile0/127.449s, integration strict Clippy0/434.322s,
+  fmt0/3.313s; source/incoming-after verified, artifact collection/packaging pending.
+- [ ] Rerun the unchanged failing archive assertion with exact key/manifest/output
+  and an independent read-only CAS snapshot. Establish whether publication violates
+  the intended class before changing product code or any acceptance assertion.
+  Current normal-dev harness reproduces RED0/1/raw101/261.576s. Three worker
+  archives complete0, delivered42 passes, then the identical assertion rejects key
+  9b4a10a63147e615fb49370c4e5dbf4a1e276502935607cde2aa5b5b5ac99264.
+  Independent native SQLite snapshot808cd0be36ce9703afc4c03320f1d555e4d4930872c854a804922af9c0a0a895
+  records rustc-workspace-committed-dag-rlib-v1, both committed producer keys and
+  adopted0 for all transitive ancestry. Initial comparison samples0 is expected
+  before independent executions. The fresh-only expectation appears stale under
+  the existing automatic DAG classes, not an established execution-only leak.
+  No acceptance change is made; existing mixed archive replay case is running.
+- [x] Existing committed mixed archive consumer PASS1/1/raw0/468.927s with the
+  current normal-dev harness and0fb four normal tools:9 actual worker executions,
+  3 qualified actions, two later all3-action cache serves (including relocation),
+  byte-identical stock/cold/hit archives+diagnostics, exact transitive ancestry,
+  independent samples and unchanged worker journal on both warm rounds.
+  DSRarchive aggregate remainsFAILED101/DSR6 because the original plain-Rust
+  fresh-only assertion is stillRED; no gate change or milestone closure.
+- [x] Run the existing generated-input returned-binary consumer unchanged. Its
+  generated workspace ancestry intentionally stays execution-only, preserving the
+  original no-publication controls while exercising real archive cache hits,
+  six delivered programs, changed generator input and the selected failure.
+  Started13:12:41UTC viaDSRrabs_current_generated_binary after archive terminal.
+  PASS1/1/raw0/588.515s; DSR270f3101 terminalSUCCESS. All six actual delivered
+  programs42/43, generated-input invalidation, warm/relocated dependency archive
+  replay and selected build-script failure pass.13actual worker executions,
+  lastreceipt0/residual0/releasedtrue/resolvedtrue; full source/binary-after
+  verified, observererrors0. Report8ecacb649136cd0819a1195b2d8cc958ab7911c6c43cf7e5d9a308189eef0b27.
+- [ ] Rerun the ORIGINAL metadata/TLS consumer on TRJ's complete installed SDK
+  with documentation and extra targets intact. Current0fb four tools are copied
+  byte-identically from their normal shipping producer; actual original older
+  harness identity remains explicit. DSRrabs_elf_private_trj_tls started12:56:26UTC,
+  unchanged limits/jobs1 and /tmp; source22's original TRJ0/1 timeout is retained.
+  Current0fb rerun remainsRED0/1/raw101/528.578s, DSR4e75b9dd terminalFAILED6/657s.
+  Original300s Cargo budget expires after first admission, no worker execution
+  receipt (journal lastnull); source/incoming/binary/harness-after audits verify.
+  Captured-image reuse does not by itself close the complete-SDK transfer gap.
+- [ ] Qualify the new8-line actual mTLS TCP_NODELAY candidate3f7c2470. Source
+  review finds plaintext TcpPeer already disables Nagle, while actual accepted
+  and connected mTLS sockets inherit the default from Asup rev78b64636. Enable
+  the existing socket option at both actual endpoints without wire/limit/key
+  changes. Cause/performance benefit is UNPROVEN. Native DSRrabs_tls_nodelay_native
+  started13:17:31UTC onTRJ: full adapter library plus the three original actual
+  TLS/admission/delivery/interrupt/resume suites and scoped check/Clippy/fmt.
+  Scripted peers are transport proof only; original compiler consumer is separate.
+- [ ] Rebuild all four normal tools and run full workspace check/strictClippy/fmt
+  for3f7; then rerun the ORIGINAL full-SDK TRJ consumer without weakening limits.
+  DSRrabs_tls_nodelay_shipping started13:25:19UTC onTS2 after generated terminal.
+- [ ] Complete normal Mac RCH459 build, inspect actual native binaries and run
+  version/help if it succeeds. Do not treat Linux-only tests as Mac passes.
+- [ ] Run original Linux wiring/source-lock/config guards on qualified capacity;
+  then prove the actual public RCH opt-in route with its matching client.
+  Exact source459 staged on TS2,1694 selected members/61 allowed omissions,
+  archive10d7cb606835b3cd7e6d5a78f0969aa638f207151763183369af33e578722929.
+  Tests are not launched; do not displace the active canonical diagnostic.
 
 **Initial source assessed:** `7ae3f5fe0cf4a4ca533c235e9e1d89dbfd413ff3`.
 **CI/release policy, explicitly confirmed by the user November 1:** DSR only.
 Never enable or dispatch GitHub Actions. Historical workflow receipts below
 remain unqualified history; the earlier optional enablement question is closed.
+**Latest actual-worker proof, November 3 at 10:53 UTC:** the ORIGINAL real
+Cargo/TLS/cache consumer passes1/1/raw0/925.296s on TS2, DSRc4deb3ac terminal
+0/955s. All four normal source22 shipping tools execute20 actual worker units,
+serve4 dependency results, and pass workspace relocation, dependency mutation,
+exact typed42/43 answers, released receipts/no residuals and the selected
+failing-build-script negative. Source/binary-after audits verify. The worker
+captures its SDK once and reuses it19times. Report746af3eccf424b00d63b825f29630203a1e22b6ee84d75457933091daea37648.
+Scope: the tested TS2 installed SDK/physical compiler, local TLS worker process,
+source-identical older be324 harness with explicitly older linked dependencies/
+profile. Distinct-host authority, default Rustup, storm/performance, full QA and
+release remain unqualified. Source69's four normal shipping tools separately
+compile0/683.971s, DSRb75e965a terminal0/713s. Its native controls and required
+FULL workspace check/strict Clippy/fmt now PASS:3/3 focused,30/30 canonical,
+1466passed/0failed/1ignored library; check0/549.004s,Clippy0/623.992s,fmt0/14.117s.
+DSR05b79ef8 terminal0/2776s, final source/harness audits verify;
+report23b8bf15ac87afaa9a0c85e42b21fe547144943a51d16853b085552e906175b3.
+The bounded four-file ownership fix is committed on main as3d0b7840; all other
+1692 shared-index entries are preserved byte-for-byte. UBS candidate and retained
+source22 both raw1 with the same3 unchanged FileSig false positives; no suppression.
+The returned-binary consumer remains RED on original source22:
+0/1/raw101/272.984s, DSRbfeef0d5 terminal6/295s. Three remote codegen
+attempts acquire the retained SDK/runtime and fail; the retained last receipt
+records exit127. Ordinary Cargo fallback
+completes and the first delivered executable runs, then the test correctly
+rejects zero completed remote offers. It does not reach its later cache rounds
+or qualify the six-build acceptance. Source/binary-after audits verify;
+report8d71ec6448d28ea40a6213795e0dc2e86cd94d8fedaf310273dcefa6e0ec18a5.
+
+**Codegen blocker isolated, November3 at11:12UTC:** a native stock-rustc `-vV`
+probe reproduces that exact stderr hash84e0fceb88836fb1fc6fa24c7cb2f6ed9b9804eacfef52e5f494404469c69f05:
+no procfs means the ELF loader cannot resolve rustc's `$ORIGIN` library search.
+Metadata's proc mount succeeds; directly invoking the actual ELF interpreter
+also succeeds WITHOUT procfs. A two-file sandbox fix now acquires the compiler's
+bounded ELF64 PT_INTERP, requires that exact interpreter in the measured retained
+runtime, binds its path and a new launch-contract marker into the runtime key,
+and uses it only for Rlib/ClosedMetadata launches. No environment/search path,
+proc/entropy restriction or acceptance assertion is relaxed. New native archive
+coverage omits LD_LIBRARY_PATH and still rejects assembler reads of host-only
+bytes, /proc/self/exe, /proc/version, random UUID and urandom. The original two
+archive controls and closed-metadata control remain required. Source9ff2d718,
+manifestfee06397ec22685f48f3b644d1cd9526b5b3098f143aab813e8ff74366094e01,
+1697present/58allowed omissions fully audited on an independent retained source,
+was submitted through DSRrabs_elf_interpreter_tests at11:11:55UTC. Its actual
+sandbox harness compiles0/25m46, but the full library is RED443passed/12failed/
+10ignored: all12 existing RuntimeFixture owners inherit group-writable temporary
+directory permissions and the unchanged production runtime-owner gate refuses.
+The four real compiler cases are UNRUN in that failed cut. Corrected source0fb4cf2d
+uses explicit0700 only for test-owned runtime roots; the original0770-refusal
+assertions and production guard remain. Its manifest is
+4afc22f08ab72b8e408797084b5914ecb5d35f7e5dd859499c5c0a846dd65dd4.
+DSRrabs_elf_private_fixture_tests onTS2 starts11:53:16UTC after69terminal,
+normal dev compile0/1m18 and full sandbox455passed/0failed/10ignored at11:56UTC.
+The four selected actual compiler cases have completed and their receipts/scoped
+QA are being verified. Normal production rebuild, original worker consumers and
+new-source full-workspace QA remain pending; source9ff's adverse receipt stays.
+Source458's earlier daemon-test job is terminal5/3712s before any native tests;
+its original Cargo PID is absent. No test pass is inferred from compilation.
+
+**Local-cache proof, November 3 at 07:47 UTC:** the original real Cargo
+local-cache experiment PASSES on TS2: all five commands0, all11metadata files
+byte-equal,8cold commits, two rounds of8verified actions, then8hits+8served and
+zero daemon-admitted dependency executions. Source/binary-after checks verify.
+DSR49a88c6f attempt3 is terminal0/379s, exact source22 wrapper plus separately
+bound older272 daemon; reportc91f8990a6dc69d53c2d8428829caf3def380cb2b5606b6a8ebb0fbb2e6a33e7.
+This proves local reuse in the tested explicit-physical-compiler Linux setup,
+not default Rustup, a matching current four-tool release, TLS worker execution,
+RCH opt-in routing, fleet authority or a sustained performance win. The busy
+trj experiment's7/8failure and all preceding losses remain. The current source22
+four-tool shipping build timed out5/3628s after one normal Cargo-root binary;
+TLS and workspace QA did not run. Supported same-run attempt2 failed before
+compilation because its operational driver expected a source audit that had
+been checked but not saved before that timeout. Attempt3 started09:15:20UTC
+after correcting the checkpoint handling: exact retained source/home/target,
+fresh full source audits, ordinary Cargo locking/freshness, unchanged shipping
+profile/jobs/deadlines. Attempt3's ordinary Cargo build now completes0/596.71s:
+all FOUR source22 shipping tools are bound to actual Cargo artifacts and hashes.
+The unchanged TLS case immediately fails0/1 before worker work because TS2
+lacks bubblewrap. Ubuntu's bubblewrap prerequisite is now installed, preserving
+the existing enforcing AppArmor policy and kernel restriction1; the full
+namespace smoke and the original check/TLS worker consumer pass afterward.
+Attempt3 subsequently times out5/3616s during workspace checking; its Clippy and
+formatting are unrun. The unchanged
+TLS case on supported TRJ with byte-identical shipping tools is now also RED:
+0/1/raw101/645.60s, terminal DSR6/864s. TLS standby/heartbeats work, but no
+execution receipt completes before the original600s operation bound. Live
+file/thread observations expose duplicate full toolchain capture: standalone
+preparation captures the SDK, then the remote lane recaptures that same retained
+SDK (including documentation). A four-file fix now passes the original captured
+image through the canonical operation's typed ownership capability; no deadline,
+key, isolation, dependency or numeric resource limit changes. Source458a5fa4
+native library-test compilation remains slow on TRJ, not yet qualified. Review
+found its negative fixture tries to modify read-only captured data; corrected
+source69a967f1 explicitly changes only that owned test file's permissions before
+mutation and preserves every refusal assertion. Source69 has all four normal
+shipping tools compiled0/683.971s (DSRb75e965a terminal0/713s), full immutable
+source/binary audits, and an actual new daemon hash
+e0358bc3f16f69915b1c850a263bb524c1c9011ad585a3c034af89bbbbf5b455.
+Its focused controls PASS3/3, full canonical module PASS30/30, and full daemon
+library PASS1466/0failed/1ignored (1467 enumerated,131.90s) at11:27UTC. Native
+compilation took22m07s with the normal Asup proc-macros+tls features. Required
+full workspace check/strict Clippy/fmt continue in DSRrabs_standalone69_native,
+version2.1.34-rabsstandalonenative.69a967f1; they remain unqualified.
+M6/S7/A012 remain in progress.
+
+Current execution checklist (extend these items as new concrete gaps appear):
+
+- [x] Prove source22 whole-process supervision against the retained failing
+  wrapper in the same native invocation;114 unit/11 integration tests pass.
+- [x] Run the original five-command public cache experiment on TS2; all11
+  metadata outputs match stock and the final round serves all8 dependencies.
+- [x] Preserve the busy-host7/8 failure, different-key diagnostic, host refusals,
+  source6538 shipping timeout and current22 shipping/resume failures.
+- [x] Correct the unsaved operational checkpoint, pin the original driver and
+  retained Cargo artifact source path, and save before every new subprocess.
+- [x] Complete the normal four-role source22 shipping build on TS2; bind each
+  actual Cargo artifact and executable hash, retaining any new terminal failure.
+- [x] Run the unchanged source22 real canonical Cargo/TLS worker/cache case. Preserve
+  all qualifying/warm/invalidation outputs, released receipts, no residuals,
+  relocated workspace edits and the required failing-build-script negative.
+- [x] Diagnose actual source22 shipping TLS timeout and wire the already
+  captured standalone compiler image into remote keying/upload ownership.
+- [x] Compile corrected source69a967f1 and run its three real filesystem ownership/
+  mutation controls, complete canonical-path unit module and daemon library.
+  Native compile0/22m07s, focused3/3 and canonical module30/30 pass;
+  full library1466passed/0failed/1ignored at11:27UTC. Full workspace QA later0.
+- [x] Build all four normal corrected source69 shipping tools with unchanged
+  shipping profile and full source/binary-after audits; actual Cargo0/683.971s.
+- [x] Finish source69's required workspace check/strict Clippy/formatting (all0).
+  Its isolated runtime rerun is superseded, UNRUN, by the normal source0fb tools
+  that include the same source69 production fix plus the qualified loader repair.
+- [ ] Run the existing Cargo-build consumer that links and EXECUTES returned
+  binaries, with the same actual normal tools and original acceptance. First
+  actual run is RED0/1, three remote codegen failures with last receipt127 despite successful local
+  fallback and one correct delivered executable. Preserve this adverse receipt.
+- [x] Retain the returned-binary failure's exact source/binary-after audits,
+  worker streams, exit127 receipt and original acceptance assertions.
+- [x] Recover the actual stderr and fix codegen; rerun the ORIGINAL returned-binary
+  consumer unchanged. Source0fb completes all3 first-round worker executions0;
+  delivered program42 passes. Later fresh-workspace publication assertion is RED.
+- [x] Match the exit127 receipt's exact stderr digest to the missing rustc-driver
+  loader diagnostic and reproduce it with stock rustc in a closed native view.
+- [x] Prove explicit interpreter invocation fixes that stock loader diagnostic
+  while keeping procfs absent; preserve the three-command diagnostic receipt.
+- [x] Compile source9ff sandbox harness and record RED443/12failed/10ignored;
+  four real cases UNRUN there. Correct only test-owned root permissions in0fb,
+  then full455/0/10 and all4 selected real compiler/negative controls pass.
+- [x] Rebuild all four normal tools with the interpreter fix; rerun original
+  metadata TLS (PASS) and returned-binary (publication RED), full workspace QA0.
+- [ ] Prove the explicit canonical environment through the public CLI across
+  separate real SSH/Cargo sessions; do not change key policy to create hits.
+- [ ] Probe ordinary Rustup-proxy selection and report its actual behavior.
+- [x] Complete full source0fb workspace/all-target check, strict Clippy and
+  formatting; all0, independently of the retained runtime raw101.
+- [ ] Compile/run RCH wiring459 on admitted capacity: original routing,
+  source-lock lifecycle and config-guard tests, then normal client/full QA.
+- [ ] Reassess default deployment, distinct-host authority,15-agent storm and
+  sustained rollout only after their own real named probes. No local cache or
+  TLS result closes these broader acceptance items.
+
 **Continuation, November 2 at 00:44 UTC:** the explicit-daemon dev harness
 compiled successfully (497.84s), and its selector and real-process shutdown
 controls each pass 1/1. The original three-hour job then times out during
@@ -2677,7 +2948,15 @@ real Cargo serving, fleet performance or release qualification.
     source-after1697matches+58declared exclusions verifies. Componentraw0;
     retained normal wrapper8,265,632bytes SHA-256
     ffa6e5004811684239c54fed139759ffae2316c6681dd93358f02f4f8de61b4d.
-  - [ ] Finish source22 scoped/full required QA and terminal DSR receipt.
+  - [x] Read source22 component job's actual terminal DSR receipt:
+    77a91f67-f006-4e13-8ad0-b01809439a23 timeout5/3717s. Native114/11,
+    same-invocation old/new controls and scoped check/strictClippy/fmt completed
+    before the timeout. Full workspace check's retained log reports package-
+    cache and build-directory lock waits; it has no terminal Cargo result.
+    Full-workspace Clippy is unrun. Preserve whole-process/terminal-state.json
+    and terminal-result.json; component0 does not turn this overall job green.
+  - [ ] Finish source22 full required QA and final full-source audit on admitted
+    capacity; the TS2 joint-runtime recipe retains these mandatory checks.
   - [x] Submit the ORIGINAL five-check public11metadata/8dependency ladder
     06:25:43UTC, PID2887, DSRtoolrabs_whole_public_canary,
     version2.1.34-rabswholepublic.22d4aae9. Actual source22 normal wrapper and
@@ -2687,14 +2966,45 @@ real Cargo serving, fleet performance or release qualification.
     old/new thread controls. Immutable13,015-byte driver67c88e460438cee9da90851def6eb897358e57d5b2cdbe48e805a0dbe1b60b2a.
     Fresh private state/breaker/targets, same-invocation stock, original2s
     cleanup/30sready/60ssettle and all11output/8dependency assertions unchanged.
-  - [ ] Read all five Cargo terminal results, exact output/decision counts and
-    source/binary-after checks. Preserve failures. Native component is not
-    practical repair, current4tool, release, fleet or speed proof.
-    At06:59UTC: stockCargo0/11metadata; coldCargo0/14m50s, exact8execute+
-    8commit and11metadataequal. First verificationCargo0/5m21s, exact8more
-    execute+8verified and11metadataequal. This passes the original failed
-    round with unchanged bounds; second verification and final8served/
-    zeroexecute remain pending. No full ladder or speed win yet.
+  - [x] Retain source22 public TERMINAL FAILURE, DSR5149cb54-0dd2-47cb-bb80-f9689c8b79f2,
+    raw6/2516s. All FIVE Cargo commands0 and all11metadata byte-equal in all
+    four wrapped rounds. Stock364.582s; cold893.579s/exact8execute+8commit;
+    verify1=323.770s/8execute+8verified; verify2=390.805s/8execute+8verified.
+    The completion fix passes both previously blocked verification rounds.
+    Final281.846s has ONLY7hit+7served, zero daemon-admitted executions; sha2
+    has no final hit/serve/execute/refusal record. The original8dependency
+    criterion FAILS, and final source/binary-after checks are not reached.
+    Missing receipt is not direct proof of a particular local execution path.
+    Reportf73f068981e5d34fafe6fe3edaf8a7d7e19adbdd714e3f4e844b621f9776b51b,
+    local whole-public-canary/terminal-{run,state,result}.json. Correct outputs
+    and7cache serves are real partial reuse, not full qualification or a speed
+    win; Cargo package-cache contention makes these timings unsuitable for
+    attributing a speedup. Final breaker reads closed0; that alone cannot
+    identify an earlier bypass. Keep114/11component0 separate from publicRED.
+  - [x] Submit ONE focused fresh-target trace07:18:11UTC/PID92804 through
+    DSRtoolrabs_cache_bypass_trace/version2.1.34-rabstrace.22d4aae9. Existing
+    RABS_WRAP_TRACE=1 exposes bypass reasons without production edits. Reuse
+    the exact original frozen root, binary pair, trained private CAS and
+    breaker only after clean socket retirement; no resets or extra warmup.
+    Reuse the original DSR_CONFIG_DIR/DSR_STATE_DIR values too: these arbitrary
+    environment values are keyed, so a new configuration path can otherwise
+    split the action identity. Explicitly compare actual hits to all8 original
+    committed keys instead of inferring identity from source labels. New driver
+    fe2f27048fa53b8023379e8d92899cddc96db8da8d939ba159592774c883b8d6,
+    15,835bytes, preserves30sreadiness/60ssettle/all original product bounds;
+    full source/binary-after audits run on failure as well. Original full-run
+    RED remains. This one-run diagnosis is not a replacement five-run pass.
+  - [x] Read the trace as a FAILED diagnostic: Cargo0/364.656s,11metadataequal,
+    but8execute+8commit under DIFFERENT keys, zero hits. same_training_keys=false;
+    full selected source1697+58 and binary-after audits verify. Trace reports
+    only expected workspace bypasses; it does NOT reproduce the old sha2 miss.
+    Report6760be860942a57c56e500cf08c156cf5e4ea4fcd4fdddf55b1975bd1a17d748,
+    local cache-bypass-trace/terminal-run.json. Same configuration paths alone
+    do not establish stable action identity; key-split cause still unresolved.
+    Read-only CAS inspection finds no stored key_breakdowns/observed recipes
+    for either sha2 key, so their absence supplies no input-equivalence proof.
+  - [ ] Identify the key split and original missing sha2 observation before
+    speculative production changes or a claim of reliable complete reuse.
   - [x] Source22 scoped all-target check0/338.6s, strict Clippy0/226.0s and
     workspace formatting0. Full-workspace compiler/Clippy checks remain pending.
   - [x] Submit a second independent native public experiment on hz3 via DSR,
@@ -2752,6 +3062,160 @@ real Cargo serving, fleet performance or release qualification.
     probe passes. If it succeeds, run actual Cargo/TLS worker acceptance with
     source/profile-bound tools, unchanged300s/600s bounds and retained worker
     streams. Keep distinct-host TLS/fleet/current4tools qualification separate.
+    Readiness is now satisfied07:25:29UTC through task-only SSH connection
+    reuse: new rabs-lilacshore-ts2-20261103 alias uses the SAME authenticated
+    endpoint100.96.111.98, original host-key alias192.168.1.124/key identity,
+    StrictHostKeyChecking=yes and private0700 ControlPath. Existing aliases
+    unchanged; no daemon/slot/priority/timeout changes. Original cold probe
+    0/14.808s remains adverse; warm actual command0/0.193s, full ORIGINAL
+    DSR health0/154ms, all storage/toolchain/clock checks0. Config fingerprint
+    changes explicitly to0d1e05fe1e16896f799b5615047c483ae09d4eb4d92a581e14ca3c1dc3500489.
+    This is transport maintenance/admission, not a product or performance win.
+  - [x] Submit supported SAME-RUN TS2 attempt2 07:26:30UTC/PID96886 after that
+    real readiness0, retaining attempt1 refusal. Same frozen source22/pair,
+    immutable driver, original5checks/11outputs/8ladder and deadlines/stock;
+    only explicit transport configuration changes. No new qualification yet.
+  - [x] Retain TS2 attempt2 PRE-CARGO failure, raw6/80s(native128): copied
+    .git/objects/info/alternates points at a trj-only absolute object path.
+    ZERO Cargo commands. Preserve the broken source and stage, not a pass.
+  - [x] Repair portable Git METADATA in a new self-contained private source:
+    create126MB Git bundle from the original trj source, clone --no-checkout
+    on TS2, byte-copy the source excluding .git, read-tree HEAD into ONLY the
+    new clone's index, git fsck --connectivity-only0. No source implementation
+    edits or existing checkout replacement/deletion. Restore new root0700
+    after tar imports its source directory mode. Fresh full1697matches+58
+    declared exclusions, no differences, main/HEAD85dc06ed and no alternates;
+    source-self-contained-audit.json retains exact proof. Update only private
+    DSR host_paths to this equal-byte source. Original broken copy retained.
+  - [x] Resume SAME49a88c6f TS2 attempt3 07:39:26UTC/PID62562 after concrete
+    metadata repair. Same source22/pair/immutable driver/5checks/11outputs/
+    8dependency criterion, original product/readiness deadlines and stock.
+  - [x] Read TS2 public PASS: all5Cargo0/all11metadataequal, exact8coldexecute+
+    8commit, two rounds each8execute+8verified, final8hit+8served/zero admitted
+    dependency executions. Full source/binary-after hashes verify. DSR49a88c6f
+    attempt3 terminal0/379s. Reportc91f8990a6dc69d53c2d8428829caf3def380cb2b5606b6a8ebb0fbb2e6a33e7,
+    local ts2-public-canary/terminal-run.json and attempt3 state/result. Stock
+    55.147s/cold113.673s/verify39.474s+37.052s/final27.999s. Publish cold cost
+    and all timings, not a claimed2x general win from one progressively warm
+    batch. Actual local reuse is proved, distinct-host TLS/fleet/release is not.
+  - [x] Probe real environment variation across fresh SSH versus the private
+    multiplexed connection, with values hashed and only differing names shown:
+    SSH_CLIENT, SSH_CONNECTION, XDG_SESSION_ID. Source env_role keys these names;
+    RABS_WRAP_TRACE is separately confirmed unkeyed with tracked-read veto.
+    These real session differences could explain cross-job key splitting, but
+    no original compiler environment snapshots prove they were the sole cause.
+    Do not silently drop arbitrary environment values to manufacture hits.
+  - [ ] Prove practical reuse across separate real SSH/Cargo invocations,
+    and test the existing explicit canonical environment contract. If changing
+    key policy becomes necessary, retain semantic env!/option_env! negative
+    controls, preserve actual values, version the policy and publish coverage
+    gains/losses. One persistent-session public pass is not cross-session proof.
+  - [x] Submit DSR rabs_ts2_current_release07:56:29UTC/PID18236,
+    version2.1.34-rabsts2release.22d4aae9, immutable13,898-byte driver
+    d8e47cd021f540c709212d455f09fa2358d7573cd07cfd217a853481ba34f9d7.
+    Build ALL FOUR normal source22 production roles together with unchanged
+    shipping release profile, then the unchanged real canonical Cargo/TLS/cache
+    case. Original300s/600s bounds and /tmp fixture placement remain. Require
+    native114/11+old/new control and public5/11/8 first. Source-identical older
+    be324 harness3dad09777e9004721d50a6c75df95dc4a922e43a58d76ec74d94a11605e2cbe4
+    retains explicitly older linked dependencies/profile. Hold only owned
+    regular worker stdout/stderr through cleanup; retain raw streams and observer
+    errors/truncation. Runtime/source/binary checkpoint precedes full workspace
+    check/strictClippy/fmt; overall0 requires all gates. Same private host state
+    keeps host concurrency1. No upload/install/signing or full release claim.
+  - [ ] Finish the four-tool build, actual TLS case and required workspace QA;
+    retain each exact source/binary/profile/denominator/result independently.
+    Then compile/run RCH wiring459 on the admitted capacity, keeping its original
+    routing/source-lock/config-guard tests and unrun states explicit.
+    DSRcfacacdd-6149-40f4-8288-3a594a1dfd47 attempt1 is terminal timeout5/3628s,
+    only normal Cargo-root reported; other three roles incomplete, TLS unrun.
+    Attempt2 raw6/30s fails pre-storage with KeyError source_before: original
+    driver checked the audit but saved only after subprocess completion.
+    Keep both raw receipts; no source-check gate is relaxed. Attempt3 resumes
+   09:15:20UTC/PID36384 with exact original source/home/target, pinned original
+    driver d8e47cd0 and retained normal Cargo-root source path, then mandatory
+    fresh complete source audits. New immutable16,719-byte driver SHA-256
+    3d38e41fb772263d6d387a83cfb2cad1354feeb99366d4e150a6f5e4352c3239
+    saves before each subprocess; new private job-current-release-checkpoint-
+    repair-20261103 preserves the failed results. Original driver/Cargo are
+    gone; the09:00 same-uid path inventory has zero matches but10 permission
+    errors, so it is NOT strict all-holder/closure proof. No process signals,
+    forced Fresh, deadline/profile/joblimit change, install or upload.
+    Named TLS case also requires dependency invalidation and a selected failing
+    build script; do not report every internal Cargo invocation as successful.
+  - [x] Complete current22 normal four-role shipping build0/596.708s in attempt3.
+    Actual normal Cargo artifacts: rabsd7,886,992bytes SHA-256
+    a94d278b1424692e54c3c0777d10e158315323793b9f9cf3882d8880b33828ec;
+    worker3,940,512bytes4791b7adcf37bc865908d8c71c1468411aeb8ff90d39ee9e944dd7d1548c0ada;
+    root402,464bytesc153b0e5c98f5a75a93fe236336a791d1edd7619f63b8c107069880c7fd82f6e;
+    wrapper495,984bytes97016468a2ceb298b12b9a52fc289b461b915b8fb7309caad2789f7e6babdcda.
+    Unchanged TLS test0passed/1failed/0ignored/raw101 in0.204s: host probe says
+    bubblewrapNone/usernsfalse, before any worker. Full source/binary-after
+    checks verify. Required full-workspace QA is now running independently.
+  - [x] Diagnose and repair TS2 prerequisite: bubblewrap absent; Ubuntu's
+    enforcing bwrap/unpriv_bwrap AppArmor profiles already loaded and kernel
+    apparmor_restrict_unprivileged_userns1. Package simulation selects ONLY
+    bubblewrap0.11.0-2ubuntu0.1,0upgrades/0removals. Install that official
+    package with restart mode list-only; dpkg independently reports install ok
+    installed. The outer shell returns1 because its receipt variable status
+    is read-only in zsh; retain that error rather than claiming a captured apt0.
+    Real bwrap version0 and user/PID/network/IPC/UTS/private-proc/dev/tmp smoke0,
+    restriction still1. No AppArmor/sysctl weakening or RABS global installation.
+    This is host enablement, NOT a rerun of the failed native case.
+  - [x] Submit unchanged check/TLS case on supported TRJ09:31:46UTC/PID27024,
+    DSR47c48ab3-8af5-42eb-9a2d-cce10a6c3179,
+    toolrabs_current22_shipping_tls/version2.1.34-rabsshippingtls.22d4aae9.
+    Exact normal four shipping tools copied byte-for-byte from TS2, producer
+    checkpointf75d404b82289cdb61d32b0c3a8752491916f8264b0ed7a17ec57cbb885927f3.
+    Full source22/component114/11+old/new controls remain mandatory. Immutable
+    10,232-byte driver0d3b74130d48f5f35ed491377ef6349f2fe08b0d1c3de628b641dbfb04271d84;
+    retains owned regular worker streams and original300s/600s/job1/tmp tests.
+    TS2 workspace checks continue, no host-concurrency change. This is a local
+    actual-worker test on another host, NOT distinct-host TLS/fleet authority.
+  - [ ] Read actual current22 TLS result; if it passes, run the existing build/
+    archive consumer and execute all six delivered binaries. The TS2 build-case
+    recipe/profile are prepared but UNRUN and correctly require prior TLS0.
+    The separate explicit canonical CLI profile is also prepared but UNRUN.
+    Actual current22 TRJ result:0passed/1failed/0ignored/raw101/645.601s,
+    DSR47c48ab3 terminal6/864s. Original600s operation timeout, full source and
+    binary-after checks verify. Worker TLS standby-ready/heartbeats are real;
+    terminal journal last=null, no completed execution receipt. Retained worker
+    stderr10,326bytes SHA089b8151171f5821287b24e2d1bc2aeb52b5f0639b1ce14c088d12672382d971,
+    stdout0bytes, no observer errors or truncation. Live retained FDs show
+    first capture of original full multi-target toolchain/docs, then a second
+    rabs-remote-tool capture of the already retained bundle/toolchain. Do not
+    replace this RED with connection/readiness proof.
+  - [x] Implement standalone captured-image reuse in four existing files:
+    preparation returns its Arc<PreparedToolchain>; CanonicalPaths binds that
+    exact already-owned mount before sharing; remote keying/upload retains the
+    same image plus operation owner rather than recapturing. The service path
+    already does retained-image reuse and remains unchanged. Preserve complete
+    generation checks before planning/keying/upload/completion and descriptor-
+    before-directory drop ordering. No new dependency, weaker key/isolation,
+    trimmed SDK, raised timeout, changed fixture or resource-cap increase.
+  - [x] Add three filesystem controls (not compiler execution evidence): exact
+    original image/inode and lifetime after original-source change; foreign/
+    modified image refusal; bind-before-sharing. Formatting/diff0. Scoped UBS
+    raw1: three unchanged FileSig equality false positives concern filesystem
+    identity, not secrets. Retain raw report; no suppression or clean-scan claim.
+  - [x] Freeze reviewed source
+    85dc06ed-overlay-22d4-standalone-toolchain-458a5fa424c2b7538e8c695f8c7ca61944b1c7ccfdb14a9e53cba4673de1b5d4,
+    manifest826ef9694deff64e95036966f10de51839448ebad87c7dcc405df89d80f5e834.
+    Original draft78521 is UNRUN: review caught one remaining Box-to-Arc
+    conversion and corrected descriptor drop ordering before the reviewed cut.
+    No compiled result or performance win is assigned to either draft.
+  - [x] Submit DSR rabs_standalone_toolchain_tests10:01:26UTC/PID94286,
+    version2.1.34-rabsstandalone.458a5fa4. Immutable7,977-byte driver
+    169309a3956b3539f06fb800103c08d554d16c6139962ec9c92e7148d954e58f
+    compiles actual Cargo daemon library harness, requires exact ordinary Asup
+    proc-macros+tls/no test-internals, runs focused3/fullcanonical/full daemon
+    library with enumerated counts, then scoped check/strictClippy/fmt. Its
+    artifact is explicitly a UNIT TEST HARNESS, not a production daemon. Retained
+    dev cache/home use ordinary Cargo locks/freshness, no forced Fresh or
+    all-holder assertion. Save before every subprocess and audit sources after.
+  - [ ] Read current unit/compile results and fix real failures; independently
+    rebuild normal shipping tools and original TLS consumer, then full workspace
+    gates for source458a5fa4. Old22 TS2 workspace QA cannot qualify this fix.
   - [ ] Probe the ordinary Rustup-proxy compiler PATH explicitly. The current
     public canary prepends the physical toolchain bin and therefore proves only
     that selected configuration. Source review shows the observer deliberately
@@ -2808,6 +3272,12 @@ real Cargo serving, fleet performance or release qualification.
     source2729/10, source8130/4, debugtimeout and Rustix candidate REDs remain.
     Shipping profile alone is not fullworkspace, current-harness, useful-speed,
     distinct-host/fleet, installer/release or sustained operational qualification.
+    Corrected terminal audit: DSRbbb17c64-ca70-43d8-890a-872b155c2c60 is
+    timeout5/3673s, zero normal roles completed and zero TLS cases. Its partial
+    run.json was stale; active-looking partial rows are not live-job evidence.
+    Retain tls-release/terminal-state.json and terminal-result.json; current22
+    on admitted TS2 is the changed-source/capacity continuation, not a claim
+    that this source6538 job passed or remains running.
   - [x] Finish the original worktree suite: **9 passed, 1 failed, 0 ignored**,
     raw101, libtest780.20s. Five real Cargo cases and four binary-integrity
     controls pass. Vendored dependencies fail at verify-1: expected3 verified
@@ -3261,6 +3731,11 @@ real Cargo serving, fleet performance or release qualification.
   checks; overall qualification still needs every required check. Original
   product budgets and10,800s host deadline stay. At04:26UTC fsqlite-core is
   compiling; no new routing pass or current client exists yet.
+- [x] Retain attempt3 terminal timeout/raw5,10,868s, ZERO focused tests and no
+  normal client checkpoint. Save attempt-3-terminal-state/result.json under
+  worker-cache-wiring evidence. Do not blindly repeat on busy trj; new TS2
+  physical-ZFS/private-SSH admission work above is capacity preparation, not
+  a compiled RCH routing pass. All original routing/QA requirements stay open.
 - [ ] Observe routing, source-lock and config-guard test denominators; require
   actual nonzero test counts as well as raw exits. Finish workspace check,
   strict Clippy, fmt, rch build and both source-after audits. Retain the first

@@ -546,6 +546,11 @@ pub async fn accept_peer(
     acceptor: &TlsAcceptor,
     stream: TcpStream,
 ) -> Result<AuthenticatedPeer, String> {
+    // ATP exchanges bounded control records and per-chunk acknowledgments.
+    // Do not hold those records behind Nagle while the peer waits for credit.
+    stream
+        .set_nodelay(true)
+        .map_err(|e| format!("worker TCP no-delay configuration: {e}"))?;
     established(
         acceptor
             .accept(stream)
@@ -565,6 +570,9 @@ pub async fn connect_peer(
         let stream = TcpStream::connect(address.to_owned())
             .await
             .map_err(|e| format!("worker connect: {e}"))?;
+        stream
+            .set_nodelay(true)
+            .map_err(|e| format!("worker TCP no-delay configuration: {e}"))?;
         established(
             connector
                 .connect(server_name, stream)
