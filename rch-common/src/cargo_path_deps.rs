@@ -2734,7 +2734,9 @@ fn resolve_manifest_dependency_candidate(
         // crates (for example fastapi -> fastapi-core).
         for ancestor in package_root.ancestors() {
             let candidate_manifest = ancestor.join("Cargo.toml");
-            if candidate_manifest == declaring_manifest || !candidate_manifest.is_file() {
+            // A root package can declare its own workspace. Its manifest is
+            // the first candidate, just as Cargo's workspace search requires.
+            if !candidate_manifest.is_file() {
                 continue;
             }
             let candidate = read_manifest_document(&candidate_manifest)?;
@@ -2848,13 +2850,30 @@ fn read_manifest_document(
         .get("workspace")
         .and_then(toml::Value::as_table)
         .and_then(|workspace| workspace.get("dependencies"));
-    let workspace_dependency_names = workspace_dependencies
+    if workspace_dependencies.is_some_and(|dependencies| !dependencies.is_table()) {
+        return Err(CargoPathDependencyError::new(
+            CargoPathDependencyErrorKind::ManifestParseFailure,
+            "workspace.dependencies must be a table",
+        )
+        .with_manifest_path(manifest_path));
+    }
+    // Only usable source definitions can satisfy inheritance. Unused
+    // source-less declarations stay inert, as they do in Cargo; inheriting
+    // one still fails lookup rather than being mistaken for a nonlocal source.
+    let workspace_dependency_names: BTreeSet<String> = workspace_dependencies
         .and_then(toml::Value::as_table)
-        .map(|dependencies| dependencies.keys().cloned().collect())
+        .map(|dependencies| {
+            dependencies
+                .iter()
+                .filter(|(_, value)| workspace_dependency_source_is_valid(value))
+                .map(|(name, _)| name.clone())
+                .collect()
+        })
         .unwrap_or_default();
-    let workspace_path_dependencies = workspace_dependencies
+    let mut workspace_path_dependencies = workspace_dependencies
         .map(collect_named_path_dependencies)
         .unwrap_or_default();
+    workspace_path_dependencies.retain(|name, _| workspace_dependency_names.contains(name));
     let patch_path_dependencies = table
         .get("patch")
         .and_then(toml::Value::as_table)
@@ -2941,6 +2960,27 @@ fn read_manifest_document(
         path_dependencies,
         materialization_path_dependencies,
     })
+}
+
+fn workspace_dependency_source_is_valid(value: &toml::Value) -> bool {
+    // A malformed local source must never disappear from the materialization
+    // closure by being classified as a registry or Git dependency. This only
+    // checks source shape; Cargo remains the authority for full semantics.
+    match value {
+        toml::Value::String(_) => true,
+        toml::Value::Table(spec) => {
+            let sources = ["path", "git", "version"];
+            sources.iter().any(|key| spec.contains_key(*key))
+                && sources
+                    .iter()
+                    .all(|key| spec.get(*key).is_none_or(toml::Value::is_str))
+                && !(spec.contains_key("path") && spec.contains_key("git"))
+                && spec
+                    .get("optional")
+                    .is_none_or(|value| value.as_bool() == Some(false))
+        }
+        _ => false,
+    }
 }
 
 fn collect_dependency_specs(
@@ -6023,6 +6063,383 @@ dev_only_dep = { path = "../dev_dep" }
                 .all(|pkg| pkg.package_root != dev_dep_canonical),
             "manifest fallback must not pull pure dev-only path deps into runtime closure"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_workspace_package_inherits_registry_dependencies() {
+        let fixture = TopologyFixture::new("root-workspace-registry");
+        let root = fixture.canonical_root.join("repro-inherit");
+        write_bin_crate(&root, "repro-inherit", &[]);
+        // Issue #131: this is both the declaring package and its workspace.
+        fs::write(
+            root.join("Cargo.toml"),
+            r#"[package]
+name = "repro-inherit"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde.workspace = true
+tokio.workspace = true
+
+[workspace]
+members = ["."]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+"#,
+        )
+        .unwrap();
+
+        let graph = resolve_cargo_path_dependency_graph_with_policy_and_provider(
+            &root,
+            &fixture.policy(),
+            |_| {
+                Err(CargoPathDependencyError::new(
+                    CargoPathDependencyErrorKind::MetadataInvocationFailure,
+                    "exercise non-mutating manifest fallback",
+                ))
+            },
+        )
+        .expect("root package can inherit its own registry dependencies");
+        let closure =
+            resolve_cargo_path_materialization_closure_with_policy(&root, &fixture.policy())
+                .expect("registry inheritance must not block materialization");
+        let canonical_root = root.canonicalize().unwrap();
+        assert_eq!(graph.workspace_root, Some(canonical_root.clone()));
+        assert_eq!(graph.root_packages, vec![canonical_root]);
+        assert_eq!(graph.packages.len(), 1);
+        assert!(graph.edges.is_empty());
+        assert_eq!(closure.packages, graph.packages);
+        assert_eq!(closure.root_packages, graph.root_packages);
+        assert_eq!(closure.workspace_root, graph.workspace_root);
+        assert!(closure.edges.is_empty());
+        assert!(!root.join("Cargo.lock").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_workspace_keeps_unused_source_less_definitions_inert() {
+        let fixture = TopologyFixture::new("root-workspace-unused-sources");
+        let root = fixture.canonical_root.join("app");
+        write_bin_crate(&root, "app", &[]);
+        fs::write(
+            root.join("Cargo.toml"),
+            r#"[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[workspace.dependencies]
+registry_dep = "1"
+unused_empty = {}
+unused_features = { features = ["derive"] }
+
+[dependencies]
+registry_dep.workspace = true
+"#,
+        )
+        .unwrap();
+        let graph = resolve_from_manifest_fallback(&root.join("Cargo.toml"), &fixture.policy())
+            .expect("unused workspace definitions do not participate in inheritance");
+        let closure =
+            resolve_cargo_path_materialization_closure_with_policy(&root, &fixture.policy())
+                .expect("unused workspace definitions do not require materialization");
+        assert_eq!(graph.packages.len(), 1);
+        assert!(graph.edges.is_empty());
+        assert_eq!(closure.packages, graph.packages);
+        assert!(closure.edges.is_empty());
+        assert!(!root.join("Cargo.lock").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_workspace_non_path_inheritance_covers_all_dependency_sections() {
+        let fixture = TopologyFixture::new("root-workspace-non-path");
+        let root = fixture.canonical_root.join("app");
+        write_bin_crate(&root, "app", &[]);
+        for (section, optional) in [
+            ("dependencies", ""),
+            ("dependencies", ", optional = true"),
+            ("build-dependencies", ""),
+            ("dev-dependencies", ""),
+            ("target.'cfg(windows)'.dependencies", ""),
+            ("target.'cfg(windows)'.build-dependencies", ""),
+            ("target.'cfg(windows)'.dev-dependencies", ""),
+        ] {
+            fs::write(
+                root.join("Cargo.toml"),
+                format!(
+                    r#"[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[workspace.dependencies]
+registry_dep = {{ version = "1", optional = false }}
+git_dep = {{ package = "upstream", git = "https://example.invalid/upstream.git", version = "1" }}
+
+[{section}]
+registry_dep = {{ workspace = true{optional} }}
+git_dep = {{ workspace = true{optional} }}
+"#
+                ),
+            )
+            .unwrap();
+            // These manifest-only APIs never access the registry or Git URL.
+            let graph = resolve_from_manifest_fallback(&root.join("Cargo.toml"), &fixture.policy())
+                .unwrap_or_else(|error| panic!("{section}{optional}: {error}"));
+            let closure =
+                resolve_cargo_path_materialization_closure_with_policy(&root, &fixture.policy())
+                    .unwrap_or_else(|error| panic!("{section}{optional}: {error}"));
+            assert_eq!(graph.packages.len(), 1, "{section}{optional}");
+            assert_eq!(closure.packages, graph.packages, "{section}{optional}");
+            assert!(graph.edges.is_empty(), "{section}{optional}");
+            assert!(closure.edges.is_empty(), "{section}{optional}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_workspace_inherited_paths_keep_transitive_and_optional_materialization() {
+        let fixture = TopologyFixture::new("root-workspace-paths");
+        let root = fixture.canonical_root.join("app");
+        let member = root.join("member");
+        let dep = root.join("dep");
+        let transitive = root.join("transitive");
+        let optional = root.join("optional");
+        let patched = root.join("patched");
+        write_bin_crate(&root, "app", &[]);
+        write_lib_crate(&member, "member", &[]);
+        write_lib_crate(&dep, "dep", &[("transitive", "../transitive")]);
+        write_lib_crate(&transitive, "transitive", &[]);
+        write_lib_crate(&optional, "optional", &[]);
+        write_lib_crate(&patched, "patched", &[]);
+        fs::write(
+            root.join("Cargo.toml"),
+            r#"[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+[workspace]
+members = ["member"]
+exclude = ["dep", "transitive", "optional", "patched"]
+[workspace.dependencies]
+dep = { path = "dep" }
+optional = { path = "optional" }
+patched = "0.1"
+[patch.crates-io]
+patched = { path = "patched" }
+[dependencies]
+dep.workspace = true
+optional = { workspace = true, optional = true }
+patched.workspace = true
+"#,
+        )
+        .unwrap();
+        fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname='member'\nversion='0.1.0'\nedition='2021'\n[dependencies]\ndep.workspace=true\n",
+        )
+        .unwrap();
+
+        let graph = resolve_from_manifest_fallback(&root.join("Cargo.toml"), &fixture.policy())
+            .expect("root and member inherit paths relative to the workspace");
+        let closure =
+            resolve_cargo_path_materialization_closure_with_policy(&root, &fixture.policy())
+                .unwrap();
+        let root = root.canonicalize().unwrap();
+        let member = member.canonicalize().unwrap();
+        let dep = dep.canonicalize().unwrap();
+        let transitive = transitive.canonicalize().unwrap();
+        let optional = optional.canonicalize().unwrap();
+        let patched = patched.canonicalize().unwrap();
+        let roots = |packages: &[CargoPathDependencyPackage]| {
+            packages
+                .iter()
+                .map(|package| package.package_root.clone())
+                .collect::<BTreeSet<_>>()
+        };
+        assert_eq!(
+            roots(&graph.packages),
+            BTreeSet::from([
+                root.clone(),
+                member.clone(),
+                dep.clone(),
+                transitive.clone(),
+                patched.clone()
+            ])
+        );
+        assert_eq!(
+            roots(&closure.packages),
+            BTreeSet::from([
+                root.clone(),
+                member.clone(),
+                dep.clone(),
+                transitive,
+                optional,
+                patched
+            ])
+        );
+        for declaring_root in [root, member] {
+            assert!(graph.edges.contains(&CargoPathDependencyEdge {
+                from: declaring_root,
+                to: dep.clone(),
+                dependency_name: "dep".into(),
+            }));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_root_workspace_inheritance_stops_at_its_own_manifest() {
+        let fixture = TopologyFixture::new("nested-root-workspace");
+        let outer = fixture.canonical_root.join("outer");
+        let inner = outer.join("inner");
+        write_bin_crate(&inner, "inner", &[]);
+        fs::write(
+            outer.join("Cargo.toml"),
+            "[workspace]\nexclude=['inner']\n[workspace.dependencies]\nshared='1'\n",
+        )
+        .unwrap();
+        let manifest = inner.canonicalize().unwrap().join("Cargo.toml");
+        for own_workspace in ["[workspace]\n", "[workspace.dependencies]\nother='1'\n"] {
+            fs::write(
+                &manifest,
+                format!(
+                    "[package]\nname='inner'\nversion='0.1.0'\n[dependencies]\nshared.workspace=true\n{own_workspace}"
+                ),
+            )
+            .unwrap();
+            for result in [
+                resolve_from_manifest_fallback(&manifest, &fixture.policy()).map(|_| ()),
+                resolve_materialization_from_manifests(&manifest, &fixture.policy()).map(|_| ()),
+            ] {
+                let error = result.expect_err("an outer workspace cannot supply the missing entry");
+                assert_eq!(
+                    error.kind(),
+                    &CargoPathDependencyErrorKind::ManifestParseFailure
+                );
+                assert_eq!(error.dependency_name(), Some("shared"));
+                assert_eq!(error.manifest_path(), Some(manifest.as_path()));
+                assert!(error.detail().contains("is not defined by"), "{error}");
+                assert!(
+                    error.detail().contains(&manifest.display().to_string()),
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_workspace_inherited_path_failures_preserve_topology_checks() {
+        let fixture = TopologyFixture::new("root-workspace-unsafe-paths");
+        let root = fixture.canonical_root.join("app");
+        let outside = fixture.root.join("outside");
+        write_bin_crate(&root, "app", &[]);
+        write_lib_crate(&outside, "dep", &[]);
+        symlink(&outside, root.join("escape")).unwrap();
+        for (path, kind) in [
+            (
+                "missing",
+                CargoPathDependencyErrorKind::MissingPathDependency,
+            ),
+            (
+                "../../../outside",
+                CargoPathDependencyErrorKind::PathPolicyViolation,
+            ),
+            ("escape", CargoPathDependencyErrorKind::PathPolicyViolation),
+        ] {
+            fs::write(
+                root.join("Cargo.toml"),
+                format!(
+                    "[package]\nname='app'\nversion='0.1.0'\n[workspace]\n[workspace.dependencies]\ndep={{path='{path}'}}\n[dependencies]\ndep.workspace=true\n"
+                ),
+            )
+            .unwrap();
+            for result in [
+                resolve_from_manifest_fallback(&root.join("Cargo.toml"), &fixture.policy())
+                    .map(|_| ()),
+                resolve_cargo_path_materialization_closure_with_policy(&root, &fixture.policy())
+                    .map(|_| ()),
+            ] {
+                let error = result.expect_err("unsafe or missing inherited paths stay refused");
+                assert_eq!(error.kind(), &kind, "{path}: {error}");
+                assert_eq!(error.dependency_name(), Some("dep"), "{path}: {error}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_workspace_inheritance_rejects_malformed_manifests() {
+        let fixture = TopologyFixture::new("root-workspace-invalid");
+        let root = fixture.canonical_root.join("app");
+        write_bin_crate(&root, "app", &[]);
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='app'\n[dependencies]\nserde.workspace=true\n[workspace.dependencies]\nserde={version=\n",
+        )
+        .unwrap();
+        for result in [
+            resolve_from_manifest_fallback(&root.join("Cargo.toml"), &fixture.policy()).map(|_| ()),
+            resolve_cargo_path_materialization_closure_with_policy(&root, &fixture.policy())
+                .map(|_| ()),
+        ] {
+            let error = result.expect_err("malformed owning manifests cannot be ignored");
+            assert_eq!(
+                error.kind(),
+                &CargoPathDependencyErrorKind::ManifestParseFailure
+            );
+            assert!(error.detail().contains("failed to parse manifest"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_workspace_inheritance_rejects_invalid_source_shapes() {
+        let fixture = TopologyFixture::new("root-workspace-invalid-source");
+        let root = fixture.canonical_root.join("app");
+        write_bin_crate(&root, "app", &[]);
+        for source in [
+            "123",
+            "{}",
+            "{features=['derive']}",
+            "{path=123}",
+            "{path=123,version='1'}",
+            "{git=123}",
+            "{version=123}",
+            "{path='dep',git='https://example.invalid/dep.git'}",
+            "{version='1',optional=true}",
+        ] {
+            fs::write(
+                root.join("Cargo.toml"),
+                format!(
+                    "[package]\nname='app'\nversion='0.1.0'\n[workspace.dependencies]\ndep={source}\n[dependencies]\ndep.workspace=true\n"
+                ),
+            )
+            .unwrap();
+            for result in [
+                resolve_from_manifest_fallback(&root.join("Cargo.toml"), &fixture.policy())
+                    .map(|_| ()),
+                resolve_cargo_path_materialization_closure_with_policy(&root, &fixture.policy())
+                    .map(|_| ()),
+            ] {
+                let error = result.expect_err("invalid sources must not be treated as registry deps");
+                assert_eq!(
+                    error.kind(),
+                    &CargoPathDependencyErrorKind::ManifestParseFailure
+                );
+                assert_eq!(error.dependency_name(), Some("dep"), "{source}: {error}");
+            }
+        }
     }
 
     #[cfg(unix)]
