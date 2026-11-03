@@ -12023,6 +12023,193 @@ fn test_explicit_workspace_owner_metadata_survives_member_collapse() {
     assert!(!workspace.join("Cargo.lock").exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn test_explicit_workspace_owner_survives_staged_cargo_execution() {
+    use super::dependency_closure::build_owned_sync_closure_layout;
+    use rch_common::cargo_path_deps::{SelectedCargoEntry, validate_selected_cargo_tree_at};
+    use std::collections::BTreeMap;
+    use std::fs;
+
+    let _guard = test_guard!();
+    let (fixture, _) = topology_tempdir();
+    let projects = fixture.path().join("source/projects");
+    let member = projects.join("repo/member");
+    let workspace = projects.join("ws");
+    let helper = projects.join("helper");
+    let cargo_home = fixture.path().join("cargo-home");
+    let target = fixture.path().join("target");
+    for directory in [
+        member.join("src"),
+        helper.join("src"),
+        workspace.clone(),
+        cargo_home.clone(),
+    ] {
+        fs::create_dir_all(directory).unwrap();
+    }
+    let policy = PathTopologyPolicy::new(projects.clone(), projects);
+    let files = [
+        (
+            workspace.join("Cargo.toml"),
+            "[workspace]\nmembers=['../repo/member']\nresolver='2'\n[workspace.package]\nversion='0.1.0'\nedition='2021'\n[workspace.dependencies]\nhelper={package='oracle_helper',path='../helper'}\n",
+        ),
+        (
+            member.join("Cargo.toml"),
+            "[package]\nname='workspace_oracle'\nversion.workspace=true\nedition.workspace=true\nworkspace='../../ws'\n[dependencies]\nhelper.workspace=true\n",
+        ),
+        (
+            member.join("src/main.rs"),
+            "fn main() { println!(\"{}\", helper::answer()); }\n",
+        ),
+        (
+            helper.join("Cargo.toml"),
+            "[package]\nname='oracle_helper'\nversion='0.1.0'\nedition='2021'\n",
+        ),
+        (helper.join("src/lib.rs"), "pub fn answer() -> u32 { 42 }\n"),
+    ];
+    for (path, contents) in &files {
+        fs::write(path, contents).unwrap();
+    }
+    // Keep nested Cargo invocations local and independent of developer cache,
+    // target-directory, or compiler-wrapper settings.
+    let cargo = |directory: &Path| {
+        let mut command = std::process::Command::new("cargo");
+        command
+            .current_dir(directory)
+            .env("CARGO_HOME", &cargo_home)
+            .env("CARGO_NET_OFFLINE", "true")
+            .env("CARGO_TARGET_DIR", &target)
+            .env("CARGO_BUILD_BUILD_DIR", target.join("build"))
+            .env("CARGO_INCREMENTAL", "0")
+            .env("CARGO_PROFILE_DEV_DEBUG", "0")
+            .env_remove("CARGO_BUILD_TARGET")
+            .env_remove("RUSTC_WRAPPER")
+            .env_remove("RUSTC_WORKSPACE_WRAPPER");
+        command
+    };
+    let lock = cargo(&member)
+        .args(["generate-lockfile", "--offline", "--manifest-path"])
+        .arg(member.join("Cargo.toml"))
+        .output()
+        .unwrap();
+    assert!(
+        lock.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lock.stderr)
+    );
+    let lock_path = workspace.join("Cargo.lock");
+    let lock_bytes = fs::read(&lock_path).unwrap();
+    let lock_modified = fs::metadata(&lock_path).unwrap().modified().unwrap();
+
+    let reporter = HookReporter::new(OutputVisibility::None);
+    let runtime = build_dependency_runtime_plan(
+        &member,
+        Some(CompilationKind::CargoBuild),
+        &reporter,
+        &policy,
+    );
+    assert!(runtime.fail_open_decision.is_none(), "{runtime:#?}");
+    let sync = build_sync_closure_plan(&runtime.sync_roots, &member, "fixture", &policy);
+    let layout = build_owned_sync_closure_layout(
+        &sync,
+        &policy,
+        fixture.path().join("worker/staging").to_str().unwrap(),
+        ".rch-target-local-fixture-pool-0123456789abcdef0123456789abcdef",
+    )
+    .unwrap();
+    assert_eq!(layout.plan.len(), 3);
+    let primary = layout.plan.iter().find(|entry| entry.is_primary).unwrap();
+    let owner = layout
+        .plan
+        .iter()
+        .find(|entry| entry.local_root == workspace)
+        .unwrap();
+    assert_eq!(owner.mode, SyncClosureMode::WorkspaceMetadata);
+
+    // Physically stage the planned source/metadata and validate its inventory.
+    // This tests relocation and Cargo execution without requiring SSH or rsync.
+    let mut inventory = BTreeMap::new();
+    for source in files.iter().map(|(path, _)| path).chain([&lock_path]) {
+        let entry = layout
+            .plan
+            .iter()
+            .find(|entry| source.starts_with(&entry.local_root))
+            .unwrap();
+        let destination =
+            Path::new(&entry.remote_root).join(source.strip_prefix(&entry.local_root).unwrap());
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::copy(source, &destination).unwrap();
+        assert_eq!(fs::read(source).unwrap(), fs::read(&destination).unwrap());
+        inventory.insert(
+            destination
+                .strip_prefix(&layout.source_root)
+                .unwrap()
+                .to_path_buf(),
+            SelectedCargoEntry::File(
+                (source.file_name().unwrap() == "Cargo.toml")
+                    .then(|| fs::read_to_string(source).unwrap()),
+            ),
+        );
+    }
+    let selected_manifest = Path::new(&primary.remote_root)
+        .join("Cargo.toml")
+        .strip_prefix(&layout.source_root)
+        .unwrap()
+        .to_path_buf();
+    validate_selected_cargo_tree_at(&inventory, &selected_manifest).unwrap();
+    let staged_lock = Path::new(&owner.remote_root).join("Cargo.lock");
+    let staged_lock_modified = fs::metadata(&staged_lock).unwrap().modified().unwrap();
+    let outcomes = layout
+        .plan
+        .iter()
+        .cloned()
+        .map(|entry| (entry, SyncRootOutcome::Synced))
+        .collect::<Vec<_>>();
+    let checks = synced_dependency_preflight_checks(&outcomes);
+    let probe = build_remote_dependency_preflight_command(&checks).unwrap();
+    let probe_output = std::process::Command::new("sh")
+        .args(["-c", &probe])
+        .output()
+        .unwrap();
+    assert_eq!(probe_output.status.code(), Some(0));
+    let (present, missing) =
+        parse_dependency_preflight_probe_output(&String::from_utf8(probe_output.stdout).unwrap());
+    let report = build_dependency_preflight_report(
+        &make_test_worker_config("local-cargo-fixture"),
+        &outcomes,
+        &present,
+        &missing,
+        None,
+    );
+    assert!(report.verified, "{report:#?}");
+
+    let build = cargo(Path::new(&primary.remote_root))
+        .args(["build", "--locked", "--offline", "--manifest-path"])
+        .arg(Path::new(&primary.remote_root).join("Cargo.toml"))
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let executable = std::process::Command::new(target.join("debug/workspace_oracle"))
+        .output()
+        .unwrap();
+    assert!(executable.status.success());
+    assert_eq!(executable.stdout, b"42\n");
+    assert_eq!(fs::read(&lock_path).unwrap(), lock_bytes);
+    assert_eq!(
+        fs::metadata(&lock_path).unwrap().modified().unwrap(),
+        lock_modified
+    );
+    assert_eq!(fs::read(&staged_lock).unwrap(), lock_bytes);
+    assert_eq!(
+        fs::metadata(staged_lock).unwrap().modified().unwrap(),
+        staged_lock_modified
+    );
+}
+
 #[test]
 fn test_dependency_runtime_plan_refuses_invalid_transitive_workspace_owners() {
     let _guard = test_guard!();
