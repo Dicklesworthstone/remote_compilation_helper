@@ -2481,9 +2481,71 @@ real Cargo serving, fleet performance or release qualification.
     1,755-file manifest audit, retaining the old aggregate match as reported
     evidence and the before/after aggregate comparison. No runtime assertion,
     compiler-skip authority, original failed suite or budget is weakened.
-  - [ ] Collect all five public local Cargo results and exact11/8 counts.
-    A pass establishes this bounded opt-in unsandboxed local lane only; keep
-    original9/10, canonical/worker, current RCH frontdoor and release open.
+  - [x] Finish the original source272 public canary: all5 Cargo checks raw0,
+    all11 metadata files byte-equal to stock, but the canary is RED because
+    the original eight-dependency ladder never executes/commits/verifies/serves.
+    Every wrapped round only shadows requests. Actual daemon reason:
+    `compiler path is not absolute` for bare `rustc`. Stock298.703s; wrapped
+    356.417/415.667/281.862/285.409s, all retained, no favorable-only timing win.
+    All3 bad-precondition negatives reject; legacy source inventory matches,
+    complete selected-source-before audit passes. Terminal report SHA-256
+    d020c1b43c3f28c140e2054e0ee91d4d4bd7c34f4999262d9dbf0be8fe8feb89,
+    `/Volumes/trj-data/rabs-wrapper-trace-20261103/public-canary/terminal-run.json`.
+    The failed runtime gate remains failed; its original script does not reach
+    source/binary-after checks after that failure. Do not invent those fields.
+  - [x] Diagnose and implement the boundary repair: resolve the actual caller's
+    executable PATH with safe effective-user access checks, preserve symlink
+    spelling and original argv[0], then BIND admitted execution to that selected
+    absolute executable. Probes/non-UTF8/unknown lookup failures retain direct
+    exec. Leave daemon absolute-toolchain/publication/caller-loss gates intact.
+    Rustix fs reuses locked1.1.5; one new runtime edge means wrapper2/3 budget,
+    no raised cap/package upgrade/unsafe code or new Cargo environment variable.
+  - [x] Freeze source52 plus5files (lock, wrapper manifest/main/supervision,
+    existing supervision integration tests):
+    `85dc06ed-overlay-52a6-bare-compiler-c356a023954d2df9446135b0215be493e0ad519aa23cd109072d5ab25dc7c914`,
+    manifest a9d79f73bf1e11b2f704beb21581abbd038d7200fb4537aea4b6b07222976851,
+    1,697 matches+58 original omissions twice. Native DSR rabs_bare_compiler
+    submitted03:43:54UTC,PID75413,version2.1.34-rabsbare.c356a023;
+    immutable9,085-byte driver f6655ec40f232c34014e5347e270048214c3e9acac591b6b0e380ed2e845c246.
+  - [x] Actual candidate compile0/230.01s; lookup3/3 and supervision9/9 pass,
+    followed by full110/110 wrapper units. Those subsets are not extra tests.
+    Actual-wrapper integration9passed/1failed/0ignored, raw101; BOTH new binding
+    and original-argv0 cases pass. Existing paused-caller-loss case instead
+    panics in the fixture's late decision write with BrokenPipe after the
+    wrapper has legitimately closed. Preserve the RED aggregate and raw log.
+    Scoped all-target compiler check0/153.35s; later QA recorded separately.
+    Compiled normal wrapper8,162,024 bytes, SHA-256
+    487f7c2b2c958f8c69469c219b077d79833e48c826020c97140e3cdbcaedb273.
+    Its line-tables-only profile differs from the baseline; no size/speed win.
+  - [x] Correct ONLY that cancellation fixture: a paused reply after deliberately
+    killing the original caller may return None on BrokenPipe/ConnectionReset.
+    Normal decision writes still must succeed; all original no-compiler-start,
+    no-success, caller/group identity and deadline assertions stay. Two comment
+    clarifications are the only other delta. Native qualification is pending.
+    Source `85dc06ed-overlay-c356-cancelled-decision-861f3a5c7bb3c7093e47c1e007eb8db600630aca8aabb39509108f841f62245a`,
+    manifest273cf49613466cda1cc72d18dd7c6c47aabc37b1e550d71ae59ca56aaba64a67,
+    full1,697/1,755+58 audit twice. DSR rabs_cancelled_decision submitted
+    04:14:49UTC,PID23187,version2.1.34-rabscancel.861f3a5c;
+    immutable9,481-byte driver98c1d21bd94cc3e8d75740c5485c09a5e51b1d86de6d3537335deea82cc0e496.
+  - [ ] Finish corrected-fixture original10 integration cases, full110 units,
+    source-after, scoped/full workspace check, strict Clippy and fmt. Preserve
+    the original9/10; never substitute a retry for that RED or close M6 on units.
+  - [x] Launch independent public runtime retest using compiled c356 wrapper
+    plus unchanged source272 daemon, each bound to its own source/hash. No
+    claim of a newly matching4tool/current-main toolset; the known integration
+    9/10 stays red. Pair-preflight0150fd493f41373a9481f21668ea847e0d21034363ccc69729d875f08be9fc9b;
+    normal daemon inputs remain identical across the selected source maps.
+    Explicit fresh private breaker now isolates the private socket; no shared
+    state is cleared. This harness setting and differing wrapper debug profile
+    prevent a one-factor performance claim. Original5checks/11outputs/8ladder
+    and original deadlines stay. DSR rabs_bare_public_canary submitted04:04:23UTC,
+    PID40325,version2.1.34-rabsbarepublic.c356a023; immutable11,562-byte driver
+    e19267025c0abd59aced09ece9851a42587dfd35aaf821703557aefb0273ddc0.
+  - [ ] Observe ALL public candidate rounds and exact11/8 counts, retain every
+    timing/result and source/binary-after. Initial actual commits/verifications
+    are progress, not a terminal pass. A pass establishes this bounded opt-in
+    local lane only; original9/10, canonical/TLS worker, RCH frontdoor, fleet,
+    performance and release acceptance stay separately open.
   - [x] Finish the original worktree suite: **9 passed, 1 failed, 0 ignored**,
     raw101, libtest780.20s. Five real Cargo cases and four binary-integrity
     controls pass. Vendored dependencies fail at verify-1: expected3 verified
@@ -2675,6 +2737,11 @@ real Cargo serving, fleet performance or release qualification.
     original controls and the new parser case; require a nonzero enumerated
     denominator, exact matching counts and source-after. No performance win
     or quiescence repair is established by a component pass.
+    - [x] Observe native DSR component terminal timeout/raw5,3,699s including
+      orchestration. No process-group test ran. Preserve terminal state/result
+      under process-group-component; this candidate has no new runtime or
+      performance qualification. Prior27/473/1464/etc sourcebe324 proof stays
+      distinct. Do not treat this compilation timeout as a product test failure.
     - [x] Run UBS on process_groups.rs: raw1,2critical/184warning/46info.
       Both critical patterns are unchanged in the frozen source272 baseline:
       the generic configured process executable and fixed shell process-tree
@@ -2712,6 +2779,11 @@ real Cargo serving, fleet performance or release qualification.
     - [ ] Finish wrapper all-target check, strict Clippy, workspace fmt and
       source-after for source52. Full workspace qualification and actual
       runtime acceptance remain separately pending even if these pass.
+      - [x] Source52 DSR662d4f92 is terminal completed/raw0: wrapper check0
+        705.41s, strict Clippy0/294.95s, workspace fmt0, full source-after0.
+        Full workspace compiler check/Clippy were NOT part of that scoped
+        driver. Terminal state/result/run retained under capture-capacity-component.
+        Artifact is a test executable, never a claimed shipping wrapper/toolset.
   - [x] Bound alternate-capacity probes: ts1 has the pinned toolchain and a
     healthy mounted NAS, but root and/tmp fail14% (tmp also fails20G).
     No build was launched there. Earlier be324 retains a verified daemon,
