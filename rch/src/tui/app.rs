@@ -891,6 +891,7 @@ mod tests {
 
     fn worker_status(id: &str, status: &str, circuit: &str) -> WorkerStatusFromApi {
         WorkerStatusFromApi {
+            source_topology_mismatches: Vec::new(),
             id: id.to_string(),
             host: "worker.local".to_string(),
             user: "builder".to_string(),

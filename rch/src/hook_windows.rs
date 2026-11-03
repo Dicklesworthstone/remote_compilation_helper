@@ -155,6 +155,7 @@ pub(crate) async fn query_daemon(
     _preferred_workers: &[WorkerId],
     _job_mode: bool,
     _required_tools: &[String],
+    _source_topology: Option<&rch_common::SourceTopology>,
 ) -> anyhow::Result<SelectionResponse> {
     Err(PlatformError::UnixSocketUnsupported)?
 }
@@ -179,6 +180,7 @@ pub(crate) async fn query_daemon_dry_run(
     _toolchain: Option<&ToolchainInfo>,
     _required_runtime: RequiredRuntime,
     _preferred_workers: &[WorkerId],
+    _source_topology: Option<&rch_common::SourceTopology>,
 ) -> anyhow::Result<SelectionResponse> {
     Err(PlatformError::UnixSocketUnsupported)?
 }

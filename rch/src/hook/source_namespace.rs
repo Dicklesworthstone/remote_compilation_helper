@@ -12,6 +12,7 @@ use super::super::ssh::{
 };
 use super::{PathTopologyPolicy, SyncClosurePlanEntry, WorkerConfig};
 use anyhow::Context as _;
+use rch_common::WorkerId;
 use sha2::{Digest as _, Sha256};
 use std::time::Duration;
 
@@ -21,6 +22,97 @@ const ADMISSION: &str = include_str!("source_claim_admission.sh");
 const CLAIMS: &str = include_str!("source_claim_registry.sh");
 const CONTROL: &str = include_str!("source_namespace_control.sh");
 const SOURCE_ADMISSION_WAIT: Duration = Duration::from_secs(60);
+
+/// A completed namespace verdict proved that this worker's existing physical
+/// roots cannot satisfy the requested topology. Another worker may serve the
+/// job, but repeating it on this worker cannot repair its filesystem layout.
+#[derive(Debug, Clone)]
+pub(in crate::hook) struct SourceTopologyIncompatible {
+    pub(in crate::hook) worker_id: WorkerId,
+    pub(in crate::hook) mismatch: rch_common::SourceTopologyMismatch,
+}
+
+impl SourceTopologyIncompatible {
+    pub(in crate::hook) fn mismatch(&self) -> &rch_common::SourceTopologyMismatch {
+        &self.mismatch
+    }
+}
+
+impl std::fmt::Display for SourceTopologyIncompatible {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "worker {} has incompatible source topology (canonical {:?}, alias {:?}): {}; \
+             choose a worker with a compatible layout or have the operator correct the configured \
+             mapping; existing directories and aliases will not be overwritten",
+            self.worker_id,
+            self.mismatch.topology.canonical_root,
+            self.mismatch.topology.alias_root,
+            self.mismatch.detail,
+        )
+    }
+}
+
+impl std::error::Error for SourceTopologyIncompatible {}
+
+/// Only the path program's finite metadata belongs in a permanent worker
+/// report. SSH startup banners or unrelated stderr may contain source data.
+fn topology_refusal_detail(
+    verdict: &str,
+    stderr: &str,
+    requested: &rch_common::SourceTopology,
+) -> String {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct PhysicalMapping {
+        canonical: String,
+        canonical_physical: String,
+        alias: String,
+        alias_physical: String,
+    }
+
+    let physical_path = |path: &str| {
+        (path.starts_with('/') || path == "<unresolved>") && !path.contains(['\0', '\n', '\r'])
+    };
+    let mut mappings = stderr.lines().filter_map(|line| {
+        let mapping: PhysicalMapping =
+            serde_json::from_str(line.strip_prefix("RCH_SOURCE_TOPOLOGY_PATHS ")?).ok()?;
+        (mapping.canonical == requested.canonical_root
+            && mapping.alias == requested.alias_root
+            && physical_path(&mapping.canonical_physical)
+            && physical_path(&mapping.alias_physical))
+        .then_some(mapping)
+    });
+    let first = mappings.next();
+    let Some(mapping) = first.filter(|_| mappings.next().is_none()) else {
+        return format!(
+            "{verdict}; physical mapping metadata unavailable or did not match the requested roots"
+        );
+    };
+    // Reserve space for both physical roots. One unusually long path must
+    // not remove the other mapping or introduce raw terminal controls.
+    let path_metadata = |value: &str| {
+        let escaped = format!("{value:?}");
+        if escaped.len() <= 1792 {
+            return escaped;
+        }
+        let mut bounded = String::new();
+        for character in escaped.chars() {
+            if bounded.len() + character.len_utf8() > 1792 {
+                break;
+            }
+            bounded.push(character);
+        }
+        bounded.push_str(" [truncated]");
+        bounded
+    };
+    format!(
+        "{verdict}; canonical_physical={}; alias_physical={}",
+        path_metadata(&mapping.canonical_physical),
+        path_metadata(&mapping.alias_physical),
+    )
+}
+
 // A bounded, monotonic wait reports metadata contention independently of the
 // enclosing control group's 15-second execution deadline. Python is already
 // required for the registry's record/directory fsync. The descriptor survives
@@ -227,6 +319,7 @@ pub(super) async fn initialize_worker_namespace(
     }
     Err(namespace_refusal(
         worker,
+        policy,
         output.status.code(),
         &output.stderr,
     ))
@@ -238,26 +331,68 @@ pub(super) async fn initialize_worker_namespace(
 /// the release fences the (project, worker) pair (bd-p3kuz). Untyped, rchd
 /// kept placing the project on the same worker: vmi1153651 refused it four
 /// times in 30 minutes on 2026-10-23 while one long build held the source.
-fn namespace_refusal(worker: &WorkerConfig, status: Option<i32>, stderr: &[u8]) -> anyhow::Error {
+fn namespace_refusal(
+    worker: &WorkerConfig,
+    policy: &PathTopologyPolicy,
+    status: Option<i32>,
+    stderr: &[u8],
+) -> anyhow::Error {
     let detail = String::from_utf8_lossy(stderr);
+    let permanent_mapping = if status == Some(73)
+        && !detail.lines().any(|line| {
+            [
+                "RCH_SOURCE_NAMESPACE_CONTROL_UNSETTLED",
+                "RCH_SOURCE_NAMESPACE_INTERRUPTED",
+                "RCH_SOURCE_NAMESPACE_PROCESS_TERMINATED",
+                "RCH_SOURCE_NAMESPACE_METADATA_LOCK_BUSY",
+                "RCH_SOURCE_REGISTRY_PUBLICATION_UNCONFIRMED",
+                "RCH_SOURCE_CANCELLATION_FENCE",
+                "RCH: durable source ownership: unfinished overlapping",
+            ]
+            .iter()
+            .any(|marker| line.starts_with(marker))
+        }) {
+        detail.lines().find(|line| {
+            matches!(
+                *line,
+                "RCH_SOURCE_TOPOLOGY_INCOMPATIBLE: conflicting_alias_base"
+                    | "RCH_SOURCE_TOPOLOGY_INCOMPATIBLE: canonical_not_directory"
+            )
+        })
+    } else {
+        None
+    };
     let detail = detail.trim();
     let detail = if detail.is_empty() {
         "RCH_SOURCE_NAMESPACE_INTERRUPTED: worker returned no diagnostic; publication and teardown are unconfirmed"
     } else {
         detail
     };
+    let topology = rch_common::SourceTopology::from_policy(policy);
+    let rendered_detail = permanent_mapping.map_or_else(
+        || detail.escape_debug().to_string(),
+        |verdict| topology_refusal_detail(verdict, detail, &topology),
+    );
     let error = anyhow::anyhow!(
         "worker source namespace initialization refused on {} (status {:?}): {}",
         worker.id,
         status,
-        detail,
+        rendered_detail,
     );
-    if status == Some(76) && detail.contains("RCH_SOURCE_NAMESPACE_METADATA_LOCK_BUSY") {
+    if permanent_mapping.is_some() {
+        error.context(SourceTopologyIncompatible {
+            worker_id: worker.id.clone(),
+            mismatch: rch_common::SourceTopologyMismatch {
+                topology,
+                detail: rendered_detail,
+            },
+        })
+    } else if status == Some(76) && detail.contains("RCH_SOURCE_NAMESPACE_METADATA_LOCK_BUSY") {
         error.context(crate::transfer::SourceAuthorityBusy(format!(
             "worker registry metadata lock on {} remained busy; no source grant was admitted",
             worker.id
         )))
-    } else if retryable_source_admission_error(&error) {
+    } else if status == Some(75) && retryable_source_admission_error(&error) {
         overlapping_owner_outlived_wait(error, worker)
     } else {
         error
@@ -269,6 +404,10 @@ mod tests {
     use super::super::SyncClosureMode;
     use super::*;
     use std::path::PathBuf;
+
+    fn test_policy() -> PathTopologyPolicy {
+        PathTopologyPolicy::new("/Users/test/projects".into(), "/dp".into())
+    }
 
     fn root(path: &str) -> SyncClosurePlanEntry {
         SyncClosurePlanEntry {
@@ -413,7 +552,7 @@ mod tests {
 
     /// An overlap verdict from the initializer must reach the release as
     /// source-busy, or rchd never fences the pair and re-places the project on
-    /// the same held worker (2026-10-23). Every other refusal stays untyped.
+    /// the same held worker (2026-10-23). A topology mismatch is a separate type.
     #[test]
     fn namespace_overlap_refusal_is_typed_source_busy() {
         let worker = WorkerConfig {
@@ -430,17 +569,223 @@ mod tests {
             "RCH: durable source ownership: unfinished overlapping physical source owner\n",
             "RCH: durable source ownership: unfinished overlapping source owner\n",
         ] {
-            let error = namespace_refusal(&worker, Some(75), overlap.as_bytes());
+            let error = namespace_refusal(&worker, &test_policy(), Some(75), overlap.as_bytes());
             assert!(crate::transfer::source_authority_busy(&error), "{error:#}");
             assert!(format!("{error:#}").contains("initialization refused on w1"));
+            // Only the completed registry overlap status authorizes a busy
+            // report. Interrupted/unknown failures can retain older stderr.
+            for status in [None, Some(0), Some(73), Some(76), Some(137), Some(255)] {
+                let error = namespace_refusal(&worker, &test_policy(), status, overlap.as_bytes());
+                assert!(!crate::transfer::source_authority_busy(&error), "{error:#}");
+            }
         }
         for terminal in [
             "RCH: durable source ownership: invalid claim record\n",
             "RCH_TOPOLOGY_ERR_CANONICAL_NOT_DIRECTORY\n",
         ] {
-            let error = namespace_refusal(&worker, Some(73), terminal.as_bytes());
+            let error = namespace_refusal(&worker, &test_policy(), Some(73), terminal.as_bytes());
             assert!(!crate::transfer::source_authority_busy(&error), "{error:#}");
         }
+    }
+
+    #[test]
+    fn source_namespace_permanent_mapping_requires_completed_explicit_verdict() {
+        let worker = WorkerConfig {
+            id: WorkerId::new("incompatible-worker"),
+            ..WorkerConfig::default()
+        };
+        let policy = test_policy();
+        for reason in ["conflicting_alias_base", "canonical_not_directory"] {
+            let diagnostic = format!("RCH_SOURCE_TOPOLOGY_INCOMPATIBLE: {reason}\n");
+            let error = namespace_refusal(&worker, &policy, Some(73), diagnostic.as_bytes())
+                .context("outer namespace preflight context");
+            let mismatch = error.downcast_ref::<SourceTopologyIncompatible>().unwrap();
+            assert_eq!(mismatch.worker_id, worker.id);
+            assert_eq!(
+                mismatch.mismatch().topology.canonical_root,
+                "/Users/test/projects"
+            );
+            assert_eq!(mismatch.mismatch().topology.alias_root, "/dp");
+            assert!(mismatch.mismatch().detail.contains(reason));
+            assert!(!crate::transfer::source_authority_busy(&error));
+            let message = mismatch.to_string();
+            assert!(message.contains("incompatible-worker"));
+            assert!(message.contains("choose a worker with a compatible layout"));
+            assert!(message.contains("operator correct the configured mapping"));
+
+            // A diagnostic observed before termination, transport failure or
+            // contention is not a completed permanent refusal.
+            for status in [None, Some(0), Some(75), Some(76), Some(137), Some(255)] {
+                let error = namespace_refusal(&worker, &policy, status, diagnostic.as_bytes());
+                assert!(error.downcast_ref::<SourceTopologyIncompatible>().is_none());
+            }
+            for uncertain in [
+                "RCH_SOURCE_NAMESPACE_CONTROL_UNSETTLED status=137",
+                "RCH_SOURCE_NAMESPACE_INTERRUPTED",
+                "RCH_SOURCE_NAMESPACE_PROCESS_TERMINATED status=137",
+                "RCH_SOURCE_NAMESPACE_METADATA_LOCK_BUSY elapsed_ms=5000",
+                "RCH_SOURCE_REGISTRY_PUBLICATION_UNCONFIRMED",
+                "RCH_SOURCE_CANCELLATION_FENCE",
+                "RCH: durable source ownership: unfinished overlapping source owner",
+            ] {
+                let mixed = format!("{diagnostic}{uncertain}\n");
+                let error = namespace_refusal(&worker, &policy, Some(73), mixed.as_bytes());
+                assert!(error.downcast_ref::<SourceTopologyIncompatible>().is_none());
+                assert!(!crate::transfer::source_authority_busy(&error), "{error:#}");
+            }
+        }
+        for diagnostic in [
+            "RCH: source namespace: conflicting alias base",
+            "prefix RCH_SOURCE_TOPOLOGY_INCOMPATIBLE: conflicting_alias_base",
+            " RCH_SOURCE_TOPOLOGY_INCOMPATIBLE: conflicting_alias_base",
+            "RCH_SOURCE_TOPOLOGY_INCOMPATIBLE: conflicting_alias_base suffix",
+            "RCH_SOURCE_TOPOLOGY_INCOMPATIBLE: unknown",
+            "RCH_SOURCE_NAMESPACE_METADATA_LOCK_INVALID invalid lock inode",
+            "RCH: source namespace: cannot create canonical base",
+            "RCH: source namespace: namespace changed during initialization",
+            "RCH_SOURCE_REGISTRY_PUBLICATION_UNCONFIRMED",
+            "RCH_SOURCE_NAMESPACE_PROCESS_TERMINATED status=137",
+        ] {
+            let error = namespace_refusal(&worker, &policy, Some(73), diagnostic.as_bytes());
+            assert!(error.downcast_ref::<SourceTopologyIncompatible>().is_none());
+        }
+    }
+
+    #[test]
+    fn source_namespace_mapping_diagnostic_is_bounded_and_control_safe() {
+        let worker = WorkerConfig::default();
+        let paths = serde_json::json!({
+            "canonical": "/Users/test/projects",
+            "alias": "/dp",
+            "canonical_physical": format!("/canonical\u{1b}[31m/{}", "é".repeat(5000)),
+            "alias_physical": "/physical\t/alias",
+        });
+        let diagnostic = format!(
+            "RCH_SOURCE_TOPOLOGY_INCOMPATIBLE: conflicting_alias_base\n\
+             RCH_SOURCE_TOPOLOGY_PATHS {paths}\n"
+        );
+        let error = namespace_refusal(&worker, &test_policy(), Some(73), diagnostic.as_bytes());
+        let mismatch = error.downcast_ref::<SourceTopologyIncompatible>().unwrap();
+        assert!(mismatch.mismatch().detail.len() <= 4096);
+        assert!(mismatch.mismatch().detail.contains("[truncated]"));
+        assert!(mismatch.mismatch().detail.contains("alias_physical="));
+        assert!(!mismatch.mismatch().detail.chars().any(char::is_control));
+        assert!(!format!("{error:#}").chars().any(char::is_control));
+    }
+
+    #[test]
+    fn source_namespace_permanent_diagnostics_ignore_unrelated_or_unbound_data() {
+        let worker = WorkerConfig::default();
+        let mapping = serde_json::json!({
+            "canonical": "/Users/test/projects",
+            "canonical_physical": "/worker/canonical",
+            "alias": "/dp",
+            "alias_physical": "/worker/other-projects",
+        });
+        let verdict = "RCH_SOURCE_TOPOLOGY_INCOMPATIBLE: conflicting_alias_base";
+        let diagnostic = format!(
+            "private startup/source sentinel\n{verdict}\nRCH_SOURCE_TOPOLOGY_PATHS {mapping}\nprivate trailing source sentinel\n"
+        );
+        let error = namespace_refusal(&worker, &test_policy(), Some(73), diagnostic.as_bytes());
+        let mismatch = error.downcast_ref::<SourceTopologyIncompatible>().unwrap();
+        assert!(mismatch.mismatch().detail.contains("/worker/canonical"));
+        assert!(
+            mismatch
+                .mismatch()
+                .detail
+                .contains("/worker/other-projects")
+        );
+        assert!(!mismatch.to_string().contains("sentinel"));
+        assert!(!format!("{error:#}").contains("sentinel"));
+        mismatch.mismatch().validate().unwrap();
+
+        for changed in ["canonical", "alias", "unexpected_key", "alias_physical"] {
+            let mut mapping = mapping.clone();
+            mapping[changed] = serde_json::Value::String("private source sentinel".into());
+            let diagnostic = format!("{verdict}\nRCH_SOURCE_TOPOLOGY_PATHS {mapping}\n");
+            let error = namespace_refusal(&worker, &test_policy(), Some(73), diagnostic.as_bytes());
+            let mismatch = error.downcast_ref::<SourceTopologyIncompatible>().unwrap();
+            assert!(mismatch.mismatch().detail.contains("metadata unavailable"));
+            assert!(!format!("{error:#}").contains("sentinel"));
+        }
+        // Conflicting duplicate metadata must not select an arbitrary physical
+        // mapping even when both copies name the requested logical roots.
+        let mut second = mapping.clone();
+        second["alias_physical"] = serde_json::Value::String("/different/physical".into());
+        let diagnostic = format!(
+            "{verdict}\nRCH_SOURCE_TOPOLOGY_PATHS {mapping}\nRCH_SOURCE_TOPOLOGY_PATHS {second}\n"
+        );
+        let error = namespace_refusal(&worker, &test_policy(), Some(73), diagnostic.as_bytes());
+        let mismatch = error.downcast_ref::<SourceTopologyIncompatible>().unwrap();
+        assert!(mismatch.mismatch().detail.contains("metadata unavailable"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_namespace_production_conflict_preserves_roots_and_is_permanent() {
+        use std::io::Write as _;
+        use std::os::unix::fs::{MetadataExt as _, symlink};
+        use std::process::Stdio;
+
+        let temp = tempfile::tempdir().unwrap();
+        let canonical = temp.path().join("Users/test/projects");
+        let physical = temp.path().join("data/projects");
+        let alias = temp.path().join("dp");
+        let registry = temp.path().join("registry");
+        std::fs::create_dir_all(&canonical).unwrap();
+        std::fs::create_dir_all(&physical).unwrap();
+        std::fs::write(canonical.join("keep"), b"canonical source contents").unwrap();
+        std::fs::write(physical.join("keep"), b"other source contents").unwrap();
+        symlink(&physical, &alias).unwrap();
+        let inode = std::fs::symlink_metadata(&alias).unwrap().ino();
+        let policy = PathTopologyPolicy::new(canonical.clone(), alias.clone());
+        let command = namespace_command(&policy, "0123", registry.to_str().unwrap()).unwrap();
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", CONTROL])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(command.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(73));
+        assert!(output.stdout.is_empty());
+        let worker = WorkerConfig {
+            id: WorkerId::new("different-layout"),
+            ..WorkerConfig::default()
+        };
+        let error = namespace_refusal(&worker, &policy, output.status.code(), &output.stderr);
+        assert!(error.is::<SourceTopologyIncompatible>(), "{error:#}");
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        assert!(diagnostic.contains(physical.to_str().unwrap()));
+        assert!(diagnostic.contains(canonical.to_str().unwrap()));
+        assert!(!diagnostic.contains("source contents"));
+        assert_eq!(std::fs::symlink_metadata(&alias).unwrap().ino(), inode);
+        assert_eq!(std::fs::read_link(&alias).unwrap(), physical);
+        assert_eq!(
+            std::fs::read(canonical.join("keep")).unwrap(),
+            b"canonical source contents"
+        );
+        assert_eq!(
+            std::fs::read(physical.join("keep")).unwrap(),
+            b"other source contents"
+        );
+        assert!(std::fs::read_dir(registry).unwrap().all(|entry| {
+            !matches!(
+                entry
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .and_then(|extension| extension.to_str()),
+                Some("claim" | "pending")
+            )
+        }));
     }
 
     #[test]
@@ -456,7 +801,7 @@ mod tests {
             tools: vec![],
         };
         let busy = b"RCH_SOURCE_NAMESPACE_METADATA_LOCK_BUSY elapsed_ms=5003 lock=/registry/metadata.lock\n";
-        let error = namespace_refusal(&worker, Some(76), busy);
+        let error = namespace_refusal(&worker, &test_policy(), Some(76), busy);
         assert!(crate::transfer::source_authority_busy(&error), "{error:#}");
         let detail = format!("{error:#}");
         assert!(detail.contains("metadata-worker"));
@@ -466,7 +811,7 @@ mod tests {
         // A killed/interrupted controller might have captured a busy line
         // before failing elsewhere. That is not a completed busy verdict.
         for status in [None, Some(73), Some(137)] {
-            let error = namespace_refusal(&worker, status, busy);
+            let error = namespace_refusal(&worker, &test_policy(), status, busy);
             assert!(!crate::transfer::source_authority_busy(&error), "{error:#}");
             assert!(format!("{error:#}").contains("elapsed_ms=5003"));
         }
@@ -478,7 +823,7 @@ mod tests {
             "Killed",
         ] {
             for status in [Some(73), Some(76)] {
-                let error = namespace_refusal(&worker, status, refusal.as_bytes());
+                let error = namespace_refusal(&worker, &test_policy(), status, refusal.as_bytes());
                 assert!(!crate::transfer::source_authority_busy(&error), "{error:#}");
                 assert!(format!("{error:#}").contains(refusal));
             }
@@ -499,7 +844,7 @@ mod tests {
         };
         for status in [None, Some(73), Some(76), Some(137)] {
             for stderr in [b"".as_slice(), b" \n\t".as_slice()] {
-                let error = namespace_refusal(&worker, status, stderr);
+                let error = namespace_refusal(&worker, &test_policy(), status, stderr);
                 assert!(!crate::transfer::source_authority_busy(&error), "{error:#}");
                 let detail = format!("{error:#}");
                 assert!(detail.contains("silent-worker"));

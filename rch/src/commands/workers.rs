@@ -337,6 +337,19 @@ pub(super) fn collect_refresh_warnings(workers: &[WorkerCapabilitiesFromApi]) ->
         .collect()
 }
 
+fn source_topology_warnings(
+    worker_id: &str,
+    mismatches: &[rch_common::SourceTopologyMismatch],
+) -> Vec<String> {
+    mismatches
+        .iter()
+        .map(|mismatch| {
+            let hint = crate::status_types::source_topology_remediation(worker_id, mismatch);
+            format!("{}; {}", hint.message, hint.suggested_action)
+        })
+        .collect()
+}
+
 fn workers_list_verbose_enabled(ctx: &OutputContext) -> bool {
     ctx.is_verbose() && !ctx.is_json()
 }
@@ -454,6 +467,24 @@ fn apply_live_worker_slots(
             worker.total_slots = live.total_slots;
         }
     }
+}
+
+fn worker_info_with_status(
+    worker: &WorkerConfig,
+    daemon_status: Option<&DaemonFullStatusResponse>,
+) -> WorkerInfo {
+    let live = daemon_status.and_then(|status| {
+        status
+            .workers
+            .iter()
+            .find(|entry| entry.id == worker.id.as_str())
+    });
+    let mut info = WorkerInfo::from(worker);
+    info.disk = disk_info_from_daemon(live);
+    info.source_topology_mismatches = live
+        .map(|worker| worker.source_topology_mismatches.clone())
+        .unwrap_or_default();
+    info
 }
 
 fn render_worker_verbose_lines(
@@ -628,13 +659,10 @@ pub async fn workers_list(show_speedscore: bool, ctx: &OutputContext) -> Result<
         query_worker_disk_status().await
     };
     apply_live_worker_slots(&mut workers, daemon_status.as_ref());
-    let mut worker_infos: Vec<WorkerInfo> = workers.iter().map(WorkerInfo::from).collect();
-    for info in &mut worker_infos {
-        let live = daemon_status
-            .as_ref()
-            .and_then(|status| status.workers.iter().find(|worker| worker.id == info.id));
-        info.disk = disk_info_from_daemon(live);
-    }
+    let mut worker_infos: Vec<WorkerInfo> = workers
+        .iter()
+        .map(|worker| worker_info_with_status(worker, daemon_status.as_ref()))
+        .collect();
 
     // JSON output mode
     if ctx.is_json() {
@@ -720,6 +748,9 @@ pub async fn workers_list(show_speedscore: bool, ctx: &OutputContext) -> Result<
 
         println!("{}", stats_line);
         println!("    {}", format_worker_disk(&info.disk));
+        for warning in source_topology_warnings(&info.id, &info.source_topology_mismatches) {
+            println!("    {}", style.warning(&warning));
+        }
 
         if !worker.tags.is_empty() {
             println!(
@@ -811,6 +842,12 @@ pub async fn workers_capabilities(
         ));
     }
     warnings.extend(collect_refresh_warnings(&workers));
+    for worker in &workers {
+        warnings.extend(source_topology_warnings(
+            &worker.id,
+            &worker.source_topology_mismatches,
+        ));
+    }
 
     if ctx.is_json() {
         let report = WorkersCapabilitiesReport {
@@ -2556,6 +2593,59 @@ mod probe_summary_tests {
         status.workers[0].total_slots = 0;
         apply_live_worker_slots(&mut workers, Some(&status));
         assert_eq!(workers[0].total_slots, 8);
+    }
+
+    #[test]
+    fn source_topology_list_and_capabilities_render_scoped_refusal() {
+        let mut status = make_daemon_status();
+        let mismatch: rch_common::SourceTopologyMismatch = serde_json::from_value(
+            serde_json::json!({
+                "topology": {"canonical_root": "/Users/dispatcher/projects", "alias_root": "/dp"},
+                "detail": "canonical resolves to /Users/dispatcher/projects; alias resolves to /data/projects"
+            }),
+        )
+        .unwrap();
+        status.workers[0].source_topology_mismatches = vec![mismatch.clone()];
+        let worker = make_worker();
+        let info = worker_info_with_status(&worker, Some(&status));
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(
+            json["source_topology_mismatches"][0]["topology"]["alias_root"],
+            "/dp"
+        );
+        assert_eq!(info.total_slots, worker.total_slots);
+        let warnings = source_topology_warnings(&info.id, &info.source_topology_mismatches);
+        assert_eq!(warnings.len(), 1);
+        for expected in [
+            worker.id.as_str(),
+            "/Users/dispatcher/projects",
+            "/dp",
+            "/data/projects",
+            "Choose a compatible worker",
+            "rch workers capabilities --refresh",
+        ] {
+            assert!(warnings[0].contains(expected), "{}", warnings[0]);
+        }
+        let capabilities: WorkerCapabilitiesFromApi = serde_json::from_value(serde_json::json!({
+            "id": worker.id.as_str(), "host": worker.host, "user": worker.user,
+            "capabilities": {}, "source_topology_mismatches": [mismatch]
+        }))
+        .unwrap();
+        assert_eq!(
+            source_topology_warnings(&capabilities.id, &capabilities.source_topology_mismatches),
+            warnings,
+        );
+        status.workers[0].id = "another-worker".into();
+        assert!(
+            worker_info_with_status(&worker, Some(&status))
+                .source_topology_mismatches
+                .is_empty()
+        );
+        assert!(
+            worker_info_with_status(&worker, None)
+                .source_topology_mismatches
+                .is_empty()
+        );
     }
 
     #[test]

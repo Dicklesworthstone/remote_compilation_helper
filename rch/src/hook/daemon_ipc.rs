@@ -412,6 +412,7 @@ pub(crate) async fn query_daemon(
     preferred_workers: &[WorkerId],
     job_mode: bool,
     required_tools: &[String],
+    source_topology: Option<&rch_common::SourceTopology>,
 ) -> anyhow::Result<SelectionResponse> {
     query_daemon_with_mode(
         socket_path,
@@ -430,6 +431,7 @@ pub(crate) async fn query_daemon(
         job_mode,
         required_tools,
         false,
+        source_topology,
     )
     .await
 }
@@ -447,6 +449,7 @@ pub(crate) async fn query_daemon_dry_run(
     toolchain: Option<&ToolchainInfo>,
     required_runtime: RequiredRuntime,
     preferred_workers: &[WorkerId],
+    source_topology: Option<&rch_common::SourceTopology>,
 ) -> anyhow::Result<SelectionResponse> {
     query_daemon_with_mode(
         socket_path,
@@ -465,6 +468,7 @@ pub(crate) async fn query_daemon_dry_run(
         false,
         &[],
         true,
+        source_topology,
     )
     .await
 }
@@ -521,7 +525,11 @@ async fn query_daemon_with_mode(
     job_mode: bool,
     required_tools: &[String],
     dry_run: bool,
+    source_topology: Option<&rch_common::SourceTopology>,
 ) -> anyhow::Result<SelectionResponse> {
+    if let Some(topology) = source_topology {
+        topology.validate().map_err(anyhow::Error::msg)?;
+    }
     if let Some(refusal) = unresolved_toolchain_refusal(toolchain, required_runtime) {
         return Ok(refusal);
     }
@@ -563,6 +571,12 @@ async fn query_daemon_with_mode(
         query.push_str(&format!("&disk_headroom_gib={disk_headroom_gib}"));
     }
     query.push_str(&format!("&command={}", urlencoding_encode(command)));
+    if let Some(topology) = source_topology {
+        query.push_str(&format!(
+            "&source_topology={}",
+            urlencoding_encode(&serde_json::to_string(topology)?)
+        ));
+    }
 
     if let Some(tc) = toolchain
         && let Ok(json) = serde_json::to_string(tc)
@@ -803,6 +817,9 @@ pub(crate) struct ReleaseFaults<'a> {
     pub(crate) live_checkout_refused: bool,
     /// Another owner held this worker's source past the admission wait.
     pub(crate) source_busy: bool,
+    /// A deterministic refusal of this worker's requested source mapping.
+    /// This report is scoped to the exact admitted worker and topology.
+    pub(crate) source_topology_mismatch: Option<&'a rch_common::SourceTopologyMismatch>,
     /// Attributable output high water, even when the job exceeded its budget.
     pub(crate) disk_peak_output_bytes: Option<u64>,
 }
@@ -878,6 +895,13 @@ pub(crate) async fn release_worker_with_fault(
     }
     if faults.source_busy {
         request.push_str("&worker_source_busy=1");
+    }
+    if let Some(mismatch) = faults.source_topology_mismatch {
+        mismatch.validate().map_err(anyhow::Error::msg)?;
+        request.push_str(&format!(
+            "&worker_source_topology_mismatch={}",
+            urlencoding_encode(&serde_json::to_string(mismatch)?)
+        ));
     }
     request.push('\n');
 
@@ -1290,6 +1314,7 @@ mod bounded_ipc_tests {
                     &[],
                     false,
                     &[],
+                    None,
                 )
                 .await
                 .unwrap();
@@ -1314,6 +1339,7 @@ mod bounded_ipc_tests {
                 toolchain.as_ref(),
                 RequiredRuntime::Rust,
                 &[],
+                None,
             )
             .await
             .unwrap();
@@ -1381,6 +1407,7 @@ mod bounded_ipc_tests {
             Some(&info),
             RequiredRuntime::Rust,
             &[],
+            None,
         );
         let (response, ()) = timeout(Duration::from_secs(2), async {
             tokio::join!(client, server)
@@ -1409,6 +1436,7 @@ mod bounded_ipc_tests {
             required_runtime: RequiredRuntime::None,
             job_mode: true,
             required_tools: vec!["clang".into()],
+            source_topology: None,
         };
         let server = async {
             let (stream, _) = listener.accept().await.unwrap();
@@ -1671,6 +1699,7 @@ mod bounded_ipc_tests {
                     worker_disk_roots: &[],
                     live_checkout_refused,
                     source_busy,
+                    source_topology_mismatch: None,
                     disk_peak_output_bytes: Some(21 * rch_common::BuildDiskBudget::GIB),
                 },
             );
@@ -1709,6 +1738,99 @@ mod bounded_ipc_tests {
                 "{request}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn source_topology_selection_and_release_carry_the_exact_mapping() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("topology.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let topology = rch_common::SourceTopology {
+            canonical_root: "/Users/builder/projects & research".into(),
+            alias_root: "/dp".into(),
+        };
+        let mismatch = rch_common::SourceTopologyMismatch {
+            topology: topology.clone(),
+            detail: "canonical resolves to /Users/builder/projects & research; alias resolves to /data/projects".into(),
+        };
+        let worker = WorkerId::new("topology-worker");
+        let server = async {
+            let mut observed = Vec::new();
+            for body in [
+                "{\"worker\":null,\"reason\":\"source_topology_incompatible\"}",
+                "{}",
+            ] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut request = String::new();
+                BufReader::new(reader)
+                    .read_line(&mut request)
+                    .await
+                    .unwrap();
+                observed.push(request);
+                writer
+                    .write_all(format!("HTTP/1.1 200 OK\r\n\r\n{body}").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            observed
+        };
+        let client = async {
+            let response = query_daemon(
+                path.to_str().unwrap(),
+                "project",
+                1,
+                0,
+                "make",
+                None,
+                RequiredRuntime::None,
+                CommandPriority::Normal,
+                0,
+                None,
+                Some("topology-wrapper"),
+                false,
+                std::slice::from_ref(&worker),
+                false,
+                &[],
+                Some(&topology),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.reason, SelectionReason::SourceTopologyIncompatible);
+            release_worker_with_fault(
+                path.to_str().unwrap(),
+                &worker,
+                1,
+                Some(42),
+                Some(1),
+                None,
+                None,
+                None,
+                Some("topology-wrapper"),
+                ReleaseFaults {
+                    worker_fault: true,
+                    source_topology_mismatch: Some(&mismatch),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        };
+        let ((), observed) = timeout(Duration::from_secs(3), async {
+            tokio::join!(client, server)
+        })
+        .await
+        .unwrap();
+        assert!(observed[0].contains(&format!(
+            "&source_topology={}",
+            urlencoding_encode(&serde_json::to_string(&topology).unwrap()),
+        )));
+        assert!(observed[1].contains(&format!(
+            "&worker_source_topology_mismatch={}",
+            urlencoding_encode(&serde_json::to_string(&mismatch).unwrap()),
+        )));
+        assert!(observed[1].contains("&local_wrapper_id=topology-wrapper&exit_code=1"));
+        assert!(!observed[1].contains("worker_source_busy=1"));
     }
 
     #[tokio::test]

@@ -47,6 +47,9 @@ pub struct WorkerInfo {
     pub speedscore: Option<f64>,
     #[serde(flatten)]
     pub disk: WorkerDiskInfo,
+    /// Source-root pairs this worker has refused; not a global health failure.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub source_topology_mismatches: Vec<rch_common::SourceTopologyMismatch>,
 }
 
 impl From<&WorkerConfig> for WorkerInfo {
@@ -60,6 +63,7 @@ impl From<&WorkerConfig> for WorkerInfo {
             tags: w.tags.clone(),
             speedscore: None,
             disk: WorkerDiskInfo::default(),
+            source_topology_mismatches: Vec::new(),
         }
     }
 }

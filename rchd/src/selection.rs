@@ -585,6 +585,9 @@ pub struct WorkerSelector {
     pub admission_gate: Option<Arc<AdmissionGate>>,
     /// Same durable ownership ledger used by final API admission.
     build_history: Option<Arc<crate::history::BuildHistory>>,
+    /// Legacy clients omit a requested mapping. Resolve their default inside
+    /// selection so adding this feature does not change durable queue digests.
+    default_source_topology: rch_common::SourceTopology,
     /// Optional repo convergence service for pre-build freshness checks (bd-vvmd.3.3).
     pub repo_convergence: Option<Arc<crate::repo_convergence::RepoConvergenceService>>,
     /// Optional unified reliability aggregator for multi-signal health (bd-vvmd.5.5).
@@ -640,6 +643,7 @@ impl WorkerSelector {
             audit_log: Arc::new(RwLock::new(SelectionAuditLog::default())),
             admission_gate: None,
             build_history: None,
+            default_source_topology: rch_common::SourceTopology::from_policy(&Default::default()),
             repo_convergence: None,
             reliability: None,
             ssh_pool: None,
@@ -657,6 +661,7 @@ impl WorkerSelector {
             audit_log: Arc::new(RwLock::new(SelectionAuditLog::default())),
             admission_gate: None,
             build_history: None,
+            default_source_topology: rch_common::SourceTopology::from_policy(&Default::default()),
             repo_convergence: None,
             reliability: None,
             ssh_pool: None,
@@ -671,6 +676,20 @@ impl WorkerSelector {
 
     pub(crate) fn set_build_history(&mut self, history: Arc<crate::history::BuildHistory>) {
         self.build_history = Some(history);
+    }
+
+    pub(crate) fn set_default_source_topology(&mut self, topology: rch_common::SourceTopology) {
+        self.default_source_topology = topology;
+    }
+
+    fn source_topology_for<'a>(
+        &'a self,
+        request: &'a SelectionRequest,
+    ) -> &'a rch_common::SourceTopology {
+        request
+            .source_topology
+            .as_ref()
+            .unwrap_or(&self.default_source_topology)
     }
 
     /// Use the same guarded job allowance in placement and authoritative
@@ -740,6 +759,50 @@ impl WorkerSelector {
                 },
             )
             .err()
+    }
+
+    async fn source_topology_mismatch(
+        &self,
+        worker: &WorkerState,
+        request: &SelectionRequest,
+    ) -> Option<rch_common::SourceTopologyMismatch> {
+        let topology = self.source_topology_for(request);
+        if let Some(history) = self.build_history.as_ref() {
+            let config = worker.config.read().await;
+            if let Some(fence) = history.source_topology_fences().into_iter().find(|fence| {
+                fence.endpoint.matches_config(&config) && &fence.mismatch.topology == topology
+            }) {
+                return Some(fence.mismatch);
+            }
+        }
+        worker
+            .capabilities()
+            .await
+            .source_topology_mismatch()
+            .filter(|mismatch| &mismatch.topology == topology)
+    }
+
+    async fn all_requested_topologies_incompatible(
+        &self,
+        pool: &WorkerPool,
+        request: &SelectionRequest,
+    ) -> bool {
+        let mut considered = false;
+        for worker in pool.all_workers().await {
+            let id = worker.config.read().await.id.clone();
+            if !request.preferred_workers.is_empty() && !request.preferred_workers.contains(&id) {
+                continue;
+            }
+            considered = true;
+            if self
+                .source_topology_mismatch(&worker, request)
+                .await
+                .is_none()
+            {
+                return false;
+            }
+        }
+        considered
     }
 
     /// Set the repo convergence service for pre-build freshness checks (bd-vvmd.3.3).
@@ -879,6 +942,27 @@ impl WorkerSelector {
             "Starting worker selection"
         );
         let cache_use = cache_use_for_request(request);
+
+        // A fixed namespace refusal cannot turn into "busy" merely because
+        // the same worker's health or capacity also changed. Different layouts
+        // remain independent, and a compatible alternative can still recover.
+        if self
+            .all_requested_topologies_incompatible(pool, request)
+            .await
+        {
+            let reason = SelectionReason::SourceTopologyIncompatible;
+            let diagnostics = self
+                .build_selection_diagnostics(pool, request, excluded_worker_ids)
+                .await;
+            self.record_audit_entry(request, Vec::new(), None, &reason, select_start.elapsed())
+                .await;
+            record_selection_metrics(&reason, select_start.elapsed());
+            return SelectionResult {
+                worker: None,
+                reason,
+                diagnostics: Some(diagnostics),
+            };
+        }
 
         // Get eligible workers
         let eligible = match self
@@ -1301,6 +1385,15 @@ impl WorkerSelector {
         // In particular, an exact runtime or named-tool requirement must not
         // disappear when the normal eligibility pass finds no usable worker.
         let capabilities = worker.capabilities().await;
+        if capabilities.is_topology_healthy_for(Some(self.source_topology_for(request)))
+            == Some(false)
+            || self
+                .source_topology_mismatch(&worker, request)
+                .await
+                .is_some()
+        {
+            return None;
+        }
         if required_tool_capability_mismatch(request, &capabilities).is_some() {
             return None;
         }
@@ -1623,6 +1716,9 @@ impl WorkerSelector {
             let circuit_state = worker.circuit_state().await.unwrap_or(CircuitState::Closed);
             let available_slots = worker.available_slots().await;
             let capabilities = worker.capabilities().await;
+            let source_topology_mismatch = self.source_topology_mismatch(&worker, request).await;
+            let topology_healthy =
+                capabilities.is_topology_healthy_for(Some(self.source_topology_for(request)));
             let pressure = worker.pressure_assessment().await;
             let disk_headroom_failure = self
                 .disk_headroom_failure(&worker, worker_id.as_str(), disk_budget)
@@ -1687,320 +1783,298 @@ impl WorkerSelector {
                 None
             };
 
-            let (final_decision, final_reason) =
-                if outside_requested_set(request, worker_id.as_str()) {
-                    // `get_eligible_workers` drops these before any other gate.
-                    push_reason_code(&mut reason_codes, "selection.not_requested");
-                    (
-                        WorkerSelectionDiagnosticDecision::Deny,
-                        "not in the requested worker set".to_string(),
-                    )
-                } else if !matches!(status, WorkerStatus::Healthy | WorkerStatus::Degraded) {
-                    push_reason_code(&mut reason_codes, "worker.status_not_assignable");
-                    (
-                        WorkerSelectionDiagnosticDecision::Deny,
-                        format!("worker status is {status:?}"),
-                    )
-                } else if circuit_state == CircuitState::Open {
-                    push_reason_code(&mut reason_codes, "worker.circuit_open");
-                    (
-                        WorkerSelectionDiagnosticDecision::Deny,
-                        "circuit is open".to_string(),
-                    )
-                } else if circuit_state == CircuitState::HalfOpen
-                    && !worker.can_probe(&self.circuit_config).await
-                {
-                    push_reason_code(&mut reason_codes, "worker.half_open_no_probe_budget");
-                    (
-                        WorkerSelectionDiagnosticDecision::Deny,
-                        "half-open circuit has no probe budget".to_string(),
-                    )
-                } else if active_project_excluded {
-                    push_reason_code(&mut reason_codes, "active_project_exclusion");
-                    (
-                        WorkerSelectionDiagnosticDecision::Deny,
-                        "worker already has an active build for this project".to_string(),
-                    )
-                } else if let Some(failure) = disk_headroom_failure {
-                    push_reason_code(&mut reason_codes, failure.reason_code());
-                    (WorkerSelectionDiagnosticDecision::Deny, failure.to_string())
-                } else if !os_gate_admits(declared_os.as_deref(), required_os.as_deref()) {
-                    // Must mirror the gate in `get_eligible_workers`, and sit at
-                    // the same point in the ladder (before runtime). Without it
-                    // diagnostics report a worker as eligible that selection
-                    // denies, which is worse than no diagnostic at all.
-                    push_reason_code(&mut reason_codes, "os.declared_mismatch");
-                    (
-                        WorkerSelectionDiagnosticDecision::Deny,
-                        match (declared_os.as_deref(), required_os.as_deref()) {
-                            (Some(declared), Some(required)) => format!(
-                                "worker declares os={declared}, command requires os={required}"
-                            ),
-                            (Some(declared), None) => format!(
-                                "worker declares os={declared}, so it takes only commands \
+            let (final_decision, final_reason) = if outside_requested_set(
+                request,
+                worker_id.as_str(),
+            ) {
+                // `get_eligible_workers` drops these before any other gate.
+                push_reason_code(&mut reason_codes, "selection.not_requested");
+                (
+                    WorkerSelectionDiagnosticDecision::Deny,
+                    "not in the requested worker set".to_string(),
+                )
+            } else if let Some(mismatch) = source_topology_mismatch {
+                push_reason_code(&mut reason_codes, "topology.source_incompatible");
+                (
+                    WorkerSelectionDiagnosticDecision::Deny,
+                    format!(
+                        "{}; canonical={} alias={}; safely reconcile the mapping after source owners retire, then run rch workers capabilities --refresh",
+                        mismatch.detail,
+                        mismatch.topology.canonical_root,
+                        mismatch.topology.alias_root
+                    ),
+                )
+            } else if !matches!(status, WorkerStatus::Healthy | WorkerStatus::Degraded) {
+                push_reason_code(&mut reason_codes, "worker.status_not_assignable");
+                (
+                    WorkerSelectionDiagnosticDecision::Deny,
+                    format!("worker status is {status:?}"),
+                )
+            } else if circuit_state == CircuitState::Open {
+                push_reason_code(&mut reason_codes, "worker.circuit_open");
+                (
+                    WorkerSelectionDiagnosticDecision::Deny,
+                    "circuit is open".to_string(),
+                )
+            } else if circuit_state == CircuitState::HalfOpen
+                && !worker.can_probe(&self.circuit_config).await
+            {
+                push_reason_code(&mut reason_codes, "worker.half_open_no_probe_budget");
+                (
+                    WorkerSelectionDiagnosticDecision::Deny,
+                    "half-open circuit has no probe budget".to_string(),
+                )
+            } else if active_project_excluded {
+                push_reason_code(&mut reason_codes, "active_project_exclusion");
+                (
+                    WorkerSelectionDiagnosticDecision::Deny,
+                    "worker already has an active build for this project".to_string(),
+                )
+            } else if let Some(failure) = disk_headroom_failure {
+                push_reason_code(&mut reason_codes, failure.reason_code());
+                (WorkerSelectionDiagnosticDecision::Deny, failure.to_string())
+            } else if !os_gate_admits(declared_os.as_deref(), required_os.as_deref()) {
+                // Must mirror the gate in `get_eligible_workers`, and sit at
+                // the same point in the ladder (before runtime). Without it
+                // diagnostics report a worker as eligible that selection
+                // denies, which is worse than no diagnostic at all.
+                push_reason_code(&mut reason_codes, "os.declared_mismatch");
+                (
+                    WorkerSelectionDiagnosticDecision::Deny,
+                    match (declared_os.as_deref(), required_os.as_deref()) {
+                        (Some(declared), Some(required)) => {
+                            format!("worker declares os={declared}, command requires os={required}")
+                        }
+                        (Some(declared), None) => format!(
+                            "worker declares os={declared}, so it takes only commands \
                                  targeting that OS"
-                            ),
-                            (None, Some(required)) => {
-                                format!("command requires os={required}, worker declares no os")
-                            }
-                            // `os_gate_admits` admits (None, None), so this arm
-                            // is unreachable today. Describe it rather than
-                            // `unreachable!()`: a future edit to the gate must
-                            // not be able to panic the daemon from here.
-                            (None, None) => "OS gate denied with no OS on either side".to_string(),
-                        },
-                    )
-                } else if !runtime_available {
-                    push_reason_code(&mut reason_codes, "runtime.unavailable");
-                    (
-                        WorkerSelectionDiagnosticDecision::Deny,
-                        format!(
-                            "required runtime {:?} is unavailable",
-                            request.required_runtime
                         ),
-                    )
-                } else if let Some(reason) = tool_mismatch {
-                    // Sits where the real gate sits (immediately after runtime,
-                    // before components): a diagnostic that reported a worker
-                    // eligible where selection denies it is worse than none.
-                    push_reason_code(&mut reason_codes, "tool.required_missing");
-                    (WorkerSelectionDiagnosticDecision::Deny, reason)
-                } else if let Some(reason) = component_mismatch {
-                    push_reason_code(&mut reason_codes, "toolchain.component_missing");
-                    (WorkerSelectionDiagnosticDecision::Deny, reason)
-                } else if let Some(reason) = toolchain_mismatch {
-                    push_reason_code(&mut reason_codes, "toolchain.version_mismatch");
-                    (WorkerSelectionDiagnosticDecision::Deny, reason)
-                } else if let Some(reason) = cached_toolchain_failure {
-                    push_reason_code(&mut reason_codes, "toolchain.preflight_failed");
-                    (WorkerSelectionDiagnosticDecision::Deny, reason)
-                } else if let Some((code, reason)) = hard_admission {
-                    push_reason_code(
-                        &mut reason_codes,
-                        if code == "admission_disk_floor" {
-                            "pressure.disk_floor"
-                        } else {
-                            "pressure.critical"
-                        },
-                    );
-                    (
-                        WorkerSelectionDiagnosticDecision::Deny,
-                        format!("admission rejected: {reason}"),
-                    )
+                        (None, Some(required)) => {
+                            format!("command requires os={required}, worker declares no os")
+                        }
+                        // `os_gate_admits` admits (None, None), so this arm
+                        // is unreachable today. Describe it rather than
+                        // `unreachable!()`: a future edit to the gate must
+                        // not be able to panic the daemon from here.
+                        (None, None) => "OS gate denied with no OS on either side".to_string(),
+                    },
+                )
+            } else if !runtime_available {
+                push_reason_code(&mut reason_codes, "runtime.unavailable");
+                (
+                    WorkerSelectionDiagnosticDecision::Deny,
+                    format!(
+                        "required runtime {:?} is unavailable",
+                        request.required_runtime
+                    ),
+                )
+            } else if let Some(reason) = tool_mismatch {
+                // Sits where the real gate sits (immediately after runtime,
+                // before components): a diagnostic that reported a worker
+                // eligible where selection denies it is worse than none.
+                push_reason_code(&mut reason_codes, "tool.required_missing");
+                (WorkerSelectionDiagnosticDecision::Deny, reason)
+            } else if let Some(reason) = component_mismatch {
+                push_reason_code(&mut reason_codes, "toolchain.component_missing");
+                (WorkerSelectionDiagnosticDecision::Deny, reason)
+            } else if let Some(reason) = toolchain_mismatch {
+                push_reason_code(&mut reason_codes, "toolchain.version_mismatch");
+                (WorkerSelectionDiagnosticDecision::Deny, reason)
+            } else if let Some(reason) = cached_toolchain_failure {
+                push_reason_code(&mut reason_codes, "toolchain.preflight_failed");
+                (WorkerSelectionDiagnosticDecision::Deny, reason)
+            } else if let Some((code, reason)) = hard_admission {
+                push_reason_code(
+                    &mut reason_codes,
+                    if code == "admission_disk_floor" {
+                        "pressure.disk_floor"
+                    } else {
+                        "pressure.critical"
+                    },
+                );
+                (
+                    WorkerSelectionDiagnosticDecision::Deny,
+                    format!("admission rejected: {reason}"),
+                )
+            } else if pressure.state == PressureState::Critical {
+                push_reason_code(&mut reason_codes, "pressure.critical");
+                (
+                    WorkerSelectionDiagnosticDecision::Deny,
+                    format!("critical pressure: {}", pressure.reason_code),
+                )
+            } else if total_slots < request.estimated_cores {
+                push_reason_code(&mut reason_codes, "slots.request_exceeds_capacity");
+                (
+                    WorkerSelectionDiagnosticDecision::Deny,
+                    format!(
+                        "requested cores {} exceed total slots {total_slots}",
+                        request.estimated_cores
+                    ),
+                )
+            } else if available_slots < request.estimated_cores {
+                push_reason_code(&mut reason_codes, "slots.insufficient");
+                (
+                    WorkerSelectionDiagnosticDecision::Deny,
+                    format!(
+                        "available slots {available_slots} < {}",
+                        request.estimated_cores
+                    ),
+                )
+            } else if let Some(false) = topology_healthy {
+                push_reason_code(&mut reason_codes, "topology.preflight_failed");
+                (
+                    WorkerSelectionDiagnosticDecision::Deny,
+                    capabilities
+                        .projects_root_issue
+                        .clone()
+                        .unwrap_or_else(|| "topology preflight failed".to_string()),
+                )
+            } else {
+                let mut hard_decision = None;
+                if let Some(ref convergence_svc) = self.repo_convergence {
+                    let drift_state = convergence_svc.get_drift_state(&worker_id).await;
+                    match drift_state {
+                        crate::repo_convergence::ConvergenceDriftState::Ready => {}
+                        crate::repo_convergence::ConvergenceDriftState::Drifting => {
+                            push_reason_code(&mut reason_codes, "convergence.drifting");
+                        }
+                        crate::repo_convergence::ConvergenceDriftState::Stale => {
+                            push_reason_code(&mut reason_codes, "convergence.stale");
+                        }
+                        crate::repo_convergence::ConvergenceDriftState::Converging => {
+                            push_reason_code(&mut reason_codes, "convergence.in_progress");
+                            hard_decision = Some((
+                                WorkerSelectionDiagnosticDecision::Deny,
+                                "repo convergence is in progress".to_string(),
+                            ));
+                        }
+                        crate::repo_convergence::ConvergenceDriftState::Failed => {
+                            push_reason_code(&mut reason_codes, "convergence.failed");
+                            hard_decision = Some((
+                                WorkerSelectionDiagnosticDecision::Deny,
+                                "repo convergence failed".to_string(),
+                            ));
+                        }
+                    }
+                }
+
+                if hard_decision.is_none()
+                    && let Some(max_load) = self.config.max_load_per_core
+                    && let Some(true) = capabilities.is_high_load(max_load)
+                {
+                    let load_per_core = capabilities.load_per_core().unwrap_or(0.0);
+                    push_reason_code(&mut reason_codes, "preflight.high_load");
+                    soft_reason = Some(format!(
+                        "high load {:.2} > {:.2} per core",
+                        load_per_core, max_load
+                    ));
+                }
+
+                if let Some(min_disk) = self.config.min_free_gb
+                    && let Some(true) = capabilities.is_low_disk(min_disk)
+                {
+                    let free_gb = capabilities.build_disk_gb().0.unwrap_or(0.0);
+                    push_reason_code(&mut reason_codes, "preflight.low_disk");
+                    soft_reason = Some(format!("low disk {:.1} GB < {:.1} GB", free_gb, min_disk));
+                }
+
+                // Mirror get_eligible_workers: when an admission gate is wired
+                // it REPLACES the raw pressure-state check, so the diagnostic
+                // decision must come from the gate verdict too. Otherwise a
+                // gate-REJECTED worker is reported here as Allow — misleading
+                // exactly the "why was nothing selected" output operators rely
+                // on (bd-review-selection-diag-gate). `None` means admitted, not
+                // evaluated this round, or no critical pressure — letting the
+                // chain fall through to the reliability/health checks.
+                //
+                // Use the CACHED verdict (recorded by get_eligible_workers
+                // during this selection round), never `evaluate()`: evaluate()
+                // mutates gate state (record_rejection/cache_verdict, hysteresis
+                // recovery), and diagnostics must be read-only — exactly the
+                // reason the reliability check above reuses `get_assessment`
+                // rather than re-evaluating.
+                let admission_decision: Option<(
+                    WorkerSelectionDiagnosticDecision,
+                    String,
+                    &'static str,
+                )> = if let Some(ref gate) = self.admission_gate {
+                    use crate::admission::AdmissionVerdict;
+                    match gate.cached_verdict(worker_id.as_str()).await {
+                        Some(AdmissionVerdict::Reject {
+                            reason_code,
+                            reason,
+                        }) => {
+                            if matches!(
+                                reason_code.as_str(),
+                                "admission_critical_pressure" | "admission_disk_floor"
+                            ) {
+                                // Hard exclusion (not even fail-open fallback).
+                                Some((
+                                    WorkerSelectionDiagnosticDecision::Deny,
+                                    format!("disk admission rejected: {reason}"),
+                                    if reason_code == "admission_disk_floor" {
+                                        "pressure.disk_floor"
+                                    } else {
+                                        "pressure.critical"
+                                    },
+                                ))
+                            } else {
+                                // Non-critical reject: excluded from primary
+                                // selection but kept for fail-open fallback,
+                                // exactly as get_eligible_workers does.
+                                Some((
+                                    WorkerSelectionDiagnosticDecision::FallbackCandidate,
+                                    format!("admission rejected: {reason}"),
+                                    "admission.rejected",
+                                ))
+                            }
+                        }
+                        // Gate admitted this worker → authoritative (it already
+                        // weighed pressure/headroom/hysteresis); no denial.
+                        Some(AdmissionVerdict::Admit { .. }) => None,
+                        // Not evaluated by the gate this round (excluded by an
+                        // earlier check): fall back to the raw critical-pressure
+                        // check so a pressured worker isn't reported as Allow.
+                        None => {
+                            if pressure.state == PressureState::Critical {
+                                Some((
+                                    WorkerSelectionDiagnosticDecision::Deny,
+                                    format!("critical pressure: {}", pressure.reason_code),
+                                    "pressure.critical",
+                                ))
+                            } else {
+                                None
+                            }
+                        }
+                    }
                 } else if pressure.state == PressureState::Critical {
-                    push_reason_code(&mut reason_codes, "pressure.critical");
-                    (
+                    Some((
                         WorkerSelectionDiagnosticDecision::Deny,
                         format!("critical pressure: {}", pressure.reason_code),
-                    )
-                } else if total_slots < request.estimated_cores {
-                    push_reason_code(&mut reason_codes, "slots.request_exceeds_capacity");
-                    (
-                        WorkerSelectionDiagnosticDecision::Deny,
-                        format!(
-                            "requested cores {} exceed total slots {total_slots}",
-                            request.estimated_cores
-                        ),
-                    )
-                } else if available_slots < request.estimated_cores {
-                    push_reason_code(&mut reason_codes, "slots.insufficient");
-                    (
-                        WorkerSelectionDiagnosticDecision::Deny,
-                        format!(
-                            "available slots {available_slots} < {}",
-                            request.estimated_cores
-                        ),
-                    )
-                } else if let Some(false) = capabilities.is_topology_healthy() {
-                    push_reason_code(&mut reason_codes, "topology.preflight_failed");
-                    (
-                        WorkerSelectionDiagnosticDecision::Deny,
-                        capabilities
-                            .projects_root_issue
-                            .clone()
-                            .unwrap_or_else(|| "topology preflight failed".to_string()),
-                    )
+                        "pressure.critical",
+                    ))
                 } else {
-                    let mut hard_decision = None;
-                    if let Some(ref convergence_svc) = self.repo_convergence {
-                        let drift_state = convergence_svc.get_drift_state(&worker_id).await;
-                        match drift_state {
-                            crate::repo_convergence::ConvergenceDriftState::Ready => {}
-                            crate::repo_convergence::ConvergenceDriftState::Drifting => {
-                                push_reason_code(&mut reason_codes, "convergence.drifting");
-                            }
-                            crate::repo_convergence::ConvergenceDriftState::Stale => {
-                                push_reason_code(&mut reason_codes, "convergence.stale");
-                            }
-                            crate::repo_convergence::ConvergenceDriftState::Converging => {
-                                push_reason_code(&mut reason_codes, "convergence.in_progress");
-                                hard_decision = Some((
-                                    WorkerSelectionDiagnosticDecision::Deny,
-                                    "repo convergence is in progress".to_string(),
-                                ));
-                            }
-                            crate::repo_convergence::ConvergenceDriftState::Failed => {
-                                push_reason_code(&mut reason_codes, "convergence.failed");
-                                hard_decision = Some((
-                                    WorkerSelectionDiagnosticDecision::Deny,
-                                    "repo convergence failed".to_string(),
-                                ));
-                            }
-                        }
-                    }
+                    None
+                };
 
-                    if hard_decision.is_none()
-                        && let Some(max_load) = self.config.max_load_per_core
-                        && let Some(true) = capabilities.is_high_load(max_load)
-                    {
-                        let load_per_core = capabilities.load_per_core().unwrap_or(0.0);
-                        push_reason_code(&mut reason_codes, "preflight.high_load");
-                        soft_reason = Some(format!(
-                            "high load {:.2} > {:.2} per core",
-                            load_per_core, max_load
-                        ));
-                    }
-
-                    if let Some(min_disk) = self.config.min_free_gb
-                        && let Some(true) = capabilities.is_low_disk(min_disk)
-                    {
-                        let free_gb = capabilities.build_disk_gb().0.unwrap_or(0.0);
-                        push_reason_code(&mut reason_codes, "preflight.low_disk");
-                        soft_reason =
-                            Some(format!("low disk {:.1} GB < {:.1} GB", free_gb, min_disk));
-                    }
-
-                    // Mirror get_eligible_workers: when an admission gate is wired
-                    // it REPLACES the raw pressure-state check, so the diagnostic
-                    // decision must come from the gate verdict too. Otherwise a
-                    // gate-REJECTED worker is reported here as Allow — misleading
-                    // exactly the "why was nothing selected" output operators rely
-                    // on (bd-review-selection-diag-gate). `None` means admitted, not
-                    // evaluated this round, or no critical pressure — letting the
-                    // chain fall through to the reliability/health checks.
-                    //
-                    // Use the CACHED verdict (recorded by get_eligible_workers
-                    // during this selection round), never `evaluate()`: evaluate()
-                    // mutates gate state (record_rejection/cache_verdict, hysteresis
-                    // recovery), and diagnostics must be read-only — exactly the
-                    // reason the reliability check above reuses `get_assessment`
-                    // rather than re-evaluating.
-                    let admission_decision: Option<(
-                        WorkerSelectionDiagnosticDecision,
-                        String,
-                        &'static str,
-                    )> = if let Some(ref gate) = self.admission_gate {
-                        use crate::admission::AdmissionVerdict;
-                        match gate.cached_verdict(worker_id.as_str()).await {
-                            Some(AdmissionVerdict::Reject {
-                                reason_code,
-                                reason,
-                            }) => {
-                                if matches!(
-                                    reason_code.as_str(),
-                                    "admission_critical_pressure" | "admission_disk_floor"
-                                ) {
-                                    // Hard exclusion (not even fail-open fallback).
-                                    Some((
-                                        WorkerSelectionDiagnosticDecision::Deny,
-                                        format!("disk admission rejected: {reason}"),
-                                        if reason_code == "admission_disk_floor" {
-                                            "pressure.disk_floor"
-                                        } else {
-                                            "pressure.critical"
-                                        },
-                                    ))
-                                } else {
-                                    // Non-critical reject: excluded from primary
-                                    // selection but kept for fail-open fallback,
-                                    // exactly as get_eligible_workers does.
-                                    Some((
-                                        WorkerSelectionDiagnosticDecision::FallbackCandidate,
-                                        format!("admission rejected: {reason}"),
-                                        "admission.rejected",
-                                    ))
-                                }
-                            }
-                            // Gate admitted this worker → authoritative (it already
-                            // weighed pressure/headroom/hysteresis); no denial.
-                            Some(AdmissionVerdict::Admit { .. }) => None,
-                            // Not evaluated by the gate this round (excluded by an
-                            // earlier check): fall back to the raw critical-pressure
-                            // check so a pressured worker isn't reported as Allow.
-                            None => {
-                                if pressure.state == PressureState::Critical {
-                                    Some((
-                                        WorkerSelectionDiagnosticDecision::Deny,
-                                        format!("critical pressure: {}", pressure.reason_code),
-                                        "pressure.critical",
-                                    ))
-                                } else {
-                                    None
-                                }
-                            }
-                        }
-                    } else if pressure.state == PressureState::Critical {
-                        Some((
-                            WorkerSelectionDiagnosticDecision::Deny,
-                            format!("critical pressure: {}", pressure.reason_code),
-                            "pressure.critical",
-                        ))
-                    } else {
-                        None
+                if let Some(decision) = hard_decision {
+                    decision
+                } else if let Some((decision, reason, code)) = admission_decision {
+                    push_reason_code(&mut reason_codes, code);
+                    (decision, reason)
+                } else if let Some(ref agg) = self.reliability {
+                    // Diagnostics run after preflight in failed-selection paths. Reusing the
+                    // cached assessment keeps the report from consuming a recovery tick.
+                    let assessment = match agg.get_assessment(worker_id.as_str()).await {
+                        Some(assessment) => assessment,
+                        None => agg.evaluate(worker.as_ref(), worker_id.as_str()).await,
                     };
-
-                    if let Some(decision) = hard_decision {
-                        decision
-                    } else if let Some((decision, reason, code)) = admission_decision {
-                        push_reason_code(&mut reason_codes, code);
-                        (decision, reason)
-                    } else if let Some(ref agg) = self.reliability {
-                        // Diagnostics run after preflight in failed-selection paths. Reusing the
-                        // cached assessment keeps the report from consuming a recovery tick.
-                        let assessment = match agg.get_assessment(worker_id.as_str()).await {
-                            Some(assessment) => assessment,
-                            None => agg.evaluate(worker.as_ref(), worker_id.as_str()).await,
-                        };
-                        if assessment.hard_exclude {
-                            push_reason_code(&mut reason_codes, "reliability.quarantined");
-                            (
-                                WorkerSelectionDiagnosticDecision::Deny,
-                                format!("reliability quarantined: {}", assessment.health_state),
-                            )
-                        } else if success_rate < self.config.min_success_rate {
-                            push_reason_code(&mut reason_codes, "health.below_min_success_rate");
-                            if success_rate >= self.config.affinity.fallback_min_success_rate {
-                                (
-                                    WorkerSelectionDiagnosticDecision::FallbackCandidate,
-                                    format!(
-                                        "success_rate {:.2} < min {:.2} but >= fallback {:.2}",
-                                        success_rate,
-                                        self.config.min_success_rate,
-                                        self.config.affinity.fallback_min_success_rate
-                                    ),
-                                )
-                            } else {
-                                push_reason_code(
-                                    &mut reason_codes,
-                                    "health.below_fallback_min_success_rate",
-                                );
-                                (
-                                    WorkerSelectionDiagnosticDecision::Deny,
-                                    format!(
-                                        "success_rate {:.2} < fallback {:.2}",
-                                        success_rate,
-                                        self.config.affinity.fallback_min_success_rate
-                                    ),
-                                )
-                            }
-                        } else if let Some(reason) = soft_reason {
-                            (WorkerSelectionDiagnosticDecision::FallbackCandidate, reason)
-                        } else {
-                            (
-                                WorkerSelectionDiagnosticDecision::Allow,
-                                "eligible".to_string(),
-                            )
-                        }
+                    if assessment.hard_exclude {
+                        push_reason_code(&mut reason_codes, "reliability.quarantined");
+                        (
+                            WorkerSelectionDiagnosticDecision::Deny,
+                            format!("reliability quarantined: {}", assessment.health_state),
+                        )
                     } else if success_rate < self.config.min_success_rate {
                         push_reason_code(&mut reason_codes, "health.below_min_success_rate");
                         if success_rate >= self.config.affinity.fallback_min_success_rate {
@@ -2034,7 +2108,40 @@ impl WorkerSelector {
                             "eligible".to_string(),
                         )
                     }
-                };
+                } else if success_rate < self.config.min_success_rate {
+                    push_reason_code(&mut reason_codes, "health.below_min_success_rate");
+                    if success_rate >= self.config.affinity.fallback_min_success_rate {
+                        (
+                            WorkerSelectionDiagnosticDecision::FallbackCandidate,
+                            format!(
+                                "success_rate {:.2} < min {:.2} but >= fallback {:.2}",
+                                success_rate,
+                                self.config.min_success_rate,
+                                self.config.affinity.fallback_min_success_rate
+                            ),
+                        )
+                    } else {
+                        push_reason_code(
+                            &mut reason_codes,
+                            "health.below_fallback_min_success_rate",
+                        );
+                        (
+                            WorkerSelectionDiagnosticDecision::Deny,
+                            format!(
+                                "success_rate {:.2} < fallback {:.2}",
+                                success_rate, self.config.affinity.fallback_min_success_rate
+                            ),
+                        )
+                    }
+                } else if let Some(reason) = soft_reason {
+                    (WorkerSelectionDiagnosticDecision::FallbackCandidate, reason)
+                } else {
+                    (
+                        WorkerSelectionDiagnosticDecision::Allow,
+                        "eligible".to_string(),
+                    )
+                }
+            };
 
             diagnostics.push(WorkerSelectionDiagnostic {
                 worker_id,
@@ -2229,6 +2336,15 @@ impl WorkerSelector {
             }
             matched_preferred_worker = true;
 
+            if self
+                .source_topology_mismatch(&worker, request)
+                .await
+                .is_some()
+            {
+                filtered_by_hard_preflight += 1;
+                continue;
+            }
+
             // Applied after the allow-set check so `matched_preferred_worker`
             // keeps meaning "the requested worker exists" — an OS-incompatible
             // pin should report an empty eligible set, not a missing worker.
@@ -2405,7 +2521,9 @@ impl WorkerSelector {
             }
 
             // Filter by load-per-core threshold (bd-3eaa)
-            if let Some(false) = capabilities.is_topology_healthy() {
+            if let Some(false) =
+                capabilities.is_topology_healthy_for(Some(self.source_topology_for(request)))
+            {
                 let reason = capabilities
                     .projects_root_issue
                     .clone()
@@ -3883,6 +4001,7 @@ fn selection_reason_label(reason: &SelectionReason) -> &'static str {
         SelectionReason::AllWorkersBusy => "all_workers_busy",
         SelectionReason::NoWorkersPassedHealth => "no_workers_passed_health",
         SelectionReason::AllWorkersFailedPreflight => "all_workers_failed_preflight",
+        SelectionReason::SourceTopologyIncompatible => "source_topology_incompatible",
         SelectionReason::AllWorkersFailedConvergence => "all_workers_failed_convergence",
         SelectionReason::NoAdmissibleWorkers(_) => "no_admissible_workers",
         SelectionReason::NoMatchingWorkers => "no_matching_workers",
@@ -4655,6 +4774,7 @@ mod tests {
         rt.block_on(async {
             let worker = make_worker("test", 16, 80.0);
             let request = SelectionRequest {
+                source_topology: None,
                 job_mode: false,
                 project: "myproject".to_string(),
                 command: None,
@@ -4692,6 +4812,7 @@ mod tests {
             pool.add_worker_state(worker).await;
         }
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "disk-ranking".to_string(),
             command: None,
@@ -4754,6 +4875,7 @@ mod tests {
                 .await;
         }
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "disk-legacy".to_string(),
             command: None,
@@ -4809,6 +4931,7 @@ mod tests {
         rt.block_on(async {
             let worker = make_worker("zero", 0, 80.0);
             let request = SelectionRequest {
+                source_topology: None,
                 job_mode: false,
                 project: "myproject".to_string(),
                 command: None,
@@ -4849,6 +4972,7 @@ mod tests {
             .await;
 
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "myproject".to_string(),
             command: None,
@@ -4875,6 +4999,7 @@ mod tests {
         let pool = WorkerPool::new();
         let selector = WorkerSelector::new();
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "metrics-fallback-project".to_string(),
             command: Some("cargo test".to_string()),
@@ -4944,6 +5069,7 @@ mod tests {
         assert_eq!(full_worker.available_slots().await, 0);
 
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "myproject".to_string(),
             command: None,
@@ -4977,6 +5103,7 @@ mod tests {
         open_worker.open_circuit().await;
 
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "myproject".to_string(),
             command: None,
@@ -5014,6 +5141,7 @@ mod tests {
         worker2.open_circuit().await;
 
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "myproject".to_string(),
             command: None,
@@ -5055,6 +5183,7 @@ mod tests {
         };
         let selector = WorkerSelector::with_config(SelectionConfig::default(), circuit.clone());
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "myproject".to_string(),
             command: None,
@@ -5125,6 +5254,7 @@ mod tests {
         worker.half_open_circuit().await;
 
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "myproject".to_string(),
             command: None,
@@ -5180,6 +5310,7 @@ mod tests {
         half_open_worker.start_probe(&config).await;
 
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "myproject".to_string(),
             command: None,
@@ -5224,6 +5355,7 @@ mod tests {
         half_open_worker.half_open_circuit().await;
 
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "myproject".to_string(),
             command: None,
@@ -5262,6 +5394,7 @@ mod tests {
             .await;
 
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "myproject".to_string(),
             command: None,
@@ -5296,6 +5429,7 @@ mod tests {
         .await;
 
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "myproject".to_string(),
             command: None,
@@ -5335,6 +5469,7 @@ mod tests {
         pool.add_worker(low.config.read().await.clone()).await;
 
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "myproject".to_string(),
             command: None,
@@ -5389,6 +5524,7 @@ mod tests {
         half_open_worker.half_open_circuit().await;
 
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "myproject".to_string(),
             command: None,
@@ -5550,6 +5686,7 @@ mod tests {
         );
 
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "test-project".to_string(),
             command: None,
@@ -5591,6 +5728,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, selector).await;
 
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "test-project".to_string(),
             command: Some(command.to_string()),
@@ -5713,6 +5851,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, selector).await;
 
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "test-project".to_string(),
             command: Some("cargo build --target x86_64-pc-windows-msvc".to_string()),
@@ -5828,6 +5967,7 @@ mod tests {
         selector.record_success("warm-worker", "test-project").await;
 
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "test-project".to_string(),
             command: Some("cargo check".to_string()),
@@ -5875,6 +6015,7 @@ mod tests {
         );
 
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "test-project".to_string(),
             command: None,
@@ -5920,6 +6061,7 @@ mod tests {
         );
 
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "test-project".to_string(),
             command: None,
@@ -5957,6 +6099,7 @@ mod tests {
         );
 
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "test-project".to_string(),
             command: None,
@@ -6023,6 +6166,7 @@ mod tests {
         );
 
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "test-project".to_string(),
             command: None,
@@ -6062,6 +6206,7 @@ mod tests {
 
     fn tool_gate_request() -> SelectionRequest {
         SelectionRequest {
+            source_topology: None,
             project: "tool-gate".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -6165,6 +6310,7 @@ mod tests {
 
     fn pinned_component_request(project: &str, command: &str) -> SelectionRequest {
         SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: project.to_string(),
             command: Some(command.to_string()),
@@ -6341,6 +6487,7 @@ mod tests {
         );
 
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "test-project".to_string(),
             command: None,
@@ -6379,6 +6526,7 @@ mod tests {
         selector.record_build("cached", "proj", false).await;
 
         let base_request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "proj".to_string(),
             command: None,
@@ -6438,6 +6586,7 @@ mod tests {
         );
 
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "test-project".to_string(),
             command: None,
@@ -6477,6 +6626,7 @@ mod tests {
 
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "test".to_string(),
             command: None,
@@ -6531,6 +6681,7 @@ mod tests {
 
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "test".to_string(),
             command: None,
@@ -6598,6 +6749,7 @@ mod tests {
 
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "test".to_string(),
             command: None,
@@ -6652,6 +6804,7 @@ mod tests {
 
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let nix_request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "test".to_string(),
             command: Some("nix build .#foo".to_string()),
@@ -6714,6 +6867,7 @@ mod tests {
 
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "frankenterm".to_string(),
             command: Some("cargo test".to_string()),
@@ -6767,6 +6921,7 @@ mod tests {
 
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "frankenterm".to_string(),
             command: Some("cargo build".to_string()),
@@ -6859,6 +7014,7 @@ mod tests {
         // transient — the empty eligible set maps to AllWorkersBusy so
         // RCH_QUEUE_WHEN_BUSY polling queues instead of failing to local.
         let job_request = SelectionRequest {
+            source_topology: None,
             job_mode: true,
             project: "sharded".to_string(),
             command: Some("./run_shards.sh".to_string()),
@@ -6880,6 +7036,7 @@ mod tests {
 
         // Compilation requests keep the immediate NoAdmissibleWorkers verdict.
         let compile_request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "sharded".to_string(),
             command: Some("cargo build".to_string()),
@@ -6980,6 +7137,7 @@ mod tests {
 
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "frankenterm".to_string(),
             command: Some("cargo test -p rchd --lib".to_string()),
@@ -7043,6 +7201,7 @@ mod tests {
 
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "topology-project".to_string(),
             command: Some("cargo test --no-run".to_string()),
@@ -7081,6 +7240,7 @@ mod tests {
 
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "topology-project".to_string(),
             command: Some("cargo build".to_string()),
@@ -7098,6 +7258,115 @@ mod tests {
         let result = selector.select(&pool, &request).await;
         assert!(result.worker.is_none());
         assert_eq!(result.reason, SelectionReason::AllWorkersFailedPreflight);
+    }
+
+    #[tokio::test]
+    async fn source_topology_capability_scope_and_affinity_obey_requested_mapping() {
+        let (pool, mut selector, mut request) = active_project_capacity_fixture().await;
+        request.estimated_cores = 1;
+        request.preferred_workers = vec![WorkerId::new("active-project")];
+        let topology = rch_common::SourceTopology {
+            canonical_root: "/data/projects".into(),
+            alias_root: "/dp".into(),
+        };
+        request.source_topology = Some(topology.clone());
+        let worker = pool.get(&WorkerId::new("active-project")).await.unwrap();
+        let mut caps = worker.capabilities().await;
+        caps.projects_root_ok = Some(false);
+        caps.projects_root_topology = Some(topology);
+        caps.projects_root_issue = Some("alias_wrong_target:/other".into());
+        worker.set_capabilities(caps).await;
+        let scoped_refusal = selector.select(&pool, &request).await;
+        assert!(scoped_refusal.worker.is_none());
+        assert_eq!(
+            scoped_refusal.reason,
+            SelectionReason::SourceTopologyIncompatible
+        );
+        assert!(
+            selector
+                .try_fallback(&pool, &request, &HashSet::new())
+                .await
+                .is_none()
+        );
+        request.preferred_workers.clear();
+        let compatible = pool.get(&WorkerId::new("free-small")).await.unwrap();
+        assert!(compatible.reserve_slots(3).await);
+        let busy = selector.select(&pool, &request).await;
+        assert!(busy.worker.is_none());
+        assert_ne!(busy.reason, SelectionReason::SourceTopologyIncompatible);
+        compatible.release_slots(3).await;
+        request.preferred_workers = vec![WorkerId::new("active-project")];
+
+        // A failed worker-default mapping does not establish failure of a
+        // different requested namespace. It must still run source admission.
+        let requested = request.source_topology.as_mut().unwrap();
+        requested.canonical_root = "/isolated/builds".into();
+        requested.alias_root = "/isolated/builds".into();
+        assert_eq!(
+            selector
+                .select(&pool, &request)
+                .await
+                .worker
+                .unwrap()
+                .config
+                .read()
+                .await
+                .id
+                .as_str(),
+            "active-project"
+        );
+        assert_eq!(
+            selector
+                .try_fallback(&pool, &request, &HashSet::new())
+                .await
+                .as_deref(),
+            Some("active-project")
+        );
+
+        let history = Arc::new(crate::history::BuildHistory::new(10));
+        let admitted = history
+            .try_start_active_build_with_waiter(
+                "namespace-attempt".into(),
+                "active-project".into(),
+                "cargo check".into(),
+                std::process::id(),
+                Some("source-owner".into()),
+                1,
+                rch_common::BuildLocation::Remote,
+                None,
+                crate::disk_pressure::DiskHeadroomAdmission::default(),
+                Some(worker.endpoint_snapshot().await),
+            )
+            .unwrap()
+            .unwrap();
+        history
+            .record_source_topology_mismatch(
+                admitted.id,
+                "active-project",
+                Some("source-owner"),
+                &rch_common::SourceTopologyMismatch {
+                    topology: request.source_topology.clone().unwrap(),
+                    detail: "canonical root is not a directory".into(),
+                },
+            )
+            .unwrap();
+        selector.set_build_history(history);
+        assert!(
+            selector
+                .try_fallback(&pool, &request, &HashSet::new())
+                .await
+                .is_none()
+        );
+        let refused = selector.select(&pool, &request).await;
+        assert_eq!(refused.reason, SelectionReason::SourceTopologyIncompatible);
+        assert!(refused.worker.is_none());
+        assert!(refused.diagnostics.unwrap().workers.iter().any(|worker| {
+            worker.worker_id.as_str() == "active-project"
+                && worker
+                    .reason_codes
+                    .iter()
+                    .any(|code| code == "topology.source_incompatible")
+        }));
     }
 
     /// bd-141zu: one critical worker plus one capable-but-busy worker must
@@ -7152,6 +7421,7 @@ mod tests {
 
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "pressure-plus-busy".to_string(),
             command: Some("cargo test".to_string()),
@@ -7201,6 +7471,7 @@ mod tests {
 
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "derated-fleet".to_string(),
             command: Some("cargo build --release".to_string()),
@@ -7252,6 +7523,7 @@ mod tests {
             .record_success("active-project", "concurrent-project")
             .await;
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "concurrent-project".to_string(),
             command: Some("cargo build".to_string()),
@@ -7943,6 +8215,7 @@ mod tests {
 
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "degraded-must-respect-pressure".to_string(),
             command: Some("cargo build --release".to_string()),
@@ -8003,6 +8276,7 @@ mod tests {
 
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "os-gate-hijack".to_string(),
             command: Some("cargo build --release".to_string()),
@@ -8083,6 +8357,7 @@ mod tests {
 
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "os-gate-plus-pressure".to_string(),
             command: Some("cargo build --release".to_string()),
@@ -8124,6 +8399,7 @@ mod tests {
 
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "topology-flap".to_string(),
             command: Some("cargo check".to_string()),
@@ -8335,6 +8611,7 @@ mod tests {
 
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "toolchain-project".to_string(),
             command: Some("cargo check".to_string()),
@@ -8398,6 +8675,7 @@ mod tests {
 
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "toolchain-project".to_string(),
             command: Some("cargo test".to_string()),
@@ -8458,6 +8736,7 @@ mod tests {
 
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "pressure-critical".to_string(),
             command: Some("cargo build".to_string()),
@@ -8507,6 +8786,7 @@ mod tests {
 
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "pressure-and-health".to_string(),
             command: Some("cargo test".to_string()),
@@ -8557,6 +8837,7 @@ mod tests {
 
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "pressure-mixed".to_string(),
             command: Some("cargo test".to_string()),
@@ -8618,6 +8899,7 @@ mod tests {
 
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "pressure-gap".to_string(),
             command: Some("cargo build".to_string()),
@@ -8672,6 +8954,7 @@ mod tests {
         );
 
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "test-project".to_string(),
             command: None,
@@ -8725,6 +9008,7 @@ mod tests {
             .await;
 
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "test-project".to_string(),
             command: None,
@@ -8765,6 +9049,7 @@ mod tests {
         selector.record_build("test-warm", "proj", false).await;
 
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "proj".to_string(),
             command: Some("cargo test".to_string()),
@@ -8809,6 +9094,7 @@ mod tests {
 
         // No cache warmth recorded for either worker
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "new-project".to_string(),
             command: None,
@@ -8846,6 +9132,7 @@ mod tests {
         );
 
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "test-project".to_string(),
             command: None,
@@ -8906,6 +9193,7 @@ mod tests {
         let selector = WorkerSelector::new();
 
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "test-project".to_string(),
             command: None,
@@ -8948,6 +9236,7 @@ mod tests {
         );
 
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "test-project".to_string(),
             command: None,
@@ -8982,6 +9271,7 @@ mod tests {
 
         let selector = WorkerSelector::new();
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "test-project".to_string(),
             command: None,
@@ -9021,6 +9311,7 @@ mod tests {
         let selector = WorkerSelector::new();
         selector.record_success("fallback", "test-project").await;
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "test-project".to_string(),
             command: None,
@@ -9063,6 +9354,7 @@ mod tests {
 
         let selector = WorkerSelector::new();
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "test-project".to_string(),
             command: None,
@@ -9114,6 +9406,7 @@ mod tests {
 
         let selector = WorkerSelector::new();
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "test-project".to_string(),
             command: None,
@@ -9167,6 +9460,7 @@ mod tests {
 
         let selector = WorkerSelector::new();
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "test-project".to_string(),
             command: None,
@@ -9396,6 +9690,7 @@ mod tests {
 
         // Make a selection request
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "audit-test-project".to_string(),
             command: Some("cargo test".to_string()),
@@ -9451,6 +9746,7 @@ mod tests {
         );
         let selector = budgeted_fixture_selector(&pool, selector).await;
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "poolrepro".to_string(),
             command: Some("cargo build -j 2".to_string()),
@@ -9796,6 +10092,7 @@ mod tests {
         selector.record_success("worker1", "project-a").await;
 
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "project-a".to_string(),
             command: None,
@@ -9829,6 +10126,7 @@ mod tests {
         );
         selector.record_success("worker1", "project-a").await;
         let request = SelectionRequest {
+            source_topology: None,
             project: "project-a".to_string(),
             estimated_cores: 1,
             disk_headroom_gib: 0,
@@ -9879,6 +10177,7 @@ mod tests {
         selector.record_success("worker1", "project-a").await;
 
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "project-a".to_string(),
             command: None,
@@ -9927,6 +10226,7 @@ mod tests {
         selector.record_success("worker1", "project-a").await;
 
         let request = SelectionRequest {
+            source_topology: None,
             job_mode: false,
             project: "project-a".to_string(),
             command: None,
@@ -10013,6 +10313,7 @@ mod tests {
                     }
 
                     let request = SelectionRequest {
+                        source_topology: None,
                         project: "worker-status-proptest".to_string(),
                         command: None,
                         command_priority: CommandPriority::Normal,
@@ -10633,6 +10934,7 @@ mod tests {
             selector.set_reliability(Arc::new(reliability));
 
             let request = SelectionRequest {
+                source_topology: None,
                 job_mode: false,
                 project: "reliability-penalty".to_string(),
                 command: Some("cargo build --workspace".to_string()),
@@ -10698,6 +11000,7 @@ mod tests {
             selector.set_reliability(Arc::new(reliability));
 
             let request = SelectionRequest {
+                source_topology: None,
                 job_mode: false,
                 project: "reliability-quarantine".to_string(),
                 command: Some("cargo test".to_string()),
@@ -10789,6 +11092,7 @@ mod tests {
             selector.set_reliability(reliability.clone());
 
             let request = SelectionRequest {
+                source_topology: None,
                 job_mode: false,
                 project: "reliability-recovery".to_string(),
                 command: Some("cargo test".to_string()),
@@ -10839,6 +11143,7 @@ mod tests {
 
         fn make_selection_request(project: &str) -> SelectionRequest {
             SelectionRequest {
+                source_topology: None,
                 job_mode: false,
                 project: project.to_string(),
                 command: Some("cargo build".to_string()),

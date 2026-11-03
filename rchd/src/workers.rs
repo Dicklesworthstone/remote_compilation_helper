@@ -2725,6 +2725,10 @@ pub struct WorkerCapabilitiesInfo {
     pub host: String,
     pub user: String,
     pub capabilities: WorkerCapabilities,
+    /// Permanent incompatibilities for specific requested namespaces. Ordinary
+    /// capability/liveness success is not evidence that these mappings changed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub source_topology_mismatches: Vec<rch_common::SourceTopologyMismatch>,
     pub pressure_assessment: PressureAssessment,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refresh: Option<WorkerCapabilitiesRefreshInfo>,
@@ -2794,7 +2798,25 @@ pub async fn get_workers_capabilities(
     let workers = ctx.pool.all_workers().await;
     let mut entries = Vec::with_capacity(workers.len());
     let mut refresh_results = if refresh {
-        refresh_worker_capabilities_concurrently(&workers).await
+        // Both probes are read-only and independent. Preserve the existing
+        // response budget instead of adding a second serial network timeout.
+        let (results, ()) =
+            tokio::join!(refresh_worker_capabilities_concurrently(&workers), async {
+                let mut revalidations = tokio::task::JoinSet::new();
+                for worker in &workers {
+                    let worker = Arc::clone(worker);
+                    let history = Arc::clone(&ctx.history);
+                    revalidations.spawn(async move {
+                        revalidate_source_topologies(&worker, &history).await
+                    });
+                }
+                while let Some(result) = revalidations.join_next().await {
+                    if let Err(error) = result {
+                        tracing::warn!("source topology revalidation task failed: {error}");
+                    }
+                }
+            });
+        results
     } else {
         HashMap::new()
     };
@@ -2809,6 +2831,8 @@ pub async fn get_workers_capabilities(
             )
         };
         let capabilities = worker.capabilities().await;
+        let source_topology_mismatches =
+            source_topology_mismatches(&ctx.history, &*worker.config.read().await, &capabilities);
         let pressure_assessment = worker.pressure_assessment().await;
         let refresh = refresh_results.remove(&id);
 
@@ -2817,12 +2841,178 @@ pub async fn get_workers_capabilities(
             host,
             user,
             capabilities,
+            source_topology_mismatches,
             pressure_assessment,
             refresh,
         });
     }
 
     WorkerCapabilitiesResponse { workers: entries }
+}
+
+pub(crate) fn source_topology_mismatches(
+    history: &crate::history::BuildHistory,
+    config: &WorkerConfig,
+    capabilities: &WorkerCapabilities,
+) -> Vec<rch_common::SourceTopologyMismatch> {
+    let mut mismatches: Vec<_> = history
+        .source_topology_fences()
+        .into_iter()
+        .filter(|fence| fence.endpoint.matches_config(config))
+        .map(|fence| fence.mismatch)
+        .collect();
+    if let Some(probed) = capabilities.source_topology_mismatch()
+        && !mismatches
+            .iter()
+            .any(|recorded| recorded.topology == probed.topology)
+    {
+        mismatches.push(probed);
+    }
+    mismatches
+}
+
+/// The same read-only physical-directory predicate used by namespace
+/// initialization. No alias is created/replaced and no source grant is taken.
+fn source_topology_revalidation_command(fences: &[crate::history::SourceTopologyFence]) -> String {
+    // Define the production predicate once, in a subshell because it exits
+    // after its check. Large fleets must not repeat the entire program for
+    // every previously refused mapping.
+    let mut command = format!(
+        "set -eu\nrch_source_topology_matches() (\nset -- check \"$1\" \"$2\"\n{}\n)\n",
+        include_str!("../../rch/src/hook/source_namespace_paths.sh"),
+    );
+    for (index, fence) in fences.iter().enumerate() {
+        let topology = &fence.mismatch.topology;
+        command.push_str(&format!(
+            "if rch_source_topology_matches {} {}; then printf '%s\\n' '{index}'; fi\n",
+            shell_escape::escape(topology.canonical_root.as_str().into()),
+            shell_escape::escape(topology.alias_root.as_str().into()),
+        ));
+    }
+    command.push_str("printf 'RCH_SOURCE_TOPOLOGY_REVALIDATION_COMPLETE\\n'\n");
+    command
+}
+
+// System SSH carries `sh -c <quoted command>` in an argument. Leave margin
+// below Linux's 128 KiB single-argument limit, including the outer quoting.
+const SOURCE_TOPOLOGY_REVALIDATION_MAX_ARG_BYTES: usize = 120 * 1024;
+
+fn source_topology_revalidation_batches(
+    fences: &[crate::history::SourceTopologyFence],
+) -> Vec<(std::ops::Range<usize>, String)> {
+    let mut batches = Vec::new();
+    let mut start = 0;
+    while start < fences.len() {
+        let mut accepted = None;
+        for end in start + 1..=fences.len() {
+            let command = source_topology_revalidation_command(&fences[start..end]);
+            let argument_bytes =
+                shell_escape::escape(command.as_str().into()).len() + "sh -c ".len();
+            if argument_bytes > SOURCE_TOPOLOGY_REVALIDATION_MAX_ARG_BYTES {
+                break;
+            }
+            accepted = Some((end, command));
+        }
+        if let Some((end, command)) = accepted {
+            batches.push((start..end, command));
+            start = end;
+        } else {
+            // Corrupt or future oversized metadata cannot strand unrelated
+            // mappings. Its exclusion remains until a bounded probe is possible.
+            start += 1;
+        }
+    }
+    batches
+}
+
+fn revalidated_source_topologies(output: &rch_common::CommandResult, count: usize) -> Vec<usize> {
+    if !output.success() {
+        return Vec::new();
+    }
+    let Some(indices) = output
+        .stdout
+        .strip_suffix("RCH_SOURCE_TOPOLOGY_REVALIDATION_COMPLETE\n")
+    else {
+        return Vec::new();
+    };
+    let parsed = indices
+        .lines()
+        .map(|line| line.parse::<usize>().ok().filter(|index| *index < count))
+        .collect::<Option<Vec<_>>>();
+    parsed.unwrap_or_default()
+}
+
+async fn revalidate_source_topologies(
+    worker: &Arc<WorkerState>,
+    history: &crate::history::BuildHistory,
+) {
+    let endpoint = worker.endpoint_snapshot().await;
+    let fences = history
+        .source_topology_fences()
+        .into_iter()
+        .filter(|fence| fence.endpoint.matches_config(&endpoint.config))
+        .collect::<Vec<_>>();
+    if fences.is_empty() {
+        return;
+    }
+    let Some(mut permit) = worker.background_probe().await else {
+        return;
+    };
+    let batches = source_topology_revalidation_batches(&fences);
+    if batches.is_empty() {
+        return;
+    }
+    let mut revalidated = Vec::new();
+    let probe = async {
+        let mut client = rch_common::SshClient::new(
+            endpoint.config.clone(),
+            rch_common::SshOptions {
+                connect_timeout: Duration::from_secs(10),
+                command_timeout: Duration::from_secs(15),
+                control_master: false,
+                ..Default::default()
+            },
+        );
+        client.connect().await?;
+        let result = async {
+            for (range, command) in batches {
+                let output = client.execute(&command).await?;
+                revalidated.extend(
+                    revalidated_source_topologies(&output, range.len())
+                        .into_iter()
+                        .map(|index| range.start + index),
+                );
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        let _ = client.disconnect().await;
+        result
+    };
+    // Preserve fully acknowledged earlier batches even if a later read-only
+    // probe fails or exceeds the overall budget. Incomplete output proves
+    // nothing and never contributes an index to this list.
+    if permit
+        .run(tokio::time::timeout(Duration::from_secs(20), probe))
+        .await
+        .is_none()
+        || revalidated.is_empty()
+    {
+        return;
+    }
+    let Some(_endpoint_guard) = worker.lock_current_endpoint(&endpoint).await else {
+        return;
+    };
+    let Some(_network_guard) = worker.lock_network_publication(&permit).await else {
+        return;
+    };
+    let observed: Vec<_> = revalidated
+        .into_iter()
+        .map(|index| fences[index].clone())
+        .collect();
+    if let Err(error) = history.clear_source_topology_fences(&observed) {
+        tracing::warn!(worker = %endpoint.config.id, "could not persist source topology revalidation: {error}");
+    }
 }
 
 async fn refresh_worker_capabilities_concurrently(
@@ -3207,6 +3397,196 @@ fn worker_status_label(status: WorkerStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_topology_revalidation_batches_bound_ssh_arguments_and_keep_exact_indices() {
+        let endpoint =
+            WorkerEndpointIdentity::from_config(&recovered_worker_config("many-layouts", 8));
+        let fences = (0..64)
+            .map(|index| crate::history::SourceTopologyFence {
+                endpoint: endpoint.clone(),
+                mismatch: rch_common::SourceTopologyMismatch {
+                    topology: rch_common::SourceTopology {
+                        canonical_root: format!("/{}-canonical-{index}", "'".repeat(3500)),
+                        alias_root: format!("/{}-alias-{index}", "'".repeat(3500)),
+                    },
+                    detail: "conflicting alias base".into(),
+                },
+                build_id: index + 1,
+            })
+            .collect::<Vec<_>>();
+        for fence in &fences {
+            fence.mismatch.validate().unwrap();
+        }
+        let batches = source_topology_revalidation_batches(&fences);
+        assert!(batches.len() > 1);
+        let mut covered = Vec::new();
+        for (range, command) in batches {
+            assert!(
+                shell_escape::escape(command.as_str().into()).len() + "sh -c ".len()
+                    <= SOURCE_TOPOLOGY_REVALIDATION_MAX_ARG_BYTES
+            );
+            assert_eq!(command.matches("namespace_realpath() {").count(), 1);
+            assert_eq!(
+                command.matches("if rch_source_topology_matches ").count(),
+                range.len()
+            );
+            covered.extend(range);
+        }
+        assert_eq!(covered, (0..fences.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn source_topology_revalidation_oversized_mapping_does_not_block_other_records() {
+        let endpoint =
+            WorkerEndpointIdentity::from_config(&recovered_worker_config("bounded-layout", 8));
+        let fence = |canonical: String, build_id| crate::history::SourceTopologyFence {
+            endpoint: endpoint.clone(),
+            mismatch: rch_common::SourceTopologyMismatch {
+                topology: rch_common::SourceTopology {
+                    canonical_root: canonical,
+                    alias_root: "/alias".into(),
+                },
+                detail: "conflicting alias base".into(),
+            },
+            build_id,
+        };
+        let fences = [
+            fence("/first".into(), 1),
+            fence(
+                format!(
+                    "/{}",
+                    "x".repeat(SOURCE_TOPOLOGY_REVALIDATION_MAX_ARG_BYTES)
+                ),
+                2,
+            ),
+            fence("/last".into(), 3),
+        ];
+        // Persistence rejects this today. The builder still fails closed if
+        // oversized metadata ever reaches it, while valid peers make progress.
+        assert!(fences[1].mismatch.validate().is_err());
+        let batches = source_topology_revalidation_batches(&fences);
+        let covered = batches
+            .into_iter()
+            .flat_map(|(range, _)| range)
+            .collect::<Vec<_>>();
+        assert_eq!(covered, [0, 2]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_topology_revalidation_checks_physical_mappings_without_writing() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let canonical = temp.path().join("canonical ' $(not-a-command)");
+        let other = temp.path().join("other");
+        let alias = temp.path().join("alias");
+        let compatible_alias = temp.path().join("compatible-alias");
+        std::fs::create_dir(&canonical).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        std::fs::write(canonical.join("preserved"), b"canonical contents").unwrap();
+        std::fs::write(other.join("preserved"), b"other contents").unwrap();
+        symlink(&other, &alias).unwrap();
+        symlink(&canonical, &compatible_alias).unwrap();
+        let endpoint =
+            WorkerEndpointIdentity::from_config(&recovered_worker_config("layout-worker", 8));
+        let fence = |canonical: &std::path::Path, alias: &std::path::Path, build_id| {
+            crate::history::SourceTopologyFence {
+                endpoint: endpoint.clone(),
+                mismatch: rch_common::SourceTopologyMismatch {
+                    topology: rch_common::SourceTopology::from_policy(
+                        &rch_common::path_topology::PathTopologyPolicy::new(
+                            canonical.into(),
+                            alias.into(),
+                        ),
+                    ),
+                    detail: "conflicting alias base".into(),
+                },
+                build_id,
+            }
+        };
+        let fences = vec![
+            fence(&canonical, &alias, 1),
+            fence(&canonical, &compatible_alias, 2),
+            fence(
+                &temp.path().join("missing-canonical"),
+                &temp.path().join("missing-alias"),
+                3,
+            ),
+        ];
+        let run = || {
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(source_topology_revalidation_command(&fences))
+                .output()
+                .unwrap();
+            rch_common::CommandResult {
+                exit_code: output.status.code().unwrap_or(1),
+                stdout: String::from_utf8(output.stdout).unwrap(),
+                stderr: String::from_utf8(output.stderr).unwrap(),
+                duration_ms: 0,
+            }
+        };
+        let output = run();
+        assert_eq!(output.exit_code, 0, "{}", output.stderr);
+        assert_eq!(
+            revalidated_source_topologies(&output, fences.len()),
+            vec![1]
+        );
+        assert_eq!(std::fs::read_link(&alias).unwrap(), other);
+        assert_eq!(
+            std::fs::read(canonical.join("preserved")).unwrap(),
+            b"canonical contents"
+        );
+        assert_eq!(
+            std::fs::read(other.join("preserved")).unwrap(),
+            b"other contents"
+        );
+        assert!(!temp.path().join("missing-canonical").exists());
+        assert!(!temp.path().join("missing-alias").exists());
+
+        // Simulate a deliberate repair that preserves the previous directory
+        // and leaves the existing alias untouched. Only a fresh matching
+        // physical-directory check can make this stored refusal eligible again.
+        let preserved = temp.path().join("preserved-canonical");
+        std::fs::rename(&canonical, &preserved).unwrap();
+        symlink(&other, &canonical).unwrap();
+        let repaired = run();
+        assert_eq!(
+            revalidated_source_topologies(&repaired, fences.len()),
+            vec![0, 1]
+        );
+        assert_eq!(
+            std::fs::read(preserved.join("preserved")).unwrap(),
+            b"canonical contents"
+        );
+        assert_eq!(std::fs::read_link(&alias).unwrap(), other);
+    }
+
+    #[test]
+    fn source_topology_revalidation_requires_complete_successful_protocol() {
+        let output = |exit_code, stdout: &str| rch_common::CommandResult {
+            exit_code,
+            stdout: stdout.into(),
+            stderr: String::new(),
+            duration_ms: 0,
+        };
+        assert_eq!(
+            revalidated_source_topologies(
+                &output(0, "0\nRCH_SOURCE_TOPOLOGY_REVALIDATION_COMPLETE\n"),
+                1
+            ),
+            vec![0]
+        );
+        for response in [
+            output(1, "0\nRCH_SOURCE_TOPOLOGY_REVALIDATION_COMPLETE\n"),
+            output(0, "0\n"),
+            output(0, "1\nRCH_SOURCE_TOPOLOGY_REVALIDATION_COMPLETE\n"),
+            output(0, "0\nunknown\nRCH_SOURCE_TOPOLOGY_REVALIDATION_COMPLETE\n"),
+        ] {
+            assert!(revalidated_source_topologies(&response, 1).is_empty());
+        }
+    }
 
     fn recovered_worker_config(id: &str, slots: u32) -> WorkerConfig {
         WorkerConfig {

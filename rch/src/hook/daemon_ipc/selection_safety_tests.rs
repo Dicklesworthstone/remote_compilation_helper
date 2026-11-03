@@ -48,6 +48,7 @@ async fn query_fixture(
         false,
         &[],
         dry_run,
+        None,
     );
     let (result, ()) = timeout(Duration::from_secs(3), async {
         tokio::join!(client, server)
@@ -144,6 +145,7 @@ async fn failures_before_connect_do_not_invent_unconfirmed_ownership() {
                 &[],
                 false,
                 &[],
+                None,
             )
             .await
             .unwrap_err();
@@ -325,6 +327,7 @@ async fn unrequested_fixture(
         false,
         &[],
         dry_run,
+        None,
     );
     timeout(Duration::from_secs(3), async {
         tokio::join!(client, server)
@@ -474,6 +477,7 @@ async fn resuming_query_fixture(
         true,
         &tools,
         dry_run,
+        None,
     );
     let result = timeout(Duration::from_secs(3), async {
         tokio::join!(client, server)

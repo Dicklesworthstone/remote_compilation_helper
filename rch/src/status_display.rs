@@ -1375,6 +1375,7 @@ mod tests {
             },
             workers: vec![
                 WorkerStatusFromApi {
+                    source_topology_mismatches: Vec::new(),
                     id: "worker-a".to_string(),
                     host: "10.0.0.1".to_string(),
                     user: "ubuntu".to_string(),
@@ -1403,6 +1404,7 @@ mod tests {
                     bypass: None,
                 },
                 WorkerStatusFromApi {
+                    source_topology_mismatches: Vec::new(),
                     id: "worker-b".to_string(),
                     host: "10.0.0.2".to_string(),
                     user: "ubuntu".to_string(),

@@ -4814,6 +4814,7 @@ async fn test_daemon_query_missing_socket() {
         &[],
         false,
         &[],
+        None,
     )
     .await;
     assert!(result.is_err());
@@ -6014,6 +6015,7 @@ async fn retry_failover_socket_preserves_endpoint_and_admission_constraints() {
             &[WorkerId::new("next-worker")],
             true,
             &["git".into(), "cmake".into()],
+            &rch_common::SourceTopology::from_policy(&PathTopologyPolicy::default()),
             &writer,
             true,
             &HookReporter::new(OutputVisibility::None),
@@ -6025,9 +6027,15 @@ async fn retry_failover_socket_preserves_endpoint_and_admission_constraints() {
     })
     .await
     .unwrap();
-    let response = response.unwrap().unwrap();
-    assert!(selection_cancelled_before_start(&response.0));
-    assert_eq!(response.1, WorkerId::new("next-worker"));
+    let RetryWorkerSelection::Selected {
+        response,
+        worker_id,
+    } = response.unwrap()
+    else {
+        panic!("retry cancellation must preserve the selection response");
+    };
+    assert!(selection_cancelled_before_start(&response));
+    assert_eq!(worker_id, WorkerId::new("next-worker"));
     assert_eq!(read_retry_lease(&writer).phase, "selection_pending");
 }
 
@@ -6083,6 +6091,7 @@ async fn queued_selection_lost_or_malformed_response_never_reaches_recovery() {
                 &[],
                 false,
                 &[],
+                None,
             )
             .await
         };
@@ -6155,6 +6164,7 @@ async fn queued_selection_preconnect_failure_preserves_recovery() {
             &[],
             false,
             &[],
+            None,
         )
         .await
         .unwrap_err();
@@ -6252,6 +6262,7 @@ async fn test_daemon_query_protocol() {
         &[],
         false,
         &[],
+        None,
     )
     .await;
 
@@ -6344,6 +6355,7 @@ async fn test_daemon_query_sends_preferred_workers() {
         &preferred,
         false,
         &[],
+        None,
     )
     .await;
 
@@ -6450,6 +6462,7 @@ async fn test_daemon_query_releases_worker_outside_requested_set() {
         &[WorkerId::new("requested")],
         false,
         &[],
+        None,
     )
     .await
     .expect("query should return a structured refusal");
@@ -6552,6 +6565,7 @@ async fn test_daemon_query_surfaces_unacknowledged_unrequested_worker_release() 
         &[WorkerId::new("requested")],
         false,
         &[],
+        None,
     )
     .await
     .expect_err("an unacknowledged release must not look like a safe ordinary refusal (9ec9b32f)");
@@ -6650,6 +6664,7 @@ async fn test_daemon_query_wait_parameters() {
         &[],
         false,
         &[],
+        None,
     )
     .await;
 
@@ -6725,6 +6740,7 @@ async fn test_daemon_query_url_encoding() {
         &[],
         false,
         &[],
+        None,
     )
     .await;
     daemon_handle.await.expect("Daemon task");
@@ -8241,6 +8257,138 @@ fn namespace_preflight_marker_preserves_source_busy_and_unconfirmed_precedence()
         RemotePipelineFailurePolicy::FailClosedNoLocalFallback
     );
     assert!(read_retry_lease(&writer).exit_code.is_none());
+}
+
+#[test]
+fn namespace_topology_report_requires_exact_preflight_owner_and_preserves_uncertainty() {
+    let _guard = test_guard!();
+    let retained = tempfile::tempdir().unwrap().keep();
+    let writer = queued_selection_test_lease(retained.join("topology.json"));
+    let worker = WorkerId::new("incompatible-worker");
+    writer.admit(41, &worker).unwrap();
+    let wrapper = writer.wrapper_id();
+    let mismatch = rch_common::SourceTopologyMismatch {
+        topology: rch_common::SourceTopology {
+            canonical_root: "/Users/dispatcher/projects".into(),
+            alias_root: "/dp".into(),
+        },
+        detail: "canonical=/Users/dispatcher/projects alias_physical=/data/projects".into(),
+    };
+    let failure = transfer_orchestration::SourceTopologyIncompatible {
+        worker_id: worker.clone(),
+        mismatch: mismatch.clone(),
+    };
+    // A typed verdict without the admitted journal's preflight checkpoint may
+    // not publish a durable worker exclusion through the release path.
+    let result = Err(anyhow::Error::new(failure.clone()));
+    assert!(source_topology_preflight_failure(result.as_ref().unwrap_err(), &worker).is_none());
+    assert!(
+        remote_release_faults(&result, &worker)
+            .source_topology_mismatch
+            .is_none()
+    );
+    let error = writer.source_namespace_preflight_failed(
+        &worker,
+        Some(41),
+        Some(&wrapper),
+        SourceNamespacePreflightStage::NamespaceInitialization,
+        anyhow::Error::new(failure),
+    );
+    let result = Err(error);
+    let faults = remote_release_faults(&result, &worker);
+    assert!(faults.worker_fault);
+    assert!(!faults.source_busy);
+    assert_eq!(faults.source_topology_mismatch, Some(&mismatch));
+    assert!(source_topology_preflight_failure(result.as_ref().unwrap_err(), &worker).is_some());
+    assert!(
+        source_topology_preflight_failure(
+            result.as_ref().unwrap_err(),
+            &WorkerId::new("different-worker")
+        )
+        .is_none()
+    );
+    assert!(
+        remote_release_faults(&result, &WorkerId::new("different-worker"))
+            .source_topology_mismatch
+            .is_none()
+    );
+    let result = result.map_err(|error| error.context(crate::transfer::RemoteExecutionUnconfirmed));
+    assert!(source_topology_preflight_failure(result.as_ref().unwrap_err(), &worker).is_none());
+    assert!(
+        remote_release_faults(&result, &worker)
+            .source_topology_mismatch
+            .is_none()
+    );
+    assert_eq!(
+        classify_remote_pipeline_failure(result.as_ref().unwrap_err()),
+        RemotePipelineFailurePolicy::FailClosedNoLocalFallback
+    );
+    assert!(read_retry_lease(&writer).exit_code.is_none());
+}
+
+#[test]
+fn topology_selection_refusal_is_typed_and_never_described_as_retryable() {
+    let response = |reason| SelectionResponse {
+        worker: None,
+        reason,
+        build_id: None,
+        diagnostics: None,
+    };
+    let summary =
+        source_topology_selection_refusal(&response(SelectionReason::SourceTopologyIncompatible))
+            .unwrap();
+    assert!(summary.contains("source topology incompatible"));
+    assert!(summary.contains("rch workers capabilities --refresh"));
+    assert!(!summary.contains("retryable"));
+    assert!(
+        source_topology_selection_refusal(&response(SelectionReason::AllWorkersBusy)).is_none()
+    );
+    assert!(
+        source_topology_selection_refusal(&response(SelectionReason::SelectionError(
+            "source topology incompatible".into(),
+        )))
+        .is_none(),
+        "arbitrary error prose must not become a permanent verdict"
+    );
+    let wire =
+        parse_selection_response(r#"{"worker":null,"reason":"source_topology_incompatible"}"#)
+            .unwrap();
+    assert_eq!(wire.reason, SelectionReason::SourceTopologyIncompatible);
+    assert!(source_topology_selection_refusal(&wire).is_some());
+}
+
+#[test]
+fn selection_topology_matches_normal_isolated_and_off_root_namespace_initialization() {
+    let base = "/var/tmp/rch-test-staging";
+    let controller = PathTopologyPolicy::new(
+        PathBuf::from("/Users/dispatcher/projects"),
+        PathBuf::from("/dp"),
+    );
+    for (policy, isolated, receipt) in [
+        (controller.clone(), false, false),
+        (controller.clone(), true, false),
+        (controller.clone(), false, true),
+        (controller.with_off_root(true), false, false),
+    ] {
+        let source = if policy.is_off_root() && !isolated && !receipt {
+            policy
+                .offroot_worker_canonical_root(base)
+                .unwrap()
+                .join("app")
+        } else if isolated || receipt {
+            PathBuf::from(base).join("app")
+        } else {
+            policy.canonical_root().join("app")
+        };
+        let remote =
+            ssh::remote_preflight_topology_policy(&policy, isolated, receipt, base, &[source])
+                .unwrap();
+        assert_eq!(
+            rch_common::SourceTopology::for_worker_namespace(&policy, isolated || receipt, base)
+                .unwrap(),
+            rch_common::SourceTopology::from_policy(&remote),
+        );
+    }
 }
 
 #[tokio::test]
@@ -14229,6 +14377,7 @@ async fn test_daemon_query_connect_timeout_fail_open() {
         &[],
         false,
         &[],
+        None,
     )
     .await;
 
@@ -14348,6 +14497,7 @@ async fn test_daemon_query_partial_response_timeout() {
         &[],
         false,
         &[],
+        None,
     )
     .await;
 

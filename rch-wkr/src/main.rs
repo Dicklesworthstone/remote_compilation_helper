@@ -678,6 +678,10 @@ async fn probe_capabilities(tool_probe: Option<&str>) -> WorkerCapabilities {
     let (canonical_root, alias_root) = resolved_topology_roots();
     let (topology_ok, topology_issue) = probe_projects_topology(&canonical_root, &alias_root);
     capabilities.projects_root_ok = Some(topology_ok);
+    let topology = rch_common::SourceTopology::from_policy(
+        &rch_common::path_topology::PathTopologyPolicy::new(canonical_root, alias_root),
+    );
+    capabilities.projects_root_topology = topology.validate().is_ok().then_some(topology);
     capabilities.projects_root_issue = topology_issue;
     capabilities.projects_root_checked_at_unix_ms = Some(current_unix_ms());
 
@@ -1925,7 +1929,9 @@ fn probe_projects_topology(
     canonical_root: &std::path::Path,
     alias_root: &std::path::Path,
 ) -> (bool, Option<String>) {
-    let canonical_meta = match std::fs::symlink_metadata(canonical_root) {
+    // The namespace accepts any directory spelling with the same physical
+    // target, including a canonical symlink. Inspect its target, not the link.
+    let canonical_meta = match std::fs::metadata(canonical_root) {
         Ok(meta) => meta,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return (false, Some("canonical_missing".to_string()));
@@ -1938,20 +1944,20 @@ fn probe_projects_topology(
         return (false, Some("canonical_not_directory".to_string()));
     }
 
-    // The canonical↔alias dual-root symlink convention is Unix-only (rch#15).
+    // The canonical↔alias dual-root convention is Unix-only (rch#15).
     // Windows workers use a single build base (e.g. C:/rch) with no alias, so
     // requiring an alias symlink there would fail every Windows worker's
-    // preflight. `validate_alias_symlink` enforces the symlink on Unix and is a
-    // no-op on other platforms (the caller's canonical dir check is sufficient).
-    validate_alias_symlink(canonical_root, alias_root)
+    // preflight. Unix requires equal physical directories; other platforms
+    // need only the caller's canonical directory check.
+    validate_alias_directory(canonical_root, alias_root)
 }
 
 #[cfg(unix)]
-fn validate_alias_symlink(
+fn validate_alias_directory(
     canonical_root: &std::path::Path,
     alias_root: &std::path::Path,
 ) -> (bool, Option<String>) {
-    let alias_meta = match std::fs::symlink_metadata(alias_root) {
+    let alias_meta = match std::fs::metadata(alias_root) {
         Ok(meta) => meta,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return (false, Some("alias_missing".to_string()));
@@ -1960,29 +1966,25 @@ fn validate_alias_symlink(
             return (false, Some(format!("alias_probe_error:{err}")));
         }
     };
-    if !alias_meta.file_type().is_symlink() {
-        return (false, Some("alias_not_symlink".to_string()));
+    if !alias_meta.file_type().is_dir() {
+        return (false, Some("alias_not_directory".to_string()));
     }
 
-    let alias_target = match std::fs::read_link(alias_root) {
-        Ok(target) => target,
-        Err(err) => return (false, Some(format!("alias_readlink_error:{err}"))),
+    let canonical_real = match std::fs::canonicalize(canonical_root) {
+        Ok(path) => path,
+        Err(error) => return (false, Some(format!("canonical_resolve_error:{error}"))),
     };
-    let resolved_target = if alias_target.is_absolute() {
-        alias_target
-    } else if let Some(parent) = alias_root.parent() {
-        parent.join(alias_target)
-    } else {
-        alias_target
+    let target_real = match std::fs::canonicalize(alias_root) {
+        Ok(path) => path,
+        Err(error) => return (false, Some(format!("alias_resolve_error:{error}"))),
     };
-
-    let canonical_real =
-        std::fs::canonicalize(canonical_root).unwrap_or_else(|_| canonical_root.to_path_buf());
-    let target_real = std::fs::canonicalize(&resolved_target).unwrap_or(resolved_target);
     if canonical_real != target_real {
         return (
             false,
-            Some(format!("alias_wrong_target:{}", target_real.display())),
+            Some(format!(
+                "alias_wrong_target:{}",
+                target_real.to_string_lossy().escape_debug()
+            )),
         );
     }
 
@@ -1990,7 +1992,7 @@ fn validate_alias_symlink(
 }
 
 #[cfg(not(unix))]
-fn validate_alias_symlink(
+fn validate_alias_directory(
     _canonical_root: &std::path::Path,
     _alias_root: &std::path::Path,
 ) -> (bool, Option<String>) {
@@ -2905,14 +2907,14 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_probe_projects_topology_alias_not_symlink() {
+    fn test_probe_projects_topology_conflicting_real_alias() {
         let _guard = test_guard!();
         let (base, canonical, alias) = make_temp_topology_paths("alias-not-symlink");
         std::fs::create_dir_all(&alias).expect("create alias directory");
 
         let (ok, issue) = probe_projects_topology(&canonical, &alias);
         assert!(!ok);
-        assert_eq!(issue.as_deref(), Some("alias_not_symlink"));
+        assert!(issue.as_deref().unwrap().starts_with("alias_wrong_target:"));
 
         std::fs::remove_dir_all(&base).expect("cleanup temp topology");
     }
@@ -2936,6 +2938,27 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&base).expect("cleanup temp topology");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_probe_projects_topology_accepts_matching_physical_directory_spellings() {
+        let temporary = tempfile::tempdir().unwrap();
+        let physical = temporary.path().join("physical");
+        let canonical = temporary.path().join("canonical");
+        let alias = temporary.path().join("alias");
+        std::fs::create_dir(&physical).unwrap();
+        std::os::unix::fs::symlink(&physical, &canonical).unwrap();
+        std::os::unix::fs::symlink(&physical, &alias).unwrap();
+        for (canonical, alias) in [
+            (&canonical, &alias),
+            (&canonical, &physical),
+            (&physical, &physical),
+        ] {
+            assert_eq!(probe_projects_topology(canonical, alias), (true, None));
+        }
+        assert_eq!(std::fs::read_link(&canonical).unwrap(), physical);
+        assert_eq!(std::fs::read_link(&alias).unwrap(), physical);
     }
 
     #[test]

@@ -691,6 +691,14 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
             toolchain.as_ref(),
             required_runtime,
             &preferred_workers,
+            Some(
+                &rch_common::SourceTopology::for_worker_namespace(
+                    &topology_policy,
+                    false,
+                    &config.transfer.remote_base,
+                )
+                .map_err(anyhow::Error::msg)?,
+            ),
         )
         .await
         {
@@ -1334,7 +1342,7 @@ pub(super) fn refine_admit_from_selection(
     let category = match &selection.reason {
         R::AllWorkersBusy => C::InsufficientSlots,
         R::AllWorkersUnreachable | R::AllCircuitsOpen | R::NoWorkersPassedHealth => C::CircuitOpen,
-        R::AllWorkersFailedPreflight => C::HardPreflight,
+        R::AllWorkersFailedPreflight | R::SourceTopologyIncompatible => C::HardPreflight,
         R::AllWorkersFailedConvergence => C::ActiveProjectExclusion,
         R::NoMatchingWorkers | R::NoWorkersConfigured => C::ProjectExcluded,
         R::NoWorkersWithRuntime(_) => C::MissingRuntime,
@@ -1476,6 +1484,14 @@ pub async fn admit(
                 required_runtime: required_runtime_for_kind(kind),
                 job_mode: job,
                 required_tools: pf.required.needs_tools.clone(),
+                source_topology: Some(
+                    rch_common::SourceTopology::for_worker_namespace(
+                        &topology_policy,
+                        false,
+                        &config.transfer.remote_base,
+                    )
+                    .map_err(anyhow::Error::msg)?,
+                ),
             };
             match query_admission_preview(&config.general.socket_path, &request).await {
                 Ok(preview) => {

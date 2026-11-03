@@ -49,10 +49,15 @@ pub struct PreviewRequest {
     pub job_mode: bool,
     #[serde(default)]
     pub required_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_topology: Option<crate::SourceTopology>,
 }
 
 impl PreviewRequest {
     pub fn validate(&self) -> Result<(), PreviewError> {
+        if let Some(topology) = &self.source_topology {
+            topology.validate().map_err(PreviewError::InvalidRequest)?;
+        }
         if self.protocol_version != PROTOCOL_VERSION {
             return Err(PreviewError::Version(self.protocol_version));
         }
@@ -97,6 +102,7 @@ impl PreviewRequest {
             classification_duration_us: None,
             job_mode: self.job_mode,
             required_tools: self.required_tools,
+            source_topology: self.source_topology,
             hook_pid: None,
         })
     }
@@ -209,6 +215,7 @@ mod tests {
 
     fn request() -> PreviewRequest {
         PreviewRequest {
+            source_topology: None,
             protocol_version: PROTOCOL_VERSION,
             project: "project with spaces".into(),
             command: "env NOTE='a&b=c+%? λ\\n' cargo +nightly check".into(),

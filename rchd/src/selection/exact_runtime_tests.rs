@@ -50,6 +50,7 @@ fn versioned_selector(config: SelectionConfig) -> WorkerSelector {
 
 fn request(runtime: RequiredRuntime, requirement: &str) -> SelectionRequest {
     SelectionRequest {
+        source_topology: None,
         job_mode: true,
         project: "exact-runtime-fixture".to_owned(),
         command: Some(match runtime {

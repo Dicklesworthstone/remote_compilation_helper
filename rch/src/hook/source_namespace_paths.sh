@@ -13,6 +13,28 @@ namespace_refuse() {
     exit 73
 }
 
+namespace_incompatible() {
+    # This verdict means a fixed path mapping cannot be admitted. Keep it
+    # distinct from registry contention and uncertain setup/teardown failures.
+    printf 'RCH_SOURCE_TOPOLOGY_INCOMPATIBLE: %s\n' "$1" >&2
+    if [ -z "${canonical_physical-}" ]; then
+        canonical_physical=$(namespace_realpath "$canonical") || canonical_physical='<unresolved>'
+    fi
+    if [ -z "${alias_physical-}" ]; then
+        alias_physical=$(namespace_realpath "$alias") || alias_physical='<unresolved>'
+    fi
+    # Only path metadata is printed. JSON quoting keeps control characters,
+    # quotes and shell metacharacters from becoming terminal/protocol input.
+    python3 -I -S -c '
+import json, sys
+print("RCH_SOURCE_TOPOLOGY_PATHS " + json.dumps(dict(zip(
+    ("canonical", "canonical_physical", "alias", "alias_physical"), sys.argv[1:]
+)), ensure_ascii=True))
+' "$canonical" "${canonical_physical-}" "$alias" "${alias_physical-}" >&2 \
+        || printf 'RCH: source namespace: physical mapping diagnostic unavailable\n' >&2
+    namespace_refuse "$2"
+}
+
 namespace_realpath() {
     # Preserve the trailing delimiter and refuse an ambiguous symlink target.
     # Command substitution alone would silently remove embedded final newlines.
@@ -48,12 +70,14 @@ fi
 if [ -e "$alias" ] || [ -L "$alias" ]; then
     canonical_physical=$(namespace_realpath "$canonical") || namespace_refuse 'unresolvable canonical base'
     alias_physical=$(namespace_realpath "$alias") || namespace_refuse 'unresolvable alias base'
-    [ "$canonical_physical" = "$alias_physical" ] || namespace_refuse 'conflicting alias base'
+    [ "$canonical_physical" = "$alias_physical" ] \
+        || namespace_incompatible conflicting_alias_base 'conflicting alias base'
 fi
 if [ ! -e "$canonical" ] && [ ! -L "$canonical" ]; then
     mkdir -p -- "$canonical" || namespace_refuse 'cannot create canonical base'
 fi
-[ -d "$canonical" ] || namespace_refuse 'canonical base is not a directory'
+[ -d "$canonical" ] \
+    || namespace_incompatible canonical_not_directory 'canonical base is not a directory'
 if [ ! -e "$alias" ] && [ ! -L "$alias" ]; then
     # No overwrite and no implicit directory target. A competing initializer
     # may win only by establishing the exact same mapping, checked below.

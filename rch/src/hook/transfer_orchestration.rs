@@ -69,6 +69,7 @@ pub(crate) mod recovery;
 
 #[path = "source_namespace.rs"]
 mod source_namespace;
+pub(super) use source_namespace::SourceTopologyIncompatible;
 
 /// Read the durable completion receipt after the execution SSH session exits.
 ///

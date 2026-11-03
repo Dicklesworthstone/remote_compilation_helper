@@ -39,6 +39,18 @@ struct DurableOwnership {
     /// never persisted its queue, not that a version-2 queue may be discarded.
     #[serde(default)]
     queued: Option<VecDeque<QueuedBuildState>>,
+    /// Deterministic refusals have no time expiry. Only an exact, successful
+    /// read-only revalidation of this endpoint and mapping clears one.
+    #[serde(default)]
+    source_topology_fences: Vec<SourceTopologyFence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SourceTopologyFence {
+    pub endpoint: WorkerEndpointIdentity,
+    pub mismatch: rch_common::SourceTopologyMismatch,
+    pub build_id: u64,
 }
 
 /// Cancellation and admission compete under the same ownership lock.
@@ -65,6 +77,8 @@ const MAX_TERMINAL_RECEIPTS: usize = 500;
 struct TerminalOwnership {
     record: BuildRecord,
     local_wrapper_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_topology_mismatch: Option<rch_common::SourceTopologyMismatch>,
     /// Completion must not erase an owner-validated infrastructure fault
     /// before its worker quarantine is durable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -217,6 +231,10 @@ pub struct ActiveBuildState {
     /// retargeted while the build runs; missing legacy coordinates stay unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) worker_endpoint: Option<WorkerEndpointSnapshot>,
+    /// Pre-execution refusal published before release, retained even if an
+    /// explicit revalidation repairs the mapping before completion is retried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) source_topology_mismatch: Option<rch_common::SourceTopologyMismatch>,
     pub started_at: String,
     #[serde(skip, default = "Instant::now")]
     pub started_at_mono: Instant,
@@ -389,6 +407,8 @@ pub struct BuildHistory {
     /// (project, worker) pairs whose source another owner held past the
     /// admission wait, and when (bd-p3kuz). Transient.
     source_busy_fences: Mutex<HashMap<(String, String), Instant>>,
+    /// Access while holding `active` for writes, like durable ownership.
+    source_topology_fences: Mutex<Vec<SourceTopologyFence>>,
     /// Queued builds (waiting for workers). Membership changes take `active`
     /// first, so queue departure, cancellation and admission share one commit.
     queued: RwLock<VecDeque<QueuedBuildState>>,
@@ -444,6 +464,7 @@ impl BuildHistory {
             source_fences: Mutex::new(Vec::new()),
             live_checkout_fences: Mutex::new(HashMap::new()),
             source_busy_fences: Mutex::new(HashMap::new()),
+            source_topology_fences: Mutex::new(Vec::new()),
             queued: RwLock::new(VecDeque::new()),
             queue_hold: Mutex::new(None),
             capacity,
@@ -579,6 +600,7 @@ impl BuildHistory {
             worker_id,
             command,
             worker_endpoint: None,
+            source_topology_mismatch: None,
             started_at: started_at.clone(),
             hook_process_identity: process_identity(hook_pid),
             started_at_mono,
@@ -739,6 +761,7 @@ impl BuildHistory {
             command,
             worker_endpoint,
             started_at: started_at.clone(),
+            source_topology_mismatch: None,
             hook_process_identity: process_identity(hook_pid),
             started_at_mono,
             hook_pid,
@@ -1409,6 +1432,150 @@ impl BuildHistory {
             .filter(|(project, _)| project == project_id)
             .map(|(_, worker)| worker.clone())
             .collect()
+    }
+
+    /// Publish permanent topology evidence before the refusing attempt can
+    /// release its reservation. Only that attempt's exact pre-execution owner
+    /// may do so; a duplicate release cannot invent a new terminal fault.
+    pub(crate) fn record_source_topology_mismatch(
+        &self,
+        build_id: u64,
+        worker_id: &str,
+        wrapper: Option<&str>,
+        mismatch: &rch_common::SourceTopologyMismatch,
+    ) -> std::io::Result<()> {
+        mismatch
+            .validate()
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        let mut active = self
+            .active
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(state) = active.get_mut(&build_id) else {
+            let terminal = self
+                .terminal
+                .read()
+                .unwrap_or_else(|error| error.into_inner());
+            if terminal.get(&build_id).is_some_and(|receipt| {
+                receipt.record.worker_id.as_deref() == Some(worker_id)
+                    && receipt.local_wrapper_id.as_deref() == wrapper
+                    && (receipt.source_topology_mismatch.as_ref() == Some(mismatch)
+                        // Cancellation may win the completion race before a
+                        // delayed refusal arrives. Its receipt is authoritative;
+                        // acknowledge it without inventing a new exclusion.
+                        || receipt.record.exit_code == 130
+                        || receipt.record.cancellation.is_some())
+            }) {
+                return Ok(());
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "terminal source topology report differs from the original owner-validated refusal",
+            ));
+        };
+        if state.worker_id != worker_id || state.local_wrapper_id.as_deref() != wrapper {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "source topology report ownership mismatch",
+            ));
+        }
+        if state.location != BuildLocation::Remote || state.remote_command_started() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "source topology refusal must precede remote command execution",
+            ));
+        }
+        if self.ownership_failed() {
+            return Err(std::io::Error::other(
+                "durable ownership uncertain; restart required",
+            ));
+        }
+        if let Some(original) = &state.source_topology_mismatch {
+            return if original == mismatch {
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "source topology refusal changed before release",
+                ))
+            };
+        }
+        let endpoint = state.worker_endpoint.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "source topology refusal requires the admitted worker endpoint",
+            )
+        })?;
+        let fence = SourceTopologyFence {
+            endpoint: WorkerEndpointIdentity::from_config(&endpoint.config),
+            mismatch: mismatch.clone(),
+            build_id,
+        };
+        {
+            let mut fences = self
+                .source_topology_fences
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(previous) = fences.iter_mut().find(|previous| {
+                previous.endpoint == fence.endpoint
+                    && previous.mismatch.topology == fence.mismatch.topology
+            }) {
+                *previous = fence;
+            } else {
+                if fences.len() >= SOURCE_FENCE_LIMIT {
+                    self.ownership_failed.store(true, Ordering::SeqCst);
+                    return Err(std::io::Error::other(
+                        "source topology refusal capacity exhausted",
+                    ));
+                }
+                fences.push(fence);
+            }
+        }
+        state.source_topology_mismatch = Some(mismatch.clone());
+        // A failed commit closes admission through ownership_failed. Keeping
+        // the conservative in-memory fence never claims disk publication.
+        self.persist_ownership(&active, None)
+    }
+
+    pub(crate) fn source_topology_fences(&self) -> Vec<SourceTopologyFence> {
+        self.source_topology_fences
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_source_topology_fence(
+        &self,
+        observed: &SourceTopologyFence,
+    ) -> std::io::Result<()> {
+        self.clear_source_topology_fences(std::slice::from_ref(observed))
+    }
+
+    /// Clear only exact records inspected by successful read-only probes.
+    /// A newer refusal arriving during a probe must survive it. Publish once
+    /// per refresh, so a large set cannot cause hundreds of full ledger fsyncs.
+    pub(crate) fn clear_source_topology_fences(
+        &self,
+        observed: &[SourceTopologyFence],
+    ) -> std::io::Result<()> {
+        let active = self
+            .active
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.ownership_failed() {
+            return Err(std::io::Error::other(
+                "durable ownership uncertain; restart required",
+            ));
+        }
+        {
+            let mut fences = self
+                .source_topology_fences
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            fences.retain(|fence| !observed.contains(fence));
+        }
+        self.persist_ownership(&active, None)
     }
 
     // =========================================================================
@@ -2144,11 +2311,44 @@ impl BuildHistory {
         let mut queued = VecDeque::new();
         let mut cancelled_wrappers = HashSet::new();
         let mut next_queue_id = None;
+        let mut source_topology_fences = Vec::new();
         let mut ownership_existed = false;
         match File::open(&ownership_path) {
             Ok(file) => {
                 ownership_existed = true;
                 let snapshot: DurableOwnership = serde_json::from_reader(file)?;
+                if snapshot.source_topology_fences.len() > SOURCE_FENCE_LIMIT {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "source topology refusal capacity exceeded",
+                    ));
+                }
+                let mut topology_keys = HashSet::new();
+                for fence in &snapshot.source_topology_fences {
+                    fence.mismatch.validate().map_err(|error| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                    })?;
+                    if fence.endpoint.id.as_str().is_empty()
+                        || fence.endpoint.host.is_empty()
+                        || fence.build_id == 0
+                        || fence.build_id >= QUEUE_ID_NAMESPACE
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "invalid source topology fence identity",
+                        ));
+                    }
+                    if !topology_keys
+                        .insert((fence.endpoint.clone(), fence.mismatch.topology.clone()))
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "duplicate source topology refusal identity",
+                        ));
+                    }
+                    max_id = max_id.max(fence.build_id);
+                }
+                source_topology_fences = snapshot.source_topology_fences;
                 queued = match (snapshot.version, snapshot.queued) {
                     (1, None) => VecDeque::new(),
                     (2, Some(queue)) if snapshot.next_queue_id.is_some() => queue,
@@ -2184,6 +2384,20 @@ impl BuildHistory {
                 // contradictory evidence into an apparently valid snapshot.
                 let mut active_wrappers = HashSet::new();
                 for mut state in snapshot.active {
+                    if let Some(mismatch) = &state.source_topology_mismatch {
+                        mismatch.validate().map_err(|error| {
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                        })?;
+                        if state.location != BuildLocation::Remote
+                            || state.remote_command_started()
+                            || state.worker_endpoint.is_none()
+                        {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "invalid active source topology refusal",
+                            ));
+                        }
+                    }
                     if state.id == 0
                         || state.id >= QUEUE_ID_NAMESPACE
                         || state.worker_id.is_empty()
@@ -2223,6 +2437,19 @@ impl BuildHistory {
                 }
                 for receipt in snapshot.completed {
                     let id = receipt.record.id;
+                    if let Some(mismatch) = &receipt.source_topology_mismatch {
+                        mismatch.validate().map_err(|error| {
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                        })?;
+                        if receipt.record.exit_code == 0
+                            || receipt.record.location != BuildLocation::Remote
+                        {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "invalid terminal source topology refusal",
+                            ));
+                        }
+                    }
                     if receipt.pending_disk_fault.is_some()
                         && receipt.unapplied_disk_fault.is_some()
                     {
@@ -2349,6 +2576,7 @@ impl BuildHistory {
             source_fences: Mutex::new(Vec::new()),
             live_checkout_fences: Mutex::new(HashMap::new()),
             source_busy_fences: Mutex::new(HashMap::new()),
+            source_topology_fences: Mutex::new(source_topology_fences),
             queued: RwLock::new(queued),
             queue_hold: Mutex::new(None),
             capacity,
@@ -2651,6 +2879,12 @@ impl BuildHistory {
                 "build ownership mismatch",
             ));
         }
+        if state.source_topology_mismatch.is_some() && exit_code == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "source topology refusal cannot complete successfully",
+            ));
+        }
         let record = BuildRecord {
             id: state.id,
             started_at: state.started_at.clone(),
@@ -2712,6 +2946,7 @@ impl BuildHistory {
         let receipt = TerminalOwnership {
             record: record.clone(),
             local_wrapper_id: state.local_wrapper_id.clone(),
+            source_topology_mismatch: state.source_topology_mismatch.clone(),
             pending_disk_fault,
             unapplied_disk_fault,
         };
@@ -2850,6 +3085,11 @@ impl BuildHistory {
                 .clone(),
             next_queue_id: Some(self.next_queue_id.load(Ordering::SeqCst)),
             queued: Some(queued.clone()),
+            source_topology_fences: self
+                .source_topology_fences
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone(),
         };
         let parent = path
             .parent()
@@ -3120,6 +3360,225 @@ mod tests {
         assert_eq!(
             history.source_busy_fenced_workers("mtdt"),
             HashSet::from(["vmi1293453".to_owned()])
+        );
+    }
+
+    async fn source_topology_test_admission(
+        history: &BuildHistory,
+        owner: &str,
+    ) -> ActiveBuildState {
+        let worker = crate::workers::WorkerState::new(rch_common::WorkerConfig {
+            id: WorkerId::new("layout-worker"),
+            host: "layout-host".into(),
+            user: "builder".into(),
+            identity_file: "~/.ssh/id_ed25519".into(),
+            total_slots: 8,
+            priority: 100,
+            tags: vec![],
+            tools: vec![],
+        });
+        history
+            .try_start_active_build_with_waiter(
+                format!("project-{owner}"),
+                "layout-worker".into(),
+                "cargo check".into(),
+                std::process::id(),
+                Some(owner.into()),
+                1,
+                BuildLocation::Remote,
+                None,
+                DiskHeadroomAdmission::default(),
+                Some(worker.endpoint_snapshot().await),
+            )
+            .unwrap()
+            .unwrap()
+    }
+
+    fn source_topology_test_mismatch() -> rch_common::SourceTopologyMismatch {
+        rch_common::SourceTopologyMismatch {
+            topology: rch_common::SourceTopology {
+                canonical_root: "/Users/dispatcher/projects".into(),
+                alias_root: "/dp".into(),
+            },
+            detail: "conflicting alias base: /dp -> /data/projects".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn source_topology_revalidation_cannot_clear_a_newer_owned_refusal() {
+        let temporary = TempDir::new().unwrap();
+        let path = temporary.path().join("history.jsonl");
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        let mismatch = source_topology_test_mismatch();
+        let first = source_topology_test_admission(&history, "first").await;
+        history
+            .record_source_topology_mismatch(first.id, "layout-worker", Some("first"), &mismatch)
+            .unwrap();
+        let observed = history.source_topology_fences().pop().unwrap();
+        let second = source_topology_test_admission(&history, "second").await;
+        history
+            .record_source_topology_mismatch(second.id, "layout-worker", Some("second"), &mismatch)
+            .unwrap();
+        let mut observations = vec![observed];
+        for owner in ["third", "fourth"] {
+            let admitted = source_topology_test_admission(&history, owner).await;
+            let mut other_mapping = mismatch.clone();
+            other_mapping.topology.alias_root = format!("/alias-{owner}");
+            history
+                .record_source_topology_mismatch(
+                    admitted.id,
+                    "layout-worker",
+                    Some(owner),
+                    &other_mapping,
+                )
+                .unwrap();
+            observations.push(
+                history
+                    .source_topology_fences()
+                    .into_iter()
+                    .find(|fence| fence.build_id == admitted.id)
+                    .unwrap(),
+            );
+        }
+        assert_eq!(history.source_topology_fences().len(), 3);
+        // Two current mappings clear together; the newer refusal replacing
+        // the first inspected mapping must survive the same atomic commit.
+        history.clear_source_topology_fences(&observations).unwrap();
+        assert_eq!(history.source_topology_fences().len(), 1);
+        assert_eq!(history.source_topology_fences()[0].build_id, second.id);
+        let restored = BuildHistory::load_from_file(&path, 10).unwrap();
+        assert_eq!(
+            restored.source_topology_fences(),
+            history.source_topology_fences()
+        );
+        let current = restored.source_topology_fences().pop().unwrap();
+        restored.clear_source_topology_fence(&current).unwrap();
+        // A repeated release report from a live owner is also idempotent.
+        restored
+            .record_source_topology_mismatch(second.id, "layout-worker", Some("second"), &mismatch)
+            .unwrap();
+        assert!(restored.source_topology_fences().is_empty());
+    }
+
+    #[tokio::test]
+    async fn source_topology_uncertain_publication_closes_admission_until_restart() {
+        let temporary = TempDir::new().unwrap();
+        let path = temporary.path().join("history.jsonl");
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        let owner = source_topology_test_admission(&history, "owner").await;
+        let mismatch = source_topology_test_mismatch();
+        history
+            .fail_after_ownership_rename
+            .store(true, Ordering::SeqCst);
+        assert!(
+            history
+                .record_source_topology_mismatch(
+                    owner.id,
+                    "layout-worker",
+                    Some("owner"),
+                    &mismatch
+                )
+                .is_err()
+        );
+        assert!(history.ownership_failed());
+        assert!(history.active_build(owner.id).is_some());
+        assert_eq!(history.source_topology_fences().len(), 1);
+        let restored = BuildHistory::load_from_file(&path, 10).unwrap();
+        assert!(!restored.ownership_failed());
+        assert_eq!(
+            restored.source_topology_fences(),
+            history.source_topology_fences()
+        );
+        assert_eq!(
+            restored
+                .active_build(owner.id)
+                .unwrap()
+                .source_topology_mismatch,
+            Some(mismatch)
+        );
+    }
+
+    #[tokio::test]
+    async fn source_topology_corrupt_or_duplicate_durable_fences_refuse_reload() {
+        let temporary = TempDir::new().unwrap();
+        let path = temporary.path().join("history.jsonl");
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        let owner = source_topology_test_admission(&history, "owner").await;
+        history
+            .record_source_topology_mismatch(
+                owner.id,
+                "layout-worker",
+                Some("owner"),
+                &source_topology_test_mismatch(),
+            )
+            .unwrap();
+        let snapshot: serde_json::Value =
+            serde_json::from_reader(File::open(path.with_extension("ownership.json")).unwrap())
+                .unwrap();
+        let mut corrupted = snapshot.clone();
+        corrupted["source_topology_fences"][0]["mismatch"]["topology"]["alias_root"] =
+            serde_json::json!("/dp/../other");
+        std::fs::write(
+            path.with_extension("ownership.json"),
+            serde_json::to_vec(&corrupted).unwrap(),
+        )
+        .unwrap();
+        assert!(BuildHistory::load_from_file(&path, 10).is_err());
+        let mut duplicate = snapshot;
+        let first = duplicate["source_topology_fences"][0].clone();
+        duplicate["source_topology_fences"]
+            .as_array_mut()
+            .unwrap()
+            .push(first);
+        std::fs::write(
+            path.with_extension("ownership.json"),
+            serde_json::to_vec(&duplicate).unwrap(),
+        )
+        .unwrap();
+        assert!(BuildHistory::load_from_file(&path, 10).is_err());
+    }
+
+    #[tokio::test]
+    async fn source_topology_late_refusal_preserves_terminal_cancellation() {
+        let history = BuildHistory::new(10);
+        let owner = source_topology_test_admission(&history, "owner").await;
+        history
+            .complete_durable(
+                owner.id,
+                "layout-worker",
+                Some("owner"),
+                BuildCompletion {
+                    exit_code: 130,
+                    duration_ms: None,
+                    bytes_transferred: None,
+                    disk_peak_output_bytes: None,
+                    timing: None,
+                    cancellation: None,
+                },
+            )
+            .unwrap();
+        history
+            .record_source_topology_mismatch(
+                owner.id,
+                "layout-worker",
+                Some("owner"),
+                &source_topology_test_mismatch(),
+            )
+            .unwrap();
+        assert!(history.source_topology_fences().is_empty());
+        assert_eq!(
+            history.terminal_build(owner.id, "owner").unwrap().exit_code,
+            130
+        );
+        assert!(
+            history
+                .record_source_topology_mismatch(
+                    owner.id,
+                    "layout-worker",
+                    Some("wrong-owner"),
+                    &source_topology_test_mismatch()
+                )
+                .is_err()
         );
     }
 
@@ -5447,6 +5906,7 @@ mod tests {
             (
                 id,
                 TerminalOwnership {
+                    source_topology_mismatch: None,
                     record,
                     local_wrapper_id: None,
                     pending_disk_fault: None,

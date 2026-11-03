@@ -524,6 +524,7 @@ mod tests {
         let _guard = test_guard!();
         let workers = vec![
             WorkerInfo {
+                source_topology_mismatches: Vec::new(),
                 id: "w1".to_string(),
                 host: "host1".to_string(),
                 user: "u1".to_string(),
@@ -534,6 +535,7 @@ mod tests {
                 disk: Default::default(),
             },
             WorkerInfo {
+                source_topology_mismatches: Vec::new(),
                 id: "w2".to_string(),
                 host: "host2".to_string(),
                 user: "u2".to_string(),
@@ -990,6 +992,7 @@ mod tests {
         };
         let workers = vec![
             WorkerCapabilitiesFromApi {
+                source_topology_mismatches: Vec::new(),
                 id: "w-missing".to_string(),
                 host: "host".to_string(),
                 user: "user".to_string(),
@@ -997,6 +1000,7 @@ mod tests {
                 refresh: None,
             },
             WorkerCapabilitiesFromApi {
+                source_topology_mismatches: Vec::new(),
                 id: "w-old".to_string(),
                 host: "host".to_string(),
                 user: "user".to_string(),
@@ -1019,6 +1023,7 @@ mod tests {
     fn refresh_warnings_include_cached_capability_snapshots() {
         let _guard = test_guard!();
         let workers = vec![WorkerCapabilitiesFromApi {
+            source_topology_mismatches: Vec::new(),
             id: "slow-worker".to_string(),
             host: "host".to_string(),
             user: "user".to_string(),

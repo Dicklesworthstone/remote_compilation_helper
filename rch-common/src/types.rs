@@ -180,9 +180,101 @@ pub struct SelectionRequest {
     /// run without the tool.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_tools: Vec<String>,
+    /// Exact worker namespace required by this attempt. A refusal for another
+    /// pair of roots must not make an otherwise compatible worker ineligible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_topology: Option<SourceTopology>,
     /// Process ID of the hook (for active build tracking).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hook_pid: Option<u32>,
+}
+
+/// The logical roots a worker must resolve to the same physical directory.
+/// These identify placement eligibility, never source ownership or permission
+/// to repair a worker's filesystem.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SourceTopology {
+    pub canonical_root: String,
+    pub alias_root: String,
+}
+
+impl SourceTopology {
+    pub fn from_policy(policy: &crate::path_topology::PathTopologyPolicy) -> Self {
+        Self {
+            canonical_root: policy
+                .canonical_root()
+                .to_string_lossy()
+                .trim_end_matches('/')
+                .to_owned(),
+            alias_root: policy
+                .alias_root()
+                .to_string_lossy()
+                .trim_end_matches('/')
+                .to_owned(),
+        }
+    }
+
+    /// Match the namespace the transfer pipeline will initialize. Isolated and
+    /// off-root jobs use only the staging base, never the dispatcher's shared
+    /// alias. This is a placement key, not permission to create any path.
+    pub fn for_worker_namespace(
+        policy: &crate::path_topology::PathTopologyPolicy,
+        isolated: bool,
+        remote_base: &str,
+    ) -> Result<Self, String> {
+        let topology = if isolated || policy.is_off_root() {
+            let root = validate_remote_base(remote_base)?;
+            Self {
+                canonical_root: root.clone(),
+                alias_root: root,
+            }
+        } else {
+            Self::from_policy(policy)
+        };
+        topology.validate().map_err(str::to_owned)?;
+        Ok(topology)
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        for root in [&self.canonical_root, &self.alias_root] {
+            if !root.starts_with('/')
+                || root.len() < 2
+                || root.len() > 4096
+                || root.ends_with('/')
+                || root.contains('\\')
+                || root.chars().any(char::is_control)
+                || root[1..]
+                    .split('/')
+                    .any(|part| matches!(part, "" | "." | ".."))
+            {
+                return Err("source topology roots must be normalized absolute directory paths");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A confirmed, deterministic namespace refusal. Detail is limited to the
+/// requested/physical paths and corrective action; it contains no source data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SourceTopologyMismatch {
+    pub topology: SourceTopology,
+    pub detail: String,
+}
+
+impl SourceTopologyMismatch {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.topology.validate()?;
+        if self.detail.trim().is_empty()
+            || self.detail.len() > 4096
+            || self.detail.chars().any(char::is_control)
+        {
+            return Err("source topology refusal requires a bounded diagnostic");
+        }
+        Ok(())
+    }
 }
 
 fn disk_headroom_disabled(gib: &u32) -> bool {
@@ -210,6 +302,9 @@ pub enum SelectionReason {
     NoWorkersPassedHealth,
     /// All candidate workers failed hard preflight checks.
     AllWorkersFailedPreflight,
+    /// Every available requested worker has a confirmed incompatibility with
+    /// the requested source namespace. Repeating the job cannot repair it.
+    SourceTopologyIncompatible,
     /// All candidate workers failed repo convergence checks (repos missing/stale/failed).
     AllWorkersFailedConvergence,
     /// Workers exist but admission was blocked by concrete capacity/preflight reasons.
@@ -243,6 +338,12 @@ impl std::fmt::Display for SelectionReason {
             Self::AllWorkersBusy => write!(f, "all workers at capacity"),
             Self::NoWorkersPassedHealth => write!(f, "no workers passed health thresholds"),
             Self::AllWorkersFailedPreflight => write!(f, "all workers failed preflight checks"),
+            Self::SourceTopologyIncompatible => {
+                write!(
+                    f,
+                    "requested workers have an incompatible source topology; repair the reported mappings and run rch workers capabilities --refresh"
+                )
+            }
             Self::AllWorkersFailedConvergence => {
                 write!(f, "all workers failed repo convergence checks")
             }
@@ -841,6 +942,10 @@ pub struct ReleaseRequest {
     /// (bd-p3kuz). The daemon keeps the project off the worker briefly.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub worker_source_busy: bool,
+    /// Confirmed permanent namespace refusal, bound to this release's exact
+    /// owner and worker endpoint. Never interpreted as temporary contention.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_source_topology_mismatch: Option<SourceTopologyMismatch>,
 }
 
 /// Build execution phase for daemon heartbeat tracking.
@@ -1095,12 +1200,17 @@ pub struct WorkerCapabilities {
     /// Total size in GB of the mount reported in `build_disk_free_gb`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_disk_total_gb: Option<f64>,
-    /// Canonical path-topology preflight status (`/data/projects` + `/dp` alias).
+    /// Worker-local path-topology preflight status.
     ///
     /// `Some(false)` indicates a hard preflight failure that should exclude this
-    /// worker from remote scheduling until a subsequent successful revalidation.
+    /// worker from requests for the probed mapping until successful revalidation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projects_root_ok: Option<bool>,
+    /// Exact roots inspected by the worker capability probe. Older workers
+    /// omit this scope, so their failed probe remains conservative for every
+    /// request. A different mapping still undergoes mandatory source admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projects_root_topology: Option<SourceTopology>,
     /// Machine-readable failure reason for path-topology preflight.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projects_root_issue: Option<String>,
@@ -1228,6 +1338,52 @@ impl WorkerCapabilities {
     /// Returns `None` when probe data is unavailable (fail-open behavior).
     pub fn is_topology_healthy(&self) -> Option<bool> {
         self.projects_root_ok
+    }
+
+    /// A worker-local probe says nothing about different requested roots.
+    /// Missing or invalid scope retains the legacy conservative hard refusal;
+    /// confirmed request-specific source refusals are enforced separately.
+    pub fn is_topology_healthy_for(&self, requested: Option<&SourceTopology>) -> Option<bool> {
+        if let (Some(probed), Some(requested)) = (&self.projects_root_topology, requested)
+            && probed.validate().is_ok()
+            && requested.validate().is_ok()
+            && probed != requested
+        {
+            return None;
+        }
+        self.projects_root_ok
+    }
+
+    /// A scoped capability probe can prove a permanent physical conflict
+    /// before source admission runs. Missing paths and failed probes do not
+    /// prove this verdict. Legacy probes without exact roots stay uncertain.
+    pub fn source_topology_mismatch(&self) -> Option<SourceTopologyMismatch> {
+        if self.projects_root_ok != Some(false) {
+            return None;
+        }
+        let topology = self.projects_root_topology.as_ref()?;
+        topology.validate().ok()?;
+        let issue = self.projects_root_issue.as_deref()?;
+        if !matches!(issue, "canonical_not_directory" | "alias_not_directory")
+            && !issue
+                .strip_prefix("alias_wrong_target:")
+                .is_some_and(|path| path.starts_with('/'))
+        {
+            return None;
+        }
+        // Only machine verdicts and path metadata enter this bounded report.
+        // Distinguish live capability evidence from durable namespace refusals.
+        let mut detail = String::new();
+        for character in format!("worker capability probe confirmed {issue:?}").chars() {
+            if detail.len() + character.len_utf8() > 4096 {
+                break;
+            }
+            detail.push(character);
+        }
+        Some(SourceTopologyMismatch {
+            topology: topology.clone(),
+            detail,
+        })
     }
 }
 
@@ -4851,6 +5007,131 @@ retry_max = 2
 
         caps.projects_root_ok = Some(false);
         assert_eq!(caps.is_topology_healthy(), Some(false));
+    }
+
+    #[test]
+    fn test_worker_capabilities_topology_health_is_scoped_to_probed_roots() {
+        let probed = SourceTopology {
+            canonical_root: "/data/projects".into(),
+            alias_root: "/dp".into(),
+        };
+        let requested = SourceTopology {
+            canonical_root: "/Users/dispatcher/projects".into(),
+            alias_root: "/dp".into(),
+        };
+        let mut caps = WorkerCapabilities {
+            projects_root_ok: Some(false),
+            projects_root_topology: Some(probed.clone()),
+            ..Default::default()
+        };
+        assert_eq!(caps.is_topology_healthy_for(Some(&probed)), Some(false));
+        assert_eq!(caps.is_topology_healthy_for(Some(&requested)), None);
+        assert_eq!(caps.is_topology_healthy_for(None), Some(false));
+        caps.projects_root_topology = None;
+        assert_eq!(caps.is_topology_healthy_for(Some(&requested)), Some(false));
+        caps.projects_root_topology = Some(SourceTopology {
+            canonical_root: "../not-a-root".into(),
+            alias_root: "/dp".into(),
+        });
+        assert_eq!(caps.is_topology_healthy_for(Some(&requested)), Some(false));
+        let wire = serde_json::to_string(&caps).unwrap();
+        assert_eq!(
+            serde_json::from_str::<WorkerCapabilities>(&wire)
+                .unwrap()
+                .projects_root_topology,
+            caps.projects_root_topology
+        );
+    }
+
+    #[test]
+    fn source_topology_reports_reject_unsafe_or_unbounded_metadata() {
+        let valid = SourceTopology {
+            canonical_root: "/Users/dispatcher/projects".into(),
+            alias_root: "/dp".into(),
+        };
+        assert!(valid.validate().is_ok());
+        for root in [
+            "/",
+            "relative",
+            "/dp/",
+            "/dp/../other",
+            "/dp//other",
+            "/dp/./other",
+            "/dp\nother",
+            "/dp\u{1b}[2J",
+            "/dp\\other",
+        ] {
+            let mut invalid = valid.clone();
+            invalid.alias_root = root.into();
+            assert!(invalid.validate().is_err(), "accepted unsafe root {root:?}");
+        }
+        for detail in [
+            String::new(),
+            "\n".into(),
+            "terminal\u{1b}[2J".into(),
+            "x".repeat(4097),
+        ] {
+            assert!(
+                SourceTopologyMismatch {
+                    topology: valid.clone(),
+                    detail
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        assert!(
+            SourceTopologyMismatch {
+                topology: valid,
+                detail: "conflicting alias base: /dp -> /data/projects".into()
+            }
+            .validate()
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn source_topology_capability_verdict_requires_scoped_physical_evidence() {
+        let mut capabilities = WorkerCapabilities {
+            projects_root_ok: Some(false),
+            projects_root_topology: Some(SourceTopology {
+                canonical_root: "/projects".into(),
+                alias_root: "/dp".into(),
+            }),
+            ..Default::default()
+        };
+        for issue in [
+            "canonical_not_directory",
+            "alias_not_directory",
+            "alias_wrong_target:/other\npath",
+        ] {
+            capabilities.projects_root_issue = Some(issue.into());
+            let mismatch = capabilities.source_topology_mismatch().unwrap();
+            assert!(mismatch.validate().is_ok());
+            assert!(!mismatch.detail.chars().any(char::is_control));
+            assert!(mismatch.detail.starts_with("worker capability probe"));
+        }
+        for issue in [
+            "canonical_missing",
+            "alias_missing",
+            "alias_not_symlink",
+            "alias_wrong_target:",
+            "alias_wrong_target:relative",
+            "canonical_probe_error:permission denied",
+            "alias_resolve_error:permission denied",
+        ] {
+            capabilities.projects_root_issue = Some(issue.into());
+            assert!(
+                capabilities.source_topology_mismatch().is_none(),
+                "misclassified {issue}"
+            );
+        }
+        capabilities.projects_root_issue = Some("canonical_not_directory".into());
+        capabilities.projects_root_ok = Some(true);
+        assert!(capabilities.source_topology_mismatch().is_none());
+        capabilities.projects_root_ok = Some(false);
+        capabilities.projects_root_topology = None;
+        assert!(capabilities.source_topology_mismatch().is_none());
     }
 
     #[test]

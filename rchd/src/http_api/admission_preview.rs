@@ -263,7 +263,10 @@ async fn observe(
         if ctx.history.ownership_failed() {
             return Ok(refused("durable_ownership_uncertain"));
         }
-        let reason = if selected.is_none() && (steered_off_hold || steered_off_full_lanes) {
+        let reason = if selected.is_none()
+            && (steered_off_hold || steered_off_full_lanes)
+            && result.reason != SelectionReason::SourceTopologyIncompatible
+        {
             SelectionReason::AllWorkersBusy
         } else {
             result.reason
@@ -297,6 +300,7 @@ mod tests {
 
     fn input() -> PreviewRequest {
         PreviewRequest {
+            source_topology: None,
             protocol_version: PROTOCOL_VERSION,
             project: "http-preview-fixture".into(),
             command: "make".into(),
