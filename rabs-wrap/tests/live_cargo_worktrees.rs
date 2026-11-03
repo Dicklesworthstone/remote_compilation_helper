@@ -268,6 +268,10 @@ impl World {
         if wrapped {
             cargo.env("RUSTC_WRAPPER", wrap());
         }
+        if std::env::var_os("RABS_TEST_TRACE_WRAPPER").as_deref() == Some(std::ffi::OsStr::new("1"))
+        {
+            cargo.env("RABS_WRAP_TRACE", "1");
+        }
         cargo
     }
 
@@ -437,13 +441,15 @@ fn exercise_cargo_worktrees(world: &World) -> Daemon {
         let worktree = world.worktree(name);
         World::expect_value(&worktree, 12);
         let mark = daemon.decisions().len();
-        world.cargo_check(&worktree, true);
+        let verify_build = world.cargo_check(&worktree, true);
         let decisions = daemon.settled_since(mark);
         assert_eq!(
             count(&decisions, "verified"),
             DEPENDENCIES.len(),
-            "{name}: every dependency verifies its committed key: {:?}",
-            tally(&decisions)
+            "{name}: every dependency verifies its committed key: {:?}\n\
+             decisions: {decisions:#?}\ncargo:\n{}",
+            tally(&decisions),
+            stderr(&verify_build)
         );
         for dependency in DEPENDENCIES {
             assert_eq!(

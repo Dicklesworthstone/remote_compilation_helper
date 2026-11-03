@@ -2454,8 +2454,51 @@ real Cargo serving, fleet performance or release qualification.
     Actual version and true/-vV passthrough each exit0 with empty stderr;
     hashes stay stable. Actual Cargo artifact graph is one Git78 Asupersync,
     proc-macros/tls only. Retain compiled-pair-smoke.json. This is compile and
-    launch proof only; the worktree test harness is still compiling, all
-    cache/TLS/worker/performance and release acceptance remains unproved.
+    launch proof only at that checkpoint; subsequent worktree results follow.
+    TLS/worker/performance and release acceptance remain unproved.
+  - [x] Finish the original worktree suite: **9 passed, 1 failed, 0 ignored**,
+    raw101, libtest780.20s. Five real Cargo cases and four binary-integrity
+    controls pass. Vendored dependencies fail at verify-1: expected3 verified
+    actions, observed2 execute/verified. Missing-env and primary-package
+    shadows are expected Cargo probe/app observations, not a demonstrated
+    explanation for the missing dependency action. Do not relax either check.
+    The tiny registry same-invocation timing is a loss: stock3.426094437s,
+    served4.67980662s. Keep all original counts and deadlines.
+  - [x] Run one unchanged vendored case through DSR
+    `4f945fd7-d489-41c0-bbaa-66b24afef644`: actual1 passed/0 failed/0 ignored,
+    raw0,170.58s. Retain the owned daemon's29,698-byte log after fixture
+    teardown, SHA-256
+    `20626010acc90e64bd8598a0cbaa836ea952a9c5f61d9e50cb60e6e45a962984`.
+    This establishes intermittency, not a fix or a10/10 result. Its favorable
+    timing cannot replace the original losing observation or establish a win.
+  - [x] Add opt-in wrapper bypass diagnostics for busy/open breaker,
+    reservation-write failure, failed daemon consult and daemon pass-through.
+    Default silence, source eligibility, breaker policy, product budgets,
+    compiler outcomes and assertions remain unchanged. Add diagnostic opt-in
+    to the existing live Cargo harness and include Cargo stderr/full decisions
+    in the existing verification assertion. No dependency or new test file.
+  - [x] Freeze the two-file diagnostic cut
+    `85dc06ed-overlay-272b-wrapper-trace-9872ed4b0072320a3b3a75dfe805c8e393b4451ce51d1023b0db44624cc05e5e`,
+    full1,755-file two-pass audit, manifest
+    `484d3038876abc90c1fcb6cec4fa8d90a9b874c4c475ab47dac933bc2e5da77f`.
+    Local fmt check0. DSR tool `rabs_wrapper_trace` submitted00:49:39UTC,
+    detached coordinator19571. Immutable9,989-byte driver SHA-256
+    `e18c64eeee1abb2e7333ef55ba0a95958e8ac831b0ff4549c4def6768c33a6c7`.
+    New isolated development target; original active tools are untouched.
+  - [ ] Compile the diagnostic wrapper and harness; check trace-off silence
+    and trace-on missing-daemon stderr with real executables. Reuse only the
+    explicitly named source272 daemon bytes, not a claimed matching new toolset.
+  - [ ] Execute all three predeclared fresh vendored trials, retaining every
+    raw result, Cargo stderr and owned daemon log. A pass never erases the
+    original failure. Identify the actual missing-action cause before changing
+    breaker, environment or timing policy; diagnostics alone are not a repair.
+  - [ ] Run wrapper unit tests, workspace all-target check, strict Clippy,
+    fmt and source-after audit for the diagnostic cut. These are pending;
+    the local formatting result is not compiler or runtime qualification.
+  - [ ] Finish the original three canonical service/worker cases. The worker
+    build currently changes the transitive feature union and recompiles
+    Asupersync; normal Cargo freshness decides reuse. No forced-Fresh metadata,
+    deadline extension or active-source edit is permitted to bypass that work.
   - [x] Bound alternate-capacity probes: ts1 has the pinned toolchain and a
     healthy mounted NAS, but root and/tmp fail14% (tmp also fails20G).
     No build was launched there. Earlier be324 retains a verified daemon,

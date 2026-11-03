@@ -826,6 +826,20 @@ fn consult_succeeded(reply: &str) -> bool {
     !reply.contains("\"mode\":\"shadow-error\"")
 }
 
+/// Opt-in diagnostics for observations that never reached a cache action.
+/// Keep the original compiler environment intact, including the trace knob.
+fn trace_bypass(reason: &str, args: &[String]) {
+    if std::env::var_os("RABS_WRAP_TRACE").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        return;
+    }
+    let unit = args
+        .windows(2)
+        .find(|pair| pair[0] == "--crate-name")
+        .map_or("?", |pair| pair[1].as_str());
+    let unit: String = unit.chars().take(80).collect();
+    eprintln!("rabs-wrap: observation bypass: {reason}; crate={unit:?}");
+}
+
 fn observe_with_breaker(
     socket: &str,
     path: &str,
@@ -845,12 +859,16 @@ fn observe_with_breaker(
     // what makes "one probe per cooldown" exact.
     let (probe_guard, probing_state, connect_timeout_ms, decision_timeout_ms) = {
         let Some(guard) = try_lock_breaker(path) else {
+            trace_bypass("breaker-lock-busy", args);
             return Live::PassThrough;
         };
         let state = load_state(path);
         let now = now_ms();
         match decide(&policy, &state, now) {
-            ConnectDecision::SkipToLocal => return Live::PassThrough,
+            ConnectDecision::SkipToLocal => {
+                trace_bypass("breaker-open", args);
+                return Live::PassThrough;
+            }
             ConnectDecision::Attempt {
                 connect_timeout_ms,
                 decision_timeout_ms,
@@ -863,6 +881,7 @@ fn observe_with_breaker(
                 // Ignoring a write failure permits a storm of same-window probes.
                 let probing = state.probe_started(now);
                 if store_state(path, &probing).is_err() {
+                    trace_bypass("probe-reservation-write-failed", args);
                     return Live::PassThrough;
                 }
                 (
@@ -892,6 +911,11 @@ fn observe_with_breaker(
         // An abandoned probe keeps its already published cooldown reservation;
         // the lock still drops here, and no compiler or install is retried.
         return Live::FailClosed("original compiler caller disappeared".into());
+    }
+    match &outcome {
+        Err(()) => trace_bypass("daemon-consult-failed", args),
+        Ok(Live::PassThrough) => trace_bypass("daemon-pass-through", args),
+        _ => {}
     }
     let attempt = match &outcome {
         Ok(Live::FailClosed(_) | Live::FailClosedSilently) | Err(()) => AttemptOutcome::Failed,
