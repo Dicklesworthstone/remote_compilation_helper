@@ -6,16 +6,16 @@
 //! The directory is scoped to one trusted worker administrative domain.
 
 use rabs_sandbox::source_transfer::{
-    MAX_SOURCE_BYTES, MAX_SOURCE_CHUNK, SOURCE_PROJECTION_PREFIX, SourceFile, SourceProjectionPool,
-    SourceReceiver,
+    MAX_SOURCE_BYTES, MAX_SOURCE_CHUNK, SOURCE_PROJECTION_PREFIX, SourceCheckpointError,
+    SourceFile, SourceManifest, SourceProjectionPool, SourceReceiver,
 };
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
 
 /// Retain one maximum-size source/dependency projection by default.
@@ -28,6 +28,9 @@ const INCOMING: &str = "incoming";
 const MIN_PROJECTION_CACHE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PROJECTION_IMAGES: usize = 64;
 const MAX_PROJECTION_MEMBERS: usize = 4 * MAX_FILES;
+const WRITER_FREE: u8 = 0;
+const WRITER_HELD: u8 = 1;
+const WRITER_POISONED: u8 = 2;
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -282,12 +285,46 @@ struct Entry {
 #[derive(Debug)]
 struct ProjectionWriter {
     file: Arc<File>,
-    local: Mutex<()>,
+    local: AtomicU8,
 }
 
-enum CacheWriter<'a> {
+/// An owned nonblocking guard can move with the source I/O task between frames.
+/// It retains the process lock and preserves the previous mutex's panic poison.
+struct LocalCacheWriter {
+    owner: Arc<ProjectionWriter>,
+}
+
+impl Drop for LocalCacheWriter {
+    fn drop(&mut self) {
+        self.owner.local.store(
+            if std::thread::panicking() {
+                WRITER_POISONED
+            } else {
+                WRITER_FREE
+            },
+            Ordering::Release,
+        );
+    }
+}
+
+enum CacheWriter {
     Process { file: File },
-    Local { _guard: MutexGuard<'a, ()> },
+    Local { guard: LocalCacheWriter },
+}
+
+impl CacheWriter {
+    fn verify(&self, root: &Path) -> io::Result<()> {
+        let file = match self {
+            Self::Process { file } => file,
+            Self::Local { guard } => &guard.owner.file,
+        };
+        let metadata = file.metadata()?;
+        if !ordinary(&metadata) || !same_inode(&metadata, &fs::symlink_metadata(root.join("lock"))?)
+        {
+            return Err(invalid("retained source cache writer identity changed"));
+        }
+        Ok(())
+    }
 }
 
 /// A path is only configuration, never an input capability. The cache owns a
@@ -308,6 +345,156 @@ pub(super) enum RememberError {
     /// A known-invalid execution source must not be treated as optional cache I/O.
     Source(io::Error),
     Cache(io::Error),
+}
+
+/// One upload's optional writer admission. Inventory and protection are built
+/// once, then each completed file is visited once. The owned nonblocking lock
+/// serializes capacity accounting through seal/drop; other uploads can still
+/// read verified snapshots and skip optional writes without waiting.
+pub(super) struct SourceCheckpoints {
+    cache: SourceCache,
+    writer: CacheWriter,
+    root_identity: Metadata,
+    manifest_digest: [u8; 32],
+    entries: BTreeMap<PathBuf, Entry>,
+    evictable: BTreeSet<(SystemTime, PathBuf)>,
+    protected: BTreeMap<PathBuf, u64>,
+    protected_bytes: u64,
+    total: u64,
+    visited: BTreeSet<String>,
+}
+
+impl SourceCheckpoints {
+    fn check_owner(&self) -> io::Result<()> {
+        self.cache.control.check()?;
+        private_directory(&self.cache.root)?;
+        if !same_inode(
+            &self.root_identity,
+            &fs::symlink_metadata(&self.cache.root)?,
+        ) {
+            return Err(invalid("source checkpoint cache directory was replaced"));
+        }
+        self.writer.verify(&self.cache.root)
+    }
+
+    fn remove(&mut self, path: &Path) -> io::Result<()> {
+        self.check_owner()?;
+        let entry = self
+            .entries
+            .get(path)
+            .ok_or_else(|| invalid("source checkpoint inventory changed"))?;
+        fs::remove_file(&entry.path)?;
+        let entry = self
+            .entries
+            .remove(path)
+            .ok_or_else(|| invalid("source checkpoint inventory changed"))?;
+        self.evictable.remove(&(entry.used, entry.path));
+        self.total -= entry.bytes;
+        Ok(())
+    }
+
+    pub(super) fn remember_file(
+        &mut self,
+        receiver: &mut SourceReceiver,
+        path: &str,
+    ) -> Result<(), RememberError> {
+        self.check_owner()?;
+        if receiver.manifest().digest() != self.manifest_digest {
+            return Err(RememberError::Source(invalid(
+                "source checkpoint manifest changed",
+            )));
+        }
+        let files = receiver.manifest().files();
+        let index = files
+            .binary_search_by(|file| file.path.as_str().cmp(path))
+            .map_err(|_| RememberError::Source(invalid("undeclared source checkpoint member")))?;
+        let expected = files[index].clone();
+        if !self.visited.insert(path.to_owned())
+            || expected.len == 0
+            || expected.len > self.cache.max_bytes
+            || expected.len > MAX_FILE_BYTES
+        {
+            return Ok(());
+        }
+        let destination = self.cache.root.join(object_name(&expected.sha256));
+        if let Some(bytes) = self.protected.get(&destination) {
+            if *bytes != expected.len {
+                return Err(RememberError::Source(invalid(
+                    "one source digest has conflicting declared lengths",
+                )));
+            }
+            return Ok(());
+        }
+        let Some(next_protected_bytes) =
+            self.protected_bytes
+                .checked_add(expected.len)
+                .filter(|sum| {
+                    *sum <= self.cache.max_bytes && self.protected.len() < self.cache.max_files
+                })
+        else {
+            // The complete-tree seal still verifies this member. An unfittable
+            // optional checkpoint must not evict another useful object.
+            return Ok(());
+        };
+        let scratch = self.cache.root.join(INCOMING);
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&scratch)?;
+        let snapshot = receiver.checkpoint_file(path, file, || self.cache.control.stopped());
+        // Cancellation/deadline is never made into a usable cache miss or a
+        // late successful chunk ACK, even if the filesystem call also failed.
+        self.cache.control.check()?;
+        let snapshot = snapshot.map_err(|error| match error {
+            SourceCheckpointError::Source(error) => RememberError::Source(error),
+            SourceCheckpointError::Destination(error) => RememberError::Cache(error),
+        })?;
+        if snapshot.expected() != &expected {
+            return Err(RememberError::Source(invalid(
+                "source checkpoint returned a different member",
+            )));
+        }
+        let file = snapshot.into_file();
+        let mut permissions = file.metadata()?.permissions();
+        permissions.set_readonly(true);
+        file.set_permissions(permissions)?;
+        drop(file);
+        self.check_owner()?;
+        if self.entries.contains_key(&destination) {
+            self.remove(&destination)?;
+        }
+        while self.entries.len() >= self.cache.max_files
+            || self
+                .total
+                .checked_add(expected.len)
+                .is_none_or(|sum| sum > self.cache.max_bytes)
+        {
+            let path = self
+                .evictable
+                .first()
+                .map(|(_, path)| path.clone())
+                .ok_or_else(|| invalid("source checkpoint eviction credit is inconsistent"))?;
+            self.remove(&path)?;
+        }
+        self.check_owner()?;
+        fs::rename(&scratch, &destination)?;
+        self.total += expected.len;
+        self.protected_bytes = next_protected_bytes;
+        self.protected.insert(destination.clone(), expected.len);
+        self.entries.insert(
+            destination.clone(),
+            Entry {
+                path: destination,
+                bytes: expected.len,
+                used: SystemTime::now(),
+            },
+        );
+        Ok(())
+    }
 }
 
 impl From<io::Error> for RememberError {
@@ -375,7 +562,7 @@ impl SourceCache {
             cache.projections = Some(Arc::new(pool));
             cache.projection_writer = Some(Arc::new(ProjectionWriter {
                 file,
-                local: Mutex::new(()),
+                local: AtomicU8::new(WRITER_FREE),
             }));
         } else {
             // An existing writer may still be using the old raw-file budget.
@@ -490,7 +677,7 @@ impl SourceCache {
         true
     }
 
-    fn writer(&self) -> io::Result<Option<CacheWriter<'_>>> {
+    fn writer(&self) -> io::Result<Option<CacheWriter>> {
         self.control.check()?;
         private_directory(&self.root)?;
         let path = self.root.join("lock");
@@ -499,12 +686,19 @@ impl SourceCache {
             if !ordinary(&metadata) || !same_inode(&metadata, &fs::symlink_metadata(&path)?) {
                 return Err(invalid("retained source cache writer identity changed"));
             }
-            return match owner.local.try_lock() {
-                Ok(guard) => Ok(Some(CacheWriter::Local { _guard: guard })),
-                Err(std::sync::TryLockError::WouldBlock) => Ok(None),
-                Err(std::sync::TryLockError::Poisoned(_)) => {
-                    Err(invalid("source cache writer poisoned"))
-                }
+            return match owner.local.compare_exchange(
+                WRITER_FREE,
+                WRITER_HELD,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => Ok(Some(CacheWriter::Local {
+                    guard: LocalCacheWriter {
+                        owner: Arc::clone(owner),
+                    },
+                })),
+                Err(WRITER_HELD) => Ok(None),
+                Err(_) => Err(invalid("source cache writer poisoned")),
             };
         }
         let mut quarantine = match self.quarantine.try_lock() {
@@ -602,6 +796,70 @@ impl SourceCache {
         }
         entries.sort_by(|a, b| a.used.cmp(&b.used).then_with(|| a.path.cmp(&b.path)));
         Ok(entries.into())
+    }
+
+    /// Acquire once at the first completed member, not on every chunk. A busy
+    /// writer skips this upload's checkpoints; the final seal can still attempt
+    /// ordinary optional cache admission after the upload is complete.
+    pub(super) fn checkpoints(
+        &self,
+        manifest: &SourceManifest,
+    ) -> Result<Option<SourceCheckpoints>, RememberError> {
+        let Some(writer) = self.writer()? else {
+            return Ok(None);
+        };
+        let root_identity = fs::symlink_metadata(&self.root)?;
+        let mut entries = self.inventory()?;
+        let mut total = entries.iter().try_fold(0_u64, |sum, entry| {
+            sum.checked_add(entry.bytes)
+                .ok_or_else(|| invalid("source cache size overflow"))
+        })?;
+        while total > self.max_bytes || entries.len() > self.max_files {
+            self.control.check()?;
+            let entry = entries
+                .pop_front()
+                .ok_or_else(|| invalid("source cache capacity accounting is inconsistent"))?;
+            fs::remove_file(&entry.path)?;
+            total -= entry.bytes;
+        }
+        let mut protected = BTreeMap::new();
+        for expected in manifest.files() {
+            self.control.check()?;
+            if expected.len == 0 || expected.len > MAX_FILE_BYTES || expected.len > self.max_bytes {
+                continue;
+            }
+            let path = self.root.join(object_name(&expected.sha256));
+            if !protected.contains_key(&path) && self.contains_verified(expected) {
+                protected.insert(path, expected.len);
+            }
+        }
+        let protected_bytes = protected.values().try_fold(0_u64, |sum, bytes| {
+            sum.checked_add(*bytes)
+                .ok_or_else(|| invalid("source cache protected size overflow"))
+        })?;
+        let evictable = entries
+            .iter()
+            .filter(|entry| !protected.contains_key(&entry.path))
+            .map(|entry| (entry.used, entry.path.clone()))
+            .collect();
+        self.control.check()?;
+        let checkpoint = SourceCheckpoints {
+            cache: self.clone(),
+            writer,
+            root_identity,
+            manifest_digest: manifest.digest(),
+            entries: entries
+                .into_iter()
+                .map(|entry| (entry.path.clone(), entry))
+                .collect(),
+            evictable,
+            protected,
+            protected_bytes,
+            total,
+            visited: BTreeSet::new(),
+        };
+        checkpoint.check_owner()?;
+        Ok(Some(checkpoint))
     }
 
     /// Seed only from a completed source receiver, never an arbitrary upload
@@ -979,6 +1237,153 @@ mod tests {
                 (entry.path, inode)
             })
             .collect()
+    }
+
+    #[test]
+    fn checkpoints_preserve_byte_and_entry_quotas_without_republishing_duplicate_objects() {
+        for (bytes, files) in [(8, 8), (16, 2), (8, 2)] {
+            let parent = private();
+            let input = private();
+            let mut source = staged(
+                input.path(),
+                &[
+                    ("a", b"aaaa"),
+                    ("b", b"aaaa"),
+                    ("c", b"cccc"),
+                    ("d", b"dddd"),
+                ],
+            );
+            let cache = bounded_cache(parent.path(), bytes, files);
+            let mut checkpoints = cache.checkpoints(source.manifest()).unwrap().unwrap();
+            checkpoints.remember_file(&mut source, "a").unwrap();
+            let original = cache_inodes(&cache);
+            checkpoints.remember_file(&mut source, "a").unwrap();
+            checkpoints.remember_file(&mut source, "b").unwrap();
+            assert_eq!(cache_inodes(&cache), original);
+            checkpoints.remember_file(&mut source, "c").unwrap();
+            checkpoints.remember_file(&mut source, "d").unwrap();
+            assert_eq!(checkpoints.total, 8);
+            assert_eq!(checkpoints.entries.len(), 2);
+            assert_eq!(checkpoints.protected.len(), 2);
+            let admitted = cache_inodes(&cache);
+            drop(checkpoints);
+            assert_eq!(cache.remember(&source).unwrap(), 0);
+            assert_eq!(cache_inodes(&cache), admitted);
+            assert_eq!(cache.load(&entry("a", b"aaaa")).unwrap().bytes(), b"aaaa");
+            assert_eq!(cache.load(&entry("c", b"cccc")).unwrap().bytes(), b"cccc");
+            assert!(cache.load(&entry("d", b"dddd")).is_none());
+        }
+    }
+
+    #[test]
+    fn checkpoints_protect_later_warm_members_before_admitting_an_early_miss() {
+        let parent = private();
+        let seed = private();
+        let input = private();
+        let cache = bounded_cache(parent.path(), 4, 1);
+        let old = staged(seed.path(), &[("hot", b"warm")]);
+        cache.remember(&old).unwrap();
+        let original = cache_inodes(&cache);
+        let mut source = staged(input.path(), &[("a-cold", b"cold"), ("z-hot", b"warm")]);
+        let mut checkpoints = cache.checkpoints(source.manifest()).unwrap().unwrap();
+        checkpoints.remember_file(&mut source, "a-cold").unwrap();
+        assert_eq!(cache_inodes(&cache), original);
+        checkpoints.remember_file(&mut source, "z-hot").unwrap();
+        assert_eq!(cache_inodes(&cache), original);
+        assert!(cache.load(&entry("a-cold", b"cold")).is_none());
+        assert_eq!(
+            cache.load(&entry("z-hot", b"warm")).unwrap().bytes(),
+            b"warm"
+        );
+    }
+
+    #[test]
+    fn checkpoint_writer_contention_skips_writes_but_keeps_verified_reads_available() {
+        let parent = private();
+        let first = private();
+        let second = private();
+        let cache = SourceCache::open(parent.path(), DEFAULT_SOURCE_CACHE_BYTES).unwrap();
+        let mut source = staged(first.path(), &[("a", b"first")]);
+        let other = staged(second.path(), &[("b", b"other")]);
+        let mut checkpoints = cache.checkpoints(source.manifest()).unwrap().unwrap();
+        checkpoints.remember_file(&mut source, "a").unwrap();
+        assert!(cache.checkpoints(other.manifest()).unwrap().is_none());
+        assert_eq!(cache.remember(&other).unwrap(), 0);
+        assert_eq!(cache.load(&entry("a", b"first")).unwrap().bytes(), b"first");
+        drop(checkpoints);
+        assert_eq!(cache.remember(&other).unwrap(), 1);
+        assert_eq!(cache.load(&entry("b", b"other")).unwrap().bytes(), b"other");
+    }
+
+    #[test]
+    fn checkpoint_writer_preserves_panic_poison_and_rejects_a_replaced_lock_inode() {
+        for panic_writer in [false, true] {
+            let parent = private();
+            let input = private();
+            let cache = SourceCache::open(parent.path(), DEFAULT_SOURCE_CACHE_BYTES).unwrap();
+            let mut source = staged(input.path(), &[("a", b"first"), ("b", b"other")]);
+            let mut checkpoints = cache.checkpoints(source.manifest()).unwrap().unwrap();
+            checkpoints.remember_file(&mut source, "a").unwrap();
+            if panic_writer {
+                assert!(
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                        let _owned = checkpoints;
+                        panic!("exercise owned source writer poisoning");
+                    }))
+                    .is_err()
+                );
+                assert!(cache.writer().is_err());
+            } else {
+                fs::rename(cache.root.join("lock"), cache.root.join("preserved-lock")).unwrap();
+                drop(File::create(cache.root.join("lock")).unwrap());
+                assert!(matches!(
+                    checkpoints.remember_file(&mut source, "b"),
+                    Err(RememberError::Cache(_))
+                ));
+                assert!(
+                    !cache
+                        .root
+                        .join(object_name(&Sha256::digest(b"other").into()))
+                        .exists()
+                );
+            }
+            assert_eq!(cache.load(&entry("a", b"first")).unwrap().bytes(), b"first");
+        }
+    }
+
+    #[test]
+    fn checkpoint_storage_failure_and_expiry_do_not_hide_or_poison_valid_source_bytes() {
+        for expire in [false, true] {
+            let parent = private();
+            let input = private();
+            let cache = SourceCache::open(parent.path(), DEFAULT_SOURCE_CACHE_BYTES).unwrap();
+            let expected = entry("file", b"good");
+            let mut source = SourceReceiver::create(
+                &input.path().join("source"),
+                SourceManifest::new(vec![expected.clone()]).unwrap(),
+            )
+            .unwrap();
+            source
+                .write_chunk("file", 0, b"good", expected.sha256)
+                .unwrap();
+            let mut checkpoints = cache.checkpoints(source.manifest()).unwrap().unwrap();
+            if expire {
+                checkpoints.cache.control.deadline = Some(Instant::now());
+            } else {
+                fs::create_dir(cache.root.join(INCOMING)).unwrap();
+            }
+            assert!(matches!(
+                checkpoints.remember_file(&mut source, "file"),
+                Err(RememberError::Cache(_))
+            ));
+            assert!(!cache.root.join(object_name(&expected.sha256)).exists());
+            assert!(source.sealed_root().is_none());
+            source.seal().unwrap();
+            assert_eq!(
+                fs::read(source.sealed_root().unwrap().join("file")).unwrap(),
+                b"good"
+            );
+        }
     }
 
     #[test]

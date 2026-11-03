@@ -2,7 +2,8 @@
 //!
 //! The wire names a manifest and relative files, never the worker's staging
 //! directory. A sealed owner is moved to the execution lifetime; reconnects
-//! discard incomplete staging, not execution history. Completed result recovery
+//! discard incomplete staging but may reuse individually verified byte objects.
+//! They never discard execution history. Completed result recovery
 //! uses the ORIGINAL source-bearing request fingerprint and needs no reupload.
 //! Optional source-byte reuse is explicit in source-begin. It saves transport,
 //! never grants action-cache authority or skips the request's final source seal.
@@ -187,6 +188,8 @@ pub struct SourceOwner {
     missing_files: Vec<String>,
     reused_bytes: u64,
     cache: Option<cache::SourceCache>,
+    cache_checkpoints: Option<cache::SourceCheckpoints>,
+    cache_checkpoints_started: bool,
     cache_protection: Option<SourceCache>,
     prepared_projections: Mutex<std::collections::BTreeMap<String, SourceProjectionLease>>,
     cache_write_error: Option<String>,
@@ -1515,6 +1518,44 @@ impl SourceOwner {
         Ok(())
     }
 
+    fn checkpoint_completed_file(&mut self, path: &str, next: u64) -> Result<(), String> {
+        let Some(cache) = &self.cache else {
+            return Ok(());
+        };
+        let files = self.receiver.manifest().files();
+        let index = files
+            .binary_search_by(|file| file.path.as_str().cmp(path))
+            .map_err(|_| invalid("undeclared source checkpoint member"))?;
+        if next != files[index].len {
+            return Ok(());
+        }
+        let result = (|| {
+            if !self.cache_checkpoints_started {
+                self.cache_checkpoints_started = true;
+                self.cache_checkpoints = cache.checkpoints(self.receiver.manifest())?;
+            }
+            if let Some(checkpoints) = &mut self.cache_checkpoints {
+                checkpoints.remember_file(&mut self.receiver, path)?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => Ok(()),
+            Err(cache::RememberError::Cache(error)) => {
+                self.cache_write_error = Some(error.to_string());
+                // Do not repeat a failed full inventory for every later file.
+                // Final seal retains its one ordinary optional cache attempt.
+                drop(self.cache_checkpoints.take());
+                Ok(())
+            }
+            Err(cache::RememberError::Source(error)) => {
+                self.source_failed = true;
+                drop(self.cache_checkpoints.take());
+                Err(format!("completed source verification failed: {error}"))
+            }
+        }
+    }
+
     fn within_budget(&self) -> Result<(), String> {
         if Instant::now() >= self.deadline {
             return Err(invalid("source upload deadline exceeded"));
@@ -1735,6 +1776,8 @@ impl SourceTransferState {
                 cache_protection: self.cache.clone(),
                 prepared_projections: Mutex::new(std::collections::BTreeMap::new()),
                 cache,
+                cache_checkpoints: None,
+                cache_checkpoints_started: false,
                 cache_write_error: None,
                 source_failed: false,
                 cargo_home,
@@ -1780,6 +1823,12 @@ impl SourceTransferState {
                 // live again. Do not acknowledge progress after the deadline.
                 owner.within_budget()?;
                 check_cancelled(&cancelled)?;
+                // A completed member can survive a disconnect before the rest
+                // of the source tree arrives. Only verified independent bytes
+                // enter the cache; the receiver still needs its full final seal.
+                owner.checkpoint_completed_file(path, next)?;
+                owner.within_budget()?;
+                check_cancelled(&cancelled)?;
                 Ok(json!({"kind":"source-chunk-accepted", "request_id":id,
                     "manifest_sha256":hex(&owner.receiver.manifest().digest()),
                     "path":path, "next_offset":next}))
@@ -1792,6 +1841,7 @@ impl SourceTransferState {
                 check_cancelled(&cancelled)?;
                 sealed.map_err(|error| error.to_string())?;
                 owner.within_budget()?;
+                drop(owner.cache_checkpoints.take());
                 // Seed once, before execution owns the source. Optional cache
                 // storage failure is not an execution failure; discovering a
                 // changed source is, and remains fenced on subsequent frames.
@@ -4083,6 +4133,239 @@ mod tests {
     }
 
     #[test]
+    fn source_checkpoints_resume_complete_files_before_manifest_seal() {
+        use std::os::unix::fs::MetadataExt;
+        let cache = tempfile::tempdir().unwrap();
+        let complete = vec![0x6d; MAX_SOURCE_CHUNK * 2 + 7];
+        let partial = vec![0x41; MAX_SOURCE_CHUNK + 3];
+        let manifest = projection(&[
+            ("a/dependency.crate", &complete, false),
+            ("b/source.rs", &partial, false),
+        ]);
+        let mut cold = cached_state(cache.path());
+        assert_eq!(
+            cold.handle(&begin(&manifest, 71), true, false).unwrap()["missing_files"],
+            json!(["a/dependency.crate", "b/source.rs"])
+        );
+        upload(&mut cold, &manifest, 71, "a/dependency.crate", &complete);
+        upload(
+            &mut cold,
+            &manifest,
+            71,
+            "b/source.rs",
+            &partial[..MAX_SOURCE_CHUNK],
+        );
+        let object = cache
+            .path()
+            .join("source-files-v1")
+            .join(format!("{}.src", hex(&Sha256::digest(&complete))));
+        assert_ne!(
+            std::fs::metadata(&object).unwrap().ino(),
+            std::fs::metadata(
+                cold.pending
+                    .as_ref()
+                    .unwrap()
+                    ._directory
+                    .path()
+                    .join("workspace/a/dependency.crate")
+            )
+            .unwrap()
+            .ino()
+        );
+        assert!(
+            cold.pending
+                .as_ref()
+                .unwrap()
+                .receiver
+                .sealed_root()
+                .is_none()
+        );
+        drop(cold); // Disconnect before source-seal; no source owner survives.
+
+        let mut resumed = cached_state(cache.path());
+        let ready = resumed.handle(&begin(&manifest, 72), true, false).unwrap();
+        assert_eq!(ready["missing_files"], json!(["b/source.rs"]));
+        assert_eq!(ready["source_reused_bytes"], complete.len());
+        assert_eq!(ready["sealed"], false);
+        let request = json!({"request_id":72, "source_manifest":manifest});
+        assert!(resumed.prepared_path(&request, true).is_err());
+        assert!(resumed.take_prepared(&request).is_err());
+        assert!(resumed.handle(&seal(&manifest, 72), true, false).is_err());
+        upload(&mut resumed, &manifest, 72, "b/source.rs", &partial);
+        resumed.handle(&seal(&manifest, 72), true, false).unwrap();
+        let root =
+            std::path::PathBuf::from(resumed.prepared_path(&request, true).unwrap().unwrap());
+        assert_eq!(
+            std::fs::read(root.join("a/dependency.crate")).unwrap(),
+            complete
+        );
+        assert_eq!(std::fs::read(root.join("b/source.rs")).unwrap(), partial);
+        assert_ne!(
+            std::fs::metadata(object).unwrap().ino(),
+            std::fs::metadata(root.join("a/dependency.crate"))
+                .unwrap()
+                .ino()
+        );
+    }
+
+    #[test]
+    fn source_checkpoint_retry_and_duplicate_contents_keep_one_cached_inode() {
+        use std::os::unix::fs::MetadataExt;
+        let cache = tempfile::tempdir().unwrap();
+        let manifest = projection(&[("a", b"same", false), ("b", b"same", true)]);
+        let mut state = cached_state(cache.path());
+        state.handle(&begin(&manifest, 73), true, false).unwrap();
+        upload(&mut state, &manifest, 73, "a", b"same");
+        let object = cache
+            .path()
+            .join("source-files-v1")
+            .join(format!("{}.src", hex(&Sha256::digest(b"same"))));
+        let inode = std::fs::metadata(&object).unwrap().ino();
+        upload(&mut state, &manifest, 73, "a", b"same");
+        upload(&mut state, &manifest, 73, "b", b"same");
+        assert_eq!(std::fs::metadata(&object).unwrap().ino(), inode);
+        assert_eq!(
+            std::fs::read_dir(object.parent().unwrap())
+                .unwrap()
+                .filter(|entry| entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".src"))
+                .count(),
+            1
+        );
+        state.handle(&seal(&manifest, 73), true, false).unwrap();
+        assert_eq!(std::fs::metadata(object).unwrap().ino(), inode);
+    }
+
+    #[test]
+    fn source_checkpoint_corruption_is_a_miss_and_a_new_upload_repairs_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let cache = tempfile::tempdir().unwrap();
+        let manifest = projection(&[("a", b"good", false), ("b", b"later", false)]);
+        let mut cold = cached_state(cache.path());
+        cold.handle(&begin(&manifest, 74), true, false).unwrap();
+        upload(&mut cold, &manifest, 74, "a", b"good");
+        drop(cold);
+        let object = cache
+            .path()
+            .join("source-files-v1")
+            .join(format!("{}.src", hex(&Sha256::digest(b"good"))));
+        std::fs::set_permissions(&object, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&object, b"evil").unwrap();
+        let mut repaired = cached_state(cache.path());
+        assert_eq!(
+            repaired.handle(&begin(&manifest, 75), true, false).unwrap()["missing_files"],
+            json!(["a", "b"])
+        );
+        upload(&mut repaired, &manifest, 75, "a", b"good");
+        drop(repaired);
+        let mut reopened = cached_state(cache.path());
+        assert_eq!(
+            reopened.handle(&begin(&manifest, 76), true, false).unwrap()["missing_files"],
+            json!(["b"])
+        );
+        assert_eq!(std::fs::read(object).unwrap(), b"good");
+    }
+
+    #[test]
+    fn source_checkpoint_rejects_wrong_final_digest_and_changed_physical_bytes() {
+        use std::io::Write;
+        for mutate_staging in [false, true] {
+            let cache = tempfile::tempdir().unwrap();
+            let bytes = vec![0x39; MAX_SOURCE_CHUNK + 5];
+            let manifest = projection(&[("file", &bytes, false)]);
+            let mut state = cached_state(cache.path());
+            state.handle(&begin(&manifest, 77), true, false).unwrap();
+            upload(
+                &mut state,
+                &manifest,
+                77,
+                "file",
+                &bytes[..MAX_SOURCE_CHUNK],
+            );
+            if mutate_staging {
+                let path = state
+                    .pending
+                    .as_ref()
+                    .unwrap()
+                    ._directory
+                    .path()
+                    .join("workspace/file");
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .write_all(b"x")
+                    .unwrap();
+            }
+            let tail: &[u8] = if mutate_staging {
+                &bytes[MAX_SOURCE_CHUNK..]
+            } else {
+                b"wrong"
+            };
+            assert!(
+                state
+                    .handle(
+                        &json!({"kind":"source-chunk", "request_id":77,
+                    "manifest_sha256":manifest["manifest_sha256"], "path":"file",
+                    "offset":MAX_SOURCE_CHUNK, "data_hex":hex(tail),
+                    "chunk_sha256":hex(&Sha256::digest(tail))}),
+                        true,
+                        false,
+                    )
+                    .is_err()
+            );
+            let request = json!({"request_id":77, "source_manifest":manifest});
+            assert!(state.handle(&seal(&manifest, 77), true, false).is_err());
+            assert!(state.prepared_path(&request, true).is_err());
+            assert!(state.take_prepared(&request).is_err());
+            let object = cache
+                .path()
+                .join("source-files-v1")
+                .join(format!("{}.src", hex(&Sha256::digest(&bytes))));
+            assert!(!object.exists());
+        }
+    }
+
+    #[test]
+    fn source_checkpoint_opt_out_and_cancelled_or_expired_tail_publish_nothing() {
+        for policy in ["opt-out", "cancelled", "expired"] {
+            let cache = tempfile::tempdir().unwrap();
+            let manifest = projection(&[("file", b"complete", false)]);
+            let mut state = cached_state(cache.path());
+            let mut start = begin(&manifest, 78);
+            if policy == "opt-out" {
+                start["allow_cached_files"] = json!(false);
+            }
+            state.handle(&start, true, false).unwrap();
+            upload(&mut state, &manifest, 78, "file", b"comp");
+            if policy == "cancelled" {
+                state.cancelled.store(true, Ordering::Release);
+            } else if policy == "expired" {
+                state.pending.as_mut().unwrap().deadline = Instant::now() - Duration::from_secs(1);
+            }
+            let result = state.handle(
+                &json!({"kind":"source-chunk", "request_id":78,
+                    "manifest_sha256":manifest["manifest_sha256"], "path":"file", "offset":4,
+                    "data_hex":hex(b"lete"), "chunk_sha256":hex(&Sha256::digest(b"lete"))}),
+                true,
+                false,
+            );
+            assert_eq!(result.is_ok(), policy == "opt-out");
+            drop(state);
+            let mut next = cached_state(cache.path());
+            assert_eq!(
+                next.handle(&begin(&manifest, 79), true, false).unwrap()["missing_files"],
+                json!(["file"]),
+                "{policy}"
+            );
+        }
+    }
+
+    #[test]
     fn large_archive_upload_then_reopened_cache_reuses_private_bytes_but_still_requires_seal() {
         use std::os::unix::fs::MetadataExt;
         let cache = tempfile::tempdir().unwrap();
@@ -4255,7 +4538,16 @@ mod tests {
             .join(format!("{}.src", hex(&Sha256::digest(b"good"))));
         std::fs::set_permissions(&cached, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::write(&cached, b"evil").unwrap();
-        let mut next = cached_state(cache.path());
+        // Production sessions clone the one configured cache. An independent
+        // open must remain a passive reader while its projection owner lives.
+        let independent = SourceCache::open(cache.path(), DEFAULT_SOURCE_CACHE_BYTES).unwrap();
+        assert!(
+            independent
+                .checkpoints(state.pending.as_ref().unwrap().receiver.manifest())
+                .unwrap()
+                .is_none()
+        );
+        let mut next = SourceTransferState::default().with_cache(state.cache.clone());
         assert_eq!(
             next.handle(&begin(&manifest, 2), true, false).unwrap()["missing_files"],
             json!(["lib.rs"])
