@@ -2,7 +2,20 @@
 
 ## Reality check and execution order — updated November 3, 2026
 
-**Current execution checkpoint, November3 at14:36UTC:** actual generated-input
+**Current execution checkpoint, November3 at16:10UTC:** the ordinary RCH stock
+baseline actually compiled on TRJ (Cargo0/38.91s), but its supervising client
+returned255/213.7s with `RCH_SCOPED_COMPLETION_UNCONFIRMED`. No public RABS
+round ran. Build30093651321290753, wrapper
+rchw-782df74f-a591-44cc-8cf6-f642d906673e, was recovered without replaying Cargo;
+the supported recovery records terminal cancellation130, not successful delivery.
+Its wrapper is acknowledged, source/target ownership released and durable active
+list empty. The worker's exact supervisor result0 remains retained. Private
+recovery daemon1136604 stopped through the supported command and its PID is
+absent. Shared TRJ scheduling was restored through `workers enable trj` at16:10;
+shared service1521977 was not restarted. Diagnose the actual completion failure
+before another public build; do not replace these losing receipts with a retry.
+
+**Earlier functional checkpoint, November3 at14:36UTC:** actual generated-input
 consumer PASS1/1 with the current normal-dev harness and four normal0fb tools:
 six delivered programs print the expected42/43, dependency archives replay
 across relocated worktrees, changed generator input invalidates the consumer,
@@ -36,6 +49,19 @@ Current highest-value TODO, in execution order:
   Zero test bodies ran; compiler processes are absent. No blind compile retry.
 - [ ] Run full adapter unit and original TLS/delivery/interrupt/resume suites
   on admitted faster capacity after the current RCH job; preserve normal profile.
+  Original3f7 now actually ran through DSR70fd7ee1 on TS2:158passed/3failed/
+  0ignored across161 tests (adapter126/1, delivery24/2, interrupt5/0, resume3/0).
+  Scoped check, strictClippy and fmt all0; DSR terminalFAILED6. Retain the three
+  failures: J011 injected-clock/native-wake mismatch; prepared source fixture
+  parent not private; scripted failed-compiler peer omits empty stdout range.
+- [ ] Qualify the clock/fixture repair against all four full suites and FULL
+  workspace QA, preserving every original assertion, timeout and privacy gate.
+  DSR7b05b9f9 sourceb678f970 is queued behind the RCH diagnostic job. It adds
+  an early-wake regression, private fixture setup plus explicit0770 refusal,
+  exact empty stdout framing and unchanged diagnostic/ACK/offline checks.
+  The working tree additionally rechecks the selected clock after a native
+  wake and tests a clock crossing during that poll; this stronger final change
+  is NOT included in frozenb678 and requires its own qualified continuation.
 - [x] Run original full-SDK TRJ compiler consumer with3f7 shipping tools.
   DSRrabs_tls_nodelay_trj_runtime started14:33:09UTC, original300s Cargo/600s
   helper, full installed SDK and original byte-bound older harness. Prior0fb
@@ -53,21 +79,91 @@ Current highest-value TODO, in execution order:
   timeout increase, source-key relaxation or synthetic pass.
 - [x] Run original current-tree Linux RCH focused tests, sourcee792e4ba:
   worker-cache wiring1/1, source-lock lifecycle1/1, config guards8/8, all raw0.
-- [ ] Complete current-tree RCH client/daemon compile and full workspace
-  check/strictClippy/fmt. DSRrch_current_tree_wiring started13:59:31UTC;
+- [x] Compile current-tree RCH client and daemon: normal dev build0/1458.6s.
+  Client1068926072B SHAf2263f549e1885d16d3ab4cfbd90638cb9fef7c043a8ca0e4ce9b0dcb1a5fe79;
+  daemon385037392B SHA712f0e29c7fd72b97b66d20fdc1ea76b9c21abf90c8fd14f53a596b6bc50861d.
+  Component source/incoming-after audits verify. Actual retained native client
+  --version and exec --help both0, empty stderr; no installation or release.
+- [x] Complete current-tree full workspace check/strictClippy/fmt.
+  DSRrch_current_tree_wiring/a2b75cf1 started13:59:31UTC;
   source is whole main4d4e1db9 plus frozen working bytes,1694 selected files.
   Older459/116e preparations remain UNRUN/superseded; no topology downgrade.
+  First attempt TIMEOUT5/3615s during workspace checking; both binaries and
+  component audits retained, Clippy/fmt UNRUN. Continuation started15:01:40UTC
+  through DSRrch_current_tree_continuation on the same frozen source/home/target,
+  original complete driver/limits repeated. Focused1/1+1/1+8/8 pass again,
+  both binaries are Cargo-fresh and byte-identical. FULL workspace check0/419.2s,
+  strict Clippy101/208.8s on integration router manual_strip, fmt0/17.2s.
+  DSR9e32b33f is terminalFAILED; source/incoming-after audits verify. No lint
+  suppression or gate waiver. The unchanged baseline UBS also retains the same
+  seven critical fixture panic/shell findings; raw1 remains explicit.
+- [x] Manually replace that test router's starts_with plus identical prefix
+  slicing with strip_prefix; all five topology safety assertions remain.
+- [x] Qualify the router fix: repeat original focused10 and all FIVE actual
+  CLI topology fixture cases, then FULL check/strictClippy/fmt. DSR97783 launcher
+  started15:19UTC, sourcea426260b with exactly one test-file delta frome792;
+  manifestc20fdc4c6e87965a4d6a7ed55feccf9402824ffde757ed80f7f41bf61c9e59f2.
+  Original e792 archive and router bytes retained. Production source is identical;
+  reuse its exact compiled client/daemon with original per-binary provenance.
+  Fixture CLI proof is not the actual RABS worker/cache consumer.
+  Terminal DSR4b32a491 native raw0: fifteen tests pass, full check0/4.1s,
+  strictClippy0/381.4s and fmt0/16.2s. Report747f08540313e951563193e481c4d5ce90afce1fbd0b6cb8c7099848e688ba51.
+  Commit ed2865cc changes only that router prefix expression; all original
+  assertions remain. Shared Git index SHA remains bafc2682cfc6ef108c0988b89c5ee7257d4a5301f5e589470975b678e912ea09.
 - [x] Verify real existing TS2-to-TRJ strict-host-key SSH and authoritative
   worker row (eight real slots). No new credentials or private-key copying.
 - [ ] With task-private client/daemon/config/state and real worker tools, run
   ordinary public cargo-rabs --rabs-remote through RCH. Require source receipt,
   actual worker-local RABS activity, correct returned outputs and terminal ACK.
+- [x] Restore shared TRJ scheduling after the isolated pool has cleanly settled;
+  do not leave it drained when this work stops. Shared TS2 service PID1521977 was
+  already running since09:52; at15:44 TRJhealthy/used0/slots8/noactive was drained
+  through the supported scoped command, then independently observed drained/0.
+  No jobs cancelled or other workers changed. First public run failed before
+  compiler startup because its private socket was also configured as shared;
+  retain that preparation-only failure. New isolated attempt uses the existing
+  separate CLI socket plus worker-config contract and actual shared endpoint
+  in daemon-only config. No singleton/slot guard bypass; recover any uncertain
+  private ownership before returning TRJ to shared scheduling.
+- [x] Reconcile the exact failed stock build without compilation replay; retain
+  its cancelled130 completion and original worker result0 separately, as above.
+- [ ] Diagnose actual supervisor255 using exact production shell bytes on TRJ;
+  first isolate a real small payload with a native DSR probe and syscall trace.
+  Change no cleanup authority, process census, clock, timeout or gate to get green.
+  Exact-e792 native shell probes2/2 pass,14.47s and35.75s traced; both groups
+  independently empty and result receipts0. DSR1e26cae5 remains FAILED7 at
+  artifact collection because the diagnostic did not produce its configured
+  binary. This is native supervisor proof, not RCH/RABS success. Earlier
+  DSRb1ff26ec failed its source guard before any payload; retain both outcomes.
+- [ ] Qualify bounded failure-only RCH completion details with unchanged exact
+  uncertainty marker/status255, ownership retention and cleanup conditions.
+  Sourcec5299732, DSRd2f7fa98: all27 native process cases and all3 compiled
+  shell parse/quoting cases pass. Normal client/daemon rebuild and full required
+  check/strictClippy/fmt are pending. UBS candidate and baseline both retain
+  the same16 critical fixture/eval findings,24warnings,141info; raw1 is not green.
+  This diagnostic change does not fix or reproduce the original stock failure.
+- [ ] Correct the public canary's metadata collector before its next run:
+  actual Cargo `build.build-dir` can put libitoa metadata below debug/build,
+  so enumerate actual returned artifacts and require exactly one matching rmeta.
+  Preserve the exact stock/cache byte comparison and declared one-dependency ladder.
+  Source review also confirms cargo check intentionally returns diagnostics,
+  not compiler intermediates. The local prepared collector now joins the exact
+  source-receipt decimal build ID to its acknowledged durable job, then observes
+  exactly one rmeta in that worker's private granted pool, including debug/build.
+  It compares exact bytes there and claims no local intermediate delivery.
+  Syntax-only validation passes; the original remote driver remains unchanged
+  and these stronger observations are still UNRUN.
 - [ ] Test cold independent targets, independent qualification, warm cache serve,
   changed-input invalidation and ordinary Rustup separately; fallback is not a hit.
 - [x] Retain Mac RCH459 DSR0190c286 terminalTIMEOUT5/4620s, no binaries/tests.
   Both known Mac alternatives fail original storage guards; no floor exceptions.
 - [ ] Close the S7 DSR archive producer/installer member mismatch, then prove
   private install/doctor/uninstall on actual matching bytes and admitted hosts.
+- [x] Run actual production private install and independent verify of the four
+  normal3f7 ELF tools plus API1 launcher on TRJ, then five actual-tool smoke
+  commands: seven raw exits0. Generationgen-omdwywst; report
+  cbe9cb53f5726e2f95539c6952dee1c98f1166ac99c1776b4137f43be929d201.
+  No global install, daemon start, named S7 host or release qualification implied.
 - [ ] Distinct-host shared authority/cancellation/restart, fifteen-agent storm,
   paired current-RCH/stock performance and sustained rollout remain UNRUN.
 - [ ] Keep M6/S7/A012 in_progress until their own acceptance probes complete;
