@@ -2456,6 +2456,34 @@ real Cargo serving, fleet performance or release qualification.
     proc-macros/tls only. Retain compiled-pair-smoke.json. This is compile and
     launch proof only at that checkpoint; subsequent worktree results follow.
     TLS/worker/performance and release acceptance remain unproved.
+  - [x] Correct an overbroad orchestration precondition for a SCOPED public
+    local launcher experiment: it needs this exact normal two-binary pair,
+    not a final report from unrelated canonical preparation. The old gate
+    currently refuses it (no overall_raw_exit); its full-suite/release
+    requirement remains unmet. Do not invent a terminal runtime report.
+    Fresh full source audit1,697/1,755+58 omissions and the actual Cargo
+    normal-build artifact source/profile records bind the pair. Retain the
+    wrapper privately so an active later build cannot overwrite this input;
+    hashes match the values above. Pair-preflight SHA-256
+    707a18736b913b03a052ea48c0936860a7fdd707afafd4ecb2f7fb572276795d.
+    Admission split: admit only this source-bound local experiment; still
+    reject wrong source, failed source audit or wrong wrapper hash before
+    Cargo (three original-predicate negatives in the runner). No admission
+    for full-suite,4tool,canonical/TLS,release,fleet or performance claims.
+  - [x] Submit native DSR rabs_public_local_canary03:14:45UTC, PID90086,
+    version2.1.34-rabspublic.272b3ab0. Immutable11,194-byte runner
+    75fa37d52a2f86618d3991f57d87fcd36cde1c7d1d4b0898401c9834041cf9fc.
+    Keep all ORIGINAL five Cargo checks,11metadata byte-equality outputs,
+    eight cold executions/commits, two eight-verification rounds and final
+    eight serves/zero executions. Keep30s daemon readiness/60s settlement,
+    source-before/after, binary-after, fresh targets and same-invocation stock.
+    Replace the legacy aggregate source constant with the complete pinned
+    1,755-file manifest audit, retaining the old aggregate match as reported
+    evidence and the before/after aggregate comparison. No runtime assertion,
+    compiler-skip authority, original failed suite or budget is weakened.
+  - [ ] Collect all five public local Cargo results and exact11/8 counts.
+    A pass establishes this bounded opt-in unsandboxed local lane only; keep
+    original9/10, canonical/worker, current RCH frontdoor and release open.
   - [x] Finish the original worktree suite: **9 passed, 1 failed, 0 ignored**,
     raw101, libtest780.20s. Five real Cargo cases and four binary-integrity
     controls pass. Vendored dependencies fail at verify-1: expected3 verified
@@ -2671,9 +2699,19 @@ real Cargo serving, fleet performance or release qualification.
       units (at least100), wrapper all-target check/strict Clippy, workspace
       fmt and source-after; no zero-run green. Linux pre-staged source and
       a clearly named test executable, not caller-local sync/release proof.
-    - [ ] Collect raw corrected-fixture positive/negative counts and every
-      full-unit failure; compare to the original105/106 RED without erasing
-      it. A pass establishes a valid fixture, not a production capture fix.
+    - [x] Compile corrected fixture with native Cargo0,963.27s, then execute
+      **12 capture tests passed/0failed/0ignored**, raw0,4.67s external.
+      The actual pair queues16,039,936 bytes; report32,079,911 bytes. Every
+      caller-loss, noACK, missing/invalid/partial receipt, suffix-resumption
+      and unchanged absolute-deadline control passes. Full original wrapper
+      suite then **106passed/0failed/0ignored**, raw0,10.11s external. The12
+      capture cases are a subset, not118 independent tests. Original105/106
+      RED remains retained; the corrected fixture establishes backpressure,
+      not a production capture repair or real Cargo/worker/performance pass.
+      Logs retained at `/Volumes/trj-data/rabs-wrapper-trace-20261103/capture-capacity-component/`.
+    - [ ] Finish wrapper all-target check, strict Clippy, workspace fmt and
+      source-after for source52. Full workspace qualification and actual
+      runtime acceptance remain separately pending even if these pass.
   - [x] Bound alternate-capacity probes: ts1 has the pinned toolchain and a
     healthy mounted NAS, but root and/tmp fail14% (tmp also fails20G).
     No build was launched there. Earlier be324 retains a verified daemon,
@@ -2881,6 +2919,16 @@ real Cargo serving, fleet performance or release qualification.
   failure and mark later commands unrun. The inherited manifest description
   still names an older two-file cut; its complete file map binds the actual
   seven-file RCH overlay, and the descriptor text is not used as byte evidence.
+- [x] Execute the original nine Linux bootstrap regression methods as a
+  supplemental source-bound diagnostic, raw0,33.252s libtest-style summary
+  (34.930s external), no skips. Selected worker_cache.rs, worker_cache.py and
+  test_rabs_worker_bootstrap.py bytes match source459 before/after; original
+  per-fixture6s deadlines stay. Startup poisoning, byte-exact argv/stdin/env,
+  jobserver descriptors, cancellation and exactly-once fixture Cargo pass.
+  The preparation API and Cargo are explicit fixtures, so this is not a
+  compiled Rust routing, RABS daemon/cache, real worker or release/CI result.
+  Logs/report: `/Volumes/trj-data/rabs-worker-cache-wiring-20261102/bootstrap-source-regressions.*`;
+  log SHA-2561ecc55c2f3f9140f4960b748caf2fccdb93084020d35e6a26a3dd5a09da3d690.
 - [ ] Bind native source before/after and actual artifact identity. Then build
   the matching private Mac client through DSR and prove real public opt-in
   preparation with an actual installed private RABS toolset and real Cargo.
