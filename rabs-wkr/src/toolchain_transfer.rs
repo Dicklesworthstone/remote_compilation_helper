@@ -143,8 +143,8 @@ impl SealedToolchain {
         self.prepared.identity()
     }
 
-    pub(crate) fn root(&self) -> &Path {
-        self.prepared.root()
+    pub(crate) fn prepared(&self) -> &PreparedToolchain {
+        &self.prepared
     }
 
     pub(crate) fn into_parts(self) -> (PreparedToolchain, tempfile::TempDir) {
@@ -1287,6 +1287,209 @@ mod tests {
             second.verify(|| false).unwrap();
         }
 
+        fn full_durable_fixture() -> (
+            tempfile::TempDir,
+            Arc<toolchain_pool::ToolchainPool>,
+            Value,
+            std::path::PathBuf,
+        ) {
+            let (source, initial_pool, wire) = fixture(1024, false);
+            drop(initial_pool);
+            fs::write(
+                source.path().join("bin/compiler"),
+                vec![b'x'; CONTENTS.len()],
+            )
+            .unwrap();
+            let other = fingerprint_toolchain(source.path(), &ToolchainLimits::default(), || false)
+                .unwrap();
+            let parent = tempfile::tempdir().unwrap();
+            let root = parent.path().join("durable");
+            let budget = CONTENTS.len() as u64;
+            let pool =
+                toolchain_pool::ToolchainPool::with_directory(budget, 1, Some(&root)).unwrap();
+            let retained = pool.acquire(source.path(), Some(&other), || false).unwrap();
+            let retained_root = retained.root().to_path_buf();
+            drop(retained);
+            drop(pool);
+            // Reopening empties the memory pool while the durable catalogue
+            // remains full. Its refusal must not force another private copy.
+            let pool = Arc::new(
+                toolchain_pool::ToolchainPool::with_directory(budget, 1, Some(&root)).unwrap(),
+            );
+            (parent, pool, wire, retained_root)
+        }
+
+        #[test]
+        fn full_durable_cache_adopts_the_upload_until_its_last_ephemeral_lease_drops() {
+            use rabs_sandbox::canonical_namespace::{Bind, CanonicalNamespaceSpec};
+
+            let (parent, pool, wire, retained_root) = full_durable_fixture();
+            let cache_root = parent.path().join("durable");
+            let retained_inode = inode(&retained_root.join("bin/compiler"));
+            let (owner, request) = upload(&pool, &wire);
+            let root = Path::new(&request.toolchain_backing).to_path_buf();
+            let directory_inode = inode(&root);
+            let compiler_inode = inode(&root.join("bin/compiler"));
+            let lease = pool.adopt(sealed(owner, &request), || false).unwrap();
+            assert_eq!(lease.disposition(), "adopted");
+            assert_eq!(lease.root(), root);
+            assert_eq!(inode(lease.root()), directory_inode);
+            assert_eq!(inode(&lease.root().join("bin/compiler")), compiler_inode);
+            assert_eq!(fs::read(lease.root().join("rustc")).unwrap(), CONTENTS);
+            lease.verify(|| false).unwrap();
+            let retained = pool.lookup(lease.identity(), || false).unwrap().unwrap();
+            assert_eq!(retained.root(), root);
+            drop(retained);
+            assert_eq!(
+                fs::read_dir(cache_root.join("toolchains-v1"))
+                    .unwrap()
+                    .count(),
+                1
+            );
+            assert_eq!(inode(&retained_root.join("bin/compiler")), retained_inode);
+
+            for writable in [root.parent().unwrap(), cache_root.as_path()] {
+                let mut spec = CanonicalNamespaceSpec::new();
+                spec.ro_binds
+                    .push(Bind::new(&root, rabs_sandbox::layout::TOOLCHAIN));
+                spec.rw_binds
+                    .push(Bind::new(writable, rabs_sandbox::layout::WORKSPACE));
+                assert!(lease.validate_namespace(&spec).is_err());
+            }
+            let identity = *lease.identity();
+            drop(pool);
+            assert!(root.is_dir());
+            assert!(
+                toolchain_pool::ToolchainPool::with_directory(
+                    CONTENTS.len() as u64,
+                    1,
+                    Some(&cache_root),
+                )
+                .is_err(),
+                "the private lease must also retain the durable store lock",
+            );
+            lease.verify(|| false).unwrap();
+            drop(lease);
+            assert!(!root.exists());
+            assert_eq!(inode(&retained_root.join("bin/compiler")), retained_inode);
+            let reopened = toolchain_pool::ToolchainPool::with_directory(
+                CONTENTS.len() as u64,
+                1,
+                Some(&cache_root),
+            )
+            .unwrap();
+            assert!(reopened.lookup(&identity, || false).unwrap().is_none());
+        }
+
+        #[test]
+        fn too_small_durable_budget_keeps_the_owned_upload_private_without_copying() {
+            let (_source, initial_pool, wire) = fixture(1024, false);
+            drop(initial_pool);
+            let parent = tempfile::tempdir().unwrap();
+            let cache_root = parent.path().join("durable");
+            let pool = Arc::new(
+                toolchain_pool::ToolchainPool::with_directory(
+                    CONTENTS.len() as u64 - 1,
+                    2,
+                    Some(&cache_root),
+                )
+                .unwrap(),
+            );
+            let (owner, request) = upload(&pool, &wire);
+            let root = Path::new(&request.toolchain_backing).to_path_buf();
+            let directory_inode = inode(&root);
+            let compiler_inode = inode(&root.join("bin/compiler"));
+            let lease = pool.adopt(sealed(owner, &request), || false).unwrap();
+            assert_eq!(lease.disposition(), "private");
+            assert_eq!(lease.root(), root);
+            assert_eq!(inode(lease.root()), directory_inode);
+            assert_eq!(inode(&lease.root().join("bin/compiler")), compiler_inode);
+            assert!(pool.lookup(lease.identity(), || false).unwrap().is_none());
+            assert_eq!(
+                fs::read_dir(cache_root.join("toolchains-v1"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+            drop(pool);
+            lease.verify(|| false).unwrap();
+            drop(lease);
+            assert!(!root.exists());
+        }
+
+        #[test]
+        fn busy_durable_writer_adopts_an_unrelated_upload_without_copying_or_waiting() {
+            use std::cell::Cell;
+
+            let (source, initial_pool, wire) = fixture(1024, false);
+            drop(initial_pool);
+            fs::write(
+                source.path().join("bin/compiler"),
+                vec![b'x'; CONTENTS.len()],
+            )
+            .unwrap();
+            let other = fingerprint_toolchain(source.path(), &ToolchainLimits::default(), || false)
+                .unwrap();
+            let parent = tempfile::tempdir().unwrap();
+            let cache_root = parent.path().join("durable");
+            let pool = Arc::new(
+                toolchain_pool::ToolchainPool::with_directory(1024, 2, Some(&cache_root)).unwrap(),
+            );
+            let (owner, request) = upload(&pool, &wire);
+            let root = Path::new(&request.toolchain_backing).to_path_buf();
+            let directory_inode = inode(&root);
+            let compiler_inode = inode(&root.join("bin/compiler"));
+            let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+            let (resume_tx, resume_rx) = mpsc::sync_channel(1);
+            let writer_pool = Arc::clone(&pool);
+            let source_root = source.path().to_path_buf();
+            let objects = cache_root.join("toolchains-v1");
+            let writer = std::thread::spawn(move || {
+                let paused = Cell::new(false);
+                writer_pool.acquire(&source_root, Some(&other), || {
+                    if !paused.get()
+                        && fs::read_dir(&objects).unwrap().any(|entry| {
+                            entry
+                                .unwrap()
+                                .file_name()
+                                .to_string_lossy()
+                                .starts_with(".pending-")
+                        })
+                    {
+                        // An actual durable capture holds the writer and its
+                        // on-disk reservation, before copying the first byte.
+                        paused.set(true);
+                        entered_tx.send(()).unwrap();
+                        resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    }
+                    false
+                })
+            });
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let lease = pool.adopt(sealed(owner, &request), || false).unwrap();
+            assert_eq!(lease.disposition(), "adopted");
+            assert_eq!(lease.root(), root);
+            assert_eq!(inode(lease.root()), directory_inode);
+            assert_eq!(inode(&lease.root().join("bin/compiler")), compiler_inode);
+            assert_eq!(
+                fs::read_dir(cache_root.join("toolchains-v1"))
+                    .unwrap()
+                    .count(),
+                1
+            );
+            lease.verify(|| false).unwrap();
+            resume_tx.send(()).unwrap();
+            let captured = writer.join().unwrap().unwrap();
+            assert_eq!(captured.disposition(), "captured");
+            assert_ne!(captured.identity(), lease.identity());
+            captured.verify(|| false).unwrap();
+            drop(captured);
+            drop(pool);
+            assert!(root.is_dir());
+            drop(lease);
+            assert!(!root.exists());
+        }
+
         #[test]
         fn durable_upload_capture_survives_restart_and_reuses_the_published_image() {
             use std::cell::Cell;
@@ -1398,33 +1601,243 @@ mod tests {
 
         #[test]
         fn changed_or_cancelled_upload_never_becomes_a_retained_lease() {
-            let (_source, pool, wire) = fixture(1024, false);
+            for cache in ["memory", "durable-full", "durable-available"] {
+                let (_parent, pool, wire) = match cache {
+                    "durable-full" => {
+                        let (parent, pool, wire, _) = full_durable_fixture();
+                        (parent, pool, wire)
+                    }
+                    "durable-available" => {
+                        let (_source, initial_pool, wire) = fixture(1024, false);
+                        drop(initial_pool);
+                        let parent = tempfile::tempdir().unwrap();
+                        let pool = Arc::new(
+                            toolchain_pool::ToolchainPool::with_directory(
+                                1024,
+                                2,
+                                Some(&parent.path().join("durable")),
+                            )
+                            .unwrap(),
+                        );
+                        (parent, pool, wire)
+                    }
+                    _ => fixture(1024, false),
+                };
+                let identity = parse_toolchain_identity(&wire).unwrap().unwrap();
+                let (owner, request) = upload(&pool, &wire);
+                let root = Path::new(&request.toolchain_backing).to_path_buf();
+                let compiler = root.join("bin/compiler");
+                fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755)).unwrap();
+                // Even restored bytes and final modes cannot refresh the sealed
+                // inode's mutation witness into a newly admitted generation.
+                fs::write(&compiler, CONTENTS).unwrap();
+                fs::set_permissions(&compiler, fs::Permissions::from_mode(0o555)).unwrap();
+                assert!(
+                    pool.adopt(sealed(owner, &request), || false).is_err(),
+                    "{cache}"
+                );
+                assert!(!root.exists());
+                assert!(pool.lookup(&identity, || false).unwrap().is_none());
+
+                let (owner, request) = upload(&pool, &wire);
+                let root = Path::new(&request.toolchain_backing).to_path_buf();
+                let error = pool.adopt(sealed(owner, &request), || true).err().unwrap();
+                assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+                assert!(!root.exists());
+                assert!(pool.lookup(&identity, || false).unwrap().is_none());
+
+                // A refused owner must release its memory reservation, so a
+                // fresh exact upload can occupy the same bounded slot.
+                let (owner, request) = upload(&pool, &wire);
+                let lease = pool.adopt(sealed(owner, &request), || false).unwrap();
+                if cache == "durable-available" {
+                    assert_eq!(lease.disposition(), "captured");
+                    assert!(!Path::new(&request.toolchain_backing).exists());
+                } else {
+                    assert_eq!(lease.disposition(), "adopted");
+                    assert_eq!(lease.root(), Path::new(&request.toolchain_backing));
+                }
+                assert!(pool.lookup(&identity, || false).unwrap().is_some());
+            }
+        }
+
+        #[test]
+        fn durable_capture_rejects_a_refreshed_upload_generation_before_publication() {
+            use std::cell::Cell;
+
+            let (_source, initial_pool, wire) = fixture(1024, false);
+            drop(initial_pool);
+            let parent = tempfile::tempdir().unwrap();
+            let cache_root = parent.path().join("durable");
+            let objects = cache_root.join("toolchains-v1");
+            let pool = Arc::new(
+                toolchain_pool::ToolchainPool::with_directory(
+                    CONTENTS.len() as u64,
+                    1,
+                    Some(&cache_root),
+                )
+                .unwrap(),
+            );
+            let (owner, request) = upload(&pool, &wire);
+            let root = Path::new(&request.toolchain_backing).to_path_buf();
+            let compiler = root.join("bin/compiler");
+            let changed = Cell::new(false);
+            assert!(
+                pool.adopt(sealed(owner, &request), || {
+                    if !changed.get() && fs::read_dir(&objects).unwrap().next().is_some() {
+                        // Admission has preserved the original generation and
+                        // reserved durable storage. A fresh source scan could now
+                        // accept these restored bytes, but the sealed witness cannot.
+                        changed.set(true);
+                        fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755)).unwrap();
+                        fs::write(&compiler, CONTENTS).unwrap();
+                        fs::set_permissions(&compiler, fs::Permissions::from_mode(0o555)).unwrap();
+                    }
+                    false
+                })
+                .is_err()
+            );
+            assert!(changed.get());
+            assert!(!root.exists());
+            let entries: Vec<_> = fs::read_dir(&objects)
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(entries.len(), 1);
+            assert!(
+                entries[0]
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".pending-")
+            );
+            assert_eq!(
+                fs::read(entries[0].path().join("tree/bin/compiler")).unwrap(),
+                CONTENTS
+            );
             let identity = parse_toolchain_identity(&wire).unwrap().unwrap();
+            assert!(pool.lookup(&identity, || false).unwrap().is_none());
+            // The failed durable reservation remains charged and unpublished;
+            // only the failed in-memory acquisition reservation is released.
+            let (owner, request) = upload(&pool, &wire);
+            let lease = pool.adopt(sealed(owner, &request), || false).unwrap();
+            assert_eq!(lease.disposition(), "adopted");
+            assert_eq!(lease.root(), Path::new(&request.toolchain_backing));
+            lease.verify(|| false).unwrap();
+            assert!(entries[0].path().exists());
+        }
+
+        #[test]
+        fn independent_durable_hit_does_not_revalidate_a_redundant_uploaded_generation() {
+            let (source, initial_pool, wire) = fixture(1024, false);
+            drop(initial_pool);
+            let parent = tempfile::tempdir().unwrap();
+            let cache_root = parent.path().join("durable");
+            let identity = parse_toolchain_identity(&wire).unwrap().unwrap();
+            let initial =
+                toolchain_pool::ToolchainPool::with_directory(1024, 2, Some(&cache_root)).unwrap();
+            let retained = initial
+                .acquire(source.path(), Some(&identity), || false)
+                .unwrap();
+            let published = retained.root().to_path_buf();
+            let published_inode = inode(&published.join("bin/compiler"));
+            drop(retained);
+            drop(initial);
+            let pool = Arc::new(
+                toolchain_pool::ToolchainPool::with_directory(1024, 2, Some(&cache_root)).unwrap(),
+            );
             let (owner, request) = upload(&pool, &wire);
             let root = Path::new(&request.toolchain_backing).to_path_buf();
             let compiler = root.join("bin/compiler");
             fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755)).unwrap();
-            // Even restored bytes and final modes cannot refresh the sealed
-            // inode's mutation witness into a newly admitted generation.
-            fs::write(&compiler, CONTENTS).unwrap();
+            fs::write(&compiler, vec![b'x'; CONTENTS.len()]).unwrap();
             fs::set_permissions(&compiler, fs::Permissions::from_mode(0o555)).unwrap();
-            assert!(pool.adopt(sealed(owner, &request), || false).is_err());
+            let lease = pool.adopt(sealed(owner, &request), || false).unwrap();
+            assert_eq!(lease.root(), published);
+            assert_eq!(inode(&lease.root().join("bin/compiler")), published_inode);
+            assert_eq!(fs::read(lease.root().join("rustc")).unwrap(), CONTENTS);
+            lease.verify(|| false).unwrap();
             assert!(!root.exists());
-            assert!(pool.lookup(&identity, || false).unwrap().is_none());
+        }
 
+        #[test]
+        fn durable_decline_checks_cancellation_during_the_owned_byte_scan() {
+            use std::cell::Cell;
+
+            let (_parent, pool, wire, _) = full_durable_fixture();
+            let identity = parse_toolchain_identity(&wire).unwrap().unwrap();
             let (owner, request) = upload(&pool, &wire);
             let root = Path::new(&request.toolchain_backing).to_path_buf();
-            let error = pool.adopt(sealed(owner, &request), || true).err().unwrap();
+            let compiler = root.join("bin/compiler");
+            let cancelled = Cell::new(false);
+            let error = pool
+                .adopt(sealed(owner, &request), || {
+                    // Cancel only once the actual owned file is open for its byte
+                    // scan. No timing assumption or checkpoint count decides when
+                    // durable admission has declined and verification has begun.
+                    let reading = fs::read_dir("/proc/self/fd").unwrap().any(|entry| {
+                        entry
+                            .ok()
+                            .and_then(|entry| fs::read_link(entry.path()).ok())
+                            .as_deref()
+                            == Some(compiler.as_path())
+                    });
+                    cancelled.set(cancelled.get() || reading);
+                    cancelled.get()
+                })
+                .err()
+                .unwrap();
+            assert!(
+                cancelled.get(),
+                "cancellation must reach owned-image verification"
+            );
             assert_eq!(error.kind(), io::ErrorKind::Interrupted);
             assert!(!root.exists());
             assert!(pool.lookup(&identity, || false).unwrap().is_none());
-
-            // A refused owner must release its reservation, so a fresh exact
-            // upload can occupy the same bounded slot without a copied tree.
             let (owner, request) = upload(&pool, &wire);
             let lease = pool.adopt(sealed(owner, &request), || false).unwrap();
+            assert_eq!(lease.disposition(), "adopted");
             assert_eq!(lease.root(), Path::new(&request.toolchain_backing));
-            assert!(pool.lookup(&identity, || false).unwrap().is_some());
+            lease.verify(|| false).unwrap();
+        }
+
+        #[test]
+        fn durable_corruption_and_io_errors_never_fall_back_to_a_valid_upload() {
+            for corrupt_bytes in [false, true] {
+                let (source, initial_pool, wire) = fixture(1024, false);
+                drop(initial_pool);
+                let identity = parse_toolchain_identity(&wire).unwrap().unwrap();
+                let parent = tempfile::tempdir().unwrap();
+                let cache_root = parent.path().join("durable");
+                let initial =
+                    toolchain_pool::ToolchainPool::with_directory(1024, 2, Some(&cache_root))
+                        .unwrap();
+                let retained = initial
+                    .acquire(source.path(), Some(&identity), || false)
+                    .unwrap();
+                let compiler = retained.root().join("bin/compiler");
+                drop(retained);
+                drop(initial);
+                let pool = Arc::new(
+                    toolchain_pool::ToolchainPool::with_directory(1024, 2, Some(&cache_root))
+                        .unwrap(),
+                );
+                let (owner, request) = upload(&pool, &wire);
+                let root = Path::new(&request.toolchain_backing).to_path_buf();
+                if corrupt_bytes {
+                    fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755)).unwrap();
+                    fs::write(&compiler, vec![b'x'; CONTENTS.len()]).unwrap();
+                    fs::set_permissions(&compiler, fs::Permissions::from_mode(0o555)).unwrap();
+                } else {
+                    fs::rename(
+                        cache_root.join("toolchains-v1"),
+                        cache_root.join("held-objects"),
+                    )
+                    .unwrap();
+                }
+                assert!(pool.adopt(sealed(owner, &request), || false).is_err());
+                assert!(!root.exists());
+                assert!(pool.lookup(&identity, || false).is_err());
+            }
         }
 
         #[test]

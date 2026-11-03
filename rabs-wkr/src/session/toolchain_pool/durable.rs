@@ -10,7 +10,7 @@
 //! and RABS_WORKER_TOOLCHAIN_CACHE_BYTES to a nonzero retention budget. Without
 //! CACHE_DIR the existing process-local policy is unchanged. The durable store
 //! has at most eight entries and the configured logical-byte budget, including
-//! incomplete reservations. A full store uses private execution copies; it never
+//! incomplete reservations. A full store uses private execution inputs; it never
 //! evicts a published tree. Inspect pending entries before operator-directed
 //! cleanup with the worker stopped. Filesystem I/O is checkpointed but kernel
 //! calls are not claimed interruptible. No state or directories are deleted here.
@@ -430,13 +430,38 @@ impl DurableCache {
     }
 
     /// Capture directly into the durable store, without a second toolchain copy.
-    /// Capacity or writer contention uses the existing private-capture lane.
+    /// Capacity or writer contention declines retention so the caller can keep
+    /// its owned upload or capture private execution inputs.
     /// Corruption/I/O/cancellation is an error, not permission to trust a path.
     pub(super) fn capture(
         &self,
         source: &Path,
         expected: &ToolchainIdentity,
         stopped: &impl Fn() -> bool,
+    ) -> io::Result<Option<PreparedToolchain>> {
+        self.capture_with(source, expected, stopped, || Ok(()))
+    }
+
+    /// A sealed upload owns its original generation witness. Preserve that
+    /// witness across a new durable capture, even if a mutation restores the
+    /// same bytes and modes. A verified existing durable image remains an
+    /// independent source and need not consult the redundant uploaded tree.
+    pub(super) fn capture_prepared(
+        &self,
+        source: &PreparedToolchain,
+        stopped: &impl Fn() -> bool,
+    ) -> io::Result<Option<PreparedToolchain>> {
+        self.capture_with(source.root(), source.identity(), stopped, || {
+            source.verify_retained_generation(stopped)
+        })
+    }
+
+    fn capture_with(
+        &self,
+        source: &Path,
+        expected: &ToolchainIdentity,
+        stopped: &impl Fn() -> bool,
+        verify_source: impl Fn() -> io::Result<()>,
     ) -> io::Result<Option<PreparedToolchain>> {
         checkpoint(stopped)?;
         if expected.bytes > self.max_bytes {
@@ -464,6 +489,7 @@ impl DurableCache {
             expected.files <= limits.max_entries as u64 && expected.bytes <= limits.max_bytes,
             "persistent toolchain capture exceeds dataset bounds",
         )?;
+        verify_source()?;
         let objects = self.root.join(OBJECTS);
         // The pending name records the COMPLETE reservation before any copy.
         // Startup charges it without trusting or adopting partial tree bytes.
@@ -484,6 +510,7 @@ impl DurableCache {
                 &limits,
                 stopped,
             )?;
+            verify_source()?;
             prepared.sync(stopped)?;
             File::open(&staging)?.sync_all()?;
             checkpoint(stopped)?;

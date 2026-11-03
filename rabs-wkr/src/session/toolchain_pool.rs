@@ -311,14 +311,29 @@ impl Dataset {
         pool: &Arc<PoolDirectory>,
         upload: SealedToolchain,
         stopped: &impl Fn() -> bool,
-    ) -> io::Result<Arc<Self>> {
+    ) -> io::Result<(Arc<Self>, &'static str)> {
         checkpoint(stopped)?;
-        if pool.1.is_some() {
+        if let Some(cache) = &pool.1
+            && let Some(toolchain) = cache.capture_prepared(upload.prepared(), stopped)?
+        {
             // Durable storage still requires its own bounded reservation,
             // synchronous publication and reopen at the final stable name.
             // Keep the upload owner alive throughout that existing capture.
-            return Self::capture(pool, upload.root(), Some(upload.identity()), stopped);
+            return Ok((
+                Arc::new(Self {
+                    toolchain,
+                    _directory: None,
+                    pool: Arc::clone(pool),
+                    verification: Mutex::new(None),
+                }),
+                "captured",
+            ));
         }
+        // Capacity or writer contention can decline durable retention. The
+        // sealed upload already owns independent bytes: retain that image rather
+        // than copying the complete SDK into another temporary tree. Errors from
+        // durable verification/publication still propagate and never select this
+        // fallback.
         let (toolchain, directory) = upload.into_parts();
         let dataset = Arc::new(Self {
             toolchain,
@@ -330,7 +345,7 @@ impl Dataset {
         // generation and all bytes, without creating a second private tree.
         dataset.verify(stopped)?;
         checkpoint(stopped)?;
-        Ok(dataset)
+        Ok((dataset, "adopted"))
     }
 }
 
@@ -625,8 +640,9 @@ impl ToolchainPool {
         expected: Option<&ToolchainIdentity>,
         stopped: impl Fn() -> bool,
     ) -> io::Result<ToolchainLease> {
-        self.acquire_with(expected, &stopped, "captured", || {
+        self.acquire_with(expected, &stopped, || {
             Dataset::capture(&self.directory, source, expected, &stopped)
+                .map(|dataset| (dataset, "captured"))
         })
     }
 
@@ -636,12 +652,7 @@ impl ToolchainPool {
         stopped: impl Fn() -> bool,
     ) -> io::Result<ToolchainLease> {
         let expected = *upload.identity();
-        let disposition = if self.directory.1.is_some() {
-            "captured"
-        } else {
-            "adopted"
-        };
-        self.acquire_with(Some(&expected), &stopped, disposition, || {
+        self.acquire_with(Some(&expected), &stopped, || {
             Dataset::adopt(&self.directory, upload, &stopped)
         })
     }
@@ -653,14 +664,13 @@ impl ToolchainPool {
         &self,
         expected: Option<&ToolchainIdentity>,
         stopped: &impl Fn() -> bool,
-        disposition: &'static str,
-        produce: impl FnOnce() -> io::Result<Arc<Dataset>>,
+        produce: impl FnOnce() -> io::Result<(Arc<Dataset>, &'static str)>,
     ) -> io::Result<ToolchainLease> {
         checkpoint(stopped)?;
         let Some(expected) =
             expected.filter(|expected| self.max_bytes != 0 && expected.bytes <= self.max_bytes)
         else {
-            return produce().map(|dataset| ToolchainLease {
+            return produce().map(|(dataset, _)| ToolchainLease {
                 dataset,
                 disposition: "private",
             });
@@ -720,7 +730,7 @@ impl ToolchainPool {
                 let Some(victim) = victim else {
                     drop(state);
                     drop(retired);
-                    return produce().map(|dataset| ToolchainLease {
+                    return produce().map(|(dataset, _)| ToolchainLease {
                         dataset,
                         disposition: "private",
                     });
@@ -741,7 +751,7 @@ impl ToolchainPool {
             // Potentially slow filesystem cleanup and capture never hold the
             // admission mutex or block hits for another retained identity.
             drop(retired);
-            let dataset = produce()?;
+            let (dataset, disposition) = produce()?;
             checkpoint(stopped)?;
             let mut state = self.lock()?;
             if !matches!(state.entries.get(&identity), Some(Slot::Capturing)) {
