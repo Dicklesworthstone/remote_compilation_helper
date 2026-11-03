@@ -4587,6 +4587,10 @@ fi
                 healthy
                     .record_transport_result(true, heartbeat, &circuit)
                     .await;
+                // Retargeting starts the replacement endpoint Unreachable, and
+                // slot admission requires schedulable eligibility. Record the
+                // healthy probe that would qualify it before a build lands.
+                healthy.apply_health_status(WorkerStatus::Healthy).await;
                 assert!(healthy.reserve_slots(3).await);
                 let peer = history
                     .try_start_active_build_with_waiter(

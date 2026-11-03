@@ -1151,7 +1151,23 @@ async fn clean_overlay_subdirectory_real_git_archive_and_cargo_preserve_selected
             );
         }
     }
-    assert!(target.join("debug/deps").is_dir());
+    // Cargo's classic layout keeps intermediates in `debug/deps`; its newer
+    // build-dir layout keeps them per unit under `debug/build`. Either proves
+    // the build used the managed target.
+    let built = ["debug/deps", "debug/build"]
+        .iter()
+        .any(|dir| target.join(dir).is_dir());
+    let listing = std::fs::read_dir(target.join("debug")).map(|entries| {
+        entries
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect::<Vec<_>>()
+    });
+    assert!(
+        built,
+        "no Cargo intermediates under {}: {listing:?}",
+        target.display()
+    );
     assert!(!selected_root.join("returned-target").exists());
 }
 
