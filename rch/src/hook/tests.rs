@@ -3829,6 +3829,16 @@ fn topology_tempdir() -> (CanonicalTempDir, PathTopologyPolicy) {
     )
 }
 
+/// A project the dependency planner can read. Planning proves materialization
+/// of the primary root, so a directory without a manifest stops at RCH-E415.
+fn write_minimal_cargo_manifest(project_dir: &Path) {
+    std::fs::write(
+        project_dir.join("Cargo.toml"),
+        "[package]\nname = \"remote_compilation_helper\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write project manifest");
+}
+
 async fn spawn_mock_daemon(socket_path: &str, response: SelectionResponse) {
     let _ = std::fs::remove_file(socket_path);
     let listener = UnixListener::bind(socket_path).expect("Failed to bind mock socket");
@@ -13017,6 +13027,7 @@ async fn test_execute_remote_compilation_syncs_custom_cargo_target_dir_artifacts
     temp_dir.keep_after_test();
     let project_dir = temp_dir.path().join("remote_compilation_helper");
     std::fs::create_dir_all(&project_dir).expect("create project dir");
+    write_minimal_cargo_manifest(&project_dir);
     let custom_target_dir_path = project_dir.join(".rch-test-target-cache");
     let custom_target_dir = custom_target_dir_path.to_string_lossy().to_string();
 
@@ -13131,6 +13142,7 @@ async fn test_terminal_source_sync_failure_never_launches_remote_cargo() {
     temp_dir.keep_after_test();
     let project_dir = temp_dir.path().join("remote_compilation_helper");
     std::fs::create_dir_all(&project_dir).expect("create project dir");
+    write_minimal_cargo_manifest(&project_dir);
     let prev_cwd = std::env::current_dir().ok();
     std::env::set_current_dir(&project_dir).expect("cd into project dir");
     let worker = SelectedWorker {
@@ -13327,6 +13339,7 @@ async fn test_layer0_pack_reaches_the_executed_remote_command() {
     temp_dir.keep_after_test();
     let project_dir = temp_dir.path().join("remote_compilation_helper");
     std::fs::create_dir_all(&project_dir).expect("create project dir");
+    write_minimal_cargo_manifest(&project_dir);
     let prev_cwd = std::env::current_dir().ok();
     std::env::set_current_dir(&project_dir).expect("cd into project dir");
 
@@ -13436,6 +13449,7 @@ async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
     temp_dir.keep_after_test();
     let project_dir = temp_dir.path().join("remote_compilation_helper");
     std::fs::create_dir_all(&project_dir).expect("create project dir");
+    write_minimal_cargo_manifest(&project_dir);
 
     let prev_cwd = std::env::current_dir().ok();
     std::env::set_current_dir(&project_dir).expect("cd into project dir");
