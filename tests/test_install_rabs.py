@@ -613,5 +613,241 @@ esac
         self.assertEqual((self.bin / "rabsd").read_bytes(), before)
 
 
+@unittest.skipUnless(sys.platform == "linux", "Linux archive/install contract")
+class PackageTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="rabs-package-test-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.bundle = self.root / "bundle"
+        self.bundle.mkdir()
+        self.bin = self.root / "bin"
+        self.output = self.root / "release.tar.gz"
+        self.target = next(target for target, machine in installer.TARGET_MACHINES.items()
+                           if machine == installer.host_machine())
+        executable = shutil.which("true")
+        self.assertIsNotNone(executable)
+        # Real ELF fixtures test distribution, not source identity or RABS execution.
+        for name in installer.TOOLS[1:]:
+            shutil.copyfile(executable, self.bundle / name)
+            (self.bundle / name).chmod(0o755)
+        (self.bundle / "cargo-rabs").write_text(
+            "#!/usr/bin/env python3\nprint('packaged launcher')\n", encoding="utf-8")
+        (self.bundle / "cargo-rabs").chmod(0o755)
+
+    def package(self, output=None, target=None):
+        return installer.package_archive(installer.source_files(self.bundle, None),
+                                         output or self.output, target or self.target)
+
+    def main(self, *arguments):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = installer.main(list(arguments))
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_exact_flat_archive_installs_and_verifies_without_executing_tools(self):
+        expected = installer.expected_toolset(installer.source_files(self.bundle, None))
+        with mock.patch.object(installer.subprocess, "Popen", side_effect=AssertionError("executed tool")):
+            result = self.package()
+            self.assertFalse(self.bin.exists())
+            code, _, error = self.main("--from-archive", str(self.output), "--bin-dir", str(self.bin))
+            self.assertEqual(code, 0, error)
+            code, stdout, error = self.main("--verify", "--from-archive", str(self.output),
+                                           "--bin-dir", str(self.bin))
+            self.assertEqual(code, 0, error)
+            self.assertEqual(json.loads(stdout)["state"], "verified")
+        self.assertEqual(result["toolset"], expected)
+        self.assertEqual(result["bytes"], self.output.stat().st_size)
+        self.assertEqual(result["sha256"], hashlib.sha256(self.output.read_bytes()).hexdigest())
+        self.assertFalse(result["services_started"])
+        self.assertFalse(result["cargo_config_changed"])
+        self.assertTrue(Path(result["staging_directory"]).is_dir())
+        with tarfile.open(self.output, "r:gz") as archive:
+            members = archive.getmembers()
+            self.assertEqual([member.name for member in members],
+                             list(installer.TOOLS) + ["install-rabs"])
+            for member in members:
+                self.assertTrue(member.isreg())
+                self.assertEqual(member.mode, 0o755)
+                self.assertEqual((member.uid, member.gid, member.mtime), (0, 0, 0))
+                self.assertEqual(member.pax_headers, {})
+                source = SCRIPT if member.name == "install-rabs" else self.bundle / member.name
+                self.assertEqual(archive.extractfile(member).read(), source.read_bytes())
+
+    def test_identical_inputs_produce_identical_archive_bytes(self):
+        first = self.package()
+        second_path = self.root / "different-filename.tar.gz"
+        second = self.package(output=second_path)
+        self.assertEqual(self.output.read_bytes(), second_path.read_bytes())
+        self.assertEqual(first["sha256"], second["sha256"])
+
+    def test_cross_architecture_packaging_does_not_execute_supplied_binaries(self):
+        target, machine = next((target, machine) for target, machine in installer.TARGET_MACHINES.items()
+                               if target != self.target)
+        for name in installer.TOOLS[1:]:
+            data = bytearray((self.bundle / name).read_bytes())
+            data[18:20] = machine.to_bytes(2, "little")
+            (self.bundle / name).write_bytes(data)
+        with mock.patch.object(installer.subprocess, "Popen", side_effect=AssertionError("executed tool")):
+            result = self.package(target=target)
+        self.assertEqual(result["toolset"]["machine"], machine)
+        self.assertEqual(result["target"], target)
+
+    def test_split_profiles_use_the_checkout_launcher_and_explicit_target(self):
+        build = self.root / "target"
+        for profile in ("wrapper-release", "daemon-release"):
+            (build / profile).mkdir(parents=True)
+        for name in installer.TOOLS[1:]:
+            profile = "wrapper-release" if name == "rabs-wrap" else "daemon-release"
+            shutil.copy2(self.bundle / name, build / profile / name)
+        code, stdout, error = self.main("--from-build", str(build), "--package", str(self.output),
+                                       "--target", self.target)
+        self.assertEqual(code, 0, error)
+        self.assertEqual(json.loads(stdout)["kind"], "rabs-packaged")
+        with tarfile.open(self.output, "r:gz") as archive:
+            self.assertEqual(archive.extractfile("cargo-rabs").read(),
+                             SCRIPT.with_name("cargo-rabs").read_bytes())
+        self.assertFalse(self.bin.exists())
+
+    def test_wrong_target_missing_or_mixed_tools_never_publish(self):
+        other = next(target for target in installer.TARGET_MACHINES if target != self.target)
+        with self.assertRaisesRegex(installer.InstallError, "match --target"):
+            self.package(target=other)
+        with self.assertRaisesRegex(installer.InstallError, "supported Linux GNU"):
+            installer.package_archive(installer.source_files(self.bundle, None), self.output, None)
+        (self.bundle / "rabsd").rename(self.bundle / "saved-rabsd")
+        with self.assertRaises(FileNotFoundError):
+            self.package()
+        (self.bundle / "saved-rabsd").rename(self.bundle / "rabsd")
+        data = bytearray((self.bundle / "rabsd").read_bytes())
+        data[18:20] = installer.TARGET_MACHINES[other].to_bytes(2, "little")
+        (self.bundle / "rabsd").write_bytes(data)
+        with self.assertRaisesRegex(installer.InstallError, "mixes executable architectures"):
+            self.package()
+        self.assertFalse(self.output.exists())
+        self.assertFalse(list(self.root.glob(".rabs-package-*")))
+
+    def test_symlink_and_invalid_launcher_inputs_are_refused(self):
+        saved = self.bundle / "saved-rabsd"
+        (self.bundle / "rabsd").rename(saved)
+        (self.bundle / "rabsd").symlink_to(saved)
+        with self.assertRaisesRegex(installer.InstallError, "regular executable"):
+            self.package()
+        (self.bundle / "rabsd").rename(self.bundle / "saved-link")
+        saved.rename(self.bundle / "rabsd")
+        (self.bundle / "cargo-rabs").write_text("#!/usr/bin/env python3\ninvalid (\n")
+        with self.assertRaises(SyntaxError):
+            self.package()
+        self.assertFalse(self.output.exists())
+
+    def test_late_input_change_is_detected_before_archive_publication(self):
+        original = installer.copy_transfer_file
+
+        def change_earlier_source(source, *args, **kwargs):
+            result = original(source, *args, **kwargs)
+            if Path(source).name == "rabs-cargo-root":
+                with (self.bundle / "rabs-wrap").open("ab") as writer:
+                    writer.write(b"changed after capture")
+            return result
+
+        with mock.patch.object(installer, "copy_transfer_file", side_effect=change_earlier_source):
+            with self.assertRaisesRegex(installer.InstallError, "changed during capture"):
+                self.package()
+        self.assertFalse(self.output.exists())
+        self.assertEqual(len(list(self.root.glob(".rabs-package-*"))), 1)
+
+    def test_consumer_rejection_prevents_publication(self):
+        with mock.patch.object(installer, "unpack_archive",
+                               side_effect=installer.InstallError("consumer rejected archive")):
+            with self.assertRaisesRegex(installer.InstallError, "consumer rejected archive"):
+                self.package()
+        self.assertFalse(self.output.exists())
+
+    def test_existing_files_and_dangling_symlinks_are_never_replaced(self):
+        self.output.write_bytes(b"existing release")
+        with self.assertRaisesRegex(installer.InstallError, "replace an existing archive"):
+            self.package()
+        self.assertEqual(self.output.read_bytes(), b"existing release")
+        link = self.root / "dangling.tar.gz"
+        link.symlink_to(self.root / "absent")
+        with self.assertRaisesRegex(installer.InstallError, "replace an existing archive"):
+            self.package(output=link)
+        self.assertEqual(os.readlink(link), str(self.root / "absent"))
+        self.assertFalse(list(self.root.glob(".rabs-package-*")))
+
+    def test_archive_changed_after_consumer_verification_is_not_published(self):
+        original = installer.unpack_archive
+
+        def replace_verified_archive(path, *args, **kwargs):
+            original(path, *args, **kwargs)
+            path.chmod(0o600)
+            path.write_bytes(b"not a gzip archive")
+
+        with mock.patch.object(installer, "unpack_archive", side_effect=replace_verified_archive):
+            with self.assertRaisesRegex(installer.InstallError, "archive changed"):
+                self.package()
+        self.assertFalse(self.output.exists())
+
+    def test_bundled_installer_bytes_are_verified_too(self):
+        original = installer.tarfile.TarFile.addfile
+
+        def corrupt_installer(archive, member, reader=None):
+            if member.name == "install-rabs":
+                data = reader.read()
+                reader = io.BytesIO(b"x" + data[1:])
+            return original(archive, member, reader)
+
+        with mock.patch.object(installer.tarfile.TarFile, "addfile", new=corrupt_installer):
+            with self.assertRaisesRegex(installer.InstallError, "installer digest differs"):
+                self.package()
+        self.assertFalse(self.output.exists())
+
+    def test_output_created_during_packaging_is_not_overwritten(self):
+        original = installer.os.link
+
+        def raced_publication(source, destination, **kwargs):
+            self.output.write_bytes(b"concurrent release")
+            return original(source, destination, **kwargs)
+
+        with mock.patch.object(installer.os, "link", side_effect=raced_publication):
+            with self.assertRaises(installer.InstallError):
+                self.package()
+        self.assertEqual(self.output.read_bytes(), b"concurrent release")
+
+    def test_compressed_output_limit_is_enforced_during_writes(self):
+        output = io.BytesIO()
+        writer = installer.ArchiveWriter(output)
+        with mock.patch.object(installer, "MAX_ARCHIVE_BYTES", 10):
+            writer.write(b"1234567890")
+            with self.assertRaisesRegex(installer.InstallError, "compressed byte limit"):
+                writer.write(b"x")
+        self.assertEqual(output.getvalue(), b"1234567890")
+
+    def test_package_cli_rejects_install_deploy_and_verification_options(self):
+        for extra in (["--verify"], ["--ssh", "worker.example"], ["--bin-dir", str(self.bin)],
+                      ["--ssh-jobs", "2"], ["--ssh-timeout", "42"],
+                      ["--from-archive", str(self.output)], ["--from-image", str(self.output)]):
+            with self.subTest(extra=extra):
+                code, _, error = self.main("--package", str(self.output), "--target", self.target, *extra)
+                self.assertEqual(code, 1)
+                self.assertIn("--package accepts only", error)
+        code, _, error = self.main("--target", self.target)
+        self.assertEqual(code, 1)
+        self.assertIn("--target requires --package", error)
+        self.assertFalse(self.output.exists())
+        self.assertFalse(self.bin.exists())
+
+    def test_empty_output_or_missing_target_cannot_fall_through_to_installation(self):
+        for arguments in (["--package", ""], ["--package", "", "--target", self.target],
+                          ["--package", str(self.output)]):
+            with self.subTest(arguments=arguments):
+                with mock.patch.object(installer, "install", side_effect=AssertionError("installed")), \
+                        mock.patch.object(installer, "source_files", side_effect=AssertionError("read inputs")):
+                    code, _, error = self.main(*arguments)
+                self.assertEqual(code, 1)
+                self.assertIn("nonempty output path and --target", error)
+        self.assertFalse(self.output.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

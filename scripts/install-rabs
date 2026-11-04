@@ -31,6 +31,7 @@ import argparse
 import ast
 from concurrent.futures import ThreadPoolExecutor
 import fcntl
+import gzip
 import hashlib
 import json
 import os
@@ -535,6 +536,151 @@ def expected_from_image(path):
     if len(machines) != 1:
         raise InstallError("retained deployment image mixes executable architectures")
     return validate_toolset({"schema": 1, "machine": machines.pop(), "files": files}), header["bin_dir"]
+
+
+class ArchiveWriter:
+    """Bound compressed output as it is written, including gzip framing."""
+
+    def __init__(self, writer):
+        self.writer = writer
+        self.count = 0
+
+    def write(self, data):
+        if self.count + len(data) > MAX_ARCHIVE_BYTES:
+            raise InstallError("packaged archive exceeds its compressed byte limit")
+        written = self.writer.write(data)
+        self.count += written
+        return written
+
+    def flush(self):
+        self.writer.flush()
+
+
+def package_archive(paths, output, target):
+    """Produce the exact flat release format accepted by this installer.
+
+    Inputs are trusted build products; byte identities do not authenticate their
+    publisher or prove that separate binaries came from the same source revision.
+    Capture once, validate the actual archive with the consumer, then publish
+    without replacing an existing pathname. Keep the private stage for recovery.
+    """
+    if target not in TARGET_MACHINES:
+        raise InstallError("packaging requires a supported Linux GNU --target")
+    expected = expected_toolset(paths)
+    if expected["machine"] != TARGET_MACHINES[target]:
+        raise InstallError("packaged executables do not match --target")
+    sources = {**paths, "install-rabs": Path(__file__).resolve()}
+    observed = {name: signature(path.lstat()) for name, path in sources.items()}
+    total = sum(identity[2] for identity in observed.values())
+    if not 0 < total <= MAX_ARCHIVE_BYTES:
+        raise InstallError("package exceeds its expanded byte limit")
+    output = Path(output).absolute()
+    directory = open_directory(output.parent)
+    stage = None
+    try:
+        try:
+            os.stat(output.name, dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise InstallError("refusing to replace an existing archive: " + str(output))
+        # Snapshots, gzip output and consumer extraction coexist. This is only
+        # a preflight: every later write can still fail if capacity changes.
+        deployment_space(output.parent, total * 4 + MIN_DEPLOY_RESERVE)
+        stage = Path(tempfile.mkdtemp(prefix=".rabs-package-", dir=output.parent))
+        snapshot = stage / "inputs"
+        snapshot.mkdir(mode=0o700)
+        entries = {}
+        for name, source in sources.items():
+            limit = MAX_INSTALLER_BYTES if name == "install-rabs" else MAX_FILE_BYTES
+            with (snapshot / name).open("xb") as writer:
+                entry, _ = copy_transfer_file(source, writer, limit, observed[name],
+                                              name != "install-rabs")
+                writer.flush()
+                os.fchmod(writer.fileno(), 0o555)
+                os.fsync(writer.fileno())
+            if name in TOOLS and entry != expected["files"][name]:
+                raise InstallError("package input differs from captured toolset: " + name)
+            entries[name] = entry
+        for name, source in sources.items():
+            if signature(source.lstat()) != observed[name]:
+                raise InstallError("package input changed during capture: " + name)
+        if expected_toolset(source_files(snapshot, None)) != expected:
+            raise InstallError("package snapshot differs from captured toolset")
+        installer_source = (snapshot / "install-rabs").read_text(encoding="utf-8")
+        if not installer_source.startswith("#!/usr/bin/env python3\n"):
+            raise InstallError("invalid packaged installer")
+        ast.parse(installer_source, filename="install-rabs")
+        archive_path = stage / "release.tar.gz"
+        with archive_path.open("xb") as raw:
+            with gzip.GzipFile(filename="", mode="wb", fileobj=ArchiveWriter(raw),
+                               mtime=0) as compressed:
+                with tarfile.open(fileobj=compressed, mode="w|",
+                                  format=tarfile.USTAR_FORMAT) as archive:
+                    for name in TOOLS + ("install-rabs",):
+                        member = tarfile.TarInfo(name)
+                        member.size = entries[name]["bytes"]
+                        member.mode = 0o755
+                        member.uid = member.gid = member.mtime = 0
+                        member.uname = member.gname = ""
+                        with (snapshot / name).open("rb") as reader:
+                            archive.addfile(member, reader)
+            raw.flush()
+            os.fchmod(raw.fileno(), 0o444)
+            os.fsync(raw.fileno())
+        archive_identity = signature(archive_path.lstat())
+        verification = stage / "verified"
+        verification.mkdir(mode=0o700)
+        unpack_archive(archive_path, verification)
+        if signature(archive_path.lstat()) != archive_identity:
+            raise InstallError("produced archive changed during verification")
+        if expected_toolset(source_files(verification, None)) != expected:
+            raise InstallError("produced archive failed installer round-trip verification")
+        # The consumer deliberately ignores the bundled installer. Check that
+        # sixth member separately so the published helper is also byte-bound.
+        with tarfile.open(archive_path, "r:gz", tarinfo=ReleaseMember) as archive:
+            member = archive.getmember("install-rabs")
+            if member.size != entries["install-rabs"]["bytes"]:
+                raise InstallError("produced archive installer size differs")
+            with archive.extractfile(member) as reader:
+                data = reader.read(MAX_INSTALLER_BYTES + 1)
+            if (len(data) != member.size
+                    or hashlib.sha256(data).hexdigest() != entries["install-rabs"]["sha256"]):
+                raise InstallError("produced archive installer digest differs")
+        digest = hashlib.sha256()
+        with archive_path.open("rb") as reader:
+            if signature(os.fstat(reader.fileno())) != archive_identity:
+                raise InstallError("produced archive changed during verification")
+            remaining = archive_identity[2]
+            if not 0 < remaining <= MAX_ARCHIVE_BYTES:
+                raise InstallError("invalid produced archive size")
+            while remaining:
+                chunk = reader.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    raise InstallError("produced archive was truncated")
+                digest.update(chunk)
+                remaining -= len(chunk)
+            if (reader.read(1) or signature(os.fstat(reader.fileno())) != archive_identity
+                    or signature(archive_path.lstat()) != archive_identity):
+                raise InstallError("produced archive changed during verification")
+        verify_directory(output.parent, directory)
+        if signature(archive_path.lstat()) != archive_identity:
+            raise InstallError("produced archive changed before publication")
+        # A hard link on the same filesystem publishes complete bytes atomically
+        # and refuses both existing files and dangling symlinks. Never replace().
+        os.link(archive_path, output.name, dst_dir_fd=directory, follow_symlinks=False)
+        os.fsync(directory)
+        return {"kind": "rabs-packaged", "archive": str(output), "target": target,
+                "bytes": archive_identity[2], "sha256": digest.hexdigest(),
+                "toolset": expected, "staging_directory": str(stage),
+                "services_started": False, "cargo_config_changed": False}
+    except (InstallError, OSError, SyntaxError, UnicodeError, RecursionError,
+            tarfile.TarError, EOFError, zlib.error) as error:
+        if stage is not None:
+            raise InstallError("{}; retained package stage: {}".format(error, stage)) from error
+        raise
+    finally:
+        os.close(directory)
 
 
 def existing_install_directory(path, private=False, parent=None):
@@ -1204,6 +1350,10 @@ def main(argv=None):
                         help="authenticated release archive per Linux GNU target; repeat for a mixed SSH fleet")
     source.add_argument("--from-image", metavar="TRANSFER_BIN",
                         help="retained transfer_image to inspect after a lost acknowledgment; requires --verify")
+    parser.add_argument("--package", metavar="TAR_GZ",
+                        help="produce and verify a new flat release archive from --from-build or --from-bundle")
+    parser.add_argument("--target", choices=tuple(TARGET_MACHINES),
+                        help="required archive target for --package; no supplied executable is run")
     parser.add_argument("--verify", action="store_true",
                         help="read-only comparison of the active generation with the selected expected toolset")
     parser.add_argument("--bin-dir", help="absolute destination; default is the destination user's ~/.local/bin")
@@ -1217,6 +1367,19 @@ def main(argv=None):
                         help="required deployment headroom, minimum 64 MiB; not a disk reservation")
     args = parser.parse_args(argv)
     try:
+        if args.package is not None:
+            if not args.package or args.target is None:
+                raise InstallError("--package requires a nonempty output path and --target")
+            if (args.verify or args.from_image or args.from_target or args.from_archive
+                    or args.bin_dir is not None or args.ssh or args.ssh_jobs != 1
+                    or args.ssh_timeout != 600 or args.ssh_reserve_mib != 1024):
+                raise InstallError("--package accepts only --from-build/--from-bundle and --target")
+            result = package_archive(source_files(args.from_bundle, args.from_build),
+                                     args.package, args.target)
+            print(json.dumps(result, sort_keys=True))
+            return 0
+        if args.target is not None:
+            raise InstallError("--target requires --package")
         validate_parallelism(args.ssh_jobs)
         if not args.ssh and args.ssh_jobs != 1:
             raise InstallError("--ssh-jobs requires at least one --ssh worker")

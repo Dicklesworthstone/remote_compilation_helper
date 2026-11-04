@@ -6,6 +6,37 @@ host aliases. This is the S7 tool-distribution path: it does **not** turn the
 host-local dependency cache into fleet-wide canonical execution, start services,
 reconfigure Cargo, or qualify a release to serve cached compiler outputs.
 
+## Produce a complete release archive
+
+After DSR builds the wrapper and daemon profiles, use the same installer to
+produce its exact supported archive format:
+
+```sh
+python3 scripts/install-rabs \
+  --from-build /absolute/target/x86_64-unknown-linux-gnu \
+  --package /absolute/dist/rabs-x86_64-unknown-linux-gnu.tar.gz \
+  --target x86_64-unknown-linux-gnu
+```
+
+The output contains exactly six flat regular files: the five RABS tools and
+`install-rabs`. It does not inherit generic archive additions or nested
+`scripts/` paths. An extracted complete toolset can instead be selected with
+`--from-bundle`. The explicit target must match all four native executables;
+packaging can run on another architecture because it never executes them.
+
+The producer captures stable input bytes, writes a deterministic gzip/USTAR
+archive, reads it through the real installer, and checks all six members before
+publishing a new pathname atomically. Existing output files and symlinks are
+refused. Its JSON receipt includes the archive SHA-256, byte count, tool
+identities, and retained private staging directory. Capacity checks allow for
+the input snapshots, archive and verification extraction; stages are retained
+on failure as well as success.
+
+Run the normal DSR signing and publication steps on that output. The producer
+checks complete bytes and architecture, not publisher authenticity, matching
+source revisions, compiler behavior, or fleet readiness. It does not install
+anything, start services, or change Cargo configuration.
+
 ## Install a trusted release
 
 Verify the release's publisher signature/checksum **before** selecting its
