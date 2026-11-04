@@ -180,6 +180,10 @@ finally:
         os.killpg(timer, signal.SIGKILL)
     except ProcessLookupError:
         pass
+    except PermissionError:
+        # Darwin answers EPERM once the group holds only zombies.
+        if sys.platform != "darwin":
+            raise
     _, status = os.waitpid(timer, 0)
 
 if not failed and sys.argv[1] == "teardown":

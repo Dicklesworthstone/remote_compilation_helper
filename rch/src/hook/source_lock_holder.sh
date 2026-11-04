@@ -113,6 +113,10 @@ if monitor:
         os.killpg(monitor, signal.SIGKILL)
     except ProcessLookupError:
         pass
+    except PermissionError:
+        # Darwin answers EPERM once the group holds only zombies.
+        if sys.platform != "darwin":
+            raise
     _, status = os.waitpid(monitor, 0)
     os.set_blocking(receipt_read, False)
     try:
