@@ -606,7 +606,7 @@ cache publication or a compiler skip.
 
 ### Prepare the selected Cargo dependency graph
 
-For `build`, `check`, `test`, `run` and `bench`, a `canonical-cargo-v1` launcher profile can opt into
+For `build`, `check`, `clippy`, `test`, `run` and `bench`, a `canonical-cargo-v1` launcher profile can opt into
 command-specific dependency preparation with this field:
 
 ```json
@@ -636,12 +636,25 @@ graph for that one target because Cargo's run command may look for an executable
 even during graph-only planning. The worker still receives the original `run`
 command and its literal arguments. Ambiguous default binaries are refused.
 
+Clippy planning runs the captured `cargo-clippy` with its captured `cargo` and
+`rustc`, and requires the ordinary executable `clippy-driver` companion from
+the same toolchain image. It preserves `--no-deps` and the validated lint-level
+arguments after `--`; the preparer inserts every locked/offline and unit-graph
+control before that lint tail. `--no-deps` changes linting, not dependency input
+requirements: selected ordinary dependencies, build scripts and procedural
+macros still need their complete sources. A missing companion or an unsupported
+lint argument refuses preparation before Cargo planning. Neither graph planning
+nor a selected source archive is permission to reuse a Clippy result.
+
 Planning and execution use the same validated literal application environment.
 Overrides of Cargo, Rustup, compiler, loader, Git or RABS control variables are
-refused, apart from the existing explicit `CARGO_INCREMENTAL` control. The
-canonical Cargo program and the selected manifest's parent working directory
-must agree with the launcher request; direct native requests have the same
-requirements. Captured compiler flags must also be independent of the planning
+refused, apart from the existing explicit `CARGO_INCREMENTAL` control and
+Clippy's exact launcher-supplied canonical `CARGO`/`RUSTC` bindings. The latter
+are rebound only to their captured physical siblings during local planning;
+profile environment settings cannot replace them. The canonical Cargo or Clippy
+program and the selected manifest's parent working directory must agree with the
+launcher request. Remote canonical requests sent directly to `rabsd` have the
+same requirements. Captured compiler flags must also be independent of the planning
 machine: `-C target-cpu=native` is refused in this mode because it can change
 conditional dependency selection on a worker with different hardware. Explicit
 CPU and target-feature settings remain supported.
@@ -662,9 +675,9 @@ This option still captures the complete approved source anchor and retains its
 original manifests, lockfile and configuration. It changes dependency
 preparation, not the worker's artifact or cache-authority contract. Profiles
 without `source_selection` keep the existing complete-graph preparation.
-`clippy` does not yet accept this opt-in marker; its existing profiles continue
-to use the default preparer until selected preparation qualifies the captured
-Clippy companion and compiler environment.
+Clippy retains its full captured source identity and separate private target
+families, including the ordered lint controls. This option does not relax its
+freshness or cache-authority boundary.
 
 ### Captured compiler configuration
 

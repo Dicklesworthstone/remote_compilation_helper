@@ -448,15 +448,111 @@ class CanonicalCargo(unittest.TestCase):
                 self.assertEqual(list(self.operations.iterdir()), [])
                 self.assertFalse(self.record.exists())
 
-    def test_selected_source_profile_refuses_unqualified_clippy_without_fallback(self):
+    def test_selected_source_clippy_preserves_companions_selection_and_ordered_lints(self):
         self.install_clippy()
+        cargo_home = self.root / "approved Clippy Cargo home"
+        cargo_home.mkdir(mode=0o700)
+        self.profile.update(source_selection="cargo-unit-graph-v1",
+                            cargo_home_source=str(cargo_home),
+                            env={"BUILD_LABEL": "selected '雪'"})
+        cases = [
+            ["clippy", "--workspace", "--exclude=unused", "--all-targets", "--all-features",
+             "--profile=ci", "--target=x86_64-unknown-linux-gnu",
+             "--", "-D", "warnings", "-Aclippy::needless_return"],
+            ["clippy", "--no-deps", "-p", "app@0.1.0", "--no-default-features", "--lib",
+             "--release", "--", "--force-warn", "clippy::pedantic", "--cap-lints=warn"],
+            ["clippy", "--frozen"],
+            ["clippy", "--"],
+        ]
+        for incremental in (False, True):
+            self.profile["incremental"] = incremental
+            self.save()
+            original = self.profile_path.read_bytes()
+            for args in cases:
+                with self.subTest(incremental=incremental, args=args):
+                    status, stdout, stderr, pid = self.invoke(args, input=b"caller input\x00\xff")
+                    self.assertEqual(status, 0, stderr)
+                    record = self.records()[-1]
+                    request = record["request"]
+                    separator = args.index("--") if "--" in args else len(args)
+                    self.assertEqual(request["program"], "/__rabs/toolchain/bin/cargo-clippy")
+                    self.assertEqual(request["args"][:separator], args[:separator])
+                    generated = request["args"][separator:]
+                    if "--" in args:
+                        self.assertEqual(generated[generated.index("--"):], args[separator:])
+                        generated = generated[:generated.index("--")]
+                    if "--frozen" not in args:
+                        self.assertIn("--locked", generated)
+                        self.assertIn("--offline", generated)
+                    self.assertEqual(generated.count("--message-format=json"), 1)
+                    self.assertIn("/__rabs/workspace/Cargo.toml", generated)
+                    self.assertIn("/__rabs/out/cargo", generated)
+                    self.assertEqual(request["cargo_source"], {
+                        "manifest": "Cargo.toml", "cargo_home_source": str(cargo_home),
+                        "selection": "cargo-unit-graph-v1"})
+                    self.assertEqual(request["command_context"]["env"], {
+                        "CARGO_INCREMENTAL": "1" if incremental else "0",
+                        "CARGO": "/__rabs/toolchain/bin/cargo",
+                        "RUSTC": "/__rabs/toolchain/bin/rustc",
+                        "BUILD_LABEL": "selected '雪'"})
+                    self.assertEqual(request["artifacts"]["cargo"],
+                                     "cargo-private-incremental-json-v1" if incremental else "cargo-json-v1")
+                    self.assertEqual(record["pid"], pid)
+                    self.assertEqual(record["input"], b"caller input\x00\xff".hex())
+                    self.assertEqual(stdout, b"fixture Cargo stdout\x00\xff\n")
+                    self.assertEqual(self.profile_path.read_bytes(), original)
+        self.assertFalse(self.forbidden.exists())
+
+    def test_selected_source_clippy_requires_executable_companions_before_operation_creation(self):
         self.profile["source_selection"] = "cargo-unit-graph-v1"
         self.save()
-        status, _, stderr, _ = self.invoke(["clippy"])
-        self.assertEqual(status, 2, stderr)
-        self.assertIn(b"does not support Clippy", stderr)
+        self.assert_refused(["clippy"])
+        self.install_clippy()
+        for name in ("cargo-clippy", "clippy-driver"):
+            with self.subTest(name=name):
+                tool = self.toolchain / "bin" / name
+                tool.chmod(0o600)
+                self.assert_refused(["clippy", "--no-deps", "--", "-D", "warnings"])
+                tool.chmod(0o700)
         self.assertEqual(list(self.operations.iterdir()), [])
         self.assertFalse(self.record.exists())
+        self.assertFalse(self.forbidden.exists())
+
+    def test_selected_source_clippy_refuses_tool_overrides_and_lint_argument_injection(self):
+        self.install_clippy()
+        self.profile["source_selection"] = "cargo-unit-graph-v1"
+        for name, value in (("CARGO", "/host/cargo"), ("RUSTC", "/host/rustc"),
+                            ("CARGO", "/__rabs/toolchain/bin/cargo"),
+                            ("CLIPPY_ARGS", "--fix"), ("RUSTC_WORKSPACE_WRAPPER", "/host/wrapper")):
+            with self.subTest(name=name, value=value):
+                self.profile["env"] = {name: value}
+                self.save()
+                self.assert_refused(["clippy"])
+        self.profile.pop("env")
+        self.save()
+        for tail in (["--unit-graph"], ["--fix"], ["-D", "--emit=metadata"],
+                     ["--sysroot=/outside"], ["@response"], ["-Dwarnings__CLIPPY_HACKERY__--print"]):
+            with self.subTest(tail=tail):
+                self.assert_refused(["clippy", "--"] + tail)
+        self.assertEqual(list(self.operations.iterdir()), [])
+
+    def test_selected_source_clippy_uses_one_explicit_rustup_selection_for_all_tools(self):
+        self.install_clippy()
+        self.select_rustup()
+        self.profile["source_selection"] = "cargo-unit-graph-v1"
+        self.save()
+        env = dict(self.env, RUSTUP_TOOLCHAIN="unselected-ambient",
+                   TEST_RUSTUP_SELECTIONS=json.dumps({"selected": str(self.toolchain / "bin/rustc")}))
+        status, _, stderr, _ = self.invoke(["+selected", "clippy", "--no-deps", "--", "-Dwarnings"], env)
+        self.assertEqual(status, 0, stderr)
+        discovery, = [json.loads(line) for line in self.rustup_record.read_text().splitlines()]
+        self.assertEqual(discovery["argv"], ["which", "--toolchain", "selected", "rustc"])
+        request = self.records()[-1]["request"]
+        self.assertEqual(request["program"], "/__rabs/toolchain/bin/cargo-clippy")
+        self.assertEqual(request["args"][:2], ["clippy", "--no-deps"])
+        self.assertEqual(request["args"][-2:], ["--", "-Dwarnings"])
+        self.assertEqual(request["toolchain_source"], str(self.toolchain))
+        self.assertEqual(request["cargo_source"]["selection"], "cargo-unit-graph-v1")
         self.assertFalse(self.forbidden.exists())
 
     def test_source_selection_remains_absent_for_legacy_profiles(self):
