@@ -544,7 +544,7 @@ fn native_fixture() -> (tempfile::TempDir, Value) {
     );
     let owner = tempfile::Builder::new()
         .prefix("rabs-canon-")
-        .tempdir_in("/tmp")
+        .tempdir_in(std::env::temp_dir())
         .unwrap();
     fs::set_permissions(owner.path(), fs::Permissions::from_mode(0o700)).unwrap();
     for name in ["source-a", "source-b", "state", "ops"] {
