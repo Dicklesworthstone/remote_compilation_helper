@@ -95,10 +95,21 @@ fn request(command: &str, extra: &[&str]) -> Value {
         "--message-format=json".into(),
     ]);
     args.extend(extra[separator..].iter().map(|value| (*value).to_owned()));
+    let (program, environment) = if command == "clippy" {
+        (
+            "/__rabs/toolchain/bin/cargo-clippy",
+            json!({
+                "CARGO":"/__rabs/toolchain/bin/cargo",
+                "RUSTC":"/__rabs/toolchain/bin/rustc",
+            }),
+        )
+    } else {
+        ("/__rabs/toolchain/bin/cargo", json!({}))
+    };
     json!({
-        "program":"/__rabs/toolchain/bin/cargo",
+        "program":program,
         "args":args,
-        "command_context":{"version":COMMAND_CONTEXT_VERSION,"cwd":"/__rabs/workspace","env":{}},
+        "command_context":{"version":COMMAND_CONTEXT_VERSION,"cwd":"/__rabs/workspace","env":environment},
     })
 }
 
@@ -576,6 +587,296 @@ fn selected_command_binds_build_check_features_profiles_and_target_to_actual_arg
 }
 
 #[test]
+fn selected_clippy_preserves_selection_lints_and_captured_planning_tools() {
+    let mut input = request(
+        "clippy",
+        &[
+            "--workspace",
+            "--exclude=other",
+            "--package=app",
+            "--features=one,two",
+            "--no-default-features",
+            "--all-targets",
+            "--target=x86_64-unknown-linux-gnu",
+            "--profile=ci",
+            "--no-deps",
+            "--",
+            "-D",
+            "warnings",
+            "-Aclippy::needless_return",
+            "--force-warn=dead_code",
+            "--cap-lints",
+            "warn",
+        ],
+    );
+    input["command_context"]["env"]["PROJECT_SETTING"] = json!("literal value");
+    input["command_context"]["env"]["CARGO_INCREMENTAL"] = json!("0");
+    let original = input.clone();
+    let selected =
+        SelectedCommand::parse(&input, "Cargo.toml", PreparationContext::RemoteRequest).unwrap();
+    assert_eq!(selected.command, CompilationCommand::Clippy);
+    assert!(selected.run_package().is_none());
+    assert_eq!(
+        selected.graph_arguments(&Value::Null, None).unwrap(),
+        [
+            "clippy",
+            "--workspace",
+            "--no-default-features",
+            "--all-targets",
+            "--no-deps",
+            "--package",
+            "app",
+            "--exclude",
+            "other",
+            "--features",
+            "one,two",
+            "--target",
+            "x86_64-unknown-linux-gnu",
+            "--profile",
+            "ci",
+        ]
+    );
+    assert_eq!(
+        selected.graph_tail_arguments().unwrap(),
+        [
+            "--",
+            "-D",
+            "warnings",
+            "-Aclippy::needless_return",
+            "--force-warn=dead_code",
+            "--cap-lints",
+            "warn",
+        ]
+    );
+    let mut process = Command::new("/captured/toolchain/bin/cargo-clippy");
+    selected.configure(
+        &mut process,
+        Path::new("/captured/toolchain/bin/rustc"),
+        Path::new("/private/planning"),
+    );
+    let environment = process
+        .get_envs()
+        .map(|(name, value)| (name.to_str().unwrap(), value.unwrap().to_str().unwrap()))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        environment,
+        BTreeMap::from([
+            ("CARGO", "/captured/toolchain/bin/cargo"),
+            ("CARGO_INCREMENTAL", "0"),
+            ("PROJECT_SETTING", "literal value"),
+            ("RUSTC", "/captured/toolchain/bin/rustc"),
+        ])
+    );
+    assert_eq!(input, original);
+    assert!(
+        SelectedCommand::parse(
+            &request("clippy", &[]),
+            "Cargo.toml",
+            PreparationContext::RemoteRequest,
+        )
+        .unwrap()
+        .graph_tail_arguments()
+        .unwrap()
+        .is_empty()
+    );
+}
+
+#[test]
+fn selected_clippy_requires_exact_canonical_program_and_compiler_bindings() {
+    let native_error = SelectedCommand::parse(
+        &request("clippy", &[]),
+        "Cargo.toml",
+        PreparationContext::CanonicalLocal,
+    )
+    .unwrap_err();
+    assert_eq!(
+        native_error.to_string(),
+        "selected native Cargo preparation does not support Clippy"
+    );
+    for program in [
+        "/__rabs/toolchain/bin/cargo",
+        "/host/bin/cargo-clippy",
+        "cargo-clippy",
+        "/__rabs/toolchain/bin/clippy-driver",
+    ] {
+        let mut input = request("clippy", &[]);
+        input["program"] = json!(program);
+        assert!(
+            SelectedCommand::parse(&input, "Cargo.toml", PreparationContext::RemoteRequest)
+                .is_err(),
+            "{program}"
+        );
+    }
+    for command in ["check", "build", "test", "run", "bench"] {
+        let mut input = request(command, &[]);
+        input["program"] = json!("/__rabs/toolchain/bin/cargo-clippy");
+        assert!(
+            SelectedCommand::parse(&input, "Cargo.toml", PreparationContext::RemoteRequest)
+                .is_err(),
+            "{command}"
+        );
+    }
+    for name in ["CARGO", "RUSTC"] {
+        for value in [Value::Null, json!("/host/tool"), json!("tool"), json!(true)] {
+            let mut input = request("clippy", &[]);
+            input["command_context"]["env"][name] = value;
+            assert!(
+                SelectedCommand::parse(&input, "Cargo.toml", PreparationContext::RemoteRequest)
+                    .is_err(),
+                "{name}"
+            );
+        }
+        let mut input = request("clippy", &[]);
+        input["command_context"]["env"]
+            .as_object_mut()
+            .unwrap()
+            .remove(name);
+        assert!(
+            SelectedCommand::parse(&input, "Cargo.toml", PreparationContext::RemoteRequest)
+                .is_err(),
+            "missing {name}"
+        );
+    }
+    for name in [
+        "CARGO_HOME",
+        "CARGO_BUILD_TARGET",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "RUSTC_BOOTSTRAP",
+        "CLIPPY_ARGS",
+        "CLIPPY_CONF_DIR",
+        "CLIPPY_DRIVER_PATH",
+        "RUSTFLAGS",
+        "PATH",
+    ] {
+        let mut input = request("clippy", &[]);
+        input["command_context"]["env"][name] = json!("untrusted");
+        assert!(
+            SelectedCommand::parse(&input, "Cargo.toml", PreparationContext::RemoteRequest)
+                .is_err(),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn selected_clippy_refuses_compiler_execution_controls_and_unbounded_lint_tails() {
+    for extra in [
+        vec!["--no-run"],
+        vec!["--no-fail-fast"],
+        vec!["--doc"],
+        vec!["--fix"],
+        vec!["filter"],
+        vec!["--no-deps", "--no-deps"],
+        vec!["--", "--unit-graph"],
+        vec!["--", "--emit=link"],
+        vec!["--", "--sysroot", "/host"],
+        vec!["--", "--cfg=unretained"],
+        vec!["--", "-Ctarget-cpu=native"],
+        vec!["--", "@response-file"],
+        vec!["--", "-D"],
+        vec!["--", "--cap-lints=force-warn"],
+        vec!["--", "--allow", "clippy::"],
+        vec!["--", "--deny", "warnings\n"],
+        vec!["--", "-D", "warnings", "--", "--unit-graph"],
+    ] {
+        assert!(
+            SelectedCommand::parse(
+                &request("clippy", &extra),
+                "Cargo.toml",
+                PreparationContext::RemoteRequest,
+            )
+            .is_err(),
+            "{extra:?}"
+        );
+    }
+    let mut excessive = vec!["--"];
+    excessive.extend(std::iter::repeat_n("-Dwarnings", 129));
+    assert!(
+        SelectedCommand::parse(
+            &request("clippy", &excessive),
+            "Cargo.toml",
+            PreparationContext::RemoteRequest,
+        )
+        .is_err()
+    );
+    let mut hidden = request("clippy", &[]);
+    hidden["args"]
+        .as_array_mut()
+        .unwrap()
+        .insert(1, json!("--"));
+    assert!(
+        SelectedCommand::parse(&hidden, "Cargo.toml", PreparationContext::RemoteRequest).is_err()
+    );
+    for command in ["check", "build", "test", "run", "bench"] {
+        assert!(
+            SelectedCommand::parse(
+                &request(command, &["--no-deps"]),
+                "Cargo.toml",
+                PreparationContext::RemoteRequest,
+            )
+            .is_err(),
+            "{command}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn selected_clippy_requires_both_ordinary_executable_captured_companions() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let fixture = tempfile::tempdir().unwrap();
+    let selected = SelectedCommand::parse(
+        &request("clippy", &[]),
+        "Cargo.toml",
+        PreparationContext::RemoteRequest,
+    )
+    .unwrap();
+    for failed_program in ["cargo-clippy", "clippy-driver"] {
+        for kind in ["missing", "directory", "nonexecutable", "symlink", "valid"] {
+            let bin = fixture.path().join(failed_program).join(kind).join("bin");
+            fs::create_dir_all(&bin).unwrap();
+            for name in ["cargo-clippy", "clippy-driver"] {
+                let path = bin.join(name);
+                if name == failed_program {
+                    match kind {
+                        "missing" => continue,
+                        "directory" => {
+                            fs::create_dir(path).unwrap();
+                            continue;
+                        }
+                        "nonexecutable" => {
+                            fs::write(&path, "captured tool").unwrap();
+                            fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+                            continue;
+                        }
+                        "symlink" => {
+                            let target = bin.join("untrusted");
+                            fs::write(&target, "untrusted tool").unwrap();
+                            fs::set_permissions(&target, fs::Permissions::from_mode(0o755))
+                                .unwrap();
+                            symlink(target, path).unwrap();
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+                fs::write(&path, "captured tool").unwrap();
+                fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let result = selected.graph_program(&bin.join("cargo"));
+            if kind == "valid" {
+                assert_eq!(result.unwrap(), bin.join("cargo-clippy"));
+            } else {
+                assert!(result.is_err(), "{failed_program}: {kind}");
+            }
+        }
+    }
+}
+
+#[test]
 fn selected_harness_commands_preserve_selection_without_interpreting_runtime_arguments() {
     for command in ["test", "bench"] {
         let input = request(
@@ -757,7 +1058,7 @@ fn selected_command_refuses_independent_resolution_and_execution_controls() {
             "{extra:?}"
         );
     }
-    for command in ["clippy", "metadata", "install", "publish", "clean"] {
+    for command in ["metadata", "install", "publish", "clean"] {
         assert!(
             SelectedCommand::parse(
                 &request(command, &[]),
@@ -1445,18 +1746,29 @@ fn cargo_output(
     seed: &Path,
     args: &[&str],
 ) -> io::Result<Vec<u8>> {
+    let program = if args.first() == Some(&"clippy") {
+        toolchain.join("bin/cargo-clippy")
+    } else {
+        cargo.to_owned()
+    };
     let mut command = super::super::planning_command(
-        cargo,
+        &program,
         &toolchain.join("bin/rustc"),
         workspace,
         "Cargo.toml",
         seed,
         Some(toolchain),
     )?;
+    let separator = args
+        .iter()
+        .position(|argument| *argument == "--")
+        .unwrap_or(args.len());
     command
-        .args(args)
+        .env("CARGO", cargo)
+        .args(&args[..separator])
         .arg("--manifest-path")
-        .arg(workspace.join("Cargo.toml"));
+        .arg(workspace.join("Cargo.toml"))
+        .args(&args[separator..]);
     super::super::bounded_command(
         command,
         seed,
@@ -1902,7 +2214,7 @@ fn installed_cargo_replays_only_selected_registry_archives_from_a_fresh_home() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn installed_cargo_prepares_execution_commands_without_running_project_code() {
+fn installed_cargo_prepares_execution_and_clippy_without_running_project_code() {
     let fixture = tempfile::tempdir().unwrap();
     let tools = fixture.path().join("tools");
     fs::create_dir(&tools).unwrap();
@@ -2022,6 +2334,19 @@ fn installed_cargo_prepares_execution_commands_without_running_project_code() {
     .unwrap();
     let image = capture(&workspace);
     for (command, extra) in [
+        ("clippy", vec![]),
+        (
+            "clippy",
+            vec![
+                "--all-targets",
+                "--no-deps",
+                "--target=x86_64-unknown-linux-gnu",
+                "--",
+                "-D",
+                "warnings",
+                "-Aclippy::needless_return",
+            ],
+        ),
         ("test", vec![]),
         ("test", vec!["--no-run", "--all-targets"]),
         ("test", vec!["--doc"]),
@@ -2138,6 +2463,7 @@ fn installed_cargo_prepares_execution_commands_without_running_project_code() {
             ]
             .map(String::from),
         );
+        arguments.extend(selection.graph_tail_arguments().unwrap());
         let graph: Value = serde_json::from_slice(
             &cargo_output(
                 &cargo,
@@ -2179,7 +2505,10 @@ fn installed_cargo_prepares_execution_commands_without_running_project_code() {
                 }
             );
         }
-        if matches!(command, "test" | "bench") || extra.contains(&"--example") {
+        if matches!(command, "test" | "bench")
+            || extra.contains(&"--example")
+            || extra.contains(&"--all-targets")
+        {
             assert!(
                 units
                     .iter()
@@ -2188,6 +2517,10 @@ fn installed_cargo_prepares_execution_commands_without_running_project_code() {
         }
     }
     let selected_missing = [
+        (
+            "clippy",
+            vec!["--all-features", "--no-deps", "--", "-Dwarnings"],
+        ),
         ("test", vec!["--all-features"]),
         ("bench", vec!["--all-features"]),
         ("run", vec!["--bin", "other", "--features", "remote"]),

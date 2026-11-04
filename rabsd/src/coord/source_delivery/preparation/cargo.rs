@@ -17,6 +17,7 @@ use super::{PreparationContext, PreparationControl, capture_error};
 use rabs_asupersync::process_groups::ManagedProcessGroup;
 use rabs_asupersync::region_tree::Attribution;
 use rabs_asupersync::stream_drain::{DrainLimits, DrainedOutput};
+use rabs_sandbox::cargo_check::CompilationCommand;
 use rabs_sandbox::snapshot_capture::{
     MemberKind, SealedSourceSnapshot, capture_sealed_source_cancellable,
 };
@@ -258,6 +259,11 @@ impl CargoSource {
             };
             (cargo, rustc)
         };
+        let graph_program = self
+            .selection
+            .as_ref()
+            .map(|selection| selection.graph_program(&cargo))
+            .transpose()?;
         let home = planning_root.join("home");
         fs::create_dir(&home)?;
         let cargo_home = planning_root.join("cargo-home");
@@ -377,9 +383,13 @@ impl CargoSource {
             // build-script/proc-macro units. Target-filtered metadata cannot
             // stand in for that closure. Run planning resolves one exact
             // binary/example without executing it; harness/program arguments
-            // remain exclusively in the original execution request.
+            // remain exclusively in the original execution request. Clippy
+            // instead uses its captured executable and sibling lint driver,
+            // with the same lint tail after all nonexecuting Cargo controls.
             let mut graph = planning_command(
-                &cargo,
+                graph_program
+                    .as_deref()
+                    .ok_or_else(|| invalid("selected Cargo graph executable missing"))?,
                 &rustc,
                 &root,
                 &self.manifest,
@@ -387,6 +397,9 @@ impl CargoSource {
                 selected_toolchain,
             )?;
             selection.configure(&mut graph, &rustc, &planning_root);
+            if selection.command == CompilationCommand::Clippy {
+                graph.env("CARGO", &cargo);
+            }
             graph
                 .args(selection.graph_arguments(&metadata, package_id.as_deref())?)
                 .args([
@@ -398,7 +411,8 @@ impl CargoSource {
                 .arg("--manifest-path")
                 .arg(root.join(&self.manifest))
                 .arg("--target-dir")
-                .arg(planning_root.join("target"));
+                .arg(planning_root.join("target"))
+                .args(selection.graph_tail_arguments()?);
             let output = bounded_command_controlled(
                 graph,
                 &planning_root,

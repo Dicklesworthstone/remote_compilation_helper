@@ -15,7 +15,7 @@ use rabs_sandbox::snapshot_capture::SealedSourceSnapshot;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub(super) const VERSION: &str = "cargo-unit-graph-v1";
@@ -38,10 +38,6 @@ impl SelectedCommand {
         manifest: &str,
         preparation: PreparationContext,
     ) -> io::Result<Self> {
-        require(
-            request["program"] == "/__rabs/toolchain/bin/cargo",
-            "selected Cargo preparation requires the canonical Cargo executable",
-        )?;
         let args = request["args"]
             .as_array()
             .filter(|args| !args.is_empty() && args.len() <= 256)
@@ -58,14 +54,29 @@ impl SelectedCommand {
             "build" => CompilationCommand::Build,
             "check" => CompilationCommand::Check,
             "test" => CompilationCommand::Test,
+            "clippy" => CompilationCommand::Clippy,
             "run" => CompilationCommand::Run,
             "bench" => CompilationCommand::Bench,
             _ => {
                 return Err(invalid(
-                    "selected Cargo preparation supports build, check, test, run and bench",
+                    "selected Cargo preparation supports build, check, test, clippy, run and bench",
                 ));
             }
         };
+        let native = preparation == PreparationContext::CanonicalLocal;
+        require(
+            !native || command != CompilationCommand::Clippy,
+            "selected native Cargo preparation does not support Clippy",
+        )?;
+        require(
+            request["program"]
+                == if command == CompilationCommand::Clippy {
+                    "/__rabs/toolchain/bin/cargo-clippy"
+                } else {
+                    "/__rabs/toolchain/bin/cargo"
+                },
+            "selected Cargo preparation requires the canonical executable for its command",
+        )?;
         let canonical_manifest = format!("/__rabs/workspace/{manifest}");
         let cwd = Path::new(&canonical_manifest)
             .parent()
@@ -82,7 +93,6 @@ impl SelectedCommand {
             .ok_or_else(|| {
                 invalid("selected Cargo preparation requires its manifest-parent context")
             })?;
-        let native = preparation == PreparationContext::CanonicalLocal;
         let inputs = context
             .get("env")
             .and_then(Value::as_object)
@@ -105,6 +115,14 @@ impl SelectedCommand {
                 "selected native Cargo preparation requires the driver's exact compiler controls",
             )?;
         }
+        if command == CompilationCommand::Clippy {
+            require(
+                inputs.get("CARGO").and_then(Value::as_str) == Some("/__rabs/toolchain/bin/cargo")
+                    && inputs.get("RUSTC").and_then(Value::as_str)
+                        == Some("/__rabs/toolchain/bin/rustc"),
+                "selected Clippy requires the exact canonical Cargo and rustc bindings",
+            )?;
+        }
         let environment = inputs
             .iter()
             .map(|(name, value)| {
@@ -113,9 +131,13 @@ impl SelectedCommand {
                     .ok_or_else(|| invalid("selected Cargo environment values must be strings"))?;
                 if name == "CARGO_INCREMENTAL" {
                     require(matches!(value, "0" | "1"), "invalid selected Cargo incremental policy")?;
-                } else if !native || !matches!(name.as_str(), "CARGO_TARGET_DIR" | "RUSTC" | "RUSTDOC") {
-                    // Only the complete fixed native control set checked above
-                    // bypasses this rule. Public requests retain the same boundary.
+                } else if !(native
+                    && matches!(name.as_str(), "CARGO_TARGET_DIR" | "RUSTC" | "RUSTDOC"))
+                    && !(command == CompilationCommand::Clippy
+                        && matches!(name.as_str(), "CARGO" | "RUSTC"))
+                {
+                    // Only the complete native or Clippy control set checked
+                    // above bypasses this rule; arbitrary overrides still fail.
                     require(
                         !matches!(name.as_str(), "CARGO" | "RUSTC" | "RUSTDOC" | "RUSTFLAGS" | "RUSTDOCFLAGS" | "GLIBC_TUNABLES")
                             && !["CARGO_", "RUSTUP_", "RUSTC_", "RUSTDOC_", "CLIPPY_", "LD_", "DYLD_", "GIT_", "RABS_", "RCH_"]
@@ -135,6 +157,16 @@ impl SelectedCommand {
         let mut at = 1;
         while at < args.len() {
             if args[at] == "--" {
+                if command == CompilationCommand::Clippy {
+                    // The shared selection validator admits only bounded lint
+                    // controls. Keep their order, and append them to planning
+                    // only after every driver-owned Cargo control.
+                    selection.lint_args = args[at + 1..]
+                        .iter()
+                        .map(|value| (*value).to_owned())
+                        .collect();
+                    break;
+                }
                 require(
                     matches!(
                         command,
@@ -265,6 +297,7 @@ impl SelectedCommand {
                         "--doc" => &mut selection.doc,
                         "--no-run" => &mut selection.no_run,
                         "--no-fail-fast" => &mut selection.no_fail_fast,
+                        "--no-deps" => &mut selection.no_deps,
                         _ => return Err(invalid("unsupported selected Cargo argument")),
                     };
                     require(!*flag, "duplicate selected Cargo flag")?;
@@ -306,12 +339,41 @@ impl SelectedCommand {
     pub(super) fn configure(&self, command: &mut Command, rustc: &Path, planning: &Path) {
         for (name, value) in &self.environment {
             match name.as_str() {
+                "CARGO" => command.env(name, rustc.with_file_name("cargo")),
                 "RUSTC" => command.env(name, rustc),
                 "RUSTDOC" => command.env(name, rustc.with_file_name("rustdoc")),
                 "CARGO_TARGET_DIR" => command.env(name, planning.join("target")),
                 _ => command.env(name, value),
             };
         }
+    }
+
+    /// Clippy's executable selects its sibling driver. Verify both captured
+    /// programs before any graph query; ordinary Cargo must never discover a
+    /// host cargo-clippy plugin or a rustup proxy through PATH.
+    pub(super) fn graph_program(&self, cargo: &Path) -> io::Result<PathBuf> {
+        if self.command != CompilationCommand::Clippy {
+            return Ok(cargo.to_owned());
+        }
+        let bin = cargo
+            .parent()
+            .ok_or_else(|| invalid("selected Cargo executable parent missing"))?;
+        for program in ["cargo-clippy", "clippy-driver"] {
+            let metadata = std::fs::symlink_metadata(bin.join(program))?;
+            require(
+                metadata.is_file(),
+                "selected Clippy requires captured ordinary cargo-clippy and clippy-driver executables",
+            )?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                require(
+                    metadata.permissions().mode() & 0o111 != 0,
+                    "selected Clippy requires captured ordinary cargo-clippy and clippy-driver executables",
+                )?;
+            }
+        }
+        Ok(bin.join("cargo-clippy"))
     }
 
     /// `cargo run` does not reliably return a graph without looking for its
@@ -333,6 +395,16 @@ impl SelectedCommand {
             arguments.extend(["--jobs".into(), jobs.to_string()]);
         }
         Ok(arguments)
+    }
+
+    /// Program and harness tails never belong to a graph query. Clippy's lint
+    /// tail does, but only after the fixed nonexecuting resolution controls.
+    pub(super) fn graph_tail_arguments(&self) -> io::Result<Vec<String>> {
+        if self.command == CompilationCommand::Clippy {
+            self.selection.runtime_arguments(self.command)
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     /// An explicit target already lets Cargo resolve its ordinary package
