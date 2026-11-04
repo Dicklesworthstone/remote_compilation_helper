@@ -65,10 +65,6 @@ impl SelectedCommand {
         };
         let native = preparation == PreparationContext::CanonicalLocal;
         require(
-            !native || command != CompilationCommand::Clippy,
-            "selected native Cargo preparation does not support Clippy",
-        )?;
-        require(
             request["program"]
                 == if command == CompilationCommand::Clippy {
                     "/__rabs/toolchain/bin/cargo-clippy"

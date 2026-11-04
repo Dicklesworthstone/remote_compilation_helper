@@ -206,6 +206,10 @@ class CanonicalLocalCargo(unittest.TestCase):
              {"packages": ["app"], "features": ["fast"]}),
             (["build", "--release", "--bin", "server"],
              {"release": True, "bin": ["server"]}),
+            (["clippy", "--workspace", "--all-targets", "--no-deps", "--", "-D", "warnings",
+              "-Aclippy::needless_return", "--cap-lints", "warn"],
+             {"workspace": True, "all_targets": True, "no_deps": True,
+              "lint_args": ["-D", "warnings", "-Aclippy::needless_return", "--cap-lints", "warn"]}),
             (["test", "--doc", "--", "--nocapture"],
              {"doc": True, "test_args": ["--nocapture"]}),
             (["run", "--bin", "server", "--", "--literal"],
@@ -222,7 +226,19 @@ class CanonicalLocalCargo(unittest.TestCase):
                 self.assertEqual(json.loads(Path(record["retained"]).read_bytes()), expected)
                 self.assertEqual(self.profile_path.read_bytes(), original)
 
-    def test_selected_source_mode_refuses_invalid_versions_vendor_and_clippy_before_handoff(self):
+        self.profile.update(command="clippy", selection={"no_deps": True, "lint_args": ["-Dwarnings"]})
+        self.save()
+        original = self.profile_path.read_bytes()
+        for arguments, selection in ((["check"], {}), (["clippy", "--", "-Awarnings"],
+                                                       {"lint_args": ["-Awarnings"]})):
+            with self.subTest(saved_clippy=arguments):
+                status, _, stderr, _ = self.invoke(arguments)
+                self.assertEqual(status, 0, stderr)
+                expected = dict(self.profile, command=arguments[0], selection=selection)
+                self.assertEqual(self.records()[-1]["profile"], expected)
+                self.assertEqual(self.profile_path.read_bytes(), original)
+
+    def test_selected_source_mode_refuses_invalid_versions_and_vendor_before_handoff(self):
         for version in (None, True, {}, "future", "Complete"):
             with self.subTest(version=version):
                 self.profile["source_selection"] = version
@@ -233,14 +249,12 @@ class CanonicalLocalCargo(unittest.TestCase):
         self.save()
         stderr = self.assert_refused(["build"])
         self.assertIn(b"source_selection cannot be combined with vendor", stderr)
-        self.profile.pop("vendor")
-        self.save()
         stderr = self.assert_refused(["clippy", "--", "-Dwarnings"])
-        self.assertIn(b"source_selection does not support Clippy", stderr)
+        self.assertIn(b"source_selection cannot be combined with vendor", stderr)
         self.profile["command"] = "clippy"
         self.save()
         stderr = self.assert_refused(["check"])
-        self.assertIn(b"source_selection does not support Clippy", stderr)
+        self.assertIn(b"source_selection cannot be combined with vendor", stderr)
 
     def test_rustup_selection_reaches_native_local_profile_as_one_physical_root(self):
         self.select_rustup()
@@ -604,20 +618,28 @@ class CanonicalLocalCargo(unittest.TestCase):
                 self.assertEqual(self.profile_path.read_bytes(), original)
 
     def test_clippy_requires_captured_components_before_retaining_operation(self):
-        for name in ("cargo", "rustc", "cargo-clippy", "clippy-driver"):
-            with self.subTest(name=name):
-                tool = self.tools / "bin" / name
-                tool.chmod(0o600)
-                self.assert_refused(["clippy"])
-                tool.chmod(0o700)
         incomplete = self.root / "incomplete-toolchain"
         (incomplete / "bin").mkdir(parents=True)
-        self.profile["toolchain_root"] = str(incomplete)
-        self.save()
-        self.assert_refused(["clippy"])
+        for mode in (None, "cargo-unit-graph-v1"):
+            if mode is None:
+                self.profile.pop("source_selection", None)
+            else:
+                self.profile["source_selection"] = mode
+            self.profile["toolchain_root"] = str(self.tools)
+            self.save()
+            for name in ("cargo", "rustc", "cargo-clippy", "clippy-driver"):
+                with self.subTest(source_selection=mode, name=name):
+                    tool = self.tools / "bin" / name
+                    tool.chmod(0o600)
+                    self.assert_refused(["clippy"])
+                    tool.chmod(0o700)
+            self.profile["toolchain_root"] = str(incomplete)
+            self.save()
+            with self.subTest(source_selection=mode, incomplete=True):
+                self.assert_refused(["clippy"])
 
     def test_clippy_rejects_compiler_authority_test_execution_and_invalid_lint_tails(self):
-        for args in (
+        cases = (
             ["clippy", "--no-run"], ["clippy", "--doc"], ["clippy", "--no-fail-fast"],
             ["clippy", "test-filter"], ["clippy", "--config=other"],
             ["clippy", "--", "--emit=link"], ["clippy", "--", "--sysroot", "/other"],
@@ -628,9 +650,16 @@ class CanonicalLocalCargo(unittest.TestCase):
             ["clippy", "--", "--allow", "clippy::lint__CLIPPY_HACKERY__--sysroot"],
             ["clippy", "--", "--cap-lints", "force-warn"],
             ["check", "--no-deps"], ["build", "--no-deps"], ["test", "--no-deps"],
-        ):
-            with self.subTest(args=args):
-                self.assert_refused(args)
+        )
+        for mode in (None, "cargo-unit-graph-v1"):
+            if mode is None:
+                self.profile.pop("source_selection", None)
+            else:
+                self.profile["source_selection"] = mode
+            self.save()
+            for args in cases:
+                with self.subTest(source_selection=mode, args=args):
+                    self.assert_refused(args)
         exact = ["clippy", "--"] + ["-Awarnings"] * 128
         self.assertEqual(len(launcher.canonical_local_selection(exact)["lint_args"]), 128)
         for args in (exact + ["-Awarnings"], ["clippy", "-papp"] + exact[1:],

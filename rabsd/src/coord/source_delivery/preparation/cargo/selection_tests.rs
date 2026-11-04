@@ -139,9 +139,11 @@ fn native_specification(profile: Value) -> Value {
 #[cfg(target_os = "linux")]
 #[test]
 fn selected_native_commands_map_driver_controls_without_widening_public_requests() {
-    for command in ["check", "build", "test", "run", "bench"] {
+    for command in ["check", "build", "test", "clippy", "run", "bench"] {
         let selection = if command == "run" {
             json!({"bin":["app"], "run_args":["--unit-graph", "--jobs=100"]})
+        } else if command == "clippy" {
+            json!({"no_deps":true, "lint_args":["-D", "warnings", "-Aclippy::needless_return"]})
         } else {
             json!({})
         };
@@ -157,7 +159,11 @@ fn selected_native_commands_map_driver_controls_without_widening_public_requests
         );
         assert_eq!(&arguments[arguments.len() - 2..], ["--jobs", "2"]);
         assert!(!arguments.iter().any(|argument| argument == "--unit-graph"));
-        let mut process = Command::new("/captured/toolchain/bin/cargo");
+        let mut process = Command::new(if command == "clippy" {
+            "/captured/toolchain/bin/cargo-clippy"
+        } else {
+            "/captured/toolchain/bin/cargo"
+        });
         selected.configure(
             &mut process,
             Path::new("/captured/toolchain/bin/rustc"),
@@ -171,6 +177,13 @@ fn selected_native_commands_map_driver_controls_without_widening_public_requests
         ]);
         if command == "test" {
             expected.insert("RUSTDOC".into(), "/captured/toolchain/bin/rustdoc".into());
+        }
+        if command == "clippy" {
+            expected.insert("CARGO".into(), "/captured/toolchain/bin/cargo".into());
+            assert_eq!(
+                selected.graph_tail_arguments().unwrap(),
+                ["--", "-D", "warnings", "-Aclippy::needless_return"]
+            );
         }
         let actual = process
             .get_envs()
@@ -285,6 +298,75 @@ fn selected_native_commands_refuse_mutated_controls_and_unbounded_jobs() {
         )
         .is_err()
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn selected_native_clippy_refuses_changed_compiler_controls_and_lint_injection() {
+    let input = native_specification(native_profile(
+        "clippy",
+        json!({"no_deps":true, "lint_args":["-D", "warnings"]}),
+    ));
+    SelectedCommand::parse(&input, "Cargo.toml", PreparationContext::CanonicalLocal).unwrap();
+    for name in ["CARGO", "RUSTC", "CARGO_INCREMENTAL", "CARGO_TARGET_DIR"] {
+        let mut missing = input.clone();
+        missing["command_context"]["env"]
+            .as_object_mut()
+            .unwrap()
+            .remove(name);
+        assert!(
+            SelectedCommand::parse(&missing, "Cargo.toml", PreparationContext::CanonicalLocal)
+                .is_err(),
+            "missing {name}"
+        );
+        let mut changed = input.clone();
+        changed["command_context"]["env"][name] = json!("/host/replacement");
+        assert!(
+            SelectedCommand::parse(&changed, "Cargo.toml", PreparationContext::CanonicalLocal)
+                .is_err(),
+            "changed {name}"
+        );
+    }
+    for name in [
+        "CLIPPY_ARGS",
+        "RUSTC_WRAPPER",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "RUSTDOC",
+    ] {
+        let mut changed = input.clone();
+        changed["command_context"]["env"][name] = json!("/host/replacement");
+        assert!(
+            SelectedCommand::parse(&changed, "Cargo.toml", PreparationContext::CanonicalLocal)
+                .is_err(),
+            "extra {name}"
+        );
+    }
+    let mut wrong_program = input.clone();
+    wrong_program["program"] = json!("/__rabs/toolchain/bin/cargo");
+    assert!(
+        SelectedCommand::parse(
+            &wrong_program,
+            "Cargo.toml",
+            PreparationContext::CanonicalLocal
+        )
+        .is_err()
+    );
+    for tail in [
+        vec!["--emit=metadata"],
+        vec!["--sysroot", "/outside"],
+        vec!["-Dwarnings__CLIPPY_HACKERY__--print"],
+        vec!["@response"],
+    ] {
+        let mut changed = input.clone();
+        let arguments = changed["args"].as_array_mut().unwrap();
+        let separator = arguments.iter().position(|value| value == "--").unwrap();
+        arguments.truncate(separator + 1);
+        arguments.extend(tail.into_iter().map(|value| json!(value)));
+        assert!(
+            SelectedCommand::parse(&changed, "Cargo.toml", PreparationContext::CanonicalLocal)
+                .is_err()
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -517,6 +599,152 @@ fn installed_cargo_native_source_specification_prepares_and_replays_selected_com
     assert!(!approved.join("registry/cache").exists());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cargo_native_clippy_prepares_selected_graph_without_running_project_code() {
+    let fixture = tempfile::tempdir().unwrap();
+    let workspace = fixture.path().join("workspace");
+    let seed = fixture.path().join("seed");
+    let tools = fixture.path().join("tools");
+    for path in [
+        workspace.join("app/src"),
+        workspace.join("host-helper/src"),
+        workspace.join("other/src"),
+        seed.join("home"),
+        seed.join("cargo-home"),
+        tools.clone(),
+    ] {
+        fs::create_dir_all(path).unwrap();
+    }
+    let cargo = super::super::local_tool("cargo", &tools).unwrap();
+    let toolchain = cargo.parent().unwrap().parent().unwrap();
+    for name in ["cargo-clippy", "clippy-driver"] {
+        assert!(
+            fs::symlink_metadata(toolchain.join("bin").join(name))
+                .unwrap()
+                .is_file()
+        );
+    }
+    fs::write(workspace.join("Cargo.toml"),
+        "[workspace]\nmembers=['app','host-helper','other']\ndefault-members=['app']\nresolver='2'\n").unwrap();
+    fs::write(
+        workspace.join("app/Cargo.toml"),
+        "[package]\nname='selected-native-clippy'\nversion='0.1.0'\nedition='2021'\n\
+         [dependencies]\nrabs-selection-missing={version='=1.0.0',optional=true}\n\
+         [build-dependencies]\nhost-helper={path='../host-helper'}\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("app/src/lib.rs"),
+        "compile_error!(\"source planning must not lint or compile project code\");\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("app/build.rs"),
+        "compile_error!(\"source planning must not compile build scripts\");\n\
+         fn main() { panic!(\"source planning must not execute build scripts\"); }\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("host-helper/Cargo.toml"),
+        "[package]\nname='host-helper'\nversion='0.1.0'\nedition='2021'\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("host-helper/src/lib.rs"),
+        "compile_error!(\"source planning must not compile host dependencies\");\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("other/Cargo.toml"),
+        "[package]\nname='unselected-native-clippy'\nversion='0.1.0'\nedition='2021'\n\
+         [dependencies]\nrabs-selection-missing='=1.0.0'\n",
+    )
+    .unwrap();
+    fs::write(workspace.join("other/src/lib.rs"), "pub fn unused() {}\n").unwrap();
+    let approved = seed.join("cargo-home");
+    seed_index(&approved, &archive());
+    cargo_output(
+        &cargo,
+        toolchain,
+        &workspace,
+        &seed,
+        &["generate-lockfile", "--offline"],
+    )
+    .unwrap();
+    assert!(!approved.join("registry/cache").exists());
+
+    let mut profile = native_profile(
+        "clippy",
+        json!({
+            "packages":["selected-native-clippy"], "all_targets":true, "no_deps":true,
+            "lint_args":["-D", "warnings", "-Aclippy::needless_return"],
+        }),
+    );
+    profile["source_root"] = json!(workspace);
+    profile["toolchain_root"] = json!(toolchain);
+    profile["cargo_home_source"] = json!(approved);
+    let specification = native_specification(profile.clone());
+    let original = specification.clone();
+    assert_eq!(
+        specification["program"],
+        "/__rabs/toolchain/bin/cargo-clippy"
+    );
+    let control = PreparationControl::uncontrolled();
+    let inputs = super::super::super::SourcePreparation::parse(
+        &workspace,
+        &specification,
+        PreparationContext::CanonicalLocal,
+    )
+    .unwrap();
+    assert!(inputs.requires_selected_toolchain());
+    let upload = inputs
+        .capture_controlled(Some(toolchain), &control)
+        .unwrap();
+    assert_eq!(specification, original);
+    assert!(
+        upload
+            .manifest
+            .files()
+            .iter()
+            .all(|file| !file.path.ends_with(".crate"))
+    );
+    for member in [
+        "Cargo.lock",
+        "app/src/lib.rs",
+        "app/build.rs",
+        "host-helper/src/lib.rs",
+        "other/src/lib.rs",
+    ] {
+        assert_eq!(
+            upload.image.file_bytes("workspace", member).unwrap(),
+            fs::read(workspace.join(member)).unwrap()
+        );
+    }
+    assert!(!workspace.join("target").exists());
+    assert!(!approved.join("registry/cache").exists());
+
+    for selection in [
+        json!({"packages":["selected-native-clippy"], "all_features":true, "no_deps":true}),
+        json!({"packages":["unselected-native-clippy"], "no_deps":true}),
+    ] {
+        profile["selection"] = selection;
+        let required = native_specification(profile.clone());
+        let inputs = super::super::super::SourcePreparation::parse(
+            &workspace,
+            &required,
+            PreparationContext::CanonicalLocal,
+        )
+        .unwrap();
+        assert!(
+            inputs
+                .capture_controlled(Some(toolchain), &control)
+                .is_err()
+        );
+    }
+    assert!(!workspace.join("target").exists());
+}
+
 #[test]
 fn selected_command_binds_build_check_features_profiles_and_target_to_actual_argv() {
     for command in ["build", "check"] {
@@ -691,7 +919,7 @@ fn selected_clippy_requires_exact_canonical_program_and_compiler_bindings() {
     .unwrap_err();
     assert_eq!(
         native_error.to_string(),
-        "selected native Cargo preparation does not support Clippy"
+        "selected native Cargo preparation requires the driver's exact compiler controls"
     );
     for program in [
         "/__rabs/toolchain/bin/cargo",

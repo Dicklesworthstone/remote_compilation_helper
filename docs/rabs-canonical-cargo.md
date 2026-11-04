@@ -1344,11 +1344,19 @@ fields to prepare dependencies for the command you actually select:
 
 A purely local graph needs only `source_selection`. Both the native entry point
 and `cargo rabs --rabs-canonical-local` support this mode for `check`, `build`,
-`test`, `run` and `bench`. The captured Cargo plans the actual package, feature,
+`clippy`, `test`, `run` and `bench`. The captured Cargo plans the actual package, feature,
 target and profile selection, including host build dependencies and procedural
 macros. The driver's fixed compiler paths, output directory and job count remain
 bound to that execution. The [selected preparation constraints](#prepare-the-selected-cargo-dependency-graph)
-apply; `vendor` and `clippy` currently cannot use this opt-in mode.
+apply; `vendor` cannot use this opt-in mode.
+
+For Clippy, preparation invokes the captured `cargo-clippy` and requires its
+ordinary executable `clippy-driver` companion. Its exact `CARGO` and `RUSTC`
+bindings resolve inside the captured toolchain during planning, while retained
+requests keep their canonical paths. Ordered lint controls follow Cargo's
+nonexecuting graph flags. Preparation neither compiles nor executes project code;
+the subsequent Clippy command still runs its current lint selection, without
+claiming a cached lint result.
 
 Final delivery includes only registry archives belonging to the validated
 selected units. The complete locked sparse-index records, registry configuration,

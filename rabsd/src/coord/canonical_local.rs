@@ -975,10 +975,6 @@ impl Profile {
             self.vendor.is_none(),
             "selected Cargo preparation does not support vendor sources",
         )?;
-        require(
-            self.command != CompilationCommand::Clippy,
-            "selected Cargo preparation does not support Clippy",
-        )?;
         Ok(Some("cargo-unit-graph-v1"))
     }
 }
@@ -2388,6 +2384,7 @@ mod tests {
             CompilationCommand::Check,
             CompilationCommand::Build,
             CompilationCommand::Test,
+            CompilationCommand::Clippy,
             CompilationCommand::Run,
             CompilationCommand::Bench,
         ] {
@@ -2399,7 +2396,14 @@ mod tests {
                     "selection":"cargo-unit-graph-v1"})
             );
             assert_eq!(request["args"], json!(profile.compilation_args().unwrap()));
-            assert_eq!(request["program"], CARGO);
+            assert_eq!(
+                request["program"],
+                if command == CompilationCommand::Clippy {
+                    CARGO_CLIPPY
+                } else {
+                    CARGO
+                }
+            );
             assert_eq!(
                 request["command_context"]["cwd"],
                 "/__rabs/workspace/member"
@@ -2432,7 +2436,7 @@ mod tests {
     }
 
     #[test]
-    fn source_selection_rejects_vendor_and_clippy_before_opening_profile_roots() {
+    fn source_selection_rejects_vendor_before_opening_profile_roots() {
         let mut profile = application_environment_profile();
         profile.source_selection = SourceSelection::UnitGraph;
         profile.vendor = Some("vendor".into());
@@ -2443,10 +2447,13 @@ mod tests {
                 .contains("does not support vendor sources")
         );
         assert!(profile.source_specification().is_err());
-        profile.vendor = None;
         profile.command = CompilationCommand::Clippy;
         let error = profile.validate().unwrap_err();
-        assert!(error.to_string().contains("does not support Clippy"));
+        assert!(
+            error
+                .to_string()
+                .contains("does not support vendor sources")
+        );
         assert!(profile.source_specification().is_err());
     }
 

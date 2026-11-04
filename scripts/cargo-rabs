@@ -2110,8 +2110,6 @@ def canonical_local_source_selection(profile):
         raise SetupError("local canonical source_selection must be cargo-unit-graph-v1")
     if profile.get("vendor") is not None:
         raise SetupError("local canonical source_selection cannot be combined with vendor")
-    if profile.get("command", "check") == "clippy":
-        raise SetupError("local canonical source_selection does not support Clippy")
 
 
 def canonical_local_environment(profile):
