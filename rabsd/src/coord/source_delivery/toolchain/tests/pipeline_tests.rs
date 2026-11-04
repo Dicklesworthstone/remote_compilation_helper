@@ -114,7 +114,7 @@ fn the_first_cold_burst_spans_metadata_and_file_bytes_before_waiting() {
     let root = tempfile::tempdir().unwrap();
     let (upload, request, bytes) = fixture(root.path());
     let mut peer = TracedPeer::new();
-    upload.transmit(&mut peer, &request, false).unwrap();
+    upload.transmit(&mut peer, &request, false, false).unwrap();
     // Root, bin directory, compiler entry, then its first chunk. The old sender
     // waits after each entry, so its first burst has only one control.
     assert_eq!(
@@ -166,7 +166,7 @@ fn empty_files_share_windows_and_the_final_short_batch_is_drained() {
         let root = crate::test_util::private_tempdir();
         let (upload, request) = empty_files(root.path(), count);
         let mut peer = TracedPeer::new();
-        upload.transmit(&mut peer, &request, false).unwrap();
+        upload.transmit(&mut peer, &request, false, false).unwrap();
         let entries = count + 1; // the root is an identity-bearing entry too
         assert_eq!(peer.attempted, entries);
         assert_eq!(peer.encoded_controls, entries);
@@ -189,6 +189,106 @@ fn empty_files_share_windows_and_the_final_short_batch_is_drained() {
 }
 
 #[test]
+fn file_manifests_page_by_count_and_empty_trees_still_finish_the_manifest_and_dataset() {
+    for count in [0, MAX_TOOLCHAIN_FILE_PAGE_ENTRIES + 1] {
+        let root = crate::test_util::private_tempdir();
+        let (upload, request) = empty_files(root.path(), count);
+        let mut peer = ReceiverPeer::new();
+        peer.file_reuse_enabled = true;
+        upload.transmit(&mut peer, &request, false, true).unwrap();
+        let pages = peer
+            .sent
+            .iter()
+            .filter(|frame| frame["kind"] == "toolchain-file-manifest")
+            .collect::<Vec<_>>();
+        assert_eq!(pages.len(), count.div_ceil(MAX_TOOLCHAIN_FILE_PAGE_ENTRIES));
+        let mut offset = 0;
+        for page in pages {
+            assert_eq!(page["offset"].as_u64(), Some(offset as u64));
+            let files = page["files"].as_array().unwrap();
+            assert!(files.len() <= MAX_TOOLCHAIN_FILE_PAGE_ENTRIES);
+            assert!(serde_json::to_vec(page).unwrap().len() <= MAX_TOOLCHAIN_FILE_PAGE_BYTES);
+            offset += files.len();
+        }
+        assert_eq!(offset, count);
+        assert_eq!(
+            peer.sent
+                .iter()
+                .filter(|frame| frame["kind"] == "toolchain-file-manifest-seal")
+                .count(),
+            1
+        );
+        assert_eq!(
+            peer.sent
+                .iter()
+                .filter(|frame| frame["kind"] == "toolchain-entry")
+                .count(),
+            count + 1
+        );
+        assert_eq!(peer.sent.last().unwrap()["kind"], "toolchain-seal");
+        assert_eq!(
+            peer.sealed.as_ref().unwrap().identity(),
+            upload.prepared.identity()
+        );
+        assert!(peer.replies.is_empty());
+    }
+}
+
+#[test]
+fn file_manifest_pages_respect_escaped_json_bytes_before_the_file_count_bound() {
+    let root = crate::test_util::private_tempdir();
+    let source = root.path().join("source");
+    let component = "quoted\"".repeat(30);
+    let directory = source.join(&component).join(&component).join(&component);
+    fs::create_dir_all(&directory).unwrap();
+    for index in 0..512 {
+        fs::write(directory.join(format!("file-{index:04}")), []).unwrap();
+    }
+    let retained = capture_toolchain(
+        &source,
+        &root.path().join("retained"),
+        None,
+        &ToolchainLimits::default(),
+        || false,
+    )
+    .unwrap();
+    let request = json!({"kind":"canonical-exec", "request_id":0,
+        "toolchain_transfer":TOOLCHAIN_TRANSFER_VERSION,
+        "toolchain_identity":toolchain_identity_value(retained.identity())});
+    let upload = ToolchainUpload::new(retained, &request).unwrap();
+    let mut peer = ReceiverPeer::new();
+    peer.file_reuse_enabled = true;
+    upload.transmit(&mut peer, &request, false, true).unwrap();
+    let pages = peer
+        .sent
+        .iter()
+        .filter(|frame| frame["kind"] == "toolchain-file-manifest")
+        .collect::<Vec<_>>();
+    assert!(pages.len() > 1);
+    assert!(
+        pages
+            .iter()
+            .all(|page| page["files"].as_array().unwrap().len() < MAX_TOOLCHAIN_FILE_PAGE_ENTRIES)
+    );
+    assert!(
+        pages
+            .iter()
+            .all(|page| serde_json::to_vec(page).unwrap().len() <= MAX_TOOLCHAIN_FILE_PAGE_BYTES)
+    );
+    assert_eq!(
+        pages
+            .iter()
+            .map(|page| page["files"].as_array().unwrap().len())
+            .sum::<usize>(),
+        512
+    );
+    assert_eq!(
+        peer.sealed.as_ref().unwrap().identity(),
+        upload.prepared.identity()
+    );
+}
+
+#[test]
 fn every_batched_ack_stays_correlated_and_errors_never_send_a_seal() {
     let root = tempfile::tempdir().unwrap();
     let (upload, request, _) = fixture(root.path());
@@ -205,7 +305,7 @@ fn every_batched_ack_stays_correlated_and_errors_never_send_a_seal() {
         let mut peer = TracedPeer::new();
         peer.fault = Some(fault);
         assert!(
-            upload.transmit(&mut peer, &request, false).is_err(),
+            upload.transmit(&mut peer, &request, false, false).is_err(),
             "{fault}"
         );
         assert_eq!(
@@ -230,7 +330,7 @@ fn failed_send_stops_immediately_without_retry_or_automatic_draining() {
     peer.fail_send = true;
     assert_eq!(
         upload
-            .transmit(&mut peer, &request, false)
+            .transmit(&mut peer, &request, false, false)
             .unwrap_err()
             .kind(),
         io::ErrorKind::ConnectionAborted
@@ -372,7 +472,7 @@ fn cold_transfer_refills_after_each_ack_without_emptying_the_pipeline() {
     let root = crate::test_util::private_tempdir();
     let (upload, request, bytes) = fixture(root.path());
     let mut peer = TracedPeer::new();
-    upload.transmit(&mut peer, &request, false).unwrap();
+    upload.transmit(&mut peer, &request, false, false).unwrap();
     let controls = peer.attempted;
     assert!(controls > CHUNK_WINDOW * 2, "exercise sustained transfer");
     let full_reads = controls - CHUNK_WINDOW + 1;

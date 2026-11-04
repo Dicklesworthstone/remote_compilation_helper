@@ -184,6 +184,7 @@ fn canonical_action_observes_only_worker_authored_jobserver_env() {
                 slots: 6,
                 host_budget: Some(&host_budget),
                 source_cache: None,
+                toolchain_file_cache: None,
                 runtime_pool: None,
                 target_cache: None,
             },
@@ -270,6 +271,7 @@ fn canonical_action_observes_only_worker_authored_jobserver_env() {
         slots: 6,
         host_budget: Some(&host_budget),
         source_cache: None,
+        toolchain_file_cache: None,
         runtime_pool: None,
         target_cache: None,
     };

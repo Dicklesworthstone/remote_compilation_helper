@@ -889,6 +889,7 @@ pub struct ExecutionResources<'a> {
     pub slots: u32,
     pub host_budget: Option<&'a crate::host_budget::HostBudget>,
     pub source_cache: Option<&'a crate::source_transfer::SourceCache>,
+    pub toolchain_file_cache: Option<&'a crate::toolchain_transfer::ToolchainFileCache>,
     pub runtime_pool: Option<&'a RuntimePool>,
     pub target_cache: Option<(
         &'a std::sync::Arc<crate::target_cache::TargetCache>,
@@ -903,6 +904,7 @@ impl ExecutionResources<'_> {
             slots,
             host_budget: None,
             source_cache: None,
+            toolchain_file_cache: None,
             runtime_pool: None,
             target_cache: None,
         }
@@ -1522,6 +1524,16 @@ fn execute_canonical_inner(
             if let Err(error) = cache.validate_runtime_root(&bind.backing) {
                 let _ =
                     control.retain_outputs(Err(format!("source cache mount isolation: {error}")));
+                return exec_error(request.request_id);
+            }
+        }
+    }
+    if let Some(cache) = resources.toolchain_file_cache {
+        for bind in &spec.rw_binds {
+            if let Err(error) = cache.validate_runtime_root(&bind.backing) {
+                let _ = control.retain_outputs(Err(format!(
+                    "toolchain file cache mount isolation: {error}"
+                )));
                 return exec_error(request.request_id);
             }
         }

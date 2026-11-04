@@ -607,7 +607,7 @@ fn selected_registry_capture_defers_only_absent_archives_and_checks_selected_own
         )
         .unwrap();
     for bad_id in [
-        format!("registry+https://github.com/rust-lang/crates.io-index#other@1.0.0"),
+        "registry+https://github.com/rust-lang/crates.io-index#other@1.0.0".to_owned(),
         format!("registry+https://github.com/rust-lang/crates.io-index#{DEPENDENCY}@2.0.0"),
         format!("sparse+https://other.invalid/index/#{DEPENDENCY}@1.0.0"),
     ] {

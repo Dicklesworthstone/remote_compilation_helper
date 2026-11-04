@@ -10,11 +10,14 @@ use crate::session::{CanonicalExecRequest, parse_toolchain_identity};
 use crate::source_transfer::hex;
 use rabs_sandbox::toolchain_dataset::{PreparedToolchain, ToolchainIdentity, ToolchainLimits};
 use rabs_sandbox::toolchain_transfer::{
-    MAX_TOOLCHAIN_CHUNK, TOOLCHAIN_REUSE_VERSION, TOOLCHAIN_TRANSFER_VERSION,
-    TOOLCHAIN_UPLOAD_BUDGET, ToolchainEntry, ToolchainEntryKind, ToolchainReceiver,
+    MAX_TOOLCHAIN_CHUNK, MAX_TOOLCHAIN_FILE_PAGE_BYTES, MAX_TOOLCHAIN_FILE_PAGE_ENTRIES,
+    MAX_TOOLCHAIN_METADATA_BYTES, TOOLCHAIN_FILE_REUSE_VERSION, TOOLCHAIN_REUSE_VERSION,
+    TOOLCHAIN_TRANSFER_VERSION, TOOLCHAIN_UPLOAD_BUDGET, ToolchainCheckpointError, ToolchainEntry,
+    ToolchainEntryKind, ToolchainFile, ToolchainReceiver,
 };
 use serde_json::{Value, json};
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,6 +25,12 @@ use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::task::{Context, Poll, Waker};
 use std::thread::JoinHandle;
 use std::time::Instant;
+
+mod cache;
+pub use cache::{MAX_TOOLCHAIN_FILE_CACHE_BYTES, ToolchainFileCache};
+
+#[cfg(all(test, target_os = "linux"))]
+mod file_reuse_tests;
 
 fn fields(value: &Value, names: &[&str]) -> Result<(), String> {
     if value.as_object().is_some_and(|object| {
@@ -123,10 +132,280 @@ pub fn selected_reuse(
     }
 }
 
+pub fn selected_file_reuse(
+    frame: &str,
+    authenticated: bool,
+    transfer_enabled: bool,
+    configured: bool,
+) -> Result<bool, String> {
+    let value: Value = serde_json::from_str(frame).map_err(|error| error.to_string())?;
+    match value.get("toolchain_file_reuse") {
+        None => Ok(false),
+        Some(selection) if selection.as_str() == Some(TOOLCHAIN_FILE_REUSE_VERSION) => {
+            if !authenticated || !transfer_enabled || !configured {
+                return Err(
+                    "toolchain file reuse requires authenticated transfer and configured cache"
+                        .to_owned(),
+                );
+            }
+            Ok(true)
+        }
+        Some(_) => Err("unsupported toolchain_file_reuse selection".to_owned()),
+    }
+}
+
+struct PlannedFile {
+    expected: ToolchainFile,
+    hit: Option<cache::SnapshotRange>,
+}
+
+/// All hits are independently owned before a missing-file answer is sent.
+/// Pages bound wire and metadata work; ordinary entry/chunk sequencing remains
+/// unchanged after the exact file/byte declaration has been sealed.
+struct FileReuse {
+    files: BTreeMap<String, PlannedFile>,
+    count: u64,
+    bytes: u64,
+    metadata: usize,
+    last_path: Option<String>,
+    current: Option<ToolchainFile>,
+    snapshots: Option<cache::Snapshots>,
+    writer: Option<cache::CacheWriter>,
+    sealed: bool,
+}
+
+impl FileReuse {
+    fn new(
+        cache: ToolchainFileCache,
+        identity: &ToolchainIdentity,
+        stopped: &impl Fn() -> bool,
+    ) -> Self {
+        Self {
+            files: BTreeMap::new(),
+            count: 0,
+            bytes: 0,
+            metadata: 0,
+            last_path: None,
+            current: None,
+            writer: cache.writer(stopped).unwrap_or_else(|error| {
+                eprintln!("rabs-wkr: optional toolchain file checkpoints unavailable: {error}");
+                None
+            }),
+            snapshots: match cache::Snapshots::new(cache, identity.bytes) {
+                Ok(snapshots) => Some(snapshots),
+                Err(error) => {
+                    eprintln!("rabs-wkr: optional toolchain file snapshots unavailable: {error}");
+                    None
+                }
+            },
+            sealed: false,
+        }
+    }
+
+    fn page(
+        &mut self,
+        frame: &Value,
+        identity: &ToolchainIdentity,
+        stopped: &impl Fn() -> bool,
+    ) -> Result<Value, String> {
+        fields(frame, &["kind", "request_id", "sha256", "offset", "files"])?;
+        if self.sealed || frame["offset"].as_u64() != Some(self.count) {
+            return Err("toolchain file manifest offset or phase mismatch".to_owned());
+        }
+        if serde_json::to_vec(frame)
+            .map_err(|error| error.to_string())?
+            .len()
+            > MAX_TOOLCHAIN_FILE_PAGE_BYTES
+        {
+            return Err("toolchain file manifest page exceeds byte bound".to_owned());
+        }
+        let page = frame["files"]
+            .as_array()
+            .ok_or("toolchain file manifest requires files")?;
+        if page.is_empty() || page.len() > MAX_TOOLCHAIN_FILE_PAGE_ENTRIES {
+            return Err("toolchain file manifest page exceeds count bound".to_owned());
+        }
+        let mut missing = Vec::new();
+        for value in page {
+            fields(value, &["path", "bytes", "executable", "sha256"])?;
+            let path = value["path"]
+                .as_str()
+                .ok_or("toolchain manifest file requires path")?;
+            if path.is_empty()
+                || path.len() > 4096
+                || path.contains(['\\', ':'])
+                || path.chars().any(char::is_control)
+                || path.split('/').count() > 64
+                || path
+                    .split('/')
+                    .any(|part| part.len() > 255 || matches!(part, "" | "." | ".."))
+                || self
+                    .last_path
+                    .as_ref()
+                    .is_some_and(|last| last.as_str() >= path)
+            {
+                return Err(
+                    "toolchain manifest files require canonical ordered relative paths".to_owned(),
+                );
+            }
+            let expected = ToolchainFile {
+                path: path.to_owned(),
+                bytes: value["bytes"]
+                    .as_u64()
+                    .ok_or("toolchain manifest file bytes must be unsigned")?,
+                executable: value["executable"]
+                    .as_bool()
+                    .ok_or("toolchain manifest executable must be boolean")?,
+                sha256: digest(&value["sha256"])?,
+            };
+            self.count = self
+                .count
+                .checked_add(1)
+                .filter(|count| *count <= identity.files)
+                .ok_or("toolchain file manifest exceeds declared file count")?;
+            self.bytes = self
+                .bytes
+                .checked_add(expected.bytes)
+                .filter(|bytes| *bytes <= identity.bytes)
+                .ok_or("toolchain file manifest exceeds declared bytes")?;
+            self.metadata = self
+                .metadata
+                .checked_add(256 + 2 * path.len())
+                .filter(|bytes| *bytes <= MAX_TOOLCHAIN_METADATA_BYTES)
+                .ok_or("toolchain file manifest exceeds metadata bound")?;
+            let hit = match &mut self.snapshots {
+                Some(snapshots) => snapshots
+                    .append(&expected, stopped)
+                    .map_err(|error| error.to_string())?,
+                None => None,
+            };
+            if hit.is_some() {
+                if let Some(writer) = &mut self.writer {
+                    writer.protect(&expected.sha256);
+                }
+            } else {
+                missing.push(path.to_owned());
+            }
+            self.last_path = Some(path.to_owned());
+            self.files
+                .insert(path.to_owned(), PlannedFile { expected, hit });
+        }
+        Ok(
+            json!({"kind":"toolchain-file-manifest-accepted", "request_id":frame["request_id"],
+            "sha256":frame["sha256"], "next_offset":self.count, "missing":missing}),
+        )
+    }
+
+    fn seal(
+        &mut self,
+        identity: &ToolchainIdentity,
+        stopped: &impl Fn() -> bool,
+    ) -> Result<(), String> {
+        if self.sealed || self.count != identity.files || self.bytes != identity.bytes {
+            return Err("toolchain file manifest differs from complete SDK declaration".to_owned());
+        }
+        if let Some(snapshots) = &mut self.snapshots {
+            snapshots.seal(stopped).map_err(|error| error.to_string())?;
+        }
+        self.sealed = true;
+        Ok(())
+    }
+
+    fn entry(
+        &mut self,
+        receiver: &mut ToolchainReceiver,
+        entry: ToolchainEntry,
+        stopped: &impl Fn() -> bool,
+    ) -> Result<(), String> {
+        if !self.sealed {
+            return Err("toolchain file manifest must be sealed before entries".to_owned());
+        }
+        self.current = None;
+        let expected = match &entry.kind {
+            ToolchainEntryKind::File { bytes, executable } => {
+                let planned = self
+                    .files
+                    .remove(&entry.path)
+                    .ok_or("toolchain file is absent from negotiated manifest")?;
+                if planned.expected.bytes != *bytes || planned.expected.executable != *executable {
+                    return Err("toolchain file entry differs from negotiated manifest".to_owned());
+                }
+                Some(planned)
+            }
+            _ => {
+                if self.files.contains_key(&entry.path) {
+                    return Err("toolchain entry replaces a negotiated regular file".to_owned());
+                }
+                None
+            }
+        };
+        receiver.entry(entry).map_err(|error| error.to_string())?;
+        if let Some(PlannedFile { expected, hit }) = expected {
+            if let Some(hit) = hit {
+                let mut file = self
+                    .snapshots
+                    .as_mut()
+                    .ok_or("toolchain hit snapshot owner unavailable")?
+                    .materialize(hit, stopped)
+                    .map_err(|error| error.to_string())?;
+                receiver
+                    .import_file(&expected, &mut file, stopped)
+                    .map_err(|error| error.to_string())?;
+            } else if expected.bytes == 0 {
+                self.remember(receiver, &expected, stopped)?;
+            } else {
+                self.current = Some(expected);
+            }
+        }
+        Ok(())
+    }
+
+    fn completed(
+        &mut self,
+        receiver: &mut ToolchainReceiver,
+        path: &str,
+        offset: u64,
+        stopped: &impl Fn() -> bool,
+    ) -> Result<(), String> {
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|file| file.path == path && file.bytes == offset)
+        {
+            let expected = self.current.take().expect("completed file was selected");
+            self.remember(receiver, &expected, stopped)?;
+        }
+        Ok(())
+    }
+
+    fn remember(
+        &mut self,
+        receiver: &mut ToolchainReceiver,
+        expected: &ToolchainFile,
+        stopped: &impl Fn() -> bool,
+    ) -> Result<(), String> {
+        let Some(writer) = &mut self.writer else {
+            return Ok(());
+        };
+        match writer.remember(receiver, expected, stopped) {
+            Ok(()) => Ok(()),
+            Err(ToolchainCheckpointError::Source(error)) => Err(error.to_string()),
+            Err(ToolchainCheckpointError::Destination(error)) => {
+                // The surrounding owner checks its original deadline and
+                // cancellation before sending an ACK, even for optional writes.
+                eprintln!("rabs-wkr: optional toolchain file checkpoint unavailable: {error}");
+                self.writer = None;
+                Ok(())
+            }
+        }
+    }
+}
+
 struct UploadedToolchain {
     // Inventory and receiver descriptors close before the parent is removed.
     prepared: Option<PreparedToolchain>,
     receiver: ToolchainReceiver,
+    file_reuse: Option<FileReuse>,
     _directory: tempfile::TempDir,
 }
 
@@ -161,6 +440,7 @@ impl UploadedToolchain {
         let Self {
             prepared,
             receiver,
+            file_reuse: _,
             _directory: directory,
         } = self;
         let prepared = prepared.ok_or_else(|| io::Error::other("toolchain is not sealed"))?;
@@ -328,10 +608,30 @@ impl ToolchainOwner {
             return Err("toolchain upload is already sealed".to_owned());
         };
         let UploadedToolchain {
-            prepared, receiver, ..
+            prepared,
+            receiver,
+            file_reuse,
+            ..
         } = &mut **upload;
         let identity = hex(&self.identity.sha256);
+        let deadline = self.deadline;
+        let stopped = || cancelled.load(Ordering::Acquire) || Instant::now() >= deadline;
         let result = (|| match frame["kind"].as_str() {
+            Some("toolchain-file-manifest") => file_reuse
+                .as_mut()
+                .ok_or("toolchain file reuse not negotiated")?
+                .page(frame, &self.identity, &stopped),
+            Some("toolchain-file-manifest-seal") => {
+                fields(frame, &["kind", "request_id", "sha256"])?;
+                file_reuse
+                    .as_mut()
+                    .ok_or("toolchain file reuse not negotiated")?
+                    .seal(&self.identity, &stopped)?;
+                Ok(
+                    json!({"kind":"toolchain-file-manifest-ready", "request_id":self.request_id,
+                    "sha256":identity, "files":self.identity.files, "bytes":self.identity.bytes}),
+                )
+            }
             Some("toolchain-entry") => {
                 fields(frame, &["kind", "request_id", "sha256", "path", "entry"])?;
                 if receiver.entry_count() >= self.entries {
@@ -368,18 +668,23 @@ impl ToolchainOwner {
                     }
                     _ => return Err("unsupported toolchain entry kind".to_owned()),
                 };
-                receiver
-                    .entry(ToolchainEntry {
-                        path: path.to_owned(),
-                        kind,
-                    })
-                    .map_err(|error| error.to_string())?;
+                let entry = ToolchainEntry {
+                    path: path.to_owned(),
+                    kind,
+                };
+                match file_reuse {
+                    Some(reuse) => reuse.entry(receiver, entry, &stopped)?,
+                    None => receiver.entry(entry).map_err(|error| error.to_string())?,
+                }
                 Ok(
                     json!({"kind":"toolchain-entry-accepted", "request_id":self.request_id,
                         "sha256":identity, "path":path}),
                 )
             }
             Some("toolchain-chunk") => {
+                if file_reuse.as_ref().is_some_and(|reuse| !reuse.sealed) {
+                    return Err("toolchain file manifest must be sealed before chunks".to_owned());
+                }
                 fields(
                     frame,
                     &[
@@ -405,6 +710,9 @@ impl ToolchainOwner {
                 receiver
                     .write_chunk(path, offset, &bytes, digest(&frame["chunk_sha256"])?)
                     .map_err(|error| error.to_string())?;
+                if let Some(reuse) = file_reuse {
+                    reuse.completed(receiver, path, next, &stopped)?;
+                }
                 Ok(
                     json!({"kind":"toolchain-chunk-accepted", "request_id":self.request_id,
                         "sha256":identity, "path":path, "next_offset":next}),
@@ -415,11 +723,16 @@ impl ToolchainOwner {
                 if receiver.entry_count() != self.entries {
                     return Err("toolchain entry count differs from declaration".to_owned());
                 }
-                let deadline = self.deadline;
-                let verified = receiver
-                    .seal(|| cancelled.load(Ordering::Acquire) || Instant::now() >= deadline)
-                    .map_err(|error| error.to_string())?;
+                if file_reuse.as_ref().is_some_and(|reuse| {
+                    !reuse.sealed || !reuse.files.is_empty() || reuse.current.is_some()
+                }) {
+                    return Err("toolchain file manifest has unreceived files".to_owned());
+                }
+                let verified = receiver.seal(stopped).map_err(|error| error.to_string())?;
                 *prepared = Some(verified);
+                // Completed byte objects survive; upload-only spools and the
+                // optional writer release before execution takes this SDK.
+                *file_reuse = None;
                 Ok(
                     json!({"kind":"toolchain-ready", "request_id":self.request_id,
                     "sha256":identity, "sealed":true}),
@@ -442,6 +755,7 @@ impl ToolchainOwner {
 struct TransferState {
     owner: Option<ToolchainOwner>,
     reuse: bool,
+    file_cache: Option<ToolchainFileCache>,
     // Test receivers get a real isolated pool, avoiding process-global registry
     // changes or environment mutation while parallel tests own other sessions.
     #[cfg(test)]
@@ -540,6 +854,11 @@ impl TransferState {
                 backing: ToolchainBacking::Uploaded(Box::new(UploadedToolchain {
                     prepared: None,
                     receiver,
+                    file_reuse: self.file_cache.clone().map(|cache| {
+                        FileReuse::new(cache, &identity, &|| {
+                            cancelled.load(Ordering::Acquire) || Instant::now() >= deadline
+                        })
+                    }),
                     _directory: directory,
                 })),
                 request_id: id,
@@ -648,7 +967,7 @@ pub struct ToolchainTransferTask {
 
 impl Default for ToolchainTransferTask {
     fn default() -> Self {
-        Self::with_reuse(false)
+        Self::with_configuration(false, None)
     }
 }
 
@@ -656,10 +975,11 @@ impl ToolchainTransferTask {
     /// Reuse is an explicit session selection; local cache configuration alone
     /// never permits the receiver to skip the sender's full transfer protocol.
     #[must_use]
-    pub fn with_reuse(reuse: bool) -> Self {
+    pub fn with_configuration(reuse: bool, file_cache: Option<ToolchainFileCache>) -> Self {
         Self {
             state: Some(TransferState {
                 reuse,
+                file_cache,
                 ..TransferState::default()
             }),
             shared: Arc::new(Mutex::new(CompletionState::default())),
@@ -684,16 +1004,17 @@ impl ToolchainTransferTask {
         let thread = std::thread::Builder::new()
             .name("rabs-toolchain-io".to_owned())
             .spawn(move || {
-                while let Ok(mut job) = receiver.recv() {
+                while let Ok(job) = receiver.recv() {
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        handle(&mut job.state, &job.frame, &cancelled)
+                        // Drop upload snapshots and writer ownership during an
+                        // unwind before exposing the fatal completion.
+                        let Job { mut state, frame } = job;
+                        let response = handle(&mut state, &frame, &cancelled);
+                        Completed { state, response }
                     }));
                     let fatal = outcome.is_err();
                     let result = match outcome {
-                        Ok(response) => Ok(Completed {
-                            state: job.state,
-                            response,
-                        }),
+                        Ok(completed) => Ok(completed),
                         Err(_) => Err("toolchain filesystem worker panicked".to_owned()),
                     };
                     let wake = {
@@ -748,7 +1069,14 @@ impl ToolchainTransferTask {
         }
         if !matches!(
             frame["kind"].as_str(),
-            Some("toolchain-begin" | "toolchain-entry" | "toolchain-chunk" | "toolchain-seal")
+            Some(
+                "toolchain-begin"
+                    | "toolchain-file-manifest"
+                    | "toolchain-file-manifest-seal"
+                    | "toolchain-entry"
+                    | "toolchain-chunk"
+                    | "toolchain-seal"
+            )
         ) {
             return Err("unknown toolchain operation".to_owned());
         }
@@ -957,6 +1285,37 @@ mod tests {
     }
 
     #[test]
+    fn file_reuse_selection_requires_authentication_transfer_and_configured_capacity() {
+        let ack = json!({"kind":"session-ok", "toolchain_file_reuse":TOOLCHAIN_FILE_REUSE_VERSION})
+            .to_string();
+        assert!(selected_file_reuse(&ack, true, true, true).unwrap());
+        for (authenticated, transfer, configured) in [
+            (false, true, true),
+            (true, false, true),
+            (true, true, false),
+        ] {
+            assert!(selected_file_reuse(&ack, authenticated, transfer, configured).is_err());
+        }
+        assert!(!selected_file_reuse(r#"{"kind":"session-ok"}"#, false, false, false).unwrap());
+        for bad in [
+            Value::Null,
+            json!(false),
+            json!(7),
+            json!("toolchain-file-reuse-v2"),
+        ] {
+            assert!(
+                selected_file_reuse(
+                    &json!({"toolchain_file_reuse":bad}).to_string(),
+                    true,
+                    true,
+                    true
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn selected_requests_require_exact_identity_and_exclude_host_paths() {
         assert_eq!(
             request_identity(&request()).unwrap(),
@@ -1070,7 +1429,7 @@ mod tests {
         }
 
         fn task(pool: &Arc<toolchain_pool::ToolchainPool>, reuse: bool) -> ToolchainTransferTask {
-            let mut task = ToolchainTransferTask::with_reuse(reuse);
+            let mut task = ToolchainTransferTask::with_configuration(reuse, None);
             task.state.as_mut().unwrap().pool = Some(Arc::clone(pool));
             task
         }
@@ -2329,6 +2688,7 @@ mod tests {
                 let owner = UploadedToolchain {
                     prepared: Some(prepared),
                     receiver,
+                    file_reuse: None,
                     _directory: directory,
                 }
                 .into_sealed(&identity)

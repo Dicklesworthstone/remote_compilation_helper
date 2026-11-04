@@ -222,6 +222,7 @@ pub(super) struct RuntimeResources {
     pub host_budget: Option<Arc<rabs_wkr::host_budget::HostBudget>>,
     pub target_cache: Option<Arc<rabs_wkr::target_cache::TargetCache>>,
     pub source_cache: Option<rabs_wkr::source_transfer::SourceCache>,
+    pub toolchain_file_cache: Option<rabs_wkr::toolchain_transfer::ToolchainFileCache>,
     pub runtime_pool: Option<Arc<rabs_sandbox::runtime_cohort::RuntimePool>>,
 }
 

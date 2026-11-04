@@ -171,7 +171,7 @@ fn missing_or_changed_registry_support_stops_before_bytes_and_execution() {
     ordinary.as_object_mut().unwrap().remove("cargo_home");
     let mut peer = RegistryPeer::new();
     assert!(
-        upload.transmit(&mut peer, &ordinary, false).is_err(),
+        upload.transmit(&mut peer, &ordinary, false, false).is_err(),
         "unsolicited Cargo home selection is not authority"
     );
     assert_eq!(peer.inner.sent.len(), 1);
@@ -286,7 +286,7 @@ fn prepared_registry_bundle_retains_selection_and_warm_transfer_still_requires_s
         );
     }
     peer.inner.missing = Some(json!([]));
-    upload.transmit(&mut peer, &request, false).unwrap();
+    upload.transmit(&mut peer, &request, false, false).unwrap();
     assert_eq!(peer.inner.sent.len(), 2);
     assert_eq!(peer.inner.sent[0]["cargo_home"], selection());
     assert_eq!(peer.inner.sent[1]["kind"], "source-seal");

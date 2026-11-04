@@ -12,6 +12,7 @@
 
 use crate::toolchain_dataset::{PreparedToolchain, ToolchainIdentity, ToolchainLimits};
 use std::collections::VecDeque;
+use std::fs::File;
 use std::io;
 use std::path::Path;
 use std::time::Duration;
@@ -19,6 +20,10 @@ use std::time::Duration;
 pub const TOOLCHAIN_TRANSFER_VERSION: &str = "toolchain-tree-v1";
 /// Optional admission capability: a verified retained dataset may seal begin.
 pub const TOOLCHAIN_REUSE_VERSION: &str = "toolchain-reuse-v1";
+/// Optional completed-file recovery, independent of whole-image retention.
+pub const TOOLCHAIN_FILE_REUSE_VERSION: &str = "toolchain-file-reuse-v1";
+pub const MAX_TOOLCHAIN_FILE_PAGE_ENTRIES: usize = 1024;
+pub const MAX_TOOLCHAIN_FILE_PAGE_BYTES: usize = 256 * 1024;
 pub const MAX_TOOLCHAIN_CHUNK: usize = 64 * 1024;
 pub const MAX_TOOLCHAIN_METADATA_BYTES: usize = 64 * 1024 * 1024;
 pub const TOOLCHAIN_UPLOAD_TIMEOUT_MS: u64 = 30 * 60 * 1000;
@@ -40,6 +45,51 @@ pub enum ToolchainEntryKind {
     Directory,
     Symlink { target: String },
     File { bytes: u64, executable: bool },
+}
+
+/// A regular file's byte identity from the retained SDK's complete scan. This
+/// is a transfer optimization only; the complete tree identity remains the
+/// authority for a sealed toolchain, including directories and symlinks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolchainFile {
+    pub path: String,
+    pub bytes: u64,
+    pub executable: bool,
+    pub sha256: [u8; 32],
+}
+
+impl ToolchainFile {
+    pub(crate) fn metadata_bytes(&self) -> usize {
+        160 + self.path.len()
+    }
+}
+
+/// An independent, fully hashed copy of a completed received file. This is not
+/// a sealed toolchain and cannot authorize compiler execution.
+#[derive(Debug)]
+pub struct VerifiedToolchainFile {
+    file: File,
+    expected: ToolchainFile,
+}
+
+impl VerifiedToolchainFile {
+    #[must_use]
+    pub fn expected(&self) -> &ToolchainFile {
+        &self.expected
+    }
+
+    #[must_use]
+    pub fn into_file(self) -> File {
+        self.file
+    }
+}
+
+/// Invalid input revokes the receiver; a failed optional cache destination
+/// does not. The caller enforces its fixed deadline on cancellation.
+#[derive(Debug)]
+pub enum ToolchainCheckpointError {
+    Source(io::Error),
+    Destination(io::Error),
 }
 
 impl ToolchainEntry {
@@ -176,6 +226,48 @@ impl ToolchainReceiver {
         }
     }
 
+    /// Import independent, complete bytes into the last declared untouched
+    /// file. The exact digest and retained input generation are verified while
+    /// copying. Any failure poisons this receiver; final whole-tree seal is
+    /// still required even when every file was imported.
+    pub fn import_file(
+        &mut self,
+        expected: &ToolchainFile,
+        input: &mut File,
+        stopped: impl Fn() -> bool,
+    ) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            self.inner
+                .apply(|inner| inner.import_file(expected, input, &stopped))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (expected, input, stopped);
+            Err(unsupported())
+        }
+    }
+
+    /// Checkpoint the most recently completed regular file into a new empty
+    /// private file, without granting whole-toolchain readiness. Source errors
+    /// poison the receiver; destination failures preserve ordinary uploading.
+    pub fn checkpoint_file(
+        &mut self,
+        expected: &ToolchainFile,
+        destination: File,
+        stopped: impl Fn() -> bool,
+    ) -> Result<VerifiedToolchainFile, ToolchainCheckpointError> {
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.checkpoint_file(expected, destination, &stopped)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (expected, destination, stopped);
+            Err(ToolchainCheckpointError::Source(unsupported()))
+        }
+    }
+
     pub fn seal(&mut self, stopped: impl Fn() -> bool) -> io::Result<PreparedToolchain> {
         #[cfg(target_os = "linux")]
         {
@@ -228,8 +320,8 @@ mod linux {
     use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, mkdirat, openat2, symlinkat};
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
-    use std::fs::{self, File};
-    use std::io::Write;
+    use std::fs::{self, File, Metadata};
+    use std::io::{Read, Seek, Write};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::{Component, PathBuf};
 
@@ -241,6 +333,11 @@ mod linux {
         executable: bool,
     }
 
+    struct CompletedFile {
+        path: String,
+        metadata: Metadata,
+    }
+
     pub(super) struct Receiver {
         root: PathBuf,
         directory: File,
@@ -249,6 +346,7 @@ mod linux {
         limits: ToolchainLimits,
         pub(super) entries: BTreeMap<String, ToolchainEntryKind>,
         current: Option<PendingFile>,
+        completed: Option<CompletedFile>,
         declared_bytes: u64,
         files: u64,
         pub(super) received_bytes: u64,
@@ -262,6 +360,38 @@ mod linux {
             && !matches!(value, "." | "..")
             && !value.contains(['/', '\\', ':'])
             && !value.chars().any(char::is_control)
+    }
+
+    fn checkpoint(stopped: &impl Fn() -> bool) -> io::Result<()> {
+        if stopped() {
+            Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "toolchain file transfer interrupted",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn same_generation(left: &Metadata, right: &Metadata) -> bool {
+        left.dev() == right.dev()
+            && left.ino() == right.ino()
+            && left.len() == right.len()
+            && left.mode() == right.mode()
+            && left.nlink() == right.nlink()
+            && left.uid() == right.uid()
+            && left.gid() == right.gid()
+            && left.mtime() == right.mtime()
+            && left.mtime_nsec() == right.mtime_nsec()
+            && left.ctime() == right.ctime()
+            && left.ctime_nsec() == right.ctime_nsec()
+    }
+
+    fn ordinary_file(metadata: &Metadata, bytes: u64) -> io::Result<()> {
+        require(
+            metadata.is_file() && metadata.len() == bytes && metadata.nlink() == 1,
+            "toolchain file type, length or link count changed",
+        )
     }
 
     impl Receiver {
@@ -325,6 +455,7 @@ mod linux {
                 limits,
                 entries: BTreeMap::new(),
                 current: None,
+                completed: None,
                 declared_bytes: 0,
                 files: 0,
                 received_bytes: 0,
@@ -373,6 +504,7 @@ mod linux {
                 self.current.is_none(),
                 "toolchain file is incomplete before next entry",
             )?;
+            self.completed = None;
             require(
                 self.entries.len() < self.limits.max_entries,
                 "toolchain entry count exceeded",
@@ -472,6 +604,12 @@ mod linux {
                     } else {
                         0o444
                     }))?;
+                let metadata = file.file.metadata()?;
+                ordinary_file(&metadata, file.expected)?;
+                self.completed = Some(CompletedFile {
+                    path: file.path,
+                    metadata,
+                });
             }
             Ok(())
         }
@@ -509,6 +647,219 @@ mod linux {
                 .filter(|bytes| *bytes <= self.expected.bytes)
                 .ok_or_else(|| invalid("toolchain received byte count exceeded"))?;
             self.finish_file()
+        }
+
+        fn check_root(&self) -> io::Result<()> {
+            let named = File::from(openat2(
+                CWD,
+                &self.root,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+                ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+            )?);
+            let metadata = named.metadata()?;
+            require(
+                (metadata.dev(), metadata.ino()) == self.root_inode,
+                "toolchain staging root was replaced",
+            )
+        }
+
+        fn selected_file(&self, expected: &ToolchainFile) -> io::Result<File> {
+            self.check_root()?;
+            require(
+                self.entries.last_key_value().is_some_and(|(path, kind)| {
+                    path == &expected.path
+                        && *kind
+                            == ToolchainEntryKind::File {
+                                bytes: expected.bytes,
+                                executable: expected.executable,
+                            }
+                }),
+                "toolchain file identity differs from the last declared entry",
+            )?;
+            Ok(File::from(openat2(
+                &self.directory,
+                expected.path.as_str(),
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+                ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
+            )?))
+        }
+
+        pub(super) fn import_file(
+            &mut self,
+            expected: &ToolchainFile,
+            input: &mut File,
+            stopped: &impl Fn() -> bool,
+        ) -> io::Result<()> {
+            // Keep a panic in the caller's cancellation hook from reopening a
+            // partially written receiver. Only complete success clears this.
+            self.closed = true;
+            checkpoint(stopped)?;
+            let target = self.selected_file(expected)?;
+            let target_before = target.metadata()?;
+            ordinary_file(&target_before, 0)?;
+            let before = input.metadata()?;
+            require(
+                before.is_file() && before.len() == expected.bytes && before.nlink() <= 1,
+                "toolchain import requires an independent ordinary or anonymous file",
+            )?;
+            require(
+                (before.dev(), before.ino()) != (target_before.dev(), target_before.ino()),
+                "toolchain import aliases its destination",
+            )?;
+            let mut output = if expected.bytes == 0 {
+                require(
+                    self.current.is_none()
+                        && self.completed.as_ref().is_some_and(|file| {
+                            file.path == expected.path
+                                && same_generation(&file.metadata, &target_before)
+                        }),
+                    "empty toolchain import differs from its retained generation",
+                )?;
+                None
+            } else {
+                let pending = self
+                    .current
+                    .as_ref()
+                    .ok_or_else(|| invalid("toolchain import requires an untouched file"))?;
+                require(
+                    pending.path == expected.path
+                        && pending.written == 0
+                        && pending.expected == expected.bytes
+                        && pending.executable == expected.executable
+                        && same_generation(&pending.file.metadata()?, &target_before),
+                    "toolchain import requires its original untouched file",
+                )?;
+                Some(pending.file.try_clone()?)
+            };
+            input.rewind()?;
+            let mut remaining = expected.bytes;
+            let mut digest = Sha256::new();
+            let mut buffer = [0_u8; MAX_TOOLCHAIN_CHUNK];
+            while remaining != 0 {
+                checkpoint(stopped)?;
+                let count = remaining.min(buffer.len() as u64) as usize;
+                input.read_exact(&mut buffer[..count])?;
+                digest.update(&buffer[..count]);
+                output
+                    .as_mut()
+                    .ok_or_else(|| invalid("toolchain import output is absent"))?
+                    .write_all(&buffer[..count])?;
+                remaining -= count as u64;
+            }
+            checkpoint(stopped)?;
+            require(
+                input.read(&mut buffer[..1])? == 0
+                    && same_generation(&before, &input.metadata()?)
+                    && <[u8; 32]>::from(digest.finalize()) == expected.sha256,
+                "toolchain import bytes or retained generation changed",
+            )?;
+            let target_after = target.metadata()?;
+            ordinary_file(&target_after, expected.bytes)?;
+            require(
+                same_generation(&target_after, &self.selected_file(expected)?.metadata()?),
+                "toolchain import destination was replaced",
+            )?;
+            if let Some(file) = &mut self.current {
+                file.written = expected.bytes;
+            }
+            self.received_bytes = self
+                .received_bytes
+                .checked_add(expected.bytes)
+                .filter(|bytes| *bytes <= self.expected.bytes)
+                .ok_or_else(|| invalid("toolchain imported byte count exceeded"))?;
+            self.finish_file()?;
+            checkpoint(stopped)?;
+            self.closed = false;
+            Ok(())
+        }
+
+        pub(super) fn checkpoint_file(
+            &mut self,
+            expected: &ToolchainFile,
+            mut destination: File,
+            stopped: &impl Fn() -> bool,
+        ) -> Result<VerifiedToolchainFile, ToolchainCheckpointError> {
+            use ToolchainCheckpointError::{Destination, Source};
+
+            require(!self.closed, "toolchain receiver is closed or poisoned").map_err(Source)?;
+            self.closed = true;
+            let result = (|| {
+                let completed = self
+                    .completed
+                    .as_ref()
+                    .filter(|file| file.path == expected.path && self.current.is_none())
+                    .ok_or_else(|| {
+                        Source(invalid("toolchain checkpoint requires a completed file"))
+                    })?;
+                let mut input = self.selected_file(expected).map_err(Source)?;
+                let before = input.metadata().map_err(Source)?;
+                ordinary_file(&before, expected.bytes).map_err(Source)?;
+                require(
+                    same_generation(&completed.metadata, &before),
+                    "completed toolchain file generation changed",
+                )
+                .map_err(Source)?;
+                checkpoint(stopped).map_err(Destination)?;
+                let target = destination.metadata().map_err(Destination)?;
+                ordinary_file(&target, 0).map_err(Destination)?;
+                require(
+                    target.mode() & 0o077 == 0
+                        && target.mode() & 0o200 != 0
+                        && (target.dev(), target.ino()) != (before.dev(), before.ino())
+                        && destination.stream_position().map_err(Destination)? == 0,
+                    "toolchain checkpoint requires an independent empty private writer",
+                )
+                .map_err(Destination)?;
+                let mut digest = Sha256::new();
+                let mut buffer = [0_u8; MAX_TOOLCHAIN_CHUNK];
+                let mut remaining = expected.bytes;
+                while remaining != 0 {
+                    checkpoint(stopped).map_err(Destination)?;
+                    let count = remaining.min(buffer.len() as u64) as usize;
+                    input.read_exact(&mut buffer[..count]).map_err(Source)?;
+                    digest.update(&buffer[..count]);
+                    destination
+                        .write_all(&buffer[..count])
+                        .map_err(Destination)?;
+                    remaining -= count as u64;
+                }
+                checkpoint(stopped).map_err(Destination)?;
+                require(
+                    input.read(&mut buffer[..1]).map_err(Source)? == 0
+                        && same_generation(&before, &input.metadata().map_err(Source)?)
+                        && <[u8; 32]>::from(digest.finalize()) == expected.sha256,
+                    "completed toolchain file bytes or generation changed",
+                )
+                .map_err(Source)?;
+                require(
+                    same_generation(
+                        &before,
+                        &self
+                            .selected_file(expected)
+                            .map_err(Source)?
+                            .metadata()
+                            .map_err(Source)?,
+                    ),
+                    "completed toolchain file was replaced",
+                )
+                .map_err(Source)?;
+                ordinary_file(
+                    &destination.metadata().map_err(Destination)?,
+                    expected.bytes,
+                )
+                .map_err(Destination)?;
+                checkpoint(stopped).map_err(Destination)?;
+                Ok(VerifiedToolchainFile {
+                    file: destination,
+                    expected: expected.clone(),
+                })
+            })();
+            if !matches!(&result, Err(Source(_))) {
+                self.closed = false;
+            }
+            result
         }
 
         pub(super) fn seal(
@@ -572,7 +923,8 @@ mod tests {
     use crate::toolchain_dataset::{capture_toolchain, fingerprint_toolchain, open_toolchain};
     use sha2::{Digest, Sha256};
     use std::fs;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    use std::io::{Seek, Write};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
 
     fn private() -> tempfile::TempDir {
         let directory = tempfile::tempdir().unwrap();
@@ -685,6 +1037,18 @@ mod tests {
             || false,
         )
         .unwrap();
+        let files = prepared.files().unwrap();
+        assert_eq!(files, reopened.files().unwrap());
+        assert_eq!(files.len() as u64, prepared.identity().files);
+        assert_eq!(
+            files.iter().map(|file| file.bytes).sum::<u64>(),
+            prepared.identity().bytes
+        );
+        for file in &files {
+            let bytes = fs::read(prepared.root().join(&file.path)).unwrap();
+            assert_eq!(file.sha256, <[u8; 32]>::from(Sha256::digest(&bytes)));
+            assert_eq!(file.executable, file.path == "bin/compiler");
+        }
         let mut receiver = receiver(parent.path(), *prepared.identity());
         transfer(&reopened, &mut receiver);
         assert_eq!(receiver.entry_count(), prepared.entries().unwrap().len());
@@ -735,6 +1099,285 @@ mod tests {
         received.verify(|| false).unwrap();
         assert!(receiver.seal(|| false).is_err());
         assert!(receiver.entry(directory("z")).is_err());
+    }
+
+    fn checkpoint_destination(path: &Path) -> File {
+        fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap()
+    }
+
+    fn file_identity(path: &str, bytes: &[u8]) -> ToolchainFile {
+        ToolchainFile {
+            path: path.to_owned(),
+            bytes: bytes.len() as u64,
+            executable: false,
+            sha256: Sha256::digest(bytes).into(),
+        }
+    }
+
+    fn complete_file(receiver: &mut ToolchainReceiver, path: &str, bytes: &[u8]) {
+        receiver.entry(file(path, bytes.len() as u64)).unwrap();
+        for (index, chunk) in bytes.chunks(MAX_TOOLCHAIN_CHUNK).enumerate() {
+            receiver
+                .write_chunk(
+                    path,
+                    (index * MAX_TOOLCHAIN_CHUNK) as u64,
+                    chunk,
+                    Sha256::digest(chunk).into(),
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn completed_file_checkpoint_survives_an_unsealed_upload_and_imports_independent_bytes() {
+        let source = private();
+        fs::write(source.path().join("a"), b"completed before disconnect").unwrap();
+        fs::set_permissions(source.path().join("a"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(source.path().join("b"), b"upload after reconnect").unwrap();
+        fs::write(source.path().join("empty"), []).unwrap();
+        symlink("a", source.path().join("link")).unwrap();
+        let source_owner = private();
+        let prepared = capture_toolchain(
+            source.path(),
+            &source_owner.path().join("sdk"),
+            None,
+            &ToolchainLimits::default(),
+            || false,
+        )
+        .unwrap();
+        let expected = prepared.files().unwrap()[0].clone();
+        let first_owner = private();
+        let cache_owner = private();
+        let mut first = receiver(first_owner.path(), *prepared.identity());
+        first.entry(directory("")).unwrap();
+        first
+            .entry(ToolchainEntry {
+                path: expected.path.clone(),
+                kind: ToolchainEntryKind::File {
+                    bytes: expected.bytes,
+                    executable: true,
+                },
+            })
+            .unwrap();
+        let bytes = prepared
+            .read_chunk("a", 0, MAX_TOOLCHAIN_CHUNK, || false)
+            .unwrap();
+        first
+            .write_chunk("a", 0, &bytes, Sha256::digest(&bytes).into())
+            .unwrap();
+        let saved = first
+            .checkpoint_file(
+                &expected,
+                checkpoint_destination(&cache_owner.path().join("saved")),
+                || false,
+            )
+            .unwrap();
+        assert_eq!(saved.expected(), &expected);
+        assert_ne!(
+            fs::metadata(first_owner.path().join("received/a"))
+                .unwrap()
+                .ino(),
+            fs::metadata(cache_owner.path().join("saved"))
+                .unwrap()
+                .ino()
+        );
+        drop(first); // No whole SDK seal or execution owner was produced.
+        let second_owner = private();
+        let mut second = receiver(second_owner.path(), *prepared.identity());
+        let mut saved = saved.into_file();
+        for entry in prepared.entries().unwrap() {
+            let path = entry.path.clone();
+            let bytes = match &entry.kind {
+                ToolchainEntryKind::File { bytes, .. } => *bytes,
+                _ => 0,
+            };
+            second.entry(entry).unwrap();
+            if path == "a" {
+                second.import_file(&expected, &mut saved, || false).unwrap();
+            } else if bytes != 0 {
+                let chunk = prepared
+                    .read_chunk(&path, 0, MAX_TOOLCHAIN_CHUNK, || false)
+                    .unwrap();
+                second
+                    .write_chunk(&path, 0, &chunk, Sha256::digest(&chunk).into())
+                    .unwrap();
+            } else if path == "empty" {
+                let mut empty = tempfile::tempfile_in(cache_owner.path()).unwrap();
+                assert_eq!(empty.metadata().unwrap().nlink(), 0);
+                second
+                    .import_file(&file_identity("empty", b""), &mut empty, || false)
+                    .unwrap();
+            }
+        }
+        assert_eq!(second.received_bytes(), prepared.identity().bytes);
+        let sealed = second.seal(|| false).unwrap();
+        assert_eq!(sealed.identity(), prepared.identity());
+        assert_eq!(sealed.files().unwrap(), prepared.files().unwrap());
+        assert_ne!(
+            saved.metadata().unwrap().ino(),
+            fs::metadata(sealed.root().join("a")).unwrap().ino()
+        );
+        saved.rewind().unwrap();
+        saved.write_all(b"cache mutation after import").unwrap();
+        sealed.verify(|| false).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_refuses_partial_wrong_digest_replaced_file_and_replaced_root() {
+        for case in 0..4 {
+            let owner = private();
+            let mut receiver = receiver(owner.path(), selected(3, 1));
+            receiver.entry(directory("")).unwrap();
+            receiver.entry(file("file", 3)).unwrap();
+            let mut expected = file_identity("file", b"abc");
+            let bytes: &[u8] = if case == 0 { b"a" } else { b"abc" };
+            receiver
+                .write_chunk("file", 0, bytes, Sha256::digest(bytes).into())
+                .unwrap();
+            match case {
+                1 => expected.sha256 = [0; 32],
+                2 => {
+                    fs::rename(owner.path().join("received/file"), owner.path().join("old"))
+                        .unwrap();
+                    fs::write(owner.path().join("received/file"), b"abc").unwrap();
+                }
+                3 => {
+                    fs::rename(owner.path().join("received"), owner.path().join("old")).unwrap();
+                    fs::create_dir(owner.path().join("received")).unwrap();
+                    fs::write(owner.path().join("received/file"), b"abc").unwrap();
+                }
+                _ => {}
+            }
+            let result = receiver.checkpoint_file(
+                &expected,
+                checkpoint_destination(&owner.path().join("checkpoint")),
+                || false,
+            );
+            assert!(
+                matches!(result, Err(ToolchainCheckpointError::Source(_))),
+                "case {case}"
+            );
+            assert!(receiver.entry(directory("next")).is_err());
+            assert!(receiver.seal(|| false).is_err());
+        }
+    }
+
+    #[test]
+    fn optional_checkpoint_destination_failure_and_cancellation_preserve_the_final_seal() {
+        for case in 0..5 {
+            let source = private();
+            fs::write(source.path().join("file"), b"abc").unwrap();
+            let identity =
+                fingerprint_toolchain(source.path(), &ToolchainLimits::default(), || false)
+                    .unwrap();
+            let owner = private();
+            let mut receiver = receiver(owner.path(), identity);
+            receiver.entry(directory("")).unwrap();
+            complete_file(&mut receiver, "file", b"abc");
+            let path = owner.path().join("checkpoint");
+            let mut destination = checkpoint_destination(&path);
+            match case {
+                0 => destination.write_all(b"not empty").unwrap(),
+                1 => destination
+                    .set_permissions(fs::Permissions::from_mode(0o644))
+                    .unwrap(),
+                2 => destination = File::open(&path).unwrap(),
+                3 => {
+                    destination.seek(std::io::SeekFrom::Start(1)).unwrap();
+                }
+                _ => {}
+            }
+            let result =
+                receiver.checkpoint_file(&file_identity("file", b"abc"), destination, || case == 4);
+            assert!(
+                matches!(result, Err(ToolchainCheckpointError::Destination(_))),
+                "case {case}"
+            );
+            assert_eq!(receiver.seal(|| false).unwrap().identity(), &identity);
+        }
+    }
+
+    #[test]
+    fn checkpoint_detects_mutation_during_copy_and_never_blesses_late_bytes() {
+        let owner = private();
+        let bytes = vec![7; MAX_TOOLCHAIN_CHUNK + 1];
+        let mut receiver = receiver(owner.path(), selected(bytes.len() as u64, 1));
+        receiver.entry(directory("")).unwrap();
+        complete_file(&mut receiver, "file", &bytes);
+        let calls = std::cell::Cell::new(0);
+        let result = receiver.checkpoint_file(
+            &file_identity("file", &bytes),
+            checkpoint_destination(&owner.path().join("checkpoint")),
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() == 3 {
+                    let path = owner.path().join("received/file");
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+                    fs::write(path, &bytes).unwrap();
+                }
+                false
+            },
+        );
+        assert!(matches!(result, Err(ToolchainCheckpointError::Source(_))));
+        assert!(receiver.seal(|| false).is_err());
+    }
+
+    #[test]
+    fn imported_files_require_exact_bytes_selection_and_an_untouched_destination() {
+        for case in 0..6 {
+            let owner = private();
+            let mut receiver = receiver(owner.path(), selected(3, 1));
+            receiver.entry(directory("")).unwrap();
+            receiver.entry(file("file", 3)).unwrap();
+            let mut input = tempfile::tempfile_in(owner.path()).unwrap();
+            input
+                .write_all(if case == 0 { b"bad" } else { b"abc" })
+                .unwrap();
+            let mut expected = file_identity("file", b"abc");
+            match case {
+                1 => expected.path = "other".into(),
+                2 => expected.executable = true,
+                3 => expected.bytes = 2,
+                4 => receiver
+                    .write_chunk("file", 0, b"a", Sha256::digest(b"a").into())
+                    .unwrap(),
+                _ => {}
+            }
+            assert!(
+                receiver
+                    .import_file(&expected, &mut input, || case == 5)
+                    .is_err(),
+                "case {case}"
+            );
+            assert!(
+                receiver
+                    .write_chunk("file", 0, b"abc", Sha256::digest(b"abc").into())
+                    .is_err()
+            );
+            assert!(receiver.seal(|| false).is_err());
+        }
+    }
+
+    #[test]
+    fn all_file_hits_still_require_the_exact_whole_toolchain_identity() {
+        let owner = private();
+        let mut receiver = receiver(owner.path(), selected(3, 1));
+        receiver.entry(directory("")).unwrap();
+        receiver.entry(file("file", 3)).unwrap();
+        let mut input = tempfile::tempfile_in(owner.path()).unwrap();
+        input.write_all(b"abc").unwrap();
+        receiver
+            .import_file(&file_identity("file", b"abc"), &mut input, || false)
+            .unwrap();
+        assert_eq!(receiver.received_bytes(), 3);
+        assert!(receiver.seal(|| false).is_err());
+        assert!(receiver.entry(directory("next")).is_err());
     }
 
     #[test]

@@ -19,9 +19,9 @@ use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::toolchain_transfer::ToolchainEntry;
 #[cfg(target_os = "linux")]
 use crate::toolchain_transfer::ToolchainEntryKind;
+use crate::toolchain_transfer::{ToolchainEntry, ToolchainFile};
 
 pub const TOOLCHAIN_DATASET_VERSION: &str = "toolchain-dataset-v1";
 
@@ -61,6 +61,8 @@ pub struct PreparedToolchain {
     inventory: linux::Inventory,
     #[cfg(target_os = "linux")]
     source_inventory: Option<linux::Inventory>,
+    #[cfg(target_os = "linux")]
+    file_hashes: Vec<[u8; 32]>,
 }
 
 impl PreparedToolchain {
@@ -139,6 +141,21 @@ impl PreparedToolchain {
         #[cfg(target_os = "linux")]
         {
             self.inventory.transfer_entries()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(unsupported())
+        }
+    }
+
+    /// Export regular-file identities from the original complete byte scan.
+    /// These are bound to the retained generation, not a refreshed observation
+    /// of mutable paths. A receiver may reuse matching independent bytes, but
+    /// must still verify the complete namespace and dataset identity at seal.
+    pub fn files(&self) -> io::Result<Vec<ToolchainFile>> {
+        #[cfg(target_os = "linux")]
+        {
+            self.inventory.transfer_files(&self.file_hashes)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -334,7 +351,7 @@ pub fn open_toolchain(
     #[cfg(target_os = "linux")]
     {
         let inventory = linux::Inventory::scan(root, limits, &stopped)?;
-        let identity = inventory.stream(None, &stopped)?;
+        let (identity, file_hashes) = inventory.stream_with_file_hashes(&stopped)?;
         inventory.verify(&stopped)?;
         require(
             identity == *expected,
@@ -345,6 +362,7 @@ pub fn open_toolchain(
             identity,
             inventory,
             source_inventory: None,
+            file_hashes,
         })
     }
     #[cfg(not(target_os = "linux"))]
@@ -520,6 +538,36 @@ mod linux {
                 entries.push(transfer);
             }
             Ok(entries)
+        }
+
+        pub(super) fn transfer_files(&self, hashes: &[[u8; 32]]) -> io::Result<Vec<ToolchainFile>> {
+            require(
+                hashes.len() as u64 == self.files,
+                "toolchain retained file hash count differs from its inventory",
+            )?;
+            let mut metadata_bytes = 0_usize;
+            let mut files = Vec::with_capacity(hashes.len());
+            for ((path, entry), sha256) in self
+                .entries
+                .iter()
+                .filter(|(_, entry)| matches!(entry.kind, Kind::File))
+                .zip(hashes)
+            {
+                let file = ToolchainFile {
+                    path: path.clone(),
+                    bytes: entry.stamp.size,
+                    executable: entry.stamp.mode & 0o111 != 0,
+                    sha256: *sha256,
+                };
+                metadata_bytes = metadata_bytes
+                    .checked_add(file.metadata_bytes())
+                    .filter(|bytes| {
+                        *bytes <= crate::toolchain_transfer::MAX_TOOLCHAIN_METADATA_BYTES
+                    })
+                    .ok_or_else(|| invalid("toolchain file metadata limit exceeded"))?;
+                files.push(file);
+            }
+            Ok(files)
         }
 
         pub(super) fn read_chunk(
@@ -822,7 +870,20 @@ mod linux {
             destination: Option<&Path>,
             stopped: &impl Fn() -> bool,
         ) -> io::Result<ToolchainIdentity> {
-            self.stream_with_cloner(destination, stopped, &|_, _, _| false)
+            self.stream_with_cloner(destination, stopped, &|_, _, _| false, None)
+        }
+
+        pub(super) fn stream_with_file_hashes(
+            &self,
+            stopped: &impl Fn() -> bool,
+        ) -> io::Result<(ToolchainIdentity, Vec<[u8; 32]>)> {
+            // Retain only digests in the inventory's immutable canonical order.
+            // At most 100,000 hashes are stored; paths are cloned only when a
+            // bounded file-transfer manifest is actually requested.
+            let mut hashes = Vec::with_capacity(self.files as usize);
+            let identity =
+                self.stream_with_cloner(None, stopped, &|_, _, _| false, Some(&mut hashes))?;
+            Ok((identity, hashes))
         }
 
         fn stream_with_cloner(
@@ -830,6 +891,7 @@ mod linux {
             destination: Option<&Path>,
             stopped: &impl Fn() -> bool,
             cloner: &impl Fn(&File, &File, &Path) -> bool,
+            mut file_hashes: Option<&mut Vec<[u8; 32]>>,
         ) -> io::Result<ToolchainIdentity> {
             let mut digest = Sha256::new();
             digest.update(TOOLCHAIN_DATASET_VERSION.as_bytes());
@@ -956,7 +1018,11 @@ mod linux {
                                 && Stamp::of(&source.metadata()?) == entry.stamp,
                             "toolchain file changed during capture",
                         )?;
-                        digest.update(file_digest.finalize());
+                        let sha256: [u8; 32] = file_digest.finalize().into();
+                        digest.update(sha256);
+                        if let Some(hashes) = &mut file_hashes {
+                            hashes.push(sha256);
+                        }
                         if let Some(output) = output {
                             output.set_permissions(fs::Permissions::from_mode(
                                 if entry.stamp.mode & 0o111 != 0 {
@@ -1027,15 +1093,16 @@ mod linux {
         let inventory = Inventory::scan(source, limits, stopped)?;
         checkpoint(stopped)?;
         fs::DirBuilder::new().mode(0o700).create(&destination)?;
-        let identity = inventory.stream_with_cloner(Some(&destination), stopped, cloner)?;
+        let identity = inventory.stream_with_cloner(Some(&destination), stopped, cloner, None)?;
         inventory.verify(stopped)?;
         require(
             expected.is_none_or(|expected| *expected == identity),
             "toolchain identity does not match expected dataset",
         )?;
         let retained = Inventory::scan(&destination, limits, stopped)?;
+        let (retained_identity, file_hashes) = retained.stream_with_file_hashes(stopped)?;
         require(
-            retained.stream(None, stopped)? == identity,
+            retained_identity == identity,
             "retained toolchain bytes differ from captured dataset",
         )?;
         retained.verify(stopped)?;
@@ -1045,6 +1112,7 @@ mod linux {
             identity,
             inventory: retained,
             source_inventory: Some(inventory),
+            file_hashes,
         })
     }
 }

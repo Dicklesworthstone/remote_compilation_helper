@@ -28,7 +28,9 @@ use rabs_sandbox::dependency_context::{
     DependencyExecutionMode,
 };
 use rabs_sandbox::source_transfer::SOURCE_TRANSFER;
-use rabs_sandbox::toolchain_transfer::{TOOLCHAIN_REUSE_VERSION, TOOLCHAIN_TRANSFER_VERSION};
+use rabs_sandbox::toolchain_transfer::{
+    TOOLCHAIN_FILE_REUSE_VERSION, TOOLCHAIN_REUSE_VERSION, TOOLCHAIN_TRANSFER_VERSION,
+};
 use rabs_wkr::artifacts::{
     self, ARTIFACT_TRANSFER, ArtifactPlan, ArtifactTransferState, CapturedArtifacts,
 };
@@ -47,7 +49,9 @@ use rabs_wkr::session::{
 };
 use rabs_wkr::source_task::{SourceReply, SourceTransferTask};
 use rabs_wkr::source_transfer::{self, SourceCache, SourceOwner};
-use rabs_wkr::toolchain_transfer::{self, ToolchainOwner, ToolchainReply, ToolchainTransferTask};
+use rabs_wkr::toolchain_transfer::{
+    self, ToolchainFileCache, ToolchainOwner, ToolchainReply, ToolchainTransferTask,
+};
 use std::collections::VecDeque;
 use std::future::{Future, poll_fn};
 use std::io;
@@ -548,6 +552,25 @@ fn prepare_source_cache(
     SourceCache::open(root, bytes).map(Some)
 }
 
+fn toolchain_file_cache_limit(environment: Option<&std::ffi::OsStr>) -> Result<u64, String> {
+    let Some(value) = environment else {
+        return Ok(0);
+    };
+    if let Some(value) = value.to_str()
+        && !value.is_empty()
+        && value.len() <= 11
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && let Ok(bytes) = value.parse::<u64>()
+        && bytes <= toolchain_transfer::MAX_TOOLCHAIN_FILE_CACHE_BYTES
+    {
+        return Ok(bytes);
+    }
+    Err(
+        "RABS_WORKER_TOOLCHAIN_FILE_CACHE_BYTES requires decimal bytes from 0 to 68719476736"
+            .to_owned(),
+    )
+}
+
 fn target_cache_epoch(
     argument: Option<&str>,
     environment: Option<&std::ffi::OsStr>,
@@ -614,6 +637,8 @@ fn main() {
                  --source-cache-bytes or RABS_WORKER_SOURCE_CACHE_BYTES bounds verified input reuse (default 536870912; 0 disables).\n\
                  Source bytes persist below the private worker state directory; RABS_SOURCE_CACHE_DIR selects another private directory.\n\
                  Inputs are reverified and copied into a fresh receiver before every execution.\n\
+                 RABS_WORKER_TOOLCHAIN_FILE_CACHE_BYTES retains completed SDK files across interrupted uploads (default 0/off; maximum 68719476736).\n\
+                 SDK file bytes persist below worker state; each upload also owns bounded private hit snapshots and still verifies the complete SDK.\n\
                  --target-cache-bytes or RABS_WORKER_TARGET_CACHE_BYTES enables bounded private Cargo seeds (default 0/off).\n\
                  --target-cache-epoch or RABS_WORKER_TARGET_CACHE_EPOCH also retains seeds across restarts.\n\
                  Change the epoch before updating host tools, libraries or other runtime inputs.\n\
@@ -711,6 +736,15 @@ fn main() {
             std::process::exit(2);
         }
     };
+    let toolchain_file_cache_bytes = match toolchain_file_cache_limit(
+        std::env::var_os("RABS_WORKER_TOOLCHAIN_FILE_CACHE_BYTES").as_deref(),
+    ) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("rabs-wkr: {error}");
+            std::process::exit(2);
+        }
+    };
     let host_budget = match HostBudget::from_environment() {
         Ok(budget) => budget,
         Err(error) => {
@@ -738,6 +772,17 @@ fn main() {
         Err(error) => {
             eprintln!("rabs-wkr: source cache configuration: {error}");
             std::process::exit(2);
+        }
+    };
+    let toolchain_file_cache = if toolchain_file_cache_bytes == 0 {
+        None
+    } else {
+        match ToolchainFileCache::open(journal.storage_root(), toolchain_file_cache_bytes) {
+            Ok(cache) => Some(cache),
+            Err(error) => {
+                eprintln!("rabs-wkr: toolchain file cache configuration: {error}");
+                std::process::exit(2);
+            }
         }
     };
     let target_cache = if target_cache_bytes == 0 {
@@ -796,6 +841,7 @@ fn main() {
             host_budget,
             target_cache,
             source_cache,
+            toolchain_file_cache,
             runtime_pool,
         },
     ));
@@ -1566,6 +1612,7 @@ where
         dependency_mode,
         input_budgets,
         None,
+        None,
         launch,
         heartbeat,
     )
@@ -1592,6 +1639,7 @@ async fn drive_session_with_reader<S, L, H>(
     dependency_mode: Option<DependencySelection>,
     input_budgets: InputBudgets,
     source_cache: Option<SourceCache>,
+    toolchain_file_cache: Option<ToolchainFileCache>,
     mut launch: L,
     mut heartbeat: H,
 ) -> Result<(), String>
@@ -1609,6 +1657,9 @@ where
 {
     if toolchain_reuse_enabled && !toolchain_transfer_enabled {
         return Err("toolchain reuse requires toolchain transfer".to_owned());
+    }
+    if toolchain_file_cache.is_some() && !toolchain_transfer_enabled {
+        return Err("toolchain file reuse requires toolchain transfer".to_owned());
     }
     if dependency_mode.is_some()
         && !(source_transfer_enabled && toolchain_transfer_enabled && artifact_transfer_enabled)
@@ -1631,7 +1682,8 @@ where
             .then_some(rabs_sandbox::toolchain_transfer::TOOLCHAIN_INPUT_BUDGET),
         source_cache,
     );
-    let mut toolchain_transfer = ToolchainTransferTask::with_reuse(toolchain_reuse_enabled);
+    let mut toolchain_transfer =
+        ToolchainTransferTask::with_configuration(toolchain_reuse_enabled, toolchain_file_cache);
     let mut input_deadline = InputDeadline::new(input_budgets);
     let mut deferred = DeferredFrames::default();
     let mut retained_result: Option<(u64, String)> = None;
@@ -1728,7 +1780,8 @@ where
                                 Err(reason) => request_error(request_id, &reason),
                             }
                         }
-                        Some("toolchain-begin" | "toolchain-entry" | "toolchain-chunk" | "toolchain-seal") => {
+                        Some("toolchain-begin" | "toolchain-file-manifest" | "toolchain-file-manifest-seal"
+                            | "toolchain-entry" | "toolchain-chunk" | "toolchain-seal") => {
                             let started = Instant::now();
                             let begins_toolchain = value["kind"] == "toolchain-begin";
                             let ready = if toolchain_transfer_enabled {
@@ -2004,7 +2057,11 @@ where
     outcome
 }
 
-fn worker_hello(report: &rabs_wkr::session::CapabilityReport, journal: &WorkerJournal) -> String {
+fn worker_hello(
+    report: &rabs_wkr::session::CapabilityReport,
+    journal: &WorkerJournal,
+    toolchain_file_cache_enabled: bool,
+) -> String {
     serde_json::json!({
         "kind": "worker-hello", "worker_id": report.worker_id,
         "canonical": report.canonical_namespace, "slots": report.slots, "token_id": 1,
@@ -2015,6 +2072,7 @@ fn worker_hello(report: &rabs_wkr::session::CapabilityReport, journal: &WorkerJo
         "source_transfers": [SOURCE_TRANSFER],
         "toolchain_transfers": [TOOLCHAIN_TRANSFER_VERSION],
         "toolchain_reuses": [TOOLCHAIN_REUSE_VERSION],
+        "toolchain_file_reuses": if toolchain_file_cache_enabled { vec![TOOLCHAIN_FILE_REUSE_VERSION] } else { Vec::<&str>::new() },
         "execution_leases": [REQUEST_EXECUTION_LEASE_VERSION],
         "command_contexts": [rabs_sandbox::process_context::COMMAND_CONTEXT_VERSION],
         "dependency_contexts": [DEPENDENCY_CONTEXT_VERSION, CANONICAL_DEPENDENCY_CONTEXT_VERSION, CANONICAL_WORKSPACE_CONTEXT_VERSION, CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION],
@@ -2107,8 +2165,12 @@ async fn session_loop(
         async {
             // Extend, rather than replace, the journal/artifact hello: transport
             // authentication does not replace durable execution ownership.
-            let mut hello: serde_json::Value = serde_json::from_str(&worker_hello(report, journal))
-                .map_err(|e| format!("local worker hello: {e}"))?;
+            let mut hello: serde_json::Value = serde_json::from_str(&worker_hello(
+                report,
+                journal,
+                resources.toolchain_file_cache.is_some(),
+            ))
+            .map_err(|e| format!("local worker hello: {e}"))?;
             if let Some(identity) = local_identity {
                 hello["peer_id"] = serde_json::json!(
                     identity
@@ -2154,6 +2216,7 @@ async fn session_loop(
         receive_sources,
         receive_toolchain,
         reuse_toolchain,
+        reuse_toolchain_files,
         output_preview,
         metadata_prefetch,
         execution_lease,
@@ -2226,6 +2289,12 @@ async fn session_loop(
             let toolchain = toolchain_transfer::selected(&ack, local_identity.is_some(), source)?;
             let reuse =
                 toolchain_transfer::selected_reuse(&ack, local_identity.is_some(), toolchain)?;
+            let file_reuse = toolchain_transfer::selected_file_reuse(
+                &ack,
+                local_identity.is_some(),
+                toolchain,
+                resources.toolchain_file_cache.is_some(),
+            )?;
             let preview = output_preview_requested(&ack)?;
             let prefetch = metadata_prefetch_requested(&ack)?;
             let dependency_context = dependency_context_selection(
@@ -2253,6 +2322,7 @@ async fn session_loop(
                 source,
                 toolchain,
                 reuse,
+                file_reuse,
                 preview,
                 prefetch,
                 lease,
@@ -2267,6 +2337,11 @@ async fn session_loop(
     let spills = std::env::temp_dir().join(format!("rabs-wkr-spill-{}", std::process::id()));
     for path in [&cargo_home, &home, &spills] {
         if let Some(cache) = &resources.source_cache {
+            cache
+                .validate_runtime_root(path)
+                .map_err(|error| error.to_string())?;
+        }
+        if let Some(cache) = &resources.toolchain_file_cache {
             cache
                 .validate_runtime_root(path)
                 .map_err(|error| error.to_string())?;
@@ -2294,6 +2369,10 @@ async fn session_loop(
         dependency_context,
         InputBudgets::default(),
         resources.source_cache.clone(),
+        resources
+            .toolchain_file_cache
+            .clone()
+            .filter(|_| reuse_toolchain_files),
         |request, timeout, artifacts, source, toolchain, lease| {
             let cargo_home = cargo_home.clone();
             let home = home.clone();
@@ -2301,6 +2380,7 @@ async fn session_loop(
             let slots = report.slots;
             let host_budget = resources.host_budget.clone();
             let source_cache = resources.source_cache.clone();
+            let toolchain_file_cache = resources.toolchain_file_cache.clone();
             let target_cache = resources.target_cache.clone();
             let runtime_pool = resources.runtime_pool.clone();
             let id = request.request_id;
@@ -2320,6 +2400,7 @@ async fn session_loop(
                     slots,
                     host_budget: host_budget.as_deref(),
                     source_cache: source_cache.as_ref(),
+                    toolchain_file_cache: toolchain_file_cache.as_ref(),
                     runtime_pool: runtime_pool.as_deref(),
                     target_cache: target_cache.as_ref().map(|cache| (cache, target_scope)),
                 };
@@ -2710,6 +2791,44 @@ mod tests {
             let invalid = OsStr::from_bytes(b"\xff");
             assert!(source_cache_limit(None, Some(invalid)).is_err());
             assert_eq!(source_cache_limit(Some("0"), Some(invalid)).unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn sdk_file_recovery_is_opt_in_with_an_independent_bounded_budget() {
+        use std::ffi::OsStr;
+        assert_eq!(toolchain_file_cache_limit(None).unwrap(), 0);
+        assert_eq!(
+            toolchain_file_cache_limit(Some(OsStr::new("0"))).unwrap(),
+            0
+        );
+        assert_eq!(
+            toolchain_file_cache_limit(Some(OsStr::new("2147483648"))).unwrap(),
+            2 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            toolchain_file_cache_limit(Some(OsStr::new("68719476736"))).unwrap(),
+            toolchain_transfer::MAX_TOOLCHAIN_FILE_CACHE_BYTES
+        );
+        for invalid in [
+            "",
+            "-1",
+            "+1",
+            " 1",
+            "1 ",
+            "1.0",
+            "68719476737",
+            "99999999999999999999",
+        ] {
+            assert!(
+                toolchain_file_cache_limit(Some(OsStr::new(invalid))).is_err(),
+                "{invalid:?}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert!(toolchain_file_cache_limit(Some(OsStr::from_bytes(b"\xff"))).is_err());
         }
     }
 
@@ -3547,6 +3666,7 @@ mod tests {
                 None,
                 InputBudgets::default(),
                 None,
+                None,
                 |_, _, _, _, _, _| panic!("standby and control frames cannot launch execution"),
                 pressure,
             ))
@@ -3603,6 +3723,7 @@ mod tests {
                 false,
                 None,
                 InputBudgets::default(),
+                None,
                 None,
                 |_, _, _, _, _, _| panic!("control frames must not launch execution"),
                 pressure,
@@ -4834,13 +4955,20 @@ mod tests {
             .admit(&request(80), DEFAULT_EXECUTION_TIMEOUT)
             .unwrap();
         let hello: serde_json::Value =
-            serde_json::from_str(&worker_hello(&report(), &journal)).unwrap();
+            serde_json::from_str(&worker_hello(&report(), &journal, false)).unwrap();
         assert_eq!(hello["boot_generation"], journal.boot_generation().0);
         assert_eq!(
             hello["incarnation"],
             format!("{:032x}", journal.incarnation().0)
         );
         assert_eq!(hello["request_high_water"], 80);
+        assert_eq!(hello["toolchain_file_reuses"], serde_json::json!([]));
+        let file_reuse: serde_json::Value =
+            serde_json::from_str(&worker_hello(&report(), &journal, true)).unwrap();
+        assert_eq!(
+            file_reuse["toolchain_file_reuses"],
+            serde_json::json!([TOOLCHAIN_FILE_REUSE_VERSION])
+        );
         assert_eq!(hello["recovery_protocols"][0], RECOVERY_PROTOCOL);
         assert_eq!(
             hello["output_previews"],
