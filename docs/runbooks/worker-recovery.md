@@ -221,11 +221,13 @@ rch workers probe <worker-id> -v           # run a probe now
 rch status --fleet                         # confirm it returned to the live pool
 ```
 
-**Native Windows workers:** Git Bash reports `-` for the Unix inode count on
-NTFS. Recovery checks free disk bytes on Windows without imposing the Unix
-inode floor; Unix workers still require both. A `disk` recovery refusal on an
-older daemon despite sufficient free bytes can therefore require a daemon
-upgrade, rather than disk cleanup.
+**Filesystems without a fixed inode pool:** btrfs allocates inodes on demand,
+so `df -i` reports 0 total and 0 free inodes; Git Bash on NTFS reports `-`.
+Recovery checks only free disk bytes on such roots, and on every Windows
+worker. Roots with a fixed inode pool (ext4 and similar) must clear both the
+byte floor and the inode floor (`min_disk_inodes`). An older daemon refuses
+`disk` recovery on btrfs or Windows despite plenty of free bytes; the fix for
+that is a daemon upgrade, not disk cleanup.
 
 The recovery inventory also queries every installed Rust toolchain. A manual
 worker probe can succeed while the daemon's shorter recovery probe times out.

@@ -86,6 +86,709 @@ pause: it suppresses auto-rejoin until you explicitly `rch workers enable`, so a
 worker disabled for a momentary blip stays out of the pool. Prefer observing the
 self-healing breaker (open → half-open → closed) over any manual intervention.
 
+### Source namespace and terminal cancellation recovery (#111)
+
+**Symptoms:** source namespace initialization refuses with status 73, an
+overlapping source owner remains unavailable, or an SSH control session retains
+source locks after its dispatcher has disappeared. A lease can already report
+`state=finished` and `terminal_acknowledged=true` while an older cancellation
+still needs worker metadata reconciliation.
+
+Start with the original wrapper on the dispatcher that retains its journal:
+
+```bash
+rch jobs
+rch jobs recover <wrapper-id> --timeout-secs 300
+rch jobs attach <wrapper-id> --timeout-secs 300
+```
+
+Recovery keeps the recorded worker, build, token and source closure. For an
+already acknowledged cancellation, it acquires exclusive journal ownership and
+validates the failed delivery result and complete source, tree and pair
+retirement. It then reconciles worker metadata, without reopening source paths,
+replaying compilation or repeating completed daemon accounting. Ordinary
+acknowledged deliveries do not require this cancellation operation.
+
+New cancellations persist `source_cancellation_settled=false` before contacting
+the worker. Only an exact worker settlement reply allows the journal to record
+`true`; a failed journal publication remains retryable. A new terminal
+acknowledgement or readmission cannot discard an unresolved cancellation.
+Recovery also resumes settlement if source retirement reached the journal but
+the dispatcher stopped before recording the failed returned result. Persisted
+resource retirement does not bypass an outstanding cancellation obligation.
+Older preparation cancellations without this field also enter reconciliation.
+The daemon's existing recovery service considers eligible acknowledged
+cancellations normally after a 15-minute scheduling grace, retaining its
+per-worker concurrency limits and failure backoff. It excludes live or unverified owners.
+Elapsed time selects a recovery attempt; it never proves source ownership has
+ended.
+
+#### Evidence required on the worker
+
+The worker acquires the token's activity locks before registry metadata locks.
+This drains previously admitted transfers, execution and cleanup. Future normal
+activity must reject the cancellation fence; cleanup must still possess an
+active claim. Locks are checked against their current inodes, and records must
+match the exact requested token and source-closure digest. The transaction
+confirms file and containing-directory durability before acknowledging a change.
+
+The following outcomes additionally require the complete, owned local recovery
+evidence described above:
+
+| Worker evidence | Settlement result |
+|---|---|
+| Exact active claim plus cancellation marker | Move the existing claim into `cancelled/` and retain the marker. |
+| Exact cancellation marker with no remaining grant | Publish a cancellation receipt and retain the marker; no source tree is inspected or changed. |
+| Exact completed cancellation receipt | Reconfirm durability and retain or create the matching marker. Repeated recovery is idempotent. |
+| Active claim without a cancellation fence, incomplete pending state, quarantine without a completed cancellation receipt, missing evidence, mismatched roots, contradictory terminal state, or ambiguous registry histories | Refuse settlement and retain the evidence. |
+
+**A remaining `.cancelling` file is not a failed cleanup verdict.** It protects
+against delayed acquire/recover requests for that identity even after retention
+GC removes an old cancellation receipt. New identities are excluded by active
+or complete pending claims, not by an unrelated terminal marker. A successfully
+settled old token must remain refused while a new token can acquire the released
+closure.
+
+Unowned cancellation retains its durable fence before independently publishing
+the completed receipt or returning `unowned`. It does not depend on the
+dispatcher reaching a later settlement call. Replaying `cancel`, `finish-cancel`
+or `settle-cancel` against an exact historical receipt-only cancellation restores
+and confirms its fence before acknowledging success.
+
+Cancellation-receipt retention requires a complete, byte-identical durable fence
+and no conflicting records for that token. Receipt-only, malformed, symlinked,
+quarantined or contradictory evidence is preserved. In particular, an incomplete
+hard-linked quarantine fence cannot replace the complete receipt needed for
+later recovery. Failed fence or registry durability barriers preserve both
+records. Released receipts are retained even when they are old and unambiguous:
+they are the only durable restart proof if release succeeded on the worker but
+its reply or the dispatcher's local checkpoint was lost. Age cannot prove that
+the dispatcher acknowledged release. Removing that receipt also permits an old
+initial acquisition request to reuse the identity. Retaining the original
+receipt preserves both proofs without rewriting its bytes or inode.
+Each cancellation-receipt collection pass validates at most 16 candidates;
+this bounds the added checks, not directory enumeration or filesystem latency.
+Unresolved early candidates can defer later collection. Activity lock files are
+not collected. Released-receipt and activity-lock growth remain unresolved;
+safe collection needs a durable acknowledgement and identity-fencing protocol,
+not an age threshold.
+
+All dispatchers sharing a registry must run the corrected embedded transaction,
+or their old sessions must be quiesced. An older dispatcher can still collect
+released receipts needed by a newer one. This correction cannot reconstruct a
+receipt already collected: missing worker evidence remains unconfirmed.
+
+Preserve the original journal, cancellation records and lock files when
+diagnosing a refusal. Neither a terminal lease alone, an empty process listing,
+a free metadata lock, nor record age authorizes deleting them. Unlinking an
+apparently stale `*.activity.lock` can leave an existing holder on the old inode
+while a new caller locks a different inode. The settlement operation does not
+reap activity lock files or infer cleanup authority from current source bytes.
+
+#### Distinguishing refusals
+
+Use the diagnostic token and its operation/stage fields, rather than status 73
+or the word `Killed` alone:
+
+| Diagnostic | Meaning and next observation |
+|---|---|
+| `RCH_SOURCE_NAMESPACE_METADATA_LOCK_BUSY` | The initializer exhausted its five-second metadata-lock wait; `elapsed_ms` and `lock` identify that wait. This uses status 76 and admits no source grant. |
+| `RCH_SOURCE_NAMESPACE_PRE_ADMISSION_FAILED` | The named topology or initialization stage failed before source or execution intent. The exact admitted journal recorded the phase; retry still requires acknowledged daemon release and its exact terminal receipt. |
+| `RCH_SOURCE_SETTLEMENT_LOCK_BUSY` | Recovery could not drain the named activity or metadata lock within its bounded wait. Retain the journal and retry after the owning activity resolves. |
+| `RCH_SOURCE_CANCELLATION_FENCE` | An explicit same-token fence or an overlapping active cancelling owner caused refusal. Use the reported identity/record to find its owning journal. |
+| `RCH_SOURCE_REGISTRY_PUBLICATION_UNCONFIRMED` | A record transition or durability confirmation did not complete. A visible rename is insufficient acknowledgement; retry the same identity. |
+| `RCH_SOURCE_REGISTRY_INTERRUPTED` | A registry step exited unexpectedly; retain its `operation`, `stage`, `status` and identity. |
+| `RCH_SOURCE_PAIR_PUBLICATION_UNCONFIRMED` | A pair owner or exact release receipt could not complete publication or durability confirmation. Preserve its records and retry the owning lease; a visible record does not by itself acknowledge release. |
+| `RCH_SOURCE_PAIR_OWNERSHIP_UNCONFIRMED` | Pair custody is missing, malformed, changed or inconsistent with the requested identity. A free lock or an old receipt cannot replace conflicting owner evidence. |
+| `RCH_SOURCE_NAMESPACE_PROCESS_TERMINATED`, `RCH_SOURCE_NAMESPACE_CONTROL_UNSETTLED`, or `RCH_SOURCE_NAMESPACE_INTERRUPTED` | The program terminated, teardown was not confirmed, or the worker supplied no diagnostic. These do not establish whether the cause was an external signal, a deadline, OOM, or another infrastructure fault. |
+| `RCH_SOURCE_LOCK_HEARTBEAT_EXPIRED`, `RCH_SOURCE_LOCK_DISCONNECTED`, or `RCH_SOURCE_LOCK_RELEASE_TIMEOUT` | The control session expired or lost its release protocol. Durable ownership remains for recovery. |
+| `RCH_SOURCE_LOCK_PROCESS_TERMINATED` or `RCH_SOURCE_LOCK_SUPERVISOR_TERMINATED` | The holder or its supervisor terminated. A process exit alone does not authorize retiring the durable claim. |
+| `RCH_SOURCE_CANCELLATION_UNSETTLED` | Worker evidence or its lock namespace could not be verified. The accompanying reason identifies what must be resolved before retrying. |
+| `RCH_SOURCE_CLAIM_RETENTION_DEFERRED` | Receipt collection could not confirm the retained cancellation fence's durability. Both records remain; this does not grant cleanup authority. |
+| `RCH_GC_LEGACY_SOURCE_OWNERSHIP_UNKNOWN` | A legacy active claim is malformed or unsafe to read. GC cannot prove the candidate unowned and preserves both the record and source tree. |
+
+#### Namespace failure, daemon completion and readmission
+
+The topology probe and namespace initialization run before the recovery intent,
+source or pair acquisition, transfer and execution. A failure at either boundary
+can receive the typed preflight diagnostic only after the exact admitted journal
+durably records its failed phase. Its schema, wrapper, worker, build and
+nonpending selection must match, with no source recovery, observed outcome or
+terminal acknowledgement. The phase is diagnostic, never recovery authority;
+later finalize or release-uncertain heartbeats may replace it. The outcome stays
+unset until daemon completion is verified.
+
+For this path, an acknowledged release is followed by a bounded read-only
+completion query on the same configured daemon socket. The wrapper, worker and
+build must match the exact terminal record. An ordinary failed result permits
+the existing retry policy. A completed cancellation with exit `130`, the exact
+cancellation operation ID and successful cleanup/history evidence instead
+publishes terminal acknowledgement and exits without selecting another worker.
+A release ACK alone cannot choose between those results: an idempotent release
+may acknowledge cancellation that already won the race.
+
+The journal rechecks admission identity, absent source recovery and outcome
+agreement under its mutex after the query. A failed or oversized reply,
+contradictory receipt, changed admission or failed journal publication remains
+unconfirmed; it cannot authorize another selection. Any
+`RemoteExecutionUnconfirmed` in the original error chain still takes precedence.
+Generic later SSH timeouts remain fail closed, while original source-contention
+evidence remains available to the worker-selection policy.
+
+If the dispatcher stops before release or before receiving that terminal
+receipt, the journal has no invented exit code to conflict with a later daemon
+cancellation. Existing owner-verified restart recovery can adopt the exact
+daemon completion after the wrapper is absent. This neither fabricates daemon
+completion from a phase nor relaxes conflicting outcomes in older journals.
+
+#### Journal custody during readmission
+
+Readmission that supersedes source recovery must preserve the preceding journal
+under its exclusive ownership gate. Current journals written with a normal
+umask, including modes `0640` and `0644`, can supply that evidence when they are
+regular files owned by the current user, have one link and are not writable by
+group or others. Retained snapshots and publication temporaries remain private
+(`0600`). Exact bytes and named inode are verified before and after publication;
+changed, symlinked, hard-linked or externally writable evidence is refused. The
+original journal is not chmodded or otherwise changed to satisfy snapshot
+validation.
+
+#### Interrupted source-pair publication and cancellation
+
+Clean-overlay source pairs have their own durable owner and per-identity
+release receipt, in addition to the source registry. Earlier pair operations
+wrote these final names in place. A failed write could truncate the owner to
+an empty file and make every later acquisition refuse the pool. Pair operations
+now write complete private temporary records, sync them, recheck the expected
+old inode and bytes, atomically publish the new record and confirm the file and
+parent-directory barriers before replying. All publishers retain the same pair
+lock; first acquisition also retains the registry metadata lock and checks its
+cancellation fences.
+
+The exact release receipt becomes durable before the owner changes to
+`released`. A retry can finish that interrupted transition when the old owner
+still matches and its source root is absent. An existing release receipt is
+immutable: its exact token is confirmed without rewriting it, and that token
+cannot acquire the pair again. Historical receipt confirmation preserves a
+different valid current owner and never inspects that successor's source tree.
+Owned regular records with one link and no group/other write permission are
+accepted, including safe legacy `0640`/`0644` records; new records use `0600`.
+Partial, symlinked, hard-linked, writable or contradictory records remain
+refused. The correction prevents new partial final records; it does not erase
+or guess the contents of malformed records already on a worker.
+
+Detached recovery also handles cancellation interrupted after pair release,
+both before and after worker `finish-cancel`. With exclusive verified journal
+ownership, it requires the exact bound recipe, a durable tree-retirement
+checkpoint, and either durable pair retirement or the exact worker pair-release
+receipt. It additionally requires a recorded cancellation obligation or an
+exact durable worker cancellation marker or receipt for a legacy recipe. The
+read-only `cancellation-state` probe distinguishes existing cancellation intent
+from the `cancelled` probe's completed receipt. It refuses incomplete pending,
+quarantined, unknown or contradictory same-identity evidence without repairing
+it. A positive intent probe is not source access or completed cleanup. Those facts
+authorize only cancellation metadata reconciliation and failed-job retirement.
+They authorize no new source or pair grant, source-content reads or tree
+mutation. Existing cancellation validation can inspect physical path topology.
+The worker still drains activity, checks the exact source closure and preserves
+the old-token cancellation fence. Journal changes, missing pair proof and
+conflicting worker records remain failures with the evidence retained.
+
+For a legacy job with an exact execution-completion receipt, recovery also
+recognizes a cancellation marker left before `finish-cancel` or after receipt
+collection. This includes a source pair whose tree or pair retirement has not
+finished. Before adopting that cancellation or requesting cleanup, a paired recipe must
+validate its full source intent, bind the pair token to the same identity,
+include the canonical pair root in that closure, and name that exact root for
+retirement. Comparing canonical spellings does not rewrite the stored pair or
+retirement evidence. An unrelated or invalid pair remains refused before a
+cancellation cleanup grant or source mutation. Earlier namespace discovery or
+preparation-cancellation bookkeeping does not establish cleanup authority.
+
+Recovery checkpoints the observed command exit and cancellation obligation
+before invoking the existing activity-drained cleanup. The observation does
+not itself mark sources released, return a result, retire the journal or
+acknowledge the daemon. A lost cleanup reply leaves a durable obligation for
+the next recovery owner. Missing or conflicting intent remains unconfirmed.
+If the tree checkpoint exists but the pair-release receipt is absent, the early
+metadata-only reconciliation leaves the journal unchanged and defers to the
+later execution-complete or execution-lost path. It does not invent pair
+retirement from an absent receipt.
+
+When cancellation started before tree or pair retirement completed, an exact
+execution-completion or execution-lost proof resumes the existing cancellation
+cleanup path. An unretired paired tree requires the exact live cleanup pair
+guard. Recovery cannot substitute a free kernel lock, a terminal daemon lease
+or another owner's current source for that authority. A restarted operation
+then completes the existing worker and daemon acknowledgements without
+replaying the command.
+
+#### Bounded POSIX control-session liveness
+
+New POSIX source and source-pair lock sessions carry complete heartbeats every
+10 seconds. A worker supervisor uses a monotonic 90-second idle deadline during
+bootstrap, acquisition and holding. Partial or invalid frames do not renew it.
+An explicit release has a separate 15-second completion budget. The supervisor
+owns a private process group and tears down its holders and inheriting helpers;
+the observer kills that group before reaping its direct child or accepting a
+completion receipt. Missing required Python process/locking capabilities fail
+before a source grant is acquired.
+The observer uses blocked `SIGCHLD` with `pthread_sigmask` and `sigwait`; it
+does not require the [`os.waitid`](https://docs.python.org/3.13/library/os.html#os.waitid)
+interface missing from older macOS Python.
+Child notifications trigger teardown of the still-owned session, and only its
+completion receipt can establish a successful result.
+The child session unblocks `SIGCHLD` even when the invoking environment had it
+blocked; only the observer retains its blocked notification mask. Timer death
+is observed before reaping, so descendants cannot retain metadata locks after
+an acknowledged controller teardown. An exit code of 137 alone is not a
+teardown acknowledgement.
+
+Finite shell programs now arrive completely before acquiring the source
+activity lock. Previously, `flock ... sh -s` could acquire activity while SSH
+had delivered only an opening brace, before the build supervisor or execution
+identity existed. A half-open upload could then block cancellation indefinitely.
+The outer shell now parses a complete compound containing a quoted, collision-
+checked heredoc before executing the activity prefix. Interrupted input cannot
+execute the inner program; after a delayed upload completes, the existing
+post-lock ownership check still refuses a cancelled or released identity.
+
+The framing covers build and finite transfer scripts, topology/ownership and
+dependency probes, and the bounded source-manifest verification payload. A
+separate quoted heredoc preserves that verifier's exact TSV bytes and existing
+count/hash checks. Large programs remain on stdin rather than SSH argv. A stalled
+outer upload can still leave an SSH process, but it owns no source activity
+lock. This is not an expiry policy for running compilers or streamed rsync/tar
+payloads: their independent activity must still drain before cancellation.
+
+Source rsync sessions now receive the configured
+`source_sync_silence_timeout_secs` as rsync's peer I/O timeout, including uploads,
+no-delta content barriers and clean-overlay archive upload. The default is 120
+seconds; an explicit zero keeps the existing source-sync opt-out. Estimates
+retain their own finite estimate budget, rounded upward to whole seconds, even
+when actual source sync opts out. Declared result-directory retrieval now uses
+the same 30-second I/O timeout as ordinary artifact retrieval. A real rsync
+client forwards this option to its remote sender or receiver, so a half-open
+channel no longer depends solely on the dispatcher's local progress timer to
+release transfer activity. Ongoing I/O renews the timeout; this is not a total
+transfer or compiler lifetime limit.
+Protocol keepalives can renew it without payload progress; it does not bound a
+peer that continues communicating at the application-protocol level.
+
+Source-sync rsync exit 30 is reported as a typed peer I/O stall when the source
+silence policy is enabled. It keeps the existing no-in-place-retry and worker
+failover classification, and explicitly reports that worker retirement remains
+unconfirmed. Artifact retrieval and an opted-out source policy retain their
+ordinary transfer-failure classification. Neither a process exit nor a local
+timeout releases a durable source claim or acknowledges cancellation; recovery
+still needs exact ownership and drained activity. Native rsync flavor and
+platform acceptance remain required for the deployed workers.
+
+Finite cancellation, cancellation-finish and release/receipt RPCs, including
+pair reconciliation, run inside the same bounded metadata controller as
+namespace initialization. Its worker-side execution budget is 15 seconds with
+one-second escalation; output delivery has its own two-second budget. A local
+SSH timeout alone is insufficient: a queued worker `flock` must not wake after
+the caller disappears and publish a late cancellation. Only the exact expected
+reply, including an empty finish reply, is accepted after confirmed teardown.
+
+Expiry releases control-session descriptors while retaining active claims,
+cancellation fences, pair ownership and receipts. Separately launched compiler
+or rsync sessions are not part of this group. Their activity locks and durable
+claims remain the evidence recovery must drain and validate. The bound assumes
+the worker supervisor can run and its processes can be terminated; a stopped
+supervisor or uninterruptible kernel I/O cannot be promised a hard 90-second
+lock-release time. Native Windows retains its existing transport and has no
+equivalent qualified heartbeat supervisor in this change.
+
+This policy applies to newly launched sessions. It does not change `sshd`
+configuration or retrofit watchdogs into old sessions. Dispatcher binaries
+generate the SSH programs, so updating only a worker binary does not replace
+an older dispatcher's control-session behavior.
+
+#### Legacy registries and remaining acceptance
+
+New journals persist `source_authority_namespace=current` before acquisition.
+An older journal without this field first locates exact evidence in the current
+`/var/tmp/rch-source-authority-locks/claims-v1` and legacy
+`/tmp/rch-source-authority-locks/claims-v1` registries. Discovery takes the
+identity's activity locks before both metadata locks, validates and reconfirms
+the records, and grants no source access. Recovery checkpoints the discovered
+`current` or `legacy` binding under exclusive journal ownership before issuing
+cancellation, cleanup, pair recovery or release probes. The binding cannot
+change on a later retry. Source and pair hierarchy locks, activity checks and
+retention-prefix checks all use the recorded namespace.
+
+Discovery does not initialize an absent registry to manufacture ownership
+evidence. A matching identity in both registries, an incomplete pending write,
+missing evidence or changed binding is retained and refused. Legacy cleanup
+transactions take current metadata before legacy metadata and check competing
+lexical and physical claims before authorizing cleanup; the valid legacy active
+claim remains until cleanup finishes. Creating empty current lock-directory
+plumbing for this ordering does not create a claim or cancellation receipt.
+A legacy pair-only intent without a source-registry record remains refused:
+its namespace cannot be guessed from the present layout.
+
+An isolated, complete `.pending` publication can now establish an older
+journal's namespace after its exact closure and file/directory durability
+barriers are confirmed. This closes the recovery dead end after atomic pending
+publication but before its acknowledgement: that record already excludes
+overlapping admission, yet the older journal needs a namespace before it can
+cancel. Location does not promote the claim, grant source access or perform
+cleanup. A torn record or any contradictory same-identity claim, cancellation,
+release or quarantine evidence remains refused. Normal cancellation or recovery
+must revalidate ownership and competing lexical/physical roots afterward.
+
+Detached recovery checks a retired failed legacy lease for an unrecorded
+cancellation obligation before daemon acknowledgement, and explicit recovery
+checks an already acknowledged terminal lease too. Historical cancellation
+could persist a failed return and resource retirement before its dispatcher
+died or daemon reconciliation failed. A retired shortcut must not acknowledge
+that lease and remove it from background recovery before checking the worker.
+Every detached recovery outcome now passes one completion boundary after
+resource retirement. Before contacting the worker it requires exclusive
+verified journal ownership, an unchanged retired recipe, a recorded matching
+failed delivery, a valid complete source intent and exact pair binding where
+present. An acknowledged lease additionally requires `state=finished` and an
+unchanged outer exit result. An unacknowledged lease can record its verified
+recovered delivery result, including successful recovery of an earlier transfer
+failure; the daemon's execution outcome remains a separate fact.
+
+Retirement proof applies to resources actually owned: nonempty source roots
+require source release, a present pair requires pair release, and a present
+retirement tree requires tree retirement. Missing legacy flags for an absent
+pair or tree do not invent an outstanding resource. Malformed flags or resource
+fields still refuse recovery. The hook and daemon use the same raw-recipe
+predicate, and daemon readback refuses a newly discovered pending cancellation
+even when the original candidate had no recorded obligation.
+
+The exit code alone proves no cancellation. If the namespace is unknown, a
+separate optional discovery operation reports exact `current`, `legacy` or
+`absent` evidence under the existing activity/metadata lock order. It preserves
+absent registries, pins existing registry parents and refuses malformed,
+ambiguous or changed evidence. An absent result grants no authority and leaves
+the cancellation recipe unchanged; ordinary daemon reconciliation can proceed
+from independently verified retirement. Mandatory ownership location and
+settlement still refuse missing evidence.
+
+Only a positive exact cancellation-intent observation checkpoints the namespace
+and `source_cancellation_settled=false`, preserving original JSON custody fields
+and path spellings. The existing activity-drained settlement then completes that
+obligation, including after a lost reply or dispatcher restart. A pending or
+unconfirmed observation keeps an unacknowledged lease eligible for recovery;
+daemon acknowledgement follows confirmed settlement. An already acknowledged
+terminal retry does not reconcile daemon accounting again. Both paths preserve
+retired source/pair trees, retain the old-token fence and require the same exact
+worker validation on every retry. This does not scan every historical failed
+job in the background. The final daemon checkpoint adds only its outcome or
+absence fact to the original JSON, retaining unknown custody fields, omitted
+legacy defaults and historical path spellings.
+
+The registry migration also changed hierarchy-lock paths. A read-only legacy
+scan does not prove safe admission across simultaneously active old and new
+dispatchers. Quiesce pre-migration dispatchers and account for their outstanding
+sessions and leases during rollout; do not treat this terminal-recovery change
+as qualification of mixed-version admission.
+
+**Native-worker acceptance remains required.** The
+[October 29 report](https://github.com/Dicklesworthstone/remote_compilation_helper/issues/111#issuecomment-6484520860)
+correlates a persistent project-specific namespace failure with terminal
+cancellation records. Both current source and the reported `ff152a046086`
+implementation exclude other identities through `.claim`/`.pending` records;
+the two reported terminal records alone do not explain a fresh identity's
+namespace refusal. Preserve that distinction when evaluating the repair.
+The separate retrieval-staging work tracked by `bd-ra5aw` does not resolve this
+incident by itself.
+
+The October 30 isolated Linux qualification at `5b1eee2` passed 235 regressions: 76 source
+registry/legacy-GC cases, 31 earlier registry cases, 65 holder cases, 28 control
+cases, 11 native-timer cases, three delivery cases, 13 process-group cases and
+eight real loopback OpenSSH cases. The SSH suite uses fixture-owned keys and
+strict host verification; heartbeat fault cases select a two-second idle lease,
+while queued cancellation uses the shipped 15-second execution deadline. It
+checks retained claim bytes/inodes, independent activity and absence of late
+publication after unlocking. Run it with
+`python3 scripts/tests/test_source_ownership_ssh.py` on an isolated Linux host
+where the test user may start `sshd`.
+
+The cancellation-retention repairs through `7ae3f5f` passed 90 comprehensive
+registry cases, 31 earlier registry cases and eight loopback SSH cases. Those
+historical results covered missing fences, lost durability acknowledgements,
+conflicting receipts and old-token refusal. The current registry and SSH
+qualification below supersedes those counts. These tests exercise actual
+processes, locks and transport with injected durability failures; tmpfs does
+not establish physical power-loss recovery or installed-worker acceptance.
+
+The subsequent source-pair publication qualification reproduced the previous
+failure with actual pair/metadata locks and a kernel file-size write limit:
+both `sh` and `bash`, with either an absent or previously released owner, left
+an empty owner that the next admission refused. Seven focused native tests of
+the new production custody program passed, covering interrupted writes and
+publication barriers, exact receipt replay, concurrent dispatchers, changed
+owners, readable legacy records, malformed evidence and successor preservation.
+The final frozen-source holder suite passed all 72 cases: 65 existing holder
+cases and these seven pair-custody cases, with no skips.
+The expanded real loopback OpenSSH suite passed all ten cases, including loss
+of the SSH client after pair release commits, and a restart between pair
+release and source cancellation completion. Repeated old-token reconciliation
+preserved the successor's owner, active claim and source bytes and inodes.
+Both new pair SSH cases also passed again after the final missing-owner
+refusal was added.
+These execute worker programs and real kernel locks; they do not compile the
+Rust command builders or execute the new Rust journal-recovery integration.
+
+The following legacy-cancellation and released-proof corrections reproduced
+the aged-release failure against the unchanged `358f0c6` registry under both
+`sh` and `bash`, and independently over real loopback SSH. After a lost release
+reply, another admission collected the aged receipt and the original release
+query incorrectly returned `pending`. Marker-only cancellation also left the
+completed-receipt query at `pending` while normal recovery remained refused.
+The corrected native registry suite passed all 98 cases, and the earlier
+registry/admission suite passed all 31. The expanded controller suite passed
+31 cases, the native fallback timer passed 11, and real pipe
+backpressure delivery passed three. All 12 loopback SSH cases passed, including
+lost release replies across retention, cancellation intent while independent
+activity remains live, and restart between pair release and `finish-cancel`.
+The probe preserved live claims and source bytes; successor admission and
+repeated old-token reconciliation remained safe. No skips occurred in these
+suites. The earlier holder/pair-custody results remain scoped to their prior
+revision; this correction did not change those programs.
+
+The next paired-cleanup qualification passed all 20 real loopback SSH cases,
+including eight new regressions. It executes the shipped activity check, pair
+custody/release waiter, lock-session supervisor and retained-tree program.
+Disconnect before retirement and transport loss after the retained-tree rename
+both preserve exact ownership for restart. A surviving cleanup activity must
+drain before retry; concurrent old recovery cannot bypass the real pair lock.
+Missing or changed pair owners, absent source grants and mismatched cancellation
+fences refuse without source mutation. Repeated old-token reconciliation leaves
+the admitted successor's claim, owner and source bytes unchanged. The suite also
+checks a partial finite-script upload followed by cancellation and a delayed
+upload tail. No tests were skipped. A fixture-only first-run failure caused by
+this container exposing `/dev/null` as a regular file was resolved by using a
+private empty SSH configuration; no system device or worker rule was changed.
+
+The finite-upload failure was reproduced against the unchanged `10407d7`
+launch shape: sending only an opening brace to `flock ... sh -s` held activity
+and blocked cancellation until stdin closed. The corrected shell frame instead
+leaves activity unacquired until its complete program arrives and refuses a
+late completion after cancellation. This removes that bootstrap lock orphan;
+it does not claim a universal lifetime bound for all SSH processes.
+The expanded Linux holder/pair suite passed all 76 tests without skips,
+including four new finite-input regressions. The native checks execute the
+production shell frames and post-lock ownership check, and the actual isolated
+Python manifest verifier. They cover incomplete EOF under `sh` and `bash`,
+half-open 256 KiB uploads, cancellation before a delayed tail, empty manifests,
+literal shell metacharacters and Unicode, and legitimate activity surviving
+HUP until completion. The existing heartbeat, stale-lock, pair-publication and
+owner-conflict cases passed in the same run. Pinned workspace formatting and
+`git diff --check` also passed for this correction.
+
+The following interrupted-publication, terminal-discovery and rsync-idle
+correction passed 313 Linux regression checks with no skips: 106 comprehensive
+registry cases, 31 earlier registry cases, 25 namespace cases, 80 holder/pair
+cases, 32 controller cases, 11 native-timer cases, three delivery/backpressure
+cases and 25 real loopback OpenSSH cases. The four pending-publication positive
+cases fail against the unchanged `cd8fb446` registry under both `sh` and `bash`
+in both namespaces, establishing their sensitivity to the repair. The expanded
+registry tests cover lost durability acknowledgements, fresh-process retries,
+conflicting claims, incomplete evidence and replacement of an absent registry's
+parent while discovery waits for metadata.
+
+Five new SSH cases interrupt actual pending publication before readiness, drop
+replies after worker location/cancellation/finish/settlement, and resume from
+both namespaces. Terminal legacy settlement follows actual retained-tree
+retirement under the legacy activity guard; retries preserve a live successor's
+claim, the old fence and receipt, and retained-tree bytes. Optional absence
+creates no ownership, and malformed or ambiguous evidence remains untouched.
+These execute worker programs and the metadata controller, not a copied Rust
+lease state machine.
+
+The new holder checks use a real Linux rsync 3.2.7 client and its actual remote
+receiver/sender arguments. With a two-second I/O idle budget, abandoned input
+and blocked output independently exited 30 after approximately 3.1 and 2.1
+seconds, releasing activity without fixture EOF or signal termination. Upload
+and download with ongoing traffic both succeeded after about four seconds.
+The explicit opt-out remained live after four seconds and ended only when the
+fixture closed input. Every case retained the exact claim inode and bytes and
+source sentinel, without creating cancellation or release receipts.
+
+Workspace `cargo fmt --all -- --check`, shell/Python syntax checks and
+`git diff --check` passed for this correction. Five new
+`terminal_legacy_cancellation_discovery_` Rust tests and two `source_rsync_`
+policy/classification tests were added, and the existing generated-command
+controller regression now exercises optional discovery. These RCH tests remain
+**uncompiled and unexecuted** in this environment. Independent source review
+found no ownership or protocol blocker; it is not a compiler verdict. The
+backing filesystem remained full with limited tmpfs space under the same 8 GiB
+memory constraint, so the already-failing heavy dependency build was not
+repeated. Native rsync results do not qualify openrsync, Darwin or Windows.
+
+The subsequent pre-acknowledgement correction passed 29 job-identity and journal
+tests in the actual default-feature `rch-common` crate, including four new
+resource-applicability and malformed-evidence cases. Default-feature common
+library/test Clippy passed with `-D warnings`. All 25 real loopback OpenSSH
+cases passed again with no skips, qualifying the unchanged worker protocols;
+they do not execute the changed Rust completion boundary. Pinned workspace
+formatting and `git diff --check` passed.
+
+Ten new RCH/daemon tests cover the retired pre-acknowledgement route, a concurrent
+journal owner, lost settlement replies and disk restart, optional absent or
+unconfirmed observations, legitimate transfer-failure recovery, applicable
+resource absence, pending or malformed daemon readback, and raw custody
+preservation through the final daemon checkpoint. These tests use the actual
+journal and completion functions with injected worker/daemon replies. They
+remain **uncompiled and unexecuted** here; successful common-crate compilation
+does not qualify those callers. The backing filesystem was still full and
+insufficient temporary build capacity remained for the mandatory heavy
+dependency graph, so the previous `asupersync 0.5.0` failure was not repeated.
+The earlier 313-case Linux result remains scoped to its recorded correction;
+only the 25-case SSH suite was rerun for this follow-up.
+
+The journal-custody correction passed 25 job-identity and journal tests in the
+actual default-feature `rch-common` crate using the pinned nightly toolchain.
+Default-feature `rch-common` Clippy with `--lib --tests -- -D warnings` also
+passed.
+An isolated unchanged-code build ran the readable-original regression and
+reproduced the reported `retained journal file identity, permissions or exact
+bytes changed` error on an owned `0644` original. The correction accepts `0640`
+and `0644` originals while still refusing writable or hard-linked originals,
+changed evidence and nonprivate retained snapshots. This qualification does not
+substitute for compilation and execution of the full RCH retry integration.
+
+Pinned workspace `cargo fmt --all -- --check` passed with the admission and
+source-pair corrections. Eight focused `namespace_preflight_` tests were added for
+phase publication, exact terminal receipts over real Unix sockets, cancellation
+winning a release race, invalid/oversized replies, source-busy propagation,
+journal reload and concurrent completion. These new RCH tests were **not
+executed** in this environment.
+
+Four additional `paired_cancellation_recovery_` Rust tests exercise exact journal
+ownership, daemon outcome reconciliation, durable reload, lost cancellation and
+settlement replies, missing/conflicting pair evidence and failed journal
+publication. They were independently source-reviewed but were also **not
+compiled or executed** here. The native worker-program results above do not
+replace this integration gate.
+
+Two `completed_source_cancellation_` Rust tests were added for the later legacy
+intent correction, and the four paired tests were strengthened. They exercise
+actual journal ownership and disk reload with injected worker observations,
+including a crash before cleanup, conflicting command outcomes and changed
+custody. The subsequent paired correction adds three further journal tests for
+exact cleanup binding, canonical comparison without rewriting evidence, and
+restart on both sides of tree retirement before pair release. Two new finite
+input tests cover delimiter collisions, large programs, exact manifest bytes
+and malformed input; the existing Python and portable verifier controls now
+exercise framed input too. These changed RCH tests remain **uncompiled and
+unexecuted** here. Native worker tests validate the embedded programs separately
+from the dispatcher builders and journal integration.
+
+The latest locked, default-feature `cargo check -p rch --all-targets` attempt
+again received SIGKILL while compiling the unchanged `asupersync 0.5.0`
+dependency, before reaching RCH. It used one Cargo job, one rustc thread, no
+debug info and no incremental compilation under the 8 GiB memory limit; the
+cgroup OOM-kill counter increased during that failure. The earlier full locked
+workspace check at `5b1eee2` encountered the same dependency failure. These
+attempts establish no compiler verdict for the changed RCH integration. Full
+workspace check/Clippy and execution of the RCH recovery, lease and retry
+regressions remain required before release acceptance. Successful common-crate
+Clippy and Linux process/SSH qualifications do not replace those gates or the
+original affected worker's acceptance. After the legacy-intent correction,
+both the backing filesystem and temporary filesystem had no free space; the
+heavy Rust gates were not repeated under the unchanged memory constraint.
+During the paired/bootstrap follow-up, the backing filesystem still had no
+free space, `/dev/shm` had about 185 MiB available, and cgroup usage was about
+7.9 GiB of the 8 GiB limit. No further heavy compiler retry was attempted under
+those conditions; earlier SIGKILL results are not a verdict on this revision.
+
+On a native host with sufficient build capacity, include these Rust gates with
+the worker acceptance cases below:
+
+```bash
+cargo check --locked --workspace --all-targets
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked -p rch-common --lib job_identity:: -- --test-threads=1
+cargo test --locked -p rch --bin rch retired_failed_recovery_ -- --test-threads=1
+cargo test --locked -p rch --bin rch recovered_delivery_can_replace_ -- --test-threads=1
+cargo test --locked -p rch --bin rch source_cancellation_retirement_tests -- --test-threads=1
+cargo test --locked -p rch --bin rch daemon_reconciliation_preserves_ -- --test-threads=1
+cargo test --locked -p rchd --bin rchd terminal_cancellation_recovery_preserves_ -- --test-threads=1
+cargo test --locked -p rchd --bin rchd retired_delivery_refuses_ -- --test-threads=1
+cargo test --locked -p rchd --bin rchd handoff_completion_refuses_ -- --test-threads=1
+cargo test --locked -p rch --bin rch namespace_preflight_ -- --test-threads=1
+cargo test --locked -p rch --bin rch paired_cancellation_recovery_ -- --test-threads=1
+cargo test --locked -p rch --bin rch completed_source_cancellation_ -- --test-threads=1
+cargo test --locked -p rch --bin rch terminal_legacy_cancellation_discovery_ -- --test-threads=1
+cargo test --locked -p rch --bin rch terminal_cancellation_command_preserves_ -- --test-threads=1
+cargo test --locked -p rch --bin rch source_rsync_idle_timeout_ -- --test-threads=1
+cargo test --locked -p rch --bin rch source_rsync_peer_timeout_ -- --test-threads=1
+cargo test --locked -p rch --bin rch finite_source_activity_script_ -- --test-threads=1
+cargo test --locked -p rch --bin rch remote_manifest_finite_input_ -- --test-threads=1
+cargo test --locked -p rch --bin rch verifier_ -- --test-threads=1
+cargo test --locked -p rch --bin rch source_pair_ -- --test-threads=1
+cargo test --locked -p rch --bin rch retry_selection_ -- --test-threads=1
+cargo test --locked -p rch --bin rch retry_custody_ -- --test-threads=1
+```
+
+Before calling the incident resolved on the fleet, record the exact dispatcher
+and worker revisions and complete these acceptance cases on isolated native
+worker fixtures:
+
+1. Run the required Rust workspace checks and the recovery/lease/SSH regression
+   targets, plus the Linux registry, holder and namespace-controller suites.
+   Record any blocked gate explicitly; source review is not compilation.
+2. Reproduce interrupted initialization and cancellation over real SSH,
+   including a lost settlement reply and restart between worker publication and
+   local journal acknowledgement. Retrying the original wrapper must settle
+   once, preserve the old-token fence and admit a new overlapping job safely.
+   Interrupt preflight before daemon release and race release against daemon
+   cancellation. Exact failure receipts may retry; completed cancellation must
+   remain terminal, with no replay and no invented conflicting local exit.
+   Include legacy marker-only journals and lost release replies aged past
+   retention, with all shared-registry dispatchers using the updated policy.
+   Include paired legacy journals before tree retirement and after the tree
+   checkpoint but before pair release; exact completion must resume guarded
+   cleanup, while an absent or conflicting owner must remain refused.
+   Include complete pending publication interrupted before its durability reply,
+   and terminal legacy journals with no recorded cancellation obligation.
+   Optional absent discovery must leave the terminal journal unchanged; exact
+   cancellation evidence must survive loss on either side of its checkpoint.
+   Include a retired failed legacy journal interrupted before daemon
+   acknowledgement: recovery must discover and settle its worker cancellation
+   before acknowledging it, including a lost settlement reply and disk restart.
+   Cover absent pair/tree fields with omitted retirement flags, and require
+   proof when either resource is present. Confirm that the final daemon fact
+   preserves original custody fields and path spellings, and that a recovered
+   delivery can replace an unacknowledged transfer-failure result without
+   changing the separate daemon execution outcome.
+3. Exercise concurrent dispatchers and a still-running activity. Recovery must
+   refuse while that activity owns its lock; an unrelated project must continue
+   making progress. Corrupt, changed, absent and conflicting evidence must
+   remain refused without source-tree mutation.
+4. Exercise a half-open/multiplexed SSH session and a stopped or dead client.
+   Verify control locks are released after heartbeat loss under the stated
+   scheduling assumptions, durable records remain, and separate build/transfer
+   activity is not killed. Include observer and supervisor termination, a
+   stopped supervisor and an explicit `SIGCHLD` sent to its observer.
+   Stall a finite script and manifest upload before the closing frame: neither
+   may hold activity. Cancel that exact intent, then deliver the tail and verify
+   that it refuses without touching source contents. Qualify complete large
+   programs and actual build/transfer activity independently of that bootstrap.
+   Stall rsync protocol input and output while retaining the SSH channel: the
+   remote sender/receiver must relinquish activity after its configured I/O idle
+   deadline while leaving claim bytes and source ownership intact. Verify long
+   progressing transfers survive, and qualify the explicit source-timeout zero
+   opt-out, bounded estimate policy and declared-result retrieval independently.
+5. Qualify the deployed Linux toolchain, including GNU/uutils differences, and
+   native Darwin process/locking behavior where used, using the `python3` found
+   on the worker's noninteractive SSH `PATH`. Exercise an inherited ignored
+   `SIGCHLD` disposition and an inherited blocked mask. Linux subprocess tests,
+   including tests that remove `os.waitid`, do not qualify Darwin or Windows.
+6. Revisit the affected project and worker with the new diagnostics and original
+   lease evidence. Establish the cause of the historical namespace refusal and
+   verify repeated admissions after recovery. A passing isolated reproduction
+   does not establish that the production failure has been eliminated.
+
 ### Disk Pressure Critical
 
 **Symptoms:** Worker pressure state "critical", builds deferred

@@ -608,11 +608,38 @@ ends that preparation; its token is drained and cancelled before a new attempt,
 so an older upload cannot arrive after verification and change compiler inputs.
 Recovery of an interrupted preparation drains surviving transfers and cancels
 that token, so a delayed upload cannot mutate a tree after ownership is released.
-Once execution may have started, recovery requires its exact completion record.
+Once execution may have started, recovery requires its exact completion record
+or worker activity evidence that the original execution is gone; a missing
+receipt alone does not prove completion.
 If a worker loses its ownership registry or the local recovery recipe predates
 this protocol, recovery refuses to infer ownership from the current source bytes.
 Worker cache cleanup also respects retained source grants, including jobs whose
 outputs are quiet but still await recovery.
+
+`rch jobs recover` also reconciles an acknowledged terminal cancellation when
+its retained recipe still owes worker settlement. A local `state=finished` and
+`terminal_acknowledged=true` are insufficient by themselves: recovery verifies
+the exact journal, failed result, resource retirement, worker records and drained
+activity before recording `source_cancellation_settled=true`. This operation
+does not reopen source trees or rerun the command. A retained `.cancelling`
+marker may remain after success to fence delayed requests for the old token;
+its presence alone does not block a new token. Missing or conflicting evidence
+remains an error rather than permission to remove records.
+
+Recovery records the source registry namespace as part of its durable recipe.
+For older journals it first verifies exact worker evidence and checkpoints the
+current or legacy binding before cancellation or cleanup. This keeps recovery
+on the original registry and lock hierarchy instead of creating a contradictory
+receipt in a newer namespace. Ambiguous or incomplete evidence remains refused;
+cleanup also checks for competing lexical and physical owners.
+
+New POSIX source-lock sessions send heartbeats every 10 seconds and expire after
+90 seconds without a complete heartbeat, subject to worker process scheduling
+and termination. Expiry retains durable ownership and leaves separately running
+compiler/rsync activity to the normal recovery protocol. See the
+[source namespace and terminal cancellation runbook](docs/runbooks/reliability-operations.md#source-namespace-and-terminal-cancellation-recovery-111)
+for diagnostics, legacy registry handling, and the native-worker acceptance
+still required for [#111](https://github.com/Dicklesworthstone/remote_compilation_helper/issues/111).
 
 ### Config + Diagnostics
 
@@ -1097,7 +1124,7 @@ On Linux boxes configured with `[general] role = "dispatcher"`, status and docto
 also report unmanaged local Cargo/rustc processes. The warning remains visible
 while those processes run, including when the daemon is unavailable. Check
 `rch shim status`, PATH order, and absolute-path toolchain Cargo invocations.
-Processes carrying `RCH_CARGO_WRAPPER_BYPASS=1` or descended from `rch` are excluded.
+Processes descended from `rch` or carrying `rch`'s internal local-fallback marker (`RCH_CARGO_WRAPPER_BYPASS=1` with `RCH_CARGO_WRAPPER_ORIGIN=rch`) are excluded; a bare caller-set `RCH_CARGO_WRAPPER_BYPASS=1` is not excluded.
 
 An alarm event is logged once per observed episode and clears after a successful
 scan finds no unmanaged compiler processes. Status and doctor share a locked
@@ -1286,8 +1313,20 @@ Git tree hash, and remote path. All roots share the same execution lease and
 are retired together. Cross-repository symlinks and non-sibling layouts are
 currently refused.
 
-This check conservatively covers all selected manifests, including inactive
-fixtures. File-based `--config`, configuration includes, and changes to Cargo's
+Manifest semantics follow the selected entrypoint's workspace members and local
+dependency closure, including dev, build, target-specific, optional, inherited,
+patched and replaced path dependencies. Unreferenced Cargo manifests remain
+transferred fixture bytes; naming the same fixture as a member, dependency or
+entrypoint activates the same containment and source checks. Workspace excludes
+are literal directory prefixes; explicit members override them, while excluded
+default members stay excluded. Exclusions never hide actual path dependencies.
+Legacy Cargo dependency-table and package-table aliases retain these checks.
+Workspace pointers in selected ancestor packages activate their captured root
+too; absolute, absent, aliased or non-workspace targets refuse before Cargo.
+Selected manifest-file symlinks are refused because resolving their bytes must
+not change Cargo's relative source base; unreferenced aliases remain data.
+All inventory paths/symlinks and selected Cargo configuration retain their
+containment checks. File-based `--config`, configuration includes, and changes to Cargo's
 working directory are refused. On the worker, any Cargo-home or ancestor
 configuration is refused before Cargo starts, even if that configuration would
 be harmless. Cargo clean-overlay jobs currently require a Unix worker for this

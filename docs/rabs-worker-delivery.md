@@ -94,6 +94,27 @@ activation, the script prints the public certificate SPKI SHA-256 to use for
 `RABS_DEPENDENCY_WORKER_SPKI_SHA256`. Successful service startup does not prove
 that the coordinator has accepted a worker session.
 
+Deployment requires the complete canonical namespace by default. For an
+archive worker on a Linux host that cannot mount private procfs, set
+`RABS_DEPLOY_CAPABILITY=dependency-rlib` on the deployment command above.
+The selector accepts only `canonical` or `dependency-rlib`; an empty or unknown
+value refuses locally before contacting SSH. The archive probe measures the
+same user, PID, IPC, UTS and network isolation as native archive execution,
+with a cleared environment, private `/tmp` and `/__rabs/tmp`, and only the
+nonsymlink Linux null character device (major 1, minor 3). It checks the device
+before and after the no-op and never mounts procfs or a general device tree.
+Trusted read-only host runtime files allow the probe's `/usr/bin/true` to run;
+real dependency compilation still requires the separately retained keyed
+runtime and complete captured inputs.
+
+A successful archive probe reports `dependency-rlib-ok`. It does not claim
+canonical or metadata execution support. Probe failures refuse before any
+credential, binary, service or journal changes. The selector applies only to
+that deployment and is not saved in the managed service: an upgrade without
+it requires canonical capability again. The installed worker independently
+measures and advertises its execution modes, and the coordinator still must
+negotiate the requested mode before admitting a compiler invocation.
+
 `RABS_WORKER_ID` and `RABS_WORKER_STATE_DIR` are optional. On a fresh install,
 omitting them preserves the worker's short-hostname identity and default
 durable state layout. During an upgrade, omitted values are copied from the
@@ -178,34 +199,75 @@ transfer without reopening mutable target paths.
 A populated dependency search directory may be disjoint from the action's
 output directory or may be that same directory. In the shared case, the worker
 places each retained dependency file above its private writable output mount
-as a separate read-only bind. Bare toolchain externs, proc macros,
-native libraries and executable/shared-library linker output remain local. Build scripts themselves
-also continue to run locally.
+as a separate read-only bind. Bare toolchain externs, proc macros and
+executable/shared-library linker output remain local. Ordinary dependency
+execution also refuses native library inputs; the canonical Cargo archive
+extension below admits a bounded generated-static-library case. Build scripts
+themselves continue to run locally.
 These limits apply to each compiler action; they do not prevent Cargo from
 continuing with other units.
 
 Both dependency classes may consume a previously completed Cargo build
 script's generated `OUT_DIR` tree. Admission binds the exact captured Cargo
 build-script output record, the original `OUT_DIR` path and every generated
-file, including an explicitly captured empty tree. A tree containing empty
-subdirectories stays on the local protocol because the current file transfer
-cannot reproduce those directories; a truly empty root is supported.
-Generated file contents or membership changes select a different key. The
+file, including an explicitly captured empty tree. The transfer also retains
+every generated directory, including empty subdirectories.
+Generated file contents, directory membership and empty-directory topology
+select a different key. The
 captured `rustc-env` directives must agree with the compiler environment. Every
 source or generated path reported by dep-info must belong to the captured
 input closure. This does not cache or replay
 the build script's execution.
 
+**Generated native static archives in canonical Cargo builds.** A canonical
+remote external-dependency `lib`/`rlib` compilation may use `-L native=PATH` when every native search
+directory is the current package's captured `OUT_DIR` or one of its declared
+subdirectories. Explicit library arguments must have exactly `-l static=NAME`
+form, and a matching `libNAME.a` must appear in the captured generated files
+under one of those search directories. Source `#[link]` attributes may use the
+same closed search view. The complete generated tree, native search order,
+library arguments and Cargo build-script record all participate in the key;
+native actions also have a distinct isolation policy. Pure Rust action keys
+retain their existing policy.
+
+The worker independently validates the native argument shape and directory
+topology before execution. Rustc bundles the retained native objects into its
+returned rlib inside the existing closed archive namespace, with no external
+linker, general host filesystem, procfs or entropy devices. Thin-archive members
+must also resolve within retained inputs; a reference to an unmounted host
+object fails the private compile. The existing verified-drain fallback handles
+that failure before output installation. This uses the existing canonical v4
+context and generated-tree transfer; older workers that reject native arguments
+continue through that same fallback boundary.
+
+This extension is automatic for eligible canonical dependency workers during
+`cargo rabs --rabs-canonical-local PROFILE.json -- build ...`. It does not add
+local native-result capture. Metadata-only checks, system or dynamic library
+searches, library modifiers/renaming, and native search paths belonging to a
+different package's `OUT_DIR` continue locally. In particular, a native search
+path propagated through a larger dependency graph is not implicitly included
+in the current package's captured generated tree. Fresh workspace library
+execution can bundle archives from its own captured `OUT_DIR` under the
+separately negotiated `canonical-workspace-exec-v3` contract. It validates the
+same complete generated-file and directory evidence, retains exact arguments,
+and grants no action-cache publication or replay authority. A workspace unit
+consuming a native path from another package's generated tree remains local.
+
 The worker keeps the original source, generated-input, output and toolchain
 path spellings and full compiler environment inside private mounts. The
-`dependency-exec-v7` context binds an explicit list of populated dependency
+`dependency-exec-v8` context binds an explicit list of populated dependency
 roots to their first-use directory indices. A single sealed source transfer contains
 `package/<source-path>`, optional `generated/<generated-path>` and
 `dependencies/NNNN/<artifact-basename>`; only the declared package, generated
 and retained candidate files may appear. The worker verifies that inventory
 and mounts the generated tree and each disjoint populated dependency root
-read-only. A captured empty generated tree receives an exclusive empty
-backing. The generated root must match the original `OUT_DIR` environment
+read-only. The context carries every generated subdirectory, including empty
+ones, separately from the file-byte manifest. The worker reconstructs the exact
+tree in an exclusive backing without modifying the sealed transfer bundle or
+sharing file inodes with it. This preserves compiler path traversal such as
+`empty/../value.rs`; removing or replacing an empty directory also invalidates
+the retained input guard. A truly empty generated root has the same explicit
+ownership. The generated root must match the original `OUT_DIR` environment
 value and cannot overlap source, output, dependency or toolchain roots.
 Generated input files never become returned compiler artifacts.
 For a shared input/output root, it rechecks the sealed input bytes and creates
@@ -248,7 +310,7 @@ Metadata and whole-Cargo execution retain their full canonical isolation checks.
 Sealed-result recovery requires the original request fingerprint and retained
 bytes, without requiring the restarted host to support new execution.
 
-The launcher requires a daemon advertising `dependency-exec-v7`; old execution
+The launcher requires a daemon advertising `dependency-exec-v8`; old execution
 contexts cannot admit new work. Already sealed results from older contexts can
 still resume against their exact saved request fingerprint.
 
@@ -340,7 +402,7 @@ CARGO_RABS_WRAP="$PWD/target/debug/rabs-wrap" \
 This starts a live daemon if needed. Subsequent invocations retain the exported
 pool selection so the launcher checks the attached daemon's exact normalized
 configuration, including worker order, remote protocol 1 and
-`dependency-exec-v7`. The advertised `remote_dependency` object contains these
+`dependency-exec-v8`. The advertised `remote_dependency` object contains these
 protocol fields and a `workers` array in configured order. A singleton daemon
 does not satisfy a pool request, even when the pool contains that one worker.
 An existing daemon is never reconfigured or restarted to fit a new request;
@@ -365,6 +427,35 @@ other codegen actions, native linking, proc macros and build-script
 execution retain their existing local path. `--rabs-require-daemon` guarantees
 matching daemon setup, not remote execution of every Cargo action. The original
 three-variable singleton configuration and its status fields remain supported.
+
+### Reuse uploaded sources and dependency archives
+
+Workers retain a digest-verified input cache across sessions and restarts by
+default. Its objects live in `source-files-v1` below the worker's existing
+private journal directory and have a 512 MiB aggregate allowance. Source files,
+generated inputs and Rust dependency archives share this cache; objects larger
+than 4 MiB are reusable too, up to the existing 512 MiB source-projection limit.
+Every hit is fully hashed into a private snapshot before populating a fresh
+execution receiver. Hashing and copying use 64 KiB buffers, and the final source
+seal remains required even when no file bytes need uploading.
+
+For a directly launched worker, `--source-cache-bytes N` overrides
+`RABS_WORKER_SOURCE_CACHE_BYTES`. Both accept 0–8589934592 bytes; `0` disables
+input reuse. For example:
+
+```sh
+rabs-wkr --coordinator 192.0.2.10:7092 --worker-id leaf-worker --source-cache-bytes 1073741824
+```
+
+`RABS_SOURCE_CACHE_DIR` optionally selects another existing absolute private
+directory instead of the journal directory. Reducing the allowance trims older
+retained objects when the next source upload seals. Cache corruption or eviction costs
+another upload; retained readers have independent snapshots, and execution
+never shares writable inodes with cached objects. Capacity bounds retained
+objects; transfer staging and one in-flight verification snapshot require
+additional temporary space. Lookup, copy and cache population use the original
+input deadline. This cache saves input transport; compilation, result
+publication and Cargo target-state policies retain their existing checks.
 
 ### Share a CPU budget between workers on the same host
 
@@ -457,7 +548,7 @@ receipt. Terminal events are associated with the crate that admitted their
 action key; one crate's successful execution cannot stand in for another's.
 Toolchain warmup may let different nodes start qualification on different runs.
 
-With `dependency-exec-v7`, this DAG oracle can use shared or disjoint dependency
+With `dependency-exec-v8`, this DAG oracle can use shared or disjoint dependency
 and output directories. It performs no compiler-argument rewriting and never
 treats local fallback as evidence of remote admission. It selects the installed
 Cargo and its matching compiler explicitly; ordinary rustup-based Cargo use
@@ -537,6 +628,41 @@ It compiles an archive containing captured `.incbin` bytes and refuses attempts
 to read host-only files, procfs or `/dev/urandom`. This proves the production
 sandbox boundary; the worker and live Cargo fixtures establish the broader
 remote execution and replay behavior when run successfully.
+
+The generated-native sandbox regression uses that same production archive
+view, links and executes the returned rlib, and requires a thin archive's
+attempt to read an unmounted original host object to fail:
+
+```sh
+RABS_TEST_TOOLCHAIN_ROOT="$(rustc --print sysroot)" \
+  cargo test -p rabs-sandbox --lib \
+    real_canonical_archive_bundles_retained_native_inputs_and_denies_thin_escape \
+    -- --ignored --nocapture
+```
+
+It also needs `cc` and GNU `ar`. The lightweight compiler conformance test
+`bundled_static_archive_changes_executable_without_changing_dep_info` in
+`rabs-key/tests/live_dependency_out_dir_conformance.rs` proves that native
+archive edits change the executable even though rustc's dep-info is unchanged.
+It requires no namespaces and makes no claim about remote serving.
+
+For the complete Cargo, authenticated-worker, cache and artifact-delivery path:
+
+```sh
+RABS_CANONICAL_TEST_WRAPPER="$PWD/target/debug/rabs-wrap" \
+RABS_TEST_WORKER_BIN="$PWD/target/debug/rabs-wkr" \
+  cargo test -p rabsd --test canonical_check_local \
+    canonical_cargo_build_bundles_generated_native_archives_replays_and_invalidates_them \
+    -- --ignored --nocapture
+```
+
+This fixture requires the full Cargo namespace and OpenSSL as well. It demands
+actual remote cold samples, subsequent cache replay across worktrees, a working
+delivered executable, and a new remote result when only the native generator's
+workspace input changes. The independent Rust dependency must remain a hit.
+The workspace consumer must stay local and uncached while its two external
+dependencies offload or replay; the delivered binary exercises the native code.
+An ignored test or an unsupported-host result is not execution evidence.
 
 ## Run one delivery
 
@@ -1066,6 +1192,17 @@ and retains that first bound endpoint for recovery. Keep the worker's configured
 coordinator address, including its DNS spelling, unchanged for that journal;
 changing it also changes the journal identity. Jobs sharing a worker name, key
 pin, listener endpoint, or conflicting paths cannot execute concurrently.
+
+After a short connection delivers a normally completed result and both output
+owners acknowledge it, the worker reconnects with 125–250 ms of jitter. Its
+`worker-reconnect-scheduled` record reports `completed_delivery: true` only when
+that connection advances the durable request/release state. A fully delivered
+compiler error also counts as useful work. Completing retained-result recovery
+resets the delay once; repeated acknowledgments do not. Empty sessions, partial
+delivery, cancelled execution and unresolved results keep the existing
+exponential outage backoff, capped at 15–30 seconds of jitter. This prevents a
+sequence of successful short compilations from accumulating outage delays;
+an idle worker whose listener is absent still backs off normally.
 
 Status reports `queued`, `running`, `cancelling`, `completed`, `cancelled`,
 `failed_before_start`, or `uncertain`. Check `succeeded`, `exit_code`, `stop_reason`,
