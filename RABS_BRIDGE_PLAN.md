@@ -1,9 +1,33 @@
 # RABS Bridge Plan — From Proven Library to Living System
 
-## Reality check and execution order — updated November 3, 2026
+## Reality check and execution order — updated November 4, 2026
+
+**Resumed qualification, November4 at06:38UTC:** sourcee3c8 failed the ORIGINAL
+nested-quoting size gate: compiled protocol2passed/1failed, nested110748 bytes
+against unchanged110000 cap. Native supervisor27/27 and capability33/33 passed;
+the run was subsequently interrupted (DSR target130, missing final worker
+receipt), before recovery, normal tools or workspace QA finished. No e3 native
+process remains; this source is not eligible for public Cargo. Commit37f29b70
+contains that supervisor logic and stronger existing real-census test.
+
+- [x] Preserve the losing e3 source/report and size assertion. Shorten only
+  existing protocol comments, retaining the same signal/identity/census logic;
+  local calculation matching shell-escape now gives nested109760 bytes. The
+  unchanged COMPILED gate must still pass; this calculation is not qualification.
+- [ ] Finish native DSR `rch_recovery_fit`, sourceaf0ba154, launched06:37:46UTC:
+  native supervisor27; original identity/census21 and scope contracts31 under
+  BOTH sh and bash; compiled protocol3 and original escalation12; capability33,
+  recovery59; normal RCH client/daemon and full workspace check/strictClippy/fmt.
+  Scope fixtures are contract evidence, not a live systemd run. All1694 inputs
+  are frozen, with exactly four explicit overlays on qualified7bfb. Later peer
+  disk-monitor/bulk-upload/Rustup changes remain outside this source binding.
+- [ ] Rebind the guarded public controller to that finished producer, require
+  actual original quarantine rejoin, then stock and all four independent cache
+  rounds. Public Cargo remains unrun. Reobserve shared scheduling/ownership and
+  reserve only an idle worker through the supported drain before admission.
 
 **Active recovery qualification, November3 at20:01UTC:** native DSR
-`rch_recovery_combined` is running sourcee3c8c584, exactly the qualified7bfb
+`rch_recovery_combined` ran sourcee3c8c584, exactly the qualified7bfb
 1694-file snapshot plus four explicit recovery/supervisor files. The direct
 native same-invocation lifecycle comparison now records incumbent raw1/13.268s
 with `RCH_PROCESS_HEALTH_DEADLINE`, candidate raw0/16.657s with the exact healthy
