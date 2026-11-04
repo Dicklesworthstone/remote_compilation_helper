@@ -2,6 +2,477 @@
 
 ## Reality check and execution order — updated November 4, 2026
 
+**Current execution TODO, November4 at16:38UTC:** stock passes; the first public
+RABS round failed before execution with E2BIG. Two-layer transport fixes that
+kernel boundary, but the follow-up guard comparison is RED: preceding9478/8,
+candidateb606/8, two original6s pipe/deadline checks time out. Candidatec72 restores
+FD3 to its original command-level scope and now passes8/8 guards alongside8/8
+live reference controls. All47 candidate cases and both normal tools now pass;
+full workspace check, strictClippy and fmt also pass in a second bound DSR stage.
+TRJ settled naturally to healthy/used0/active[]; supported drain succeeded at
+13:43:09UTC. The c72 public stock+four-round diagnostic started13:43:30UTC,
+original30min no-new-Cargo cutoff retained. Stock passes0/78.031s/ACKtrue;
+controller then fails on its own wrong release-field path before any RABS Cargo.
+Continuationc92fb0e7 started13:47:52UTC from that completed stock, with lower
+outer3000s DSR cap preserving the original window. Round0 is RED: preparation
+cleanup unconfirmed, Cargo not run, CLI1/durable255, zero cache decisions;
+rounds1–3 unrun. SAME-ID recovery ACKed255 and all four releases are true.
+Own recovery authority stopped normally; shared TRJ restored13:54:40UTC.
+Four clock-linked c72 normal release RABS roles build and pass version probes.
+Retained old3f/c72 full-SDK TLS checks BOTH fail0/1 after authenticated admission;
+no worker execution journal entry, original300s Cargo timeout. This is not fixed
+by linking the clock repair. The source-bound normal-debug receiver observation
+confirms SDK chunks are progressing. Exact committed HEAD's four release roles
+and harness now build and pass full workspace QA. Integrated SDK/native runtime
+gate is running. The older private snapshot
+omits already committed SDK ownership/upload fixes. No
+success/speed claim; older private snapshots never qualified the whole HEAD.
+The earlier dated sections are retained checkpoints, not additional active runs.
+
+- [x] Collect source628 terminal results: normal client/daemon build, full
+  workspace/all-target check, strict Clippy and fmt all exit0; all1694 source
+  and incoming before/after bindings match. Broader test qualification remains
+  RED:129/131 mixed native/fixture cases and106/107 compiled cases pass.
+- [x] Qualify the witness fixture newline correction against all3 compiled
+  scoped-launch and12 escalation tests; all15 pass. Full workspace check,
+  strict Clippy and fmt also pass on frozen1694-file source23c8557e. Native DSR
+  d8aca245-9325-41e1-a076-00ccde22a5d2 finished SUCCESS with diagnostic JSON,
+  not a release. Production shell bytes are identical to compiled628.
+- [x] Commit only the comment-size maintenance and newline correction as
+  f6df6c9c, preserving the shared Git index byte-for-byte. The original110000-byte
+  cap remains; the compiled nested command is109756 bytes. UBS remains raw1,
+  matching the reviewed HEAD baseline:2 critical/16 warnings/108 informational.
+- [x] Obtain the owner's settled idle window on TRJ. RainyBluff settled exact
+  peer build30093284437131603 at09:09UTC; root did not cancel/recover it.
+- [x] Observe shared active[]/used_slots0, then use supported drain and retain
+  a fresh receipt. Verify both worker V2 policy files remain absent.
+- [x] Launch the frozen PUBLIC V1 DIAGNOSTIC using exact628 client/daemon.
+  Require original quarantine rejoin, consecutive probes and lifecycle canary;
+  stop after a new failed recovery gate, without compiler replay. Bounded driver
+  SHA290f2dd0 is prepared: no new Cargo after30min; original DSR3600s limit
+  remains. Reservation ends only after actual ownership settlement and restore.
+- [x] Run stock: build30094703907045377 exit0/70.434s/ACKtrue, metadata50420B
+  SHAc94e3e58deea2b27f90a4fa2eadc564e3bc712c1a1a54122093f00b0bdf45505.
+- [ ] Complete four independent source/target cache rounds. First attempt is
+  RED:round0/build30094703907045378, `setsid: Argument list too long`, CLI137,
+  durable execution120, zero RABS decisions. Rounds1–3 were not started.
+  Require acknowledged source/build/lease bindings, exact stock metadata bytes,
+  and actual execute/commit, two verification rounds, then hit/serve with0exec.
+- [x] Settle the uncertain attempt through its SAME build ID; prove ACK plus
+  source/tree/pool release and private-daemon quiescence before shared re-enable.
+- [x] Record the terminal stock/E2BIG/settlement evidence in this TODO and
+  M6/S7/A012. Keep those
+  Beads open until their actual acceptance conditions hold. Fleet, release,
+  live V2 and sustained speed targets remain unqualified.
+- [x] Diagnose the real launch boundary: the outer durable supervisor already
+  uses literal script transport, but its inner setsid/sh-c still sends the
+  composed RABS bootstrap and disk guard as one oversized argument.
+- [x] Implement a bounded transport repair in transfer.rs: quoted descriptor4,
+  login-shell reader preserving trailing newlines, close/unset before children;
+  keep session identity, watchdog, disk guards, caps and deadlines unchanged.
+- [x] Retain source37455136's native result:9/11 durable cases passed; the new
+  input was too small to reach the actual128KiB boundary, and the unchanged
+  unread-stderr activity-lock test failed its original10s deadline. Isolated
+  and delayed-reader observation runs pass that original test; a full observed
+  rerun passes10/11 with only the known too-small new input failing. The
+  intermittent lock-release failure has no proved cause or repair yet.
+- [x] Collect frozen94751c21's larger-input result: native compilation completed
+  in13m05s; the new focused case failed0/1 with actual inner `sh: Argument list
+  too long`, disk refusal120 versus required fixture37. All1694 source/incoming
+  before/after bindings match; native DSR ended FAILED/826s. Retain this proved
+  one-layer loss. No normal-tools or fullQA stage ran after that failure.
+- [x] Extend literal transport through both shell boundaries using one private
+  helper. Close descriptor4 and unset the script before children; no new
+  dependency, cap/deadline/guard change. Increase opaque input to1536 repeats
+  so both layers are stressed while the actual workload remains below128KiB.
+  Local full-workspace fmt check passes; native qualification is still pending.
+- [x] Qualify sourceb60fc32a through native DSR: durable11 (including real kernel
+  E2BIG negative then one exact opaque-argv/null-stdin execution), render7,
+  bootstrap6, protocol3 and escalation12; normal RCH/rchd; workspace check,
+  strictClippy and fmt; all1694 source/incoming before/after bindings. Initial
+  source518d recipe failed before compilation because rch has no library target;
+  retain it. Native39-case gates and normal tools must all pass. New test's
+  kernel-boundary assertion is scoped to x86-64 Linux, not other page sizes.
+- [x] Collect native DSR539f309a (started11:03:42UTC) without extending the
+  original3600s cap. Preserve
+  its source during the run; collect actual terminal results before claiming
+  qualification. Exact transfer bytes1033491/SHA9a8d086d, manifestSHA8f9e3092.
+  At11:27UTC: actual kernel negative + repaired composed RABS case1/1 passed;
+  full durable11/11, command rendering7/7, bootstrap6/6 and scoped protocol3/3
+  plus escalation12/12 pass (39 distinct cases; focused case overlaps durable11).
+  At11:37UTC both normal RCH/rchd executables build0/659.5s; full workspace QA
+  and final source/binary audit remain pending. At11:58UTC workspace/all-target
+  check passes0/1212.8s. Strict Clippy is running near the original60min DSR
+  bound; native fmt/final audit remain pending. A timeout will be retained as
+  FAILED; any retry must repeat the same full gates, unchanged source and cap,
+  with genuine Cargo reuse explicitly reported. No real cache round has run.
+- [x] Retain cold bundled DSR539f309a's timeout: native status timeout/exit5,
+  elapsed3623s (outer3627s).39 targeted cases, normal tools and full check passed;
+  Clippy was interrupted and fmt unrun. It is FAILED, with no release artifact.
+  Postmortem confirms no remaining compiler processes and both1694-file source
+  roots match. No source change or timeout increase follows from this loss.
+- [x] Complete the same full qualification retryef13f84a (driver hash) using
+  genuine Cargo reuse, same b60fc32a source/flags/profiles/case counts and3600s
+  cap. Every gate runs again; do not erase the cold failure or claim cold speed.
+  DSRb6373e24 finished SUCCESS/957s:39/39 cases; normal build0, full check0,
+  strictClippy0/657.4s, fmt0/19.0s. All1694 root+incoming before/after files match;
+  normal binaries match the cold build bit-for-bit (rchSHAef0f03e7,
+  rchdSHA413df419). Archive is private diagnostic evidence, not a release.
+- [x] Run the8 existing disk/refusal/timeout cases against preserved947 binary
+  and the new compiled binary in one native DSR invocation. Both tracked and
+  standalone outcomes matter because the disk wrapper is shared. Prepared
+  original driverd76f2e71 remains unrun. Rebound unchanged gates to the successful
+  retry via driver2c6ad59e; native DSR20486e6b started12:25UTC. Preserve every
+  failure and original timer;8 cases per binary, both actually live in one run.
+  Terminal FAILED/246s:947 passes8/8, b60 passes6/8. Candidate-only failures are
+  disk_budget_real_shell_preserves_small_build_status_and_deadlines (tracked
+  normal case1; case0 standalone passed) and test_external_timeout_real_build_id_
+  watchdog_and_pipe_lifetime (streams/137/selfkill pass; deadline case times out).
+  Both fail the original6s finite-output bound; no threshold changed. Syscall
+  observation driverbb1b0534 started12:37UTC against both exact binaries; this
+  is diagnostic tracing, never acceptance proof. Inspect process/pipe ownership
+  before altering the qualified transport; no public cache round or commit yet.
+- [x] Retain the syscall observation: both binaries fail the original timing
+  assertion under strace overhead; diagnostic data is not acceptance proof.
+  DSR trace run also FAILED/exit7 because recipe expected fd-trace-observation
+  while the actual output was fd-trace-observation.json. Preserve that operator
+  collection loss and its two raw101 test results; no rerun to manufacture green.
+- [x] Restore FD3 to the original executable-command redirection instead of
+  redirecting the surrounding brace group. Two-layer literal transport remains;
+  only2 production lines changed from b60. Full local fmt0; no timer/guard change.
+- [x] Complete c72fafe2 build/runtime DSR stage (driver825fafa5, started12:48UTC):
+  all47 distinct candidate cases,8 live947 reference guards and both normal
+  tools. At13:01UTC both guard sets pass8/8; candidate kernel1/1, durable11/11,
+  rendering7/7 pass. Terminal3f09eb66 is SUCCESS/1273s: all47 distinct candidate
+  cases,8 live references and normal executables pass. All1694 source+incoming
+  before/after files match; rchSHA0c71b211, rchdSHA87114f99.
+- [x] Then run required full check/strictClippy/fmt as a separate bound DSR stage
+  with the same3600s cap (driverfed2604a). Require all47 runtime
+  tests and8 references before it starts. Sum both stages' real commands and
+  report total elapsed; no cold60min whole-pipeline or performance claim. Its
+  JSON artifact/control directory is separate from actual manifest-bound Cargo
+  ROOT, with explicit before/after control-file and1694-source-file audits.
+  Terminal295d50c9 SUCCESS/1089s: check0/483.758s, strictClippy0/521.503s,
+  fmt0/15.170s; source/control/tools unchanged. Combined actual command time
+  across both stages2091.672s excludes staging/archive/queue overhead. Neither
+  stage is a release or performance win; the earlier cold timeout remains RED.
+- [x] Prepare the next real cache controllerc1f87fd2, still UNRUN: new qualified
+  client/daemon required; fresh stock +4 source/target roots; exact metadata;
+  terminal ACK plus all4 source/tree/pool release flags per counted job. Keep
+  private authority alive for SAME-ID recovery if shutdown is not quiescent.
+  Original c1f87fd2 remains unrun; final controllerac7369e7 points to the full
+  successful retry and retains the cold qualification timeout explicitly.
+  Both are now SUPERSEDED/UNRUN after b60's6/8 guard loss; do not launch either.
+  The final c72 controller3a3d8fe7 requires BOTH complete DSR stages, all47 cases,
+  all8 reference controls and every original actual-cache acceptance condition.
+- [ ] Collect actual c72 public stock+four cache rounds. Fresh idle drain receipt
+  shared-worker-drain-v1-command-scope.json precedes DSR launch13:43:30UTC;
+  no new Cargo after14:13:09UTC. New independent sources and targets exclude
+  CargoFresh; require real execute/commit, two verify rounds, hit/serve0exec,
+  exact stock metadata and all acknowledged ownership releases. Preserve any
+  failure; settle only owned IDs, then restore shared scheduling and send END.
+  First controllerDSR21211b5a FAILED/exit6: stock30094967510663169 passed and
+  acknowledged, but the operator incorrectly read lease.release instead of
+  lease.recovery for the four release flags. No RABS Cargo began; private pool
+  had active[]/queued[]/client_lease_ids[], ownership_failedfalse, daemon exit0.
+  Continuationc92fb0e7 reads the actual schema, retains that loss, inherits exact
+  stock/source/tools and runs only the still-unrun cache rounds. No stock replay
+  or worker-window extension; no new Cargo after the same14:13:09UTC cutoff.
+  Continuation itself failed after actual public round0/69.211s, build
+  30094971939848193/wrapperrchw-05a3d068-26e7-4c1a-b2f2-58e8d82e4e8c:
+  preparation cleanup unconfirmed, CLI1/durable255. E2BIG no longer occurs;
+  zero cache decisions, no Cargo and rounds1–3 unrun. DSR retired its private
+  child despite controller retention, so supported recovery first refused the
+  absent socket. Restarted only own absent authority204948 with same history;
+  SAME-ID recovery ACKtrue/exit255, all source/tree/pair/retired releases true.
+  Stock30094967510663169 also ACKtrue/exit0/all releases. Private active[]/queued[]/leases[],
+  ownership_failedfalse; birth/session/argv/UID-pinned SIGTERM and death proved.
+  Shared enable0/healthy/used0/active[] and owner END at13:54:40UTC. No replay.
+- [x] Commit only actually qualified owned code, preserve the shared index.
+  eaed44a7 contains only transfer.rs134add/14remove; shared index remains
+  SHA858f9f03. Native qualification above binds exact fileSHAa71bcfd3. UBS raw1
+  remains documented; no scanner exclusions, suppression or hook bypass.
+- [ ] Resolve route-aware Mac capacity admission with actual source/pool write
+  paths if a bounded repair is available; no global root override, sample
+  fabrication, threshold reduction, shared-daemon restart or cleanup expansion.
+- [x] Link the already tested transport-clock repair into all four private ordinary
+  RABS tools before the next full-SDK TLS consumer. The current public diagnostic
+  still pins older3f7 RABS tools; its RCH628 client/daemon contain the recovery
+  fixes. Frozen clock-repaired worker_transport is47438B/SHA062752a1, versus
+  shipping3f7's45123B/SHAc8bbf677. Do not call the old tools clock-repaired or
+  claim the earlier162-test native proof qualifies their linked bytes.
+  Native DSR93837437 SUCCESS/404s now built all four normal release roles from
+  c72 source (actual Cargo392.908s; original profile unchanged), all1694 inputs
+  and frozen control before/after, versions and wrapper/real-rustc-vV pass.
+  Private new rabsd7896560B/SHA8b5ad6b2, worker3951416B/SHA643a4aaf,
+  wrap495984B/SHA97016468, root402464B/SHAea4b0da6. These are built tools;
+  their full-SDK TLS runtime, distinct-host and fleet qualification is pending.
+- [ ] Diagnose original preparation7s/cleanup250ms refusal with the actual
+  adapter/old3f installed launcher, no Cargo/compiler or timer changes.
+  Parent-only syscall observationf23a83e2 launched through DSR13:58:44UTC,
+  own physical data directory,600s operator bound. strace timing is diagnostic;
+  even collection0 cannot count as untraced preparation or cache acceptance.
+  Observation terminal: existing-daemon preparation0/3.736s, actual expected
+  RCH_RABS_WORKER_ACTIVE1 and wrapper path. Parent trace shows WNOWAIT-owned
+  helper exited0 and wait4 reaped it after group kill; source/tools unchanged.
+  It does not reproduce/explain the original cold-start cleanup failure, so
+  retain that failure and do not claim an untraced runtime fix. Shared peer613
+  is active again; no new drain/public Cargo while it owns the worker.
+- [x] Build four private ordinary release-profile tools from exact c72 source
+  after that observation. Frozen controller67a4e91b launched14:01:46UTC, all1694
+  inputs/control beforeafter, unchanged shipping profile and real Cargo reuse;
+  require normal artifacts for rabsd/rabs-wkr/rabs-wrap/rabs-cargo-root and actual
+  version/rustc passthrough smokes. Prior162-test ancestor evidence remains a
+  separate ledger. No global install/service switch/publication or TLS claim.
+- [x] Repair only the native-fixture temporary route: replace hardcoded/tmp
+  with std::env::temp_dir so explicit TMPDIR selects the real admitted ZFS
+  volume. No mount/source aliases, SDK reduction, deadline/profile/gate/assertion
+  changes. Exact one-line file395119B/SHAf480fdae; all1693 other source inputs
+  unchanged from c72. Preserve original fixture bytes in the owned job.
+- [x] Qualify the fixture compiler/check/lint/format sourcebca7d9b8:
+  DSR5169f0b5 controller started
+  14:13:12UTC, original3600s cap. Actual current canonical test executable
+  compiles0/141.571s in ordinary debug profile; named check case list1/1.
+  Terminal native DSR SUCCESS/1420s: harness compile0/141.571s, full workspace
+  check0/551.093s, strictClippy0/670.390s, fmt0/16.711s; all1694 source/control
+  before/after bindings match. This qualifies the fixture build, not TLS runtime.
+  The physical scratch is /build/rabs-lilacshore-public-20261103/t-c72,
+  actualZFS/device49 with unchanged20GiB storage guard, no RAM-backed compiler
+  or SDK stage. The previous c72 source was frozen until release stage ended.
+- [ ] Run frozen full-SDK controlleree9cf51d only after full
+  fixture QA passes. Old3f and clock-linkedc72 ordinary tools must both be LIVE
+  in the SAME native invocation using the same newly compiled bca7 harness.
+  Retain old check outcome; candidate must pass original TLS check (three4-unit
+  executions, then two2-hit/two-fresh-workspace rounds), then original archive
+  build test (exact archives, live metadata delivery, linked programs42/43).
+  Require original300s Cargo/600s helper limits, full SDK, receipts/no residual
+  members and all1694 source/control/tool/harness bindings before/after.
+  No stock-Cargo speed, isolated-clock-only causality, distinct-host or fleet
+  claim. Stop after any candidate failure or unsettled observed owned process.
+  DSRa3141351 FAILED/exit6/159s: old check0/1/60.890s, new check0/1/56.612s;
+  both canonical CLI exits2 before Cargo because operation_root is too long for
+  the existing108-byte Unix socket bound. No execution journal entry or residual
+  observed process; all1694 source/tool/control/harness beforeafter bindings
+  match. This is an OPERATOR PATH REFUSAL, never a TLS/clock comparison.
+  Corrected controller56cb2359 launched14:43:37UTC with the same full qualifier,
+  source/harness/tools and original limits. Only runtime TMPDIR changes to an
+  ordinary private /build/rlt1104 directory on the same actualZFS/device49;
+  preflight requires predicted socket bytes<108. No aliases, mounts, SDK or
+  socket-limit changes. Retain the first refusal; both binaries run again LIVE.
+  That short-root attempta755e18b also FAILED/exit6/22s before any runtime
+  subprocess: /build is root-owned0755, so creating /build/rlt1104 was refused.
+  No permission change or escalation follows. Controller33f7a856 now uses the
+  existing user-owned BASE/q directory; independent preflight proves writable
+  private parent, no existing target, actualZFS and predicted106bytes<108.
+  It started14:47:29UTC with identical source/harness/tools, all original limits
+  and both previous setup losses retained. No compiler has been replayed from
+  either pre-execution refusal. Initial launch annotation104 was corrected to
+  actual printed106 while retaining that annotation correction explicitly.
+  Actual owned-root DSR84732208 FAILED/exit6/757s: old check0/1/357.780s,
+  candidate check0/1/357.790s. Both reach real TLS standby, dispatch and one
+  authenticated/fenced rabsd-remote-dependency-admitted event for the same
+  first ActionKeyf8d25213; worker journals remain last=null. Original300s Cargo
+  command expires, actual normal released tools unchanged, all1694 source/
+  control/harness/tool beforeafter bindings match, observed residual processes
+  empty. Candidate build/program case stays UNRUN after the check loss. No
+  timer/profile/SDK/gate change, no claim that the clock repair fixes this path.
+- [x] Commit the one-line temporary-route repair only after complete QA and
+  actual named runtime outcome; preserve shared index and all peer changes.
+  Exact-file UBS remains raw1/3 critical,2044 warnings,475 informational;
+  its3 unchanged Command::new findings execute trusted test fixture outputs or
+  the explicitly selected worker. External baseline-path scan is not comparable
+  (11critical,2036warnings,476info, different test-file classification), never
+  an8-critical reduction claim. No policy/exclusion/suppression changes.
+  b526cd8c contains exactly1add/1remove in canonical_check_local.rs; shared
+  index remainsSHA858f9f03. Required fullQA0 and actual physical-route outcome
+  above are retained; this fixture commit is not TLS/cache qualification.
+- [ ] Locate and repair the actual post-admission handoff stall before another
+  acceptance attempt. No speculative production patch from the repeated timeout.
+  First diagnostic uses the actual normal debug coordinator produced by the
+  qualified harness build (789231920B/SHAf4fb34c2), release worker/wrapper,
+  same bca7 harness and original300/600s limits. Its two GDB snapshots catch
+  pre-admission SDK capture and CAS setup, not the blocked release handoff.
+  DSR collection0/649s, runtime0/1; independent debugger-postcheck marks two
+  trailing-end Python command errors despite GDB raw0. Original controller's
+  observation_complete=true is not clean debugger qualification; retain the
+  postcheck and do not inflate it. No residual observed processes remain.
+- [x] Build ordinary normal debug worker for receiver-side source-linked stacks:
+  controllerb14f7731 launched15:29:24UTC via DSR, original3600s cap; sourcebca7
+  unchanged, no flags/profile overrides. Includes genuine compilation of the
+  worker's Asupersync feature set. DSRcbce26ca completed SUCCESS/1156s; actual
+  Cargo build0/1134.210s, normalopt0/debug2/testfalse, worker713627528B/
+  SHA4cd79c76; version0 and all1694 listed source/control beforeafter match.
+  This is a diagnostic build, not a runtime or release pass.
+- [x] Collect receiver diagnostic339c8e51, launched via DSR15:49:08UTC with
+  original3600s cap. Current release coordinator remains the
+  actual failed8b5ad6b2 binary; correct source-bound debug worker plus exact
+  normal root helper will be placed together privately before the next trace.
+  Scratch BASE/r is an ordinary private physical ZFS directory; predicted
+  socket106bytes remains below the unchanged108byte limit. Corrected GDB
+  commands must reject Python errors, load symbols BEFORE stopping
+  the own birth/UID/executable-pinned worker, print no arguments/locals, detach
+  normally, and preserve original limits. Diagnostic timing is not acceptance.
+- [x] Retain DSRbf1e1433 diagnostic collection0/457s separately from actual
+  runtime0/1/raw101/358.604s. Both GDB commands are clean, source/control/tools
+  bind beforeafter, observer_errors[] and remaining_observed_processes{}.
+  Worker samples at150/240s show toolchain hex decoding then SHA256 checking;
+  write_bytes grows224747602 to511927770. This observed session is progressing
+  past admission, not a completely stuck handshake. Normal debug timing and
+  debugger stops cannot establish the release timeout's exact cause or speed.
+- [x] Audit the tested private snapshot against committed b526cd8c. There are
+  30 changed listed inputs plus46 additional committed files, no removed listed
+  inputs. The private snapshot omits SDK owned-image, upload-copy and durable
+  admission changes already committed in bff56dff/b93460b8/76f74dda, among other
+  recorded changes. It also omits9cbf86ba's single-buffer bulk hex encoder and
+  39736a0e's encode-once validated upload records: the older source_delivery::hex
+  still formats/allocates per input byte. This is a source finding, not an
+  isolated measured speedup. Do not patch the decoder speculatively or call the older
+  four private tools current whole-HEAD qualification.
+- [x] Stage exact git archive b526cd8c on physical TS2 ZFS:1740 regular files,
+  archive61952000B/SHA1aa2f082; no working overlay or shared-index change.
+- [x] Build all four mutually matching normal release roles plus the current
+  ordinary canonical harness from that committed source. DSR driver06afbdab
+  (6486B) launched16:01:12UTC, default3600s cap, jobs1, unchanged shipping/dev
+  profiles, no RUSTFLAGS or SDK trimming. Require actual Cargo artifacts,
+  versions, rustc passthrough and all1740 beforeafter source bindings.
+  DSRbb7b4917 finishes SUCCESS/728s; actual release build0/496.470s, three versions
+  and real-rustc wrapper probe0, harness compile0/177.690s and named-case list1.
+  All1740 files and frozen control bind beforeafter. Current rabsdSHAfe9c4e3f,
+  workerSHA88fd056d, wrapper97016468, root2e413f9e. Private artifacts only.
+- [x] Complete full committed-source workspace/all-target check, strictClippy
+  -Dwarnings and fmt before runtime/qualification/installation claims. DSR
+  controllerb2eb3215 launched16:14:21UTC with the same original3600s cap.
+  DSR4e835c1c SUCCESS/1374s: check0/754.720s, strictClippy0/565.830s,
+  fmt0/15.980s, all1740 files/control/tools bind beforeafter.
+  Old c72/bca7 compiler and runtime receipts remain scoped to named snapshots.
+- [ ] Run the same live incumbent/candidate full-SDK check in one invocation
+  with the newly built committed harness, original300/600s limits and original
+  complete unit/assertion denominator. Follow with archive/build/delivered
+  executable case only if the candidate check passes; retain all losses.
+  Superseded prepared a043142d is UNRUN. Its successorc37bea52 (15957B,
+  separate immutable job) adds actual locked-crate SDK upload/pool/dataset/
+  coordinator tests before the comparison. List and verify every scoped
+  compiled denominator, run installed-rustc retained-SDK test explicitly, and
+  stop on any component loss. Complete fullQA is still required first; no
+  skipped test, reduced SDK, assertion, ACK credit or deadline relaxation.
+  Native DSR launched16:38UTC with original3600s cap; collect real terminal
+  results and raw denominators before claiming any component or runtime pass.
+  At16:48UTC real locked-crate worker upload25/25 and SDK pool34/34 pass,
+  zero ignored. Sandbox compiled/listed22 cases; its installed-rustc retained
+  SDK case is explicitly running via --include-ignored on physical BASE/s.
+  The complete22-case result, coordinator upload tests, live old/new check and
+  candidate archive/program case remain pending. These59 passes are component
+  evidence, not a cache/serving, speed, fleet or release pass.
+  At16:53UTC sandbox22/22 passes including the actual installed SDK/compiler
+  case (491.920s); coordinator20/20 passes. All101 selected actual locked-crate
+  cases pass, zero failed/ignored. Actual oldc72 normal-release full-SDK check
+  is live; currentb526 check and archive/program remain pending. Read-only own
+  worker metadata sample16:53:58 pins UID1000/PID3125293/start16003238 and
+  observes141189202 write_bytes; no debugger or protocol/priority mutation.
+- [ ] After the blocking path is proved and repaired, rerun complete full-SDK
+  check+archive/program acceptance; then try a bounded ordinary shared-RCH
+  canary through normal available-slot admission before relying on exclusive
+  worker windows. Require exact source/ACK/release receipts and no shared daemon
+  or peer ownership changes; shared old-daemon compatibility remains unproved.
+
+**Live public diagnostic, November4 at09:21UTC:** supported shared drain at
+09:11:38UTC proved drained/used0/active[]. First observerece76bc7 passed actual
+recovery1/2 but omitted the unchanged480s inter-pass backoff from its own wait
+budget. It finished FAILED before Cargo, private daemon stopped0/absent and
+active[]/queued[]. The continuation's immutable driverb9788977 includes that
+actual backoff and validates the first no-Cargo/clean-shutdown report. It does
+not change worker policy, probes, canary or any compiler/readiness budget.
+Original drain fixes no-newCargo cutoff09:41:38UTC; the continuation's outer
+DSR cap is reduced to2970s to retain the original10:12UTC window end. Retain the
+first loss; no compiler has been replayed. Root must send the owner END only
+after actual settlement and supported shared re-enable.
+
+**Terminal public diagnostic, November4 at09:31UTC:** second probe and original
+canary passed; quarantine cleared, worker healthy/circuit closed, executed probe
+SHA36ce67b0 matched. Stock succeeded as above. RABS round0 exceeded the kernel's
+argument limit before a cache decision; no other round was replayed. Supported
+SAME-ID recovery finished378 with exit120/ACKtrue. Stock377 and failed378 both
+have sources_released/tree_retired/pair_released/retired true. Private status
+active[]/queued[]; recovery daemon868378 stopped normally with identity-pinned
+SIGTERM and death confirmation. Supported shared enable succeeded; fresh shared
+status healthy/used0/active[] at09:31:44UTC. END was sent to the owner. Receipts:
+`/Volumes/trj-data/rabs-worker-cache-wiring-20261102/public-route/v1-diagnostic/backoff/`.
+
+**Additional native result, November4 at08:52UTC:** DSR4889b673 compared the
+committed1d07947f monitor with its exact parent in one invocation. The original
+slow-first-census/background-writer regression fails on the parent and passes on
+the candidate. The candidate's full51-case suite remains RED:46pass/2fail/3exact
+Darwin skips. Failures are the unchanged5s backpressure receipt wait and the
+unchanged3MiB allocated-output lower bound (reported1448960B) on physical ZFS.
+All three frozen input hashes match after the run. Do not call this51/51 or a
+compiled1d/public-route proof. No production or fixture change was made; a small
+native allocation observation found a closed3MiB random file reporting1024B
+for~4s before3150848B; fsync did not immediately change the4MiB control's block
+count. The diagnostic data completed, but its DSR wrapper FAILED because its own
+collector tried to create the same output twice. Retain that loss separately
+from the actual samples. Do not weaken the allocated-byte tests or claim the
+production growth guard is fully qualified on delayed-allocation ZFS.
+
+**Retained failed experiment, November4 at07:23UTC:** the V2 occupied-scope prototype LOST
+its paired TRJ gate: incumbent selected case errors1/1; candidate scope fixtures
+29passed/2errors under each shell (31 each), no skips. All input hashes match.
+It earns no fix/performance credit and its production/test changes were manually
+retired. Prepared sourceb550 is superseded and will not be launched. Retain the
+failed receipts; no timeout was enlarged and no original assertion was removed.
+
+- [x] Finish collecting source628 normal-tools and workspace check/strictClippy/
+  fmt results. Both normal tools have compiled0; full qualification remains RED
+  regardless of later checks, due to the three named test failures above.
+- [ ] Run the explicitly labelled PUBLIC V1 DIAGNOSTIC after ALL compiler gates0,
+  final source audits, fresh worker-idle/drain and absence of both worker V2 policy
+  files. It retains and validates the exact failed producer receipts; it does not
+  change the strict all-green public/release controller. Its output is diagnostic
+  JSON, not a compiled/release artifact or M6/S7/A012 closure. It must still pass
+  original quarantine/consecutive probes/canary, resource gates, stock+four cache
+  rounds and exact acknowledged-build metadata checks, without Cargo replay.
+- [x] Qualify/commit the remaining protocol-comment size fix and one-line
+  witness-budget fixture newline correction separately; their working bytes are
+  not called compiled merely because628 compiled. Existing31-case V2 fixture
+  timing losses remain visible, independently of this default-V1 experiment.
+- [x] Mac capacity question: actual installed worker7209f6c0 reports31.527GiB on
+  native UUID24B30F94-BB75-438A-AE89-FC4590621E65 and12.244GiB on boot UUID
+  433876A4-515B-4164-8479-CF080290E46E, both topology checks valid. Only a private
+  probe alias was created; per-invocation root selectors did not update daemon
+  state/config or admit a build. Bare daemon capability command has no requested
+  path binding; a global root override would misdescribe other routes. No safe
+  config-only admission fix was found. No deletion/repack/unmount was performed.
+
+**Expanded safety checks, November4 at07:06UTC:** source628dc9b7 is still
+collecting its remaining compiled/build/workspace results. It is already RED:
+supervisor27/27, identity/census21/21 under each shell, compiled protocol3/3 and
+capability33/33 pass; each31-case V2 scope contract hits its original12s limit
+in the persistent-occupied-scope refusal case. Compiled escalation11/12 passes;
+its remaining fixture writes literal backslash-n while expecting two lines.
+No public Cargo is eligible from this producer, irrespective of later QA.
+
+- [x] Diagnose the earlier large-group timing fixture in one native invocation:
+  original adaptive case passes in this diagnostic (earlier10.020s failure
+  retained), fixed3s fault workload passes, and explicitly removing the shared
+  collection timeout still FAILS the original10s assertion at16.456s. Existing
+  assertions and production budgets are unchanged; this is fixture maintenance.
+- [x] Correct only the compiled witness-budget fixture newline: original output
+  is literal `7s\\n7s\\n`; corrected output is the expected two7s lines. Both
+  expected budgets remain7s and production budget logic is unchanged.
+- [ ] Prove the occupied-scope fix against incumbent in the SAME native DSR
+  invocation `rch_scope_occupied_paired` (07:06:20UTC): after the first live
+  post-KILL census, a fresh authenticated occupied scope can keep waiting without
+  another global census. Initial/first-post-KILL censuses remain; empty/unknown
+  always resumes the full census. Refusal45,12s fixture cap and all authority,
+  emptiness, generation and deadline assertions remain. Stronger existing test
+  requires both native censuses and no success receipt for occupied scope.
+- [ ] Qualify prepared sourceb5507274 with SIX explicit overlays, all1694 input
+  bindings, all131 mixed real-process/fixture cases, compiled3+12+33+59, both
+  normal tools and full workspace QA. It is NOT launched; do not mutate the
+  active628 source root. The paired scope run is a doubled-systemd/cgroupfs
+  contract, not a live systemd or public RABS proof.
+- [ ] Rebind the strict public controller only to a fully passing producer;
+  retain its full source, resource, quarantine/rejoin/canary and ACK gates.
+
 **Resumed qualification, November4 at06:38UTC:** sourcee3c8 failed the ORIGINAL
 nested-quoting size gate: compiled protocol2passed/1failed, nested110748 bytes
 against unchanged110000 cap. Native supervisor27/27 and capability33/33 passed;
