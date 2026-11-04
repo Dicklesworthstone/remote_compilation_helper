@@ -140,6 +140,8 @@ pub fn source_edit_identity(
 /// Cargo fingerprints feature-selected units and build-script environments;
 /// unchanged dependencies can therefore survive feature-selection changes.
 /// Clippy keeps every selection, feature and lint control in a separate family.
+/// Documentation keeps exact-argument, complete-source reuse: rustdoc assets
+/// and configuration are not modeled by ordinary rustc fingerprint families.
 #[must_use]
 pub fn compatible_arguments(
     program: &str,
@@ -863,6 +865,28 @@ mod tests {
                     CargoArtifactMode::RunExecution
                 )
                 .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn documentation_keeps_exact_private_target_identity() {
+        for selection in [
+            vec![],
+            vec!["--no-deps"],
+            vec!["--document-private-items"],
+            vec!["--package=app", "--features=extra"],
+            vec!["--target=x86_64-unknown-linux-gnu"],
+        ] {
+            let arguments = invocation("doc", &selection);
+            assert!(
+                compatible_arguments(
+                    "/__rabs/toolchain/bin/cargo",
+                    &arguments,
+                    CargoArtifactMode::Compilation,
+                )
+                .is_none(),
+                "rustdoc output must not alias a rustc compatibility family"
             );
         }
     }

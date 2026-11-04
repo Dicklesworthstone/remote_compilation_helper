@@ -55,11 +55,12 @@ impl SelectedCommand {
             "check" => CompilationCommand::Check,
             "test" => CompilationCommand::Test,
             "clippy" => CompilationCommand::Clippy,
+            "doc" => CompilationCommand::Doc,
             "run" => CompilationCommand::Run,
             "bench" => CompilationCommand::Bench,
             _ => {
                 return Err(invalid(
-                    "selected Cargo preparation supports build, check, test, clippy, run and bench",
+                    "selected Cargo preparation supports build, check, test, clippy, doc, run and bench",
                 ));
             }
         };
@@ -102,7 +103,7 @@ impl SelectedCommand {
                         == Some("/__rabs/out/cargo")
                     && inputs.get("RUSTC").and_then(Value::as_str)
                         == Some("/__rabs/toolchain/bin/rustc")
-                    && if command == CompilationCommand::Test {
+                    && if matches!(command, CompilationCommand::Test | CompilationCommand::Doc) {
                         inputs.get("RUSTDOC").and_then(Value::as_str)
                             == Some("/__rabs/toolchain/bin/rustdoc")
                     } else {
@@ -119,6 +120,15 @@ impl SelectedCommand {
                 "selected Clippy requires the exact canonical Cargo and rustc bindings",
             )?;
         }
+        if command == CompilationCommand::Doc {
+            require(
+                inputs.get("RUSTDOC").and_then(Value::as_str)
+                    == Some("/__rabs/toolchain/bin/rustdoc")
+                    && inputs.get("RUSTC").and_then(Value::as_str)
+                        == Some("/__rabs/toolchain/bin/rustc"),
+                "selected documentation requires the exact canonical rustdoc and rustc bindings",
+            )?;
+        }
         let environment = inputs
             .iter()
             .map(|(name, value)| {
@@ -131,8 +141,10 @@ impl SelectedCommand {
                     && matches!(name.as_str(), "CARGO_TARGET_DIR" | "RUSTC" | "RUSTDOC"))
                     && !(command == CompilationCommand::Clippy
                         && matches!(name.as_str(), "CARGO" | "RUSTC"))
+                    && !(command == CompilationCommand::Doc
+                        && matches!(name.as_str(), "RUSTDOC" | "RUSTC"))
                 {
-                    // Only the complete native or Clippy control set checked
+                    // Only the complete command control set checked
                     // above bypasses this rule; arbitrary overrides still fail.
                     require(
                         !matches!(name.as_str(), "CARGO" | "RUSTC" | "RUSTDOC" | "RUSTFLAGS" | "RUSTDOCFLAGS" | "GLIBC_TUNABLES")
@@ -294,6 +306,7 @@ impl SelectedCommand {
                         "--no-run" => &mut selection.no_run,
                         "--no-fail-fast" => &mut selection.no_fail_fast,
                         "--no-deps" => &mut selection.no_deps,
+                        "--document-private-items" => &mut selection.document_private_items,
                         _ => return Err(invalid("unsupported selected Cargo argument")),
                     };
                     require(!*flag, "duplicate selected Cargo flag")?;
@@ -344,32 +357,38 @@ impl SelectedCommand {
         }
     }
 
-    /// Clippy's executable selects its sibling driver. Verify both captured
-    /// programs before any graph query; ordinary Cargo must never discover a
-    /// host cargo-clippy plugin or a rustup proxy through PATH.
+    /// Verify command-specific captured executables before any graph query.
+    /// Clippy selects its sibling driver; documentation uses its bound rustdoc.
+    /// Neither may fall through to an ambient PATH tool or rustup proxy.
     pub(super) fn graph_program(&self, cargo: &Path) -> io::Result<PathBuf> {
-        if self.command != CompilationCommand::Clippy {
-            return Ok(cargo.to_owned());
-        }
+        let (programs, reason): (&[&str], _) = match self.command {
+            CompilationCommand::Clippy => (
+                &["cargo-clippy", "clippy-driver"],
+                "selected Clippy requires captured ordinary cargo-clippy and clippy-driver executables",
+            ),
+            CompilationCommand::Doc => (
+                &["rustdoc"],
+                "selected documentation requires a captured ordinary executable rustdoc",
+            ),
+            _ => return Ok(cargo.to_owned()),
+        };
         let bin = cargo
             .parent()
             .ok_or_else(|| invalid("selected Cargo executable parent missing"))?;
-        for program in ["cargo-clippy", "clippy-driver"] {
+        for program in programs {
             let metadata = std::fs::symlink_metadata(bin.join(program))?;
-            require(
-                metadata.is_file(),
-                "selected Clippy requires captured ordinary cargo-clippy and clippy-driver executables",
-            )?;
+            require(metadata.is_file(), reason)?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                require(
-                    metadata.permissions().mode() & 0o111 != 0,
-                    "selected Clippy requires captured ordinary cargo-clippy and clippy-driver executables",
-                )?;
+                require(metadata.permissions().mode() & 0o111 != 0, reason)?;
             }
         }
-        Ok(bin.join("cargo-clippy"))
+        Ok(if self.command == CompilationCommand::Clippy {
+            bin.join("cargo-clippy")
+        } else {
+            cargo.to_owned()
+        })
     }
 
     /// `cargo run` does not reliably return a graph without looking for its

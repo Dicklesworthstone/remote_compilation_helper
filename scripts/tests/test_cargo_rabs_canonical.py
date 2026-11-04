@@ -62,6 +62,9 @@ assert request["program"] == ("/__rabs/toolchain/bin/cargo-clippy" if clippy els
 if clippy:
     assert request["command_context"]["env"]["CARGO"] == "/__rabs/toolchain/bin/cargo"
     assert request["command_context"]["env"]["RUSTC"] == "/__rabs/toolchain/bin/rustc"
+if cargo_args[0] == "doc":
+    assert request["command_context"]["env"]["RUSTDOC"] == "/__rabs/toolchain/bin/rustdoc"
+    assert request["command_context"]["env"]["RUSTC"] == "/__rabs/toolchain/bin/rustc"
 if request["command_context"]["env"]["CARGO_INCREMENTAL"] == "1":
     assert request["artifacts"]["cargo"] == "cargo-private-incremental-" + (execution + "-" if execution else "") + "json-v1"
 else:
@@ -262,6 +265,11 @@ class CanonicalCargo(unittest.TestCase):
             tool = self.toolchain / "bin" / name
             tool.write_text("#!/bin/sh\nprintf unexpected >> '" + str(self.forbidden) + "'\nexit 98\n")
             tool.chmod(0o700)
+
+    def install_rustdoc(self):
+        tool = self.toolchain / "bin/rustdoc"
+        tool.write_text("#!/bin/sh\nprintf unexpected >> '" + str(self.forbidden) + "'\nexit 98\n")
+        tool.chmod(0o700)
 
     def select_rustup(self):
         self.profile.pop("toolchain_root")
@@ -1600,6 +1608,66 @@ class CanonicalCargo(unittest.TestCase):
                 self.assertEqual(stdout, b"fixture Cargo stdout\x00\xff\n")
                 self.assertIn(b'"kind": "fixture-worker-build"', stderr)
                 self.assertFalse((Path(record["operation"]) / "outputs").exists())
+
+    def test_canonical_doc_preserves_selection_compilers_and_full_tree_contract(self):
+        self.install_rustdoc()
+        for selected in (False, True):
+            for incremental in (False, True):
+                if selected:
+                    self.profile["source_selection"] = "cargo-unit-graph-v1"
+                else:
+                    self.profile.pop("source_selection", None)
+                if incremental:
+                    self.profile["incremental"] = True
+                else:
+                    self.profile.pop("incremental", None)
+                self.save()
+                args = ["doc", "--workspace", "--exclude=other", "--lib", "--bins", "--examples",
+                        "--no-deps", "--document-private-items", "--target=x86_64-unknown-linux-gnu", "--profile=release"]
+                with self.subTest(selected=selected, incremental=incremental):
+                    status, _, stderr, pid = self.invoke(args, env=dict(self.env, TEST_EXIT="101",
+                        RUSTDOC="/ambient/rustdoc", RUSTDOCFLAGS="--document-hidden-items"))
+                    self.assertEqual(status, 101, stderr.decode(errors="replace"))
+                    record = self.records()[-1]
+                    request = record["request"]
+                    self.assertEqual(record["pid"], pid)
+                    self.assertEqual(request["program"], "/__rabs/toolchain/bin/cargo")
+                    self.assertEqual(request["args"][:len(args)], args)
+                    self.assertEqual(request["command_context"]["env"], {
+                        "CARGO_INCREMENTAL": "1" if incremental else "0",
+                        "RUSTDOC": "/__rabs/toolchain/bin/rustdoc", "RUSTC": "/__rabs/toolchain/bin/rustc",
+                    })
+                    self.assertEqual(request["artifacts"], {
+                        "unit": "cargo", "files": [],
+                        "tree": "tree-files-v1", "cargo": "cargo-private-incremental-json-v1" if incremental else "cargo-json-v1",
+                    })
+                    self.assertEqual(request["cargo_source"].get("selection"),
+                                     "cargo-unit-graph-v1" if selected else None)
+
+    def test_doc_requires_ordinary_executable_rustdoc_before_operation_creation(self):
+        self.assert_refused(["doc"])
+        self.install_rustdoc()
+        tool = self.toolchain / "bin/rustdoc"
+        tool.chmod(0o600)
+        self.assert_refused(["doc"])
+        tool.chmod(0o700)
+        retained = self.toolchain / "bin/retained-rustdoc"
+        tool.rename(retained)
+        tool.symlink_to(retained)
+        self.assert_refused(["doc"])
+
+    def test_doc_refuses_browser_custom_output_harnesses_and_rustdoc_tails(self):
+        self.install_rustdoc()
+        for args in (
+            ["doc", "--open"], ["doc", "--output-format=json"], ["doc", "--config=other"],
+            ["doc", "--tests"], ["doc", "--test=integration"], ["doc", "--benches"],
+            ["doc", "--bench=timing"], ["doc", "--all-targets"], ["doc", "--doc"],
+            ["doc", "--no-run"], ["doc", "--no-fail-fast"], ["doc", "filter"],
+            ["doc", "--", "--document-hidden-items"], ["doc", "--document-private-items=true"],
+            ["check", "--document-private-items"], ["clippy", "--document-private-items"],
+        ):
+            with self.subTest(args=args):
+                self.assert_refused(args)
 
     def test_clippy_requires_both_ordinary_executable_components_before_operation_creation(self):
         self.assert_refused(["clippy"])

@@ -1,4 +1,4 @@
-//! Cargo-selected output names for canonical compilation, tests, runs and benches.
+//! Cargo-selected output names for canonical compilation, documentation and execution.
 //!
 //! Cargo owns target selection and hashed output names. Its complete bounded JSON
 //! stream supplies the required artifacts. Legacy contracts retain the complete
@@ -6,6 +6,8 @@
 //! derived compiler-state roots while retaining every reported output. Both
 //! still verify bytes and drain all writers. These messages never authorize
 //! cache publication, compiler skipping or runtime execution success.
+//! Rustdoc reports each crate's index, not every HTML page or shared asset;
+//! its reported files are a minimum for full-tree capture, never a delivery filter.
 
 use crate::artifact_tree::{MAX_TREE_FILES, TREE_FILES_VERSION, validate_tree_names};
 use serde_json::Value;
@@ -105,10 +107,32 @@ pub fn requested(request: &Value) -> io::Result<Option<CargoArtifactMode>> {
     let command = args[0];
     if !matches!(
         command,
-        "build" | "check" | "clippy" | "test" | "run" | "bench"
+        "build" | "check" | "clippy" | "doc" | "test" | "run" | "bench"
     ) {
         return Err(invalid(
-            "Cargo artifact contract requires build, check, clippy, test, run or bench",
+            "Cargo artifact contract requires build, check, clippy, doc, test, run or bench",
+        ));
+    }
+    if command == "doc"
+        && (request["command_context"]["env"]["RUSTDOC"] != "/__rabs/toolchain/bin/rustdoc"
+            || request["command_context"]["env"]["RUSTC"] != "/__rabs/toolchain/bin/rustc")
+    {
+        return Err(invalid(
+            "Cargo doc requires captured rustdoc and rustc bindings",
+        ));
+    }
+    if command == "doc"
+        && request["command_context"]["env"]
+            .as_object()
+            .is_some_and(|environment| {
+                environment.keys().any(|name| {
+                    name == "RUSTDOCFLAGS"
+                        || (name.starts_with("CARGO_") && name.ends_with("RUSTDOCFLAGS"))
+                })
+            })
+    {
+        return Err(invalid(
+            "Cargo doc refuses rustdoc flag environment overrides",
         ));
     }
     // cargo-clippy is an external Cargo command. Naming its retained binary
@@ -184,6 +208,17 @@ pub fn requested(request: &Value) -> io::Result<Option<CargoArtifactMode>> {
                 return Err(invalid(
                     "Clippy artifact capture requires a read-only lint run",
                 ));
+            }
+            "--open" | "--output-format" | "--tests" | "--test" | "--benches" | "--bench"
+            | "--all-targets" | "--doc" | "--no-fail-fast" | "--config" | "--unit-graph"
+                if command == "doc" =>
+            {
+                return Err(invalid(
+                    "Cargo doc artifact capture requires the bounded HTML documentation command",
+                ));
+            }
+            "--no-deps" | "--document-private-items" if command == "doc" && inline.is_some() => {
+                return Err(invalid("Cargo doc switches do not take values"));
             }
             "--no-run" | "--" | "--help" | "-h" | "--version" | "-V" => {
                 return Err(invalid(
@@ -381,6 +416,7 @@ fn derive_private_incremental_roots(args: &[&str]) -> io::Result<Vec<String>> {
             | "--doc"
             | "--no-deps"
                 if inline.is_none() => {}
+            "--document-private-items" if inline.is_none() && args[0] == "doc" => {}
             _ if matches!(args[0], "test" | "bench")
                 && !args[at].starts_with('-')
                 && !test_filter =>
@@ -402,6 +438,14 @@ fn derive_private_incremental_roots(args: &[&str]) -> io::Result<Vec<String>> {
         None if release || args[0] == "bench" => "release",
         None => "debug",
     };
+    if args[0] == "doc" && profile == "doc" {
+        // With this custom profile, the compiler's private-state root would
+        // be doc/incremental, also a valid rustdoc crate/output directory.
+        // The projection cannot identify those writers from names alone.
+        return Err(invalid(
+            "private incremental Cargo doc profile overlaps documentation outputs",
+        ));
+    }
     let mut roots = vec![format!("{profile}/incremental")];
     if let Some(target) = target {
         roots.push(format!("{target}/{profile}/incremental"));
@@ -991,6 +1035,163 @@ mod tests {
         let mut plain = base;
         plain["artifacts"].as_object_mut().unwrap().remove("cargo");
         assert_eq!(requested(&plain).unwrap(), None);
+    }
+
+    fn doc_request() -> Value {
+        json!({"program":"/__rabs/toolchain/bin/cargo",
+            "args":["doc", "--workspace", "--no-deps", "--document-private-items",
+                "--message-format=json", "--target-dir", OUTPUT_ROOT],
+            "command_context":{"env":{"RUSTDOC":"/__rabs/toolchain/bin/rustdoc",
+                "RUSTC":"/__rabs/toolchain/bin/rustc", "CARGO_INCREMENTAL":"1"}},
+            "artifacts":{"unit":"cargo", "tree":TREE_FILES_VERSION,
+                "files":[], "cargo":CARGO_ARTIFACTS_VERSION}})
+    }
+
+    #[test]
+    fn documentation_requires_captured_tools_and_the_complete_compilation_contract() {
+        let request = doc_request();
+        assert_eq!(
+            requested(&request).unwrap(),
+            Some(CargoArtifactMode::Compilation)
+        );
+        for field in ["RUSTDOC", "RUSTC"] {
+            for value in [
+                Value::Null,
+                json!(true),
+                json!("/host/tool"),
+                json!("rustdoc"),
+            ] {
+                let mut invalid = request.clone();
+                invalid["command_context"]["env"][field] = value;
+                assert!(requested(&invalid).is_err(), "{field}");
+            }
+        }
+        for field in [
+            "RUSTDOCFLAGS",
+            "CARGO_ENCODED_RUSTDOCFLAGS",
+            "CARGO_BUILD_RUSTDOCFLAGS",
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTDOCFLAGS",
+        ] {
+            let mut invalid = request.clone();
+            invalid["command_context"]["env"][field] = json!("--output-format=json");
+            assert!(requested(&invalid).is_err(), "{field}");
+        }
+        for contract in [
+            CARGO_TEST_ARTIFACTS_VERSION,
+            CARGO_RUN_ARTIFACTS_VERSION,
+            CARGO_BENCH_ARTIFACTS_VERSION,
+        ] {
+            let mut invalid = request.clone();
+            invalid["artifacts"]["cargo"] = json!(contract);
+            assert!(requested(&invalid).is_err(), "{contract}");
+        }
+        let mut invalid = request.clone();
+        invalid["program"] = json!("/__rabs/toolchain/bin/rustdoc");
+        assert!(requested(&invalid).is_err());
+        let mut invalid = request;
+        invalid["artifacts"]["tree"] = Value::Null;
+        assert!(requested(&invalid).is_err());
+    }
+
+    #[test]
+    fn documentation_refuses_browser_alternate_formats_and_runtime_selection() {
+        for option in [
+            "--open",
+            "--output-format=json",
+            "--output-format=html",
+            "--tests",
+            "--test=unit",
+            "--benches",
+            "--bench=timing",
+            "--all-targets",
+            "--doc",
+            "--no-run",
+            "--no-fail-fast",
+            "--config=build.rustdocflags=['--output-format=json']",
+            "--unit-graph",
+            "--document-private-items=true",
+            "--no-deps=false",
+            "--message-format=human",
+            "--target-dir=/outside",
+            "--help",
+            "--",
+        ] {
+            let mut request = doc_request();
+            request["args"].as_array_mut().unwrap().push(json!(option));
+            assert!(requested(&request).is_err(), "{option}");
+        }
+    }
+
+    #[test]
+    fn documentation_private_projection_preserves_pages_and_rejects_profile_collision() {
+        let mut request = doc_request();
+        request["artifacts"]["cargo"] = json!(CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION);
+        request["args"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("--target=x86_64-unknown-linux-gnu"));
+        let roots = private_incremental_roots(&request).unwrap().unwrap();
+        assert_eq!(
+            roots,
+            [
+                "debug/incremental",
+                "x86_64-unknown-linux-gnu/debug/incremental"
+            ]
+        );
+        for name in [
+            "doc/incremental/index.html",
+            "doc/static.files/main.js",
+            "x86_64-unknown-linux-gnu/doc/incremental/fn.item.html",
+            "x86_64-unknown-linux-gnu/doc/src/incremental/lib.rs.html",
+        ] {
+            assert!(!is_private_incremental_file(&roots, name), "{name}");
+        }
+        for selector in [vec!["--profile=doc"], vec!["--profile", "doc"]] {
+            let mut collision = request.clone();
+            collision["args"]
+                .as_array_mut()
+                .unwrap()
+                .extend(selector.into_iter().map(|value| json!(value)));
+            assert!(private_incremental_roots(&collision).is_err());
+            // Complete-tree delivery makes no private-state exclusion.
+            collision["artifacts"]["cargo"] = json!(CARGO_ARTIFACTS_VERSION);
+            assert_eq!(private_incremental_roots(&collision).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn documentation_report_indexes_are_a_minimum_for_full_tree_delivery() {
+        for prefix in ["doc", "x86_64-unknown-linux-gnu/doc"] {
+            let index = format!("{prefix}/app/index.html");
+            let source = format!("{prefix}/src/app/lib.rs.html");
+            let asset = format!("{prefix}/static.files/main.js");
+            let item = format!("{prefix}/app/fn.private_item.html");
+            let bytes = stream(&[
+                record("lib", &[&format!("{OUTPUT_ROOT}/{index}")], None),
+                json!({"reason":"build-finished", "success":true}),
+            ]);
+            let report = CargoArtifactReport::read(
+                bytes.as_slice(),
+                OUTPUT_ROOT,
+                CargoArtifactMode::Compilation,
+            )
+            .unwrap();
+            assert_eq!(report.files().collect::<Vec<_>>(), [index.as_str()]);
+            report
+                .validate_outputs([
+                    (index.as_str(), false),
+                    (source.as_str(), false),
+                    (asset.as_str(), false),
+                    (item.as_str(), false),
+                ])
+                .unwrap();
+            assert!(
+                report
+                    .validate_outputs([(asset.as_str(), false), (source.as_str(), false)])
+                    .is_err(),
+                "assets cannot substitute for the selected crate's index"
+            );
+        }
     }
 
     fn clippy_request() -> Value {

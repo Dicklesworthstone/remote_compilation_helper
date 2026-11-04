@@ -22,8 +22,9 @@ const MAX_ARGUMENT_BYTES: usize = 16 * 1024;
 /// binary/example, and `Bench` runs selected benchmarks unless `no_run` is set.
 /// Their bodies and outcomes are never cached. `Clippy` checks the selected
 /// targets with the captured lint driver, whose results are never rustc cache
-/// results. Cargo can run build scripts and load procedural macros in every
-/// command. The validated unit graph
+/// results. `Doc` renders documentation with captured rustdoc; documentation
+/// output never establishes rustc cache authority. Cargo can run build scripts
+/// and load procedural macros in every command. The validated unit graph
 /// selects the required closed-worker boundary for compiler cache authority.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -33,6 +34,7 @@ pub enum CompilationCommand {
     Build,
     Test,
     Clippy,
+    Doc,
     Run,
     Bench,
 }
@@ -45,6 +47,7 @@ impl CompilationCommand {
             Self::Build => "build",
             Self::Test => "test",
             Self::Clippy => "clippy",
+            Self::Doc => "doc",
             Self::Run => "run",
             Self::Bench => "bench",
         }
@@ -99,9 +102,11 @@ pub struct CompilationSelection {
     /// options and may contain empty strings, Unicode or control bytes other
     /// than NUL, which cannot be represented in a process argument.
     pub run_args: Vec<String>,
-    /// Lint only the selected packages, leaving dependency rustc compilation to
-    /// Cargo. This flag belongs to Clippy rather than to ordinary Cargo check.
+    /// Limit Clippy linting or documentation generation to selected packages.
+    /// Cargo still compiles any dependencies those operations require.
     pub no_deps: bool,
+    /// Include private items in generated documentation, only for `Doc`.
+    pub document_private_items: bool,
     /// Bounded lint-level controls after `--`, only for Clippy. Arbitrary rustc
     /// flags, response files and output/configuration paths are not admitted.
     pub lint_args: Vec<String>,
@@ -227,9 +232,31 @@ impl CompilationSelection {
                 "Cargo run selects one package and one binary or example",
             ));
         }
-        if command != CompilationCommand::Clippy && (self.no_deps || !self.lint_args.is_empty()) {
+        if self.no_deps
+            && !matches!(
+                command,
+                CompilationCommand::Clippy | CompilationCommand::Doc
+            )
+        {
+            return Err(invalid("--no-deps requires Cargo clippy or doc"));
+        }
+        if command != CompilationCommand::Clippy && !self.lint_args.is_empty() {
             return Err(invalid(
                 "Clippy selection requires the Cargo clippy command",
+            ));
+        }
+        if self.document_private_items && command != CompilationCommand::Doc {
+            return Err(invalid("private documentation items require Cargo doc"));
+        }
+        if command == CompilationCommand::Doc
+            && (self.tests
+                || self.benches
+                || self.all_targets
+                || !self.test.is_empty()
+                || !self.bench.is_empty())
+        {
+            return Err(invalid(
+                "Cargo doc selects libraries, binaries or examples, not tests or benches",
             ));
         }
         validate_lint_arguments(&self.lint_args)?;
@@ -295,6 +322,7 @@ impl CompilationSelection {
             (self.no_run, "--no-run"),
             (self.no_fail_fast, "--no-fail-fast"),
             (self.no_deps, "--no-deps"),
+            (self.document_private_items, "--document-private-items"),
         ] {
             if enabled {
                 args.push(option.to_owned());
@@ -735,6 +763,7 @@ mod tests {
             ("build", CompilationCommand::Build),
             ("test", CompilationCommand::Test),
             ("clippy", CompilationCommand::Clippy),
+            ("doc", CompilationCommand::Doc),
             ("run", CompilationCommand::Run),
             ("bench", CompilationCommand::Bench),
         ] {
@@ -743,7 +772,7 @@ mod tests {
             assert_eq!(serde_json::to_value(command).unwrap(), json!(text));
         }
         for value in [
-            json!("doc"),
+            json!("rustdoc"),
             json!("check --config=bad"),
             json!("Build"),
             json!(null),
@@ -752,6 +781,95 @@ mod tests {
         ] {
             assert!(serde_json::from_value::<CompilationCommand>(value).is_err());
         }
+    }
+
+    #[test]
+    fn documentation_selects_rendered_targets_without_accepting_execution_controls() {
+        let selection: CompilationSelection = serde_json::from_value(json!({
+            "workspace":true, "exclude":["unpublished"], "features":["app/fast"],
+            "lib":true, "bin":["tool"], "example":["sample"], "no_deps":true,
+            "document_private_items":true, "target":["host-tuple"], "profile":"release"
+        }))
+        .unwrap();
+        assert_eq!(
+            selection.cargo_arguments(CompilationCommand::Doc).unwrap(),
+            [
+                "doc",
+                "--workspace",
+                "--lib",
+                "--no-deps",
+                "--document-private-items",
+                "--exclude",
+                "unpublished",
+                "--features",
+                "app/fast",
+                "--bin",
+                "tool",
+                "--example",
+                "sample",
+                "--target",
+                "host-tuple",
+                "--profile",
+                "release"
+            ]
+        );
+        assert!(
+            selection
+                .runtime_arguments(CompilationCommand::Doc)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            serde_json::from_value::<CompilationSelection>(
+                serde_json::to_value(&selection).unwrap()
+            )
+            .unwrap(),
+            selection
+        );
+        for value in [
+            json!({"tests":true}),
+            json!({"test":["suite"]}),
+            json!({"benches":true}),
+            json!({"bench":["timing"]}),
+            json!({"all_targets":true}),
+            json!({"doc":true}),
+            json!({"no_run":true}),
+            json!({"no_fail_fast":true}),
+            json!({"test_filter":"case"}),
+            json!({"test_args":["--nocapture"]}),
+            json!({"run_args":["argument"]}),
+            json!({"lint_args":["-D", "warnings"]}),
+        ] {
+            let rejected: CompilationSelection = serde_json::from_value(value.clone()).unwrap();
+            assert!(
+                rejected.cargo_arguments(CompilationCommand::Doc).is_err(),
+                "{value}"
+            );
+        }
+        for command in [
+            CompilationCommand::Check,
+            CompilationCommand::Build,
+            CompilationCommand::Clippy,
+            CompilationCommand::Test,
+            CompilationCommand::Run,
+            CompilationCommand::Bench,
+        ] {
+            assert!(
+                CompilationSelection {
+                    document_private_items: true,
+                    ..CompilationSelection::default()
+                }
+                .cargo_arguments(command)
+                .is_err(),
+                "{command:?}"
+            );
+        }
+        assert!(
+            serde_json::from_value::<CompilationSelection>(
+                json!({"document_private_items":"true"})
+            )
+            .is_err()
+        );
     }
 
     #[test]

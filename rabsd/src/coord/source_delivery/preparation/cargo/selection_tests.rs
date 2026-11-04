@@ -103,6 +103,14 @@ fn request(command: &str, extra: &[&str]) -> Value {
                 "RUSTC":"/__rabs/toolchain/bin/rustc",
             }),
         )
+    } else if command == "doc" {
+        (
+            "/__rabs/toolchain/bin/cargo",
+            json!({
+                "RUSTDOC":"/__rabs/toolchain/bin/rustdoc",
+                "RUSTC":"/__rabs/toolchain/bin/rustc",
+            }),
+        )
     } else {
         ("/__rabs/toolchain/bin/cargo", json!({}))
     };
@@ -139,11 +147,13 @@ fn native_specification(profile: Value) -> Value {
 #[cfg(target_os = "linux")]
 #[test]
 fn selected_native_commands_map_driver_controls_without_widening_public_requests() {
-    for command in ["check", "build", "test", "clippy", "run", "bench"] {
+    for command in ["check", "build", "test", "clippy", "doc", "run", "bench"] {
         let selection = if command == "run" {
             json!({"bin":["app"], "run_args":["--unit-graph", "--jobs=100"]})
         } else if command == "clippy" {
             json!({"no_deps":true, "lint_args":["-D", "warnings", "-Aclippy::needless_return"]})
+        } else if command == "doc" {
+            json!({"no_deps":true, "document_private_items":true})
         } else {
             json!({})
         };
@@ -175,7 +185,7 @@ fn selected_native_commands_map_driver_controls_without_widening_public_requests
             ("CARGO_TARGET_DIR".into(), "/private/planning/target".into()),
             ("RUSTC".into(), "/captured/toolchain/bin/rustc".into()),
         ]);
-        if command == "test" {
+        if matches!(command, "test" | "doc") {
             expected.insert("RUSTDOC".into(), "/captured/toolchain/bin/rustdoc".into());
         }
         if command == "clippy" {
@@ -907,6 +917,143 @@ fn selected_clippy_preserves_selection_lints_and_captured_planning_tools() {
         .unwrap()
         .is_empty()
     );
+}
+
+#[test]
+fn selected_documentation_binds_both_compilers_and_preserves_doc_options() {
+    let input = request(
+        "doc",
+        &[
+            "--package=app",
+            "--lib",
+            "--example=sample",
+            "--no-deps",
+            "--document-private-items",
+            "--target=x86_64-unknown-linux-gnu",
+            "--profile=release",
+        ],
+    );
+    let selected =
+        SelectedCommand::parse(&input, "Cargo.toml", PreparationContext::RemoteRequest).unwrap();
+    assert_eq!(selected.command, CompilationCommand::Doc);
+    assert_eq!(
+        selected.graph_arguments(&Value::Null, None).unwrap(),
+        [
+            "doc",
+            "--lib",
+            "--no-deps",
+            "--document-private-items",
+            "--package",
+            "app",
+            "--example",
+            "sample",
+            "--target",
+            "x86_64-unknown-linux-gnu",
+            "--profile",
+            "release",
+        ]
+    );
+    assert!(selected.graph_tail_arguments().unwrap().is_empty());
+    let mut process = Command::new("/captured/toolchain/bin/cargo");
+    selected.configure(
+        &mut process,
+        Path::new("/captured/toolchain/bin/rustc"),
+        Path::new("/private/planning"),
+    );
+    let environment = process
+        .get_envs()
+        .map(|(name, value)| (name.to_str().unwrap(), value.unwrap().to_str().unwrap()))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(environment["RUSTC"], "/captured/toolchain/bin/rustc");
+    assert_eq!(environment["RUSTDOC"], "/captured/toolchain/bin/rustdoc");
+    for name in ["RUSTDOC", "RUSTC"] {
+        for value in [Value::Null, json!("/host/compiler"), json!("rustdoc")] {
+            let mut invalid = input.clone();
+            invalid["command_context"]["env"][name] = value;
+            assert!(
+                SelectedCommand::parse(&invalid, "Cargo.toml", PreparationContext::RemoteRequest)
+                    .is_err(),
+                "{name}"
+            );
+        }
+        let mut missing = input.clone();
+        missing["command_context"]["env"]
+            .as_object_mut()
+            .unwrap()
+            .remove(name);
+        assert!(
+            SelectedCommand::parse(&missing, "Cargo.toml", PreparationContext::RemoteRequest)
+                .is_err(),
+            "missing {name}"
+        );
+    }
+    for extra in [
+        vec!["--open"],
+        vec!["--output-format=json"],
+        vec!["--config=other"],
+        vec!["--tests"],
+        vec!["--test=integration"],
+        vec!["--benches"],
+        vec!["--bench=timing"],
+        vec!["--all-targets"],
+        vec!["--doc"],
+        vec!["--no-run"],
+        vec!["--no-fail-fast"],
+        vec!["--", "--document-hidden-items"],
+    ] {
+        assert!(
+            SelectedCommand::parse(
+                &request("doc", &extra),
+                "Cargo.toml",
+                PreparationContext::RemoteRequest
+            )
+            .is_err(),
+            "{extra:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn selected_documentation_requires_ordinary_executable_captured_rustdoc() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let fixture = tempfile::tempdir().unwrap();
+    let selected = SelectedCommand::parse(
+        &request("doc", &[]),
+        "Cargo.toml",
+        PreparationContext::RemoteRequest,
+    )
+    .unwrap();
+    for kind in ["missing", "directory", "nonexecutable", "symlink", "valid"] {
+        let bin = fixture.path().join(kind).join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let path = bin.join("rustdoc");
+        match kind {
+            "missing" => {}
+            "directory" => fs::create_dir(path).unwrap(),
+            "symlink" => {
+                let target = bin.join("other");
+                fs::write(&target, "captured tool").unwrap();
+                fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+                symlink(target, path).unwrap();
+            }
+            _ => {
+                fs::write(&path, "captured tool").unwrap();
+                fs::set_permissions(
+                    path,
+                    fs::Permissions::from_mode(if kind == "valid" { 0o755 } else { 0o644 }),
+                )
+                .unwrap();
+            }
+        }
+        let result = selected.graph_program(&bin.join("cargo"));
+        if kind == "valid" {
+            assert_eq!(result.unwrap(), bin.join("cargo"));
+        } else {
+            assert!(result.is_err(), "{kind}");
+        }
+    }
 }
 
 #[test]

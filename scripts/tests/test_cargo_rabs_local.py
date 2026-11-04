@@ -32,7 +32,7 @@ assert len(sys.argv) == 3 and sys.argv[1] == "--canonical-compile-local", sys.ar
 path = pathlib.Path(sys.argv[2])
 profile = json.loads(path.read_bytes())
 assert profile["version"] == "canonical-compile-local-v1"
-assert profile["command"] in ("check", "build", "test", "clippy", "run", "bench")
+assert profile["command"] in ("check", "build", "test", "clippy", "doc", "run", "bench")
 assert "selection" in profile
 record = {"pid":os.getpid(), "argv":sys.argv, "profile":profile,
           "retained":str(path), "file_mode":stat.S_IMODE(path.stat().st_mode),
@@ -84,7 +84,7 @@ class CanonicalLocalCargo(unittest.TestCase):
         for directory in (self.source, self.tools / "bin", self.state, self.operations):
             directory.mkdir(parents=True, mode=0o700)
         self.forbidden = self.root / "unexpected-build"
-        for name in ("cargo", "rustc", "cargo-clippy", "clippy-driver", "rch"):
+        for name in ("cargo", "rustc", "rustdoc", "cargo-clippy", "clippy-driver", "rch"):
             tool = self.tools / "bin" / name
             tool.write_text("#!/bin/sh\nprintf unexpected >> '" + str(self.forbidden) + "'\nexit 98\n")
             tool.chmod(0o700)
@@ -617,6 +617,60 @@ class CanonicalLocalCargo(unittest.TestCase):
                 self.assertTrue(Path(record["retained"]).parent.name.startswith("clippy-"))
                 self.assertEqual(self.profile_path.read_bytes(), original)
 
+    def test_doc_selection_and_captured_compilers_reach_native_driver_once(self):
+        self.profile.update(command="doc", selection={"no_deps": True, "document_private_items": True})
+        for mode in (None, "cargo-unit-graph-v1"):
+            if mode is None:
+                self.profile.pop("source_selection", None)
+            else:
+                self.profile["source_selection"] = mode
+            self.save()
+            original = self.profile_path.read_bytes()
+            for args, expected in (
+                (["doc"], {}),
+                (["doc", "--workspace", "--exclude=other", "--lib", "--bins", "--examples",
+                  "--no-deps", "--document-private-items", "--target=host-tuple", "--profile=release"],
+                 {"workspace": True, "exclude": ["other"], "lib": True, "bins": True, "examples": True,
+                  "no_deps": True, "document_private_items": True, "target": ["host-tuple"], "profile": "release"}),
+                (["doc", "-papp", "--bin=tool", "--example=sample", "--features=app/fast"],
+                 {"packages": ["app"], "bin": ["tool"], "example": ["sample"], "features": ["app/fast"]}),
+            ):
+                with self.subTest(mode=mode, args=args):
+                    status, _, stderr, pid = self.invoke(args)
+                    self.assertEqual(status, 0, stderr.decode(errors="replace"))
+                    record = self.records()[-1]
+                    self.assertEqual(record["pid"], pid)
+                    self.assertEqual(record["profile"], dict(self.profile, command="doc", selection=expected))
+                    self.assertTrue(Path(record["retained"]).parent.name.startswith("doc-"))
+                    self.assertEqual(launcher.canonical_local_environment(record["profile"]), {
+                        "CARGO_INCREMENTAL": "0", "CARGO_TARGET_DIR": "/__rabs/out/cargo",
+                        "RUSTC": "/__rabs/toolchain/bin/rustc", "RUSTDOC": "/__rabs/toolchain/bin/rustdoc",
+                    })
+                    self.assertEqual(self.profile_path.read_bytes(), original)
+
+    def test_doc_requires_captured_rustdoc_before_retaining_operation(self):
+        tool = self.tools / "bin/rustdoc"
+        tool.chmod(0o600)
+        self.assert_refused(["doc"])
+        tool.chmod(0o700)
+        retained = self.tools / "bin/retained-rustdoc"
+        tool.rename(retained)
+        self.assert_refused(["doc", "--no-deps"])
+        tool.symlink_to(retained)
+        self.assert_refused(["doc"])
+
+    def test_doc_rejects_browser_custom_output_harnesses_and_rustdoc_tails(self):
+        for args in (
+            ["doc", "--open"], ["doc", "--output-format=json"], ["doc", "--config=other"],
+            ["doc", "--tests"], ["doc", "--test=integration"], ["doc", "--benches"],
+            ["doc", "--bench=timing"], ["doc", "--all-targets"], ["doc", "--doc"],
+            ["doc", "--no-run"], ["doc", "--no-fail-fast"], ["doc", "filter"],
+            ["doc", "--", "--document-hidden-items"], ["doc", "--document-private-items=true"],
+            ["check", "--document-private-items"], ["clippy", "--document-private-items"],
+        ):
+            with self.subTest(args=args):
+                self.assert_refused(args)
+
     def test_clippy_requires_captured_components_before_retaining_operation(self):
         incomplete = self.root / "incomplete-toolchain"
         (incomplete / "bin").mkdir(parents=True)
@@ -983,7 +1037,7 @@ class CanonicalLocalCargo(unittest.TestCase):
 
     def test_commands_authority_options_and_missing_values_refuse_before_handoff(self):
         rejected = [
-            ["doc"], ["rustc"], ["+nightly", "check"],
+            ["rustdoc"], ["rustc"], ["+nightly", "check"],
             ["check", "--config", "build.rustc=other"], ["check", "--config=other"],
             ["check", "--target-dir=/other"], ["check", "--manifest-path", "other/Cargo.toml"],
             ["check", "--message-format=json"], ["check", "-Zunstable-options"],

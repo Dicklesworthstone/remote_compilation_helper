@@ -452,13 +452,14 @@ fn main() {
                  \n\
                  USAGE: rabsd [--version|--help|--check-config|--run-for-ms N]\n\
                  CANONICAL LOCAL: rabsd --canonical-compile-local <profile.json>\n\
-                 Captures source/toolchain, then runs selected cargo check/build/clippy/test/run/bench --offline --locked at canonical paths.\n\
+                 Captures source/toolchain, then runs selected cargo check/build/clippy/doc/test/run/bench --offline --locked at canonical paths.\n\
                  profile version canonical-compile-local-v1 requires source_root, toolchain_root, state_root,\n\
                  operation_root and wrapper absolute paths; state/operation roots must already be private (0700).\n\
                  Optional manifest (Cargo.toml), vendor or cargo_home_source, jobs (1), timeout_seconds (1800).\n\
-                 command is check (default), build, clippy, test, run or bench; selection chooses packages, features, targets and profiles.\n\
+                 command is check (default), build, clippy, doc, test, run or bench; selection chooses packages, features, targets and profiles.\n\
                  A check without selection means --lib; build, test --no-run and bench --no-run retain their completed target directory.\n\
                  Clippy requires captured cargo-clippy/clippy-driver, supports no_deps and lint_args, and never serves lint action-cache hits.\n\
+                 Doc requires captured rustdoc, supports no_deps/document_private_items, and retains generated documentation in target_dir.\n\
                  Test selection accepts doc, no_run, no_fail_fast, test_filter and literal test_args after --.\n\
                  Tests/doctests execute on every request; doctests use captured rustdoc and failures retain Cargo's status.\n\
                  Run selects one binary/example with literal run_args; Bench supports no_run, no_fail_fast, test_filter and test_args.\n\

@@ -1245,7 +1245,7 @@ def canonical_daemon_endpoint(value):
     return endpoint
 
 
-def canonical_command_environment(values, clippy=False, incremental=False):
+def canonical_command_environment(values, clippy=False, incremental=False, documentation=False):
     """Bind explicit build inputs without inheriting host variables or policy.
 
     The native env-cwd-v1 validator remains authoritative. This frontend is
@@ -1256,6 +1256,8 @@ def canonical_command_environment(values, clippy=False, incremental=False):
     environment = {"CARGO_INCREMENTAL": "1" if incremental else "0"}
     if clippy:
         environment.update(CARGO="/__rabs/toolchain/bin/cargo", RUSTC="/__rabs/toolchain/bin/rustc")
+    if documentation:
+        environment.update(RUSTDOC="/__rabs/toolchain/bin/rustdoc", RUSTC="/__rabs/toolchain/bin/rustc")
     return canonical_environment(values, environment)
 
 
@@ -1600,8 +1602,8 @@ def canonical_build_arguments(args):
     including toolchain-specific intermediate and target-triple layouts.
     """
     import re
-    if not args or args[0] not in ("build", "check", "clippy", "test", "run", "bench") or len(args) > 256:
-        raise SetupError("canonical mode requires build, check, clippy, test, run or bench")
+    if not args or args[0] not in ("build", "check", "clippy", "doc", "test", "run", "bench") or len(args) > 256:
+        raise SetupError("canonical mode requires build, check, clippy, doc, test, run or bench")
     if any(not isinstance(arg, str) or len(arg) > 4096 or "\0" in arg for arg in args):
         raise SetupError("canonical Cargo arguments exceed their bounds")
     try:
@@ -1629,6 +1631,8 @@ def canonical_build_arguments(args):
             # including strings that look like Cargo or launcher options.
             break
         option, separator, value = args[at].partition("=")
+        if args[0] == "doc" and option in ("--test", "--tests", "--bench", "--benches", "--all-targets"):
+            raise SetupError("canonical doc selects libraries, binaries or examples, not tests or benches")
         if option in ("--bin", "--example", "--test", "--bench", "--package", "-p",
                       "--features", "-F", "--target", "--color", "--exclude", "--profile"):
             if not separator:
@@ -1679,7 +1683,9 @@ def canonical_build_arguments(args):
             pass
         elif not separator and option == "--doc" and args[0] == "test":
             pass
-        elif not separator and option == "--no-deps" and args[0] == "clippy":
+        elif not separator and option == "--no-deps" and args[0] in ("clippy", "doc"):
+            pass
+        elif not separator and option == "--document-private-items" and args[0] == "doc":
             pass
         elif not separator and option in ("--locked", "--offline", "--frozen", "--all-features",
                                           "--no-default-features", "--verbose", "-v", "-vv", "--quiet", "-q"):
@@ -1718,7 +1724,9 @@ def canonical_invocation(profile_path, args, env):
     cargo_args = cargo_args[:separator]
     execution = cargo_args[0] if cargo_args[0] in ("test", "run", "bench") and "--no-run" not in cargo_args else None
     clippy = cargo_args[0] == "clippy"
-    required_tools = ("cargo", "rustc", "cargo-clippy", "clippy-driver") if clippy else ("cargo", "rustc")
+    documentation = cargo_args[0] == "doc"
+    required_tools = (("cargo", "rustc", "cargo-clippy", "clippy-driver") if clippy
+                      else ("cargo", "rustc", "rustdoc") if documentation else ("cargo", "rustc"))
     profile = canonical_profile(profile_path, required_tools, env, toolchain)
     incremental = profile.get("incremental", False)
     live_flags = ["--live-stderr"] if profile.get("live_stderr", False) else []
@@ -1732,7 +1740,7 @@ def canonical_invocation(profile_path, args, env):
                 cargo_args.append(flag)
     cargo_args += ["--message-format=json", "--manifest-path", manifest, "--target-dir", "/__rabs/out/cargo"]
     cargo_args += trailing_args
-    command_env = canonical_command_environment(profile.get("env", {}), clippy, incremental)
+    command_env = canonical_command_environment(profile.get("env", {}), clippy, incremental, documentation)
     if incremental:
         # The matching native contract retains compiler state privately and
         # excludes only its verified incremental roots from artifact delivery.
@@ -1863,6 +1871,7 @@ LOCAL_COMPILATION_VALUES = {
 }
 LOCAL_TEST_FLAGS = {"--doc": "doc", "--no-run": "no_run", "--no-fail-fast": "no_fail_fast"}
 LOCAL_CLIPPY_FLAGS = {"--no-deps": "no_deps"}
+LOCAL_DOC_FLAGS = {"--document-private-items": "document_private_items"}
 
 
 def canonical_local_selection(args):
@@ -1873,12 +1882,13 @@ def canonical_local_selection(args):
     syntax; no flag can select a compiler, manifest, config or output root.
     """
     args = list(args) if args else ["check"]
-    if args[0] not in ("check", "build", "test", "clippy", "run", "bench"):
-        raise SetupError("local canonical mode supports cargo check, build, clippy, test, run or bench only")
+    if args[0] not in ("check", "build", "test", "clippy", "doc", "run", "bench"):
+        raise SetupError("local canonical mode supports cargo check, build, clippy, doc, test, run or bench only")
     testing = args[0] in ("test", "bench")
     clippy = args[0] == "clippy"
+    documentation = args[0] == "doc"
     running = args[0] == "run"
-    flags = dict(LOCAL_COMPILATION_FLAGS, **LOCAL_TEST_FLAGS, **LOCAL_CLIPPY_FLAGS)
+    flags = dict(LOCAL_COMPILATION_FLAGS, **LOCAL_TEST_FLAGS, **LOCAL_CLIPPY_FLAGS, **LOCAL_DOC_FLAGS)
 
     def checked_value(value, *, empty=False, options=False, controls=False):
         try:
@@ -1920,8 +1930,10 @@ def canonical_local_selection(args):
                 raise SetupError("harness selection requires the local canonical test or bench command")
             if option == "--doc" and args[0] != "test":
                 raise SetupError("documentation tests require the local canonical test command")
-            if option in LOCAL_CLIPPY_FLAGS and not clippy:
-                raise SetupError("lint selection requires the local canonical clippy command")
+            if option in LOCAL_CLIPPY_FLAGS and not (clippy or documentation):
+                raise SetupError("--no-deps requires the local canonical clippy or doc command")
+            if option in LOCAL_DOC_FLAGS and not documentation:
+                raise SetupError("private documentation items require the local canonical doc command")
             selection[flags[option]] = True
             at += 1
             continue
@@ -1971,6 +1983,8 @@ def canonical_local_selection(args):
             or len(selection.get("target", [])) > 1
             or len(selection.get("bin", [])) + len(selection.get("example", [])) > 1):
         raise SetupError("local canonical run selects at most one package, target platform and binary or example")
+    if documentation and any(selection.get(field) for field in ("tests", "benches", "all_targets", "test", "bench")):
+        raise SetupError("local canonical doc selects libraries, binaries or examples, not tests or benches")
     # This is the native deterministic compilation prefix, including option bytes.
     size = len(args[0])
     size += sum(len(option) for option, field in flags.items() if selection.get(field))
@@ -1997,8 +2011,8 @@ def canonical_local_profile(path, env=None, toolchain=None):
     if (not required <= profile.keys() or profile.keys() - required - optional
             or profile["version"] != "canonical-compile-local-v1"):
         raise SetupError("invalid canonical-compile-local-v1 profile fields")
-    if profile.get("command", "check") not in ("check", "build", "test", "clippy", "run", "bench"):
-        raise SetupError("local canonical command must be check, build, clippy, test, run or bench")
+    if profile.get("command", "check") not in ("check", "build", "test", "clippy", "doc", "run", "bench"):
+        raise SetupError("local canonical command must be check, build, clippy, doc, test, run or bench")
     canonical_local_source_selection(profile)
     canonical_local_environment(profile)
     for name, maximum in (("jobs", 4096), ("timeout_seconds", 7200)):
@@ -2063,7 +2077,7 @@ def canonical_local_profile(path, env=None, toolchain=None):
         raise SetupError("local canonical wrapper must be outside source, state and operation roots")
     if profile.get("selection") is not None:
         selection = profile["selection"]
-        flags = dict(LOCAL_COMPILATION_FLAGS, **LOCAL_TEST_FLAGS, **LOCAL_CLIPPY_FLAGS)
+        flags = dict(LOCAL_COMPILATION_FLAGS, **LOCAL_TEST_FLAGS, **LOCAL_CLIPPY_FLAGS, **LOCAL_DOC_FLAGS)
         allowed = set(flags.values()) | set(LOCAL_COMPILATION_VALUES.values()) | {"profile", "test_filter", "test_args", "lint_args", "run_args"}
         if type(selection) is not dict or selection.keys() - allowed:
             raise SetupError("invalid local canonical profile selection fields")
@@ -2118,7 +2132,7 @@ def canonical_local_environment(profile):
         "CARGO_INCREMENTAL": "0", "CARGO_TARGET_DIR": "/__rabs/out/cargo",
         "RUSTC": "/__rabs/toolchain/bin/rustc",
     }
-    if profile.get("command", "check") == "test":
+    if profile.get("command", "check") in ("test", "doc"):
         controls["RUSTDOC"] = "/__rabs/toolchain/bin/rustdoc"
     if profile.get("command", "check") == "clippy":
         controls["CARGO"] = "/__rabs/toolchain/bin/cargo"
@@ -2155,14 +2169,16 @@ def canonical_local_invocation(profile_path, args, env):
     canonical_local_source_selection(profile)
     canonical_local_environment(profile)
     canonical_local_service_command(profile)
-    if profile["command"] == "clippy":
+    if profile["command"] in ("clippy", "doc"):
         binaries = Path(profile["toolchain_root"]) / "bin"
         if not stat.S_ISDIR(binaries.lstat().st_mode):
-            raise SetupError("local canonical Clippy requires an ordinary toolchain bin directory")
-        for name in ("cargo", "rustc", "cargo-clippy", "clippy-driver"):
+            raise SetupError("local canonical command requires an ordinary toolchain bin directory")
+        required_tools = (("cargo", "rustc", "cargo-clippy", "clippy-driver")
+                          if profile["command"] == "clippy" else ("cargo", "rustc", "rustdoc"))
+        for name in required_tools:
             tool = binaries / name
             if not stat.S_ISREG(tool.lstat().st_mode) or not os.access(tool, os.X_OK):
-                raise SetupError("local canonical Clippy requires ordinary executable " + name)
+                raise SetupError("local canonical command requires ordinary executable " + name)
     encoded = json.dumps(profile, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
     if len(encoded) > MAX_FRAME:
         raise SetupError("local canonical profile exceeds its native size bound")

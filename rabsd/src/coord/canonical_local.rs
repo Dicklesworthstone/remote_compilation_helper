@@ -925,7 +925,10 @@ impl Profile {
             ("CARGO_TARGET_DIR".into(), TARGET.into()),
             ("RUSTC".into(), RUSTC.into()),
         ];
-        if self.command == CompilationCommand::Test {
+        if matches!(
+            self.command,
+            CompilationCommand::Test | CompilationCommand::Doc
+        ) {
             environment.push(("RUSTDOC".into(), RUSTDOC.into()));
         }
         if self.command == CompilationCommand::Clippy {
@@ -1342,6 +1345,16 @@ fn run_operation(
             )?;
         }
     }
+    if profile.command == CompilationCommand::Doc {
+        let rustdoc = paths
+            .physical(Path::new(RUSTDOC))
+            .map_err(io::Error::other)?;
+        let metadata = fs::symlink_metadata(rustdoc)?;
+        require(
+            metadata.is_file() && metadata.mode() & 0o111 != 0,
+            "documentation requires captured ordinary executable bin/rustdoc",
+        )?;
+    }
     preparation.checkpoint()?;
     if let Some(retained) = &retained_toolchain {
         retained.image().verify_retained_generation(cancelled)?;
@@ -1745,7 +1758,10 @@ fn run_operation(
         // producer while this root waits, copies or hashes its private target.
         paths.verify_completed_producers(&coord, &cancelled)?;
         let delivered = if compiled.status.success()
-            && (profile.command == CompilationCommand::Build || profile.no_run())
+            && (matches!(
+                profile.command,
+                CompilationCommand::Build | CompilationCommand::Doc
+            ) || profile.no_run())
         {
             require(
                 paths
@@ -1889,8 +1905,8 @@ impl TargetReuseContext<'_> {
 
 /// Move, rather than recopy, a fully drained target to a newly allocated private
 /// owner on the same filesystem. There is no caller-selected overwrite target
-/// and no retained copy of source or toolchain inputs. Successful builds and
-/// Test/bench --no-run calls use this; other paths keep temporary target ownership.
+/// and no retained copy of source or toolchain inputs. Successful builds,
+/// documentation and Test/bench --no-run calls use this; other paths keep temporary target ownership.
 fn retain_build_target(parent: &Path, target: &Path) -> io::Result<PathBuf> {
     private_directory(parent)?;
     require(
@@ -2385,6 +2401,7 @@ mod tests {
             CompilationCommand::Build,
             CompilationCommand::Test,
             CompilationCommand::Clippy,
+            CompilationCommand::Doc,
             CompilationCommand::Run,
             CompilationCommand::Bench,
         ] {
@@ -2471,6 +2488,7 @@ mod tests {
             CompilationCommand::Build,
             CompilationCommand::Test,
             CompilationCommand::Clippy,
+            CompilationCommand::Doc,
             CompilationCommand::Run,
             CompilationCommand::Bench,
         ] {
@@ -2484,7 +2502,7 @@ mod tests {
                 ("CARGO_TARGET_DIR".into(), TARGET.into()),
                 ("RUSTC".into(), RUSTC.into()),
             ]);
-            if command == CompilationCommand::Test {
+            if matches!(command, CompilationCommand::Test | CompilationCommand::Doc) {
                 expected.insert("RUSTDOC".into(), RUSTDOC.into());
             }
             if command == CompilationCommand::Clippy {
@@ -2744,13 +2762,46 @@ mod tests {
                 "1"
             ])
         );
-        for command in ["rustc", "doc"] {
+        for command in ["rustc", "rustdoc"] {
             assert!(serde_json::from_value::<Profile>(json!({
                 "version":PROFILE_VERSION, "command":command,
                 "source_root":"/source", "toolchain_root":"/toolchain",
                 "state_root":"/state", "operation_root":"/operations", "wrapper":"/bin/rabs-wrap"
             })).is_err());
         }
+    }
+
+    #[test]
+    fn documentation_keeps_captured_rustdoc_and_identical_planning_selection() {
+        let mut profile = application_environment_profile();
+        profile.command = CompilationCommand::Doc;
+        profile.selection = Some(
+            serde_json::from_value(json!({
+                "packages":["app"], "lib":true, "no_deps":true,
+                "document_private_items":true, "target":["host-tuple"], "profile":"release"
+            }))
+            .unwrap(),
+        );
+        let arguments = profile.compilation_args().unwrap();
+        assert_eq!(
+            &arguments[..4],
+            ["doc", "--lib", "--no-deps", "--document-private-items"]
+        );
+        assert!(!arguments.iter().any(|argument| argument == "--"));
+        let graph = profile.graph_args(None).unwrap();
+        assert_eq!(&graph[..arguments.len()], arguments.as_slice());
+        assert!(
+            graph
+                .windows(2)
+                .any(|pair| pair == ["-Z", "unstable-options"])
+        );
+        assert!(graph.iter().any(|argument| argument == "--unit-graph"));
+        let request = profile.source_specification().unwrap();
+        assert_eq!(request["program"], CARGO);
+        assert_eq!(request["args"], json!(arguments));
+        assert_eq!(request["command_context"]["env"]["RUSTDOC"], RUSTDOC);
+        assert_eq!(request["command_context"]["env"]["RUSTC"], RUSTC);
+        assert!(!profile.inherits_stdin());
     }
 
     #[test]

@@ -1687,6 +1687,180 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn installed_cargo_doc_capture_keeps_unreported_pages_assets_and_exact_range_bytes() {
+        use rabs_sandbox::cargo_artifacts::CARGO_ARTIFACTS_VERSION;
+        use std::process::Command;
+
+        let cargo =
+            fs::canonicalize(std::env::var_os("CARGO").expect("Cargo test runner")).unwrap();
+        let tools = cargo.parent().unwrap();
+        let rustc = tools.join("rustc");
+        let rustdoc = tools.join("rustdoc");
+        assert!(rustc.is_file() && rustdoc.is_file());
+        let version = Command::new(&rustc).arg("-vV").output().unwrap();
+        assert!(version.status.success());
+        let version = String::from_utf8(version.stdout).unwrap();
+        let host = version
+            .lines()
+            .find_map(|line| line.strip_prefix("host: "))
+            .unwrap();
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        let home = fixture.path().join("home");
+        let cargo_home = fixture.path().join("cargo-home");
+        for directory in [workspace.join("src"), home.clone(), cargo_home.clone()] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname='doc-api'\nversion='0.1.0'\nedition='2024'\n[workspace]\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.join("Cargo.lock"),
+            "version = 4\n[[package]]\nname = 'doc-api'\nversion = '0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.join("src/lib.rs"),
+            "//! Delivered documentation.\n/// Public API.\npub fn visible() {}\n\
+             /// Private API must also be delivered.\nfn hidden_api() {}\n",
+        )
+        .unwrap();
+
+        for target in [None, Some(host)] {
+            let mut request = serde_json::json!({
+                "program":"/__rabs/toolchain/bin/cargo",
+                "args":["doc", "--locked", "--offline", "--no-deps", "--document-private-items",
+                    "--jobs", "1",
+                    "--message-format=json", "--target-dir", "/__rabs/out/cargo"],
+                "command_context":{"env":{"RUSTC":"/__rabs/toolchain/bin/rustc",
+                    "RUSTDOC":"/__rabs/toolchain/bin/rustdoc"}},
+                "artifacts":{"unit":"cargo", "tree":TREE_FILES_VERSION,
+                    "files":[], "cargo":CARGO_ARTIFACTS_VERSION},
+            });
+            if let Some(target) = target {
+                request["args"]
+                    .as_array_mut()
+                    .unwrap()
+                    .extend([serde_json::json!("--target"), serde_json::json!(target)]);
+            }
+            let prepared = PreparedArtifacts::new(parse_plan(&request).unwrap().unwrap()).unwrap();
+            let doc = target.map_or_else(|| "doc".to_owned(), |host| format!("{host}/doc"));
+            for warm in [false, true] {
+                // Ordinary installed Cargo supplies real bytes and real reports.
+                // This tests capture/delivery, not namespace or process ownership.
+                let mut command = Command::new(&cargo);
+                command
+                    .env_clear()
+                    .env("HOME", &home)
+                    .env("CARGO_HOME", &cargo_home)
+                    .env("CARGO_INCREMENTAL", "0")
+                    .env("RUSTC", &rustc)
+                    .env("RUSTDOC", &rustdoc)
+                    .env(
+                        "PATH",
+                        std::env::join_paths([tools, Path::new("/usr/bin"), Path::new("/bin")])
+                            .unwrap(),
+                    )
+                    .current_dir(&workspace)
+                    .args([
+                        "doc",
+                        "--locked",
+                        "--offline",
+                        "--no-deps",
+                        "--document-private-items",
+                        "--jobs",
+                        "1",
+                        "--message-format=json",
+                        "--target-dir",
+                    ])
+                    .arg(prepared.backing());
+                if let Some(target) = target {
+                    command.args(["--target", target]);
+                }
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let report = CargoArtifactReport::read(
+                    output.stdout.as_slice(),
+                    prepared.backing().to_str().unwrap(),
+                    CargoArtifactMode::Compilation,
+                )
+                .unwrap();
+                let index = format!("{doc}/doc_api/index.html");
+                let private = format!("{doc}/doc_api/fn.hidden_api.html");
+                let source = format!("{doc}/src/doc_api/lib.rs.html");
+                assert!(report.files().any(|file| file == index));
+                assert!(!report.files().any(|file| file == private));
+                if warm {
+                    assert!(output.stdout.split(|byte| *byte == b'\n').any(|line| {
+                        serde_json::from_slice::<serde_json::Value>(line).is_ok_and(|value| {
+                            value["reason"] == "compiler-artifact" && value["fresh"] == true
+                        })
+                    }));
+                }
+                let mut captured = prepared
+                    .capture_fixture_cargo_output(output.stdout.as_slice(), || false)
+                    .unwrap();
+                let mut expected = BTreeMap::new();
+                let mut pending = vec![prepared.backing().to_owned()];
+                while let Some(directory) = pending.pop() {
+                    for entry in fs::read_dir(directory).unwrap() {
+                        let entry = entry.unwrap();
+                        if entry.file_type().unwrap().is_dir() {
+                            pending.push(entry.path());
+                        } else {
+                            assert!(entry.file_type().unwrap().is_file());
+                            let path = entry.path();
+                            let name = path
+                                .strip_prefix(prepared.backing())
+                                .unwrap()
+                                .to_str()
+                                .unwrap();
+                            expected.insert(name.to_owned(), fs::read(&path).unwrap());
+                        }
+                    }
+                }
+                assert_eq!(
+                    captured.file_names().collect::<Vec<_>>(),
+                    expected.keys().map(String::as_str).collect::<Vec<_>>()
+                );
+                for required in [&index, &private, &source] {
+                    assert!(expected.contains_key(required), "{required}");
+                }
+                for extension in [".css", ".js"] {
+                    assert!(expected.keys().any(|name| {
+                        name.starts_with(&format!("{doc}/static.files/"))
+                            && name.ends_with(extension)
+                    }));
+                }
+                assert!(captured.file_names().count() > report.files().count());
+                for (name, bytes) in expected {
+                    assert_eq!(captured.file_identity(&name).unwrap().0, bytes.len() as u64);
+                    for (index, chunk) in bytes.chunks(MAX_OUTPUT_CHUNK_BYTES).enumerate() {
+                        assert_eq!(
+                            captured
+                                .read_chunk(
+                                    &name,
+                                    (index * MAX_OUTPUT_CHUNK_BYTES) as u64,
+                                    chunk.len()
+                                )
+                                .unwrap(),
+                            chunk,
+                            "{name}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn private_incremental_capture_omits_only_exact_state_payloads() {
         use rabs_sandbox::cargo_artifacts::{
             CARGO_ARTIFACTS_VERSION, CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION,
