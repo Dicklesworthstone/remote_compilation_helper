@@ -361,7 +361,7 @@ rch_test_dir=$1
 # the main census; the enclosing deadline can still tighten it in production.
 rch_observation_budget() { rch_observation_seconds=7; }
 rch_control_capture() {
-    printf '%s\\n' "$1" >> "$rch_test_dir/witness-budgets"
+    printf '%s\n' "$1" >> "$rch_test_dir/witness-budgets"
     return 125
 }
 rch_identified=1

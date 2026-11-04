@@ -240,9 +240,8 @@ rch_group_state() {
         '
         return $?
     fi
-    # One deadline covers both exchanges and inherited pipe holders. Leaders
-    # suffice for single-threaded groups; otherwise inspect only group LWPs,
-    # including zombie-leader siblings. Never enumerate unrelated threads.
+    # One deadline covers exchanges and pipe holders. Inspect group LWPs only
+    # when leaders show threads, including zombie leaders.
     rch_task_snapshot=$(LC_ALL=C rch_control_capture "${rch_observation_seconds}s" \
         /bin/sh -c '
             leaders=$(ps -e -o pid= -o lwp= -o pgid= -o s= -o nlwp=) || exit 2
@@ -291,10 +290,8 @@ rch_group_state() {
             # Positive liveness needs no complete census. Requiring a stable
             # thread count here would prevent cancelling a busy compiler.
             if (live) exit 1
-            # A previously live process (including a zombie leader with live
-            # LWPs) could fork and exit between exchanges. Its new child is
-            # outside the selected PID list. Only a later complete census may
-            # establish absence; this transition is never a cleanup receipt.
+            # Live tasks can fork outside this PID list and exit between passes.
+            # Only a later complete census proves absence.
             if (unsettled) exit 2
             for (pid in members) if (members[pid] != expected[pid]) uncertain = 1
             if (uncertain) exit 2
@@ -361,8 +358,7 @@ rch_capture_group_witnesses() {
 rch_remote_witness_matches() {
     [ "${rch_witness_identity:-}" = "$rch_boot:$rch_pgid:$rch_start" ] || return 1
     [ -n "${rch_launch_source:-}" ] || return 1
-    # TERM can change a previously fast observer into a stalled one. Bound
-    # revalidation too; a failed exchange is NOT permission to signal an orphan.
+    # Bound post-TERM revalidation; failed exchange grants no orphan authority.
     rch_observation_budget
     rch_matched=$(rch_control_capture "${rch_observation_seconds}s" /bin/sh -c '
         command eval "$1" || exit 44
@@ -380,8 +376,7 @@ rch_remote_witness_matches() {
     [ "$rch_matched" = RCH_WITNESS_MATCH_V1 ]
 }
 
-# Independently fence signals by PID view, observer group and leader/current
-# TERM witness. Census failure supplies neither identity nor self-group proof.
+# Fence PID view, observer group and leader/TERM witness independently of census.
 rch_posix_signal_authorized() (
     rch_requested_signal=$1
     [ "${rch_identified:-0}" = 1 ] || exit 43
@@ -404,8 +399,7 @@ rch_posix_signal_authorized() (
         rch_remote_witness_matches || exit 43
 )
 
-# Return 43 for unknown/reused identity. A pre-existing orphan is never adopted;
-# only an authenticated TERM in this call can authorize witnessed escalation.
+# Identity loss/reuse returns43; only TERM from this call grants orphan escalation.
 rch_signal_group() {
     [ "$rch_identified" -eq 1 ] || return 43
     if [ "${rch_scope_bound:-0}" = 1 ]; then
@@ -473,7 +467,7 @@ rch_remote_cancel() {
     rch_remote_cancel_loaded "$3"
 }
 
-# Use validated in-memory identity; never replace signal authority from a receipt.
+# Only validated in-memory identity grants signal authority.
 rch_remote_cancel_loaded() (
     # Share 30s inside 45s SSH; subshell isolates deadlines and authority.
     rch_observation_clock_checked || return 44
@@ -491,15 +485,14 @@ rch_remote_cancel_loaded() (
     rch_term_sent=0
     rch_mode=$1
     rch_kill_sent=0
-    # KILL already has live birth-fenced authority; stop its writers before
-    # a slow census. Completion still needs the full post-signal census.
+    # Birth-fenced KILL precedes slow census; completion still needs census.
     if [ "$rch_mode" = kill ] && [ "${rch_scope_bound:-0}" != 1 ] &&
         [ "${rch_identified:-0}" = 1 ] && [ "$(uname -s)" = Linux ]; then
         rch_kill_status=0
         rch_signal_group KILL || rch_kill_status=$?
         case "$rch_kill_status" in
             0) rch_kill_sent=1;;
-            43) ;; # Lost/reused identity grants nothing; observe as before.
+            43) ;;
             *) return "$rch_kill_status";;
         esac
     fi
@@ -508,8 +501,7 @@ rch_remote_cancel_loaded() (
         0) [ "$rch_kill_sent" = 1 ] || return 0;;
         1) ;;
         2)
-            # Unknown is neither stop authority nor death proof. V2 binds its
-            # scope; V1 needs a live leader for KILL. No witnesses means no TERM.
+            # Unknown proves neither authority nor death; V1 KILL needs a leader.
             if [ "$rch_kill_sent" = 0 ]; then
                 [ "${rch_identified:-0}" = 1 ] || return 43
                 [ "${rch_scope_bound:-0}" = 1 ] || rch_posix_signal_authorized KILL || return 44
@@ -533,14 +525,12 @@ rch_remote_cancel_loaded() (
         case $? in
             0) return 0;;
             1) ;;
-            # After TERM, revalidate live witnesses before KILL; still require
-            # a complete post-kill census.
+            # TERM witnesses fence KILL; post-kill census still proves death.
             2) [ "${rch_scope_bound:-0}" = 1 ] || rch_posix_signal_authorized KILL || return 44;;
             *) return 44;;
         esac
     fi
-    # Missing leader authority (43) forbids signals. A later complete census
-    # can still confirm watchdog cleanup; otherwise preserve the refusal.
+    # Authority loss (43) forbids signals; a complete census may prove cleanup.
     rch_kill_status=0
     if [ "$rch_kill_sent" = 0 ]; then
         rch_signal_group KILL || rch_kill_status=$?
@@ -549,16 +539,14 @@ rch_remote_cancel_loaded() (
     rch_attempt=0
     rch_unknown_attempts=0
     rch_last_state=2
-    # Fast live observations may need a few settling polls; slow/unavailable
-    # observations get at most three retries, within the same overall budget.
+    # Budgeted settling polls; unknown gets at most three attempts.
     rch_attempt_limit=20
     while [ "$rch_attempt" -lt "$rch_attempt_limit" ]; do
         rch_observation_clock_checked || return 44
         [ "$rch_observation_now" -lt "$rch_observation_deadline" ] || return 44
         rch_group_state
         rch_last_state=$?
-        # Without stop authority, an unavailable census keeps the refusal.
-        # A between-pass exit needs another complete census, within this cap.
+        # Unknown grants nothing; recheck between-pass exits within this cap.
         case $rch_last_state in
             0) return 0;;
             1) rch_unknown_attempts=0;;
