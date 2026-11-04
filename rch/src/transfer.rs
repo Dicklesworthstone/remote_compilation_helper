@@ -82,6 +82,22 @@ exit "$rch_rpc_status"
     )
 }
 
+/// Pass a trusted shell program without making it an exec argument or stdin.
+/// Each reader closes its descriptor before evaluating the program, so nested
+/// wrappers can reuse it and the eventual workload keeps its original stdin.
+fn shell_command_with_literal_script(invocation: &str, script: &str) -> String {
+    let reader = escape(Cow::Borrowed(
+        r#"__rch_script=$(cat <&4 && printf .) || exit 125; exec 4<&-; eval "unset __rch_script;${__rch_script%.}""#,
+    ));
+    let mut delimiter = format!("RCH_EXECUTION_{}", uuid::Uuid::new_v4().simple());
+    while script.lines().any(|line| line == delimiter) {
+        delimiter.push('_');
+    }
+    // The sentinel preserves trailing newlines. Unset before any child also
+    // handles login profiles that enable automatic variable export.
+    format!("{{ {invocation} {reader} 4<<'{delimiter}'\n{script}\n{delimiter}\n}}")
+}
+
 fn artifact_header_probe_script(
     remote: &str,
     cargo_target_root: Option<&str>,
@@ -5590,8 +5606,9 @@ impl TransferPipeline {
             "if ! command -v python3 >/dev/null 2>&1; then {refusal}; fi; python3 -I -S -c {script} {} {} {marker} {target} {plan} {mode} sh -lc {command}",
             budget.max_growth_bytes, budget.min_free_bytes,
         );
-        // Keep all control flow inside a single argv-safe shell invocation.
-        format!("sh -c {}", escape(Cow::Owned(program)))
+        // This composition can exceed the single-argument limit independently
+        // of the outer session wrapper, even when each embedded program fits.
+        shell_command_with_literal_script("sh -c", &program)
     }
 
     fn with_disk_receipt_replay(&self, execution: String) -> String {
@@ -5889,7 +5906,10 @@ exit \"$__rch_disk_status\"; }}"
             // reapers, entire tree. Killing the group includes the leader `sh -c`,
             // but that is a child of the ssh `sh -s`, so the outer shell still
             // reports 137 (128+SIGKILL) for clean timeout exit semantics.
-            let escaped_command = escape(Cow::from(colored_command.as_str()));
+            // The RABS adapter plus disk supervisor can exceed Linux's single
+            // argv limit even though each embedded program fits. Carry their
+            // literal composition on a private descriptor instead. Preserve
+            // trailing newlines and close the descriptor before the workload.
             // The watchdog publishes boot UUID + leader start ticks + build ID
             // before launching the workload, so daemon recovery rejects an
             // observed reboot or reused leader before signalling. An abnormal
@@ -5917,6 +5937,13 @@ exit \"$__rch_disk_status\"; }}"
                 )
             };
             let watchdog = escape(Cow::Owned(watchdog));
+            let launch = shell_command_with_literal_script(
+                &format!(
+                    "\"$@\" sh -c {watchdog} rch-build {escaped_pgid_file} {watchdog_timeout_secs} {} {build_id} sh -lc 3>&2",
+                    self.deadline_marker,
+                ),
+                &colored_command,
+            );
 
             // Darwin provides setsid(2), but not setsid(1). Use the same
             // isolated Python syscall/exec path as the owned-group child;
@@ -5927,17 +5954,8 @@ Darwin) set -- python3 -I -S -c 'import os, sys; os.setsid(); os.execvp(sys.argv
 *) set -- setsid;; esac; \
 if ! command -v \"$1\" >/dev/null 2>&1; then \
 {}; fi; \
-mkdir -p {} && rm -f {} && \
-\"$@\" sh -c {} rch-build {} {} {} {} sh -lc {} 3>&2",
-                setup_refusal,
-                escaped_run_dir,
-                escaped_pgid_file,
-                watchdog,
-                escaped_pgid_file,
-                watchdog_timeout_secs,
-                self.deadline_marker,
-                build_id,
-                escaped_command,
+mkdir -p {} && rm -f {} && {launch}",
+                setup_refusal, escaped_run_dir, escaped_pgid_file,
             )
         } else {
             timeout_wrapped_command
@@ -11703,6 +11721,108 @@ sys.stdout.buffer.write(b'complete')
         assert_eq!(output.stdout, literal.as_bytes());
         assert_eq!(output.stderr, b"last\n");
         assert_eq!(std::fs::read_to_string(receipt).unwrap(), "large 3\n");
+    }
+
+    /// The actual RABS bootstrap must fit through the tracked disk supervisor.
+    /// Cargo is a routing fixture here; this is not cache acceptance evidence.
+    /// x86-64 Linux has the 128 KiB per-argument limit reproduced below.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[tokio::test]
+    async fn durable_execution_rabs_bootstrap_preserves_large_argv_and_null_stdin() {
+        const CHILD: &str = "RCH_TEST_RABS_LARGE_TRACKED_SCRIPT";
+        if std::env::var_os(CHILD).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "transfer::tests::durable_execution_rabs_bootstrap_preserves_large_argv_and_null_stdin",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("RCH_RABS_WORKER_CACHE", "1")
+                .output()
+                .await
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt as _;
+        let _guard = test_guard!();
+        let root = tempfile::tempdir().unwrap().keep();
+        let bin = root.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let invocations = root.join("cargo-invocations");
+        let cargo = bin.join("cargo");
+        std::fs::write(
+            &cargo,
+            format!(
+                "#!/bin/sh\nif read -r unexpected; then exit 99; fi\n[ ! -e /proc/self/fd/4 ] || exit 98\nprintf 'once\\n' >> {}\nprintf '%s\\0' \"$@\"\nexit 37\n",
+                escape(invocations.to_string_lossy()),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let opaque = "$(printf expanded) `printf expanded` $HOME 'quoted'\n".repeat(1536);
+        let workload = format!(
+            "RCH_RABS_PREPARE_TIMEOUT_MS=0 PATH={}:$PATH cargo check --locked --config {}",
+            escape(bin.to_string_lossy()),
+            escape(Cow::Borrowed(&opaque)),
+        );
+        let receipt = root.join("completion");
+        let pipeline = disk_budget_test_pipeline(&root, Some(901), 15)
+            .with_recovery_completion(receipt.to_str().unwrap().into(), "rabs".into());
+        let wrapped = wrap_command_with_toolchain(&workload, None);
+        assert!(
+            wrapped.contains("rch-rabs-worker"),
+            "RABS must actually be enabled"
+        );
+        let payload = pipeline.wrap_with_disk_budget(&wrapped, &[], 15);
+        assert!(
+            payload.len() > 128 * 1024,
+            "exercise the real kernel boundary: {} bytes",
+            payload.len()
+        );
+        // The preceding launch shape really fails in this same invocation;
+        // no timing comparison or synthetic E2BIG return stands in for it.
+        let failure = Command::new("setsid")
+            .args(["sh", "-lc", &payload])
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .unwrap_err();
+        assert_eq!(failure.raw_os_error(), Some(7), "{failure}");
+        let program =
+            pipeline.durable_execution_command(pipeline.build_remote_command(&workload, None));
+        let script = root.join("command.sh");
+        std::fs::write(&script, program).unwrap();
+        let output = tokio::time::timeout(
+            Duration::from_secs(15),
+            Command::new("sh")
+                .arg(script)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", &root)
+                .stdin(Stdio::null())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("composed RABS supervisor must finish")
+        .unwrap();
+        let result = CommandResult {
+            exit_code: output.status.code().unwrap(),
+            stdout: String::from_utf8(output.stdout).unwrap(),
+            stderr: String::from_utf8(output.stderr).unwrap(),
+            duration_ms: 0,
+        };
+        assert_eq!(result.exit_code, 37, "{result:?}");
+        assert_eq!(
+            result.stdout,
+            format!("check\0--locked\0--config\0{opaque}\0")
+        );
+        assert_eq!(std::fs::read_to_string(invocations).unwrap(), "once\n");
+        assert_eq!(std::fs::read_to_string(receipt).unwrap(), "rabs 37\n");
+        pipeline.ensure_remote_disk_budget(&result).unwrap();
     }
 
     /// Exercise the actual disk + process-identity + durable composition that
