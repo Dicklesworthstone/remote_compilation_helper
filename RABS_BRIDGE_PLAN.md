@@ -2,7 +2,7 @@
 
 ## Reality check and execution order — updated November 4, 2026
 
-**Current execution TODO, November4 at16:38UTC:** stock passes; the first public
+**Current execution TODO, November4 at21:32UTC:** stock passes; the first public
 RABS round failed before execution with E2BIG. Two-layer transport fixes that
 kernel boundary, but the follow-up guard comparison is RED: preceding9478/8,
 candidateb606/8, two original6s pipe/deadline checks time out. Candidatec72 restores
@@ -23,10 +23,59 @@ Retained old3f/c72 full-SDK TLS checks BOTH fail0/1 after authenticated admissio
 no worker execution journal entry, original300s Cargo timeout. This is not fixed
 by linking the clock repair. The source-bound normal-debug receiver observation
 confirms SDK chunks are progressing. Exact committed HEAD's four release roles
-and harness now build and pass full workspace QA. Integrated SDK/native runtime
-gate is running. The older private snapshot
+and harness build and pass full workspace QA. All101 SDK component cases pass,
+but b526's real full-SDK check still fails at its original deadline. The older private snapshot
 omits already committed SDK ownership/upload fixes. No
 success/speed claim; older private snapshots never qualified the whole HEAD.
+First candidate is sourceac82f20c: preserve full SDK byte hashing and the original
+complete before/after generation barriers, while removing two redundant entry
+walks inside them. All103 SDK cases pass, including the actual installed compiler;
+all four ordinary release roles build and their version/compiler probes pass.
+The ordinary canonical harness builds; native DSRfe149fa4 is SUCCESS/3349s,
+all1740 source/control/tools bind beforeafter. Full candidate workspace QA is
+SUCCESS/2831s: check0/1722.5s, strictClippy0/1054.0s, fmt0/17.3s, all1740
+source/control/tools unchanged. Live b526/new-tool full-SDK acceptance is RED:
+DSR6f7cd7d3 FAILED/exit6/484s; incumbent0/1/92.4s, candidate0/1/352.8s.
+Incumbent refuses unresolved Cargo-planning cleanup. Candidate Cargo exits0 via
+local fallback:3 remote offers all fail (broken pipes/write-flush deadline),
+one unit is ineligible after an ELF-loader probe deadline, zero completed remote
+executions. Worker journal last=null. Candidate archive/program is UNRUN.
+All1740 source/control/tools/harness bind beforeafter; observed residuals{} and
+observer_errors[]. The duplicate-walk optimization was not reached and has no
+demonstrated runtime benefit. Transfer/session/probe liveness is the next
+blocking path to diagnose; no budget or safety gate is relaxed. TS2's fresh
+memory-full PSI is about53%. TS1 passes DSR health but its original SBH gate
+rejects7.3%free; TS1 runtime remains UNRUN, all staged files retained. TRJ now
+has normal available slots2/8used, negligible memory PSI, and actual bulk
+SBH0/42.4%free/6.6TB on physicalZFS54. Exact whole original SDK, source1740,
+eight role copies and harness are independently verified on TRJ. Native DSR
+489aa905 launched20:50:40UTC with original300/600/3600s clocks; all eight
+version/actual-compiler probes pass0 and the live incumbent gate is executing.
+The incumbent has reached its third independent Cargo workload after eight
+SDK/runtime acquisitions. Its latest completed durable worker receipt is real
+execution0/resolvedtrue/retained-result-releasedtrue/residual0; the next request
+is active. This is positive compiler execution, not a terminal cache-test pass.
+Read-only process samples show repeated SDK copying and filesystem waits:
+the first two coordinators account about3.8GB write_bytes each; their lifetimes
+were about435s and370s. That kernel counter is not proof of physical copying.
+At21:36UTC the incumbent's COMPLETE named check passes1/1/raw0/2645.806s:
+all three producer and both replay rounds, relocated edited workspace execution,
+dependency invalidation, expected failing script and native cleanup assertions.
+Actual worker log has20 SDK/runtime acquisitions and one shutdown receipt;
+last durable execution0/resolved/released/residual0. External sampler has three
+PermissionErrors and observed residuals{}; it is not a complete independent
+process census. The AC82 candidate is now running; whole-run final audits and
+archive/program case remain pending under the original3600s cap. A tiny native DSR diagnostic reproduces
+1.1–1.65s for each fresh4KiB clone probe versus20–40microseconds for copy.
+The complete SDK has427 files above64KiB, each previously reprobed. New source
+04ffa22b retains every hash/isolation/generation gate and uses ordinary verified
+private copies after one optional clone exceeds50ms. This threshold selects a
+copy strategy; it changes no operation deadline or verification requirement.
+One new regression covers slow-success and dirty-partial-failure branches.
+All1740 new source inputs are frozen/verified. DSR104-case/normal-role/harness
+build started21:31:42UTC on TS2; prior103-case/fullQA proof applies only to AC82.
+No installed SDK, daemon, worker configuration or capacity is changed. Public cache
+rounds remain0/4; no practical-usefulness, fleet or release qualification.
 The earlier dated sections are retained checkpoints, not additional active runs.
 
 - [x] Collect source628 terminal results: normal client/daemon build, full
@@ -369,6 +418,203 @@ The earlier dated sections are retained checkpoints, not additional active runs.
   is live; currentb526 check and archive/program remain pending. Read-only own
   worker metadata sample16:53:58 pins UID1000/PID3125293/start16003238 and
   observes141189202 write_bytes; no debugger or protocol/priority mutation.
+- [x] Collect terminal4ea6fa32: FAILED/exit6/1546s. All101 SDK tests pass,
+  incumbentc72 check0/1/357.216s, candidateb526 check0/1/357.847s. Candidate
+  archive/program stays UNRUN. Its final worker receipt is executedtrue,
+  exit130/cancelled/resolvedtrue/retained_result_releasedtrue/residual0;
+  original Cargo300s expires before a successful result. All1740 source/
+  control/tools/harness bind beforeafter; observer_errors[] and observed
+  residuals{}. This is partial functional progress, never operational success.
+- [x] Collect source-bound read-only execution observer29d616cb:229 samples,
+  actual runtime0/1/raw101/355.034s, observer_errors[]/observed residuals{},
+  all1740 bindings. No debugger, signals, priority or protocol mutation.
+  Durable execution input appears at238.73s; ldd at328.24s; bwrap/rustc around
+  330.27s. The compiler disappears after a few samples; the worker continues
+  walking SDK entries through354.03s. Successful rustc exit is not independently
+  established by these process samples. Keep the final cancelled receipt.
+- [x] Locate redundant metadata passes in Dataset::verify: its unchanged
+  verify_with already performs complete retained generation/alias/membership
+  checks before and after the shared hash, while the nested PreparedToolchain::
+  verify performs two more basic entry-stamp walks around the same byte scan.
+- [x] Implement a three-file candidate: expose rehash_retained_bytes as an
+  explicitly partial identity computation; keep the full byte read and exact
+  identity comparison inside the existing complete verification-flight barriers.
+  PreparedToolchain::verify retains its original checks. Add saved-digest
+  corruption and namespace-authority/cancellation regressions. No SDK, resource,
+  window, profile, timer, assertion, namespace or cryptographic gate changes.
+- [x] Retain first candidate d8605790's native failure: new regression compiles
+  but its fixture omits the explicit private-parent mode, so original privacy
+  validation refuses setup. Raw test0/1/101; remaining tests/builds UNRUN.
+  Fix only the fixture's parent to0700, matching existing realfs fixtures.
+- [x] Qualify corrected ac82f20c (same production bytes as d860), exactb526
+  plus only3 manually edited inputs/all1740 files. Frozen controllere0045f2f
+  launched18:02:45UTC, original3600s/jobs1: all103 SDK cases including the full
+  installed compiler, four ordinary release roles, ordinary canonical harness.
+  At18:38UTC all103 cases pass, zero failed/ignored: rehash1, upload25, pool34,
+  sandbox23 (including the actual installed compiler), coordinator20. The four
+  normal release roles are compiling; harness and final audits remain pending.
+  At18:54UTC all four ordinary release roles build0/991.6s; daemon, worker and
+  Cargo-root version probes and wrapper-to-real-rustc probe all exit0. The
+  canonical harness is compiling; final source/control/tool audit is pending.
+  Terminal DSRfe149fa4-d828-4cec-b8fd-8979e6b88ec9 is SUCCESS/3349s: harness
+  build0/251.4s, named case-list1; all1740 source/control/roles/harness bind
+  beforeafter. This is native component/build proof, not runtime acceptance.
+  Full local fmt/diff checks pass. Exact final-byte UBSraw0/0critical/542warning/
+  153info is retained alongside the pre-fixture-fix scan; no suppressions or
+  exclusions. No commit or runtime claim yet.
+- [x] Complete full ac82 workspace/all-target check, strictClippy-Dwarnings and
+  fmt. Workspace QA launched18:59:35UTC/PID34051 through DSR with
+  frozen controller171d05ef, original3600s/jobs1 and the successful103-case
+  producer required. No global installation or public worker-state changes.
+  At19:29UTC full workspace/all-target check exits0/1722.5s; strictClippy with
+  -Dwarnings is running. Formatting, final integrity audit and actual runtime
+  comparison remain pending. Host-pressure observations are diagnostic only;
+  elapsed compiler-stage time is not a code or runtime performance verdict.
+  Terminal DSR85cd8185-285d-40bd-8e39-a9c3482c8610 is SUCCESS/2831s:
+  workspace check0/1722.462s, strictClippy0/1054.029s, fmt0/17.273s; all1740
+  source/control/tool bindings match beforeafter. Neither static nor component
+  proof grants runtime acceptance.
+- [x] Run actual LIVE b526 incumbent/ac82 candidate full-SDK check in the SAME
+  invocation. Frozen controller8220b42c launched19:47:55UTC/PID54283 through
+  DSR rabs_full_sdk_barriers_private/2.1.34-sdkbarriersruntime.ac82f20c,
+  original3600s/jobs1; exact build and full-QA producers are required.
+  All103 source-matched component results are required/inherited
+  from its build producer, not old-source or isolated-harness evidence. Original
+ 300s Cargo/600s helper limits and full unit/metadata/ACK/program assertions
+  remain. Candidate archive/program follows only if check passes; retain losses.
+  Terminal6f7cd7d3-8c09-4ebd-b167-65c68469822e is FAILED/exit6/484s,
+  overall native101/candidate0cases. Incumbent0/1/92.4s refuses unresolved
+  Cargo-planning process-group cleanup. Candidate0/1/352.8s: Cargo itself0,
+  but only3 of4 required remote offers; all3 transfer attempts fail (two broken
+  pipes, one worker ATP write/flush deadline). The fourth unit is refused by
+  the ELF loader probe's original bound. No worker execution is journaled;
+  archive/program stays UNRUN. All1740 source/control/tools/harness unchanged,
+  observer_errors[] and observed residuals{}. A partial first-log inspection
+  incorrectly suggested0offers; complete structured events establish3failed
+  offers,0executions. No practical-usefulness or optimization win is claimed.
+- [ ] Diagnose the actual source-bound transfer/session failure and planning/
+  loader-probe closure failures. Keep whole-SDK bytes, original frame/input/
+  Cargo/helper clocks, cryptographic/namespace checks and source safety gates.
+  The current duplicate-walk candidate was not exercised; no inferred repair
+  or performance benefit may substitute for completed real worker/cache gates.
+- [x] Check other configured native DSR hosts without changing capacity. Fresh
+  read-only namespace probes pass on hz2/hz3/ts1. hz2/hz3 have busy RCH slots
+  and low disk headroom; TS1 reports idle0/4 and negligible memory pressure.
+  Actual unchanged DSR health ts1 exits0 at20:09:34UTC: healthytrue/warning,
+  all writable roles share filesystem64512,140.02GiB available,20GiB minimum,
+  usage93%. Preserve that warning; no threshold or admission bypass.
+- [x] Inventory the complete unmodified pinned SDKs with every regular byte
+  SHA256, entry/link/execute-bit records and beforeafter inode/mutation stamps.
+  TS2:5256entries/4270files/1921340623bytes, aggregatea735b87d9f4af0041e3ccbad
+  22c8f471e17acfca15abf7c6e5e970eb9ce14d8e. TS1's installed SDK is larger:
+  72762entries/70278files/2827979328bytes. It is not edited or substituted for
+  the original test input.
+- [x] Copy the WHOLE original TS2 SDK, exact103-case/full-QA candidate tools/
+  harness, committed incumbent roles and all1740 source files into the new
+  private TS1 physical root `/var/tmp/rabs-lilacshore-20261104` (0700/uid1000/
+  device64512). Byte-stream transfer started20:16:51UTC; no overwrites of
+  existing files, deletion, compiler/profile/SDK edit or new build. Verify all
+  inventories, source and binary fingerprints independently after transfer.
+  All nine transfer stages exit0; at20:25UTC source1740/all8roles/harness
+  fingerprints match. Independent private SDK inventory exactly matchesa735:
+  5256entries/4270files/1921340623bytes, source stamps unchanged. No native
+  runtime pass follows from copying artifacts.
+- [x] Retain the next TS1 refusal: direct original SBH20G check returns1/
+  critical/free7.329%, even though DSR's20GiB check passes/warns93%used.
+  Do NOT launch its frozenefb5dae5 controller or relax either gate. Runtime
+  is UNRUN; private SDK/source/tools and all warnings remain retained.
+- [x] Probe the rest of the configured fleet and select available TRJ bulk.
+  vmi1153651 has negligible memory pressure but SBH1/critical2%free and is
+  not used. TRJ has healthy2/8used/no drain, namespace0, memory PSI0; physical
+  bulkZFS54 passesSBH0/42.4%free/6.6TB. Fresh DSR health0 retains root/home91%
+  warnings and unchanged20GiB minimum; its actual build route is bulk54.
+- [x] Copy only the previously verified WHOLE SDK/source/tool/evidence inputs
+  into NEW private `/bulk/rabs-lilacshore-sdk-20261104` (0700/uid1000/dev54).
+  Source/destination tar exits0/0,2766448640streambytes/SHA367b5510eeeb34c4
+  111afe01810506fca6ff036223512b54d068783c6577275e. Independent TRJ SDK
+  inventory matchesa735/all5256entries/4270files/1921340623bytes; all1740
+  source files,8rolecopies and752372392B harnessSHA303710f4 match producers.
+- [ ] Complete the actual full-SDK incumbent/candidate gates via DSR on TRJ,
+  SAME original300s Cargo/600s helper/3600s DSR clocks and complete assertions.
+  Frozen controller9182a8b4 (21738B/dev54/inode42230864/uid1000/0400/nlink1)
+  launched20:50:40UTC/PID31968; native DSR489aa905-c8e3-49ba-bf88-99afbce9be3e.
+  All103 SDK component/fullQA producers are required; native compilation ran
+  on TS2, this is an actual TRJ artifact consumer. At20:52UTC both sets' three
+  versions and two actual-wrapper/rustc probes pass (8commands), source1740
+  and wholeSDK audits pass; incumbent's named real check gate is executing.
+  Own-process/I/O sampler is read-only, no debugger/trace/signals. Preserve
+  TS2 losses/TS1 refusal; a new host is not a code, speed or fleet win.
+  At21:08UTC the same test has advanced through profiles1/2 into profile3;
+  eight toolchain/runtime acquisitions are recorded. The latest completed
+  worker receipt has executedtrue/exit0/resolvedtrue/retained-result-released
+  true/residual0/no stop reason; a subsequent request now has receipt=null.
+  A current null receipt must not erase the preceding completed execution.
+  Full producer/cache/relocation/invalidation/negative-case assertions and
+  terminal denominator remain pending. First/second coordinator lifetimes
+  about435s/370s and write_bytes3.83GB/3.83GB show expensive per-command SDK
+  preparation with substantial observed filesystem waits. No code-speed or
+  causal storage claim; keep the original caps and stop policy.
+  Terminal incumbent check now PASSES1/1/raw0/2645.806s. All seven original
+  Cargo workloads run, including six successful producer/replay/relocation/
+  invalidation workloads and the intentionally failing build script. Worker
+  log records20 acquisitions and one shutdown receipt; last durable receipt
+  execution0/resolvedtrue/releasedtrue/residual0. Observed remaining processes{}
+  but three external sampler PermissionErrors limit independent census proof.
+  Exact case terminal row/stream hashes are retained in local
+  `trj-native/incumbent-check-terminal.json`; whole-run source/SDK/tool audits,
+  candidate and archive/program case remain pending. Never extend the original
+ 3600s cap or relabel this small-workload44-minute pass a practical speed win.
+- [ ] If the full-SDK gates pass, exercise the existing persistent canonical
+  service against the same complete SDK and real worker. Its service-owned
+  toolchain pool already shares a retained generation across roots; establish
+  actual repeated-client behavior and costs before proposing another SDK cache.
+  Do not alter the standalone acceptance test to substitute service behavior,
+  trim the SDK, or call CargoFresh a shared dependency-cache result.
+- [x] Diagnose the optional clone cost with actual kernel operations before
+  claiming a repair. DSRd090fa21-96b2-4648-8140-ecb14740da7e SUCCESS/15s:
+  three4KiB clone probes take1.1115s/1.4870s/1.6518s; three private-copy
+  controls take39.2/19.4/19.8microseconds. All six content/metadata isolation
+  checks pass. Physical bulk54 SBH20G passes; actual ZFS parameters are
+  bclone_enabled1/wait_dirty1/txg5. Controller764848b6/3668B is frozen0400.
+  This reproduces shipping probe operations in Python, not compiled Rust
+  performance or complete RABS acceptance. It overlaps the functional run;
+  no causal whole-host or independent benchmark claim. A prior read-only
+  syscall query was refused EPERM; no privilege escalation or tracing.
+- [x] Implement adaptive optional-clone selection in the existing SDK stream:
+  after the first callback takes over50ms, remaining files use the original
+  private-copy path. Successful slow output is still verified; failed partial
+  output/cursors are still reset; full source/destination hashes, independence,
+  namespace/mutation checks, cancellation and operation limits are unchanged.
+  One real-filesystem test exercises slow successful copying and slow failure
+  with moved cursor/oversized dirty suffix, then exact bytes/modes/inodes and
+  full retained/source verification across all three files. No COW support or
+  performance claim comes from the deterministic strategy hook. Local fmt0.
+- [x] Freeze exact b526 plus the same three declared manual inputs as source
+  04ffa22b5daae238a95495e273eba77ff93c7b9fc9d9af34370b71153174bc5f.
+  All1740 source files bind; archive64051200B/SHA c0ea056d43db592d4708d43c
+  3a676ff587f948918dc7404c884a70bca5dae52a. Only dataset implementation and
+  realfs tests differ from AC82; worker-pool bytes are unchanged. First transfer
+  command had a quotation SyntaxError before creating its output; corrected
+  quoted transfer/independent verification both pass0. No source overwrite,
+  deletion, extra dependency or peer-index edit. Prior frozen AC82 run intact.
+- [ ] Complete source04ffa22b native DSR build: all104 SDK cases including the
+  actual installed compiler, all four ordinary release roles and ordinary
+  canonical harness. Started21:31:42UTC/PID63263, toolrabs_sdk_adaptive_clone_build
+  v2.1.34-adaptiveclone.04ffa22b; controller9ffa728f/8809B/dev49/inode9933554/
+  uid1000/0400/nlink1. Original3600s cap/jobs1/profiles retained, genuine existing
+  Cargo reuse. Fresh DSR health0/healthytrue retains root/home94% warning and
+  unchanged20GiB minimum; actual build route has1.284TB/89.9%free on ZFS49.
+  Global host concurrency4/SSH20s unchanged; no global configuration edits.
+- [ ] Run full workspace/all-target check, strictClippy-Dwarnings and fmt on
+  the exact104-case source. Prior AC82 QA does not qualify the new code.
+- [ ] Compare actual complete-SDK preparation through LIVE ordinary old and
+  new tools in the SAME invocation, with identical SDK and unchanged bounds,
+  full identity/output/source-generation checks and explicit copy/I/O costs.
+  Require the incumbent to run; self-speedup alone earns maintenance credit.
+  Then repeat full canonical TLS/check/cache/invalidation/archive/program and
+  persistent-service gates before committing or claiming practical usefulness.
+- [ ] Retire the tiny clone diagnostic from execution after this lever decision;
+  retain its files/evidence unless the user explicitly authorizes deletion.
 - [ ] After the blocking path is proved and repaired, rerun complete full-SDK
   check+archive/program acceptance; then try a bounded ordinary shared-RCH
   canary through normal available-slot admission before relying on exclusive
