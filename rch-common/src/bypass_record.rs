@@ -1731,12 +1731,23 @@ mod tests {
         }
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("state.fifo");
+        #[cfg(not(target_vendor = "apple"))]
         rustix::fs::mkfifoat(
             rustix::fs::CWD,
             &path,
             rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
         )
         .unwrap();
+        // rustix has no mkfifoat on Apple targets.
+        #[cfg(target_vendor = "apple")]
+        assert!(
+            std::process::Command::new("/usr/bin/mkfifo")
+                .args(["-m", "600"])
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
         // A regression must fail, not hang the test runner inside blocking
         // open(). No writer ever opens the FIFO, and no global env is changed.
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
