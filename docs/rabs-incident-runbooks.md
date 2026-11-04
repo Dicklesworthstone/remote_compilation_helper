@@ -38,6 +38,16 @@ Each component/quarantine list is bounded and reports truncation. Missing key
 component digests remain explicitly unrecorded; the command does not invent
 miss causes or scheduler-selection explanations.
 
+Newly admitted daemon actions persist all twelve component digests together
+with their descriptor-derived runtime class, under the active coordinator
+authority in one transaction. Repeating an identical admission preserves the
+record; conflicting retained evidence refuses admission instead of replacing
+it. Matching historical partial records can be completed on a new admission.
+Requests refused by availability, pressure, capacity or authority checks do
+not add component records. Historical actions that are never admitted again
+may still have no component evidence. These component rows do not reconstruct
+all key-header fields or establish a pairwise cache-miss cause.
+
 `serving_authorization_evaluated` is always `false`: a stored `servable` value
 does not evaluate the coordinator's current authority, clock epoch, requested
 trust tier or class-wide gates. Successful inspection does not repair,

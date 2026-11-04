@@ -34,6 +34,7 @@
 
 use std::collections::HashMap;
 
+use rabs_protocol::descriptor::ActionDescriptor;
 use rabs_protocol::generation::{
     ActionGeneration, ActionGenerationId, AttemptAuthority, LeaseRenewal, WorkerBootGeneration,
     WorkerIncarnationId,
@@ -1467,6 +1468,20 @@ pub trait RabsMetadataStore {
         digest: &TypedDigest,
     ) -> Result<(), StoreError>;
 
+    /// Atomically retain the descriptor's complete set of key-component digests
+    /// and the live runtime-class receipt under its computed action key. Requires
+    /// the active coordinator authority. Identical retries and matching partial
+    /// historical records are accepted; conflicting retained bytes or class
+    /// decisions are never overwritten. The trusted admission path derives
+    /// `runtime_class` from this descriptor, rather than accepting a
+    /// socket-supplied class flag.
+    fn record_action_key_provenance(
+        &mut self,
+        authority: &TypedDigest,
+        descriptor: &ActionDescriptor,
+        runtime_class: &str,
+    ) -> Result<(), StoreError>;
+
     /// Set trust state for an action.
     fn set_trust(
         &mut self,
@@ -2496,16 +2511,16 @@ impl<E: SqlEngine> SqlMetadataStore<E> {
         body: impl FnOnce(&mut E) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
         self.engine.execute("BEGIN", &[])?;
-        match body(&mut self.engine) {
-            Ok(v) => {
-                self.engine.execute("COMMIT", &[])?;
-                Ok(v)
-            }
-            Err(e) => {
-                let _ = self.engine.execute("ROLLBACK", &[]);
-                Err(e)
-            }
+        let result = body(&mut self.engine).and_then(|value| {
+            self.engine.execute("COMMIT", &[])?;
+            Ok(value)
+        });
+        if result.is_err() {
+            // A busy or failed COMMIT can leave the transaction open too.
+            // Never let a later operation inherit unacknowledged writes.
+            let _ = self.engine.execute("ROLLBACK", &[]);
         }
+        result
     }
 
     fn active_authority_key(engine: &mut E) -> Result<Option<String>, StoreError> {
@@ -4210,6 +4225,122 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                     bytes,
                 ],
             )?;
+            Ok(())
+        })
+    }
+
+    fn record_action_key_provenance(
+        &mut self,
+        authority: &TypedDigest,
+        descriptor: &ActionDescriptor,
+        runtime_class: &str,
+    ) -> Result<(), StoreError> {
+        const COMPONENT_COUNT: usize = 12;
+        const CLASS_KIND: &str = "rabs-live-action-class-v1";
+        const CLASS_REASON: &str = "semantic class bound to the submitted action descriptor";
+
+        // The canonical descriptor traversal supplies names, domains, and bytes
+        // together. Never accept an independently asserted key or breakdown.
+        let breakdown = rabs_key::action_key::compute_action_key(descriptor);
+        if breakdown.components.len() != COMPONENT_COUNT {
+            return Err(StoreError::Corruption(
+                "unsupported action key component count".into(),
+            ));
+        }
+        self.intern(breakdown.final_key.domain);
+        for component in &breakdown.components {
+            self.intern(component.digest.domain);
+        }
+        let action = digest_key(&breakdown.final_key);
+        let authority = authority.clone();
+        let runtime_class = runtime_class.to_owned();
+        self.in_txn(move |engine| {
+            Self::require_active(engine, &authority)?;
+            // The primary key bounds this seek to one action. One extra row
+            // detects legacy extras without loading an unbounded history.
+            let retained = engine.query(
+                "SELECT component, algo, domain, bytes FROM key_breakdowns \
+                 WHERE action_key = ?1 ORDER BY component LIMIT 13",
+                &[SqlValue::Text(action.clone())],
+            )?;
+            if retained.len() > COMPONENT_COUNT {
+                return Err(StoreError::AppendConflict("key_breakdowns".into()));
+            }
+            let mut present = [false; COMPONENT_COUNT];
+            for row in &retained {
+                let [name, algo, domain, bytes] = row.as_slice() else {
+                    return Err(StoreError::Corruption("key breakdown shape".into()));
+                };
+                let name = expect_text(name, "key component")?;
+                let Some(index) = breakdown
+                    .components
+                    .iter()
+                    .position(|component| component.name == name)
+                else {
+                    return Err(StoreError::AppendConflict("key_breakdowns".into()));
+                };
+                if present[index] {
+                    return Err(StoreError::Corruption("duplicate key component".into()));
+                }
+                let expected = Self::digest_params(&breakdown.components[index].digest);
+                if [algo, domain, bytes] != [&expected[0], &expected[1], &expected[2]] {
+                    return Err(StoreError::AppendConflict("key_breakdowns".into()));
+                }
+                present[index] = true;
+            }
+            let receipts = engine.query(
+                "SELECT decision, reason FROM decision_receipts \
+                 WHERE kind = ?1 AND subject = ?2 AND seq = 0 LIMIT 2",
+                &[
+                    SqlValue::Text(CLASS_KIND.to_owned()),
+                    SqlValue::Text(action.clone()),
+                ],
+            )?;
+            match receipts.as_slice() {
+                [] => {}
+                [row] => {
+                    let [decision, reason] = row.as_slice() else {
+                        return Err(StoreError::Corruption("class receipt shape".into()));
+                    };
+                    if expect_text(decision, "runtime class")? != runtime_class
+                        || expect_text(reason, "class reason")? != CLASS_REASON
+                    {
+                        return Err(StoreError::AppendConflict("decision_receipts".into()));
+                    }
+                }
+                _ => return Err(StoreError::Corruption("duplicate class receipt".into())),
+            }
+            // Validate all retained facts before inserting. Partial historical
+            // data may be completed, but no existing row is replaced or deleted.
+            for (index, component) in breakdown.components.iter().enumerate() {
+                if present[index] {
+                    continue;
+                }
+                let [algo, domain, bytes] = Self::digest_params(&component.digest);
+                engine.execute(
+                    "INSERT INTO key_breakdowns (action_key, component, algo, domain, bytes) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    &[
+                        SqlValue::Text(action.clone()),
+                        SqlValue::Text(component.name.to_owned()),
+                        algo,
+                        domain,
+                        bytes,
+                    ],
+                )?;
+            }
+            if receipts.is_empty() {
+                engine.execute(
+                    "INSERT INTO decision_receipts (kind, subject, seq, decision, reason) \
+                     VALUES (?1, ?2, 0, ?3, ?4)",
+                    &[
+                        SqlValue::Text(CLASS_KIND.to_owned()),
+                        SqlValue::Text(action),
+                        SqlValue::Text(runtime_class),
+                        SqlValue::Text(CLASS_REASON.to_owned()),
+                    ],
+                )?;
+            }
             Ok(())
         })
     }
@@ -9784,5 +9915,422 @@ mod tests {
             FsqliteEngine::open,
             "t042-fsq",
         );
+    }
+}
+
+#[cfg(test)]
+mod action_key_provenance_tests {
+    use super::*;
+    use crate::action_inspection::inspect_action;
+    use rabs_key::action_key::compute_action_key;
+    use rabs_protocol::descriptor::ActionClass;
+    use std::time::Duration;
+
+    const CLASS_KIND: &str = "rabs-live-action-class-v1";
+    const CLASS_REASON: &str = "semantic class bound to the submitted action descriptor";
+    const RUNTIME_CLASS: &str = "rustc-dependency-compile";
+
+    struct CountedEngine {
+        inner: RusqliteEngine,
+        begins: usize,
+        commits: usize,
+        provenance_inserts: usize,
+    }
+
+    impl CountedEngine {
+        fn reset_counts(&mut self) {
+            self.begins = 0;
+            self.commits = 0;
+            self.provenance_inserts = 0;
+        }
+    }
+
+    impl SqlEngine for CountedEngine {
+        fn execute(&mut self, sql: &str, params: &[SqlValue]) -> Result<usize, StoreError> {
+            match sql {
+                "BEGIN" => self.begins += 1,
+                "COMMIT" => self.commits += 1,
+                _ => {}
+            }
+            if sql.starts_with("INSERT INTO key_breakdowns")
+                || sql.starts_with("INSERT INTO decision_receipts")
+            {
+                self.provenance_inserts += 1;
+            }
+            self.inner.execute(sql, params)
+        }
+
+        fn query(
+            &mut self,
+            sql: &str,
+            params: &[SqlValue],
+        ) -> Result<Vec<Vec<SqlValue>>, StoreError> {
+            self.inner.query(sql, params)
+        }
+    }
+
+    fn digest(domain: &'static str, tag: u8) -> TypedDigest {
+        TypedDigest {
+            algorithm: DigestAlgorithm::Sha256V1,
+            domain,
+            bytes: [tag; 32],
+        }
+    }
+
+    fn descriptor() -> ActionDescriptor {
+        ActionDescriptor {
+            key_epoch: 3,
+            projection_epoch: 4,
+            action_class: ActionClass::RustcDependencyCompile,
+            normalized_invocation: digest("rabs.invocation.v1", 1),
+            virtual_working_directory: digest("rabs.virtual-cwd.v1", 2),
+            action_inputs: digest("rabs.inputs.v1", 3),
+            negative_dependencies: digest("rabs.negdeps.v1", 4),
+            dependency_inputs: digest("rabs.dependencies.v1", 5),
+            toolchain: digest("rabs.toolchain-contract.v1", 6),
+            output_platform: digest("rabs.output-platform.v1", 7),
+            environment: digest("rabs.environment.v1", 8),
+            sandbox_semantic_policy: digest("rabs.sandbox-policy.v1", 9),
+            build_path_semantic_policy: digest("rabs.build-path-policy.v1", 10),
+            execution_semantics: digest("rabs.execution-semantics.v1", 11),
+            output_declarations: digest("rabs.outputs.v1", 12),
+        }
+    }
+
+    fn fixture() -> (
+        tempfile::TempDir,
+        SqlMetadataStore<CountedEngine>,
+        AuthorityRow,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = CountedEngine {
+            inner: RusqliteEngine::open(&directory.path().join("meta.sqlite")).unwrap(),
+            begins: 0,
+            commits: 0,
+            provenance_inserts: 0,
+        };
+        let mut store = SqlMetadataStore::open(engine).unwrap();
+        let authority = AuthorityRow {
+            digest: digest("rabs.authority.sha256.v1", 90),
+            cluster_id: "provenance-test".into(),
+            incarnation: 1,
+            term: 1,
+            acquired_seq: 1,
+        };
+        store.acquire_authority(&authority).unwrap();
+        store.engine.reset_counts();
+        (directory, store, authority)
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct Snapshot {
+        components: Vec<Vec<SqlValue>>,
+        receipts: Vec<Vec<SqlValue>>,
+    }
+
+    fn snapshot(store: &mut SqlMetadataStore<CountedEngine>) -> Snapshot {
+        Snapshot {
+            components: store
+                .query(
+                    "SELECT action_key, component, algo, domain, bytes FROM key_breakdowns \
+                     ORDER BY action_key, component",
+                    &[],
+                )
+                .unwrap(),
+            receipts: store
+                .query(
+                    "SELECT kind, subject, seq, decision, reason FROM decision_receipts \
+                     ORDER BY kind, subject, seq",
+                    &[],
+                )
+                .unwrap(),
+        }
+    }
+
+    fn assert_visible_components(directory: &tempfile::TempDir, descriptor: &ActionDescriptor) {
+        let expected = compute_action_key(descriptor);
+        let report = inspect_action(
+            &directory.path().join("meta.sqlite"),
+            &digest_key(&expected.final_key),
+        )
+        .unwrap();
+        assert_eq!(report.action_key, digest_key(&expected.final_key));
+        assert!(report.observed);
+        assert_eq!(report.runtime_class.as_deref(), Some(RUNTIME_CLASS));
+        assert_eq!(report.breakdown.items.len(), 12);
+        assert!(!report.breakdown.truncated);
+        for expected in expected.components {
+            let recorded = report
+                .breakdown
+                .items
+                .iter()
+                .find(|recorded| recorded.component == expected.name)
+                .unwrap();
+            assert_eq!(recorded.algorithm, algo_tag(expected.digest.algorithm));
+            assert_eq!(recorded.domain, expected.digest.domain);
+            assert_eq!(recorded.digest_hex, hex(&expected.digest.bytes));
+        }
+    }
+
+    #[test]
+    fn complete_provenance_is_durable_idempotent_and_commits_once() {
+        let (directory, mut store, authority) = fixture();
+        let descriptor = descriptor();
+        store
+            .record_action_key_provenance(&authority.digest, &descriptor, RUNTIME_CLASS)
+            .unwrap();
+        assert_eq!(store.engine.begins, 1);
+        assert_eq!(store.engine.commits, 1);
+        assert_eq!(store.engine.provenance_inserts, 13);
+        assert_visible_components(&directory, &descriptor);
+        let before_retry = snapshot(&mut store);
+        store.engine.reset_counts();
+        store
+            .record_action_key_provenance(&authority.digest, &descriptor, RUNTIME_CLASS)
+            .unwrap();
+        assert_eq!(store.engine.begins, 1);
+        assert_eq!(store.engine.commits, 1);
+        assert_eq!(store.engine.provenance_inserts, 0);
+        assert_eq!(snapshot(&mut store), before_retry);
+        drop(store);
+        assert_visible_components(&directory, &descriptor);
+    }
+
+    #[test]
+    fn matching_receipt_only_and_partial_historical_rows_are_completed() {
+        for (component_count, has_class) in [(0, true), (3, false), (3, true)] {
+            let (directory, mut store, authority) = fixture();
+            let descriptor = descriptor();
+            let breakdown = compute_action_key(&descriptor);
+            for component in breakdown.components.iter().take(component_count) {
+                store
+                    .put_key_breakdown(&breakdown.final_key, component.name, &component.digest)
+                    .unwrap();
+            }
+            if has_class {
+                store
+                    .record_decision_receipt(
+                        CLASS_KIND,
+                        &digest_key(&breakdown.final_key),
+                        0,
+                        RUNTIME_CLASS,
+                        CLASS_REASON,
+                    )
+                    .unwrap();
+            }
+            store.engine.reset_counts();
+            store
+                .record_action_key_provenance(&authority.digest, &descriptor, RUNTIME_CLASS)
+                .unwrap();
+            assert_eq!(store.engine.begins, 1);
+            assert_eq!(store.engine.commits, 1);
+            assert_eq!(
+                store.engine.provenance_inserts,
+                12 - component_count + usize::from(!has_class)
+            );
+            assert_visible_components(&directory, &descriptor);
+        }
+    }
+
+    #[test]
+    fn conflicting_components_extras_and_class_receipts_are_never_replaced() {
+        for conflict in [
+            "bytes",
+            "domain",
+            "algorithm",
+            "name",
+            "excess",
+            "class",
+            "reason",
+        ] {
+            let (_directory, mut store, authority) = fixture();
+            let descriptor = descriptor();
+            let breakdown = compute_action_key(&descriptor);
+            let first = &breakdown.components[0];
+            let table = match conflict {
+                "class" | "reason" => {
+                    store
+                        .record_decision_receipt(
+                            CLASS_KIND,
+                            &digest_key(&breakdown.final_key),
+                            0,
+                            if conflict == "class" {
+                                "different-class"
+                            } else {
+                                RUNTIME_CLASS
+                            },
+                            if conflict == "reason" {
+                                "different-reason"
+                            } else {
+                                CLASS_REASON
+                            },
+                        )
+                        .unwrap();
+                    "decision_receipts"
+                }
+                "excess" => {
+                    for component in &breakdown.components {
+                        store
+                            .put_key_breakdown(
+                                &breakdown.final_key,
+                                component.name,
+                                &component.digest,
+                            )
+                            .unwrap();
+                    }
+                    store
+                        .put_key_breakdown(&breakdown.final_key, "unexpected", &first.digest)
+                        .unwrap();
+                    "key_breakdowns"
+                }
+                _ => {
+                    let mut retained = first.digest.clone();
+                    if conflict == "bytes" {
+                        retained.bytes[0] ^= 1;
+                    }
+                    if conflict == "domain" {
+                        retained.domain = "rabs.other-component.v1";
+                    }
+                    store
+                        .put_key_breakdown(
+                            &breakdown.final_key,
+                            if conflict == "name" {
+                                "unexpected"
+                            } else {
+                                first.name
+                            },
+                            &retained,
+                        )
+                        .unwrap();
+                    if conflict == "algorithm" {
+                        store
+                            .engine
+                            .execute("UPDATE key_breakdowns SET algo = 'unsupported'", &[])
+                            .unwrap();
+                    }
+                    "key_breakdowns"
+                }
+            };
+            let before = snapshot(&mut store);
+            assert_eq!(
+                store.record_action_key_provenance(&authority.digest, &descriptor, RUNTIME_CLASS),
+                Err(StoreError::AppendConflict(table.into())),
+                "conflict: {conflict}"
+            );
+            assert_eq!(snapshot(&mut store), before, "conflict: {conflict}");
+            assert!(store.engine.inner.conn.is_autocommit());
+        }
+    }
+
+    #[test]
+    fn inactive_authority_cannot_record_components_or_class() {
+        let (_directory, mut store, authority) = fixture();
+        let descriptor = descriptor();
+        let before = snapshot(&mut store);
+        assert_eq!(
+            store.record_action_key_provenance(
+                &digest("rabs.authority.sha256.v1", 99),
+                &descriptor,
+                RUNTIME_CLASS,
+            ),
+            Err(StoreError::NotActiveAuthority)
+        );
+        store.release_authority(&authority.digest).unwrap();
+        assert_eq!(
+            store.record_action_key_provenance(&authority.digest, &descriptor, RUNTIME_CLASS),
+            Err(StoreError::NotActiveAuthority)
+        );
+        assert_eq!(snapshot(&mut store), before);
+        assert!(store.engine.inner.conn.is_autocommit());
+    }
+
+    #[test]
+    fn late_sql_failures_roll_back_components_and_receipt_together() {
+        for (table, condition) in [
+            ("key_breakdowns", "NEW.component = 'output_declarations'"),
+            (
+                "decision_receipts",
+                "NEW.kind = 'rabs-live-action-class-v1'",
+            ),
+        ] {
+            let (directory, mut store, authority) = fixture();
+            let descriptor = descriptor();
+            store
+                .engine
+                .execute(
+                    &format!(
+                        "CREATE TRIGGER refuse_provenance BEFORE INSERT ON {table} \
+                         WHEN {condition} BEGIN SELECT RAISE(ABORT, 'provenance fault'); END"
+                    ),
+                    &[],
+                )
+                .unwrap();
+            let before = snapshot(&mut store);
+            assert!(matches!(
+                store.record_action_key_provenance(&authority.digest, &descriptor, RUNTIME_CLASS),
+                Err(StoreError::Backend(_))
+            ));
+            assert_eq!(snapshot(&mut store), before);
+            assert!(store.engine.inner.conn.is_autocommit());
+            store
+                .engine
+                .execute("DROP TRIGGER refuse_provenance", &[])
+                .unwrap();
+            store
+                .record_action_key_provenance(&authority.digest, &descriptor, RUNTIME_CLASS)
+                .unwrap();
+            assert_visible_components(&directory, &descriptor);
+        }
+    }
+
+    #[test]
+    fn busy_commit_rolls_back_and_same_connection_can_retry() {
+        let (directory, mut store, authority) = fixture();
+        store
+            .engine
+            .inner
+            .conn
+            .pragma_update(None, "journal_mode", "DELETE")
+            .unwrap();
+        store
+            .engine
+            .inner
+            .conn
+            .busy_timeout(Duration::ZERO)
+            .unwrap();
+        let reader = rusqlite::Connection::open_with_flags(
+            directory.path().join("meta.sqlite"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let count: i64 = reader
+            .query_row("SELECT count(*) FROM key_breakdowns", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+
+        let descriptor = descriptor();
+        let before = snapshot(&mut store);
+        let error = store
+            .record_action_key_provenance(&authority.digest, &descriptor, RUNTIME_CLASS)
+            .unwrap_err();
+        assert!(
+            matches!(error, StoreError::Backend(ref detail) if detail.contains("locked") || detail.contains("busy"))
+        );
+        // SQLite retains a failed COMMIT's transaction unless our actual
+        // in_txn cleanup rolls it back. Check the SAME connection explicitly.
+        assert!(store.engine.inner.conn.is_autocommit());
+        assert_eq!(store.engine.provenance_inserts, 13);
+        assert_eq!(store.engine.commits, 1);
+        assert_eq!(snapshot(&mut store), before);
+        reader.execute_batch("ROLLBACK").unwrap();
+
+        store.engine.reset_counts();
+        store
+            .record_action_key_provenance(&authority.digest, &descriptor, RUNTIME_CLASS)
+            .unwrap();
+        assert_eq!(store.engine.commits, 1);
+        assert!(store.engine.inner.conn.is_autocommit());
+        assert_visible_components(&directory, &descriptor);
     }
 }

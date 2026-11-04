@@ -498,6 +498,7 @@ pub const LIVE_REPLAY_INSTALL_LIMIT: u64 = 16;
 
 fn record_descriptor_class(
     store: &mut dyn RabsMetadataStore,
+    authority: &TypedDigest,
     descriptor: &ActionDescriptor,
 ) -> Result<(), StoreError> {
     use rabs_key::live_dependency::workspace_cache::{
@@ -543,13 +544,7 @@ fn record_descriptor_class(
             None => LIVE_PRIVATE_CLASS,
         }
     };
-    store.record_decision_receipt(
-        LIVE_CLASS_RECEIPT,
-        &digest_key(&compute_action_key(descriptor).final_key),
-        0,
-        class,
-        "semantic class bound to the submitted action descriptor",
-    )
+    store.record_action_key_provenance(authority, descriptor, class)
 }
 
 fn recorded_action_risk(
@@ -3195,11 +3190,18 @@ impl CoordLive {
                 _ => return Err(SubmissionRefusal::Unavailable),
             }
             // Projection and bounded admission checks have succeeded. A
-            // rejected queue flood must not grow the durable class ledger.
+            // rejected queue flood must not grow the durable class ledger or
+            // key-component evidence. Both are committed in one transaction
+            // that rechecks authority before creating the in-memory actor.
             // This follows the submissions -> store order used by dispatch.
             // The socket caller never supplies this keyed risk classification.
-            record_descriptor_class(&mut *store, &input.descriptor).map_err(|error| {
-                SubmissionRefusal::Admission(format!("action class: {error:?}"))
+            record_descriptor_class(
+                &mut *store,
+                &authority_digest(&authority),
+                &input.descriptor,
+            )
+            .map_err(|error| {
+                SubmissionRefusal::Admission(format!("action provenance: {error:?}"))
             })?;
         }
         let mut actor = ActionActor::new(
@@ -5323,9 +5325,12 @@ mod tests {
 
     #[test]
     fn live_serving_class_is_key_bound_and_survives_reopen() {
+        use rabs_cas::action_inspection::{BreakdownInspection, inspect_action};
+
         let (state, coord) = submission_coordinator();
         let (_source_dir, source, manifest, mut descriptor) = source_fixture();
         descriptor.action_class = ActionClass::RustcDependencyCompile;
+        let dependency_descriptor = descriptor.clone();
         let dependency = coord
             .submit_action(
                 submission(&source, &manifest, &descriptor),
@@ -5335,6 +5340,7 @@ mod tests {
             )
             .unwrap();
         descriptor.action_class = ActionClass::RustcWorkspaceCompile;
+        let workspace_descriptor = descriptor.clone();
         let workspace = coord
             .submit_action(
                 submission(&source, &manifest, &descriptor),
@@ -5344,6 +5350,25 @@ mod tests {
             )
             .unwrap();
         assert_ne!(dependency.action_key, workspace.action_key);
+        descriptor.toolchain.bytes[0] ^= 1;
+        let changed_toolchain = coord
+            .submit_action(
+                submission(&source, &manifest, &descriptor),
+                request(3, SubscriberKind::ForegroundAgent, 1),
+                3,
+                0,
+            )
+            .unwrap();
+        assert_ne!(workspace.action_key, changed_toolchain.action_key);
+        let rejoined = coord
+            .submit_action(
+                submission(&source, &manifest, &descriptor),
+                request(4, SubscriberKind::ForegroundAgent, 1),
+                4,
+                0,
+            )
+            .unwrap();
+        assert!(!rejoined.actor_created);
         drop(coord);
         let reopened = mount_and_reconcile(state.path()).unwrap();
         let mut store = reopened.store().lock().unwrap();
@@ -5360,6 +5385,173 @@ mod tests {
             recorded_action_risk(&mut *store, &unknown).unwrap(),
             ActionClassRisk::Elevated
         );
+        drop(store);
+
+        let mut recorded = Vec::new();
+        for (descriptor, key, class) in [
+            (
+                dependency_descriptor,
+                dependency.action_key,
+                LIVE_DEPENDENCY_CLASS,
+            ),
+            (
+                workspace_descriptor,
+                workspace.action_key,
+                LIVE_PRIVATE_CLASS,
+            ),
+            (descriptor, changed_toolchain.action_key, LIVE_PRIVATE_CLASS),
+        ] {
+            let inspection =
+                inspect_action(&state.path().join("meta.sqlite"), &digest_key(&key)).unwrap();
+            assert_eq!(inspection.runtime_class.as_deref(), Some(class));
+            assert!(inspection.publication.is_none());
+            assert!(!inspection.breakdown.truncated);
+            let computed = compute_action_key(&descriptor);
+            assert_eq!(computed.final_key, key);
+            let mut expected: Vec<_> = computed
+                .components
+                .iter()
+                .map(|component| BreakdownInspection {
+                    component: component.name.to_owned(),
+                    algorithm: "sha256-v1".to_owned(),
+                    domain: component.digest.domain.to_owned(),
+                    digest_hex: rabs_protocol::raw_bytes::encode_hex(&component.digest.bytes),
+                })
+                .collect();
+            expected.sort_by(|a, b| a.component.cmp(&b.component));
+            assert_eq!(expected.len(), 12);
+            assert_eq!(inspection.breakdown.items, expected);
+            recorded.push(inspection.breakdown.items);
+        }
+        let changed: Vec<_> = recorded[1]
+            .iter()
+            .zip(&recorded[2])
+            .filter(|(before, after)| before != after)
+            .map(|(before, _)| before.component.as_str())
+            .collect();
+        assert_eq!(changed, ["toolchain"]);
+    }
+
+    #[test]
+    fn refused_new_submissions_leave_no_key_provenance() {
+        use rabs_cas::action_inspection::inspect_action;
+
+        let (_source_dir, source, manifest, descriptor) = source_fixture();
+        let key = compute_action_key(&descriptor).final_key;
+        for case in ["unavailable", "brownout", "stale", "serial", "capacity"] {
+            let (state, coord) = submission_coordinator();
+            let authority = coord.authority().unwrap();
+            let mut kind = SubscriberKind::ForegroundAgent;
+            let expected = match case {
+                "unavailable" => {
+                    coord.mark_down();
+                    SubmissionRefusal::Unavailable
+                }
+                "brownout" => {
+                    coord.set_speculation_pressure(PressureBand::Soft).unwrap();
+                    kind = SubscriberKind::Speculative;
+                    SubmissionRefusal::Brownout
+                }
+                "stale" => {
+                    coord
+                        .live_cas()
+                        .unwrap()
+                        .store()
+                        .lock()
+                        .unwrap()
+                        .release_authority(&authority_digest(&authority))
+                        .unwrap();
+                    SubmissionRefusal::Unavailable
+                }
+                "serial" => {
+                    coord.submissions.lock().unwrap().serial = u64::MAX;
+                    SubmissionRefusal::IdentityExhausted
+                }
+                _ => {
+                    // Populate only the in-memory capacity fixture. The rejected
+                    // request must never create any durable admission evidence.
+                    let mut submissions = coord.submissions.lock().unwrap();
+                    for order in 0..1024_u64 {
+                        let mut occupied = descriptor.clone();
+                        occupied.normalized_invocation = rabs_key::typed_digest::compute(
+                            "rabs.capacity-fixture.v1",
+                            &order.to_le_bytes(),
+                        );
+                        let input = Arc::new(submission(&source, &manifest, &occupied));
+                        submissions.entries.insert(
+                            input.key(),
+                            SubmittedActor {
+                                actor: ActionActor::new(
+                                    occupied,
+                                    &authority,
+                                    &authority.cluster_id.0,
+                                    0,
+                                ),
+                                input,
+                                state: DispatchState::Queued,
+                                order,
+                                started_as_speculative: false,
+                                promoted_from_speculation: false,
+                                started_at: None,
+                            },
+                        );
+                    }
+                    SubmissionRefusal::Capacity
+                }
+            };
+            assert_eq!(
+                coord
+                    .submit_action(
+                        submission(&source, &manifest, &descriptor),
+                        request(1, kind, 1),
+                        1,
+                        0,
+                    )
+                    .unwrap_err(),
+                expected,
+                "{case}",
+            );
+            assert!(coord.submitted_actor(&key).unwrap().is_none(), "{case}");
+            let inspection =
+                inspect_action(&state.path().join("meta.sqlite"), &digest_key(&key)).unwrap();
+            assert!(!inspection.observed, "{case}");
+            assert!(inspection.breakdown.items.is_empty(), "{case}");
+            assert!(inspection.runtime_class.is_none(), "{case}");
+        }
+    }
+
+    #[test]
+    fn retained_key_component_conflict_refuses_actor_creation() {
+        use rabs_cas::action_inspection::inspect_action;
+
+        let (state, coord) = submission_coordinator();
+        let (_source_dir, source, manifest, descriptor) = source_fixture();
+        let key = compute_action_key(&descriptor).final_key;
+        let mut conflicting = descriptor.toolchain.clone();
+        conflicting.bytes[0] ^= 1;
+        coord
+            .live_cas()
+            .unwrap()
+            .store()
+            .lock()
+            .unwrap()
+            .put_key_breakdown(&key, "toolchain", &conflicting)
+            .unwrap();
+        let before = inspect_action(&state.path().join("meta.sqlite"), &digest_key(&key)).unwrap();
+        assert!(matches!(
+            coord.submit_action(
+                submission(&source, &manifest, &descriptor),
+                request(1, SubscriberKind::ForegroundAgent, 1),
+                1,
+                0,
+            ),
+            Err(SubmissionRefusal::Admission(_)),
+        ));
+        assert!(coord.submitted_actor(&key).unwrap().is_none());
+        let after = inspect_action(&state.path().join("meta.sqlite"), &digest_key(&key)).unwrap();
+        assert_eq!(after, before);
+        assert_eq!(after.breakdown.items.len(), 1);
+        assert!(after.runtime_class.is_none());
     }
 
     #[test]
@@ -5697,10 +5889,11 @@ mod tests {
         }
         let (state, coord) = submission_coordinator();
         let mut private = Vec::new();
+        let authority = authority_digest(&coord.authority().unwrap());
         {
             let mut store = coord.live_cas().unwrap().store().lock().unwrap();
             for (descriptor, _) in &descriptors {
-                record_descriptor_class(&mut *store, descriptor).unwrap();
+                record_descriptor_class(&mut *store, &authority, descriptor).unwrap();
                 let dag = (10..=15).contains(&descriptor.key_epoch);
                 for mutation in 0..if dag { 6 } else { 4 } {
                     let mut changed = descriptor.clone();
@@ -5724,7 +5917,7 @@ mod tests {
                             }
                         }
                     }
-                    record_descriptor_class(&mut *store, &changed).unwrap();
+                    record_descriptor_class(&mut *store, &authority, &changed).unwrap();
                     private.push(compute_action_key(&changed).final_key);
                 }
             }
