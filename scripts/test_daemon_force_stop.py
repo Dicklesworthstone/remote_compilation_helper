@@ -200,6 +200,14 @@ class NativeForceStop(unittest.TestCase):
                     script = guarded / name
                     script.write_text('#!/bin/sh\nprintf attempted >> "$RCH_TEST_GUARD"\nexit 99\n')
                     script.chmod(0o700)
+                # On a systemd host the CLI must ask the manager whether it owns
+                # rchd. This test-owned daemon has no unit; any other use is unsafe.
+                systemctl = guarded / 'systemctl'
+                systemctl.write_text('#!/bin/sh\ncase " $* " in\n'
+                                     '*" show rchd "*) echo LoadState=not-found; exit 0;;\n'
+                                     '*" is-enabled rchd "*) echo not-found; exit 1;;\nesac\n'
+                                     'printf attempted >> "$RCH_TEST_GUARD"\nexit 99\n')
+                systemctl.chmod(0o700)
                 with Fixture(root, mode, committed=False) as daemon, Fixture(root, name='peer.sock') as peer:
                     env = {'PATH': str(guarded), 'HOME': str(root),
                            'RCH_CONFIG_DIR': str(config), 'RCH_SOCKET_PATH': str(daemon.path),

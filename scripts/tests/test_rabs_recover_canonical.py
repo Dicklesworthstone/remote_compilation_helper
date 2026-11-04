@@ -200,7 +200,7 @@ class CanonicalRecoveryTests(unittest.TestCase):
         self.assertEqual(self.events()[-1]["argv"][1], "--acknowledge")
         self.assertEqual(len(self.events()), 2)
 
-    def test_private_incremental_contracts_resume_and_acknowledge_the_exact_saved_request(self):
+    def test_execution_and_incremental_contracts_recover_the_exact_saved_request(self):
         self.persisted()
         previous = self.partial()
         completed = self.base / "completed"
@@ -210,6 +210,10 @@ class CanonicalRecoveryTests(unittest.TestCase):
         for command, contract in (
             ("check", "cargo-private-incremental-json-v1"),
             ("test", "cargo-private-incremental-test-json-v1"),
+            ("run", "cargo-run-json-v1"),
+            ("bench", "cargo-bench-json-v1"),
+            ("run", "cargo-private-incremental-run-json-v1"),
+            ("bench", "cargo-private-incremental-bench-json-v1"),
         ):
             with self.subTest(contract=contract):
                 request = json.loads(self.raw)
@@ -217,7 +221,8 @@ class CanonicalRecoveryTests(unittest.TestCase):
                 request["artifacts"]["cargo"] = contract
                 request["command_context"] = {
                     "version":"env-cwd-v1", "cwd":"/__rabs/workspace",
-                    "env":{"CARGO_INCREMENTAL":"1", "PRIVATE":"DO_NOT_PRINT_CANONICAL_REQUEST"},
+                    "env":{"CARGO_INCREMENTAL":"1" if "private-incremental" in contract else "0",
+                           "PRIVATE":"DO_NOT_PRINT_CANONICAL_REQUEST"},
                 }
                 raw = json.dumps(request, ensure_ascii=False, indent=2).encode()
                 self.put(self.bundle / "request.json", raw)
@@ -239,7 +244,8 @@ class CanonicalRecoveryTests(unittest.TestCase):
                     self.assertEqual(event["request"], request)
                     self.assertEqual(event["digest"], hashlib.sha256(raw).hexdigest())
                     self.assertEqual(event["state"], str(self.state))
-                    self.assertEqual(event["request"]["command_context"]["env"]["CARGO_INCREMENTAL"], "1")
+                    self.assertEqual(event["request"]["command_context"]["env"]["CARGO_INCREMENTAL"],
+                                     "1" if "private-incremental" in contract else "0")
                     self.assertNotIn(b"DO_NOT_PRINT_CANONICAL_REQUEST", result.stdout + result.stderr)
                 self.assertEqual((self.bundle / "request.json").read_bytes(), raw)
                 self.assertEqual((self.root / "spec.json").read_bytes(), original_spec)

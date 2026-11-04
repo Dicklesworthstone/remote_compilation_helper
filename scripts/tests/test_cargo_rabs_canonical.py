@@ -50,16 +50,16 @@ assert not pathlib.Path(delivery).exists()
 assert not pathlib.Path(output).exists()
 assert request["artifacts"]["tree"] == "tree-files-v1"
 cargo_args = request["args"][:request["args"].index("--")] if "--" in request["args"] else request["args"]
-test_execution = cargo_args[0] == "test" and "--no-run" not in cargo_args
+execution = cargo_args[0] if cargo_args[0] in ("test", "run", "bench") and "--no-run" not in cargo_args else None
 clippy = cargo_args[0] == "clippy"
 assert request["program"] == ("/__rabs/toolchain/bin/cargo-clippy" if clippy else "/__rabs/toolchain/bin/cargo")
 if clippy:
     assert request["command_context"]["env"]["CARGO"] == "/__rabs/toolchain/bin/cargo"
     assert request["command_context"]["env"]["RUSTC"] == "/__rabs/toolchain/bin/rustc"
 if request["command_context"]["env"]["CARGO_INCREMENTAL"] == "1":
-    assert request["artifacts"]["cargo"] == ("cargo-private-incremental-test-json-v1" if test_execution else "cargo-private-incremental-json-v1")
+    assert request["artifacts"]["cargo"] == "cargo-private-incremental-" + (execution + "-" if execution else "") + "json-v1"
 else:
-    assert request["artifacts"]["cargo"] == ("cargo-test-json-v1" if test_execution else "cargo-json-v1")
+    assert request["artifacts"]["cargo"] == "cargo-" + (execution + "-" if execution else "") + "json-v1"
 assert cargo_args.count("--message-format=json") == 1
 assert request["toolchain_source"] + "/bin/cargo" == os.environ["CARGO"]
 assert request["toolchain_source"] + "/bin/rustc" == os.environ["RUSTC"]
@@ -288,6 +288,9 @@ class CanonicalCargo(unittest.TestCase):
             (["check", "--all-targets"], "cargo-private-incremental-json-v1"),
             (["test", "--no-run"], "cargo-private-incremental-json-v1"),
             (["test", "chosen", "--", "--exact"], "cargo-private-incremental-test-json-v1"),
+            (["run", "--bin", "app", "--", "--no-run"], "cargo-private-incremental-run-json-v1"),
+            (["bench", "--bench=measured", "chosen", "--", "--exact"], "cargo-private-incremental-bench-json-v1"),
+            (["bench", "--no-run"], "cargo-private-incremental-json-v1"),
             (["clippy", "--workspace", "--", "-D", "warnings"], "cargo-private-incremental-json-v1"),
         )
         for daemon in (False, True):
@@ -697,7 +700,7 @@ class CanonicalCargo(unittest.TestCase):
                 os.close(write)
 
     def test_unknown_and_ambiguous_output_controls_refuse_before_any_operation(self):
-        for args in (["run", "--bin=hello"], ["test", "--no-run=false"],
+        for args in (["doc", "--bin=hello"], ["test", "--no-run=false"],
                      ["test", "--no-run", "--no-run"], ["build", "--no-run"],
                      ["check", "--no-run"], ["test", "--no-run", "--", "filter"],
                      ["test", "--no-run", "filter"], ["test", "--doc", "--no-run"],
@@ -726,6 +729,8 @@ class CanonicalCargo(unittest.TestCase):
             ["test", "--no-run", "--workspace"],
             ["test", "--no-run", "--test", "integration", "--release"],
             ["test", "--no-run", "--bin=hello"],
+            ["bench", "--no-run", "--workspace"],
+            ["bench", "--no-run", "--bench=measured"],
         )
         for args in cases:
             with self.subTest(args=args):
@@ -748,6 +753,9 @@ class CanonicalCargo(unittest.TestCase):
             (["test", "--profile=1stage", "selected::case"],
              ["--", "--exact", "--profile=opaque-harness-value", "--release"]),
             (["clippy", "--profile", "ci", "--no-deps"], ["--", "-D", "warnings"]),
+            (["run", "--profile=ci", "--example=demo"], ["--", "--profile=opaque", ""]),
+            (["bench", "--profile=ci", "selected"], ["--", "--release", "--no-run"]),
+            (["bench", "--profile=ci", "--no-run"], []),
             (["build", "--profile=" + "p" * 64], []),
         )
         for before, after in cases:
@@ -810,6 +818,63 @@ class CanonicalCargo(unittest.TestCase):
                 self.assertIn(b'"kind": "fixture-worker-build"', stderr)
                 self.assertIn(b"native-driver-diagnostic", stderr)
                 self.assertFalse((Path(record["operation"]) / "outputs").exists())
+
+    def test_canonical_run_and_bench_preserve_runtime_arguments_output_and_native_status(self):
+        cases = (
+            (["run"], []),
+            (["run", "--bin=app", "-p", "app", "--release"],
+             ["--", "", "value with spaces'雪", "--no-run", "--rabs-remote", "--message-format=json"]),
+            (["run", "--example", "demo"], ["--", "--workspace", "--help"]),
+            (["bench"], []),
+            (["bench", "--workspace", "--no-fail-fast"], ["--", "--nocapture"]),
+            (["bench", "--bench=measured", "literal=filter雪"], ["--", "--exact", "--no-run", ""]),
+        )
+        for daemon in (False, True):
+            if daemon:
+                self.select_daemon()
+            for before, after in cases:
+                with self.subTest(daemon=daemon, before=before, after=after):
+                    count = len(self.records()) if self.record.exists() else 0
+                    status, stdout, stderr, pid = self.invoke(before + after, env=dict(self.env, TEST_EXIT="37"))
+                    self.assertEqual(status, 37)
+                    self.assertEqual(len(self.records()), count + 1, "one native handoff, no execution retry")
+                    record = self.records()[-1]
+                    request = record["request"]
+                    self.assertEqual(record["pid"], pid)
+                    self.assertEqual(record["argv"][1], "--job-build" if daemon else "--worker-build-tls")
+                    self.assertEqual(request["request_id"], "allocate")
+                    self.assertEqual(request["artifacts"]["cargo"], "cargo-" + before[0] + "-json-v1")
+                    self.assertEqual(request["args"][:len(before)], before)
+                    controls = request["args"][:-len(after)] if after else request["args"]
+                    self.assertEqual(controls.count("--locked"), 1)
+                    self.assertEqual(controls.count("--offline"), 1)
+                    self.assertEqual(controls.count("--message-format=json"), 1)
+                    self.assertEqual(controls[-2:], ["--target-dir", "/__rabs/out/cargo"])
+                    if after:
+                        self.assertEqual(request["args"][-len(after):], after)
+                    self.assertEqual(stdout, b"fixture Cargo stdout\x00\xff\n")
+                    self.assertIn(b"native-driver-diagnostic", stderr)
+                    metadata = json.loads((Path(record["operation"]) / "operation.json").read_text())
+                    self.assertFalse(metadata["automatic_retry"])
+                    self.assertFalse(metadata["publication_authorized"])
+                    self.assertFalse((Path(record["operation"]) / "outputs").exists())
+
+    def test_canonical_run_and_bench_refuse_ambiguous_selection_and_execution_controls(self):
+        cases = (
+            ["run", "filter"], ["run", "--workspace"], ["run", "--lib"],
+            ["run", "--bins"], ["run", "--examples"], ["run", "--all-targets"],
+            ["run", "--test=integration"], ["run", "--bench=measured"],
+            ["run", "--bin=app", "--bin=other"], ["run", "--bin=app", "--example=demo"],
+            ["run", "-p", "app", "--package=other"], ["run", "--exclude=other"],
+            ["run", "--no-run"], ["run", "--no-fail-fast"], ["run", "--doc"],
+            ["bench", "--doc"], ["bench", "--release"], ["bench", "-r"],
+            ["bench", "--no-run=false"], ["bench", "--no-run", "--no-run"],
+            ["bench", "--no-run", "filter"], ["bench", "--no-run", "--", "--exact"],
+            ["bench", "first", "second"], ["bench", "--exclude=other"],
+        )
+        for args in cases:
+            with self.subTest(args=args):
+                self.assert_refused(args)
 
     def test_canonical_clippy_binds_captured_tools_and_keeps_lint_controls_after_cargo_flags(self):
         self.install_clippy()

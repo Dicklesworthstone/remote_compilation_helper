@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # S7 (bead bd-n8qt3): capability-gated fleet provisioning of rabs-wkr.
 #
-# Deploys the release rabs-wkr binary to a worker over SSH — but ONLY
-# after PROVING the host can run the canonical namespace. A non-bwrap
-# host is a TYPED REFUSAL, not a silent skip and never a partial
-# install: rabs-wkr itself refuses non-canonical hosts (S5), so shipping
-# it there would only produce runtime refusals.
+# Deploys the release rabs-wkr binary to a worker over SSH after measuring
+# the selected execution namespace. The default requires canonical execution;
+# RABS_DEPLOY_CAPABILITY=dependency-rlib selects the separate archive profile
+# for hosts that cannot mount procfs. The native worker independently measures
+# and advertises its supported modes; deployment never grants capabilities.
 #
 # Usage:
 #   RABS_WORKER_TLS_CA=/local/ca.pem \
@@ -24,6 +24,8 @@
 # may be issued by a different CA. This script never creates or learns trust.
 # Identity, state directory and target-cache settings are optional. Omit them
 # to retain previous managed settings, or worker defaults on a fresh install.
+# RABS_DEPLOY_CAPABILITY is canonical (default) or dependency-rlib. It selects
+# only this deployment's admission probe and is not saved in the service.
 # A nonempty target-cache epoch enables retention across restarts; change it
 # before updating host tools, libraries or any other runtime input. An empty
 # epoch selects process-only retention; zero bytes disables all target reuse.
@@ -41,6 +43,7 @@ usage() {
   echo 'Required: RABS_WORKER_TLS_CA/CERT/KEY (local PEM files), RABS_WORKER_TLS_SERVER_NAME' >&2
   echo 'Optional: RABS_WORKER_ID, RABS_WORKER_STATE_DIR (absolute remote journal directory)' >&2
   echo 'Optional: RABS_WORKER_TARGET_CACHE_BYTES (0..8589934592), RABS_WORKER_TARGET_CACHE_EPOCH (stable host runtime identity)' >&2
+  echo 'Optional: RABS_DEPLOY_CAPABILITY=canonical|dependency-rlib (default canonical; this deployment only)' >&2
   exit 2
 }
 
@@ -52,6 +55,12 @@ REMOTE_BIN=/usr/local/bin/rabs-wkr
 SSH_OPTS=(-o ConnectTimeout=20 -o BatchMode=yes)
 
 input_error() { printf 'rabs_fleet_deploy: %s\n' "$1" >&2; exit 2; }
+
+DEPLOY_CAPABILITY=${RABS_DEPLOY_CAPABILITY-canonical}
+case "$DEPLOY_CAPABILITY" in
+  canonical|dependency-rlib) ;;
+  *) input_error 'RABS_DEPLOY_CAPABILITY must be canonical or dependency-rlib' ;;
+esac
 
 dns_name() {
   [[ ${#1} -le 253 && $1 =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.?$ ]]
@@ -225,32 +234,65 @@ WORKER_SPKI_SHA256=${CERT_KEY_ID##* }
 emit() { printf '{"kind":"fleet-deploy","worker":"%s","step":"%s","status":"%s"}\n' "$WORKER" "$1" "$2"; }
 failed() { emit "$1" failed; printf 'rabs_fleet_deploy: %s\n' "$2" >&2; exit 1; }
 
-# CAPABILITY GATE: exercise the complete canonical namespace BEFORE any copy.
-# Keep this no-input launch aligned with rabs-sandbox's canonical namespace
-# probe: a host may allow a root-bind userns while refusing private proc/dev/tmp
-# mounts or one of the other namespaces the actual worker always requires.
+# CAPABILITY GATE: exercise the selected namespace BEFORE any copy. The value
+# interpolated into the remote command is one of the two fixed tokens above.
+# Keep both no-input launches aligned with the native capability probes. The
+# archive no-op uses trusted /usr bytes only to measure the base namespace;
+# actual dependency execution requires its separately retained keyed runtime.
 emit capability-probe start
-CAP=$(ssh "${SSH_OPTS[@]}" "root@$WORKER" '
-  command -v bwrap >/dev/null 2>&1 || { echo "no-bwrap"; exit 0; }
-  bwrap --die-with-parent --unshare-user --unshare-pid --unshare-ipc \
-    --unshare-uts --unshare-net --hostname rabs --clearenv \
-    --proc /proc --dev /dev --ro-bind /usr /usr \
-    --symlink usr/bin /bin --symlink usr/sbin /sbin \
-    --symlink usr/lib /lib --symlink usr/lib64 /lib64 \
-    --ro-bind-try /etc/ld.so.cache /etc/ld.so.cache \
-    --ro-bind-try /etc/alternatives /etc/alternatives \
-    --tmpfs /__rabs/tmp --chdir / -- /usr/bin/true >/dev/null 2>&1 ||
-    { echo "bwrap-present-but-canonical-fails"; exit 0; }
+CAP=$(ssh "${SSH_OPTS[@]}" "root@$WORKER" "RABS_DEPLOY_CAPABILITY=$DEPLOY_CAPABILITY"'
+  bwrap_command=$(command -v bwrap) || { echo "no-bwrap"; exit 0; }
+  case "$RABS_DEPLOY_CAPABILITY" in
+    canonical)
+      bwrap --die-with-parent --unshare-user --unshare-pid --unshare-ipc \
+        --unshare-uts --unshare-net --hostname rabs --clearenv \
+        --proc /proc --dev /dev --ro-bind /usr /usr \
+        --symlink usr/bin /bin --symlink usr/sbin /sbin \
+        --symlink usr/lib /lib --symlink usr/lib64 /lib64 \
+        --ro-bind-try /etc/ld.so.cache /etc/ld.so.cache \
+        --ro-bind-try /etc/alternatives /etc/alternatives \
+        --tmpfs /__rabs/tmp --chdir / -- /usr/bin/true >/dev/null 2>&1 ||
+        { echo "bwrap-present-but-canonical-fails"; exit 0; }
+      ;;
+    dependency-rlib)
+      for tool in uname stat env; do
+        probe_tool=$(command -v "$tool") || { echo "missing-rlib-probe-tool"; exit 0; }
+      done
+      [ "$(uname -s)" = Linux ] || { echo "dependency-rlib-requires-linux"; exit 0; }
+      # Do not open /dev/null even for redirection until its identity is known.
+      # A malformed regular file at that path must remain untouched on refusal.
+      bwrap_version=$(bwrap --version 2>&1) ||
+        { echo "bwrap-present-but-dependency-rlib-fails"; exit 0; }
+      valid_null_device() {
+        [ ! -L /dev/null ] && [ -c /dev/null ] &&
+          [ "$(stat -c "%t:%T" -- /dev/null)" = "1:3" ]
+      }
+      valid_null_device || { echo "dependency-rlib-invalid-null-device"; exit 0; }
+      env -i PATH="$PATH" bwrap --die-with-parent --unshare-user --unshare-pid --unshare-ipc \
+        --unshare-uts --unshare-net --hostname rabs --clearenv \
+        --dir /dev --dev-bind /dev/null /dev/null --ro-bind /usr /usr \
+        --symlink usr/bin /bin --symlink usr/sbin /sbin \
+        --symlink usr/lib /lib --symlink usr/lib64 /lib64 \
+        --ro-bind-try /etc/ld.so.cache /etc/ld.so.cache \
+        --ro-bind-try /etc/alternatives /etc/alternatives \
+        --tmpfs /tmp --tmpfs /__rabs/tmp --chdir /__rabs/tmp -- /usr/bin/true >/dev/null 2>&1 ||
+        { echo "bwrap-present-but-dependency-rlib-fails"; exit 0; }
+      valid_null_device || { echo "dependency-rlib-invalid-null-device"; exit 0; }
+      ;;
+    *) echo "unsupported-deployment-capability"; exit 0 ;;
+  esac
   for tool in systemctl flock install mktemp cat chmod mv; do
     command -v "$tool" >/dev/null 2>&1 || { echo "missing-deployment-tool"; exit 0; }
   done
   systemctl show-environment >/dev/null 2>&1 || { echo "systemd-unavailable"; exit 0; }
-  echo "canonical-ok"
+  echo "$RABS_DEPLOY_CAPABILITY-ok"
 ') || failed capability-probe 'worker is unreachable'
 
-if [ "$CAP" != "canonical-ok" ]; then
+if [ "$CAP" != "$DEPLOY_CAPABILITY-ok" ]; then
   case "$CAP" in
-    no-bwrap|bwrap-present-but-canonical-fails|missing-deployment-tool|systemd-unavailable)
+    no-bwrap|bwrap-present-but-canonical-fails|bwrap-present-but-dependency-rlib-fails|\
+    dependency-rlib-invalid-null-device|dependency-rlib-requires-linux|\
+    missing-rlib-probe-tool|missing-deployment-tool|systemd-unavailable)
       emit capability-probe "refused:$CAP"
       printf 'REFUSED: %s (%s); no files copied\n' "$WORKER" "$CAP" >&2
       exit 1
@@ -258,7 +300,7 @@ if [ "$CAP" != "canonical-ok" ]; then
     *) failed capability-probe 'unrecognized worker capability response; no files copied' ;;
   esac
 fi
-emit capability-probe canonical-ok
+emit capability-probe "$CAP"
 
 # A private, never-reused credential generation keeps a running worker from
 # observing a half-updated certificate/key pair. Failed stages are not activated.

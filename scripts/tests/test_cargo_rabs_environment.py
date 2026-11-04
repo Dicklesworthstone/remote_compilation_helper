@@ -185,7 +185,7 @@ class CanonicalEnvironment(unittest.TestCase):
         for supplied in (False, True):
             if supplied:
                 self.profile["env"] = {}
-            for command in ("build", "check", "clippy", "test"):
+            for command in ("build", "check", "clippy", "test", "run", "bench"):
                 self.assertEqual(self.invoke([command])[0], 0)
                 expected = {"CARGO_INCREMENTAL":"0"}
                 if command == "clippy":

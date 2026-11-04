@@ -24,6 +24,13 @@ CONTROL = Path(os.environ.get("RCH_TEST_SOURCE_NAMESPACE_CONTROL",
 SHELL = os.environ.get("RCH_TEST_SHELL", "/bin/sh")
 PYTHON = sys.executable
 READY = b"RCH_TOPOLOGY_OK\n"
+# uutils cat (Ubuntu 25.10+ /usr/bin/cat) enlarges its output pipe for a splice
+# fast path, so a pinned 4 KiB pipe never stalls it. The stalled-delivery test
+# needs GNU cat, g-prefixed where uutils is the default.
+GNU_CAT = next((path for path in map(shutil.which, ("gnucat", "gcat", "cat"))
+                if path and b"GNU coreutils" in subprocess.run(
+                    [path, "--version"], capture_output=True, timeout=3, check=False).stdout),
+               None)
 
 
 @unittest.skipUnless(sys.platform == "linux" and hasattr(os, "pidfd_open"),
@@ -37,7 +44,10 @@ class NativeTimerTests(unittest.TestCase):
         self.tmp.mkdir()
         for name in ("mktemp", "ps", "head", "grep", "mkfifo", "wc", "cmp",
                      "cat", "mv", "rm", "rmdir", "sleep"):
-            executable = shutil.which(name)
+            # uutils cat (Ubuntu 25.10+ /usr/bin/cat) calls F_SETPIPE_SZ(1 MiB)
+            # on pipe outputs, overriding the test's 4 KiB pipe backpressure pin.
+            executable = (shutil.which("gnucat") or shutil.which("gcat") or shutil.which("cat")
+                          if name == "cat" else shutil.which(name))
             self.assertIsNotNone(executable, name)
             (self.tools / name).symlink_to(executable)
         (self.tools / "sh").symlink_to(SHELL)
@@ -131,22 +141,37 @@ class NativeTimerTests(unittest.TestCase):
                 self.assertEqual(result.stderr, b"diagnostic\n")
         self.assertEqual(list(self.tmp.iterdir()), [])
 
-    def test_gnu_remains_preferred_without_starting_python(self):
+    def test_gnu_remains_timer_backend_with_portable_child_observation(self):
         timer = shutil.which("gnutimeout") or shutil.which("gtimeout") or shutil.which("timeout")
         if not timer:
             self.skipTest("GNU preference control requires GNU timeout")
         version = subprocess.run([timer, "--version"], capture_output=True, timeout=3)
         if b"GNU coreutils" not in version.stdout:
             self.skipTest("the discovered timer is not GNU timeout")
-        (self.tools / "gnutimeout").symlink_to(timer)
+        calls = self.root / "gnu-timer-calls"
+        gnu = self.tools / "gnutimeout"
+        gnu.write_text("#!/bin/sh\nprintf '%s %s\\n' \"$2\" \"$3\" >> " +
+                       shlex.quote(str(calls)) + "\nexec " + shlex.quote(timer) + ' "$@"\n')
+        gnu.chmod(0o700)
         (self.tools / "python3").rename(self.tools / "retained-python3")
-        forbidden = self.root / "python-started"
+        forbidden = self.root / "native-timer-started"
+        observed = self.root / "observer-started"
         python = self.tools / "python3"
-        python.write_text("#!/bin/sh\nprintf forbidden > " + shlex.quote(str(forbidden)) + "\nexit 99\n")
+        # Non-reaping observation now requires Python even with GNU timeout.
+        # Prove GNU still performs timing; forbidding its observer would keep
+        # the reproduced externally-killed-timer orphan bug as a test gate.
+        python.write_text(
+            '#!/bin/sh\ncase "${4-}" in *"def kill_owned_group()"*)\n'
+            "printf forbidden > " + shlex.quote(str(forbidden)) + "\nexit 99;; esac\n"
+            "printf observed\\n >> " + shlex.quote(str(observed)) +
+            "\nexec " + shlex.quote(PYTHON) + ' "$@"\n')
         python.chmod(0o700)
         result = self.run_control(b"printf 'RCH_TOPOLOGY_OK\\n'\n")
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, READY, b""))
         self.assertFalse(forbidden.exists())
+        self.assertTrue(observed.exists())
+        self.assertEqual(calls.read_text().splitlines(),
+                         ["1 mktemp", "15 sh", "2 sh", "1 sh"])
 
     def test_fixed_timer_abi_refuses_unknown_options_before_execution(self):
         prefix = self.script.split("# GNU timeout kills", 1)[0]
@@ -294,6 +319,11 @@ class NativeTimerTests(unittest.TestCase):
             process.stderr.close()
 
     def test_stalled_diagnostic_delivery_is_bounded_and_withholds_readiness(self):
+        if GNU_CAT is None:
+            self.skipTest("no GNU cat: uutils cat resizes the pipe instead of stalling")
+        gnu_cat = self.tools / "cat.gnu"
+        gnu_cat.symlink_to(GNU_CAT)
+        os.replace(gnu_cat, self.tools / "cat")
         process = subprocess.Popen([SHELL, "-c", self.script], stdin=subprocess.PIPE,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    env=self.env)

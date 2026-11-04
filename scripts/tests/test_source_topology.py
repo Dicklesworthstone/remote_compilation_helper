@@ -14,6 +14,7 @@ import select
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -111,6 +112,19 @@ class SourceTopologyTests(unittest.TestCase):
             tool.chmod(0o700)
         return {**self.env, "PATH": str(directory) + os.pathsep + self.env["PATH"]}
 
+    def barrier_tools(self, program):
+        # Topology barriers fsync the resolved root and its parent through the
+        # registry's `python3 -c` adapter, never the sync utility. `program`
+        # sees the barrier path as $1 and fails the barrier by exiting nonzero;
+        # otherwise the real fsync runs. The utility itself always fails here.
+        return self.fault_tools({
+            "python3": ('case "${4-}" in *os.fsync*)\n'
+                        "  barrier() {\n" + program + "\n  }\n"
+                        '  barrier "$5" || exit\n'
+                        "esac\nexec " + shlex.quote(sys.executable) + ' "$@"'),
+            "sync": "exit 97",
+        })
+
     def test_namespace_never_becomes_a_durable_build_claim(self):
         before = self.inventory()
         self.initialize()
@@ -195,7 +209,7 @@ class SourceTopologyTests(unittest.TestCase):
         self.assertEqual(set(self.inventory()), {"metadata.lock"})
 
     def test_durability_failure_refuses_then_additive_setup_can_resume(self):
-        result = self.topology(env=self.fault_tools({"sync": "exit 1"}))
+        result = self.topology(env=self.barrier_tools("exit 1"))
         self.assertEqual(result.returncode, 73, result.stderr)
         self.assertEqual(result.stdout, b"")
         self.assertTrue(self.alias.is_symlink(), "failed barriers must preserve additive setup")
@@ -204,7 +218,7 @@ class SourceTopologyTests(unittest.TestCase):
 
     def test_already_present_fast_path_reestablishes_durability(self):
         self.initialize()
-        result = self.topology(env=self.fault_tools({"sync": "exit 1"}))
+        result = self.topology(env=self.barrier_tools("exit 1"))
         self.assertEqual(result.returncode, 73, result.stderr)
         self.assertEqual(result.stdout, b"")
         self.assertEqual(self.alias.resolve(), self.canonical.resolve())
@@ -233,12 +247,9 @@ class SourceTopologyTests(unittest.TestCase):
 
     def test_ready_and_new_claim_wait_for_complete_namespace_confirmation(self):
         entered, gate = self.base / "entered", self.base / "continue"
-        real_sync = shlex.quote(shutil.which("sync"))
-        env = self.fault_tools({"sync": (
+        env = self.barrier_tools(
             "touch " + shlex.quote(str(entered)) + "\n"
-            + "while [ ! -e " + shlex.quote(str(gate)) + " ]; do sleep 0.01; done\n"
-            + "exec " + real_sync + ' "$@"'
-        )})
+            + "while [ ! -e " + shlex.quote(str(gate)) + " ]; do sleep 0.01; done")
         command, data = self.command("topology", "a1", self.scope, *self.topology_commands())
         initializer = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                        stderr=subprocess.PIPE, env=env)

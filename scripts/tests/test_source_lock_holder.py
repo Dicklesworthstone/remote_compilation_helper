@@ -6,10 +6,15 @@ bootstrap is selected with a test-owned uname, but the locks are Linux locks:
 this does not substitute for running this suite on Darwin. Nothing contacts a
 worker or changes a real RCH registry. Fixtures are retained for inspection.
 """
+import contextlib
 import errno
 import fcntl
+import hashlib
+import json
 import os
 from pathlib import Path
+import re
+import resource
 import selectors
 import shlex
 import shutil
@@ -17,22 +22,139 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
 REPO = Path(__file__).resolve().parents[2]
 HOLDER = (REPO / "rch/src/hook/source_lock_holder.sh").read_text()
+SSH_SOURCE = (REPO / "rch/src/hook/ssh.rs").read_text()
+RELEASE_WAITER = SSH_SOURCE.split(
+    'const SOURCE_AUTHORITY_RELEASE_WAITER: &str = r#"', 1)[1].split('"#;', 1)[0]
+PAIR_CUSTODY = SSH_SOURCE.split(
+    'const SOURCE_PAIR_CUSTODY: &str = r#"', 1)[1].split('"#;', 1)[0]
+CLAIM_REGISTRY = (REPO / "rch/src/hook/source_claim_registry.sh").read_text()
+CLAIM_HELPER_SOURCE = (REPO / "rch-common/src/stale_target_reap.rs").read_text()
+CLAIM_HELPERS = CLAIM_HELPER_SOURCE.split(
+    'pub const SOURCE_CLAIM_RECORD_HELPERS: &str = r#"', 1)[1].split('"#;', 1)[0]
+# Execute the unchanged production upload framing and post-lock ownership
+# check. The native suite does not reimplement either admission decision.
+ACTIVITY_SOURCE = SSH_SOURCE.split(
+    'fn source_authority_activity_prefix_for_mode(', 1)[1].split('\n}\n', 1)[0]
+ACTIVITY_LITERAL = re.search(r'let check = ("(?:[^"\\]|\\[\s\S])*");', ACTIVITY_SOURCE).group(1)
+ACTIVITY_CHECK = json.loads(re.sub(r'\\\n[ \t]*', '', ACTIVITY_LITERAL))
+TRANSFER_SOURCE = (REPO / "rch/src/transfer.rs").read_text()
+FINITE_ACTIVITY_TEMPLATE = TRANSFER_SOURCE.split(
+    'pub(crate) fn source_activity_finite_script(', 1)[1].split('r#"', 1)[1].split('"#', 1)[0]
+FIDELITY_SOURCE = (REPO / "rch/src/hook/source_fidelity.rs").read_text()
+MANIFEST_TEMPLATE = FIDELITY_SOURCE.split(
+    'fn remote_manifest_verifier_script(', 1)[1].split('r#"', 1)[1].split('"#', 1)[0]
+MANIFEST_VERIFIER = FIDELITY_SOURCE.split(
+    'const REMOTE_VERIFY_PYTHON: &str = r#"', 1)[1].split('"#;', 1)[0]
 FLOCK = shutil.which("flock")
 GNU_FLOCK = bool(FLOCK and b"--no-fork" in subprocess.run(
     [FLOCK, "--help"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     timeout=5, check=False,
 ).stdout)
 BASH = shutil.which("bash")
+RSYNC = shutil.which("rsync")
 GNU_CANCELLABLE = bool(GNU_FLOCK and BASH and subprocess.run(
     [BASH, "--noprofile", "--norc", "-p", "-c",
      "(( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 1) ))"],
     stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5, check=False,
 ).returncode == 0)
+
+
+# A real rsync client starts this test-owned remote-shell transport. Preserve
+# the server arguments it actually sends, and run that server under the exact
+# production activity check. Deliberately retain a half-open pipe after client
+# failure: local timeout/SSH teardown alone must not make this test pass.
+RSYNC_ACTIVITY_PROXY = r'''
+import json, os, signal, subprocess, sys, threading, time
+from pathlib import Path
+
+config = json.loads(Path(sys.argv[1]).read_text())
+root = Path(config["fixture"])
+server_args = sys.argv[3:]
+(root / "server-argv.json").write_text(json.dumps(server_args))
+assert server_args[0] == "rsync", server_args
+started = time.monotonic()
+report = {"input_bytes": 0, "output_bytes": 0, "fixture_closed_input": False,
+          "fixture_killed_server": False, "client_signals": []}
+# rsync can signal its local remote-shell child on failure. This proxy also
+# observes the independent worker, so keep that observer alive like a remote
+# sshd after its local ssh client has gone. No signal reaches the server group.
+for signum in (signal.SIGUSR1, signal.SIGHUP, signal.SIGTERM):
+    signal.signal(signum, lambda signum, _frame: report["client_signals"].append(signum))
+stderr = open(root / "server.stderr", "wb")
+server = subprocess.Popen(
+    ["nohup", config["flock"], "-x", "--", config["activity"], "/bin/sh", "-c",
+     config["check"], "rch-source-activity", config["registry"], "aa", "active",
+     config["rsync"], *server_args[1:]],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr,
+    start_new_session=True,
+)
+channel_stalled = threading.Event()
+
+def forward_input():
+    try:
+        while True:
+            data = os.read(0, 65536)
+            if not data:
+                return  # Keep worker stdin OPEN despite client EOF.
+            if channel_stalled.is_set():
+                return  # Retain stdin, but do not deliver client keepalives.
+            report["input_bytes"] += len(data)
+            view = memoryview(data)
+            while view:
+                view = view[os.write(server.stdin.fileno(), view):]
+    except (BrokenPipeError, OSError):
+        pass
+
+def forward_output():
+    try:
+        while True:
+            data = os.read(server.stdout.fileno(), 8192)
+            if not data:
+                return
+            report["output_bytes"] += len(data)
+            if config["mode"] == "output-stall" and report["output_bytes"] >= 32768:
+                channel_stalled.set()
+                (root / "output-stalled").write_text("worker pipe retained, unread")
+                return  # Keep worker stdout OPEN, with no reader draining it.
+            view = memoryview(data)
+            while view:
+                view = view[os.write(1, view):]
+    except (BrokenPipeError, OSError):
+        pass
+
+try:
+    if config["mode"] != "input-stall":
+        threading.Thread(target=forward_input, daemon=True).start()
+    threading.Thread(target=forward_output, daemon=True).start()
+    if config["observe_unbounded"]:
+        # Only the explicit opt-out baseline closes a fixture channel. Every
+        # positive timeout case must end through rsync's own I/O deadline.
+        time.sleep(4)
+        report["alive_at_four_seconds"] = server.poll() is None
+        report["fixture_closed_input"] = True
+        server.stdin.close()
+    report["server_status"] = server.wait(timeout=14)
+except subprocess.TimeoutExpired:
+    report["server_status"] = 255
+    report["failure"] = "worker outlived the fixture's independent observation deadline"
+finally:
+    # Signal only this direct child's private group while its leader is still
+    # unreaped. Retain all fixture files, durable claims and registry evidence.
+    if server.poll() is None:
+        report["fixture_killed_server"] = True
+        os.killpg(server.pid, signal.SIGKILL)
+        server.wait(timeout=5)
+    report["elapsed"] = time.monotonic() - started
+    (root / "server-report.json").write_text(json.dumps(report, indent=2))
+    stderr.close()
+sys.exit(report["server_status"])
+'''
 
 
 def eventually(predicate, detail):
@@ -71,7 +193,7 @@ def _ignored_sighup():
 
 class Holder:
     def __init__(self, script, args, env, plan, claim="claim input", fd_limit=None,
-                 closed_stdin=False, ignore_hup=False):
+                 closed_stdin=False, ignore_hup=False, session_idle=None):
         command = "set -eu\n"
         if fd_limit:
             command += "ulimit -n {}\n".format(fd_limit)
@@ -86,6 +208,12 @@ class Holder:
         command += "exec 4<<'RCH_TEST_CLAIM'\n{}\nRCH_TEST_CLAIM\n".format(claim)
         command += "exec sh -c {} {} {}".format(
             shlex.quote(script), shlex.quote(script), shlex.join(args))
+        if session_idle is not None:
+            # Match source_authority_live_session_command: the supervisor
+            # receives the whole holder script on fd 3, never through argv.
+            command = ("set -eu\nexec 3<<'RCH_SOURCE_LOCK_SESSION_PROGRAM'\n{}\n"
+                       "RCH_SOURCE_LOCK_SESSION_PROGRAM\nexec sh -c {} {} --rch-session {}"
+                       ).format(command, shlex.quote(script), shlex.quote(script), session_idle)
         self.process = subprocess.Popen(
             ["/bin/sh", "-c", command], env=env,
             stdin=subprocess.DEVNULL if closed_stdin else subprocess.PIPE,
@@ -117,8 +245,15 @@ class Holder:
 
     def finish(self):
         if self.process.stdin is not None:
-            self.process.stdin.close()
-            self.process.stdin = None
+            try:
+                self.process.stdin.close()
+            except BrokenPipeError:
+                # Cancellation may close the remote reader while the last
+                # heartbeat is buffered. Still inspect its real exit status,
+                # output and retained ownership below.
+                pass
+            finally:
+                self.process.stdin = None
         return self.process.communicate(timeout=5)
 
     def failure(self):
@@ -133,12 +268,346 @@ class Holder:
         self.process.communicate(timeout=5)
 
 
+@unittest.skipUnless(FLOCK, "real pair publication requires flock")
+class SourcePairCustodyTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="rch-source-pair-custody-"))
+
+    def paths(self, name):
+        directory = self.root / name
+        directory.mkdir()
+        return {
+            "directory": directory,
+            "lock": directory / "pair.lock",
+            "owner": directory / "pair.lock.owner",
+            "source": directory / "source",
+        }
+
+    def receipt(self, paths, token="aa"):
+        # The Rust caller derives this opaque name from the pair root/token;
+        # this native test exercises the exact production custody program.
+        return paths["directory"] / ("pair.lock.released-" + token)
+
+    def command(self, paths, operation, token="aa", fault=None):
+        program = PAIR_CUSTODY
+        if fault:
+            # Inject failures only at real filesystem syscall boundaries.
+            # The production state machine and bytes are executed unchanged.
+            injection = r'''
+import errno as _rch_errno
+import os as _rch_os
+import stat as _rch_stat
+import sys as _rch_sys
+_rch_replace = _rch_os.replace
+_rch_fsync = _rch_os.fsync
+_rch_last_destination = None
+_rch_owner_path = _rch_sys.argv[2]
+_rch_receipt_path = _rch_sys.argv[3]
+def _rch_test_replace(source, destination, *args, **kwargs):
+    global _rch_last_destination
+    role = "owner" if destination == _rch_os.path.basename(_rch_owner_path) else "receipt"
+    if _rch_fault == "before-" + role + "-rename":
+        _rch_os._exit(91)
+    _rch_replace(source, destination, *args, **kwargs)
+    _rch_last_destination = role
+    if _rch_fault == "after-" + role + "-rename":
+        _rch_os._exit(92)
+def _rch_test_fsync(fd):
+    global _rch_fault
+    is_directory = _rch_stat.S_ISDIR(_rch_os.fstat(fd).st_mode)
+    if _rch_fault == "private-sync" and not is_directory and _rch_last_destination is None:
+        raise OSError(_rch_errno.EIO, "injected private-file fsync failure")
+    if (is_directory and _rch_last_destination is not None
+            and _rch_fault == _rch_last_destination + "-directory-sync"):
+        raise OSError(_rch_errno.EIO, "injected containing-directory fsync failure")
+    if _rch_fault == "owner-changed-before-rename" and not is_directory:
+        with open(_rch_owner_path, "wb") as changed:
+            changed.write(b"bb\n")
+        _rch_fault = None
+    return _rch_fsync(fd)
+_rch_os.replace = _rch_test_replace
+_rch_os.fsync = _rch_test_fsync
+'''
+            program = "_rch_fault = " + repr(fault) + "\n" + injection + "\n" + program
+        return [FLOCK, "-x", "--", str(paths["lock"]), sys.executable,
+                "-I", "-S", "-c", program, operation, str(paths["owner"]),
+                str(self.receipt(paths, token)), token, str(paths["source"])]
+
+    def transact(self, paths, operation, token="aa", fault=None, limited=False):
+        def limit_writes():
+            signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+            resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
+        return subprocess.run(self.command(paths, operation, token, fault),
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=10, check=False,
+                              preexec_fn=limit_writes if limited else None)
+
+    def accepted(self, result, stdout=b""):
+        self.assertEqual((result.returncode, result.stdout), (0, stdout), result.stderr)
+
+    def refused(self, result):
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, b"", "incomplete custody must not acknowledge")
+
+    def test_pair_failed_private_write_preserves_owner_and_allows_safe_retry(self):
+        for initial in ("absent", "released"):
+            with self.subTest(initial=initial):
+                paths = self.paths("claim-" + initial)
+                if initial == "released":
+                    paths["owner"].write_bytes(b"released\n")
+                    before = paths["owner"].stat().st_ino
+                result = self.transact(paths, "claim", limited=True)
+                self.refused(result)
+                self.assertIn(b"RCH_SOURCE_PAIR_PUBLICATION_UNCONFIRMED", result.stderr)
+                if initial == "released":
+                    self.assertEqual(paths["owner"].read_bytes(), b"released\n")
+                    self.assertEqual(paths["owner"].stat().st_ino, before)
+                else:
+                    self.assertFalse(paths["owner"].exists())
+                evidence = list(paths["directory"].glob(".pair-write.*"))
+                self.assertTrue(evidence, "failed private bytes must be retained")
+                self.accepted(self.transact(paths, "claim"))
+                self.assertEqual(paths["owner"].read_bytes(), b"aa\n")
+                self.assertTrue(all(path.exists() for path in evidence))
+                self.assertEqual(paths["owner"].stat().st_mode & 0o777, 0o600)
+                self.assertFalse(paths["source"].exists())
+        for operation in ("release", "cancel-unowned"):
+            with self.subTest(operation=operation):
+                paths = self.paths(operation)
+                self.accepted(self.transact(paths, "claim"))
+                owner_inode = paths["owner"].stat().st_ino
+                self.refused(self.transact(paths, operation, limited=True))
+                self.assertEqual(paths["owner"].read_bytes(), b"aa\n")
+                self.assertEqual(paths["owner"].stat().st_ino, owner_inode)
+                self.assertFalse(self.receipt(paths).exists())
+                expected = b"unowned" if operation == "cancel-unowned" else b""
+                self.accepted(self.transact(paths, operation), expected)
+                self.assertEqual(paths["owner"].read_bytes(), b"released\n")
+                self.assertEqual(self.receipt(paths).read_bytes(), b"aa\n")
+
+    def test_pair_interrupted_claim_never_publishes_partial_or_unowned_authority(self):
+        for fault in ("private-sync", "before-owner-rename", "after-owner-rename",
+                      "owner-directory-sync"):
+            with self.subTest(fault=fault):
+                paths = self.paths(fault)
+                paths["owner"].write_bytes(b"released\n")
+                self.refused(self.transact(paths, "claim", fault=fault))
+                owner = paths["owner"].read_bytes()
+                if fault in ("private-sync", "before-owner-rename"):
+                    self.assertEqual(owner, b"released\n")
+                    self.accepted(self.transact(paths, "claim"))
+                else:
+                    self.assertEqual(owner, b"aa\n")
+                    self.refused(self.transact(paths, "claim", token="bb"))
+                    self.accepted(self.transact(paths, "recover"))
+                self.assertFalse(paths["source"].exists())
+                self.accepted(self.transact(paths, "cancel-unowned"), b"unowned")
+                self.accepted(self.transact(paths, "claim", token="bb"))
+
+    def test_pair_interrupted_release_reconciles_exact_receipt_before_readmission(self):
+        for fault in ("private-sync", "before-receipt-rename", "after-receipt-rename",
+                      "receipt-directory-sync", "before-owner-rename",
+                      "after-owner-rename", "owner-directory-sync"):
+            with self.subTest(fault=fault):
+                paths = self.paths(fault)
+                self.accepted(self.transact(paths, "claim"))
+                self.refused(self.transact(paths, "release", fault=fault))
+                receipt = self.receipt(paths)
+                self.assertIn(paths["owner"].read_bytes(), (b"aa\n", b"released\n"))
+                if receipt.exists():
+                    self.assertEqual(receipt.read_bytes(), b"aa\n")
+                    inode = receipt.stat().st_ino
+                    self.refused(self.transact(paths, "recover"))
+                    self.accepted(self.transact(paths, "released"), b"released")
+                    self.assertEqual(receipt.stat().st_ino, inode)
+                else:
+                    self.accepted(self.transact(paths, "released"), b"pending")
+                    self.refused(self.transact(paths, "claim", token="bb"))
+                    self.accepted(self.transact(paths, "release"))
+                self.assertEqual(paths["owner"].read_bytes(), b"released\n")
+                self.assertEqual(receipt.read_bytes(), b"aa\n")
+                self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
+                receipt_inode = receipt.stat().st_ino
+                self.accepted(self.transact(paths, "release"))
+                self.assertEqual(receipt.stat().st_ino, receipt_inode)
+                self.refused(self.transact(paths, "claim"))
+                self.accepted(self.transact(paths, "claim", token="bb"))
+                paths["source"].mkdir()
+                source = paths["source"] / "successor-owned"
+                source.write_bytes(b"live successor content")
+                owner_inode = paths["owner"].stat().st_ino
+                self.accepted(self.transact(paths, "released"), b"released")
+                self.assertEqual(paths["owner"].stat().st_ino, owner_inode)
+                self.assertEqual(paths["owner"].read_bytes(), b"bb\n")
+                self.assertEqual(source.read_bytes(), b"live successor content")
+
+    def test_pair_cancellation_replays_owned_and_unowned_publication_frontiers(self):
+        paths = self.paths("owned")
+        self.accepted(self.transact(paths, "claim"))
+        self.accepted(self.transact(paths, "cancel-owned"), b"owned")
+        self.assertFalse(self.receipt(paths).exists())
+        self.refused(self.transact(paths, "release", fault="after-receipt-rename"))
+        paths["source"].mkdir()
+        sentinel = paths["source"] / "still-owned"
+        sentinel.write_bytes(b"live source blocks receipt reconciliation")
+        self.refused(self.transact(paths, "cancel-owned"))
+        self.assertEqual(paths["owner"].read_bytes(), b"aa\n")
+        self.assertEqual(sentinel.read_bytes(), b"live source blocks receipt reconciliation")
+        paths["source"].rename(paths["directory"] / "retired-source")
+        self.accepted(self.transact(paths, "cancel-owned"), b"unowned")
+        self.accepted(self.transact(paths, "released"), b"released")
+        self.accepted(self.transact(paths, "claim", token="bb"))
+        self.accepted(self.transact(paths, "cancel-owned"), b"unowned")
+        self.assertEqual(paths["owner"].read_bytes(), b"bb\n")
+
+        for fault in ("after-receipt-rename", "before-owner-rename", "after-owner-rename"):
+            with self.subTest(fault=fault):
+                paths = self.paths("unowned-" + fault)
+                self.accepted(self.transact(paths, "claim"))
+                # This operation has no source authority. Even a path left by
+                # unrelated activity is neither inspected nor removed by it.
+                paths["source"].mkdir()
+                source = paths["source"] / "preserve"
+                source.write_bytes(b"outside unowned intent authority")
+                self.refused(self.transact(paths, "cancel-unowned", fault=fault))
+                self.accepted(self.transact(paths, "cancel-unowned"), b"unowned")
+                self.assertEqual(source.read_bytes(), b"outside unowned intent authority")
+                self.assertEqual(paths["owner"].read_bytes(), b"released\n")
+                self.assertEqual(self.receipt(paths).read_bytes(), b"aa\n")
+
+    def test_pair_malformed_conflicting_and_aliased_records_remain_fail_closed(self):
+        for index, malformed in enumerate((b"", b"aa", b"aa\n\n", b"aa\nbb\n", b"released")):
+            paths = self.paths("malformed-owner-" + str(index))
+            paths["owner"].write_bytes(malformed)
+            self.receipt(paths).write_bytes(b"aa\n")
+            inode = paths["owner"].stat().st_ino
+            for operation in ("claim", "recover", "release", "cancel-owned", "cancel-unowned", "released"):
+                with self.subTest(index=index, operation=operation):
+                    self.refused(self.transact(paths, operation))
+                    self.assertEqual(paths["owner"].read_bytes(), malformed)
+                    self.assertEqual(paths["owner"].stat().st_ino, inode)
+                    self.assertEqual(self.receipt(paths).read_bytes(), b"aa\n")
+        for index, malformed in enumerate((b"", b"aa", b"aa\n\n", b"bb\n", b"released\n")):
+            paths = self.paths("malformed-receipt-" + str(index))
+            paths["owner"].write_bytes(b"aa\n")
+            receipt = self.receipt(paths)
+            receipt.write_bytes(malformed)
+            inode = receipt.stat().st_ino
+            for operation in ("claim", "recover", "release", "cancel-owned", "cancel-unowned", "released"):
+                with self.subTest(index=index, operation=operation):
+                    self.refused(self.transact(paths, operation))
+                    self.assertEqual(receipt.read_bytes(), malformed)
+                    self.assertEqual(receipt.stat().st_ino, inode)
+                    self.assertEqual(paths["owner"].read_bytes(), b"aa\n")
+        for role in ("owner", "receipt"):
+            for corruption in ("symlink", "hardlink", "writable", "fifo", "directory"):
+                with self.subTest(role=role, corruption=corruption):
+                    paths = self.paths(role + "-" + corruption)
+                    target = paths["owner"] if role == "owner" else self.receipt(paths)
+                    other = paths["directory"] / "evidence"
+                    if corruption == "symlink":
+                        other.write_bytes(b"aa\n")
+                        target.symlink_to(other)
+                    elif corruption == "hardlink":
+                        other.write_bytes(b"aa\n")
+                        os.link(other, target)
+                    elif corruption == "fifo":
+                        os.mkfifo(target)
+                    elif corruption == "directory":
+                        target.mkdir()
+                    else:
+                        target.write_bytes(b"aa\n")
+                        target.chmod(0o666)
+                    if role == "owner":
+                        self.receipt(paths).write_bytes(b"aa\n")
+                    else:
+                        paths["owner"].write_bytes(b"aa\n")
+                    before = target.lstat()
+                    self.refused(self.transact(paths, "released"))
+                    self.refused(self.transact(paths, "cancel-unowned"))
+                    self.assertEqual(target.lstat().st_ino, before.st_ino)
+                    self.assertEqual(target.lstat().st_mode, before.st_mode)
+                    if other.exists():
+                        self.assertEqual(other.read_bytes(), b"aa\n")
+        paths = self.paths("receipt-without-owner")
+        self.receipt(paths).write_bytes(b"aa\n")
+        for operation in ("claim", "recover", "release", "cancel-owned", "cancel-unowned", "released"):
+            with self.subTest(operation=operation):
+                self.refused(self.transact(paths, operation))
+        self.assertFalse(paths["owner"].exists())
+
+    def test_pair_readable_legacy_records_and_changed_owner_are_handled_exactly(self):
+        for mode in (0o640, 0o644):
+            paths = self.paths("legacy-" + oct(mode))
+            paths["owner"].write_bytes(b"aa\n")
+            paths["owner"].chmod(mode)
+            receipt = self.receipt(paths)
+            receipt.write_bytes(b"aa\n")
+            receipt.chmod(mode)
+            receipt_inode = receipt.stat().st_ino
+            self.accepted(self.transact(paths, "released"), b"released")
+            self.assertEqual(paths["owner"].read_bytes(), b"released\n")
+            self.assertEqual(paths["owner"].stat().st_mode & 0o777, 0o600)
+            self.assertEqual(receipt.stat().st_ino, receipt_inode)
+            self.assertEqual(receipt.stat().st_mode & 0o777, mode)
+        paths = self.paths("changed-during-private-write")
+        paths["owner"].write_bytes(b"released\n")
+        self.refused(self.transact(paths, "claim", fault="owner-changed-before-rename"))
+        self.assertEqual(paths["owner"].read_bytes(), b"bb\n")
+        self.assertTrue(list(paths["directory"].glob(".pair-write.*")))
+        self.assertFalse(paths["source"].exists())
+
+    def test_pair_concurrent_dispatchers_preserve_one_owner_and_one_release_receipt(self):
+        paths = self.paths("concurrent")
+        commands = [("aa", self.command(paths, "claim", "aa")),
+                    ("bb", self.command(paths, "claim", "bb"))]
+        children = [(token, subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE))
+                    for token, command in commands]
+        results = []
+        for token, child in children:
+            output, error = child.communicate(timeout=10)
+            results.append((token, child.returncode, output, error))
+        winners = [row for row in results if row[1] == 0]
+        self.assertEqual(len(winners), 1, results)
+        token = winners[0][0]
+        self.assertEqual(paths["owner"].read_bytes(), (token + "\n").encode())
+        releases = [subprocess.Popen(self.command(paths, "release", token),
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    for _ in range(3)]
+        for child in releases:
+            output, error = child.communicate(timeout=10)
+            self.assertEqual((child.returncode, output), (0, b""), error)
+        receipt = self.receipt(paths, token)
+        self.assertEqual(receipt.read_bytes(), (token + "\n").encode())
+        self.assertEqual(receipt.stat().st_nlink, 1)
+        self.assertEqual(paths["owner"].read_bytes(), b"released\n")
+        self.refused(self.transact(paths, "claim", token))
+        self.accepted(self.transact(paths, "claim", "cc"))
+        owner_inode = paths["owner"].stat().st_ino
+        self.accepted(self.transact(paths, "released", token), b"released")
+        self.assertEqual(paths["owner"].read_bytes(), b"cc\n")
+        self.assertEqual(paths["owner"].stat().st_ino, owner_inode)
+
+
 class SourceLockHolderTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="rch-source-holder-"))
         self.holders = []
+        self.activity_processes = []
 
     def tearDown(self):
+        for process in reversed(self.activity_processes):
+            # Each fixture created its own group. Signal it only while its
+            # unreaped leader remains this test's direct child.
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+            if process.stdin is not None:
+                try:
+                    process.stdin.close()
+                except BrokenPipeError:
+                    pass
+                process.stdin = None
+            process.communicate(timeout=5)
         for holder in reversed(self.holders):
             holder.close()
 
@@ -147,9 +616,12 @@ class SourceLockHolderTests(unittest.TestCase):
         directory = self.root / (name if bash else name + "-legacy")
         directory.mkdir(exist_ok=True)
         uname = directory / "uname"
-        uname.write_text("#!/bin/sh\nprintf 'called\\n' >> {}\nprintf '%s\\n' {}\n".format(
-            shlex.quote(str(directory / "uname.calls")), "Darwin" if portable else "Linux"))
-        uname.chmod(0o700)
+        # Sibling holders may still be executing this same fixture. Its
+        # contents are immutable; replacing it races exec with ETXTBSY.
+        if not uname.exists():
+            uname.write_text("#!/bin/sh\nprintf 'called\\n' >> {}\nprintf '%s\\n' {}\n".format(
+                shlex.quote(str(directory / "uname.calls")), "Darwin" if portable else "Linux"))
+            uname.chmod(0o700)
         for name, target in [("sh", "/bin/sh"), ("cat", shutil.which("cat"))]:
             path = directory / name
             if not path.exists():
@@ -166,8 +638,9 @@ class SourceLockHolderTests(unittest.TestCase):
             # A successful test must never invoke GNU flock on this path.
             flock = directory / "flock"
             self.assertFalse(flock.is_symlink(), "must not overwrite a real tool through a symlink")
-            flock.write_text("#!/bin/sh\nprintf 'unexpected flock invocation\\n' >&2\nexit 97\n")
-            flock.chmod(0o700)
+            if not flock.exists():
+                flock.write_text("#!/bin/sh\nprintf 'unexpected flock invocation\\n' >&2\nexit 97\n")
+                flock.chmod(0o700)
         elif FLOCK:
             path = directory / "flock"
             if not path.exists():
@@ -185,6 +658,29 @@ class SourceLockHolderTests(unittest.TestCase):
         self.holders.append(holder)
         return holder
 
+    def session_python_environment(self, setup):
+        # Alter platform capabilities or the scheduling boundary before the
+        # exact embedded production program runs. Ordinary holder/terminal
+        # Python commands still exec the real interpreter unchanged.
+        env = self.environment()
+        directory = self.root / "session-python-bin"
+        directory.mkdir()
+        bootstrap = ("import os, signal, sys\n"
+                     "if (sys.argv[1:4] == ['-I', '-S', '-c'] and len(sys.argv) == 6\n"
+                     "        and 'RCH_SOURCE_LOCK_HEARTBEAT' in sys.argv[4]):\n"
+                     + "".join("    " + line + "\n" for line in setup.splitlines())
+                     + "    test_program = sys.argv[4]\n"
+                     "    sys.argv = ['-c', *sys.argv[5:]]\n"
+                     "    exec(compile(test_program, '<production source-lock session>', 'exec'))\n"
+                     "else:\n"
+                     "    os.execv(sys.executable, [sys.executable, *sys.argv[1:]])\n")
+        wrapper = directory / "python3"
+        wrapper.write_text("#!/bin/sh\nexec {} -I -S -c {} \"$@\"\n".format(
+            shlex.quote(sys.executable), shlex.quote(bootstrap)))
+        wrapper.chmod(0o700)
+        env["PATH"] = str(directory) + os.pathsep + env["PATH"]
+        return env
+
     def assert_waiting(self, holder, paths, detail):
         # The holder validates and opens the WHOLE plan before taking any
         # lock, then retries the closure non-blocking and releases every
@@ -201,6 +697,657 @@ class SourceLockHolderTests(unittest.TestCase):
         # must leave the roots before it to other builds.
         eventually(lambda: all(available(path) for path in paths),
                    "waiter monopolized earlier roots while contended")
+
+    def release_registry(self, name="registry"):
+        registry = self.root / name
+        registry.mkdir()
+        for child in ("released", "cancelled", "quarantine"):
+            (registry / child).mkdir()
+        (registry / "metadata.lock").write_bytes(b"")
+        return registry
+
+    def claim_bytes(self, roots):
+        return ("\n".join(sorted(set(map(str, roots)))) + "\n").encode()
+
+    def claim_record(self, registry, token, roots, extension="claim", directory=None):
+        content = self.claim_bytes(roots)
+        digest = hashlib.sha256(content).hexdigest()
+        path = (directory or registry) / f"{token}.{digest}.{extension}"
+        path.write_bytes(content)
+        return path, digest, content
+
+    def registry_transaction(self, registry, token, roots, operation):
+        # Run the exact shared helpers and production transaction, including
+        # cancellation's activity-before-metadata lock order. Starting with a
+        # valid old claim models an admitted invocation, so a full test disk
+        # never requires disabling the fresh-admission headroom checks.
+        content = self.claim_bytes(roots)
+        digest = hashlib.sha256(content).hexdigest()
+        command = [FLOCK, "-x", "--", str(registry / "metadata.lock"),
+                   "/bin/sh", "-c", CLAIM_HELPERS + "\n" + CLAIM_REGISTRY,
+                   "rch-source-registry", str(registry), token, digest, operation]
+        if operation in ("cancel", "finish-cancel"):
+            command = [FLOCK, "-x", "--", str(registry / f"{token}.activity.lock"),
+                       *command]
+        return subprocess.run(command, input=content, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, timeout=20, check=False,
+                              env={**os.environ, "LC_ALL": "C"})
+
+    def finite_activity_script(self, registry, command, token="aa"):
+        prefix = shlex.join([
+            "nohup", FLOCK, "-x", "--", str(registry / f"{token}.activity.lock"),
+            "sh", "-c", ACTIVITY_CHECK, "rch-source-activity", str(registry), token, "active",
+        ])
+        delimiter = "RCH_TEST_FINITE_ACTIVITY"
+        self.assertNotIn(delimiter, command.splitlines())
+        return FINITE_ACTIVITY_TEMPLATE.format(
+            prefix=prefix, script=command, delimiter=delimiter), delimiter
+
+    def start_finite_activity(self, script):
+        process = subprocess.Popen(
+            ["/bin/sh", "-s"], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+            cwd=self.root,
+        )
+        self.activity_processes.append(process)
+        process.stdin.write(script.encode())
+        process.stdin.flush()
+        return process
+
+    def finish_finite_activity(self, process, remaining=""):
+        if remaining:
+            process.stdin.write(remaining.encode())
+            process.stdin.flush()
+        process.stdin.close()
+        process.stdin = None
+        return process.communicate(timeout=5)
+
+    def run_rsync_activity(self, direction, mode, timeout=2):
+        fixture = self.root / f"rsync-{direction}-{mode}"
+        fixture.mkdir()
+        worker_root = fixture / "worker"
+        client_root = fixture / "client"
+        worker_root.mkdir()
+        client_root.mkdir()
+        sentinel = worker_root / "source-sentinel"
+        sentinel.write_bytes(b"durable source ownership must survive transport failure")
+        registry = self.release_registry(fixture.name + "-registry")
+        claim, _, content = self.claim_record(registry, "aa", [worker_root])
+        inode = claim.stat().st_ino
+        activity = registry / "aa.activity.lock"
+        payload = bytes(range(256)) * (512 if mode == "progress" else 1024)
+        source = (client_root if direction == "push" else worker_root) / "payload"
+        source.write_bytes(payload)
+        destination = (worker_root if direction == "push" else client_root) / "payload"
+        config = fixture / "proxy.json"
+        config.write_text(json.dumps({
+            "fixture": str(fixture), "flock": FLOCK, "rsync": RSYNC,
+            "activity": str(activity), "registry": str(registry),
+            "check": ACTIVITY_CHECK, "mode": mode,
+            "observe_unbounded": timeout == 0,
+        }))
+        proxy = fixture / "remote-shell"
+        proxy.write_text("#!{}\n{}".format(sys.executable, RSYNC_ACTIVITY_PROXY))
+        proxy.chmod(0o700)
+        command = [RSYNC, "-a", "-e", shlex.join([str(proxy), str(config)])]
+        if timeout:
+            command.append(f"--timeout={timeout}")
+        if mode == "progress":
+            command.append("--bwlimit=32")
+        if direction == "push":
+            command += [str(source), "fixture:" + str(destination)]
+        else:
+            command += ["fixture:" + str(source), str(destination)]
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   start_new_session=True, cwd=fixture)
+        self.activity_processes.append(process)
+        eventually(lambda: activity.exists() and not available(activity),
+                   "real rsync server never held source activity")
+        self.assertEqual((claim.stat().st_ino, claim.read_bytes()), (inode, content))
+        if mode == "output-stall":
+            eventually(lambda: (fixture / "output-stalled").exists(),
+                       "real rsync sender never reached the blocked-output frontier")
+        stdout, stderr = process.communicate(timeout=20)
+        eventually(lambda: (fixture / "server-report.json").exists(),
+                   "remote-shell fixture did not record the real server's exit")
+        report = json.loads((fixture / "server-report.json").read_text())
+        report["client_status"] = process.returncode
+        report["client_stderr"] = stderr.decode(errors="replace")
+        report["server_stderr"] = (fixture / "server.stderr").read_text()
+        args = json.loads((fixture / "server-argv.json").read_text())
+        self.assertEqual("--sender" in args, direction == "pull", args)
+        self.assertEqual([arg for arg in args if arg.startswith("--timeout=")],
+                         [f"--timeout={timeout}"] if timeout else [], args)
+        self.assertFalse(report["fixture_killed_server"], report)
+        self.assertEqual((claim.stat().st_ino, claim.read_bytes()), (inode, content))
+        self.assertEqual(sentinel.read_bytes(),
+                         b"durable source ownership must survive transport failure")
+        self.assertEqual(list(registry.glob("*.cancelling")), [])
+        self.assertEqual(list((registry / "released").iterdir()), [])
+        self.assertEqual(list((registry / "cancelled").iterdir()), [])
+        self.assertTrue(available(activity), report)
+        if mode == "progress":
+            self.assertEqual(destination.read_bytes(), payload)
+        (fixture / "qualification.json").write_text(json.dumps(report, indent=2))
+        return report
+
+    @unittest.skipUnless(FLOCK and RSYNC, "flock and rsync required for real activity I/O")
+    def test_rsync_receiver_times_out_half_open_input_without_releasing_claim(self):
+        report = self.run_rsync_activity("push", "input-stall")
+        self.assertEqual(report["server_status"], 30, report)
+        self.assertIn("timeout", report["server_stderr"].lower())
+        self.assertFalse(report["fixture_closed_input"], report)
+        self.assertLess(report["elapsed"], 10, report)
+        self.assertGreater(report["output_bytes"], 0, "no real protocol handshake")
+
+    @unittest.skipUnless(FLOCK and RSYNC, "flock and rsync required for real activity I/O")
+    def test_rsync_sender_times_out_blocked_output_without_releasing_claim(self):
+        report = self.run_rsync_activity("pull", "output-stall")
+        self.assertEqual(report["server_status"], 30, report)
+        self.assertIn("timeout", report["server_stderr"].lower())
+        self.assertFalse(report["fixture_closed_input"], report)
+        self.assertLess(report["elapsed"], 10, report)
+        self.assertGreater(report["input_bytes"], 0, "no real client/server negotiation")
+
+    @unittest.skipUnless(FLOCK and RSYNC, "flock and rsync required for real activity I/O")
+    def test_rsync_progress_renews_idle_budget_in_both_directions(self):
+        for direction in ("push", "pull"):
+            with self.subTest(direction=direction):
+                report = self.run_rsync_activity(direction, "progress")
+                self.assertEqual((report["client_status"], report["server_status"]), (0, 0), report)
+                self.assertFalse(report["fixture_closed_input"], report)
+                self.assertGreater(report["elapsed"], 2, "test must exceed its I/O idle budget")
+                self.assertLess(report["elapsed"], 10, report)
+
+    @unittest.skipUnless(FLOCK and RSYNC, "flock and rsync required for real activity I/O")
+    def test_rsync_explicit_opt_out_keeps_activity_until_fixture_input_eof(self):
+        report = self.run_rsync_activity("push", "input-stall", timeout=0)
+        self.assertTrue(report["alive_at_four_seconds"], report)
+        self.assertTrue(report["fixture_closed_input"], report)
+        self.assertEqual(report["server_status"], 12, report)
+
+    @unittest.skipUnless(FLOCK, "flock required for real activity authority")
+    def test_finite_activity_incomplete_eof_never_executes_or_acquires_authority(self):
+        shells = ["/bin/sh", *([BASH] if BASH else [])]
+        for shell in shells:
+            for frontier in ("opening", "header", "body", "delimiter", "closing-brace"):
+                with self.subTest(shell=shell, frontier=frontier):
+                    registry = self.release_registry(f"{Path(shell).name}-{frontier}")
+                    claim, _, content = self.claim_record(registry, "aa", [self.root / "project"])
+                    inode = claim.stat().st_ino
+                    ran = registry / "workload-started"
+                    payload = "printf started > {}\n# {}\n".format(
+                        shlex.quote(str(ran)), "x" * (256 * 1024))
+                    script, delimiter = self.finite_activity_script(registry, payload)
+                    body = script.index(payload)
+                    end = script.index("\n" + delimiter + "\n", body)
+                    cut = {
+                        "opening": 2,
+                        "header": body,
+                        "body": body + len(payload) // 2,
+                        "delimiter": end + len(delimiter) // 2,
+                        "closing-brace": len(script) - 2,
+                    }[frontier]
+                    result = subprocess.run(
+                        [shell, "-s"], input=script[:cut].encode(),
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        timeout=5, check=False,
+                    )
+                    self.assertNotEqual(result.returncode, 0, (frontier, result.stderr))
+                    self.assertFalse(ran.exists(), "partial bootstrap executed a workload")
+                    self.assertFalse((registry / "aa.activity.lock").exists(),
+                                     "partial bootstrap entered the activity prefix")
+                    self.assertEqual((claim.stat().st_ino, claim.read_bytes()), (inode, content))
+
+    @unittest.skipUnless(FLOCK, "flock required for real activity cancellation")
+    def test_half_open_finite_upload_cannot_cross_cancel_or_terminal_fence(self):
+        for terminal in (False, True):
+            with self.subTest(terminal=terminal):
+                registry = self.release_registry("terminal" if terminal else "cancelling")
+                roots = [self.root / "unmaterialized-project"]
+                claim, digest, content = self.claim_record(registry, "aa", roots)
+                inode = claim.stat().st_ino
+                ran = registry / "workload-started"
+                payload = "printf forbidden > {}\n# {}\n".format(
+                    shlex.quote(str(ran)), "x" * (256 * 1024))
+                script, delimiter = self.finite_activity_script(registry, payload)
+                cut = script.index("\n" + delimiter + "\n", script.index(payload))
+                process = self.start_finite_activity(script[:cut])
+                # The upload exceeds pipe capacity, so its initial bytes have
+                # actually been consumed, but the channel stays open. There is
+                # no activity lock, workload or PGID for cancellation to drain.
+                self.assertIsNone(process.poll())
+                self.assertFalse((registry / "aa.activity.lock").exists())
+                self.assertFalse(ran.exists())
+                cancelled = self.registry_transaction(registry, "aa", roots, "cancel")
+                self.assertEqual((cancelled.returncode, cancelled.stdout),
+                                 (0, b"owned"), cancelled.stderr)
+                fence = registry / f"aa.{digest}.cancelling"
+                self.assertEqual((claim.stat().st_ino, claim.read_bytes()), (inode, content))
+                self.assertEqual(fence.read_bytes(), content)
+                if terminal:
+                    # No source tree was materialized. This exact transaction
+                    # settles only the fixture's owned cancellation.
+                    finished = self.registry_transaction(registry, "aa", roots, "finish-cancel")
+                    self.assertEqual((finished.returncode, finished.stdout),
+                                     (0, b""), finished.stderr)
+                stdout, stderr = self.finish_finite_activity(process, script[cut:])
+                self.assertEqual((process.returncode, stdout), (73, b""), stderr)
+                self.assertIn(b"source grant is not active" if terminal
+                              else b"source grant is cancelling", stderr)
+                self.assertFalse(ran.exists(), "late upload bypassed the cancellation fence")
+                self.assertTrue(available(registry / "aa.activity.lock"))
+                retained = registry / "cancelled" / f"aa.{digest}.claim" if terminal else claim
+                self.assertEqual(retained.read_bytes(), content)
+                self.assertEqual(fence.read_bytes(), content)
+
+    @unittest.skipUnless(FLOCK, "flock required for real activity authority")
+    def test_complete_finite_program_preserves_bytes_and_live_activity_after_hup(self):
+        registry = self.release_registry()
+        claim, _, content = self.claim_record(registry, "aa", [self.root / "project"])
+        started = registry / "workload-started"
+        finish = registry / "workload-may-finish"
+        literal = "$(printf expanded) `printf expanded` $HOME 'literal'"
+        payload = "# {}\nprintf started > {}; while [ ! -e {} ]; do sleep 0.02; done; printf '%s' {}; exit 17\n".format(
+            "x" * (256 * 1024), shlex.quote(str(started)),
+            shlex.quote(str(finish)), shlex.quote(literal))
+        script, _ = self.finite_activity_script(registry, payload)
+        process = self.start_finite_activity(script)
+        process.stdin.close()
+        process.stdin = None
+        eventually(started.exists, "complete bootstrap did not start its workload")
+        activity = registry / "aa.activity.lock"
+        self.assertFalse(available(activity), "running workload lost activity authority")
+        os.killpg(process.pid, signal.SIGHUP)
+        self.assertIsNone(process.poll())
+        self.assertFalse(available(activity), "HUP released a running workload's authority")
+        self.assertEqual(claim.read_bytes(), content)
+        finish.write_bytes(b"finish\n")
+        stdout, stderr = process.communicate(timeout=5)
+        self.assertEqual((process.returncode, stdout, stderr), (17, literal.encode(), b""))
+        self.assertTrue(available(activity))
+        self.assertEqual(claim.read_bytes(), content)
+
+    @unittest.skipUnless(FLOCK, "flock required for real manifest activity")
+    def test_finite_manifest_preserves_verifier_stdin_and_refuses_incomplete_uploads(self):
+        for frontier in ("empty", "complete", "incomplete-eof", "cancelled"):
+            with self.subTest(frontier=frontier):
+                registry = self.release_registry(frontier)
+                root = registry / "source root with ' quotes"
+                root.mkdir()
+                files = []
+                if frontier != "empty":
+                    for name, data, executable in (
+                        ("literal '$HOME `printf changed` $(printf changed) café.rs", b"source\n", False),
+                        ("executable.sh", b"#!/bin/sh\nexit 0\n", True),
+                    ):
+                        path = root / name
+                        path.write_bytes(data)
+                        path.chmod(0o755 if executable else 0o644)
+                        files.append((path, data, executable))
+                payload = "".join("{}\t{}\t{}\t{}\n".format(
+                    hashlib.sha256(data).hexdigest(), len(data), int(executable), path.name,
+                ) for path, data, executable in files)
+                total = sum(len(data) for _, data, _ in files)
+                # This is the exact production Python verifier, not a receipt
+                # stub. Its row count and byte denominator detect even one
+                # extra newline or shell expansion in the nested payload.
+                verifier = shlex.join([
+                    sys.executable, "-I", "-c", MANIFEST_VERIFIER,
+                    str(root), str(len(files)), str(total),
+                ])
+                program = MANIFEST_TEMPLATE.format(
+                    command=shlex.quote(verifier), payload=payload,
+                    delimiter="RCH_TEST_MANIFEST_INPUT",
+                )
+                script, _ = self.finite_activity_script(registry, program)
+                claim, _, content = self.claim_record(registry, "aa", [root])
+                if frontier in ("empty", "complete"):
+                    process = self.start_finite_activity(script)
+                    stdout, stderr = self.finish_finite_activity(process)
+                    self.assertEqual((process.returncode, stdout, stderr), (
+                        0, f"RCH_SOURCE_CONTENT_VERIFIED\t{len(files)}\t{total}\n".encode(), b"",
+                    ))
+                else:
+                    cut = script.index(payload) + len(payload) // 2
+                    process = self.start_finite_activity(script[:cut])
+                    self.assertIsNone(process.poll())
+                    self.assertFalse((registry / "aa.activity.lock").exists())
+                    if frontier == "cancelled":
+                        cancelled = self.registry_transaction(registry, "aa", [root], "cancel")
+                        self.assertEqual((cancelled.returncode, cancelled.stdout),
+                                         (0, b"owned"), cancelled.stderr)
+                        stdout, stderr = self.finish_finite_activity(process, script[cut:])
+                        self.assertEqual((process.returncode, stdout), (73, b""), stderr)
+                        self.assertIn(b"source grant is cancelling", stderr)
+                    else:
+                        stdout, stderr = self.finish_finite_activity(process)
+                        self.assertNotEqual(process.returncode, 0, stderr)
+                        self.assertEqual(stdout, b"")
+                        self.assertFalse((registry / "aa.activity.lock").exists())
+                self.assertEqual(claim.read_bytes(), content)
+                for path, data, executable in files:
+                    self.assertEqual(path.read_bytes(), data)
+                    self.assertEqual(bool(path.stat().st_mode & 0o111), executable)
+
+    def start_release_waiter(self, registry, token, binding, mode="source", lock=None,
+                             session_idle=None):
+        lock = lock or registry / "holder.lock"
+        kind = "AUTHORITY" if mode == "source" else "PAIR"
+        release = f"RCH_SOURCE_{kind}_RELEASE:{token}"
+        # The outer production holder owns real kernel locks. Its terminal
+        # execs the production release waiter with those descriptors intact.
+        # Success here means only that the exact request was read: no fixture
+        # manufactures a durable release receipt or an acknowledgment.
+        terminal = ('set -eu; exec 4<&-; printf "%s\\n" "$1"; '
+                    'shift; exec python3 -I -S -c "$@"')
+        holder = self.start([("x", lock)], terminal=terminal,
+                            args=(RELEASE_WAITER, mode, str(registry), token,
+                                  str(binding), release), session_idle=session_idle)
+        self.assertEqual(holder.line(), b"READY")
+        return holder, lock, release
+
+    @contextlib.contextmanager
+    def heartbeat_stream(self, holder):
+        stopped = threading.Event()
+
+        def send_heartbeats():
+            while not stopped.wait(0.1):
+                try:
+                    holder.send("RCH_SOURCE_LOCK_HEARTBEAT\n")
+                except (BrokenPipeError, OSError, ValueError):
+                    # Autonomous cancellation closes this exact child's pipe.
+                    return
+
+        sender = threading.Thread(target=send_heartbeats, name="rch-test-heartbeats")
+        sender.start()
+        try:
+            yield
+        finally:
+            stopped.set()
+            sender.join(timeout=5)
+            self.assertFalse(sender.is_alive(), "fixture heartbeat writer did not stop")
+
+    def assert_heartbeat_session_held(self, holder, lock):
+        # Exceed the two-second test lease: without valid heartbeat framing,
+        # the supervisor would have killed this holder before cancellation.
+        deadline = time.monotonic() + 2.2
+        while time.monotonic() < deadline:
+            self.assertIsNone(holder.process.poll(), "healthy heartbeat session exited")
+            time.sleep(0.1)
+        self.assertFalse(available(lock), "healthy session lost its source lock")
+
+    def assert_release_waiting(self, holder, lock):
+        self.assertIsNone(holder.line(0.6), "release waiter emitted an acknowledgment")
+        self.assertIsNone(holder.process.poll(), "release waiter exited without exact evidence")
+        self.assertFalse(available(lock), "release waiter lost its kernel lock")
+
+    def assert_cancelled_waiter(self, holder, lock):
+        # Keep stdin OPEN until autonomous exit has been observed. Calling
+        # finish() first would let EOF hide the half-open transport defect.
+        holder.process.wait(timeout=5)
+        stdout, stderr = holder.finish()
+        self.assertEqual((holder.process.returncode, stdout), (75, b""), stderr)
+        self.assertIn(b"cancel", stderr.lower())
+        self.assertTrue(available(lock))
+
+    @unittest.skipUnless(FLOCK, "flock required for real cancellation transactions")
+    def test_release_waiter_cancellation_drops_kernel_locks_but_preserves_source_exclusion(self):
+        registry = self.release_registry()
+        roots = [self.root / "project", self.root / "dependency"]
+        active, digest, content = self.claim_record(registry, "aa", roots)
+        holder, lock, _ = self.start_release_waiter(registry, "aa", digest)
+        self.assertFalse(available(lock))
+        result = self.registry_transaction(registry, "aa", roots, "cancel")
+        self.assertEqual((result.returncode, result.stdout), (0, b"owned"), result.stderr)
+        self.assert_cancelled_waiter(holder, lock)
+        cancelling = registry / f"aa.{digest}.cancelling"
+        self.assertEqual(active.read_bytes(), content)
+        self.assertEqual(cancelling.read_bytes(), content)
+        # A released transient lock is NOT permission for another invocation
+        # to overwrite the still-owned tree, even on a full filesystem.
+        overlap = self.registry_transaction(registry, "bb", roots, "try-acquire")
+        self.assertEqual((overlap.returncode, overlap.stdout), (75, b""), overlap.stderr)
+        self.assertIn(b"unfinished overlapping source owner", overlap.stderr)
+        self.assertEqual(active.read_bytes(), content)
+        self.assertEqual(cancelling.read_bytes(), content)
+
+    @unittest.skipUnless(FLOCK, "flock required for real cancellation transactions")
+    def test_release_waiter_partial_request_does_not_hide_cancellation(self):
+        registry = self.release_registry()
+        roots = [self.root / "project"]
+        active, digest, content = self.claim_record(registry, "aa", roots)
+        holder, lock, release = self.start_release_waiter(registry, "aa", digest)
+        holder.send(release[:12])  # No newline; the transport remains open.
+        self.assert_release_waiting(holder, lock)
+        result = self.registry_transaction(registry, "aa", roots, "cancel")
+        self.assertEqual((result.returncode, result.stdout), (0, b"owned"), result.stderr)
+        self.assert_cancelled_waiter(holder, lock)
+        self.assertEqual(active.read_bytes(), content)
+
+    @unittest.skipUnless(FLOCK, "flock required for real cancellation transactions")
+    def test_release_waiter_cancellation_exits_healthy_heartbeat_session_before_expiry(self):
+        registry = self.release_registry()
+        roots = [self.root / "project"]
+        active, digest, content = self.claim_record(registry, "aa", roots)
+        holder, lock, _ = self.start_release_waiter(registry, "aa", digest, session_idle=2)
+        with self.heartbeat_stream(holder):
+            self.assert_heartbeat_session_held(holder, lock)
+            started = time.monotonic()
+            result = self.registry_transaction(registry, "aa", roots, "cancel")
+            self.assertEqual((result.returncode, result.stdout), (0, b"owned"), result.stderr)
+            holder.process.wait(timeout=1.5)
+            self.assertLess(time.monotonic() - started, 1.5)
+        stdout, stderr = holder.finish()
+        self.assertEqual((holder.process.returncode, stdout), (75, b""), stderr)
+        self.assertIn(b"cancel", stderr.lower())
+        self.assertNotIn(b"HEARTBEAT_EXPIRED", stderr)
+        self.assertTrue(available(lock))
+        self.assertEqual(active.read_bytes(), content)
+        self.assertEqual((registry / f"aa.{digest}.cancelling").read_bytes(), content)
+
+    @unittest.skipUnless(FLOCK, "flock required for real cancellation transactions")
+    def test_release_waiter_cleanup_pair_accepts_supervised_explicit_release(self):
+        registry = self.release_registry()
+        pair_root = self.root / "unmaterialized-pair"
+        active, digest, content = self.claim_record(registry, "aa", [pair_root])
+        result = self.registry_transaction(registry, "aa", [pair_root], "cancel")
+        self.assertEqual((result.returncode, result.stdout), (0, b"owned"), result.stderr)
+        holder, lock, release = self.start_release_waiter(
+            registry, "aa", pair_root, mode="cleanup-pair", session_idle=2)
+        with self.heartbeat_stream(holder):
+            self.assert_heartbeat_session_held(holder, lock)
+        # Stop the single heartbeat producer before writing the exact release
+        # frame, matching production serialization and avoiding interleaving.
+        holder.send(release + "\n")
+        holder.process.wait(timeout=5)
+        stdout, stderr = holder.finish()
+        self.assertEqual((holder.process.returncode, stdout, stderr), (0, b"", b""))
+        self.assertTrue(available(lock))
+        self.assertEqual(active.read_bytes(), content)
+        self.assertEqual((registry / f"aa.{digest}.cancelling").read_bytes(), content)
+
+    @unittest.skipUnless(FLOCK, "flock required for real cancellation transactions")
+    def test_release_waiter_pair_cancellation_allows_cleanup_handoff_and_terminal_retry(self):
+        registry = self.release_registry()
+        pair_root = self.root / "unmaterialized-pair"
+        roots = [pair_root, self.root / "dependency"]
+        active, digest, content = self.claim_record(registry, "aa", roots)
+        original, lock, _ = self.start_release_waiter(registry, "aa", pair_root, mode="pair")
+        result = self.registry_transaction(registry, "aa", roots, "cancel")
+        self.assertEqual((result.returncode, result.stdout), (0, b"owned"), result.stderr)
+        self.assert_cancelled_waiter(original, lock)
+        cleanup, _, release = self.start_release_waiter(
+            registry, "aa", pair_root, mode="cleanup-pair", lock=lock)
+        self.assert_release_waiting(cleanup, lock)
+        self.assertEqual(active.read_bytes(), content)
+        # Cancellation recovery must keep its newly acquired pair despite the
+        # fence that stopped the original holder. Only explicit release ends it.
+        cleanup.send(release + "\n")
+        cleanup.process.wait(timeout=5)
+        stdout, stderr = cleanup.finish()
+        self.assertEqual((cleanup.process.returncode, stdout, stderr), (0, b"", b""))
+        self.assertTrue(available(lock))
+        self.assertFalse(pair_root.exists(), "fixture must have no tree requiring retirement")
+        finished = self.registry_transaction(registry, "aa", roots, "finish-cancel")
+        self.assertEqual((finished.returncode, finished.stdout), (0, b""), finished.stderr)
+        receipt = registry / "cancelled" / f"aa.{digest}.claim"
+        cancelling = registry / f"aa.{digest}.cancelling"
+        self.assertFalse(active.exists())
+        self.assertEqual(receipt.read_bytes(), content)
+        self.assertEqual(cancelling.read_bytes(), content)
+        for mode, binding in (("source", digest), ("pair", pair_root)):
+            with self.subTest(mode=mode):
+                retry, _, _ = self.start_release_waiter(registry, "aa", binding, mode, lock)
+                self.assert_cancelled_waiter(retry, lock)
+                self.assertEqual(receipt.read_bytes(), content)
+                self.assertEqual(cancelling.read_bytes(), content)
+
+    @unittest.skipUnless(FLOCK, "flock required for real cancellation transactions")
+    def test_release_waiter_pair_observes_unowned_cancellation_without_claim(self):
+        registry = self.release_registry()
+        pair_root = self.root / "pair-before-source-grant"
+        holder, lock, _ = self.start_release_waiter(registry, "aa", pair_root, mode="pair")
+        result = self.registry_transaction(registry, "aa", [pair_root], "cancel")
+        self.assertEqual((result.returncode, result.stdout), (0, b"unowned"), result.stderr)
+        self.assert_cancelled_waiter(holder, lock)
+        content = self.claim_bytes([pair_root])
+        digest = hashlib.sha256(content).hexdigest()
+        self.assertEqual((registry / "cancelled" / f"aa.{digest}.claim").read_bytes(), content)
+        self.assertFalse((registry / f"aa.{digest}.claim").exists())
+
+    def test_release_waiter_requires_matching_identity_digest_and_exact_pair_root(self):
+        for mode, wrong in (("source", "token"), ("source", "digest"),
+                            ("pair", "token"), ("pair", "root")):
+            with self.subTest(mode=mode, wrong=wrong):
+                registry = self.release_registry(f"registry-{mode}-{wrong}")
+                root = self.root / "pair"
+                observed_root = self.root / "pair-child" if wrong == "root" else root
+                record_token = "bb" if wrong == "token" else "aa"
+                active, digest, content = self.claim_record(registry, record_token, [observed_root])
+                fence, _, _ = self.claim_record(registry, record_token, [observed_root], "cancelling")
+                binding = ("0" * 64 if wrong == "digest" else digest) if mode == "source" else root
+                holder, lock, release = self.start_release_waiter(registry, "aa", binding, mode)
+                self.assert_release_waiting(holder, lock)
+                holder.send(release + "\n")
+                holder.process.wait(timeout=5)
+                stdout, stderr = holder.finish()
+                self.assertEqual((holder.process.returncode, stdout, stderr), (0, b"", b""))
+                self.assertEqual(active.read_bytes(), content)
+                self.assertEqual(fence.read_bytes(), content)
+
+    def test_release_waiter_invalid_or_conflicting_records_never_fabricate_cancellation(self):
+        for defect in ("bad-content", "symlink", "pending", "active-and-terminal",
+                       "released-and-cancelling", "duplicate-digest"):
+            with self.subTest(defect=defect):
+                registry = self.release_registry("registry-" + defect)
+                roots = [self.root / "project"]
+                active, digest, content = self.claim_record(registry, "aa", roots)
+                fence = registry / f"aa.{digest}.cancelling"
+                records = [active]
+                if defect == "active-and-terminal":
+                    receipt, _, _ = self.claim_record(
+                        registry, "aa", roots, directory=registry / "cancelled")
+                    records.append(receipt)
+                elif defect == "symlink":
+                    fence.symlink_to(active)
+                else:
+                    fence.write_bytes(b"/different-roots\n" if defect == "bad-content" else content)
+                    records.append(fence)
+                if defect == "pending":
+                    records.append(self.claim_record(registry, "aa", roots, "pending")[0])
+                elif defect == "released-and-cancelling":
+                    records.append(self.claim_record(
+                        registry, "aa", roots, directory=registry / "released")[0])
+                elif defect == "duplicate-digest":
+                    records.append(self.claim_record(
+                        registry, "aa", [self.root / "different-project"])[0])
+                before = {path: path.read_bytes() for path in records}
+                holder, lock, release = self.start_release_waiter(registry, "aa", digest)
+                self.assert_release_waiting(holder, lock)
+                # The caller's real retirement transaction still validates all
+                # records. The waiter recognizes only the request, never an ack.
+                holder.send(release + "\n")
+                holder.process.wait(timeout=5)
+                stdout, stderr = holder.finish()
+                self.assertEqual((holder.process.returncode, stdout, stderr), (0, b"", b""))
+                self.assertEqual({path: path.read_bytes() for path in records}, before)
+                if defect == "symlink":
+                    self.assertTrue(fence.is_symlink())
+                    self.assertEqual(fence.readlink(), active)
+
+    def test_release_waiter_observes_metadata_snapshot_without_blocking_input(self):
+        registry = self.release_registry()
+        roots = [self.root / "project"]
+        _, digest, _ = self.claim_record(registry, "aa", roots)
+        metadata = os.open(registry / "metadata.lock", os.O_RDWR)
+        try:
+            fcntl.flock(metadata, fcntl.LOCK_EX)
+            self.claim_record(registry, "aa", roots, "cancelling")
+            holder, lock, _ = self.start_release_waiter(registry, "aa", digest)
+            self.assert_release_waiting(holder, lock)
+            # A complete-looking record is not a coherent snapshot while its
+            # publishing transaction still owns the metadata mutex.
+            fcntl.flock(metadata, fcntl.LOCK_UN)
+            self.assert_cancelled_waiter(holder, lock)
+        finally:
+            os.close(metadata)
+        idle_registry = self.release_registry("idle-registry")
+        _, idle_digest, _ = self.claim_record(idle_registry, "aa", roots)
+        metadata = os.open(idle_registry / "metadata.lock", os.O_RDWR)
+        try:
+            fcntl.flock(metadata, fcntl.LOCK_EX)
+            idle, lock, release = self.start_release_waiter(idle_registry, "aa", idle_digest)
+            idle.send(release + "\n")
+            idle.process.wait(timeout=5)
+            stdout, stderr = idle.finish()
+            self.assertEqual((idle.process.returncode, stdout, stderr), (0, b"", b""))
+            self.assertTrue(available(lock))
+        finally:
+            os.close(metadata)
+
+    def test_release_waiter_idle_and_fragmented_exact_request_preserve_protocol(self):
+        registry = self.release_registry()
+        active, digest, content = self.claim_record(registry, "aa", [self.root / "project"])
+        holder, lock, release = self.start_release_waiter(registry, "aa", digest)
+        self.assert_release_waiting(holder, lock)
+        half = len(release) // 2
+        holder.send(release[:half])
+        self.assert_release_waiting(holder, lock)
+        holder.send(release[half:] + "\n")
+        holder.process.wait(timeout=5)
+        stdout, stderr = holder.finish()
+        self.assertEqual((holder.process.returncode, stdout, stderr), (0, b"", b""))
+        self.assertTrue(available(lock))
+        self.assertEqual(active.read_bytes(), content)
+
+    def test_release_waiter_bad_or_oversized_input_never_acknowledges(self):
+        registry = self.release_registry()
+        active, digest, content = self.claim_record(registry, "aa", [self.root / "project"])
+        for defect in ("wrong", "cr", "nul", "oversized"):
+            with self.subTest(defect=defect):
+                holder, lock, release = self.start_release_waiter(registry, "aa", digest)
+                request = {"wrong": "WRONG\n", "cr": release + "\r\n",
+                           "nul": release + "\0\n", "oversized": "x" * 4097}[defect]
+                holder.send(request)
+                holder.process.wait(timeout=5)
+                stdout, stderr = holder.finish()
+                self.assertEqual((holder.process.returncode, stdout), (73, b""), stderr)
+                self.assertTrue(available(lock))
+                self.assertEqual(active.read_bytes(), content)
+
+    def test_release_waiter_eof_without_complete_exact_request_never_acknowledges(self):
+        registry = self.release_registry()
+        active, digest, content = self.claim_record(registry, "aa", [self.root / "project"])
+        for partial in (False, True):
+            with self.subTest(partial=partial):
+                holder, lock, release = self.start_release_waiter(registry, "aa", digest)
+                if partial:
+                    holder.send(release)
+                stdout, stderr = holder.finish()
+                self.assertEqual((holder.process.returncode, stdout), (73, b""), stderr)
+                self.assertTrue(available(lock))
+                self.assertEqual(active.read_bytes(), content)
 
     def test_all_locks_survive_terminal_exec_and_fd4_is_preserved(self):
         paths = [self.root / ("lock-{}".format(i)) for i in range(64)]
@@ -221,6 +1368,321 @@ class SourceLockHolderTests(unittest.TestCase):
         stdout, stderr = holder.finish()
         self.assertEqual((holder.process.returncode, stdout, stderr), (0, b"", b""))
         self.assertTrue(all(available(path) for path in paths))
+
+    def session_fixture(self, name="session", idle=1, env=None):
+        lock = self.root / (name + ".lock")
+        claim = self.root / (name + ".claim")
+        receipt = self.root / (name + ".released")
+        release = "RCH_SOURCE_AUTHORITY_RELEASE:abc-123"
+        terminal = ("set -eu; printf 'durable owner\\n' > {}; printf '%s\\n' \"$1\"; "
+                    "IFS= read -r request; [ \"$request\" = {} ]; "
+                    "printf '%s\\n' \"$request\" > {}; printf '%s\\n' \"$request\"").format(
+                        shlex.quote(str(claim)), shlex.quote(release), shlex.quote(str(receipt)))
+        holder = self.start([("x", lock)], terminal=terminal, session_idle=idle, env=env)
+        self.assertEqual(holder.line(), b"READY")
+        self.assertFalse(available(lock))
+        return holder, lock, claim, receipt, release
+
+    def test_session_half_open_requester_expires_without_erasing_durable_owner(self):
+        holder, lock, claim, receipt, _ = self.session_fixture()
+        # Keep stdin open: this is a half-open/stopped client, not an EOF test.
+        holder.process.wait(timeout=4)
+        stdout, stderr = holder.finish()
+        self.assertEqual((holder.process.returncode, stdout), (73, b""))
+        self.assertIn(b"RCH_SOURCE_LOCK_HEARTBEAT_EXPIRED", stderr)
+        self.assertEqual(claim.read_text(), "durable owner\n")
+        self.assertFalse(receipt.exists())
+        self.assertTrue(available(lock))
+
+    def test_session_heartbeats_renew_only_liveness_and_release_remains_exact(self):
+        holder, lock, claim, receipt, release = self.session_fixture()
+        for _ in range(14):
+            holder.send("RCH_SOURCE_LOCK_HEARTBEAT\n")
+            time.sleep(0.1)
+            self.assertIsNone(holder.process.poll())
+            self.assertFalse(available(lock))
+            self.assertFalse(receipt.exists())
+        holder.send(release + "\n")
+        # EOF immediately following a complete release must not turn a valid
+        # retirement into an unacknowledged cancellation.
+        stdout, stderr = holder.finish()
+        self.assertEqual((holder.process.returncode, stdout, stderr),
+                         (0, (release + "\n").encode(), b""))
+        self.assertEqual(receipt.read_text(), release + "\n")
+        self.assertEqual(claim.read_text(), "durable owner\n")
+        self.assertTrue(available(lock))
+
+    def test_session_partial_heartbeat_never_renews_deadline(self):
+        holder, lock, claim, receipt, _ = self.session_fixture()
+        started = time.monotonic()
+        for fragment in ("RCH_", "SOURCE_", "LOCK_", "HEARTBEAT"):
+            holder.send(fragment)
+            time.sleep(0.2)
+        holder.process.wait(timeout=2)
+        _, stderr = holder.finish()
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual(holder.process.returncode, 73)
+        self.assertIn(b"RCH_SOURCE_LOCK_HEARTBEAT_EXPIRED", stderr)
+        self.assertTrue(claim.exists() and available(lock))
+        self.assertFalse(receipt.exists())
+
+    def test_session_invalid_and_oversized_frames_never_release_authority(self):
+        for index, frame in enumerate(("RCH_SOURCE_LOCK_HEARTBEAT:release\n", "x" * 4096,
+                                       "RCH_SOURCE_AUTHORITY_RELEASE:../wrong\n")):
+            holder, lock, claim, receipt, _ = self.session_fixture(str(index))
+            holder.send(frame)
+            holder.process.wait(timeout=3)
+            _, stderr = holder.finish()
+            self.assertEqual(holder.process.returncode, 73)
+            self.assertIn(b"RCH_SOURCE_LOCK_PROTOCOL_ERROR", stderr)
+            self.assertTrue(claim.exists() and available(lock))
+            self.assertFalse(receipt.exists())
+
+    def test_session_eof_without_release_retains_owner_and_reaps_locks(self):
+        holder, lock, claim, receipt, _ = self.session_fixture(idle=90)
+        _, stderr = holder.finish()
+        self.assertEqual(holder.process.returncode, 73)
+        self.assertIn(b"RCH_SOURCE_LOCK_DISCONNECTED", stderr)
+        self.assertTrue(claim.exists() and available(lock))
+        self.assertFalse(receipt.exists())
+
+    @unittest.skipUnless(GNU_CANCELLABLE, "GNU flock and Bash 4.1 required")
+    def test_session_expires_queued_metadata_publisher_without_late_work(self):
+        root, metadata = self.root / "root.lock", self.root / "metadata.lock"
+        published = self.root / "unexpected-publication"
+        fd = os.open(metadata, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            terminal = ("printf 'WAITING\\n'; exec flock -x -- {} sh -c {}"
+                        ).format(shlex.quote(str(metadata)), shlex.quote(
+                            "printf 'late publication\\n' > " + shlex.quote(str(published))))
+            holder = self.start([("x", root)], terminal=terminal, session_idle=1,
+                                env=self.environment(portable=False))
+            self.assertEqual(holder.line(), b"WAITING")
+            self.assertFalse(available(root))
+            holder.process.wait(timeout=4)
+            _, stderr = holder.finish()
+            self.assertEqual(holder.process.returncode, 73)
+            self.assertIn(b"RCH_SOURCE_LOCK_HEARTBEAT_EXPIRED", stderr)
+            self.assertTrue(available(root))
+            self.assertFalse(published.exists())
+            self.assertFalse(available(metadata), "session killed an unrelated lock holder")
+        finally:
+            os.close(fd)
+        time.sleep(0.1)
+        self.assertFalse(published.exists(), "expired queued publisher ran after contention cleared")
+
+    def test_session_reports_external_holder_signal_without_release(self):
+        lock = self.root / "killed.lock"
+        terminal = 'printf "%s\\n" "$1" "$$"; exec cat >/dev/null'
+        holder = self.start([("x", lock)], terminal=terminal, session_idle=90)
+        self.assertEqual(holder.line(), b"READY")
+        pid = int(holder.line())
+        os.kill(pid, signal.SIGKILL)  # Exact child published by this fixture.
+        holder.process.wait(timeout=3)
+        _, stderr = holder.finish()
+        self.assertEqual(holder.process.returncode, 137)
+        self.assertIn(b"RCH_SOURCE_LOCK_PROCESS_TERMINATED: signal=9", stderr)
+        self.assertTrue(available(lock))
+
+    def test_session_teardown_reaps_descendant_lock_holders_on_normal_exit(self):
+        lock = self.root / "descendant.lock"
+        terminal = ("python3 -I -S -c {} & printf '%s\\n' \"$1\"; "
+                    "IFS= read -r request; exit 0").format(shlex.quote(
+                        "import time; time.sleep(120)"))
+        holder = self.start([("x", lock)], terminal=terminal, session_idle=90)
+        self.assertEqual(holder.line(), b"READY")
+        holder.send("RCH_SOURCE_AUTHORITY_RELEASE:abc\n")
+        stdout, stderr = holder.finish()
+        self.assertEqual((holder.process.returncode, stdout, stderr), (0, b"", b""))
+        self.assertTrue(available(lock), "descendant retained source lock after settled exit")
+
+    def test_session_heartbeat_expiry_survives_blocked_stdout(self):
+        lock = self.root / "blocked-output.lock"
+        terminal = ("printf '%s\\n' \"$1\"; exec python3 -I -S -c {}"
+                    ).format(shlex.quote("import os; os.write(1, b\"x\" * (1024 * 1024))"))
+        holder = self.start([("x", lock)], terminal=terminal, session_idle=1)
+        self.assertEqual(holder.line(), b"READY")
+        # Do not drain stdout until the monitor has terminated; this used to
+        # leave pipe writers inheriting source-lock descriptors indefinitely.
+        holder.process.wait(timeout=4)
+        _, stderr = holder.finish()
+        self.assertEqual(holder.process.returncode, 73)
+        self.assertIn(b"RCH_SOURCE_LOCK_HEARTBEAT_EXPIRED", stderr)
+        self.assertTrue(available(lock))
+
+    def test_session_observer_death_cannot_bypass_expiry_group_teardown(self):
+        lock = self.root / "orphaned-observer.lock"
+        terminal = ("printf '%s\\n' \"$1\"; exec python3 -I -S -c {}"
+                    ).format(shlex.quote(
+                        "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                        "time.sleep(120)"))
+        holder = self.start([("x", lock)], terminal=terminal, session_idle=1)
+        self.assertEqual(holder.line(), b"READY")
+        self.assertFalse(available(lock))
+        # Kill only our observer, leaving stdin open and its private holder
+        # group alive. The monitor must still kill that group even though its
+        # teardown-receipt write now fails with EPIPE.
+        holder.process.kill()
+        holder.process.wait(timeout=2)
+        eventually(lambda: available(lock), "dead observer stranded the holder group")
+        _, stderr = holder.finish()
+        self.assertEqual(holder.process.returncode, -signal.SIGKILL)
+        self.assertIn(b"RCH_SOURCE_LOCK_HEARTBEAT_EXPIRED", stderr)
+
+    def test_session_monitor_death_is_reaped_only_after_its_group_is_killed(self):
+        lock = self.root / "killed-monitor.lock"
+        terminal = ("printf '%s\\n' \"$1\"; exec python3 -I -S -c {}"
+                    ).format(shlex.quote(
+                        "import os,signal,time; print(os.getppid(), flush=True); "
+                        "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(120)"))
+        holder = self.start([("x", lock)], terminal=terminal, session_idle=90)
+        self.assertEqual(holder.line(), b"READY")
+        monitor = int(holder.line())
+        self.assertNotEqual(monitor, holder.process.pid)
+        self.assertFalse(available(lock))
+        os.kill(monitor, signal.SIGKILL)  # Exact parent reported by our fixture child.
+        holder.process.wait(timeout=3)
+        _, stderr = holder.finish()
+        self.assertEqual(holder.process.returncode, 73)
+        self.assertIn(b"RCH_SOURCE_LOCK_SUPERVISOR_TERMINATED", stderr)
+        self.assertTrue(available(lock), "externally killed monitor left its child holding locks")
+
+    def test_session_does_not_require_waitid_or_wnowait(self):
+        injected = self.root / "old-python-capabilities"
+        env = self.session_python_environment(
+            "for test_feature in ('waitid', 'WNOWAIT'):\n"
+            "    if hasattr(os, test_feature):\n"
+            "        delattr(os, test_feature)\n"
+            "with open({!r}, 'w') as test_marker:\n"
+            "    test_marker.write('unavailable\\n')".format(str(injected)))
+        holder, lock, claim, receipt, release = self.session_fixture(idle=90, env=env)
+        self.assertEqual(injected.read_text(), "unavailable\n")
+        holder.send(release + "\n")
+        stdout, stderr = holder.finish()
+        self.assertEqual((holder.process.returncode, stdout, stderr),
+                         (0, (release + "\n").encode(), b""))
+        self.assertEqual(receipt.read_text(), release + "\n")
+        self.assertEqual(claim.read_text(), "durable owner\n")
+        self.assertTrue(available(lock))
+
+    def test_session_inherited_ignored_and_blocked_sigchld_cannot_auto_reap_monitor(self):
+        env = self.session_python_environment(
+            "signal.signal(signal.SIGCHLD, signal.SIG_IGN)\n"
+            "signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGCHLD})")
+        holder, lock, claim, receipt, release = self.session_fixture(idle=90, env=env)
+        holder.send(release + "\n")
+        stdout, stderr = holder.finish()
+        self.assertEqual((holder.process.returncode, stdout, stderr),
+                         (0, (release + "\n").encode(), b""))
+        self.assertEqual(receipt.read_text(), release + "\n")
+        self.assertEqual(claim.read_text(), "durable owner\n")
+        self.assertTrue(available(lock))
+
+    def test_session_descendant_receives_child_exit_after_inherited_blocked_sigchld(self):
+        env = self.session_python_environment(
+            "signal.signal(signal.SIGCHLD, signal.SIG_IGN)\n"
+            "signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGCHLD})")
+        lock = self.root / "child-signal.lock"
+        release = "RCH_SOURCE_AUTHORITY_RELEASE:abc-123"
+        program = (
+            "import os,signal,sys,time\n"
+            "observed=[]\n"
+            "signal.signal(signal.SIGCHLD,lambda *_: observed.append(True))\n"
+            "child=os.fork()\n"
+            "if child==0: os._exit(0)\n"
+            "deadline=time.monotonic()+1\n"
+            "while not observed and time.monotonic()<deadline: time.sleep(0.01)\n"
+            "os.waitpid(child,0)\n"
+            "if not observed: sys.exit('child completion signal remained blocked')\n"
+            "print('READY',flush=True)\n"
+            "request=sys.stdin.readline()\n"
+            "if request!={!r}: sys.exit(9)\n"
+            "print(request,end='',flush=True)\n"
+        ).format(release + "\n")
+        terminal = "exec " + shlex.join([sys.executable, "-I", "-S", "-c", program])
+        holder = self.start([("x", lock)], terminal=terminal, session_idle=90, env=env)
+        self.assertEqual(holder.line(), b"READY")
+        self.assertFalse(available(lock))
+        holder.send(release + "\n")
+        stdout, stderr = holder.finish()
+        self.assertEqual((holder.process.returncode, stdout, stderr),
+                         (0, (release + "\n").encode(), b""))
+        self.assertTrue(available(lock))
+
+    def test_session_monitor_stopped_before_setsid_is_killed_without_admission(self):
+        env = self.session_python_environment(
+            "test_setsid = os.setsid\n"
+            "def test_stop_before_setsid():\n"
+            "    print('BEFORE_SETSID', os.getpid(), flush=True)\n"
+            "    os.kill(os.getpid(), signal.SIGSTOP)\n"
+            "    return test_setsid()\n"
+            "os.setsid = test_stop_before_setsid")
+        lock = self.root / "pre-session.lock"
+        claim = self.root / "pre-session.claim"
+        claim.write_text("prior durable ownership\n")
+        publication = self.root / "unexpected-publication"
+        terminal = "printf 'unexpected admission\\n' > {}".format(
+            shlex.quote(str(publication)))
+        holder = self.start([("x", lock)], terminal=terminal, session_idle=90, env=env)
+        line = holder.line()
+        self.assertIsNotNone(line)
+        marker, monitor = line.split()
+        self.assertEqual(marker, b"BEFORE_SETSID")
+        try:
+            holder.process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            # Failure cleanup: the still-waiting observer has not reaped its
+            # stopped direct child, so this fixture identity remains pinned.
+            os.kill(int(monitor), signal.SIGKILL)
+            raise
+        stdout, stderr = holder.finish()
+        self.assertEqual((holder.process.returncode, stdout), (73, b""))
+        self.assertIn(b"RCH_SOURCE_LOCK_SUPERVISOR_TERMINATED", stderr)
+        self.assertEqual(claim.read_text(), "prior durable ownership\n")
+        self.assertFalse(publication.exists())
+        self.assertFalse(lock.exists(), "stopped pre-session monitor reached lock admission")
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int(monitor), 0)
+
+    def test_session_stopped_monitor_revokes_group_and_retains_durable_owner(self):
+        lock = self.root / "stopped-monitor.lock"
+        claim = self.root / "stopped-monitor.claim"
+        terminal = ("printf 'durable owner\\n' > {}; printf '%s\\n' \"$1\"; "
+                    "exec python3 -I -S -c {}").format(shlex.quote(str(claim)), shlex.quote(
+                        "import os,signal,time; print(os.getppid(), flush=True); "
+                        "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(120)"))
+        holder = self.start([("x", lock)], terminal=terminal, session_idle=90)
+        self.assertEqual(holder.line(), b"READY")
+        monitor = int(holder.line())
+        self.assertFalse(available(lock))
+        os.kill(monitor, signal.SIGSTOP)
+        try:
+            holder.process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            os.kill(monitor, signal.SIGKILL)  # Still pinned by our live observer.
+            raise
+        stdout, stderr = holder.finish()
+        self.assertEqual((holder.process.returncode, stdout), (73, b""))
+        self.assertIn(b"RCH_SOURCE_LOCK_SUPERVISOR_TERMINATED", stderr)
+        self.assertEqual(claim.read_text(), "durable owner\n")
+        self.assertTrue(available(lock), "stopped monitor stranded inherited source locks")
+
+    def test_session_synthetic_sigchld_revokes_only_its_owned_group(self):
+        other_lock = self.root / "unrelated.lock"
+        other = self.start([("x", other_lock)])
+        self.assertEqual(other.line(), b"READY")
+        holder, lock, claim, receipt, _ = self.session_fixture(idle=90)
+        os.kill(holder.process.pid, signal.SIGCHLD)
+        holder.process.wait(timeout=3)
+        stdout, stderr = holder.finish()
+        self.assertEqual((holder.process.returncode, stdout), (73, b""))
+        self.assertIn(b"RCH_SOURCE_LOCK_SUPERVISOR_TERMINATED", stderr)
+        self.assertEqual(claim.read_text(), "durable owner\n")
+        self.assertFalse(receipt.exists())
+        self.assertTrue(available(lock))
+        self.assertIsNone(other.process.poll(), "notification killed an unrelated process")
+        self.assertFalse(available(other_lock), "notification released an unrelated lock")
 
     def test_readiness_waits_for_the_complete_ordered_plan(self):
         first, last = self.root / "first", self.root / "last"

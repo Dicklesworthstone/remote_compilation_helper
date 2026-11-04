@@ -159,12 +159,12 @@ while running and time.monotonic() < end and root.exists():
                                "RABS_DEPENDENCY_WORKER_SPKI_SHA256")
                 if "RABS_DEPENDENCY_WORKERS_JSON" in os.environ:
                     status["remote_dependency"] = {
-                        "remote_protocol": 1, "dependency_context": "dependency-exec-v7",
+                        "remote_protocol": 1, "dependency_context": "dependency-exec-v8",
                         "workers": json.loads(os.environ["RABS_DEPENDENCY_WORKERS_JSON"]),
                     }
                 elif all(name in os.environ for name in worker_keys):
                     status["remote_dependency"] = {
-                        "remote_protocol": 1, "dependency_context": "dependency-exec-v7",
+                        "remote_protocol": 1, "dependency_context": "dependency-exec-v8",
                         "listen": os.environ[worker_keys[0]],
                         "worker_id": os.environ[worker_keys[1]],
                         "worker_spki_sha256": os.environ[worker_keys[2]],
@@ -868,6 +868,33 @@ os.execvpe(sys.argv[2], sys.argv[2:], os.environ)
         self.assertFalse(rabs.process_exited(self.starts()[0]["pid"]),
                          "an incompatible shared daemon remains owned and running")
 
+    def test_configured_launch_refuses_attached_v7_daemon_without_restart_or_cargo(self):
+        settings = self.dependency_worker_settings()
+        old = {
+            "remote_protocol": 1, "dependency_context": "dependency-exec-v7",
+            "listen": settings["RABS_DEPENDENCY_WORKER_LISTEN"],
+            "worker_id": settings["RABS_DEPENDENCY_WORKER_ID"],
+            "worker_spki_sha256": settings["RABS_DEPENDENCY_WORKER_SPKI_SHA256"],
+        }
+        # Start the socket fixture without asking the launcher for remote
+        # execution. Its saved capability represents an already running v7
+        # daemon; only the subsequent configured invocation requires v8.
+        self.cargo_result(self.launch(changes={
+            "TEST_STATUS_REMOTE_JSON": json.dumps(old),
+        }))
+        identity = rabs.socket_identity(str(self.endpoint))
+        started = self.starts()
+        result = self.launch(
+            ["--rabs-no-start", "--rabs-require-daemon", "check"], settings)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(b"dependency_context", result.stderr)
+        self.assertNotIn(b"cargo's own stderr", result.stderr)
+        self.assertEqual(rabs.socket_identity(str(self.endpoint)), identity)
+        self.assertEqual(self.starts(), started)
+        self.assertEqual(len(started), 1)
+        self.assertFalse(rabs.process_exited(started[0]["pid"]))
+
     def test_prebind_lifetime_lock_handoff_rechecks_selected_dependency_worker(self):
         gate = self.root / "allow-remote-bind"
         entered = threading.Event()
@@ -943,7 +970,7 @@ os.execvpe(sys.argv[2], sys.argv[2:], os.environ)
         workers[1]["listen"] = "[2001:0DB8:0:0:0:0:0:2]:9444"
         expected = [dict(workers[0], listen="[::ffff:127.0.0.1]:9443"),
                     dict(workers[1], listen="[2001:db8::2]:9444")]
-        status = {"remote_protocol": 1, "dependency_context": "dependency-exec-v7",
+        status = {"remote_protocol": 1, "dependency_context": "dependency-exec-v8",
                   "workers": expected}
         settings = self.dependency_pool_settings(workers)
         self.assertEqual(rabs.requested_dependency_worker(settings), status)
@@ -1586,7 +1613,7 @@ class ProtocolTests(unittest.TestCase):
             "RABS_DEPENDENCY_WORKER_SPKI_SHA256": "ab" * 32,
         }
         self.assertEqual(rabs.requested_dependency_worker(settings), {
-            "remote_protocol": 1, "dependency_context": "dependency-exec-v7",
+            "remote_protocol": 1, "dependency_context": "dependency-exec-v8",
             "listen": "[::1]:9443", "worker_id": "compiler 雪",
             "worker_spki_sha256": "ab" * 32,
         })
@@ -1612,7 +1639,7 @@ class ProtocolTests(unittest.TestCase):
 
     def test_dependency_worker_status_requires_typed_supported_capability(self):
         expected = {
-            "remote_protocol": 1, "dependency_context": "dependency-exec-v7",
+            "remote_protocol": 1, "dependency_context": "dependency-exec-v8",
             "listen": "127.0.0.1:9443", "worker_id": "compiler",
             "worker_spki_sha256": "ab" * 32,
         }
@@ -1626,7 +1653,8 @@ class ProtocolTests(unittest.TestCase):
                        dict(expected, dependency_context="dependency-exec-v4"),
                        dict(expected, dependency_context="dependency-exec-v5"),
                        dict(expected, dependency_context="dependency-exec-v6"),
-                       dict(expected, dependency_context="dependency-exec-v8")]:
+                       dict(expected, dependency_context="dependency-exec-v7"),
+                       dict(expected, dependency_context="dependency-exec-v9")]:
             with self.subTest(actual=actual), self.assertRaises(rabs.RemoteConfigurationMismatch):
                 rabs.require_dependency_worker({"remote_dependency": actual}, expected)
 

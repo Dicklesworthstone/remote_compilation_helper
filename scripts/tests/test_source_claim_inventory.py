@@ -82,9 +82,28 @@ class Fixture:
 
     def tools(self, name, source):
         directory = Path(tempfile.mkdtemp(prefix="tools-", dir=self.root))
-        tool = directory / name
-        tool.write_text("#!/bin/sh\n" + source + "\n")
-        tool.chmod(0o700)
+        if name == "sync":
+            hook = directory / "sync.hook"
+            hook.write_text("#!/bin/sh\n" + source + "\n")
+            hook.chmod(0o700)
+            tool = directory / "sync"
+            tool.write_text("#!/bin/sh\necho unexpected-global-sync >&2\nexit 97\n")
+            tool.chmod(0o700)
+            py = directory / "python3"
+            py.write_text(
+                "#!/bin/sh\n"
+                'if [ "${1-}" = -I ] && [ "${2-}" = -S ] && [ "${3-}" = -c ]; then\n'
+                '  case "${4-}" in\n'
+                '    *os.fsync*) ' + shlex.quote(str(hook)) + ' -- "${5-}" || exit $?;;\n'
+                "  esac\n"
+                "fi\n"
+                "exec " + shlex.quote(sys.executable or shutil.which("python3")) + ' "$@"\n'
+            )
+            py.chmod(0o700)
+        else:
+            tool = directory / name
+            tool.write_text("#!/bin/sh\n" + source + "\n")
+            tool.chmod(0o700)
         self.env["PATH"] = str(directory) + os.pathsep + self.env["PATH"]
         return tool
 
@@ -308,7 +327,10 @@ class InventoryTests(unittest.TestCase):
         self.assert_status(f.transact("bb", roots, "release"), 0)
         receipt = next((f.registry / "released").glob("bb.*.claim"))
         before = (receipt.stat().st_ino, receipt.read_bytes())
-        f.tools("sync", "exit 91")
+        # The registry's barriers are fsyncs through its `python3 -c` adapter,
+        # not the sync utility: fail every one of them.
+        f.tools("python3", 'case "${4-}" in *os.fsync*) exit 91 ;; esac\nexec '
+                + shlex.quote(sys.executable) + ' "$@"')
         result = f.transact("bb", roots, "released")
         self.assert_status(result, 73)
         self.assertEqual((receipt.stat().st_ino, receipt.read_bytes()), before)

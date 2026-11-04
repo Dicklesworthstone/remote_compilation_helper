@@ -131,7 +131,7 @@ class TargetDeploymentTests(unittest.TestCase):
 
     def test_mixed_fleet_installs_exact_toolsets_through_real_receiver(self):
         result = self.deploy(["x86-one", "arm-one", "x86-two"])
-        self.assertEqual([r["state"] for r in result["workers"]], ["installed"] * 3)
+        self.assertEqual([r["state"] for r in result["workers"]], ["installed"] * 3, result)
         self.assertEqual([r["target"] for r in result["workers"]], [X86, ARM, X86])
         self.assertEqual(set(result["transfer_images"]), {X86, ARM})
         for worker in result["workers"]:
@@ -302,8 +302,8 @@ class TargetDeploymentTests(unittest.TestCase):
             with mock.patch.object(installer, "ssh_exchange", side_effect=observed):
                 result = installer.deploy_targets(self.specs(), hosts, None, 15, self.reserve, jobs=2)
         self.assertEqual([r["host"] for r in result["workers"]], hosts)
-        self.assertEqual([r["target"] for r in result["workers"]], [X86, ARM, X86, ARM])
         self.assertTrue(all(r["state"] == "installed" for r in result["workers"]), result)
+        self.assertEqual([r["target"] for r in result["workers"]], [X86, ARM, X86, ARM])
         self.assertEqual(counts, {"active": 0, "peak": 2})
         for host in hosts:
             self.assertEqual([c["phase"] for c in self.calls() if c["host"] == host],
