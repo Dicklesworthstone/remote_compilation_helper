@@ -621,6 +621,13 @@ pub(crate) fn block_on_worker_runtime<F: Future>(
 }
 
 fn main() {
+    if let Some(info) = rabs_protocol::release_authorization::build_info_for_args(
+        "rabs-wkr",
+        std::env::args_os().skip(1),
+    ) {
+        println!("{info}");
+        return;
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("--version") => {

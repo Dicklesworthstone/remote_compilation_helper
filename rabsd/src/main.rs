@@ -432,6 +432,13 @@ fn run_prepare(args: &[String]) -> i32 {
 }
 
 fn main() {
+    if let Some(info) = rabs_protocol::release_authorization::build_info_for_args(
+        "rabsd",
+        std::env::args_os().skip(1),
+    ) {
+        println!("{info}");
+        return;
+    }
     let boot_started_at = Instant::now();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {

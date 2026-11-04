@@ -17,6 +17,57 @@ fn worker_bin() -> &'static str {
     env!("CARGO_BIN_EXE_rabs-wkr")
 }
 
+#[test]
+fn build_info_queries_do_not_start_worker_or_cargo_root_services() {
+    for (binary, tool) in [
+        (env!("CARGO_BIN_EXE_rabs-wkr"), "rabs-wkr"),
+        (env!("CARGO_BIN_EXE_rabs-cargo-root"), "rabs-cargo-root"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let output = Command::new(binary)
+            .arg("--rabs-build-info")
+            .env("PATH", dir.path())
+            .env("RABS_WORKER_STATE_DIR", &state)
+            .env("RABS_WORKER_HOST_SLOTS", "invalid")
+            .env("RABS_WORKER_SOURCE_CACHE_BYTES", "invalid")
+            .env("CARGO_RABS_ROOT_BUDGET_DIR", &state)
+            .env("CARGO_RABS_ROOT_CAPACITY", "invalid")
+            .env("CARGO_RABS_ROOT_CGROUP", &state)
+            .env("RCH_BUILD_SOURCE", "runtime-value-must-not-win")
+            .env("RABS_BUILD_IDENTITY", "runtime-value-must-not-win")
+            .output()
+            .unwrap();
+
+        assert!(output.status.success(), "{tool}: {:?}", output.stderr);
+        assert!(output.stderr.is_empty(), "{tool}");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["schema"], 1);
+        assert_eq!(report["kind"], "rabs-build-info");
+        assert_eq!(report["tool"], tool);
+        assert_eq!(report["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            report["build_identity"],
+            rabs_protocol::release_authorization::default_build_identity()
+        );
+        let expected_source = option_env!("RCH_BUILD_SOURCE").filter(|source| {
+            source.len() == 40
+                && source
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        });
+        assert_eq!(
+            report.get("compiled_source"),
+            Some(&serde_json::json!(expected_source))
+        );
+        assert_eq!(report.as_object().unwrap().len(), 6);
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+            "{tool} created runtime state"
+        );
+    }
+}
+
 fn stage_sysroot_rustc() -> tempfile::TempDir {
     use std::os::unix::fs::PermissionsExt;
     let cargo = std::env::var("CARGO").expect("CARGO set");

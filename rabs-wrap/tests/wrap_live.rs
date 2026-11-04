@@ -49,6 +49,61 @@ fn wrap_env(dir: &std::path::Path) -> Vec<(String, String)> {
 }
 
 #[test]
+fn build_info_is_compiled_identity_without_compiler_or_state_access() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = Command::new(wrap())
+        .arg("--rabs-build-info")
+        .envs(wrap_env(dir.path()))
+        .env("PATH", dir.path())
+        .env("RCH_BUILD_SOURCE", "runtime-value-must-not-win")
+        .env("RABS_BUILD_IDENTITY", "runtime-value-must-not-win")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert!(output.stderr.is_empty());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["schema"], 1);
+    assert_eq!(report["kind"], "rabs-build-info");
+    assert_eq!(report["tool"], "rabs-wrap");
+    assert_eq!(report["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        report["build_identity"],
+        rabs_protocol::release_authorization::default_build_identity()
+    );
+    let expected_source = option_env!("RCH_BUILD_SOURCE").filter(|source| {
+        source.len() == 40
+            && source
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    });
+    assert_eq!(
+        report.get("compiled_source"),
+        Some(&serde_json::json!(expected_source))
+    );
+    assert_eq!(report.as_object().unwrap().len(), 6);
+    assert!(
+        std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+        "the identity query must not create breaker or other state"
+    );
+}
+
+#[test]
+fn build_info_as_a_compiler_argument_keeps_exec_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let compiler = write_script(dir.path(), "compiler", "printf '%s\\n' \"$1\"\nexit 27\n");
+    let output = Command::new(wrap())
+        .arg(compiler)
+        .arg("--rabs-build-info")
+        .envs(wrap_env(dir.path()))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(27));
+    assert_eq!(output.stdout, b"--rabs-build-info\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn exec_preserves_exit_codes_args_and_streams() {
     let dir = tempfile::tempdir().unwrap();
     let fake = write_script(
