@@ -107,6 +107,8 @@ fn format_wait_time(secs: u64) -> String {
 /// Parsed API request variants.
 #[derive(Debug)]
 enum ApiRequest {
+    /// Read-only placement observation for `rch admit`; reserves nothing.
+    AdmissionPreview(rch_common::admission_preview::PreviewRequest),
     SelectWorker {
         request: SelectionRequest,
         /// Client-minted identity supplied before daemon contact.
@@ -1046,6 +1048,12 @@ async fn handle_connection_with_metrics(
             handle_event_stream(&mut writer, ctx.events.clone()).await?;
             return Ok(());
         }
+        Ok(ApiRequest::AdmissionPreview(request)) => {
+            metrics::inc_requests("admission_preview");
+            let preview =
+                crate::http_api::admission_preview::observe_on_socket(&ctx, request).await;
+            (serde_json::to_string(&preview)?, "application/json")
+        }
         Ok(ApiRequest::Status) => {
             metrics::inc_requests("status");
             let status = handle_status(&ctx).await?;
@@ -1618,6 +1626,14 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
 
     if path == "/status" {
         return Ok(ApiRequest::Status);
+    }
+
+    if method == "GET"
+        && let Some(query) = query_for_exact_route(path, rch_common::admission_preview::ROUTE)
+    {
+        let request = rch_common::admission_preview::PreviewRequest::from_query(query)
+            .map_err(|_| anyhow!("Invalid admission-preview request"))?;
+        return Ok(ApiRequest::AdmissionPreview(request));
     }
 
     if path == "/metrics" {

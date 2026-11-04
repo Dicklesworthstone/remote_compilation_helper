@@ -6,7 +6,7 @@
 //! - `/ready` - Readiness probe (workers available)
 //! - `/budget` - AGENTS.md budget compliance status
 
-mod admission_preview;
+pub(crate) mod admission_preview;
 
 use std::sync::Arc;
 use std::time::Instant;
