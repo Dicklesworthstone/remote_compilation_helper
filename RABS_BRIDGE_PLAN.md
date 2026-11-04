@@ -2,7 +2,7 @@
 
 ## Reality check and execution order — updated November 4, 2026
 
-**Current execution TODO, November4 at21:32UTC:** stock passes; the first public
+**Current execution TODO, November4 at22:31UTC:** stock passes; the first public
 RABS round failed before execution with E2BIG. Two-layer transport fixes that
 kernel boundary, but the follow-up guard comparison is RED: preceding9478/8,
 candidateb606/8, two original6s pipe/deadline checks time out. Candidatec72 restores
@@ -64,8 +64,14 @@ dependency invalidation, expected failing script and native cleanup assertions.
 Actual worker log has20 SDK/runtime acquisitions and one shutdown receipt;
 last durable execution0/resolved/released/residual0. External sampler has three
 PermissionErrors and observed residuals{}; it is not a complete independent
-process census. The AC82 candidate is now running; whole-run final audits and
-archive/program case remain pending under the original3600s cap. A tiny native DSR diagnostic reproduces
+process census. The paired DSR then hits its original3600s cap: FAILED6/3607s,
+native timeout5/3602s. AC82 candidate is UNFINISHED after9 SDK/runtime
+acquisitions; archive/program is UNRUN. Only private worker84427 survives;
+UID/birth/executable/hash-verified pidfd SIGTERM stops it normally in0.254s
+with a clean shutdown receipt. Independent post-timeout audit matches source
+1740, complete SDK5256entries, eight role copies, harness and controller;
+no matching private roles live. This is not a successful paired run.
+A tiny native DSR diagnostic reproduces
 1.1–1.65s for each fresh4KiB clone probe versus20–40microseconds for copy.
 The complete SDK has427 files above64KiB, each previously reprobed. New source
 04ffa22b retains every hash/isolation/generation gate and uses ordinary verified
@@ -73,7 +79,41 @@ private copies after one optional clone exceeds50ms. This threshold selects a
 copy strategy; it changes no operation deadline or verification requirement.
 One new regression covers slow-success and dirty-partial-failure branches.
 All1740 new source inputs are frozen/verified. DSR104-case/normal-role/harness
-build started21:31:42UTC on TS2; prior103-case/fullQA proof applies only to AC82.
+build started21:31:42UTC on TS2; all104 cases pass, including all24 sandbox
+cases/actual retained compiler and coordinator20. Producer DSR0131c884 is now
+SUCCESS/3012s: all four ordinary release roles build0/847.9s; their probes
+pass; ordinary canonical harness builds0/252.5s and lists the exact real case.
+All1740 source inputs, controller, tools and harness match before/after.
+Report SHAa6d26706f174fc22a30da7a6c543d845ee2eed90e5555a5b45e4f1a55db154f9.
+Quality DSRce1ee4d9 started22:24:26UTC under the original3600s cap. Its
+original ignored native reflink isolation case passes1/1/raw0 with an actual
+COW clone required; copy fallback cannot satisfy it. This adds one actual
+native case to104 component cases, but full workspace check/strictClippy/fmt
+remain running/pending. Do not call the whole QA stage green before terminal
+results. The prior06ded84c quality controller remains superseded/UNRUN.
+Stage a four-call ABBA comparison of real ordinary-release rabsd SDK
+preparation using oldAC82 and new04ffa in the SAME invocation, COMPLETE
+original1.921GB SDK and unchanged600s per-command/3600s DSR caps. Require
+both producers/fullQA, the native COW case, all four successful preparations,
+semantic equality and independent full byte/namespace/mode/inode verification.
+Whole-SDK input is already retained on TRJ; transfer only the new normal CLI,
+frozen1740-file source and evidence. This preparation comparison is UNRUN
+until new fullQA succeeds; it cannot stand in for Cargo/cache/program/fleet
+or merged-main qualification. No runtime or performance win yet.
+Prior103-case/fullQA proof applies only to AC82. A concurrent commit e32a153e
+records this three-file repair, then merge95787df5 adds newer SDK checkpoint/
+adoption work and changes two implementation files. Frozen tests do NOT
+qualify that merged main. Preserve its code/index and next validate the current
+integration; no source/Git rollback or root staging/commit/merge occurred here.
+Exact committed main95787df5/all1747 files is independently frozen and verified,
+archive63672320B/SHA395d1e9aab0e1863b4d50736f31ad57ba34b972e438ba7bed641
+da1dc84ff904. Preliminary full workspace/all-target check + fmt DSR725e89d0
+started22:05:58UTC with a separate genuinely cold target, normal profiles,
+jobs1/original3600s cap and unchanged host concurrency4. Formatting is RED1:
+two line-wrap/import issues in live_dependency/remote.rs. These are manually
+fixed in the shared checkout under lease1113; local whole-workspace fmt0.
+Frozen main957 remains unchanged and its compiler check continues. New fixed
+source needs its own native checks; no old test count is relabeled as main.
 No installed SDK, daemon, worker configuration or capacity is changed. Public cache
 rounds remain0/4; no practical-usefulness, fleet or release qualification.
 The earlier dated sections are retained checkpoints, not additional active runs.
@@ -597,7 +637,7 @@ The earlier dated sections are retained checkpoints, not additional active runs.
   command had a quotation SyntaxError before creating its output; corrected
   quoted transfer/independent verification both pass0. No source overwrite,
   deletion, extra dependency or peer-index edit. Prior frozen AC82 run intact.
-- [ ] Complete source04ffa22b native DSR build: all104 SDK cases including the
+- [x] Complete source04ffa22b native DSR build: all104 SDK cases including the
   actual installed compiler, all four ordinary release roles and ordinary
   canonical harness. Started21:31:42UTC/PID63263, toolrabs_sdk_adaptive_clone_build
   v2.1.34-adaptiveclone.04ffa22b; controller9ffa728f/8809B/dev49/inode9933554/
@@ -605,16 +645,83 @@ The earlier dated sections are retained checkpoints, not additional active runs.
   Cargo reuse. Fresh DSR health0/healthytrue retains root/home94% warning and
   unchanged20GiB minimum; actual build route has1.284TB/89.9%free on ZFS49.
   Global host concurrency4/SSH20s unchanged; no global configuration edits.
+  At22:03UTC all104 cases pass0/zero failed/ignored:1 identity,25 upload,
+  34 SDK pool,24 sandbox/installed compiler (550.1s),20 coordinator. Full
+  coordinator libtest compilation/list took929.0s; actual20-case run5.5s.
+  Terminal DSR0131c884 SUCCESS/3012s at22:22UTC: ordinary four-role release
+  build0/847.9s, all version/compiler probes0, harness0/252.5s/exact case1.
+  All1740 source inputs/control/tools/harness match beforeafter; report17300B/
+  SHAa6d26706f174fc22a30da7a6c543d845ee2eed90e5555a5b45e4f1a55db154f9.
 - [ ] Run full workspace/all-target check, strictClippy-Dwarnings and fmt on
   the exact104-case source. Prior AC82 QA does not qualify the new code.
+  Additional original native reflink gate plus full QA controller89e1f81c/
+  6562B runs as DSRce1ee4d9-39c2-4230-b5c4-cffdce096198, launched22:24:26UTC,
+  at `job-sdk-slow-clone-quality-cow-20261104`. Original native COW case now
+  passes1/1/raw0; fallback cannot pass it. Full check/Clippy/fmt still pending
+  terminal results. Earlier06ded84c controller remains superseded/UNRUN.
+  This isolated QA is required for exact old/new preparation comparison;
+  concurrently merged main has its own separate cold-target native check.
 - [ ] Compare actual complete-SDK preparation through LIVE ordinary old and
   new tools in the SAME invocation, with identical SDK and unchanged bounds,
   full identity/output/source-generation checks and explicit copy/I/O costs.
   Require the incumbent to run; self-speedup alone earns maintenance credit.
+  Draft SDK-preparation driver uses ABBA old,new,new,old with four independent
+  bundles, identical complete1.921GB SDK and manual source. It checks every
+  output byte/entry/link/execute bit/independent inode and identical semantic
+  requests. CLI time is separate from post-audits; audits warm caches, so this
+  is not a cold-storage or isolated-host claim. Child CPU/block counters are
+  countermetrics. New CLI/source/proofs stage on TRJ while QA runs; launch only
+  after full new QA0. Tailscale SSH timed out during staging before creating
+  rabsd; existing trusted alias trj succeeds. No global route/config change.
   Then repeat full canonical TLS/check/cache/invalidation/archive/program and
   persistent-service gates before committing or claiming practical usefulness.
 - [ ] Retire the tiny clone diagnostic from execution after this lever decision;
   retain its files/evidence unless the user explicitly authorizes deletion.
+- [x] Retain original TRJ paired timeout489aa905 without extending its cap:
+  target timeout5/3602s, DSR FAILED6/3607s. Candidate unfinished after9 SDK/
+  runtime acquisitions; archive/program UNRUN. Incumbent1/1/2645.806s remains
+  valid separately. No synthetic paired terminal result is created afterward.
+- [x] Settle only expired run's private orphan84427/UID1000/birth156782987/
+  candidate-rabs-wkr/SHAd49b9010. pidfd SIGTERM after identity/hash checks
+  yields death in0.254s and clean worker-shutdown receipt, last request terminal-
+  observed/released/residual0. No peer/shared service/source-claim/config edits.
+- [x] Independently audit all inputs after timeout at21:53:50UTC: source1740,
+  SDK5256entries/4270files/a735b87d, eight role copies, harness and frozen
+  controller match; no matching private roles alive. Original sampler's three
+  PermissionErrors still limit its complete independent process census.
+- [ ] Validate concurrent main95787df5 including new toolchain-file checkpoints
+  and durable seal-time adoption; source04ffa22b/AC82 are separate. Keep all new
+  tests/gates; require normal full worker/coordinator/reactor and actual TLS
+  integrations. Upstream component proofs do not establish full native/fleet
+  correctness. Concurrent process committed the repair as e32a153e; root did
+  not stage/commit/merge during qualification. Preserve current index329e6abb;
+  old858f9f03 is historical and must never be restored over concurrent work.
+  Exact committed1747-file archive/source/control are verified on physical49.
+  Main DSR725e89d0-06bf-41df-9152-7e90b2b0ea55/toolrabs_main957_check
+  v2.1.34-main957.aabe7277 launched22:05:58UTC/PID7275. Frozen controller
+  aabe7277/4121B/dev49/inode11553768/uid1000/0400/nlink1 runs original full
+  check/all-targets + fmt only. Separate cold target avoids lock/output races
+  with old04f; registry reuse explicit. Strict Clippy/all old+new tests/ordinary
+  tools/real TLS/cache/recovery/performance/fleet/release remain REQUIRED.
+  First validation attempt ran while source transfer was still in progress;
+  size guard refused before extraction. After transport0/63672320B, extraction
+  and independent all1747-file/execute-bit verification pass0. No partial proof.
+- [x] Fix two actual merged-main native fmt failures manually in existing
+  live_dependency/remote.rs (import grouping and one test line-wrap), lease1113
+  through00:10UTC. No semantic/assertion/gate change; local cargo fmt--check0
+  and diffcheck0. Original frozen957 fmt remains raw1; compiler check continues.
+- [ ] Bind native validation to the formatting-corrected merged source after
+  current957 compiler result; fix any actual compiler/Clippy failures without
+  weakening flags, shrinking tests or substituting component facades. Preserve
+  the original957 failure and every frozen source/control receipt.
+- [x] Reconcile tracker import after the concurrent merge using JSONL truth
+  and the existing single graph writer. M6 comment21:47 triggered many newer/
+  equal-row import warnings but exported successfully; no DB/graph repair or
+  closure attempted. Read-only JSONL audit finds2225 unique issues/2550blocking
+  edges/no cycles. Normal br sync--import-only22:14 exits0/current/hashunchanged;
+  full203B output retained in br-import-after-main957.log. JSONL SHAf47b5d72
+  unchanged. No DB reset, graph edits or deletions needed; resume nonstructural
+  evidence comments. Runtime work continues independently.
 - [ ] After the blocking path is proved and repaired, rerun complete full-SDK
   check+archive/program acceptance; then try a bounded ordinary shared-RCH
   canary through normal available-slot admission before relying on exclusive

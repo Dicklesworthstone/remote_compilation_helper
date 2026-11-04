@@ -66,9 +66,7 @@ use rabs_sandbox::toolchain_dataset::capture_toolchain;
 use rabs_sandbox::toolchain_dataset::{
     PreparedToolchain, ToolchainIdentity, ToolchainLimits, capture_toolchain_with_cloner,
 };
-use rabs_sandbox::toolchain_transfer::{
-    TOOLCHAIN_FILE_REUSE_VERSION, TOOLCHAIN_TRANSFER_VERSION,
-};
+use rabs_sandbox::toolchain_transfer::{TOOLCHAIN_FILE_REUSE_VERSION, TOOLCHAIN_TRANSFER_VERSION};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -2956,8 +2954,7 @@ mod worker_pool_tests {
         // Equal normalized load would otherwise preserve round-robin and pick
         // worker-1 first. Reuse is only an advisory tie-breaker; every ordinary
         // request, capability and transfer verification still runs afterward.
-        let (preferred, preferred_claim) =
-            pool.try_reserve_for(&key(1), Some(&request)).unwrap();
+        let (preferred, preferred_claim) = pool.try_reserve_for(&key(1), Some(&request)).unwrap();
         assert_eq!(preferred.worker(), "worker-2");
         let (other, other_claim) = pool.try_reserve_for(&key(2), Some(&request)).unwrap();
         assert_eq!(other.worker(), "worker-1");
