@@ -199,7 +199,17 @@ impl Drop for VerificationOwner<'_> {
 
 impl Dataset {
     fn verify(&self, stopped: &impl Fn() -> bool) -> io::Result<()> {
-        self.verify_with(stopped, || self.toolchain.verify(stopped))
+        // verify_with owns the original complete generation checks before and
+        // after the shared scan, including aliases and directory membership.
+        // Rehash every byte here; do not repeat the two weaker metadata walks
+        // inside PreparedToolchain::verify on top of those existing barriers.
+        self.verify_with(stopped, || {
+            let observed = self.toolchain.rehash_retained_bytes(stopped)?;
+            if observed != *self.toolchain.identity() {
+                return Err(invalid("retained toolchain content changed"));
+            }
+            Ok(())
+        })
     }
 
     fn verify_with(

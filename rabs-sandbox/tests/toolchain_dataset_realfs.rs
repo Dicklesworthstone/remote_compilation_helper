@@ -550,6 +550,77 @@ fn failed_clone_resets_both_cursors_and_discards_partial_output_suffixes() {
 }
 
 #[test]
+fn slow_clone_attempts_switch_remaining_files_to_verified_private_copies() {
+    for success in [false, true] {
+        let source = private();
+        let files = [
+            ("compiler", vec![0x31; 128 * 1024], 0o755),
+            ("lib/one", vec![0x42; 192 * 1024], 0o644),
+            ("lib/two", vec![0x53; 256 * 1024], 0o644),
+        ];
+        for (name, bytes, mode) in &files {
+            write(source.path(), name, bytes, *mode);
+        }
+        let parent = private();
+        let expected =
+            fingerprint_toolchain(source.path(), &ToolchainLimits::default(), || false).unwrap();
+        let attempts = Cell::new(0);
+        let retained = capture_toolchain_with_cloner(
+            source.path(),
+            &parent.path().join("copy"),
+            Some(&expected),
+            &ToolchainLimits::default(),
+            || false,
+            |input, output, _| {
+                attempts.set(attempts.get() + 1);
+                assert_eq!(attempts.get(), 1, "repeated a slow optional clone");
+                if success {
+                    // Deterministic strategy hook, not proof of native reflink
+                    // support. The real destination bytes are checked below.
+                    io::copy(
+                        &mut input.try_clone().unwrap(),
+                        &mut output.try_clone().unwrap(),
+                    )
+                    .unwrap();
+                } else {
+                    input
+                        .try_clone()
+                        .unwrap()
+                        .seek(SeekFrom::Start(37))
+                        .unwrap();
+                    output
+                        .try_clone()
+                        .unwrap()
+                        .write_all(&vec![0xee; 384 * 1024])
+                        .unwrap();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                success
+            },
+        )
+        .unwrap();
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(*retained.identity(), expected);
+        for (name, bytes, mode) in &files {
+            let output = retained.root().join(name);
+            assert_eq!(fs::read(&output).unwrap(), *bytes);
+            assert_ne!(
+                fs::metadata(source.path().join(name)).unwrap().ino(),
+                fs::metadata(&output).unwrap().ino()
+            );
+            assert_eq!(
+                fs::metadata(&output).unwrap().mode() & 0o777,
+                if mode & 0o111 != 0 { 0o555 } else { 0o444 }
+            );
+        }
+        retained.verify(|| false).unwrap();
+        retained
+            .verify_source_unchanged(source.path(), || false)
+            .unwrap();
+    }
+}
+
+#[test]
 fn successful_clone_cannot_supply_corrupt_truncated_or_oversized_bytes() {
     let bytes = vec![0x73; 128 * 1024];
     for length in [bytes.len(), bytes.len() - 1, bytes.len() + 1] {
@@ -908,6 +979,36 @@ fn source_mutation_during_streaming_cannot_produce_an_owner() {
     assert!(
         result.is_err(),
         "mixed source bytes must not become a prepared toolchain"
+    );
+}
+
+#[test]
+fn byte_rehash_does_not_replace_the_retained_namespace_barriers() {
+    let source = private();
+    fixture(source.path());
+    let parent = private();
+    let retained = capture_toolchain(
+        source.path(),
+        &parent.path().join("copy"),
+        None,
+        &ToolchainLimits::default(),
+        || false,
+    )
+    .unwrap();
+    let expected = *retained.identity();
+    retained.verify_retained_generation(|| false).unwrap();
+    assert_eq!(retained.rehash_retained_bytes(|| false).unwrap(), expected);
+    retained.verify_retained_generation(|| false).unwrap();
+
+    // An unselected member changes namespace authority without changing the
+    // inventoried bytes. Both complete verification entry points must refuse it.
+    fs::write(retained.root().join("unexpected"), b"not in the inventory").unwrap();
+    assert_eq!(retained.rehash_retained_bytes(|| false).unwrap(), expected);
+    assert!(retained.verify_retained_generation(|| false).is_err());
+    assert!(retained.verify(|| false).is_err());
+    assert_eq!(
+        retained.rehash_retained_bytes(|| true).unwrap_err().kind(),
+        io::ErrorKind::Interrupted
     );
 }
 

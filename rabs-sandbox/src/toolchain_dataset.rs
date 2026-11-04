@@ -189,12 +189,35 @@ impl PreparedToolchain {
         #[cfg(target_os = "linux")]
         {
             self.inventory.verify(&stopped)?;
-            let current = self.inventory.stream(None, &stopped)?;
+            let current = self.rehash_retained_bytes(&stopped)?;
             self.inventory.verify(&stopped)?;
             require(
                 current == self.identity,
                 "retained toolchain content changed",
             )
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = stopped;
+            Err(unsupported())
+        }
+    }
+
+    /// Compute the retained inventory's current content identity by reading
+    /// every regular byte with the original before/after file-stamp checks.
+    ///
+    /// This is not namespace authority: directory membership and alias closure
+    /// need separate validation. A caller authorizing use must bracket this
+    /// scan with [`Self::verify_retained_generation`], or use [`Self::verify`].
+    /// This split lets an existing verification owner supply those barriers
+    /// without walking every entry twice again inside the byte scan.
+    pub fn rehash_retained_bytes(
+        &self,
+        stopped: impl Fn() -> bool,
+    ) -> io::Result<ToolchainIdentity> {
+        #[cfg(target_os = "linux")]
+        {
+            self.inventory.stream(None, &stopped)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -364,6 +387,12 @@ mod linux {
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
     use std::path::Component;
+    use std::time::{Duration, Instant};
+
+    // A successful clone may still wait for filesystem writeback. Stop trying
+    // this optional optimization after one slow call rather than multiplying
+    // that wait by every large SDK file. Ordinary copies keep all verification.
+    const MAX_USEFUL_CLONE_LATENCY: Duration = Duration::from_millis(50);
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct Stamp {
@@ -834,6 +863,7 @@ mod linux {
             let mut digest = Sha256::new();
             digest.update(TOOLCHAIN_DATASET_VERSION.as_bytes());
             let mut buffer = [0_u8; 64 * 1024];
+            let mut try_cloning = true;
             // A complete installed toolchain contains many small files. Keep
             // only eight anchored descriptors ahead of the reader, with at
             // most 1 MiB of advice per file, so filesystem reads can overlap.
@@ -904,36 +934,44 @@ mod linux {
                                     .open(root.join(path))
                             })
                             .transpose()?;
-                        let cloned =
-                            if let (Some(parent), Some(output)) = (destination, &mut output) {
-                                // The caller supplies the already-audited primitive;
-                                // small files avoid its filesystem isolation probe.
-                                let attempted = entry.stamp.size > buffer.len() as u64;
-                                let cloned = attempted && cloner(&source, output, parent);
-                                checkpoint(stopped)?;
-                                if cloned {
-                                    let metadata = output.metadata()?;
-                                    require(
-                                        metadata.is_file()
-                                            && metadata.len() == entry.stamp.size
-                                            && (metadata.dev(), metadata.ino())
-                                                != (entry.stamp.device, entry.stamp.inode),
-                                        "toolchain clone is not an independent complete file",
-                                    )?;
-                                } else if attempted {
-                                    // Failed primitives may leave both a partial
-                                    // suffix and moved file offsets. Neither may
-                                    // leak into the verified fallback copy.
-                                    output.set_len(0)?;
-                                    output.rewind()?;
-                                }
-                                if attempted {
-                                    source.rewind()?;
-                                }
+                        let cloned = if let (Some(parent), Some(output)) =
+                            (destination, &mut output)
+                        {
+                            // The caller supplies the already-audited primitive;
+                            // small files avoid its filesystem isolation probe.
+                            let attempted = try_cloning && entry.stamp.size > buffer.len() as u64;
+                            let cloned = if attempted {
+                                let started = Instant::now();
+                                let cloned = cloner(&source, output, parent);
+                                try_cloning = started.elapsed() <= MAX_USEFUL_CLONE_LATENCY;
                                 cloned
                             } else {
                                 false
                             };
+                            checkpoint(stopped)?;
+                            if cloned {
+                                let metadata = output.metadata()?;
+                                require(
+                                    metadata.is_file()
+                                        && metadata.len() == entry.stamp.size
+                                        && (metadata.dev(), metadata.ino())
+                                            != (entry.stamp.device, entry.stamp.inode),
+                                    "toolchain clone is not an independent complete file",
+                                )?;
+                            } else if attempted {
+                                // Failed primitives may leave both a partial
+                                // suffix and moved file offsets. Neither may
+                                // leak into the verified fallback copy.
+                                output.set_len(0)?;
+                                output.rewind()?;
+                            }
+                            if attempted {
+                                source.rewind()?;
+                            }
+                            cloned
+                        } else {
+                            false
+                        };
                         let mut file_digest = Sha256::new();
                         let mut copied = 0_u64;
                         loop {
@@ -1046,5 +1084,34 @@ mod linux {
             inventory: retained,
             source_inventory: Some(inventory),
         })
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::{ToolchainLimits, capture_toolchain};
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn rehash_reads_the_bytes_instead_of_returning_the_saved_identity() {
+        let parent = tempfile::tempdir().unwrap();
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let source = parent.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("compiler"), b"independently retained bytes").unwrap();
+        let mut retained = capture_toolchain(
+            &source,
+            &parent.path().join("retained"),
+            None,
+            &ToolchainLimits::default(),
+            || false,
+        )
+        .unwrap();
+        let actual = *retained.identity();
+        retained.identity.sha256[0] ^= 1;
+        assert_eq!(retained.rehash_retained_bytes(|| false).unwrap(), actual);
+        assert_ne!(retained.identity(), &actual);
+        assert!(retained.verify(|| false).is_err());
     }
 }
