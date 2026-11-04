@@ -65,8 +65,9 @@ use rabs_protocol::worker_fence::{
 /// durable clone ambiguity plus normalized worker bindings on attempts
 /// (every execution lease links through its attempt); v22 = peer
 /// authority incarnation fencing (legacy rows require a newer term);
-/// v23 = credential-generation fencing (legacy unknown generations fail closed).
-pub const SCHEMA_VERSION: u32 = 25;
+/// v23 = credential-generation fencing (legacy unknown generations fail closed);
+/// v26 = immutable action-key headers for complete key reconstruction.
+pub const SCHEMA_VERSION: u32 = 26;
 
 /// One transactional, versioned migration step.
 pub struct Migration {
@@ -529,6 +530,18 @@ pub const MIGRATIONS: &[Migration] = &[
          max_age_micros INTEGER, \
          clock_uncertainty_micros INTEGER NOT NULL, \
          clock_epoch INTEGER NOT NULL)"],
+    },
+    Migration {
+        // The component rows alone omit the epochs and semantic action-class
+        // tag that also enter the key. Retain the exact descriptor header at
+        // admission; a historical missing header cannot be inferred from a
+        // runtime policy-class receipt or invented during migration.
+        version: 26,
+        statements: &[
+            "CREATE TABLE action_key_headers (action_key TEXT PRIMARY KEY, \
+         key_epoch INTEGER NOT NULL, projection_epoch INTEGER NOT NULL, \
+         action_class_tag INTEGER NOT NULL)",
+        ],
     },
 ];
 
@@ -1468,13 +1481,13 @@ pub trait RabsMetadataStore {
         digest: &TypedDigest,
     ) -> Result<(), StoreError>;
 
-    /// Atomically retain the descriptor's complete set of key-component digests
-    /// and the live runtime-class receipt under its computed action key. Requires
-    /// the active coordinator authority. Identical retries and matching partial
-    /// historical records are accepted; conflicting retained bytes or class
-    /// decisions are never overwritten. The trusted admission path derives
-    /// `runtime_class` from this descriptor, rather than accepting a
-    /// socket-supplied class flag.
+    /// Atomically retain the descriptor's canonical key header, complete set of
+    /// key-component digests, and live runtime-class receipt under its computed
+    /// action key. Requires the active coordinator authority. Identical retries
+    /// and matching partial historical records are accepted; conflicting retained
+    /// headers, bytes, or class decisions are never overwritten. The trusted
+    /// admission path derives `runtime_class` from this descriptor, rather than
+    /// accepting a socket-supplied class flag.
     fn record_action_key_provenance(
         &mut self,
         authority: &TypedDigest,
@@ -4256,6 +4269,22 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
         let runtime_class = runtime_class.to_owned();
         self.in_txn(move |engine| {
             Self::require_active(engine, &authority)?;
+            let expected_header = [
+                SqlValue::Int(i64::from(breakdown.key_epoch)),
+                SqlValue::Int(i64::from(breakdown.projection_epoch)),
+                SqlValue::Int(i64::from(breakdown.action_class_tag)),
+            ];
+            let headers = engine.query(
+                "SELECT key_epoch, projection_epoch, action_class_tag FROM action_key_headers \
+                 WHERE action_key = ?1 LIMIT 2",
+                &[SqlValue::Text(action.clone())],
+            )?;
+            match headers.as_slice() {
+                [] => {}
+                [row] if row.as_slice() == expected_header.as_slice() => {}
+                [_] => return Err(StoreError::AppendConflict("action_key_headers".into())),
+                _ => return Err(StoreError::Corruption("duplicate action-key header".into())),
+            }
             // The primary key bounds this seek to one action. One extra row
             // detects legacy extras without loading an unbounded history.
             let retained = engine.query(
@@ -4335,9 +4364,23 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                      VALUES (?1, ?2, 0, ?3, ?4)",
                     &[
                         SqlValue::Text(CLASS_KIND.to_owned()),
-                        SqlValue::Text(action),
+                        SqlValue::Text(action.clone()),
                         SqlValue::Text(runtime_class),
                         SqlValue::Text(CLASS_REASON.to_owned()),
+                    ],
+                )?;
+            }
+            if headers.is_empty() {
+                let [key_epoch, projection_epoch, action_class_tag] = expected_header;
+                engine.execute(
+                    "INSERT INTO action_key_headers \
+                     (action_key, key_epoch, projection_epoch, action_class_tag) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    &[
+                        SqlValue::Text(action),
+                        key_epoch,
+                        projection_epoch,
+                        action_class_tag,
                     ],
                 )?;
             }
@@ -7068,6 +7111,11 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                  FROM action_entries ORDER BY key",
             ),
             (
+                "action_key_headers",
+                "SELECT action_key, key_epoch, projection_epoch, action_class_tag \
+                 FROM action_key_headers ORDER BY action_key",
+            ),
+            (
                 "action_generations",
                 "SELECT id_hex, id, action_key, authority_key, tombstoned, per_key_ordinal \
                  FROM action_generations ORDER BY id_hex",
@@ -9538,6 +9586,7 @@ mod tests {
             "action_entries",
             "action_evidence_index",
             "action_generations",
+            "action_key_headers",
             "action_publications",
             "action_serving_states",
             "action_trust_evaluations",
@@ -9954,6 +10003,7 @@ mod action_key_provenance_tests {
             }
             if sql.starts_with("INSERT INTO key_breakdowns")
                 || sql.starts_with("INSERT INTO decision_receipts")
+                || sql.starts_with("INSERT INTO action_key_headers")
             {
                 self.provenance_inserts += 1;
             }
@@ -10024,12 +10074,26 @@ mod action_key_provenance_tests {
 
     #[derive(Debug, PartialEq, Eq)]
     struct Snapshot {
+        headers: Vec<Vec<SqlValue>>,
         components: Vec<Vec<SqlValue>>,
         receipts: Vec<Vec<SqlValue>>,
     }
 
     fn snapshot(store: &mut SqlMetadataStore<CountedEngine>) -> Snapshot {
+        let mut snapshot = legacy_snapshot(store);
+        snapshot.headers = store
+            .query(
+                "SELECT action_key, key_epoch, projection_epoch, action_class_tag \
+                 FROM action_key_headers ORDER BY action_key",
+                &[],
+            )
+            .unwrap();
+        snapshot
+    }
+
+    fn legacy_snapshot(store: &mut SqlMetadataStore<CountedEngine>) -> Snapshot {
         Snapshot {
+            headers: Vec::new(),
             components: store
                 .query(
                     "SELECT action_key, component, algo, domain, bytes FROM key_breakdowns \
@@ -10057,6 +10121,10 @@ mod action_key_provenance_tests {
         assert_eq!(report.action_key, digest_key(&expected.final_key));
         assert!(report.observed);
         assert_eq!(report.runtime_class.as_deref(), Some(RUNTIME_CLASS));
+        let header = report.breakdown_header.as_ref().unwrap();
+        assert_eq!(header.key_epoch, expected.key_epoch);
+        assert_eq!(header.projection_epoch, expected.projection_epoch);
+        assert_eq!(header.action_class_tag, expected.action_class_tag);
         assert_eq!(report.breakdown.items.len(), 12);
         assert!(!report.breakdown.truncated);
         for expected in expected.components {
@@ -10081,8 +10149,16 @@ mod action_key_provenance_tests {
             .unwrap();
         assert_eq!(store.engine.begins, 1);
         assert_eq!(store.engine.commits, 1);
-        assert_eq!(store.engine.provenance_inserts, 13);
+        assert_eq!(store.engine.provenance_inserts, 14);
         assert_visible_components(&directory, &descriptor);
+        let breakdown = compute_action_key(&descriptor);
+        assert!(store.differential_snapshot().unwrap().contains(&format!(
+            "action_key_headers|{}|{}|{}|{}",
+            digest_key(&breakdown.final_key),
+            breakdown.key_epoch,
+            breakdown.projection_epoch,
+            breakdown.action_class_tag,
+        )));
         let before_retry = snapshot(&mut store);
         store.engine.reset_counts();
         store
@@ -10098,10 +10174,31 @@ mod action_key_provenance_tests {
 
     #[test]
     fn matching_receipt_only_and_partial_historical_rows_are_completed() {
-        for (component_count, has_class) in [(0, true), (3, false), (3, true)] {
+        for (component_count, has_class, has_header) in [
+            (0, true, false),
+            (3, false, false),
+            (3, true, false),
+            (0, false, true),
+            (3, true, true),
+            (12, true, false),
+        ] {
             let (directory, mut store, authority) = fixture();
             let descriptor = descriptor();
             let breakdown = compute_action_key(&descriptor);
+            if has_header {
+                store
+                    .engine
+                    .execute(
+                        "INSERT INTO action_key_headers VALUES (?1, ?2, ?3, ?4)",
+                        &[
+                            SqlValue::Text(digest_key(&breakdown.final_key)),
+                            SqlValue::Int(i64::from(breakdown.key_epoch)),
+                            SqlValue::Int(i64::from(breakdown.projection_epoch)),
+                            SqlValue::Int(i64::from(breakdown.action_class_tag)),
+                        ],
+                    )
+                    .unwrap();
+            }
             for component in breakdown.components.iter().take(component_count) {
                 store
                     .put_key_breakdown(&breakdown.final_key, component.name, &component.digest)
@@ -10126,10 +10223,127 @@ mod action_key_provenance_tests {
             assert_eq!(store.engine.commits, 1);
             assert_eq!(
                 store.engine.provenance_inserts,
-                12 - component_count + usize::from(!has_class)
+                12 - component_count + usize::from(!has_class) + usize::from(!has_header)
             );
             assert_visible_components(&directory, &descriptor);
         }
+    }
+
+    fn legacy_fixture() -> (
+        tempfile::TempDir,
+        SqlMetadataStore<CountedEngine>,
+        ActionDescriptor,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let mut engine = CountedEngine {
+            inner: RusqliteEngine::open(&directory.path().join("meta.sqlite")).unwrap(),
+            begins: 0,
+            commits: 0,
+            provenance_inserts: 0,
+        };
+        engine.execute("BEGIN", &[]).unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .take_while(|migration| migration.version <= 25)
+        {
+            for statement in migration.statements {
+                engine.execute(statement, &[]).unwrap();
+            }
+            engine
+                .execute(
+                    "INSERT INTO schema_epochs VALUES (?1, 0)",
+                    &[SqlValue::Int(i64::from(migration.version))],
+                )
+                .unwrap();
+        }
+        engine.execute("COMMIT", &[]).unwrap();
+        // Deliberately skip open's upgrade to exercise an actual v25 store.
+        let mut store = SqlMetadataStore {
+            engine,
+            domains: HashMap::new(),
+        };
+        let descriptor = descriptor();
+        let breakdown = compute_action_key(&descriptor);
+        for component in &breakdown.components {
+            store
+                .put_key_breakdown(&breakdown.final_key, component.name, &component.digest)
+                .unwrap();
+        }
+        store
+            .record_decision_receipt(
+                CLASS_KIND,
+                &digest_key(&breakdown.final_key),
+                0,
+                RUNTIME_CLASS,
+                CLASS_REASON,
+            )
+            .unwrap();
+        store.engine.reset_counts();
+        (directory, store, descriptor)
+    }
+
+    #[test]
+    fn v25_upgrade_preserves_provenance_without_inventing_headers() {
+        let (directory, mut store, descriptor) = legacy_fixture();
+        let action_key = digest_key(&compute_action_key(&descriptor).final_key);
+        let before = legacy_snapshot(&mut store);
+        let legacy = inspect_action(&directory.path().join("meta.sqlite"), &action_key).unwrap();
+        assert_eq!(legacy.schema_version, 25);
+        assert_eq!(legacy.breakdown.items.len(), 12);
+        assert!(legacy.breakdown_header.is_none());
+
+        store.apply_migrations().unwrap();
+        assert_eq!(store.schema_version(), Ok(SCHEMA_VERSION));
+        assert_eq!(store.engine.begins, 1);
+        assert_eq!(store.engine.commits, 1);
+        assert_eq!(snapshot(&mut store), before);
+        let upgraded = inspect_action(&directory.path().join("meta.sqlite"), &action_key).unwrap();
+        assert_eq!(upgraded.schema_version, 26);
+        assert!(upgraded.breakdown_header.is_none());
+        assert_eq!(upgraded.breakdown, legacy.breakdown);
+        assert_eq!(upgraded.runtime_class, legacy.runtime_class);
+    }
+
+    #[test]
+    fn failed_v26_upgrade_rolls_back_header_table_and_retries_on_same_connection() {
+        let (_directory, mut store, _descriptor) = legacy_fixture();
+        let before = legacy_snapshot(&mut store);
+        store
+            .engine
+            .execute(
+                "CREATE TRIGGER refuse_header_epoch BEFORE INSERT ON schema_epochs \
+                 WHEN NEW.version = 26 BEGIN SELECT RAISE(ABORT, 'header epoch fault'); END",
+                &[],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.apply_migrations(),
+            Err(StoreError::Backend(_))
+        ));
+        assert!(store.engine.inner.conn.is_autocommit());
+        assert_eq!(store.schema_version(), Ok(25));
+        assert!(
+            store
+                .query(
+                    "SELECT name FROM sqlite_schema WHERE name = 'action_key_headers'",
+                    &[]
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(legacy_snapshot(&mut store), before);
+
+        store
+            .engine
+            .execute("DROP TRIGGER refuse_header_epoch", &[])
+            .unwrap();
+        store.engine.reset_counts();
+        store.apply_migrations().unwrap();
+        assert_eq!(store.schema_version(), Ok(SCHEMA_VERSION));
+        assert!(store.engine.inner.conn.is_autocommit());
+        assert_eq!(store.engine.begins, 1);
+        assert_eq!(store.engine.commits, 1);
+        assert_eq!(snapshot(&mut store), before);
     }
 
     #[test]
@@ -10140,6 +10354,9 @@ mod action_key_provenance_tests {
             "algorithm",
             "name",
             "excess",
+            "header-key-epoch",
+            "header-projection-epoch",
+            "header-action-class",
             "class",
             "reason",
         ] {
@@ -10148,6 +10365,32 @@ mod action_key_provenance_tests {
             let breakdown = compute_action_key(&descriptor);
             let first = &breakdown.components[0];
             let table = match conflict {
+                "header-key-epoch" | "header-projection-epoch" | "header-action-class" => {
+                    let mut header = [
+                        breakdown.key_epoch,
+                        breakdown.projection_epoch,
+                        breakdown.action_class_tag,
+                    ];
+                    let index = match conflict {
+                        "header-key-epoch" => 0,
+                        "header-projection-epoch" => 1,
+                        _ => 2,
+                    };
+                    header[index] += 1;
+                    store
+                        .engine
+                        .execute(
+                            "INSERT INTO action_key_headers VALUES (?1, ?2, ?3, ?4)",
+                            &[
+                                SqlValue::Text(digest_key(&breakdown.final_key)),
+                                SqlValue::Int(i64::from(header[0])),
+                                SqlValue::Int(i64::from(header[1])),
+                                SqlValue::Int(i64::from(header[2])),
+                            ],
+                        )
+                        .unwrap();
+                    "action_key_headers"
+                }
                 "class" | "reason" => {
                     store
                         .record_decision_receipt(
@@ -10252,6 +10495,7 @@ mod action_key_provenance_tests {
                 "decision_receipts",
                 "NEW.kind = 'rabs-live-action-class-v1'",
             ),
+            ("action_key_headers", "1"),
         ] {
             let (directory, mut store, authority) = fixture();
             let descriptor = descriptor();
@@ -10320,7 +10564,7 @@ mod action_key_provenance_tests {
         // SQLite retains a failed COMMIT's transaction unless our actual
         // in_txn cleanup rolls it back. Check the SAME connection explicitly.
         assert!(store.engine.inner.conn.is_autocommit());
-        assert_eq!(store.engine.provenance_inserts, 13);
+        assert_eq!(store.engine.provenance_inserts, 14);
         assert_eq!(store.engine.commits, 1);
         assert_eq!(snapshot(&mut store), before);
         reader.execute_batch("ROLLBACK").unwrap();

@@ -107,6 +107,17 @@ pub struct RecordedActionEntry {
     pub projection_epoch: u32,
 }
 
+/// Immutable header written with the descriptor's component digests at admission.
+#[derive(Debug, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+pub struct RecordedBreakdownHeader {
+    /// Action-key namespace epoch.
+    pub key_epoch: u32,
+    /// Result-projection namespace epoch.
+    pub projection_epoch: u32,
+    /// Canonical numeric action class, distinct from the runtime serving policy.
+    pub action_class_tag: u32,
+}
+
 /// A committed publication, retained independently of its serving disposition.
 #[derive(Debug, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct RecordedPublication {
@@ -230,6 +241,8 @@ pub struct ActionExplanation {
     pub blocking_quarantines: RecordedRows<RecordedQuarantine>,
     /// True only when at least one component was actually recorded.
     pub breakdown_recorded: bool,
+    /// Persisted key header; historical missing fields are never inferred.
+    pub breakdown_header: Option<RecordedBreakdownHeader>,
     /// Recorded components; absent components are never synthesized.
     pub breakdown: RecordedRows<RecordedComponent>,
 }
@@ -327,6 +340,13 @@ impl ActionExplanation {
                 truncated: inspection.blocking_quarantines.truncated,
             },
             breakdown_recorded: !inspection.breakdown.items.is_empty(),
+            breakdown_header: inspection
+                .breakdown_header
+                .map(|header| RecordedBreakdownHeader {
+                    key_epoch: header.key_epoch,
+                    projection_epoch: header.projection_epoch,
+                    action_class_tag: header.action_class_tag,
+                }),
             breakdown: RecordedRows {
                 items: inspection
                     .breakdown
@@ -424,6 +444,14 @@ fn format_action(explanation: &ActionExplanation) -> String {
     }
     if explanation.blocking_quarantines.truncated {
         lines.push("blocking references: additional rows omitted".to_owned());
+    }
+    if let Some(header) = &explanation.breakdown_header {
+        lines.push(format!(
+            "key header: key_epoch={}, projection_epoch={}, action_class_tag={}",
+            header.key_epoch, header.projection_epoch, header.action_class_tag
+        ));
+    } else {
+        lines.push("key header: not recorded".to_owned());
     }
     if explanation.breakdown_recorded {
         for row in &explanation.breakdown.items {
@@ -634,6 +662,7 @@ mod tests {
             schema_version: rabs_cas::metadata_store::SCHEMA_VERSION,
             observed: false,
             entry: None,
+            breakdown_header: None,
             publication: None,
             serving: None,
             trust_evaluation: None,
@@ -774,6 +803,34 @@ mod tests {
         let error = explain_action(&"ab".repeat(32), &root).unwrap_err();
         assert!(error.to_string().contains("meta.sqlite"));
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn action_output_preserves_the_admission_header_without_inventing_missing_fields() {
+        let mut inspection = inspection_fixture();
+        let missing =
+            ActionExplanation::from_inspection(Path::new("cas/meta.sqlite"), inspection.clone());
+        assert!(missing.breakdown_header.is_none());
+        assert!(format_action(&missing).contains("key header: not recorded"));
+        inspection.observed = true;
+        inspection.breakdown_header = Some(action_inspection::BreakdownHeaderInspection {
+            key_epoch: 7,
+            projection_epoch: 3,
+            action_class_tag: 2,
+        });
+        let explanation =
+            ActionExplanation::from_inspection(Path::new("cas/meta.sqlite"), inspection);
+        assert!(explanation.entry.is_none());
+        assert!(explanation.runtime_class.is_none());
+        let json = serde_json::to_value(&explanation).unwrap();
+        assert_eq!(json["breakdown_header"]["key_epoch"], 7);
+        assert_eq!(json["breakdown_header"]["projection_epoch"], 3);
+        assert_eq!(json["breakdown_header"]["action_class_tag"], 2);
+        assert!(
+            format_action(&explanation)
+                .contains("key header: key_epoch=7, projection_epoch=3, action_class_tag=2")
+        );
+        assert!(!explanation.serving_authorization_evaluated);
     }
 
     #[test]

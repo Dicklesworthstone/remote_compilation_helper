@@ -19,7 +19,7 @@ rch --json why action <action-key> --cas-root /path/to/rabs-state/cas
 Keys may also use the full `rabs.action-key.sha256.v1:<64-hex>` form. Without
 `--cas-root`, lookup uses `RABS_STATE_DIR/cas`, then
 `~/.cache/rch/rabs-state/cas`. The database must already exist and have the
-supported schema. Inspection opens it read-only and does not initialize or
+supported schema (25 or 26). Inspection opens it read-only and does not initialize or
 migrate it. All report sections come from one snapshot, including live WAL
 data while the coordinator is writing.
 
@@ -38,15 +38,18 @@ Each component/quarantine list is bounded and reports truncation. Missing key
 component digests remain explicitly unrecorded; the command does not invent
 miss causes or scheduler-selection explanations.
 
-Newly admitted daemon actions persist all twelve component digests together
-with their descriptor-derived runtime class, under the active coordinator
-authority in one transaction. Repeating an identical admission preserves the
+Newly admitted daemon actions persist all twelve component digests, the key
+and projection epochs, the canonical numeric action class, and their
+descriptor-derived runtime class under the active coordinator authority in
+one transaction. Repeating an identical admission preserves the
 record; conflicting retained evidence refuses admission instead of replacing
 it. Matching historical partial records can be completed on a new admission.
 Requests refused by availability, pressure, capacity or authority checks do
 not add component records. Historical actions that are never admitted again
-may still have no component evidence. These component rows do not reconstruct
-all key-header fields or establish a pairwise cache-miss cause.
+may still have no component evidence or key header. Schema 25 has no header
+table and reports `breakdown_header: null`; schema 26 also preserves missing
+historical headers until a matching descriptor is admitted again. Runtime
+serving classes are never substituted for canonical numeric action classes.
 
 `serving_authorization_evaluated` is always `false`: a stored `servable` value
 does not evaluate the coordinator's current authority, clock epoch, requested

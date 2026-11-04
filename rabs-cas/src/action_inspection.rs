@@ -16,10 +16,10 @@ use std::time::Duration;
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags, Row, Transaction, TransactionBehavior};
 
-use crate::metadata_store::SCHEMA_VERSION;
-
 const ACTION_DOMAIN: &str = "rabs.action-key.sha256.v1";
 const MAX_TEXT_BYTES: usize = 4096;
+const LEGACY_SCHEMA_VERSION: u32 = 25;
+const HEADER_SCHEMA_VERSION: u32 = 26;
 
 /// Maximum number of rows returned in each per-action list.
 pub const INSPECTION_ROW_LIMIT: usize = 64;
@@ -39,6 +39,9 @@ pub struct ActionInspection {
     /// At least one of the inspected tables has a record for this action.
     pub observed: bool,
     pub entry: Option<ActionEntryInspection>,
+    /// Canonical key header recorded at admission, including before execution.
+    /// Absent on schema 25 and on historical actions without this provenance.
+    pub breakdown_header: Option<BreakdownHeaderInspection>,
     pub publication: Option<PublicationInspection>,
     pub serving: Option<ServingInspection>,
     /// Latest versioned evaluation written by the live coordinator.
@@ -59,6 +62,13 @@ pub struct ActionInspection {
 pub struct ActionEntryInspection {
     pub key_epoch: u32,
     pub projection_epoch: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BreakdownHeaderInspection {
+    pub key_epoch: u32,
+    pub projection_epoch: u32,
+    pub action_class_tag: u32,
 }
 
 /// A committed publication, irrespective of whether it is currently usable.
@@ -133,11 +143,11 @@ impl fmt::Display for InspectionError {
             Self::UnsupportedSchema { expected, found } => match found {
                 Some(found) => write!(
                     f,
-                    "CAS metadata schema {found} is unsupported; expected {expected}; inspection does not run migrations"
+                    "CAS metadata schema {found} is unsupported; expected {LEGACY_SCHEMA_VERSION} or {expected}; inspection does not run migrations"
                 ),
                 None => write!(
                     f,
-                    "CAS metadata has no schema version; expected {expected}; inspection does not initialize a store"
+                    "CAS metadata has no schema version; expected {LEGACY_SCHEMA_VERSION} or {expected}; inspection does not initialize a store"
                 ),
             },
             Self::InvalidMetadata(detail) => write!(f, "invalid CAS metadata: {detail}"),
@@ -169,6 +179,32 @@ impl From<rusqlite::Error> for InspectionError {
 /// option: an active coordinator's WAL must remain visible.
 pub fn inspect_action(database: &Path, key: &str) -> Result<ActionInspection, InspectionError> {
     let key = normalize_key(key)?;
+    with_snapshot(database, |transaction, version| {
+        inspect_snapshot(transaction, key, version)
+    })
+}
+
+/// Inspect both selected actions in one read-only database snapshot.
+///
+/// Both keys are validated before the database is opened. A coordinator write
+/// between the two lookups cannot mix an older action with newer provenance.
+/// This returns recorded facts only; it does not reconstruct or authorize keys.
+pub fn inspect_action_pair(
+    database: &Path,
+    prior: &str,
+    current: &str,
+) -> Result<(ActionInspection, ActionInspection), InspectionError> {
+    let prior = normalize_key(prior)?;
+    let current = normalize_key(current)?;
+    with_snapshot(database, |transaction, version| {
+        inspect_pair_snapshot(transaction, prior, current, version)
+    })
+}
+
+fn with_snapshot<T>(
+    database: &Path,
+    inspect: impl FnOnce(&Transaction<'_>, u32) -> Result<T, InspectionError>,
+) -> Result<T, InspectionError> {
     let mut connection = Connection::open_with_flags(
         database,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -176,9 +212,21 @@ pub fn inspect_action(database: &Path, key: &str) -> Result<ActionInspection, In
     connection.busy_timeout(Duration::from_millis(250))?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
     let version = inspect_schema(&transaction)?;
-    let inspection = inspect_snapshot(&transaction, key, version)?;
+    let inspection = inspect(&transaction, version)?;
     transaction.commit()?;
     Ok(inspection)
+}
+
+fn inspect_pair_snapshot(
+    transaction: &Transaction<'_>,
+    prior: String,
+    current: String,
+    schema_version: u32,
+) -> Result<(ActionInspection, ActionInspection), InspectionError> {
+    Ok((
+        inspect_snapshot(transaction, prior, schema_version)?,
+        inspect_snapshot(transaction, current, schema_version)?,
+    ))
 }
 
 fn normalize_key(key: &str) -> Result<String, InspectionError> {
@@ -208,13 +256,14 @@ fn inspect_schema(transaction: &Transaction<'_>) -> Result<u32, InspectionError>
     } else {
         None
     };
-    if found != Some(i64::from(SCHEMA_VERSION)) {
-        return Err(InspectionError::UnsupportedSchema {
-            expected: SCHEMA_VERSION,
+    match found {
+        Some(version) if version == i64::from(LEGACY_SCHEMA_VERSION) => Ok(LEGACY_SCHEMA_VERSION),
+        Some(version) if version == i64::from(HEADER_SCHEMA_VERSION) => Ok(HEADER_SCHEMA_VERSION),
+        _ => Err(InspectionError::UnsupportedSchema {
+            expected: HEADER_SCHEMA_VERSION,
             found,
-        });
+        }),
     }
-    Ok(SCHEMA_VERSION)
 }
 
 fn inspect_snapshot(
@@ -237,6 +286,23 @@ fn inspect_snapshot(
             })
         },
     )?;
+    let breakdown_header = if schema_version == HEADER_SCHEMA_VERSION {
+        optional_row(
+            transaction,
+            "SELECT key_epoch, projection_epoch, action_class_tag FROM action_key_headers \
+             WHERE action_key = ?1",
+            Some(&action_key),
+            |row| {
+                Ok(BreakdownHeaderInspection {
+                    key_epoch: unsigned32(row, 0, "header key epoch")?,
+                    projection_epoch: unsigned32(row, 1, "header projection epoch")?,
+                    action_class_tag: unsigned32(row, 2, "header action class")?,
+                })
+            },
+        )?
+    } else {
+        None
+    };
     let mut publication = optional_row(
         transaction,
         "SELECT descriptor_algo, descriptor_domain, descriptor_bytes, \
@@ -372,6 +438,7 @@ fn inspect_snapshot(
         },
     )?;
     let observed = entry.is_some()
+        || breakdown_header.is_some()
         || publication.is_some()
         || serving.is_some()
         || trust_evaluation.is_some()
@@ -386,6 +453,7 @@ fn inspect_snapshot(
         schema_version,
         observed,
         entry,
+        breakdown_header,
         publication,
         serving,
         trust_evaluation,
@@ -526,7 +594,7 @@ fn digest(row: &Row<'_>, index: usize) -> Result<Digest, InspectionError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata_store::MIGRATIONS;
+    use crate::metadata_store::{MIGRATIONS, SCHEMA_VERSION};
     use rusqlite::params;
 
     fn key() -> String {
@@ -534,9 +602,16 @@ mod tests {
     }
 
     fn database() -> (tempfile::TempDir, Connection) {
+        database_at_version(SCHEMA_VERSION)
+    }
+
+    fn database_at_version(version: u32) -> (tempfile::TempDir, Connection) {
         let directory = tempfile::tempdir().unwrap();
         let connection = Connection::open(directory.path().join("meta.sqlite")).unwrap();
-        for migration in MIGRATIONS {
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= version)
+        {
             for sql in migration.statements {
                 connection.execute_batch(sql).unwrap();
             }
@@ -604,6 +679,16 @@ mod tests {
             inspect_action(&missing, &key()),
             Err(InspectionError::Database(_))
         ));
+        for (prior, current) in [("bad-key".to_owned(), key()), (key(), "bad-key".to_owned())] {
+            assert!(matches!(
+                inspect_action_pair(&missing, &prior, &current),
+                Err(InspectionError::InvalidActionKey)
+            ));
+        }
+        assert!(matches!(
+            inspect_action_pair(&missing, &key(), &key()),
+            Err(InspectionError::Database(_))
+        ));
         assert!(!missing.exists());
     }
 
@@ -642,7 +727,11 @@ mod tests {
         connection
             .execute_batch("CREATE TABLE schema_epochs (version INTEGER PRIMARY KEY, applied_seq INTEGER NOT NULL)")
             .unwrap();
-        for version in [1, i64::from(SCHEMA_VERSION) + 1] {
+        for version in [
+            1,
+            i64::from(LEGACY_SCHEMA_VERSION) - 1,
+            i64::from(HEADER_SCHEMA_VERSION) + 1,
+        ] {
             connection.execute("DELETE FROM schema_epochs", []).unwrap();
             connection
                 .execute("INSERT INTO schema_epochs VALUES (?1, 0)", [version])
@@ -650,6 +739,10 @@ mod tests {
             let before = std::fs::read(&path).unwrap();
             assert!(matches!(
                 inspect_action(&path, &key()),
+                Err(InspectionError::UnsupportedSchema { found: Some(found), .. }) if found == version
+            ));
+            assert!(matches!(
+                inspect_action_pair(&path, &key(), &key()),
                 Err(InspectionError::UnsupportedSchema { found: Some(found), .. }) if found == version
             ));
             assert_eq!(before, std::fs::read(&path).unwrap());
@@ -665,11 +758,137 @@ mod tests {
     }
 
     #[test]
+    fn schema_25_inspection_neither_infers_headers_nor_migrates_the_store() {
+        let (directory, connection) = database_at_version(LEGACY_SCHEMA_VERSION);
+        insert_entry(&connection);
+        connection
+            .execute(
+                "INSERT INTO key_breakdowns VALUES (?1, 'toolchain', 'sha256-v1', 'rabs.toolchain.v1', ?2)",
+                params![key(), [7_u8; 32].as_slice()],
+            )
+            .unwrap();
+        let path = directory.path().join("meta.sqlite");
+        let before = std::fs::read(&path).unwrap();
+        let single = inspect(&directory);
+        assert_eq!(single.schema_version, LEGACY_SCHEMA_VERSION);
+        assert!(single.observed);
+        assert!(single.entry.is_some());
+        assert!(single.breakdown_header.is_none());
+        assert_eq!(single.breakdown.items.len(), 1);
+        let (prior, current) = inspect_action_pair(&path, &key(), &"cd".repeat(32)).unwrap();
+        assert_eq!(prior, single);
+        assert_eq!(current.schema_version, LEGACY_SCHEMA_VERSION);
+        assert!(!current.observed);
+        assert!(current.breakdown_header.is_none());
+        assert_eq!(before, std::fs::read(&path).unwrap());
+        let header_table: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'action_key_headers')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!header_table);
+        let version: u32 = connection
+            .query_row("SELECT MAX(version) FROM schema_epochs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, LEGACY_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn recorded_header_is_observed_before_execution_without_inventing_components() {
+        let (directory, connection) = database();
+        connection
+            .execute(
+                "INSERT INTO action_key_headers VALUES (?1, ?2, 0, 3)",
+                params![key(), u32::MAX],
+            )
+            .unwrap();
+        let inspection = inspect(&directory);
+        assert_eq!(inspection.schema_version, HEADER_SCHEMA_VERSION);
+        assert!(inspection.observed);
+        assert!(inspection.entry.is_none());
+        assert!(inspection.publication.is_none());
+        assert_eq!(
+            inspection.breakdown_header,
+            Some(BreakdownHeaderInspection {
+                key_epoch: u32::MAX,
+                projection_epoch: 0,
+                action_class_tag: 3,
+            })
+        );
+        assert!(inspection.breakdown.items.is_empty());
+    }
+
+    #[test]
+    fn pair_preserves_requested_order_normalizes_keys_and_keeps_unknown_separate() {
+        let (directory, connection) = database();
+        let second = format!("{ACTION_DOMAIN}:{}", "cd".repeat(32));
+        for (action, epoch) in [(key(), 7), (second.clone(), 8)] {
+            connection
+                .execute(
+                    "INSERT INTO action_key_headers VALUES (?1, ?2, 1, 2)",
+                    params![action, epoch],
+                )
+                .unwrap();
+        }
+        let path = directory.path().join("meta.sqlite");
+        let (prior, current) = inspect_action_pair(&path, &"CD".repeat(32), &key()).unwrap();
+        assert_eq!(prior.action_key, second);
+        assert_eq!(prior.breakdown_header.unwrap().key_epoch, 8);
+        assert_eq!(current.action_key, key());
+        assert_eq!(current.breakdown_header.as_ref().unwrap().key_epoch, 7);
+        let (same_prior, same_current) = inspect_action_pair(&path, &key(), &key()).unwrap();
+        assert_eq!(same_prior, current);
+        assert_eq!(same_current, current);
+        let (known, unknown) = inspect_action_pair(&path, &key(), &"ef".repeat(32)).unwrap();
+        assert!(known.observed);
+        assert!(!unknown.observed);
+        assert!(unknown.breakdown_header.is_none());
+    }
+
+    #[test]
+    fn malformed_header_integers_fail_single_and_pair_inspection() {
+        let (directory, connection) = database();
+        let path = directory.path().join("meta.sqlite");
+        for field in ["key_epoch", "projection_epoch", "action_class_tag"] {
+            for value in ["-1", "4294967296", "'invalid'", "1.5"] {
+                connection
+                    .execute(
+                        "INSERT OR REPLACE INTO action_key_headers VALUES (?1, 1, 1, 1)",
+                        [key()],
+                    )
+                    .unwrap();
+                connection
+                    .execute_batch(&format!("UPDATE action_key_headers SET {field} = {value}"))
+                    .unwrap();
+                assert!(
+                    matches!(
+                        inspect_action(&path, &key()),
+                        Err(InspectionError::InvalidMetadata(_))
+                    ),
+                    "{field}={value}",
+                );
+                assert!(
+                    matches!(
+                        inspect_action_pair(&path, &"cd".repeat(32), &key()),
+                        Err(InspectionError::InvalidMetadata(_))
+                    ),
+                    "{field}={value}",
+                );
+            }
+        }
+    }
+
+    #[test]
     fn unknown_action_and_receipt_without_entry_are_distinct() {
         let (directory, connection) = database();
         let unknown = inspect(&directory);
         assert!(!unknown.observed);
         assert!(unknown.entry.is_none());
+        assert!(unknown.breakdown_header.is_none());
         assert!(unknown.breakdown.items.is_empty());
         assert!(!unknown.breakdown.truncated);
         connection
@@ -681,6 +900,7 @@ mod tests {
         let admitted = inspect(&directory);
         assert!(admitted.observed);
         assert!(admitted.entry.is_none());
+        assert!(admitted.breakdown_header.is_none());
         assert_eq!(admitted.runtime_class.as_deref(), Some("rustc-test-class"));
     }
 
@@ -965,5 +1185,54 @@ mod tests {
         let after = inspect(&directory);
         assert!(after.publication.is_some());
         assert_eq!(after.trust_evaluation.unwrap().reason, "after write");
+    }
+
+    #[test]
+    fn wal_writer_cannot_mix_headers_or_components_between_paired_actions() {
+        let (directory, writer) = database();
+        writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+        let second = format!("{ACTION_DOMAIN}:{}", "cd".repeat(32));
+        for action in [key(), second.clone()] {
+            writer
+                .execute(
+                    "INSERT INTO action_key_headers VALUES (?1, 1, 2, 3)",
+                    [&action],
+                )
+                .unwrap();
+            writer
+                .execute(
+                    "INSERT INTO key_breakdowns VALUES (?1, 'toolchain', 'sha256-v1', 'rabs.toolchain.v1', ?2)",
+                    params![action, [1_u8; 32].as_slice()],
+                )
+                .unwrap();
+        }
+        let path = directory.path().join("meta.sqlite");
+        let before = with_snapshot(&path, |transaction, version| {
+            // A real schema read has already pinned the public opener's
+            // snapshot. Read one action, commit both changes through another
+            // WAL connection, then exercise the same paired reader used by the
+            // public API. No section may borrow the committed newer rows.
+            let first = inspect_snapshot(transaction, key(), version)?;
+            writer.execute_batch("BEGIN IMMEDIATE")?;
+            writer.execute("UPDATE action_key_headers SET key_epoch = 9", [])?;
+            writer.execute(
+                "UPDATE key_breakdowns SET bytes = ?1",
+                [[9_u8; 32].as_slice()],
+            )?;
+            writer.execute_batch("COMMIT")?;
+            let pair = inspect_pair_snapshot(transaction, key(), second.clone(), version)?;
+            assert_eq!(first, pair.0);
+            Ok(pair)
+        })
+        .unwrap();
+        for action in [&before.0, &before.1] {
+            assert_eq!(action.breakdown_header.as_ref().unwrap().key_epoch, 1);
+            assert_eq!(action.breakdown.items[0].digest_hex, "01".repeat(32));
+        }
+        let after = inspect_action_pair(&path, &key(), &second).unwrap();
+        for action in [&after.0, &after.1] {
+            assert_eq!(action.breakdown_header.as_ref().unwrap().key_epoch, 9);
+            assert_eq!(action.breakdown.items[0].digest_hex, "09".repeat(32));
+        }
     }
 }
