@@ -155,6 +155,37 @@ pub struct SourceReceiver {
     sealed: bool,
 }
 
+/// An independent, fully hashed copy of one completed manifest member. This
+/// carries byte identity only: it is not a sealed source tree or an execution
+/// capability. Only a receiver can construct it after checking its retained
+/// directory and the exact file generation around the copy.
+#[derive(Debug)]
+pub struct VerifiedSourceFile {
+    file: File,
+    expected: SourceFile,
+}
+
+impl VerifiedSourceFile {
+    #[must_use]
+    pub fn expected(&self) -> &SourceFile {
+        &self.expected
+    }
+
+    #[must_use]
+    pub fn into_file(self) -> File {
+        self.file
+    }
+}
+
+/// Invalid source bytes revoke this receiver; an unavailable optional byte
+/// cache does not. Cancellation is reported separately by the caller's fixed
+/// deadline/cancellation check and follows the destination-error branch here.
+#[derive(Debug)]
+pub enum SourceCheckpointError {
+    Source(io::Error),
+    Destination(io::Error),
+}
+
 #[cfg(unix)]
 fn private_directory(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -555,6 +586,105 @@ impl SourceReceiver {
         result
     }
 
+    /// Copy one completed file into an exclusively created, empty private file.
+    /// Reconnecting sessions may reuse these bytes before the whole manifest is
+    /// complete, but must still build a fresh receiver and obtain its final seal.
+    ///
+    /// The supplied destination is checked before any write; it is never
+    /// truncated, linked to a source inode, or used as source authority. Reads
+    /// are anchored to the retained root, bounded by the manifest, and rehashed
+    /// from disk. An input failure poisons this receiver. Destination failure
+    /// and cancellation leave execution-source verification to the final seal.
+    pub fn checkpoint_file(
+        &mut self,
+        path: &str,
+        mut destination: File,
+        stopped: impl Fn() -> bool,
+    ) -> Result<VerifiedSourceFile, SourceCheckpointError> {
+        use SourceCheckpointError::{Destination, Source};
+
+        if self.poisoned {
+            return Err(Source(invalid("source staging is poisoned")));
+        }
+        let pending = self
+            .files
+            .get(path)
+            .ok_or_else(|| Source(invalid("undeclared source checkpoint member")))?;
+        if pending.received != pending.expected.len {
+            return Err(Source(invalid("source checkpoint member is incomplete")));
+        }
+        let expected = pending.expected.clone();
+        checkpoint(&stopped).map_err(Destination)?;
+        let target = destination.metadata().map_err(Destination)?;
+        ordinary_file(&target, 0).map_err(Destination)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if target.permissions().mode() & 0o077 != 0 || target.permissions().readonly() {
+                return Err(Destination(invalid(
+                    "source checkpoint destination must be a private writable file",
+                )));
+            }
+        }
+        if destination.stream_position().map_err(Destination)? != 0 {
+            return Err(Destination(invalid(
+                "source checkpoint destination must start at offset zero",
+            )));
+        }
+        let result = (|| {
+            if <[u8; 32]>::from(pending.hash.clone().finalize()) != expected.sha256 {
+                return Err(Source(invalid("source checkpoint transcript changed")));
+            }
+            let mut input = open_source(&self.root, &self.root_directory, path, FileAccess::Read)
+                .map_err(Source)?;
+            let before = input.metadata().map_err(Source)?;
+            ordinary_file(&before, expected.len).map_err(Source)?;
+            if same_identity(&before, &target) {
+                return Err(Destination(invalid(
+                    "source checkpoint destination aliases its input",
+                )));
+            }
+            let mut hash = Sha256::new();
+            let mut buffer = [0_u8; MAX_SOURCE_CHUNK];
+            let mut remaining = expected.len;
+            while remaining != 0 {
+                checkpoint(&stopped).map_err(Destination)?;
+                let count = remaining.min(buffer.len() as u64) as usize;
+                input.read_exact(&mut buffer[..count]).map_err(Source)?;
+                hash.update(&buffer[..count]);
+                destination
+                    .write_all(&buffer[..count])
+                    .map_err(Destination)?;
+                remaining -= count as u64;
+            }
+            checkpoint(&stopped).map_err(Destination)?;
+            if input.read(&mut buffer[..1]).map_err(Source)? != 0
+                || !same_state(&before, &input.metadata().map_err(Source)?)
+                || <[u8; 32]>::from(hash.finalize()) != expected.sha256
+            {
+                return Err(Source(invalid(
+                    "completed source changed during checkpoint",
+                )));
+            }
+            let named = open_source(&self.root, &self.root_directory, path, FileAccess::Read)
+                .map_err(Source)?;
+            if !same_state(&before, &named.metadata().map_err(Source)?) {
+                return Err(Source(invalid("completed source generation was replaced")));
+            }
+            ordinary_file(&destination.metadata().map_err(Destination)?, expected.len)
+                .map_err(Destination)?;
+            checkpoint(&stopped).map_err(Destination)?;
+            Ok(VerifiedSourceFile {
+                file: destination,
+                expected,
+            })
+        })();
+        if matches!(&result, Err(Source(_))) {
+            self.poisoned = true;
+        }
+        result
+    }
+
     /// Import one complete, previously untouched manifest member from an owned
     /// regular file. Local byte reuse needs no transport chunk hashes. Both the
     /// ordinary copy and an optional independent CoW clone verify the complete
@@ -884,6 +1014,213 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
         dir
+    }
+
+    fn checkpoint_destination(path: &Path) -> File {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap()
+    }
+
+    #[test]
+    fn completed_file_checkpoint_has_independent_bytes_without_a_source_tree_seal() {
+        use std::os::unix::fs::MetadataExt;
+        let owner = private();
+        let root = owner.path().join("source");
+        let a = entry("a", b"finished\0\xff");
+        let b = entry("b", b"partial");
+        let mut receiver =
+            SourceReceiver::create(&root, SourceManifest::new(vec![a.clone(), b]).unwrap())
+                .unwrap();
+        receiver
+            .write_chunk("a", 0, b"finished\0\xff", a.sha256)
+            .unwrap();
+        receiver
+            .write_chunk("b", 0, b"part", Sha256::digest(b"part").into())
+            .unwrap();
+        let snapshot = receiver
+            .checkpoint_file(
+                "a",
+                checkpoint_destination(&owner.path().join("checkpoint-a")),
+                || false,
+            )
+            .unwrap();
+        assert_eq!(snapshot.expected(), &a);
+        assert_ne!(
+            snapshot.file.metadata().unwrap().ino(),
+            fs::metadata(root.join("a")).unwrap().ino()
+        );
+        assert_eq!(
+            fs::read(owner.path().join("checkpoint-a")).unwrap(),
+            b"finished\0\xff"
+        );
+        assert!(receiver.sealed_root().is_none());
+        assert!(receiver.seal().is_err());
+        assert!(matches!(
+            receiver.checkpoint_file(
+                "b",
+                checkpoint_destination(&owner.path().join("checkpoint-b")),
+                || false,
+            ),
+            Err(SourceCheckpointError::Source(_))
+        ));
+        // An invalid API precondition did not change the still-valid receiver.
+        receiver
+            .write_chunk("b", 4, b"ial", Sha256::digest(b"ial").into())
+            .unwrap();
+        receiver.seal().unwrap();
+    }
+
+    #[test]
+    fn checkpoint_destination_failures_preserve_source_and_existing_destination_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+        let owner = private();
+        let root = owner.path().join("source");
+        let expected = entry("file", b"good");
+        let mut receiver =
+            SourceReceiver::create(&root, SourceManifest::new(vec![expected.clone()]).unwrap())
+                .unwrap();
+        receiver
+            .write_chunk("file", 0, b"good", expected.sha256)
+            .unwrap();
+        let existing = owner.path().join("existing");
+        let mut file = checkpoint_destination(&existing);
+        file.write_all(b"preserve").unwrap();
+        assert!(matches!(
+            receiver.checkpoint_file("file", file, || false),
+            Err(SourceCheckpointError::Destination(_))
+        ));
+        assert_eq!(fs::read(&existing).unwrap(), b"preserve");
+        let public = owner.path().join("public");
+        let file = checkpoint_destination(&public);
+        file.set_permissions(fs::Permissions::from_mode(0o644))
+            .unwrap();
+        assert!(matches!(
+            receiver.checkpoint_file("file", file, || false),
+            Err(SourceCheckpointError::Destination(_))
+        ));
+        assert_eq!(fs::metadata(&public).unwrap().len(), 0);
+        let readonly = owner.path().join("read-only-descriptor");
+        drop(checkpoint_destination(&readonly));
+        assert!(matches!(
+            receiver.checkpoint_file("file", File::open(readonly).unwrap(), || false),
+            Err(SourceCheckpointError::Destination(_))
+        ));
+        receiver.seal().unwrap();
+        assert_eq!(fs::read(root.join("file")).unwrap(), b"good");
+    }
+
+    #[test]
+    fn checkpoint_rejects_even_an_empty_destination_that_is_the_source_inode() {
+        let owner = private();
+        let root = owner.path().join("source");
+        let mut receiver = SourceReceiver::create(
+            &root,
+            SourceManifest::new(vec![entry("empty", b"")]).unwrap(),
+        )
+        .unwrap();
+        let alias = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.join("empty"))
+            .unwrap();
+        assert!(matches!(
+            receiver.checkpoint_file("empty", alias, || false),
+            Err(SourceCheckpointError::Destination(_))
+        ));
+        receiver.seal().unwrap();
+    }
+
+    #[test]
+    fn checkpoint_rehash_and_generation_check_poison_changed_source_members() {
+        use std::cell::Cell;
+        for replacement in [false, true] {
+            let owner = private();
+            let root = owner.path().join("source");
+            let bytes = vec![0x7b; MAX_SOURCE_CHUNK * 2 + 7];
+            let expected = entry("file", &bytes);
+            let mut receiver =
+                SourceReceiver::create(&root, SourceManifest::new(vec![expected]).unwrap())
+                    .unwrap();
+            for (index, chunk) in bytes.chunks(MAX_SOURCE_CHUNK).enumerate() {
+                receiver
+                    .write_chunk(
+                        "file",
+                        (index * MAX_SOURCE_CHUNK) as u64,
+                        chunk,
+                        Sha256::digest(chunk).into(),
+                    )
+                    .unwrap();
+            }
+            let checks = Cell::new(0);
+            let result = receiver.checkpoint_file(
+                "file",
+                checkpoint_destination(&owner.path().join("snapshot")),
+                || {
+                    checks.set(checks.get() + 1);
+                    if checks.get() == 3 {
+                        if replacement {
+                            fs::rename(root.join("file"), root.join("old-generation")).unwrap();
+                            fs::write(root.join("file"), &bytes).unwrap();
+                        } else {
+                            fs::write(root.join("file"), &bytes).unwrap();
+                            File::open(root.join("file"))
+                                .unwrap()
+                                .set_modified(std::time::SystemTime::UNIX_EPOCH)
+                                .unwrap();
+                        }
+                    }
+                    false
+                },
+            );
+            assert!(matches!(result, Err(SourceCheckpointError::Source(_))));
+            assert!(receiver.sealed_root().is_none());
+            assert!(receiver.seal().is_err());
+            assert!(receiver.poisoned);
+        }
+    }
+
+    #[test]
+    fn checkpoint_cancellation_stops_after_a_bounded_copy_without_returning_a_witness() {
+        use std::cell::Cell;
+        let owner = private();
+        let root = owner.path().join("source");
+        let bytes = vec![0x23; MAX_SOURCE_CHUNK * 3];
+        let mut receiver = SourceReceiver::create(
+            &root,
+            SourceManifest::new(vec![entry("file", &bytes)]).unwrap(),
+        )
+        .unwrap();
+        for (index, chunk) in bytes.chunks(MAX_SOURCE_CHUNK).enumerate() {
+            receiver
+                .write_chunk(
+                    "file",
+                    (index * MAX_SOURCE_CHUNK) as u64,
+                    chunk,
+                    Sha256::digest(chunk).into(),
+                )
+                .unwrap();
+        }
+        let checks = Cell::new(0);
+        let snapshot = owner.path().join("snapshot");
+        assert!(matches!(
+            receiver.checkpoint_file("file", checkpoint_destination(&snapshot), || {
+                checks.set(checks.get() + 1);
+                checks.get() == 3
+            }),
+            Err(SourceCheckpointError::Destination(error)) if error.kind() == io::ErrorKind::Interrupted
+        ));
+        assert_eq!(
+            fs::metadata(snapshot).unwrap().len(),
+            MAX_SOURCE_CHUNK as u64
+        );
+        assert!(receiver.sealed_root().is_none());
+        receiver.seal().unwrap();
     }
 
     #[test]

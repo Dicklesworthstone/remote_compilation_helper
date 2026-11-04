@@ -189,12 +189,20 @@ impl ArtifactPlan {
 pub struct PreparedArtifacts {
     plan: ArtifactPlan,
     directory: tempfile::TempDir,
+    snapshot_directory: tempfile::TempDir,
 }
 
 impl PreparedArtifacts {
     /// Prepare fresh backing and declared parent directories. A later attempt
     /// cannot observe stale output files from an earlier successful compile.
     pub fn new(plan: ArtifactPlan) -> io::Result<Self> {
+        Self::new_in(plan, &std::env::temp_dir())
+    }
+
+    /// Prepare on an existing worker-owned storage root. Both compiler backing
+    /// and its eventual immutable snapshots stay on this selected storage; an
+    /// unavailable root is an error, never permission to use ambient TMPDIR.
+    pub fn new_in(plan: ArtifactPlan, parent: &Path) -> io::Result<Self> {
         let mut builder = tempfile::Builder::new();
         builder.prefix("rabs-artifacts-");
         #[cfg(unix)]
@@ -202,15 +210,35 @@ impl PreparedArtifacts {
             use std::os::unix::fs::PermissionsExt;
             builder.permissions(fs::Permissions::from_mode(0o700));
         }
-        let directory = builder.tempdir()?;
+        let directory = builder.tempdir_in(parent)?;
         Self::with_directory(plan, directory)
     }
 
     fn with_directory(plan: ArtifactPlan, directory: tempfile::TempDir) -> io::Result<Self> {
+        // Keep capture scratch outside the inventoried compiler output. Even a
+        // temporary create/unlink inside that tree can change a retained directory
+        // generation on filesystems without anonymous-file creation support.
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("rabs-artifact-snapshots-");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(fs::Permissions::from_mode(0o700));
+        }
+        let snapshot_directory = builder.tempdir_in(
+            directory
+                .path()
+                .parent()
+                .ok_or_else(|| invalid("artifact backing has no storage parent"))?,
+        )?;
         for relative in &plan.directories {
             fs::create_dir_all(directory.path().join(relative))?;
         }
-        Ok(Self { plan, directory })
+        Ok(Self {
+            plan,
+            directory,
+            snapshot_directory,
+        })
     }
 
     /// Stable physical fixture paths model canonical mount destinations without
@@ -447,12 +475,13 @@ impl PreparedArtifacts {
             };
             #[cfg(not(unix))]
             let executable = false;
-            let bytes = CapturedStream::from_reader(
+            let bytes = CapturedStream::from_reader_in(
                 CaptureReader {
                     file,
                     stopped: &stopped,
                 },
                 metadata.len(),
+                self.snapshot_directory.path(),
             )?;
             files.insert(name.clone(), CapturedArtifact { executable, bytes });
         }
@@ -533,12 +562,13 @@ impl PreparedArtifacts {
             // Retain the same inode for the post-read check even though the
             // copying reader owns its descriptor. No original output is linked.
             let witness = file.try_clone()?;
-            let bytes = CapturedStream::from_reader(
+            let bytes = CapturedStream::from_reader_in(
                 CaptureReader {
                     file,
                     stopped: &stopped,
                 },
                 metadata.len(),
+                self.snapshot_directory.path(),
             )?;
             inventory.verify_file(name, &witness)?;
             files.insert(
@@ -1179,6 +1209,57 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn selected_storage_snapshots_do_not_mutate_the_output_inventory() {
+        let root = tempfile::tempdir().unwrap();
+        let bytes: Vec<u8> = (0..MAX_OUTPUT_CHUNK_BYTES + 19)
+            .map(|index| (index % 256) as u8)
+            .collect();
+        for tree in [false, true] {
+            let plan = if tree {
+                ArtifactPlan::new_tree("dep".into(), vec!["nested/a".into()]).unwrap()
+            } else {
+                plan(&["nested/a"])
+            };
+            let prepared = PreparedArtifacts::new_in(plan, root.path()).unwrap();
+            assert_eq!(prepared.backing().parent(), Some(root.path()));
+            assert_eq!(
+                prepared.snapshot_directory.path().parent(),
+                Some(root.path())
+            );
+            assert_ne!(prepared.backing(), prepared.snapshot_directory.path());
+            fs::write(prepared.backing().join("nested/a"), &bytes).unwrap();
+            let mut captured = prepared.capture(|| false).unwrap();
+            // Both private directories are gone; only anonymous readable copies
+            // remain, and the complete tree's generation checks succeeded.
+            assert!(fs::read_dir(root.path()).unwrap().next().is_none());
+            let mut restored = captured
+                .read_chunk("nested/a", 0, MAX_OUTPUT_CHUNK_BYTES)
+                .unwrap();
+            restored.extend(
+                captured
+                    .read_chunk("nested/a", restored.len() as u64, MAX_OUTPUT_CHUNK_BYTES)
+                    .unwrap(),
+            );
+            assert_eq!(restored, bytes);
+            assert_eq!(
+                captured.file_identity("nested/a").unwrap().1,
+                crate::session::sha256_hex(&bytes)
+            );
+        }
+    }
+
+    #[test]
+    fn selected_artifact_storage_failure_never_falls_back() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("not-a-directory");
+        fs::write(&file, b"owned").unwrap();
+        for directory in [file, root.path().join("missing")] {
+            assert!(PreparedArtifacts::new_in(plan(&["a"]), &directory).is_err());
+        }
+    }
+
     #[test]
     fn fresh_backing_and_binary_artifacts_are_snapshotted_as_one_exact_set() {
         let plan = plan(&["obj/lib.rlib", "dep.d"]);
@@ -1602,6 +1683,180 @@ mod tests {
         invalid = request;
         invalid["artifacts"]["cargo"] = serde_json::json!("cargo-json-v2");
         assert!(parse_plan(&invalid).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn installed_cargo_doc_capture_keeps_unreported_pages_assets_and_exact_range_bytes() {
+        use rabs_sandbox::cargo_artifacts::CARGO_ARTIFACTS_VERSION;
+        use std::process::Command;
+
+        let cargo =
+            fs::canonicalize(std::env::var_os("CARGO").expect("Cargo test runner")).unwrap();
+        let tools = cargo.parent().unwrap();
+        let rustc = tools.join("rustc");
+        let rustdoc = tools.join("rustdoc");
+        assert!(rustc.is_file() && rustdoc.is_file());
+        let version = Command::new(&rustc).arg("-vV").output().unwrap();
+        assert!(version.status.success());
+        let version = String::from_utf8(version.stdout).unwrap();
+        let host = version
+            .lines()
+            .find_map(|line| line.strip_prefix("host: "))
+            .unwrap();
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        let home = fixture.path().join("home");
+        let cargo_home = fixture.path().join("cargo-home");
+        for directory in [workspace.join("src"), home.clone(), cargo_home.clone()] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname='doc-api'\nversion='0.1.0'\nedition='2024'\n[workspace]\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.join("Cargo.lock"),
+            "version = 4\n[[package]]\nname = 'doc-api'\nversion = '0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.join("src/lib.rs"),
+            "//! Delivered documentation.\n/// Public API.\npub fn visible() {}\n\
+             /// Private API must also be delivered.\nfn hidden_api() {}\n",
+        )
+        .unwrap();
+
+        for target in [None, Some(host)] {
+            let mut request = serde_json::json!({
+                "program":"/__rabs/toolchain/bin/cargo",
+                "args":["doc", "--locked", "--offline", "--no-deps", "--document-private-items",
+                    "--jobs", "1",
+                    "--message-format=json", "--target-dir", "/__rabs/out/cargo"],
+                "command_context":{"env":{"RUSTC":"/__rabs/toolchain/bin/rustc",
+                    "RUSTDOC":"/__rabs/toolchain/bin/rustdoc"}},
+                "artifacts":{"unit":"cargo", "tree":TREE_FILES_VERSION,
+                    "files":[], "cargo":CARGO_ARTIFACTS_VERSION},
+            });
+            if let Some(target) = target {
+                request["args"]
+                    .as_array_mut()
+                    .unwrap()
+                    .extend([serde_json::json!("--target"), serde_json::json!(target)]);
+            }
+            let prepared = PreparedArtifacts::new(parse_plan(&request).unwrap().unwrap()).unwrap();
+            let doc = target.map_or_else(|| "doc".to_owned(), |host| format!("{host}/doc"));
+            for warm in [false, true] {
+                // Ordinary installed Cargo supplies real bytes and real reports.
+                // This tests capture/delivery, not namespace or process ownership.
+                let mut command = Command::new(&cargo);
+                command
+                    .env_clear()
+                    .env("HOME", &home)
+                    .env("CARGO_HOME", &cargo_home)
+                    .env("CARGO_INCREMENTAL", "0")
+                    .env("RUSTC", &rustc)
+                    .env("RUSTDOC", &rustdoc)
+                    .env(
+                        "PATH",
+                        std::env::join_paths([tools, Path::new("/usr/bin"), Path::new("/bin")])
+                            .unwrap(),
+                    )
+                    .current_dir(&workspace)
+                    .args([
+                        "doc",
+                        "--locked",
+                        "--offline",
+                        "--no-deps",
+                        "--document-private-items",
+                        "--jobs",
+                        "1",
+                        "--message-format=json",
+                        "--target-dir",
+                    ])
+                    .arg(prepared.backing());
+                if let Some(target) = target {
+                    command.args(["--target", target]);
+                }
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let report = CargoArtifactReport::read(
+                    output.stdout.as_slice(),
+                    prepared.backing().to_str().unwrap(),
+                    CargoArtifactMode::Compilation,
+                )
+                .unwrap();
+                let index = format!("{doc}/doc_api/index.html");
+                let private = format!("{doc}/doc_api/fn.hidden_api.html");
+                let source = format!("{doc}/src/doc_api/lib.rs.html");
+                assert!(report.files().any(|file| file == index));
+                assert!(!report.files().any(|file| file == private));
+                if warm {
+                    assert!(output.stdout.split(|byte| *byte == b'\n').any(|line| {
+                        serde_json::from_slice::<serde_json::Value>(line).is_ok_and(|value| {
+                            value["reason"] == "compiler-artifact" && value["fresh"] == true
+                        })
+                    }));
+                }
+                let mut captured = prepared
+                    .capture_fixture_cargo_output(output.stdout.as_slice(), || false)
+                    .unwrap();
+                let mut expected = BTreeMap::new();
+                let mut pending = vec![prepared.backing().to_owned()];
+                while let Some(directory) = pending.pop() {
+                    for entry in fs::read_dir(directory).unwrap() {
+                        let entry = entry.unwrap();
+                        if entry.file_type().unwrap().is_dir() {
+                            pending.push(entry.path());
+                        } else {
+                            assert!(entry.file_type().unwrap().is_file());
+                            let path = entry.path();
+                            let name = path
+                                .strip_prefix(prepared.backing())
+                                .unwrap()
+                                .to_str()
+                                .unwrap();
+                            expected.insert(name.to_owned(), fs::read(&path).unwrap());
+                        }
+                    }
+                }
+                assert_eq!(
+                    captured.file_names().collect::<Vec<_>>(),
+                    expected.keys().map(String::as_str).collect::<Vec<_>>()
+                );
+                for required in [&index, &private, &source] {
+                    assert!(expected.contains_key(required), "{required}");
+                }
+                for extension in [".css", ".js"] {
+                    assert!(expected.keys().any(|name| {
+                        name.starts_with(&format!("{doc}/static.files/"))
+                            && name.ends_with(extension)
+                    }));
+                }
+                assert!(captured.file_names().count() > report.files().count());
+                for (name, bytes) in expected {
+                    assert_eq!(captured.file_identity(&name).unwrap().0, bytes.len() as u64);
+                    for (index, chunk) in bytes.chunks(MAX_OUTPUT_CHUNK_BYTES).enumerate() {
+                        assert_eq!(
+                            captured
+                                .read_chunk(
+                                    &name,
+                                    (index * MAX_OUTPUT_CHUNK_BYTES) as u64,
+                                    chunk.len()
+                                )
+                                .unwrap(),
+                            chunk,
+                            "{name}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]

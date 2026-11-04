@@ -6,6 +6,75 @@ host aliases. This is the S7 tool-distribution path: it does **not** turn the
 host-local dependency cache into fleet-wide canonical execution, start services,
 reconfigure Cargo, or qualify a release to serve cached compiler outputs.
 
+## Produce a complete release archive
+
+After DSR builds the wrapper and daemon profiles, use the same installer to
+produce its exact supported archive format:
+
+```sh
+python3 scripts/install-rabs \
+  --from-build /absolute/target/x86_64-unknown-linux-gnu \
+  --package /absolute/dist/rabs-x86_64-unknown-linux-gnu.tar.gz \
+  --target x86_64-unknown-linux-gnu
+```
+
+The output contains exactly six flat regular files: the five RABS tools and
+`install-rabs`. It does not inherit generic archive additions or nested
+`scripts/` paths. An extracted complete toolset can instead be selected with
+`--from-bundle`. The explicit target must match all four native executables;
+packaging can run on another architecture because it never executes them.
+
+The producer captures stable input bytes, writes a gzip/USTAR archive with
+deterministic metadata (repeatable bytes under the same packaging runtime),
+reads it through the real installer, and checks all six members before
+publishing a new pathname atomically. Existing output files and symlinks are
+refused. Its JSON receipt includes the archive SHA-256, byte count, tool
+identities, and retained private staging directory. Capacity checks allow for
+the input snapshots, archive and verification extraction; stages are retained
+on failure as well as success.
+
+### Require matching compiled source identities
+
+For release production, set `RCH_BUILD_SOURCE` to the same full, clean Git
+commit ID for both DSR build profiles. Then require that identity when packaging
+on the native build host:
+
+```sh
+RABS_SOURCE_COMMIT=$(git rev-parse --verify HEAD)
+python3 scripts/install-rabs \
+  --from-build /absolute/target/x86_64-unknown-linux-gnu \
+  --package /absolute/dist/rabs-x86_64-unknown-linux-gnu.tar.gz \
+  --target x86_64-unknown-linux-gnu \
+  --require-source "$RABS_SOURCE_COMMIT" \
+  --source-repository "$PWD"
+```
+
+This opt-in mode executes each of the four **captured, trusted native binaries**
+with the exact standalone `--rabs-build-info` argument. Reports must identify
+the correct tool, agree on the package version, and contain the requested full
+commit in both the build identity and the primary compiled `RCH_BUILD_SOURCE`
+field. Version-only, shortened, dirty, overlay, mixed, and malformed identities
+are refused; an invalid primary stamp cannot be hidden by a fallback identity
+variable. Each query has a deadline and a combined output bound.
+
+The launcher and bundled installer must also match the exact Git blobs from
+that commit; local Git replacement objects are disabled, and a tree or tag
+object cannot stand in for a commit. The captured files are checked again after
+the probes, and normal archive verification still runs before publication.
+Successful receipts include `source_identity`.
+
+Without `--require-source`, packaging checks bytes and architecture, never
+executes supplied binaries, and reports `source_identity: null`. Native source
+checking is independent of cross-architecture installation and SSH deployment;
+neither installation path gains any executable probe.
+
+Run the normal DSR signing and publication steps on the output. The source
+check detects inconsistent **compiled stamps and shipped bytes** within a
+trusted build chain. It cannot detect a producer deliberately labeling changed
+code with a false commit, authenticate a publisher, prove compiler behavior,
+or qualify fleet readiness. Packaging does not install anything or change
+Cargo configuration.
+
 ## Install a trusted release
 
 Verify the release's publisher signature/checksum **before** selecting its

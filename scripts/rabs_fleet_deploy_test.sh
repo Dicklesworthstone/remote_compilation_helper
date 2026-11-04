@@ -102,6 +102,9 @@ map_roots() {
     for prefix in /etc/rabs-wkr /etc/systemd/system /usr/local/bin /var/lib/rabs-wkr /root/.local/state/rabs; do
         text=${text//"$prefix"/"$RABS_TEST_REMOTE_ROOT$prefix"}
     done
+    # EnvironmentFile is read from the installed unit as data. Map that
+    # indirect open in both command strings and streamed activation scripts.
+    text=${text//'previous_environment=${line#EnvironmentFile=}'/'previous_environment="$RABS_TEST_REMOTE_ROOT${line#EnvironmentFile=}"'}
     printf '%s' "$text"
 }
 mapped_command=$(map_roots "$remote_command")
@@ -110,10 +113,6 @@ mapped_command=$(map_roots "$remote_command")
 if [[ -n ${RABS_TEST_NULL_PATH:-} ]]; then
     mapped_command=${mapped_command//"/dev/null"/"$RABS_TEST_NULL_PATH"}
 fi
-# A managed EnvironmentFile path is read from the unit as data at activation.
-# Translate that indirect open into the same private filesystem namespace as
-# the literal command paths, without rewriting the saved service/environment.
-mapped_command=${mapped_command//'previous_environment=${line#EnvironmentFile=}'/'previous_environment="$RABS_TEST_REMOTE_ROOT${line#EnvironmentFile=}"'}
 # A permissive peer default must not hide missing production chmod/umask.
 umask 022
 if [[ "${RABS_TEST_FAIL_TLS_TRANSFER:-0}" == 1 && "$remote_command" == *cat* \
@@ -315,6 +314,10 @@ run_deploy() {
     snapshot_remote > "$CASE_DIR/attempt-$ATTEMPT.before"
     if env -u BASH_ENV -u ENV -u RABS_WORKER_ID -u RABS_WORKER_STATE_DIR \
         -u RABS_WORKER_TARGET_CACHE_BYTES -u RABS_WORKER_TARGET_CACHE_EPOCH -u RABS_DEPLOY_CAPABILITY \
+        -u RABS_WORKER_SOURCE_CACHE_BYTES -u RABS_SOURCE_CACHE_DIR \
+        -u RABS_WORKER_TOOLCHAIN_CACHE_BYTES -u RABS_WORKER_TOOLCHAIN_CACHE_DIR \
+        -u RABS_WORKER_TOOLCHAIN_FILE_CACHE_BYTES \
+        -u RABS_WORKER_HOST_BUDGET_DIR -u RABS_WORKER_HOST_SLOTS \
         PATH="$CASE_DIR/probe-bin:$FIXTURE_BIN:$PATH" \
         RABS_TEST_CASE="$CASE_DIR" RABS_TEST_REMOTE_ROOT="$CASE_DIR/remote" \
         RABS_TEST_BWRAP=allow RABS_TEST_BWRAP_DENY= RABS_TEST_FAIL_TLS_TRANSFER=0 \
@@ -426,6 +429,53 @@ for cache_epoch in '.image' '../image' 'image/path' 'image with spaces' 'image%h
         "RABS_WORKER_TARGET_CACHE_EPOCH=$cache_epoch"
     assert_local_refusal 'invalid target-cache runtime epoch cannot reach SSH'
 done
+for cache_bytes in '' '-1' '+1' '1.5' '0x100' ' 1' '1 ' '8589934593' '00000000000' $'1\nExecStart=/bin/false'; do
+    run_deploy "invalid-source-limit-$ATTEMPT" failure worker.example coordinator.example:7443 \
+        "RABS_WORKER_SOURCE_CACHE_BYTES=$cache_bytes"
+    assert_local_refusal 'invalid source-cache quota cannot reach SSH'
+done
+for quota in RABS_WORKER_TOOLCHAIN_CACHE_BYTES RABS_WORKER_TOOLCHAIN_FILE_CACHE_BYTES; do
+    for cache_bytes in '' '-1' '+1' '1.5' '0x100' ' 1' '1 ' '68719476737' '18446744073709551616' $'1\nExecStart=/bin/false'; do
+        run_deploy "invalid-sdk-limit-$ATTEMPT" failure worker.example coordinator.example:7443 \
+            "$quota=$cache_bytes"
+        assert_local_refusal "invalid SDK quota cannot reach SSH: $quota"
+    done
+done
+run_deploy sdk-file-padded-limit failure worker.example coordinator.example:7443 \
+    RABS_WORKER_TOOLCHAIN_FILE_CACHE_BYTES=000000000001
+assert_local_refusal 'interrupted SDK file quota matches the worker eleven-digit bound'
+for directory in RABS_SOURCE_CACHE_DIR RABS_WORKER_TOOLCHAIN_CACHE_DIR RABS_WORKER_HOST_BUDGET_DIR; do
+    paired_settings=()
+    case "$directory" in
+        RABS_WORKER_TOOLCHAIN_CACHE_DIR) paired_settings+=(RABS_WORKER_TOOLCHAIN_CACHE_BYTES=1) ;;
+        RABS_WORKER_HOST_BUDGET_DIR) paired_settings+=(RABS_WORKER_HOST_SLOTS=1) ;;
+    esac
+    for cache_path in 'relative/cache' '/' '/var/lib/../cache' '/var/lib/./cache' $'/var/lib/cache\nRABS_WORKER_ID=other' $'/var/lib/cache\tstate' $'/var/lib/cache\377'; do
+        run_deploy "invalid-cache-directory-$ATTEMPT" failure worker.example coordinator.example:7443 \
+            "${paired_settings[@]}" "$directory=$cache_path"
+        assert_local_refusal "invalid cache/admission directory cannot reach SSH: $directory"
+    done
+done
+for slots in '' '0' '01' '+1' '-1' '1.5' '4097' '99999999999999999999' $'1\nExecStart=/bin/false'; do
+    run_deploy "invalid-host-slots-$ATTEMPT" failure worker.example coordinator.example:7443 \
+        RABS_WORKER_HOST_BUDGET_DIR=/var/lib/rabs/host-budget "RABS_WORKER_HOST_SLOTS=$slots"
+    assert_local_refusal 'host capacity must match the worker canonical decimal bound'
+done
+run_deploy sdk-directory-without-quota failure worker.example coordinator.example:7443 \
+    RABS_WORKER_TOOLCHAIN_CACHE_DIR=/var/lib/rabs/sdk
+assert_local_refusal 'persistent SDK cache requires an explicit nonzero quota'
+run_deploy sdk-directory-disabled-quota failure worker.example coordinator.example:7443 \
+    RABS_WORKER_TOOLCHAIN_CACHE_DIR=/var/lib/rabs/sdk RABS_WORKER_TOOLCHAIN_CACHE_BYTES=0
+assert_local_refusal 'zero SDK quota cannot be paired with persistent storage'
+run_deploy host-directory-without-slots failure worker.example coordinator.example:7443 \
+    RABS_WORKER_HOST_BUDGET_DIR=/var/lib/rabs/host-budget
+assert_local_refusal 'host admission directory requires its capacity'
+run_deploy host-slots-without-directory failure worker.example coordinator.example:7443 \
+    RABS_WORKER_HOST_SLOTS=32
+assert_local_refusal 'host capacity requires its admission directory'
+run_deploy host-slots-with-cleared-directory failure worker.example coordinator.example:7443 \
+    RABS_WORKER_HOST_SLOTS=32 RABS_WORKER_HOST_BUDGET_DIR=
+assert_local_refusal 'shared host admission cannot be partially disabled'
 for capability in '' metadata rlib Canonical 'dependency-rlib ' 'canonical;echo injected' $'dependency-rlib\nExecStart=/bin/false'; do
     run_deploy "invalid-capability-$ATTEMPT" failure worker.example coordinator.example:7443 \
         "RABS_DEPLOY_CAPABILITY=$capability"
@@ -610,8 +660,62 @@ assert_installation() {
     LAST_STAGE=$stage
 }
 
+assert_cache_admission_settings() {
+    local environment_file="$CASE_DIR/remote$LAST_STAGE/worker.env"
+    local assignment name observed expected='' count
+    local -a names=(
+        RABS_WORKER_SOURCE_CACHE_BYTES RABS_SOURCE_CACHE_DIR
+        RABS_WORKER_TOOLCHAIN_CACHE_BYTES RABS_WORKER_TOOLCHAIN_CACHE_DIR
+        RABS_WORKER_TOOLCHAIN_FILE_CACHE_BYTES
+        RABS_WORKER_HOST_BUDGET_DIR RABS_WORKER_HOST_SLOTS
+    )
+    observed=$(env -i bash --noprofile --norc -c '
+        . "$1"
+        shift
+        for name do
+            if declare -p "$name" >/dev/null 2>&1; then printf "%s=%s\n" "$name" "${!name}"; fi
+        done
+    ' -- "$environment_file" "${names[@]}") || fail 'cache/admission environment could not be read'
+    for name in "${names[@]}"; do
+        count=0
+        for assignment do
+            if [[ ${assignment%%=*} == "$name" ]]; then
+                expected+="$assignment"$'\n'
+                count=$((count + 1))
+            fi
+        done
+        [[ $count -le 1 ]] || fail 'duplicate expected setting in the test'
+        [[ $(grep -c "^$name=" "$environment_file" || true) == "$count" ]] \
+            || fail "$name was duplicated, dropped or enabled without an explicit selection"
+    done
+    [[ "$observed" == "${expected%$'\n'}" ]] \
+        || fail 'installed service changed the exact cache or shared-host admission settings'
+}
+
+remember_active_service() {
+    OLD_UNIT_HASH=$(sha256sum "$CASE_DIR/remote/etc/systemd/system/rabs-wkr.service")
+    OLD_BINARY_HASH=$(sha256sum "$CASE_DIR/remote/usr/local/bin/rabs-wkr")
+    OLD_ENVIRONMENT_HASH=$(sha256sum "$CASE_DIR/remote$LAST_STAGE/worker.env")
+    OLD_RESTART_COUNT=$(grep -c '^restart rabs-wkr.service$' "$CASE_DIR/systemctl.log")
+}
+
+assert_activation_refusal() {
+    [[ $(sha256sum "$CASE_DIR/remote/etc/systemd/system/rabs-wkr.service") == "$OLD_UNIT_HASH" ]] \
+        || fail "$1 replaced the old service unit"
+    [[ $(sha256sum "$CASE_DIR/remote/usr/local/bin/rabs-wkr") == "$OLD_BINARY_HASH" ]] \
+        || fail "$1 replaced the old binary"
+    [[ $(sha256sum "$CASE_DIR/remote$LAST_STAGE/worker.env") == "$OLD_ENVIRONMENT_HASH" ]] \
+        || fail "$1 changed the active worker environment"
+    [[ $(grep -c '^restart rabs-wkr.service$' "$CASE_DIR/systemctl.log") == "$OLD_RESTART_COUNT" ]] \
+        || fail "$1 restarted the old service"
+    grep -Fq '"step":"unit","status":"failed"' "$CASE_STDOUT" \
+        || fail "$1 did not refuse at configuration/activation"
+    pass "$1"
+}
+
 run_deploy successful success worker.example coordinator.example:7443
 assert_installation client coordinator.example:7443 coordinator.example
+assert_cache_admission_settings
 grep -Fq '"status":"canonical-ok"' "$CASE_STDOUT" \
     || fail 'the default deployment lost its canonical capability requirement'
 FIRST_STAGE=$LAST_STAGE
@@ -727,6 +831,112 @@ pass 'an empty epoch restores process-only retention without losing the byte quo
 run_deploy retained-targets success worker.example coordinator.example:7443 RABS_WORKER_TARGET_CACHE_BYTES=0
 assert_installation client coordinator.example:7443 coordinator.example '' '' 0 ''
 pass 'zero bytes explicitly disables target retention'
+
+SPECIAL_SOURCE='/var/lib/rabs/source with spaces\backslash"quote"$HOME`hostname`'
+SPECIAL_SDK='/var/lib/rabs/sdk with spaces\backslash"quote"$HOME`hostname`'
+SPECIAL_HOST='/var/lib/rabs/host with spaces\backslash"quote"$HOME`hostname`'
+CACHE_ADMISSION_SETTINGS=(
+    RABS_WORKER_SOURCE_CACHE_BYTES=8589934592 "RABS_SOURCE_CACHE_DIR=$SPECIAL_SOURCE"
+    RABS_WORKER_TOOLCHAIN_CACHE_BYTES=68719476736 "RABS_WORKER_TOOLCHAIN_CACHE_DIR=$SPECIAL_SDK"
+    RABS_WORKER_TOOLCHAIN_FILE_CACHE_BYTES=68719476736
+    "RABS_WORKER_HOST_BUDGET_DIR=$SPECIAL_HOST" RABS_WORKER_HOST_SLOTS=4096
+)
+run_deploy retained-cache-admission success worker.example coordinator.example:7443 \
+    "${CACHE_ADMISSION_SETTINGS[@]}"
+assert_installation client coordinator.example:7443 coordinator.example
+assert_cache_admission_settings "${CACHE_ADMISSION_SETTINGS[@]}"
+CACHE_STAGE=$LAST_STAGE
+pass 'SDK/source caches and shared-host admission reach the worker with exact bounds and literal path bytes'
+
+run_deploy retained-cache-admission success worker.example coordinator.example:7443 \
+    "RABS_WORKER_TLS_CERT=$CERT_DIR/split-client.pem" "RABS_WORKER_TLS_KEY=$CERT_DIR/split-client.key"
+assert_installation split-client coordinator.example:7443 coordinator.example
+assert_cache_admission_settings "${CACHE_ADMISSION_SETTINGS[@]}"
+[[ "$LAST_STAGE" != "$CACHE_STAGE" && -f "$CASE_DIR/remote$CACHE_STAGE/worker.env" ]] \
+    || fail 'credential rotation failed to retain the previous configured generation'
+pass 'rotated TLS credentials preserve all source, SDK, interrupted-upload and host-budget settings'
+
+run_deploy retained-cache-admission success worker.example coordinator.example:7443 \
+    RABS_WORKER_TOOLCHAIN_CACHE_BYTES=00001073741824
+assert_installation client coordinator.example:7443 coordinator.example
+CACHE_ADMISSION_SETTINGS[2]=RABS_WORKER_TOOLCHAIN_CACHE_BYTES=00001073741824
+assert_cache_admission_settings "${CACHE_ADMISSION_SETTINGS[@]}"
+pass 'updating the SDK quota preserves its durable directory and all other worker settings'
+
+remember_active_service
+run_deploy retained-cache-admission failure worker.example coordinator.example:7443 \
+    RABS_WORKER_TOOLCHAIN_CACHE_BYTES=0
+assert_activation_refusal 'an inherited persistent SDK directory cannot survive a zero quota unnoticed'
+
+run_deploy retained-cache-admission success worker.example coordinator.example:7443 \
+    RABS_SOURCE_CACHE_DIR= RABS_WORKER_TOOLCHAIN_CACHE_DIR=
+assert_installation client coordinator.example:7443 coordinator.example
+assert_cache_admission_settings RABS_WORKER_SOURCE_CACHE_BYTES=8589934592 \
+    RABS_WORKER_TOOLCHAIN_CACHE_BYTES=00001073741824 RABS_WORKER_TOOLCHAIN_FILE_CACHE_BYTES=68719476736 \
+    "RABS_WORKER_HOST_BUDGET_DIR=$SPECIAL_HOST" RABS_WORKER_HOST_SLOTS=4096
+pass 'empty source/SDK directory overrides restore default source storage and process-only SDK retention'
+
+run_deploy retained-cache-admission success worker.example coordinator.example:7443 \
+    RABS_WORKER_SOURCE_CACHE_BYTES=0 RABS_WORKER_TOOLCHAIN_CACHE_BYTES=0 \
+    RABS_WORKER_TOOLCHAIN_FILE_CACHE_BYTES=0 RABS_WORKER_HOST_BUDGET_DIR= RABS_WORKER_HOST_SLOTS=
+assert_installation client coordinator.example:7443 coordinator.example
+assert_cache_admission_settings RABS_WORKER_SOURCE_CACHE_BYTES=0 \
+    RABS_WORKER_TOOLCHAIN_CACHE_BYTES=0 RABS_WORKER_TOOLCHAIN_FILE_CACHE_BYTES=0
+pass 'explicit zero cache quotas and an empty host pair disable reuse/admission without invalid empty worker settings'
+
+run_deploy retained-cache-admission success worker.example coordinator.example:7443
+assert_installation client coordinator.example:7443 coordinator.example
+assert_cache_admission_settings RABS_WORKER_SOURCE_CACHE_BYTES=0 \
+    RABS_WORKER_TOOLCHAIN_CACHE_BYTES=0 RABS_WORKER_TOOLCHAIN_FILE_CACHE_BYTES=0
+pass 'credential-only redeploy does not re-enable explicitly disabled caches or host admission'
+
+# Simulate operator-added managed settings from an earlier deployed binary.
+# Their values must be read as data, including unescaped shell substitutions
+# that are literal EnvironmentFile bytes but executable if naively sourced.
+run_deploy inherited-operator-settings success worker.example coordinator.example:7443
+assert_installation client coordinator.example:7443 coordinator.example
+INHERITED_SOURCE='/var/lib/rabs/$(touch '"$CASE_DIR/command-ran"')/`touch '"$CASE_DIR/backtick-ran"'`'
+printf '%s\n' 'RABS_WORKER_SOURCE_CACHE_BYTES=1' "RABS_SOURCE_CACHE_DIR=\"$INHERITED_SOURCE\"" \
+    "RABS_WORKER_TOOLCHAIN_CACHE_BYTES='1'" 'RABS_WORKER_TOOLCHAIN_CACHE_DIR=/var/lib/rabs/sdk' \
+    'RABS_WORKER_TOOLCHAIN_FILE_CACHE_BYTES=1' 'RABS_WORKER_HOST_BUDGET_DIR=/var/lib/rabs/host' \
+    'RABS_WORKER_HOST_SLOTS=1' >> "$CASE_DIR/remote$LAST_STAGE/worker.env"
+run_deploy inherited-operator-settings success worker.example coordinator.example:7443
+assert_installation client coordinator.example:7443 coordinator.example
+assert_cache_admission_settings RABS_WORKER_SOURCE_CACHE_BYTES=1 "RABS_SOURCE_CACHE_DIR=$INHERITED_SOURCE" \
+    RABS_WORKER_TOOLCHAIN_CACHE_BYTES=1 RABS_WORKER_TOOLCHAIN_CACHE_DIR=/var/lib/rabs/sdk \
+    RABS_WORKER_TOOLCHAIN_FILE_CACHE_BYTES=1 RABS_WORKER_HOST_BUDGET_DIR=/var/lib/rabs/host RABS_WORKER_HOST_SLOTS=1
+[[ ! -e "$CASE_DIR/command-ran" && ! -e "$CASE_DIR/backtick-ran" ]] \
+    || fail 'retaining a managed setting executed its literal shell substitutions'
+pass 'operator cache settings are retained without executing command substitutions or backticks'
+
+for invalid_settings in \
+    'RABS_WORKER_SOURCE_CACHE_BYTES="8589934593"' \
+    'RABS_WORKER_TOOLCHAIN_CACHE_BYTES="68719476737"' \
+    'RABS_WORKER_TOOLCHAIN_FILE_CACHE_BYTES="68719476737"' \
+    'RABS_SOURCE_CACHE_DIR="relative/cache"' \
+    $'RABS_WORKER_TOOLCHAIN_CACHE_BYTES="1"\nRABS_WORKER_TOOLCHAIN_CACHE_DIR="/var/lib/../sdk"' \
+    'RABS_WORKER_TOOLCHAIN_CACHE_DIR="/var/lib/rabs/sdk"' \
+    $'RABS_WORKER_HOST_BUDGET_DIR="/var/lib/rabs/host"\nRABS_WORKER_HOST_SLOTS="01"' \
+    $'RABS_WORKER_HOST_BUDGET_DIR="/var/lib/rabs/host"\nRABS_WORKER_HOST_SLOTS="4097"' \
+    'RABS_WORKER_HOST_BUDGET_DIR="/var/lib/rabs/host"' \
+    'RABS_WORKER_HOST_SLOTS="32"' \
+    $'RABS_WORKER_SOURCE_CACHE_BYTES="1"\nRABS_WORKER_SOURCE_CACHE_BYTES="2"' \
+    'RABS_SOURCE_CACHE_DIR="/var/lib/cache"; false'; do
+    RETAINED_CASE="invalid-retained-settings-$ATTEMPT"
+    run_deploy "$RETAINED_CASE" success worker.example coordinator.example:7443
+    assert_installation client coordinator.example:7443 coordinator.example
+    printf '%s\n' "$invalid_settings" >> "$CASE_DIR/remote$LAST_STAGE/worker.env"
+    remember_active_service
+    run_deploy "$RETAINED_CASE" failure worker.example coordinator.example:7443
+    assert_activation_refusal 'invalid retained quota, path, pairing or syntax cannot replace the active worker'
+done
+
+run_deploy retained-nul-settings success worker.example coordinator.example:7443
+assert_installation client coordinator.example:7443 coordinator.example
+printf 'RABS_WORKER_SOURCE_CACHE_BYTES="1\0002"\n' >> "$CASE_DIR/remote$LAST_STAGE/worker.env"
+remember_active_service
+run_deploy retained-nul-settings failure worker.example coordinator.example:7443
+assert_activation_refusal 'a NUL-corrupted managed setting cannot be normalized into a different worker quota'
 
 run_deploy selected-identity-only success worker.example coordinator.example:7443 RABS_WORKER_ID=identity-only
 assert_installation client coordinator.example:7443 coordinator.example identity-only

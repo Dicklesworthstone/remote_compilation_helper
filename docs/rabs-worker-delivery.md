@@ -1103,7 +1103,7 @@ resolution, immutable action inputs, or permission to skip compilation.
 
 Prepared TLS builds can deliver their compiler installation along with their
 source. The worker does not need that installation at a matching local path.
-The uploaded tree is verified, independently captured for execution, and mounted
+The uploaded tree is verified, privately retained for execution, and mounted
 at `/__rabs/toolchain`. Its owner remains alive through process cleanup and
 diagnostic capture; verification before launch and after cleanup rejects changes
 to the retained backing before successful artifacts can be offered.
@@ -1143,20 +1143,21 @@ Hard links become independent copies. Absolute, dangling, escaping or cyclic
 symlinks, special files, nested mounts, incoherent reads and limit violations
 refuse. The Linux implementation uses descriptor-relative `openat2` traversal.
 Defaults allow 8 GiB, 100,000 entries and 64 levels of depth. There are no implicit
-exclusions for documentation or other toolchain files: select a complete approved
-runtime tree when a full installation is unnecessarily large. The transfer sends
+exclusions for documentation or other toolchain files: select the complete
+approved compiler installation. The transfer sends
 bounded entry records and chunks rather than loading the complete tree into
 memory. Symlinks are created after file delivery and validated against the
 complete tree. Partial, out-of-order, altered or incomplete input cannot become
 an execution root. Capture and repeated verification read the full selected tree;
 allow disk space for the retained bundle and the worker's staging and private
-execution copies.
+execution storage. A verified owned upload can be adopted without another copy.
 
 To retain toolchains across jobs and worker reconnects, set
 `RABS_WORKER_TOOLCHAIN_CACHE_BYTES` to the worker-local byte budget before
 starting the worker. Absence or zero disables retention; the pool is bounded by
-64 GiB and eight datasets. The first actual execution captures the verified
-toolchain into that pool. A later connection may select `toolchain-reuse-v1`
+64 GiB and eight datasets. A negotiated upload that fits the retention budget is
+retained when its whole-tree seal succeeds, before execution admission. A later
+connection may select `toolchain-reuse-v1`
 when the worker advertises it alongside toolchain transfer. On an exact hit,
 the worker revalidates the retained dataset on its filesystem thread and replies
 to the initial toolchain offer with `sealed:true`; the coordinator sends no
@@ -1172,10 +1173,56 @@ cache entry is retired. Cancellation and the fixed input deadline still apply
 to lookup and acknowledgment. Without explicit reuse negotiation, an unsolicited
 `sealed:true` begin reply is rejected.
 
-This pool is process-local. Worker process restart discards it, while reconnects
-within the same worker process can retain it. Prepared bundles still contain
-their own complete compiler tree and are verified locally before networking;
-cache reuse does not make a missing or corrupted local bundle executable.
+Without `RABS_WORKER_TOOLCHAIN_CACHE_DIR`, this pool is process-local. An optional
+dedicated absolute private cache directory retains completely published datasets
+across worker restarts, with the same byte and entry bounds. Incomplete captures
+remain charged but cannot supply hits, and published trees are not automatically
+evicted. Prepared bundles still contain their own complete compiler tree and are
+verified locally before networking; cache reuse does not make a missing or
+corrupted local bundle executable.
+
+#### Recover completed SDK files after an interrupted upload
+
+To retain progress before an entire SDK has arrived, set
+`RABS_WORKER_TOOLCHAIN_FILE_CACHE_BYTES` on the worker to a decimal byte budget,
+for example `2147483648` for 2 GiB. Absence or zero disables this option. The
+maximum is 64 GiB and 100,000 file objects. The worker stores these objects in
+`toolchain-files-v1/` beneath its configured `RABS_WORKER_STATE_DIR`; use the same
+state directory after restarting. This is a separate budget from source-file
+reuse and `RABS_WORKER_TOOLCHAIN_CACHE_BYTES`. Neither setting implicitly enables
+the other, and their retained disk usage adds together when both are enabled.
+
+The worker advertises `toolchain-file-reuse-v1` only with a configured file
+cache. After authenticated negotiation and a whole-SDK cache miss, the
+coordinator sends the captured regular-file identities in pages of at most
+1,024 files and 256 KiB. These hashes come from the SDK's existing complete byte
+scan. The worker verifies reusable bytes into a private snapshot before reporting
+which files are missing. Exact file counts, byte totals, ordered paths and entry
+metadata must agree before ordinary tree upload can proceed. All namespace
+entries still arrive, including directories, executable modes and symlinks;
+only the payload chunks of verified file hits are omitted.
+
+Each newly completed file that fits the cache is independently copied and
+verified before its final chunk acknowledgment. A connection lost before the SDK
+seal can therefore leave useful completed files for a fresh upload. A changed
+SDK can also reuse identical file contents from an earlier SDK. Partial files
+are uploaded again from offset zero; this capability does not resume byte ranges
+within a file. Cache absence, corruption, writer contention or a full budget can
+produce misses without authorizing different compiler bytes. Loss of optional
+cache storage can discard progress; it cannot supply an unverified hit.
+
+Retained file objects are bounded and reclaimable. During an upload the worker
+also owns a hit snapshot bounded by the smaller of the declared SDK size and
+the configured file-cache budget, plus at most one materialized file for import
+into the independent receiver. Snapshot storage uses a bounded number of file
+descriptors, even for a complete installed SDK with tens of thousands of files.
+Allow disk space for these temporary copies as well as normal SDK staging.
+The cache directory cannot be exposed by a writable execution mount.
+
+File reuse preserves the original upload deadline and cancellation checks.
+Even an upload whose every regular file is a hit must pass the ordinary complete
+dataset seal and execution-time verification. These byte objects do not cache
+build results or establish authority for executing a partial toolchain.
 
 The receiver requires the worker's explicit `toolchain-tree-v1` transfer and
 `toolchain-dataset-v1` verification capabilities before sending input bytes.

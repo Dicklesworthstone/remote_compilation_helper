@@ -41,6 +41,15 @@ use std::sync::Arc;
 
 use control::PreparationControl;
 
+/// The native driver owns fixed compiler controls that public preparation
+/// requests cannot supply. This context is selected by the Rust entry point,
+/// never decoded from a profile or execution request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PreparationContext {
+    RemoteRequest,
+    CanonicalLocal,
+}
+
 enum PreparationToolchain {
     Captured(Arc<PreparedToolchain>),
     Retained(Arc<RetainedToolchain>),
@@ -137,7 +146,7 @@ pub fn prepare_source_bundle(
         specification,
         destination,
         false,
-        false,
+        PreparationContext::RemoteRequest,
         None,
         &PreparationControl::uncontrolled(),
     )
@@ -160,7 +169,7 @@ pub(crate) fn prepare_local_bundle_controlled(
         specification,
         destination,
         false,
-        true,
+        PreparationContext::CanonicalLocal,
         toolchain,
         control,
     )
@@ -193,7 +202,7 @@ pub fn prepare_source_template(
         &probe,
         destination,
         true,
-        false,
+        PreparationContext::RemoteRequest,
         None,
         &PreparationControl::uncontrolled(),
     )
@@ -205,12 +214,17 @@ fn prepare_source_bundle_inner(
     specification: &Value,
     destination: &Path,
     allocation_intent: bool,
-    selected_planning_toolchain: bool,
+    context: PreparationContext,
     retained_toolchain: Option<Arc<RetainedToolchain>>,
     control: &PreparationControl<'_>,
 ) -> io::Result<PreparedLocalBundle> {
     control.checkpoint()?;
-    let inputs = preparation::SourcePreparation::parse(source_root, specification)?;
+    let inputs = preparation::SourcePreparation::parse(source_root, specification, context)?;
+    // Selected graph preparation must query the same captured Cargo/rustc that
+    // execution will receive, including public allocated-template preparation.
+    // The already parsed mode decides this; legacy preparation keeps its order.
+    let selected_planning_toolchain =
+        context == PreparationContext::CanonicalLocal || inputs.requires_selected_toolchain();
     require(
         destination.is_absolute()
             && destination.file_name().is_some()
@@ -293,9 +307,9 @@ fn prepare_source_bundle_inner(
         }
     }
     control.checkpoint()?;
-    // The local canonical bridge must not run an ambient RUSTC/CARGO during
-    // source planning. Capture the selected dataset first and plan through its
-    // retained executable paths. Existing operator preparation keeps its
+    // Canonical local and selected-graph preparation must not run ambient
+    // RUSTC/CARGO. Capture the selected dataset first and plan through its
+    // retained executable paths. Legacy operator preparation keeps its
     // ordinary validate-before-destination behavior.
     let planning_toolchain = if selected_planning_toolchain {
         let source = toolchain_source
@@ -1214,7 +1228,9 @@ impl SourceUpload {
             toolchain.select(hello, &mut grant)?;
         } else {
             require(
-                grant.get("toolchain_transfer").is_none() && grant.get("toolchain_reuse").is_none(),
+                grant.get("toolchain_transfer").is_none()
+                    && grant.get("toolchain_reuse").is_none()
+                    && grant.get("toolchain_file_reuse").is_none(),
                 "toolchain transfer was not authorized by this upload",
             )?;
         }
@@ -1231,10 +1247,12 @@ impl SourceUpload {
         peer: &mut P,
         request: &Value,
         toolchain_reuse_selected: bool,
+        toolchain_file_reuse_selected: bool,
     ) -> io::Result<()> {
         self.validate_request(request)?;
         require(
-            !toolchain_reuse_selected || self.toolchain.is_some(),
+            !(toolchain_reuse_selected || toolchain_file_reuse_selected)
+                || self.toolchain.is_some(),
             "toolchain reuse requires an authorized toolchain upload",
         )?;
         let id = request["request_id"]
@@ -1330,7 +1348,12 @@ impl SourceUpload {
             "worker did not seal the complete source projection",
         )?;
         if let Some(toolchain) = &self.toolchain {
-            toolchain.transmit(peer, request, toolchain_reuse_selected)?;
+            toolchain.transmit(
+                peer,
+                request,
+                toolchain_reuse_selected,
+                toolchain_file_reuse_selected,
+            )?;
         }
         Ok(())
     }
@@ -1390,7 +1413,7 @@ impl<P: WorkerPeer + ?Sized> WorkerPeer for SourcePeer<'_, P> {
         self.attempted = true;
         let grant = self.upload.grant(hello, grant)?;
         self.inner.negotiate(hello, &grant)?;
-        self.upload.transmit(self.inner, self.request, false)
+        self.upload.transmit(self.inner, self.request, false, false)
     }
 }
 
@@ -1532,7 +1555,7 @@ mod tests {
             archive.clone(),
         );
         peer.missing = Some(json!(["dependencies/0000/libdirect.rmeta"]));
-        upload.transmit(&mut peer, &request, false).unwrap();
+        upload.transmit(&mut peer, &request, false, false).unwrap();
         let received = peer.receiver.as_ref().unwrap().sealed_root().unwrap();
         assert_eq!(
             std::fs::read(received.join("package/src/lib.rs")).unwrap(),
@@ -1627,8 +1650,10 @@ mod tests {
         let cloned = upload.clone();
         let mut first = ReceiverPeer::new();
         let mut second = ReceiverPeer::new();
-        upload.transmit(&mut first, &request, false).unwrap();
-        cloned.transmit(&mut second, &request, false).unwrap();
+        upload.transmit(&mut first, &request, false, false).unwrap();
+        cloned
+            .transmit(&mut second, &request, false, false)
+            .unwrap();
         let first_root = first.receiver.as_ref().unwrap().sealed_root().unwrap();
         let second_root = second.receiver.as_ref().unwrap().sealed_root().unwrap();
         for received in [first_root, second_root] {
@@ -1857,7 +1882,7 @@ mod tests {
             assert!(upload.validate_request(&changed).is_err());
         }
         let mut peer = ReceiverPeer::new();
-        upload.transmit(&mut peer, &request, false).unwrap();
+        upload.transmit(&mut peer, &request, false, false).unwrap();
         let received = peer.receiver.as_ref().unwrap().sealed_root().unwrap();
         assert_eq!(
             fs::read(received.join("native/0000/data.bin")).unwrap(),
@@ -1929,7 +1954,7 @@ mod tests {
             }
         }
         peer.missing = Some(json!(["generated/data.bin"]));
-        upload.transmit(&mut peer, &request, false).unwrap();
+        upload.transmit(&mut peer, &request, false, false).unwrap();
         let received = peer.receiver.as_ref().unwrap().sealed_root().unwrap();
         for file in upload.manifest.files() {
             assert_eq!(
@@ -2054,7 +2079,9 @@ mod tests {
         generated.validate_request(&request).unwrap();
         assert!(plain.validate_request(&request).is_err());
         let mut peer = ReceiverPeer::new();
-        generated.transmit(&mut peer, &request, false).unwrap();
+        generated
+            .transmit(&mut peer, &request, false, false)
+            .unwrap();
         let received = peer.receiver.as_ref().unwrap().sealed_root().unwrap();
         assert!(received.join("package/src/lib.rs").is_file());
         assert!(!received.join("generated").exists());
@@ -2255,7 +2282,7 @@ mod tests {
         let mut peer = ReceiverPeer::new();
         peer.prefilled.insert("src/lib.rs".into(), bytes.clone());
         peer.missing = Some(json!([]));
-        upload.transmit(&mut peer, &request, false).unwrap();
+        upload.transmit(&mut peer, &request, false, false).unwrap();
         assert_eq!(peer.sent.len(), 2);
         assert_eq!(peer.sent[0], upload.begin_frame(&request));
         assert_eq!(peer.sent[0]["allow_cached_files"], true);
@@ -2274,21 +2301,32 @@ mod tests {
 
     #[test]
     fn source_authority_cannot_select_or_start_unretained_toolchain_reuse() {
-        use rabs_sandbox::toolchain_transfer::TOOLCHAIN_REUSE_VERSION;
+        use rabs_sandbox::toolchain_transfer::{
+            TOOLCHAIN_FILE_REUSE_VERSION, TOOLCHAIN_REUSE_VERSION,
+        };
 
         let root = tempfile::tempdir().unwrap();
         let (upload, request, _) = fixture(root.path());
         let hello = json!({"source_transfers":[SOURCE_TRANSFER],
             "toolchain_transfers":[TOOLCHAIN_TRANSFER_VERSION],
-            "toolchain_reuses":[TOOLCHAIN_REUSE_VERSION]});
-        let mut grant = json!({"kind":"session-ok"});
+            "toolchain_reuses":[TOOLCHAIN_REUSE_VERSION],
+            "toolchain_file_reuses":[TOOLCHAIN_FILE_REUSE_VERSION]});
+        let grant = json!({"kind":"session-ok"});
         let selected = upload.grant(&hello, &grant).unwrap();
         assert!(selected.get("toolchain_transfer").is_none());
         assert!(selected.get("toolchain_reuse").is_none());
-        grant["toolchain_reuse"] = json!(TOOLCHAIN_REUSE_VERSION);
-        assert!(upload.grant(&hello, &grant).is_err());
+        assert!(selected.get("toolchain_file_reuse").is_none());
+        for (field, version) in [
+            ("toolchain_reuse", TOOLCHAIN_REUSE_VERSION),
+            ("toolchain_file_reuse", TOOLCHAIN_FILE_REUSE_VERSION),
+        ] {
+            let mut unsolicited = grant.clone();
+            unsolicited[field] = json!(version);
+            assert!(upload.grant(&hello, &unsolicited).is_err());
+        }
         let mut peer = ReceiverPeer::new();
-        assert!(upload.transmit(&mut peer, &request, true).is_err());
+        assert!(upload.transmit(&mut peer, &request, true, false).is_err());
+        assert!(upload.transmit(&mut peer, &request, false, true).is_err());
         assert!(peer.sent.is_empty());
     }
 
@@ -2318,7 +2356,7 @@ mod tests {
         let mut peer = ReceiverPeer::new();
         peer.prefilled.insert("src/lib.rs".into(), bytes.clone());
         peer.missing = Some(json!(["changed.rs"]));
-        upload.transmit(&mut peer, &request, false).unwrap();
+        upload.transmit(&mut peer, &request, false, false).unwrap();
         let chunks: Vec<_> = peer
             .sent
             .iter()
@@ -2351,7 +2389,7 @@ mod tests {
         ] {
             let mut peer = ReceiverPeer::new();
             peer.missing = Some(missing);
-            assert!(upload.transmit(&mut peer, &request, false).is_err());
+            assert!(upload.transmit(&mut peer, &request, false, false).is_err());
             assert_eq!(peer.sent.len(), 1);
             assert_eq!(peer.sent[0]["kind"], "source-begin");
             assert!(peer.receiver.as_ref().unwrap().sealed_root().is_none());
@@ -2505,7 +2543,7 @@ mod tests {
             capture_sealed_source(&[("workspace".into(), source)], false, 2, 200_000).unwrap();
         let upload = SourceUpload::for_request(Arc::new(image), "workspace", &request).unwrap();
         let mut peer = ReceiverPeer::new();
-        upload.transmit(&mut peer, &request, false).unwrap();
+        upload.transmit(&mut peer, &request, false, false).unwrap();
         let received = peer.receiver.as_ref().unwrap().sealed_root().unwrap();
         assert_eq!(fs::read(received.join("src/lib.rs")).unwrap(), bytes);
         assert_eq!(fs::read(received.join("empty")).unwrap(), b"");
@@ -2713,7 +2751,7 @@ mod tests {
         fs::write(base.path().join("app/src/lib.rs"), b"new app").unwrap();
         fs::write(base.path().join("dep/src/lib.rs"), b"new dep").unwrap();
         let mut peer = ReceiverPeer::new();
-        upload.transmit(&mut peer, &request, false).unwrap();
+        upload.transmit(&mut peer, &request, false, false).unwrap();
         let root = peer.receiver.as_ref().unwrap().sealed_root().unwrap();
         assert_eq!(fs::read(root.join("app/src/lib.rs")).unwrap(), b"app");
         assert_eq!(fs::read(root.join("dep/src/lib.rs")).unwrap(), b"dep");
@@ -2750,7 +2788,7 @@ mod tests {
             }
         }
         peer.missing = Some(json!(["dep/src/lib.rs"]));
-        upload.transmit(&mut peer, &request, false).unwrap();
+        upload.transmit(&mut peer, &request, false, false).unwrap();
         let chunks: Vec<_> = peer
             .sent
             .iter()
@@ -2762,7 +2800,11 @@ mod tests {
         assert_eq!(peer.sent.last().unwrap()["kind"], "source-seal");
         let mut foreign = ReceiverPeer::new();
         foreign.missing = Some(json!(["dep/not-selected.private"]));
-        assert!(upload.transmit(&mut foreign, &request, false).is_err());
+        assert!(
+            upload
+                .transmit(&mut foreign, &request, false, false)
+                .is_err()
+        );
         assert_eq!(foreign.sent.len(), 1);
     }
 

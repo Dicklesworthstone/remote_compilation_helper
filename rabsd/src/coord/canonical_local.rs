@@ -75,6 +75,15 @@ const WRAPPER: &str = "/__rabs/home/control/rabs-wrap";
 const SOCKET: &str = "/__rabs/home/control/rustc.sock";
 const MAX_GRAPH_BYTES: u64 = 16 * 1024 * 1024;
 
+#[derive(Debug, Default, Deserialize, Eq, PartialEq)]
+enum SourceSelection {
+    #[default]
+    #[serde(skip)]
+    Complete,
+    #[serde(rename = "cargo-unit-graph-v1")]
+    UnitGraph,
+}
+
 /// All host locations are selected by the operator, not by Cargo or a wrapper
 /// request. State and operation parents must be owned, private directories.
 /// `vendor` is relative to `source_root`; `cargo_home_source` is absolute.
@@ -96,6 +105,10 @@ struct Profile {
     manifest: String,
     vendor: Option<String>,
     cargo_home_source: Option<PathBuf>,
+    /// Resolve external inputs from this command's actual Cargo unit graph.
+    /// An omitted field retains complete locked-graph preparation.
+    #[serde(default)]
+    source_selection: SourceSelection,
     /// An absent check selection retains the library-only default. An explicit
     /// empty selection and builds use Cargo's ordinary default members/targets.
     selection: Option<CompilationSelection>,
@@ -702,6 +715,7 @@ impl Profile {
         }
         self.compilation_args()?;
         self.command_environment()?;
+        self.source_selection_version()?;
         require(
             relative_member(&self.manifest),
             "manifest must be an ordinary relative path",
@@ -911,7 +925,10 @@ impl Profile {
             ("CARGO_TARGET_DIR".into(), TARGET.into()),
             ("RUSTC".into(), RUSTC.into()),
         ];
-        if self.command == CompilationCommand::Test {
+        if matches!(
+            self.command,
+            CompilationCommand::Test | CompilationCommand::Doc
+        ) {
             environment.push(("RUSTDOC".into(), RUSTDOC.into()));
         }
         if self.command == CompilationCommand::Clippy {
@@ -934,6 +951,9 @@ impl Profile {
 
     fn source_specification(&self) -> io::Result<Value> {
         let mut source = json!({"manifest":self.manifest});
+        if let Some(version) = self.source_selection_version()? {
+            source["selection"] = json!(version);
+        }
         if let Some(vendor) = &self.vendor {
             source["vendor"] = json!(vendor);
         }
@@ -949,6 +969,24 @@ impl Profile {
                 "env":environment}
         }))
     }
+
+    fn source_selection_version(&self) -> io::Result<Option<&'static str>> {
+        if self.source_selection == SourceSelection::Complete {
+            return Ok(None);
+        }
+        require(
+            self.vendor.is_none(),
+            "selected Cargo preparation does not support vendor sources",
+        )?;
+        Ok(Some("cargo-unit-graph-v1"))
+    }
+}
+
+#[cfg(test)]
+pub(super) fn source_specification_for_test(profile: Value) -> io::Result<Value> {
+    let profile: Profile = serde_json::from_value(profile)
+        .map_err(|error| invalid(format!("invalid native test profile: {error}")))?;
+    profile.source_specification()
 }
 
 /// Resolve only the graph query's run target. Every probe runs the captured
@@ -1306,6 +1344,16 @@ fn run_operation(
                 "Clippy requires captured ordinary executable bin/cargo-clippy and bin/clippy-driver",
             )?;
         }
+    }
+    if profile.command == CompilationCommand::Doc {
+        let rustdoc = paths
+            .physical(Path::new(RUSTDOC))
+            .map_err(io::Error::other)?;
+        let metadata = fs::symlink_metadata(rustdoc)?;
+        require(
+            metadata.is_file() && metadata.mode() & 0o111 != 0,
+            "documentation requires captured ordinary executable bin/rustdoc",
+        )?;
     }
     preparation.checkpoint()?;
     if let Some(retained) = &retained_toolchain {
@@ -1710,7 +1758,10 @@ fn run_operation(
         // producer while this root waits, copies or hashes its private target.
         paths.verify_completed_producers(&coord, &cancelled)?;
         let delivered = if compiled.status.success()
-            && (profile.command == CompilationCommand::Build || profile.no_run())
+            && (matches!(
+                profile.command,
+                CompilationCommand::Build | CompilationCommand::Doc
+            ) || profile.no_run())
         {
             require(
                 paths
@@ -1854,8 +1905,8 @@ impl TargetReuseContext<'_> {
 
 /// Move, rather than recopy, a fully drained target to a newly allocated private
 /// owner on the same filesystem. There is no caller-selected overwrite target
-/// and no retained copy of source or toolchain inputs. Successful builds and
-/// Test/bench --no-run calls use this; other paths keep temporary target ownership.
+/// and no retained copy of source or toolchain inputs. Successful builds,
+/// documentation and Test/bench --no-run calls use this; other paths keep temporary target ownership.
 fn retain_build_target(parent: &Path, target: &Path) -> io::Result<PathBuf> {
     private_directory(parent)?;
     require(
@@ -2331,6 +2382,99 @@ mod tests {
     }
 
     #[test]
+    fn source_selection_is_typed_and_retains_the_exact_native_execution_request() {
+        let mut profile = application_environment_profile();
+        assert!(
+            profile.source_specification().unwrap()["cargo_source"]
+                .get("selection")
+                .is_none()
+        );
+        profile.source_selection = SourceSelection::UnitGraph;
+        profile.manifest = "member/Cargo.toml".into();
+        profile.cargo_home_source = Some(PathBuf::from("/approved-cargo-home"));
+        profile.jobs = 7;
+        profile
+            .env
+            .insert("APP_INPUT".into(), "literal\nvalue".into());
+        for command in [
+            CompilationCommand::Check,
+            CompilationCommand::Build,
+            CompilationCommand::Test,
+            CompilationCommand::Clippy,
+            CompilationCommand::Doc,
+            CompilationCommand::Run,
+            CompilationCommand::Bench,
+        ] {
+            profile.command = command;
+            let request = profile.source_specification().unwrap();
+            assert_eq!(
+                request["cargo_source"],
+                json!({"manifest":"member/Cargo.toml", "cargo_home_source":"/approved-cargo-home",
+                    "selection":"cargo-unit-graph-v1"})
+            );
+            assert_eq!(request["args"], json!(profile.compilation_args().unwrap()));
+            assert_eq!(
+                request["program"],
+                if command == CompilationCommand::Clippy {
+                    CARGO_CLIPPY
+                } else {
+                    CARGO
+                }
+            );
+            assert_eq!(
+                request["command_context"]["cwd"],
+                "/__rabs/workspace/member"
+            );
+            let expected: BTreeMap<_, _> =
+                profile.command_environment().unwrap().into_iter().collect();
+            assert_eq!(request["command_context"]["env"], json!(expected));
+            assert!(
+                !profile
+                    .compilation_args()
+                    .unwrap()
+                    .iter()
+                    .any(|argument| argument == "--target-dir")
+            );
+        }
+        for selection in [
+            Value::Null,
+            json!(true),
+            json!({}),
+            json!("future"),
+            json!("Complete"),
+        ] {
+            let invalid = json!({
+                "version":PROFILE_VERSION, "source_root":"/source", "toolchain_root":"/toolchain",
+                "state_root":"/state", "operation_root":"/operations", "wrapper":"/bin/rabs-wrap",
+                "source_selection":selection,
+            });
+            assert!(serde_json::from_value::<Profile>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn source_selection_rejects_vendor_before_opening_profile_roots() {
+        let mut profile = application_environment_profile();
+        profile.source_selection = SourceSelection::UnitGraph;
+        profile.vendor = Some("vendor".into());
+        let error = profile.validate().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not support vendor sources")
+        );
+        assert!(profile.source_specification().is_err());
+        profile.command = CompilationCommand::Clippy;
+        let error = profile.validate().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not support vendor sources")
+        );
+        assert!(profile.source_specification().is_err());
+    }
+
+    #[test]
     fn explicit_application_inputs_are_literal_and_identical_in_request_and_namespace() {
         let inputs = BTreeMap::from([
             ("APP_VERSION".into(), "v1 '雪' $(touch never)".into()),
@@ -2344,6 +2488,7 @@ mod tests {
             CompilationCommand::Build,
             CompilationCommand::Test,
             CompilationCommand::Clippy,
+            CompilationCommand::Doc,
             CompilationCommand::Run,
             CompilationCommand::Bench,
         ] {
@@ -2357,7 +2502,7 @@ mod tests {
                 ("CARGO_TARGET_DIR".into(), TARGET.into()),
                 ("RUSTC".into(), RUSTC.into()),
             ]);
-            if command == CompilationCommand::Test {
+            if matches!(command, CompilationCommand::Test | CompilationCommand::Doc) {
                 expected.insert("RUSTDOC".into(), RUSTDOC.into());
             }
             if command == CompilationCommand::Clippy {
@@ -2617,13 +2762,46 @@ mod tests {
                 "1"
             ])
         );
-        for command in ["rustc", "doc"] {
+        for command in ["rustc", "rustdoc"] {
             assert!(serde_json::from_value::<Profile>(json!({
                 "version":PROFILE_VERSION, "command":command,
                 "source_root":"/source", "toolchain_root":"/toolchain",
                 "state_root":"/state", "operation_root":"/operations", "wrapper":"/bin/rabs-wrap"
             })).is_err());
         }
+    }
+
+    #[test]
+    fn documentation_keeps_captured_rustdoc_and_identical_planning_selection() {
+        let mut profile = application_environment_profile();
+        profile.command = CompilationCommand::Doc;
+        profile.selection = Some(
+            serde_json::from_value(json!({
+                "packages":["app"], "lib":true, "no_deps":true,
+                "document_private_items":true, "target":["host-tuple"], "profile":"release"
+            }))
+            .unwrap(),
+        );
+        let arguments = profile.compilation_args().unwrap();
+        assert_eq!(
+            &arguments[..4],
+            ["doc", "--lib", "--no-deps", "--document-private-items"]
+        );
+        assert!(!arguments.iter().any(|argument| argument == "--"));
+        let graph = profile.graph_args(None).unwrap();
+        assert_eq!(&graph[..arguments.len()], arguments.as_slice());
+        assert!(
+            graph
+                .windows(2)
+                .any(|pair| pair == ["-Z", "unstable-options"])
+        );
+        assert!(graph.iter().any(|argument| argument == "--unit-graph"));
+        let request = profile.source_specification().unwrap();
+        assert_eq!(request["program"], CARGO);
+        assert_eq!(request["args"], json!(arguments));
+        assert_eq!(request["command_context"]["env"]["RUSTDOC"], RUSTDOC);
+        assert_eq!(request["command_context"]["env"]["RUSTC"], RUSTC);
+        assert!(!profile.inherits_stdin());
     }
 
     #[test]

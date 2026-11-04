@@ -7,6 +7,93 @@ facets: detection signal, automatic containment, operator commands,
 evidence bundle, recovery path, and a regression-test requirement
 (an incident is not closed until its regression test exists).
 
+**Read recorded action state**
+
+The action lookup used below now reads the daemon's existing metadata directly:
+
+```sh
+rch why action <64-hex-action-key> --cas-root /path/to/rabs-state/cas
+rch --json why action <action-key> --cas-root /path/to/rabs-state/cas
+```
+
+Keys may also use the full `rabs.action-key.sha256.v1:<64-hex>` form. Without
+`--cas-root`, lookup uses `RABS_STATE_DIR/cas`, then
+`~/.cache/rch/rabs-state/cas`. The database must already exist and have the
+supported schema (25 or 26). Inspection opens it read-only and does not initialize or
+migrate it. All report sections come from one snapshot, including live WAL
+data while the coordinator is writing.
+
+| Observation code | Meaning in the inspected tables |
+| --- | --- |
+| `no-recorded-action` | No action-specific record was found; this does not establish a first-ever request. |
+| `no-recorded-publication` | Metadata exists, but no committed result was recorded. |
+| `recorded-serving-blocker` | A publication exists with a recorded restriction, quarantine reference, or unresolved divergence. |
+| `publication-recorded` | A publication exists; this is not a current cache-hit authorization. |
+
+The report preserves the committed descriptor, manifest, result kind, winning
+attempt/generation and recorded worker even when serving is blocked. It shows
+the latest versioned live trust evaluation separately from any legacy trust
+row, plus recorded serving validity, runtime class and quarantine references.
+Each component/quarantine list is bounded and reports truncation. Missing key
+component digests remain explicitly unrecorded; the command does not invent
+miss causes or scheduler-selection explanations.
+
+Newly admitted daemon actions persist all twelve component digests, the key
+and projection epochs, the canonical numeric action class, and their
+descriptor-derived runtime class under the active coordinator authority in
+one transaction. Repeating an identical admission preserves the
+record; conflicting retained evidence refuses admission instead of replacing
+it. Matching historical partial records can be completed on a new admission.
+Requests refused by availability, pressure, capacity or authority checks do
+not add component records. Historical actions that are never admitted again
+may still have no component evidence or key header. Schema 25 has no header
+table and reports `breakdown_header: null`; schema 26 also preserves missing
+historical headers until a matching descriptor is admitted again. Runtime
+serving classes are never substituted for canonical numeric action classes.
+
+`serving_authorization_evaluated` is always `false`: a stored `servable` value
+does not evaluate the coordinator's current authority, clock epoch, requested
+trust tier or class-wide gates. Successful inspection does not repair,
+un-quarantine, run a compiler, or start a service.
+
+**Compare recorded action keys**
+
+To identify which key inputs changed between two explicitly selected actions:
+
+```sh
+rch why miss --prior-key PRIOR --current-key CURRENT --cas-root /path/to/rabs-state/cas
+rch --json why miss --prior-key PRIOR --current-key CURRENT --cas-root /path/to/rabs-state/cas
+```
+
+Both records come from one read-only snapshot. Each needs its recorded key
+header and all twelve component digests. The command recomputes each key using
+the live admission encoder and verifies that it matches the requested identity
+before reporting causes. Reports include stable reason codes and exact changed
+header or digest values in canonical order. Equal identities report `identical`
+with `key_identity_only: true`; current serving permission still requires the
+coordinator.
+
+The JSON envelope's data identifies `comparison_basis: "explicit-key-pair"`,
+`lookup_decision_evaluated: false`, and `serving_authorization_evaluated: false`.
+An explicitly supplied prior key does not establish which candidate a past
+request actually considered. If either historical record lacks a header or
+component, `status` is `incomplete-key-provenance`, `comparison` is `null`, and
+`unavailable` identifies the missing evidence. Corrupt digests, unknown or
+extra components, truncation, and keys that fail recomputation are errors.
+
+The file-input form remains available:
+
+```sh
+rch why miss --prior prior.json --current current.json
+```
+
+Each file is limited to one MiB and must contain a complete, correctly keyed
+breakdown. Component order in JSON may vary; canonical names remain exact and
+unique. Digests require exactly 64 hexadecimal digits, and `final_key.domain`
+must be `rabs.action-key.sha256.v1`. Unknown fields, including an asserted
+alternative digest algorithm, are refused. One file may be `-` for stdin;
+the two input modes cannot be mixed.
+
 ## incorrect-result-divergence
 
 - **Detect:** F022/J016 differential mismatch, or a same-key

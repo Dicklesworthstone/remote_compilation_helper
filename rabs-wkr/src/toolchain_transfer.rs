@@ -5,23 +5,32 @@
 //! identity before durable execution admission. Work stays off the reactor, and
 //! cancellation revokes readiness even when a filesystem operation completes late.
 
-use crate::session::toolchain_pool::{self, ToolchainLease};
+use crate::session::toolchain_pool::{self, ToolchainLease, ToolchainPool};
 use crate::session::{CanonicalExecRequest, parse_toolchain_identity};
 use crate::source_transfer::hex;
 use rabs_sandbox::toolchain_dataset::{PreparedToolchain, ToolchainIdentity, ToolchainLimits};
 use rabs_sandbox::toolchain_transfer::{
-    MAX_TOOLCHAIN_CHUNK, TOOLCHAIN_REUSE_VERSION, TOOLCHAIN_TRANSFER_VERSION,
-    TOOLCHAIN_UPLOAD_BUDGET, ToolchainEntry, ToolchainEntryKind, ToolchainReceiver,
+    MAX_TOOLCHAIN_CHUNK, MAX_TOOLCHAIN_FILE_PAGE_BYTES, MAX_TOOLCHAIN_FILE_PAGE_ENTRIES,
+    MAX_TOOLCHAIN_METADATA_BYTES, TOOLCHAIN_FILE_REUSE_VERSION, TOOLCHAIN_REUSE_VERSION,
+    TOOLCHAIN_TRANSFER_VERSION, TOOLCHAIN_UPLOAD_BUDGET, ToolchainCheckpointError, ToolchainEntry,
+    ToolchainEntryKind, ToolchainFile, ToolchainReceiver,
 };
 use serde_json::{Value, json};
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::task::{Context, Poll, Waker};
 use std::thread::JoinHandle;
 use std::time::Instant;
+
+mod cache;
+pub use cache::{MAX_TOOLCHAIN_FILE_CACHE_BYTES, ToolchainFileCache};
+
+#[cfg(all(test, target_os = "linux"))]
+mod file_reuse_tests;
 
 fn fields(value: &Value, names: &[&str]) -> Result<(), String> {
     if value.as_object().is_some_and(|object| {
@@ -123,10 +132,280 @@ pub fn selected_reuse(
     }
 }
 
+pub fn selected_file_reuse(
+    frame: &str,
+    authenticated: bool,
+    transfer_enabled: bool,
+    configured: bool,
+) -> Result<bool, String> {
+    let value: Value = serde_json::from_str(frame).map_err(|error| error.to_string())?;
+    match value.get("toolchain_file_reuse") {
+        None => Ok(false),
+        Some(selection) if selection.as_str() == Some(TOOLCHAIN_FILE_REUSE_VERSION) => {
+            if !authenticated || !transfer_enabled || !configured {
+                return Err(
+                    "toolchain file reuse requires authenticated transfer and configured cache"
+                        .to_owned(),
+                );
+            }
+            Ok(true)
+        }
+        Some(_) => Err("unsupported toolchain_file_reuse selection".to_owned()),
+    }
+}
+
+struct PlannedFile {
+    expected: ToolchainFile,
+    hit: Option<cache::SnapshotRange>,
+}
+
+/// All hits are independently owned before a missing-file answer is sent.
+/// Pages bound wire and metadata work; ordinary entry/chunk sequencing remains
+/// unchanged after the exact file/byte declaration has been sealed.
+struct FileReuse {
+    files: BTreeMap<String, PlannedFile>,
+    count: u64,
+    bytes: u64,
+    metadata: usize,
+    last_path: Option<String>,
+    current: Option<ToolchainFile>,
+    snapshots: Option<cache::Snapshots>,
+    writer: Option<cache::CacheWriter>,
+    sealed: bool,
+}
+
+impl FileReuse {
+    fn new(
+        cache: ToolchainFileCache,
+        identity: &ToolchainIdentity,
+        stopped: &impl Fn() -> bool,
+    ) -> Self {
+        Self {
+            files: BTreeMap::new(),
+            count: 0,
+            bytes: 0,
+            metadata: 0,
+            last_path: None,
+            current: None,
+            writer: cache.writer(stopped).unwrap_or_else(|error| {
+                eprintln!("rabs-wkr: optional toolchain file checkpoints unavailable: {error}");
+                None
+            }),
+            snapshots: match cache::Snapshots::new(cache, identity.bytes) {
+                Ok(snapshots) => Some(snapshots),
+                Err(error) => {
+                    eprintln!("rabs-wkr: optional toolchain file snapshots unavailable: {error}");
+                    None
+                }
+            },
+            sealed: false,
+        }
+    }
+
+    fn page(
+        &mut self,
+        frame: &Value,
+        identity: &ToolchainIdentity,
+        stopped: &impl Fn() -> bool,
+    ) -> Result<Value, String> {
+        fields(frame, &["kind", "request_id", "sha256", "offset", "files"])?;
+        if self.sealed || frame["offset"].as_u64() != Some(self.count) {
+            return Err("toolchain file manifest offset or phase mismatch".to_owned());
+        }
+        if serde_json::to_vec(frame)
+            .map_err(|error| error.to_string())?
+            .len()
+            > MAX_TOOLCHAIN_FILE_PAGE_BYTES
+        {
+            return Err("toolchain file manifest page exceeds byte bound".to_owned());
+        }
+        let page = frame["files"]
+            .as_array()
+            .ok_or("toolchain file manifest requires files")?;
+        if page.is_empty() || page.len() > MAX_TOOLCHAIN_FILE_PAGE_ENTRIES {
+            return Err("toolchain file manifest page exceeds count bound".to_owned());
+        }
+        let mut missing = Vec::new();
+        for value in page {
+            fields(value, &["path", "bytes", "executable", "sha256"])?;
+            let path = value["path"]
+                .as_str()
+                .ok_or("toolchain manifest file requires path")?;
+            if path.is_empty()
+                || path.len() > 4096
+                || path.contains(['\\', ':'])
+                || path.chars().any(char::is_control)
+                || path.split('/').count() > 64
+                || path
+                    .split('/')
+                    .any(|part| part.len() > 255 || matches!(part, "" | "." | ".."))
+                || self
+                    .last_path
+                    .as_ref()
+                    .is_some_and(|last| last.as_str() >= path)
+            {
+                return Err(
+                    "toolchain manifest files require canonical ordered relative paths".to_owned(),
+                );
+            }
+            let expected = ToolchainFile {
+                path: path.to_owned(),
+                bytes: value["bytes"]
+                    .as_u64()
+                    .ok_or("toolchain manifest file bytes must be unsigned")?,
+                executable: value["executable"]
+                    .as_bool()
+                    .ok_or("toolchain manifest executable must be boolean")?,
+                sha256: digest(&value["sha256"])?,
+            };
+            self.count = self
+                .count
+                .checked_add(1)
+                .filter(|count| *count <= identity.files)
+                .ok_or("toolchain file manifest exceeds declared file count")?;
+            self.bytes = self
+                .bytes
+                .checked_add(expected.bytes)
+                .filter(|bytes| *bytes <= identity.bytes)
+                .ok_or("toolchain file manifest exceeds declared bytes")?;
+            self.metadata = self
+                .metadata
+                .checked_add(256 + 2 * path.len())
+                .filter(|bytes| *bytes <= MAX_TOOLCHAIN_METADATA_BYTES)
+                .ok_or("toolchain file manifest exceeds metadata bound")?;
+            let hit = match &mut self.snapshots {
+                Some(snapshots) => snapshots
+                    .append(&expected, stopped)
+                    .map_err(|error| error.to_string())?,
+                None => None,
+            };
+            if hit.is_some() {
+                if let Some(writer) = &mut self.writer {
+                    writer.protect(&expected.sha256);
+                }
+            } else {
+                missing.push(path.to_owned());
+            }
+            self.last_path = Some(path.to_owned());
+            self.files
+                .insert(path.to_owned(), PlannedFile { expected, hit });
+        }
+        Ok(
+            json!({"kind":"toolchain-file-manifest-accepted", "request_id":frame["request_id"],
+            "sha256":frame["sha256"], "next_offset":self.count, "missing":missing}),
+        )
+    }
+
+    fn seal(
+        &mut self,
+        identity: &ToolchainIdentity,
+        stopped: &impl Fn() -> bool,
+    ) -> Result<(), String> {
+        if self.sealed || self.count != identity.files || self.bytes != identity.bytes {
+            return Err("toolchain file manifest differs from complete SDK declaration".to_owned());
+        }
+        if let Some(snapshots) = &mut self.snapshots {
+            snapshots.seal(stopped).map_err(|error| error.to_string())?;
+        }
+        self.sealed = true;
+        Ok(())
+    }
+
+    fn entry(
+        &mut self,
+        receiver: &mut ToolchainReceiver,
+        entry: ToolchainEntry,
+        stopped: &impl Fn() -> bool,
+    ) -> Result<(), String> {
+        if !self.sealed {
+            return Err("toolchain file manifest must be sealed before entries".to_owned());
+        }
+        self.current = None;
+        let expected = match &entry.kind {
+            ToolchainEntryKind::File { bytes, executable } => {
+                let planned = self
+                    .files
+                    .remove(&entry.path)
+                    .ok_or("toolchain file is absent from negotiated manifest")?;
+                if planned.expected.bytes != *bytes || planned.expected.executable != *executable {
+                    return Err("toolchain file entry differs from negotiated manifest".to_owned());
+                }
+                Some(planned)
+            }
+            _ => {
+                if self.files.contains_key(&entry.path) {
+                    return Err("toolchain entry replaces a negotiated regular file".to_owned());
+                }
+                None
+            }
+        };
+        receiver.entry(entry).map_err(|error| error.to_string())?;
+        if let Some(PlannedFile { expected, hit }) = expected {
+            if let Some(hit) = hit {
+                let mut file = self
+                    .snapshots
+                    .as_mut()
+                    .ok_or("toolchain hit snapshot owner unavailable")?
+                    .materialize(hit, stopped)
+                    .map_err(|error| error.to_string())?;
+                receiver
+                    .import_file(&expected, &mut file, stopped)
+                    .map_err(|error| error.to_string())?;
+            } else if expected.bytes == 0 {
+                self.remember(receiver, &expected, stopped)?;
+            } else {
+                self.current = Some(expected);
+            }
+        }
+        Ok(())
+    }
+
+    fn completed(
+        &mut self,
+        receiver: &mut ToolchainReceiver,
+        path: &str,
+        offset: u64,
+        stopped: &impl Fn() -> bool,
+    ) -> Result<(), String> {
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|file| file.path == path && file.bytes == offset)
+        {
+            let expected = self.current.take().expect("completed file was selected");
+            self.remember(receiver, &expected, stopped)?;
+        }
+        Ok(())
+    }
+
+    fn remember(
+        &mut self,
+        receiver: &mut ToolchainReceiver,
+        expected: &ToolchainFile,
+        stopped: &impl Fn() -> bool,
+    ) -> Result<(), String> {
+        let Some(writer) = &mut self.writer else {
+            return Ok(());
+        };
+        match writer.remember(receiver, expected, stopped) {
+            Ok(()) => Ok(()),
+            Err(ToolchainCheckpointError::Source(error)) => Err(error.to_string()),
+            Err(ToolchainCheckpointError::Destination(error)) => {
+                // The surrounding owner checks its original deadline and
+                // cancellation before sending an ACK, even for optional writes.
+                eprintln!("rabs-wkr: optional toolchain file checkpoint unavailable: {error}");
+                self.writer = None;
+                Ok(())
+            }
+        }
+    }
+}
+
 struct UploadedToolchain {
     // Inventory and receiver descriptors close before the parent is removed.
     prepared: Option<PreparedToolchain>,
     receiver: ToolchainReceiver,
+    file_reuse: Option<FileReuse>,
     _directory: tempfile::TempDir,
 }
 
@@ -147,6 +426,10 @@ impl SealedToolchain {
         &self.prepared
     }
 
+    pub(crate) fn directory(&self) -> &Path {
+        self.directory.path()
+    }
+
     pub(crate) fn into_parts(self) -> (PreparedToolchain, tempfile::TempDir) {
         (self.prepared, self.directory)
     }
@@ -157,11 +440,12 @@ impl UploadedToolchain {
         let Self {
             prepared,
             receiver,
+            file_reuse: _,
             _directory: directory,
         } = self;
         let prepared = prepared.ok_or_else(|| io::Error::other("toolchain is not sealed"))?;
         if prepared.identity() != expected
-            || prepared.root() != std::fs::canonicalize(directory.path())?.join("dataset")
+            || prepared.root() != std::fs::canonicalize(directory.path())?.join("tree")
         {
             return Err(io::Error::other(
                 "sealed toolchain differs from its owned image",
@@ -178,14 +462,20 @@ impl UploadedToolchain {
 
 enum ToolchainBacking {
     Uploaded(Box<UploadedToolchain>),
+    UploadedRetained {
+        lease: ToolchainLease,
+        pool: Weak<ToolchainPool>,
+    },
     Reused(ToolchainLease),
+    Unavailable,
 }
 
 impl ToolchainBacking {
     fn prepared_root(&self) -> Option<&Path> {
         match self {
             Self::Uploaded(upload) => upload.prepared.as_ref().map(PreparedToolchain::root),
-            Self::Reused(lease) => Some(lease.root()),
+            Self::UploadedRetained { lease, .. } | Self::Reused(lease) => Some(lease.root()),
+            Self::Unavailable => None,
         }
     }
 }
@@ -232,6 +522,9 @@ impl ToolchainOwner {
             ToolchainBacking::Uploaded(upload) => {
                 toolchain_pool::adopt(upload.into_sealed(&expected)?, stopped)
             }
+            ToolchainBacking::UploadedRetained { lease, pool } => {
+                toolchain_pool::revalidate_retained_upload(lease, &pool, &expected, stopped)
+            }
             ToolchainBacking::Reused(lease) => {
                 if lease.identity() != &expected {
                     return Err(io::Error::other(
@@ -242,7 +535,47 @@ impl ToolchainOwner {
                 // path verifies it and applies the active pool's failure policy.
                 toolchain_pool::prepare(lease.root(), Some(&expected), stopped)
             }
+            ToolchainBacking::Unavailable => Err(io::Error::other("toolchain upload failed")),
         }
+    }
+
+    /// Retain only a completely sealed receiver under the original input budget.
+    /// The handoff consumes every transfer descriptor before pool publication.
+    /// A later execution still fully verifies the exact lease, adding a separate
+    /// verification boundary rather than treating the seal as execution admission.
+    fn retain_sealed(
+        &mut self,
+        pool: &Arc<ToolchainPool>,
+        cancelled: &AtomicBool,
+    ) -> Result<(), String> {
+        self.check(cancelled)?;
+        self.failed = true;
+        let ToolchainBacking::Uploaded(upload) =
+            std::mem::replace(&mut self.backing, ToolchainBacking::Unavailable)
+        else {
+            return Err("toolchain upload is already retained".to_owned());
+        };
+        let sealed = upload
+            .into_sealed(&self.identity)
+            .map_err(|error| error.to_string())?;
+        let deadline = self.deadline;
+        let lease = pool
+            .adopt(sealed, || {
+                cancelled.load(Ordering::Acquire) || Instant::now() >= deadline
+            })
+            .map_err(|error| error.to_string())?;
+        self.backing = ToolchainBacking::UploadedRetained {
+            lease,
+            // Outstanding inputs retain their own dataset and directory, not
+            // every idle SDK in a supervisor that has already shut down.
+            pool: Arc::downgrade(pool),
+        };
+        self.failed = false;
+        if let Err(error) = self.check(cancelled) {
+            self.failed = true;
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn check(&self, cancelled: &AtomicBool) -> Result<(), String> {
@@ -275,10 +608,30 @@ impl ToolchainOwner {
             return Err("toolchain upload is already sealed".to_owned());
         };
         let UploadedToolchain {
-            prepared, receiver, ..
+            prepared,
+            receiver,
+            file_reuse,
+            ..
         } = &mut **upload;
         let identity = hex(&self.identity.sha256);
+        let deadline = self.deadline;
+        let stopped = || cancelled.load(Ordering::Acquire) || Instant::now() >= deadline;
         let result = (|| match frame["kind"].as_str() {
+            Some("toolchain-file-manifest") => file_reuse
+                .as_mut()
+                .ok_or("toolchain file reuse not negotiated")?
+                .page(frame, &self.identity, &stopped),
+            Some("toolchain-file-manifest-seal") => {
+                fields(frame, &["kind", "request_id", "sha256"])?;
+                file_reuse
+                    .as_mut()
+                    .ok_or("toolchain file reuse not negotiated")?
+                    .seal(&self.identity, &stopped)?;
+                Ok(
+                    json!({"kind":"toolchain-file-manifest-ready", "request_id":self.request_id,
+                    "sha256":identity, "files":self.identity.files, "bytes":self.identity.bytes}),
+                )
+            }
             Some("toolchain-entry") => {
                 fields(frame, &["kind", "request_id", "sha256", "path", "entry"])?;
                 if receiver.entry_count() >= self.entries {
@@ -315,18 +668,23 @@ impl ToolchainOwner {
                     }
                     _ => return Err("unsupported toolchain entry kind".to_owned()),
                 };
-                receiver
-                    .entry(ToolchainEntry {
-                        path: path.to_owned(),
-                        kind,
-                    })
-                    .map_err(|error| error.to_string())?;
+                let entry = ToolchainEntry {
+                    path: path.to_owned(),
+                    kind,
+                };
+                match file_reuse {
+                    Some(reuse) => reuse.entry(receiver, entry, &stopped)?,
+                    None => receiver.entry(entry).map_err(|error| error.to_string())?,
+                }
                 Ok(
                     json!({"kind":"toolchain-entry-accepted", "request_id":self.request_id,
                         "sha256":identity, "path":path}),
                 )
             }
             Some("toolchain-chunk") => {
+                if file_reuse.as_ref().is_some_and(|reuse| !reuse.sealed) {
+                    return Err("toolchain file manifest must be sealed before chunks".to_owned());
+                }
                 fields(
                     frame,
                     &[
@@ -352,6 +710,9 @@ impl ToolchainOwner {
                 receiver
                     .write_chunk(path, offset, &bytes, digest(&frame["chunk_sha256"])?)
                     .map_err(|error| error.to_string())?;
+                if let Some(reuse) = file_reuse {
+                    reuse.completed(receiver, path, next, &stopped)?;
+                }
                 Ok(
                     json!({"kind":"toolchain-chunk-accepted", "request_id":self.request_id,
                         "sha256":identity, "path":path, "next_offset":next}),
@@ -362,11 +723,16 @@ impl ToolchainOwner {
                 if receiver.entry_count() != self.entries {
                     return Err("toolchain entry count differs from declaration".to_owned());
                 }
-                let deadline = self.deadline;
-                let verified = receiver
-                    .seal(|| cancelled.load(Ordering::Acquire) || Instant::now() >= deadline)
-                    .map_err(|error| error.to_string())?;
+                if file_reuse.as_ref().is_some_and(|reuse| {
+                    !reuse.sealed || !reuse.files.is_empty() || reuse.current.is_some()
+                }) {
+                    return Err("toolchain file manifest has unreceived files".to_owned());
+                }
+                let verified = receiver.seal(stopped).map_err(|error| error.to_string())?;
                 *prepared = Some(verified);
+                // Completed byte objects survive; upload-only spools and the
+                // optional writer release before execution takes this SDK.
+                *file_reuse = None;
                 Ok(
                     json!({"kind":"toolchain-ready", "request_id":self.request_id,
                     "sha256":identity, "sealed":true}),
@@ -389,6 +755,7 @@ impl ToolchainOwner {
 struct TransferState {
     owner: Option<ToolchainOwner>,
     reuse: bool,
+    file_cache: Option<ToolchainFileCache>,
     // Test receivers get a real isolated pool, avoiding process-global registry
     // changes or environment mutation while parallel tests own other sessions.
     #[cfg(test)]
@@ -396,6 +763,17 @@ struct TransferState {
 }
 
 impl TransferState {
+    fn retention_pool(
+        &self,
+        identity: &ToolchainIdentity,
+    ) -> io::Result<Option<Arc<ToolchainPool>>> {
+        #[cfg(test)]
+        if let Some(pool) = &self.pool {
+            return Ok(pool.retention_enabled(identity).then(|| Arc::clone(pool)));
+        }
+        toolchain_pool::retention_pool(identity)
+    }
+
     fn lookup(
         &self,
         identity: &ToolchainIdentity,
@@ -470,12 +848,17 @@ impl TransferState {
             }
             let directory = builder.tempdir().map_err(|error| error.to_string())?;
             let receiver =
-                ToolchainReceiver::create(&directory.path().join("dataset"), identity, limits)
+                ToolchainReceiver::create(&directory.path().join("tree"), identity, limits)
                     .map_err(|error| error.to_string())?;
             let owner = ToolchainOwner {
                 backing: ToolchainBacking::Uploaded(Box::new(UploadedToolchain {
                     prepared: None,
                     receiver,
+                    file_reuse: self.file_cache.clone().map(|cache| {
+                        FileReuse::new(cache, &identity, &|| {
+                            cancelled.load(Ordering::Acquire) || Instant::now() >= deadline
+                        })
+                    }),
                     _directory: directory,
                 })),
                 request_id: id,
@@ -495,7 +878,32 @@ impl TransferState {
         if owner.request_id != id || digest(&frame["sha256"])? != owner.identity.sha256 {
             return Err("toolchain transfer identity mismatch".to_owned());
         }
-        owner.handle(frame, cancelled)
+        let reply = owner.handle(frame, cancelled)?;
+        if frame["kind"] != "toolchain-seal" || !self.reuse {
+            return Ok(reply);
+        }
+        let identity = owner.identity;
+        let result = (|| {
+            if let Some(pool) = self
+                .retention_pool(&identity)
+                .map_err(|error| error.to_string())?
+            {
+                self.owner
+                    .as_mut()
+                    .expect("the sealed upload still owns this session")
+                    .retain_sealed(&pool, cancelled)?;
+            }
+            self.owner
+                .as_ref()
+                .expect("the sealed upload still owns this session")
+                .ready(cancelled)
+        })();
+        if result.is_err()
+            && let Some(owner) = &mut self.owner
+        {
+            owner.failed = true;
+        }
+        result
     }
 
     fn prepared_path(
@@ -559,7 +967,7 @@ pub struct ToolchainTransferTask {
 
 impl Default for ToolchainTransferTask {
     fn default() -> Self {
-        Self::with_reuse(false)
+        Self::with_configuration(false, None)
     }
 }
 
@@ -567,10 +975,11 @@ impl ToolchainTransferTask {
     /// Reuse is an explicit session selection; local cache configuration alone
     /// never permits the receiver to skip the sender's full transfer protocol.
     #[must_use]
-    pub fn with_reuse(reuse: bool) -> Self {
+    pub fn with_configuration(reuse: bool, file_cache: Option<ToolchainFileCache>) -> Self {
         Self {
             state: Some(TransferState {
                 reuse,
+                file_cache,
                 ..TransferState::default()
             }),
             shared: Arc::new(Mutex::new(CompletionState::default())),
@@ -595,16 +1004,17 @@ impl ToolchainTransferTask {
         let thread = std::thread::Builder::new()
             .name("rabs-toolchain-io".to_owned())
             .spawn(move || {
-                while let Ok(mut job) = receiver.recv() {
+                while let Ok(job) = receiver.recv() {
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        handle(&mut job.state, &job.frame, &cancelled)
+                        // Drop upload snapshots and writer ownership during an
+                        // unwind before exposing the fatal completion.
+                        let Job { mut state, frame } = job;
+                        let response = handle(&mut state, &frame, &cancelled);
+                        Completed { state, response }
                     }));
                     let fatal = outcome.is_err();
                     let result = match outcome {
-                        Ok(response) => Ok(Completed {
-                            state: job.state,
-                            response,
-                        }),
+                        Ok(completed) => Ok(completed),
                         Err(_) => Err("toolchain filesystem worker panicked".to_owned()),
                     };
                     let wake = {
@@ -659,7 +1069,14 @@ impl ToolchainTransferTask {
         }
         if !matches!(
             frame["kind"].as_str(),
-            Some("toolchain-begin" | "toolchain-entry" | "toolchain-chunk" | "toolchain-seal")
+            Some(
+                "toolchain-begin"
+                    | "toolchain-file-manifest"
+                    | "toolchain-file-manifest-seal"
+                    | "toolchain-entry"
+                    | "toolchain-chunk"
+                    | "toolchain-seal"
+            )
         ) {
             return Err("unknown toolchain operation".to_owned());
         }
@@ -868,6 +1285,37 @@ mod tests {
     }
 
     #[test]
+    fn file_reuse_selection_requires_authentication_transfer_and_configured_capacity() {
+        let ack = json!({"kind":"session-ok", "toolchain_file_reuse":TOOLCHAIN_FILE_REUSE_VERSION})
+            .to_string();
+        assert!(selected_file_reuse(&ack, true, true, true).unwrap());
+        for (authenticated, transfer, configured) in [
+            (false, true, true),
+            (true, false, true),
+            (true, true, false),
+        ] {
+            assert!(selected_file_reuse(&ack, authenticated, transfer, configured).is_err());
+        }
+        assert!(!selected_file_reuse(r#"{"kind":"session-ok"}"#, false, false, false).unwrap());
+        for bad in [
+            Value::Null,
+            json!(false),
+            json!(7),
+            json!("toolchain-file-reuse-v2"),
+        ] {
+            assert!(
+                selected_file_reuse(
+                    &json!({"toolchain_file_reuse":bad}).to_string(),
+                    true,
+                    true,
+                    true
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn selected_requests_require_exact_identity_and_exclude_host_paths() {
         assert_eq!(
             request_identity(&request()).unwrap(),
@@ -981,7 +1429,7 @@ mod tests {
         }
 
         fn task(pool: &Arc<toolchain_pool::ToolchainPool>, reuse: bool) -> ToolchainTransferTask {
-            let mut task = ToolchainTransferTask::with_reuse(reuse);
+            let mut task = ToolchainTransferTask::with_configuration(reuse, None);
             task.state.as_mut().unwrap().pool = Some(Arc::clone(pool));
             task
         }
@@ -1113,18 +1561,47 @@ mod tests {
             pool: &Arc<toolchain_pool::ToolchainPool>,
             request: &Value,
         ) -> (ToolchainOwner, CanonicalExecRequest) {
-            let mut task = task(pool, false);
+            let (mut task, _) = receive_upload(pool, false, request);
+            let root = task.prepared_path(request, true).unwrap().unwrap();
+            let owner = task.take_prepared(request).unwrap().unwrap();
+            drop(task);
+            (owner, execution_request(request, root))
+        }
+
+        fn receive_upload(
+            pool: &Arc<toolchain_pool::ToolchainPool>,
+            reuse: bool,
+            request: &Value,
+        ) -> (ToolchainTransferTask, std::path::PathBuf) {
+            let mut task = task(pool, reuse);
             assert_eq!(
                 exchange(&mut task, &begin(request)).unwrap()["sealed"],
                 false
             );
+            let ToolchainBacking::Uploaded(upload) =
+                &task.state.as_ref().unwrap().owner.as_ref().unwrap().backing
+            else {
+                panic!("cold begin must create an owned receiver");
+            };
+            let uploaded = fs::canonicalize(upload._directory.path())
+                .unwrap()
+                .join("tree");
             for frame in transfer_frames(request) {
-                exchange(&mut task, &frame).unwrap();
+                let reply = exchange(&mut task, &frame).unwrap();
+                if frame["kind"] == "toolchain-seal" {
+                    assert_eq!(
+                        reply,
+                        json!({"kind":"toolchain-ready",
+                        "request_id":request["request_id"],
+                        "sha256":request["toolchain_identity"]["sha256"], "sealed":true})
+                    );
+                }
             }
-            let root = task.prepared_path(request, true).unwrap().unwrap();
-            let owner = task.take_prepared(request).unwrap().unwrap();
-            drop(task);
-            let request = CanonicalExecRequest {
+            (task, uploaded)
+        }
+
+        fn execution_request(request: &Value, root: String) -> CanonicalExecRequest {
+            CanonicalExecRequest {
                 request_id: request["request_id"].as_u64().unwrap(),
                 program: "/__rabs/toolchain/bin/compiler".into(),
                 args: Vec::new(),
@@ -1134,8 +1611,7 @@ mod tests {
                 dependency_context: None,
                 jobserver_grant: None,
                 command_context: Default::default(),
-            };
-            (owner, request)
+            }
         }
 
         fn sealed(owner: ToolchainOwner, request: &CanonicalExecRequest) -> SealedToolchain {
@@ -1150,6 +1626,355 @@ mod tests {
         fn inode(path: &Path) -> (u64, u64) {
             let metadata = fs::symlink_metadata(path).unwrap();
             (metadata.dev(), metadata.ino())
+        }
+
+        #[test]
+        fn negotiated_seal_survives_disconnect_before_execution_without_reupload() {
+            let (_source, pool, mut wire) = fixture(1024, false);
+            let (cold, uploaded) = receive_upload(&pool, true, &wire);
+            let compiler_inode = inode(&uploaded.join("bin/compiler"));
+            assert_eq!(
+                cold.prepared_path(&wire, true).unwrap().unwrap(),
+                uploaded.to_str().unwrap()
+            );
+            let ToolchainBacking::UploadedRetained { lease, .. } =
+                &cold.state.as_ref().unwrap().owner.as_ref().unwrap().backing
+            else {
+                panic!("negotiated seal must retain the completed SDK");
+            };
+            assert_eq!(lease.disposition(), "adopted");
+            // Disconnect before taking an execution owner or submitting any
+            // canonical-exec. The session drop joins its filesystem worker.
+            drop(cold);
+            assert!(uploaded.is_dir());
+            wire["request_id"] = json!(37);
+            let mut warm = task(&pool, true);
+            assert_eq!(
+                exchange(&mut warm, &begin(&wire)).unwrap(),
+                json!({
+                    "kind":"toolchain-ready", "request_id":37,
+                    "sha256":wire["toolchain_identity"]["sha256"], "sealed":true,
+                })
+            );
+            // The fresh request sent only begin: no entry, chunk or seal.
+            assert_eq!(
+                warm.prepared_path(&wire, true).unwrap().unwrap(),
+                uploaded.to_str().unwrap()
+            );
+            assert_eq!(inode(&uploaded.join("bin/compiler")), compiler_inode);
+            assert_eq!(fs::read(uploaded.join("rustc")).unwrap(), CONTENTS);
+            assert!(uploaded.join("empty").is_dir());
+            drop(warm);
+            drop(pool);
+            assert!(!uploaded.exists());
+        }
+
+        #[test]
+        fn negotiated_seal_publishes_durable_input_before_any_execution() {
+            let (_source, initial, mut wire) = fixture(1024, false);
+            drop(initial);
+            let parent = tempfile::tempdir().unwrap();
+            let directory = parent.path().join("durable");
+            let pool = Arc::new(ToolchainPool::with_directory(1024, 2, Some(&directory)).unwrap());
+            let (cold, uploaded) = receive_upload(&pool, true, &wire);
+            let published =
+                std::path::PathBuf::from(cold.prepared_path(&wire, true).unwrap().unwrap());
+            assert_ne!(published, uploaded);
+            assert!(!uploaded.exists());
+            let ToolchainBacking::UploadedRetained { lease, .. } =
+                &cold.state.as_ref().unwrap().owner.as_ref().unwrap().backing
+            else {
+                panic!("the seal must publish a complete durable SDK");
+            };
+            assert_eq!(lease.disposition(), "adopted");
+            let compiler_inode = inode(&published.join("bin/compiler"));
+            drop(cold);
+            drop(pool);
+
+            let reopened =
+                Arc::new(ToolchainPool::with_directory(1024, 2, Some(&directory)).unwrap());
+            wire["request_id"] = json!(73);
+            let mut warm = task(&reopened, true);
+            let reply = exchange(&mut warm, &begin(&wire)).unwrap();
+            assert_eq!(reply["request_id"], 73);
+            assert_eq!(reply["sealed"], true);
+            assert_eq!(
+                Path::new(&warm.prepared_path(&wire, true).unwrap().unwrap()),
+                published
+            );
+            assert_eq!(inode(&published.join("bin/compiler")), compiler_inode);
+            assert_eq!(fs::read(published.join("rustc")).unwrap(), CONTENTS);
+            let owner = warm.take_prepared(&wire).unwrap().unwrap();
+            drop(warm);
+            drop(reopened);
+            assert!(ToolchainPool::with_directory(1024, 2, Some(&directory)).is_err());
+            drop(owner);
+            assert!(published.is_dir());
+            let reopened = ToolchainPool::with_directory(1024, 2, Some(&directory)).unwrap();
+            let identity = request_identity(&wire).unwrap().unwrap();
+            reopened
+                .lookup(&identity, || false)
+                .unwrap()
+                .unwrap()
+                .verify(|| false)
+                .unwrap();
+        }
+
+        #[test]
+        fn seal_retention_requires_negotiation_and_a_sufficient_enabled_budget() {
+            for (reuse, budget) in [(false, 1024), (true, 0), (true, CONTENTS.len() as u64 - 1)] {
+                let (_source, pool, mut wire) = fixture(budget, false);
+                let (cold, uploaded) = receive_upload(&pool, reuse, &wire);
+                assert!(matches!(
+                    cold.state.as_ref().unwrap().owner.as_ref().unwrap().backing,
+                    ToolchainBacking::Uploaded(_)
+                ));
+                drop(cold);
+                assert!(!uploaded.exists());
+                wire["request_id"] = json!(19);
+                let mut fresh = task(&pool, true);
+                assert_eq!(
+                    exchange(&mut fresh, &begin(&wire)).unwrap()["sealed"],
+                    false
+                );
+            }
+        }
+
+        #[test]
+        fn full_pool_keeps_sealed_upload_private_without_recapture_or_busy_eviction() {
+            let (source, pool, wire) = fixture(CONTENTS.len() as u64, false);
+            fs::write(
+                source.path().join("bin/compiler"),
+                vec![b'x'; CONTENTS.len()],
+            )
+            .unwrap();
+            let other = fingerprint_toolchain(source.path(), &ToolchainLimits::default(), || false)
+                .unwrap();
+            let busy = pool.acquire(source.path(), Some(&other), || false).unwrap();
+            let busy_root = busy.root().to_path_buf();
+            let (mut cold, uploaded) = receive_upload(&pool, true, &wire);
+            let compiler_inode = inode(&uploaded.join("bin/compiler"));
+            let root = cold.prepared_path(&wire, true).unwrap().unwrap();
+            let owner = cold.take_prepared(&wire).unwrap().unwrap();
+            drop(cold);
+            let lease = owner
+                .into_lease(&execution_request(&wire, root), || false)
+                .unwrap();
+            assert_eq!(lease.disposition(), "private");
+            assert_eq!(lease.root(), uploaded);
+            assert_eq!(inode(&uploaded.join("bin/compiler")), compiler_inode);
+            assert_eq!(busy.root(), busy_root);
+            busy.verify(|| false).unwrap();
+            assert!(pool.lookup(lease.identity(), || false).unwrap().is_none());
+            drop(lease);
+            assert!(!uploaded.exists());
+            assert!(busy_root.is_dir());
+        }
+
+        #[test]
+        fn seal_time_owner_outlives_its_pool_and_keeps_its_exact_execution_image() {
+            let (_source, pool, wire) = fixture(1024, false);
+            let (mut cold, uploaded) = receive_upload(&pool, true, &wire);
+            let compiler_inode = inode(&uploaded.join("bin/compiler"));
+            let root = cold.prepared_path(&wire, true).unwrap().unwrap();
+            let owner = cold.take_prepared(&wire).unwrap().unwrap();
+            drop(cold);
+            let weak = Arc::downgrade(&pool);
+            drop(pool);
+            assert!(
+                weak.upgrade().is_none(),
+                "an input must not retain every idle SDK"
+            );
+            assert!(uploaded.is_dir());
+            let lease = owner
+                .into_lease(&execution_request(&wire, root), || false)
+                .unwrap();
+            assert_eq!(lease.disposition(), "adopted");
+            assert_eq!(lease.root(), uploaded);
+            assert_eq!(inode(&uploaded.join("bin/compiler")), compiler_inode);
+            lease.verify(|| false).unwrap();
+            drop(lease);
+            assert!(!uploaded.exists());
+        }
+
+        #[test]
+        fn changed_or_restored_seal_time_image_refuses_execution_and_retires_its_slot() {
+            for restored in [false, true] {
+                let (_source, pool, wire) = fixture(1024, false);
+                let (mut cold, uploaded) = receive_upload(&pool, true, &wire);
+                let root = cold.prepared_path(&wire, true).unwrap().unwrap();
+                let owner = cold.take_prepared(&wire).unwrap().unwrap();
+                drop(cold);
+                let compiler = uploaded.join("bin/compiler");
+                let mode = fs::metadata(&compiler).unwrap().permissions();
+                fs::set_permissions(&compiler, fs::Permissions::from_mode(0o700)).unwrap();
+                fs::write(&compiler, vec![b'x'; CONTENTS.len()]).unwrap();
+                if restored {
+                    fs::write(&compiler, CONTENTS).unwrap();
+                    fs::set_permissions(&compiler, mode).unwrap();
+                }
+                assert!(
+                    owner
+                        .into_lease(&execution_request(&wire, root), || false)
+                        .is_err()
+                );
+                let identity = request_identity(&wire).unwrap().unwrap();
+                assert!(pool.lookup(&identity, || false).unwrap().is_none());
+                assert!(!uploaded.exists());
+            }
+        }
+
+        #[test]
+        fn retained_upload_handoff_keeps_request_full_identity_and_root_binding() {
+            for changed in ["request_id", "sha256", "files", "bytes", "missing", "root"] {
+                let (_source, pool, wire) = fixture(1024, false);
+                let (mut cold, uploaded) = receive_upload(&pool, true, &wire);
+                let root = cold.prepared_path(&wire, true).unwrap().unwrap();
+                let owner = cold.take_prepared(&wire).unwrap().unwrap();
+                drop(cold);
+                let mut request = execution_request(&wire, root);
+                match changed {
+                    "request_id" => request.request_id += 1,
+                    "sha256" => request.toolchain_identity.as_mut().unwrap().sha256[0] ^= 1,
+                    "files" => request.toolchain_identity.as_mut().unwrap().files += 1,
+                    "bytes" => request.toolchain_identity.as_mut().unwrap().bytes += 1,
+                    "missing" => request.toolchain_identity = None,
+                    "root" => request.toolchain_backing.push_str("/bin"),
+                    _ => unreachable!(),
+                }
+                assert!(owner.into_lease(&request, || false).is_err(), "{changed}");
+                // A foreign execution cannot consume this owner, but it also
+                // cannot revoke a correctly retained SDK for independent peers.
+                let identity = request_identity(&wire).unwrap().unwrap();
+                pool.lookup(&identity, || false)
+                    .unwrap()
+                    .unwrap()
+                    .verify(|| false)
+                    .unwrap();
+                drop(pool);
+                assert!(!uploaded.exists());
+            }
+        }
+
+        #[test]
+        fn cancellation_after_seal_publication_never_delivers_readiness_to_that_request() {
+            let (_source, pool, mut wire) = fixture(1024, false);
+            let (sealed_tx, sealed_rx) = mpsc::sync_channel(1);
+            let (release_tx, release_rx) = mpsc::sync_channel(1);
+            let mut cold = task(&pool, true);
+            cold.start_worker(move |state, frame, cancelled| {
+                let reply = state.handle(frame, cancelled);
+                if frame["kind"] == "toolchain-seal" {
+                    assert_eq!(reply.as_ref().unwrap()["sealed"], true);
+                    sealed_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                }
+                reply
+            })
+            .unwrap();
+            exchange(&mut cold, &begin(&wire)).unwrap();
+            let mut frames = transfer_frames(&wire);
+            let seal = frames.pop().unwrap();
+            for frame in frames {
+                exchange(&mut cold, &frame).unwrap();
+            }
+            cold.submit_owned(seal, true, false).unwrap();
+            sealed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(
+                cold.cancel(wire["request_id"].as_u64().unwrap()),
+                Some(true)
+            );
+            release_tx.send(()).unwrap();
+            let reply = wait(|cx| cold.poll_completion(cx)).unwrap();
+            assert_eq!(reply.request_id, wire["request_id"].as_u64().unwrap());
+            assert_eq!(reply.response.unwrap_err(), "toolchain upload cancelled");
+            assert!(cold.prepared_path(&wire, true).is_err());
+            assert!(cold.take_prepared(&wire).is_err());
+            drop(cold);
+            // Complete independent input is reusable; cancellation has granted
+            // neither execution nor a successful reply to the old request.
+            wire["request_id"] = json!(42);
+            let mut fresh = task(&pool, true);
+            assert_eq!(exchange(&mut fresh, &begin(&wire)).unwrap()["sealed"], true);
+        }
+
+        #[test]
+        fn cancellation_or_original_deadline_before_seal_cannot_publish_an_upload() {
+            for cancel in [false, true] {
+                let (_source, pool, wire) = fixture(1024, false);
+                let mut cold = task(&pool, true);
+                exchange(&mut cold, &begin(&wire)).unwrap();
+                let mut frames = transfer_frames(&wire);
+                let seal = frames.pop().unwrap();
+                for frame in frames {
+                    exchange(&mut cold, &frame).unwrap();
+                }
+                if cancel {
+                    assert_eq!(
+                        cold.cancel(wire["request_id"].as_u64().unwrap()),
+                        Some(true)
+                    );
+                } else {
+                    cold.state
+                        .as_mut()
+                        .unwrap()
+                        .owner
+                        .as_mut()
+                        .unwrap()
+                        .deadline = Instant::now();
+                }
+                assert!(exchange(&mut cold, &seal).is_err());
+                assert!(cold.take_prepared(&wire).is_err());
+                let identity = request_identity(&wire).unwrap().unwrap();
+                assert!(pool.lookup(&identity, || false).unwrap().is_none());
+            }
+        }
+
+        #[test]
+        fn competing_corrupt_pool_owner_refuses_seal_instead_of_refreshing_from_upload() {
+            for durable in [false, true] {
+                let (source, initial, wire) = fixture(1024, false);
+                let parent = tempfile::tempdir().unwrap();
+                let pool = if durable {
+                    Arc::new(
+                        ToolchainPool::with_directory(
+                            1024,
+                            2,
+                            Some(&parent.path().join("durable")),
+                        )
+                        .unwrap(),
+                    )
+                } else {
+                    initial
+                };
+                let identity = request_identity(&wire).unwrap().unwrap();
+                let mut cold = task(&pool, true);
+                assert_eq!(exchange(&mut cold, &begin(&wire)).unwrap()["sealed"], false);
+                let mut frames = transfer_frames(&wire);
+                let seal = frames.pop().unwrap();
+                for frame in frames {
+                    exchange(&mut cold, &frame).unwrap();
+                }
+                let competing = pool
+                    .acquire(source.path(), Some(&identity), || false)
+                    .unwrap();
+                let compiler = competing.root().join("bin/compiler");
+                fs::set_permissions(&compiler, fs::Permissions::from_mode(0o700)).unwrap();
+                fs::write(&compiler, vec![b'x'; CONTENTS.len()]).unwrap();
+                assert!(exchange(&mut cold, &seal).is_err());
+                assert!(cold.prepared_path(&wire, true).is_err());
+                assert!(cold.take_prepared(&wire).is_err());
+                assert_eq!(
+                    exchange(&mut cold, &begin(&wire)).unwrap_err(),
+                    "toolchain upload failed"
+                );
+                assert!(competing.verify(|| false).is_err());
+                if durable {
+                    assert!(pool.lookup(&identity, || false).is_err());
+                } else {
+                    assert!(pool.lookup(&identity, || false).unwrap().is_none());
+                }
+            }
         }
 
         #[test]
@@ -1491,7 +2316,7 @@ mod tests {
         }
 
         #[test]
-        fn durable_upload_capture_survives_restart_and_reuses_the_published_image() {
+        fn durable_upload_adoption_preserves_all_inodes_and_survives_restart() {
             use std::cell::Cell;
 
             let (_source, initial_pool, wire) = fixture(1024, false);
@@ -1505,6 +2330,15 @@ mod tests {
             let (owner, request) = upload(&pool, &wire);
             let uploaded = Path::new(&request.toolchain_backing).to_path_buf();
             let uploaded_inode = inode(&uploaded.join("bin/compiler"));
+            let container_inode = inode(uploaded.parent().unwrap());
+            let paths = ["", "bin", "bin/compiler", "empty", "rustc"];
+            let inodes = paths.map(|path| inode(&uploaded.join(path)));
+            let check_image = |root: &Path| {
+                for (path, expected) in paths.iter().zip(inodes) {
+                    assert_eq!(inode(&root.join(path)), expected, "{path}");
+                }
+                assert_eq!(fs::read(root.join("rustc")).unwrap(), CONTENTS);
+            };
             let published = cache_root
                 .join("toolchains-v1")
                 .join(format!(
@@ -1515,27 +2349,47 @@ mod tests {
                 ))
                 .join("tree");
             let observed_upload = Cell::new(false);
+            let observed_pending = Cell::new(false);
             let observed_publication = Cell::new(false);
             let lease = pool
                 .adopt(sealed(owner, &request), || {
                     if uploaded.exists() {
+                        check_image(&uploaded);
                         observed_upload.set(true);
-                    } else {
-                        // Acquisition checks again after its producer returns.
-                        // The upload must survive every capture step until the
-                        // stable durable image has been published and reopened.
-                        assert_eq!(fs::read(published.join("rustc")).unwrap(), CONTENTS);
+                    } else if published.exists() {
+                        check_image(&published);
                         observed_publication.set(true);
+                    } else {
+                        // The owned container moves atomically to its charged
+                        // pending name; none of its dataset inodes may change.
+                        let pending = fs::read_dir(cache_root.join("toolchains-v1"))
+                            .unwrap()
+                            .next()
+                            .unwrap()
+                            .unwrap()
+                            .path();
+                        assert!(
+                            pending
+                                .file_name()
+                                .unwrap()
+                                .to_string_lossy()
+                                .starts_with(".pending-")
+                        );
+                        assert_eq!(inode(&pending), container_inode);
+                        check_image(&pending.join("tree"));
+                        observed_pending.set(true);
                     }
                     false
                 })
                 .unwrap();
-            assert!(observed_upload.get() && observed_publication.get());
-            assert_eq!(lease.disposition(), "captured");
+            assert!(observed_upload.get() && observed_pending.get() && observed_publication.get());
+            assert_eq!(lease.disposition(), "adopted");
             assert_eq!(lease.root(), published);
             assert!(!uploaded.exists());
             let published_inode = inode(&published.join("bin/compiler"));
-            assert_ne!(published_inode, uploaded_inode);
+            assert_eq!(published_inode, uploaded_inode);
+            assert_eq!(inode(published.parent().unwrap()), container_inode);
+            assert!(!uploaded.parent().unwrap().exists());
             lease.verify(|| false).unwrap();
 
             // Supervisor shutdown does not release durable ownership while an
@@ -1577,6 +2431,303 @@ mod tests {
             assert!(!redundant.exists());
             assert_eq!(inode(&reused.root().join("bin/compiler")), published_inode);
             reused.verify(|| false).unwrap();
+        }
+
+        #[test]
+        fn cancelled_durable_move_preserves_charged_pending_image_across_restart() {
+            use std::cell::Cell;
+
+            let (_source, initial_pool, wire) = fixture(1024, false);
+            drop(initial_pool);
+            let parent = tempfile::tempdir().unwrap();
+            let cache_root = parent.path().join("durable");
+            let objects = cache_root.join("toolchains-v1");
+            let budget = CONTENTS.len() as u64;
+            let pool = Arc::new(
+                toolchain_pool::ToolchainPool::with_directory(budget, 1, Some(&cache_root))
+                    .unwrap(),
+            );
+            let identity = parse_toolchain_identity(&wire).unwrap().unwrap();
+            let (owner, request) = upload(&pool, &wire);
+            let uploaded = Path::new(&request.toolchain_backing).to_path_buf();
+            let root_inode = inode(&uploaded);
+            let compiler_inode = inode(&uploaded.join("bin/compiler"));
+            let container_inode = inode(uploaded.parent().unwrap());
+            let moved = Cell::new(false);
+            let error = pool
+                .adopt(sealed(owner, &request), || {
+                    let cancelled = !uploaded.exists();
+                    moved.set(moved.get() || cancelled);
+                    cancelled
+                })
+                .err()
+                .unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+            assert!(moved.get());
+            assert!(!uploaded.exists());
+            let entries: Vec<_> = fs::read_dir(&objects)
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(entries.len(), 1);
+            let pending = entries[0].path();
+            assert!(
+                pending
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".pending-")
+            );
+            assert_eq!(inode(&pending), container_inode);
+            assert_eq!(inode(&pending.join("tree")), root_inode);
+            assert_eq!(inode(&pending.join("tree/bin/compiler")), compiler_inode);
+            assert_eq!(fs::read(pending.join("tree/rustc")).unwrap(), CONTENTS);
+            assert!(pool.lookup(&identity, || false).unwrap().is_none());
+            drop(pool);
+            assert!(pending.is_dir());
+
+            // A restart must charge the complete interrupted reservation. It
+            // cannot reuse or erase those bytes to admit a fresh durable entry.
+            let restarted = Arc::new(
+                toolchain_pool::ToolchainPool::with_directory(budget, 1, Some(&cache_root))
+                    .unwrap(),
+            );
+            let (owner, request) = upload(&restarted, &wire);
+            let fresh = Path::new(&request.toolchain_backing).to_path_buf();
+            let lease = restarted.adopt(sealed(owner, &request), || false).unwrap();
+            assert_eq!(lease.disposition(), "adopted");
+            assert_eq!(lease.root(), fresh);
+            assert_ne!(inode(lease.root()), root_inode);
+            lease.verify(|| false).unwrap();
+            assert_eq!(fs::read_dir(&objects).unwrap().count(), 1);
+            assert_eq!(inode(&pending), container_inode);
+            assert_eq!(inode(&pending.join("tree/bin/compiler")), compiler_inode);
+        }
+
+        #[test]
+        fn durable_move_never_replaces_an_existing_pending_directory() {
+            let (_source, initial_pool, wire) = fixture(1024, false);
+            drop(initial_pool);
+            let parent = tempfile::tempdir().unwrap();
+            let cache_root = parent.path().join("durable");
+            let objects = cache_root.join("toolchains-v1");
+            let pool = Arc::new(
+                toolchain_pool::ToolchainPool::with_directory(1024, 2, Some(&cache_root)).unwrap(),
+            );
+            let identity = parse_toolchain_identity(&wire).unwrap().unwrap();
+            let (owner, request) = upload(&pool, &wire);
+            let uploaded = Path::new(&request.toolchain_backing).to_path_buf();
+            let container = fs::symlink_metadata(uploaded.parent().unwrap()).unwrap();
+            let pending = objects.join(format!(
+                ".pending-v1-{}-{}-{}-{:016x}{:016x}",
+                hex(&identity.sha256),
+                identity.files,
+                identity.bytes,
+                container.dev(),
+                container.ino(),
+            ));
+            fs::create_dir(&pending).unwrap();
+            fs::set_permissions(&pending, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::write(pending.join("receipt"), b"keep existing reservation").unwrap();
+            let pending_inode = inode(&pending);
+            let error = pool.adopt(sealed(owner, &request), || false).err().unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+            assert_eq!(inode(&pending), pending_inode);
+            assert_eq!(
+                fs::read(pending.join("receipt")).unwrap(),
+                b"keep existing reservation",
+            );
+            assert_eq!(fs::read_dir(&objects).unwrap().count(), 1);
+            assert!(pool.lookup(&identity, || false).unwrap().is_none());
+            assert!(!uploaded.exists());
+        }
+
+        #[test]
+        fn durable_move_refuses_unrelated_entries_in_the_owned_upload_container() {
+            let (_source, initial_pool, wire) = fixture(1024, false);
+            drop(initial_pool);
+            let parent = tempfile::tempdir().unwrap();
+            let cache_root = parent.path().join("durable");
+            let pool = Arc::new(
+                toolchain_pool::ToolchainPool::with_directory(1024, 2, Some(&cache_root)).unwrap(),
+            );
+            let (owner, request) = upload(&pool, &wire);
+            let uploaded = Path::new(&request.toolchain_backing).to_path_buf();
+            fs::write(uploaded.parent().unwrap().join("unrelated"), b"not keyed").unwrap();
+            assert!(pool.adopt(sealed(owner, &request), || false).is_err());
+            assert!(!uploaded.exists());
+            assert_eq!(
+                fs::read_dir(cache_root.join("toolchains-v1"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
+
+        #[test]
+        fn durable_upload_cannot_refresh_its_generation_during_published_reopen() {
+            use std::cell::Cell;
+
+            let (_source, initial_pool, wire) = fixture(1024, false);
+            drop(initial_pool);
+            let parent = tempfile::tempdir().unwrap();
+            let cache_root = parent.path().join("durable");
+            let pool = Arc::new(
+                toolchain_pool::ToolchainPool::with_directory(1024, 2, Some(&cache_root)).unwrap(),
+            );
+            let identity = parse_toolchain_identity(&wire).unwrap().unwrap();
+            let (owner, request) = upload(&pool, &wire);
+            let uploaded = Path::new(&request.toolchain_backing).to_path_buf();
+            let compiler_inode = inode(&uploaded.join("bin/compiler"));
+            let published = cache_root
+                .join("toolchains-v1")
+                .join(format!(
+                    "v1-{}-{}-{}",
+                    hex(&identity.sha256),
+                    identity.files,
+                    identity.bytes,
+                ))
+                .join("tree");
+            let changed = Cell::new(false);
+            let error = pool
+                .adopt(sealed(owner, &request), || {
+                    if !changed.get() && published.exists() {
+                        // The original witness retains one root descriptor. The
+                        // mandatory reopen holds a new directory plus its inventory
+                        // clone before scanning. A transient rebind probe holds at
+                        // most two, so this restores bytes only inside fresh scan.
+                        let roots = fs::read_dir("/proc/self/fd")
+                            .unwrap()
+                            .filter_map(Result::ok)
+                            .filter_map(|entry| fs::read_link(entry.path()).ok())
+                            .filter(|path| path == &published)
+                            .count();
+                        if roots >= 3 {
+                            changed.set(true);
+                            let compiler = published.join("bin/compiler");
+                            fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755))
+                                .unwrap();
+                            fs::write(&compiler, CONTENTS).unwrap();
+                            fs::set_permissions(&compiler, fs::Permissions::from_mode(0o555))
+                                .unwrap();
+                        }
+                    }
+                    false
+                })
+                .err()
+                .unwrap();
+            assert!(changed.get(), "the actual durable reopen must be exercised");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(!uploaded.exists());
+            assert_eq!(inode(&published.join("bin/compiler")), compiler_inode);
+            assert_eq!(fs::read(published.join("rustc")).unwrap(), CONTENTS);
+            // Publication may have completed before refusal. Retain the actual
+            // entry for inspection; never turn uncertainty into cleanup.
+            assert!(published.parent().unwrap().is_dir());
+        }
+
+        #[test]
+        #[ignore = "requires RABS_TEST_TOOLCHAIN_UPLOAD_FS on a distinct writable filesystem"]
+        fn cross_filesystem_durable_upload_uses_verified_copy_and_keeps_its_source_owner() {
+            use rabs_sandbox::toolchain_dataset::open_toolchain;
+            use sha2::{Digest, Sha256};
+            use std::cell::Cell;
+
+            let alternate = std::path::PathBuf::from(
+                std::env::var_os("RABS_TEST_TOOLCHAIN_UPLOAD_FS")
+                    .expect("set an explicit second writable filesystem for real EXDEV coverage"),
+            );
+            assert!(alternate.is_absolute());
+            let alternate = fs::canonicalize(alternate).unwrap();
+            for contents in [b"".as_slice(), CONTENTS] {
+                let (source, initial_pool, _) = fixture(1024, false);
+                drop(initial_pool);
+                fs::write(source.path().join("bin/compiler"), contents).unwrap();
+                let limits = ToolchainLimits::default();
+                let identity = fingerprint_toolchain(source.path(), &limits, || false).unwrap();
+                let exported = open_toolchain(source.path(), &identity, &limits, || false).unwrap();
+                let cache_parent = tempfile::tempdir().unwrap();
+                assert_ne!(
+                    fs::metadata(&alternate).unwrap().dev(),
+                    fs::metadata(cache_parent.path()).unwrap().dev(),
+                    "the explicit fixture must exercise an actual cross-device rename",
+                );
+                let cache_root = cache_parent.path().join("durable");
+                let pool =
+                    toolchain_pool::ToolchainPool::with_directory(1024, 2, Some(&cache_root))
+                        .unwrap();
+                let directory = tempfile::Builder::new()
+                    .prefix("rabs-toolchain-upload-")
+                    .permissions(fs::Permissions::from_mode(0o700))
+                    .tempdir_in(&alternate)
+                    .unwrap();
+                let uploaded = directory.path().join("tree");
+                let mut receiver = ToolchainReceiver::create(&uploaded, identity, limits).unwrap();
+                for entry in exported.entries().unwrap() {
+                    let path = entry.path.clone();
+                    let length = match &entry.kind {
+                        ToolchainEntryKind::File { bytes, .. } => Some(*bytes),
+                        _ => None,
+                    };
+                    receiver.entry(entry).unwrap();
+                    if let Some(length) = length {
+                        let mut offset = 0;
+                        while offset < length {
+                            let chunk = exported
+                                .read_chunk(&path, offset, MAX_TOOLCHAIN_CHUNK, || false)
+                                .unwrap();
+                            assert!(!chunk.is_empty());
+                            receiver
+                                .write_chunk(&path, offset, &chunk, Sha256::digest(&chunk).into())
+                                .unwrap();
+                            offset += chunk.len() as u64;
+                        }
+                    }
+                }
+                let prepared = receiver.seal(|| false).unwrap();
+                let owner = UploadedToolchain {
+                    prepared: Some(prepared),
+                    receiver,
+                    file_reuse: None,
+                    _directory: directory,
+                }
+                .into_sealed(&identity)
+                .unwrap();
+                let compiler_inode = inode(&uploaded.join("bin/compiler"));
+                let published = cache_root
+                    .join("toolchains-v1")
+                    .join(format!(
+                        "v1-{}-{}-{}",
+                        hex(&identity.sha256),
+                        identity.files,
+                        identity.bytes,
+                    ))
+                    .join("tree");
+                let source_at_publication = Cell::new(false);
+                let lease = pool
+                    .adopt(owner, || {
+                        if uploaded.exists() {
+                            assert_eq!(inode(&uploaded.join("bin/compiler")), compiler_inode);
+                            assert_eq!(fs::read(uploaded.join("rustc")).unwrap(), contents);
+                            if published.exists() {
+                                source_at_publication.set(true);
+                            }
+                        } else {
+                            // The copied image must already be complete before its
+                            // still-owned source is released.
+                            assert_eq!(fs::read(published.join("rustc")).unwrap(), contents);
+                        }
+                        false
+                    })
+                    .unwrap();
+                assert_eq!(lease.disposition(), "captured");
+                assert_eq!(lease.root(), published);
+                assert!(source_at_publication.get());
+                assert!(!uploaded.exists());
+                assert_ne!(inode(&published.join("bin/compiler")), compiler_inode);
+                assert_eq!(fs::read(published.join("rustc")).unwrap(), contents);
+                lease.verify(|| false).unwrap();
+            }
         }
 
         #[test]
@@ -1651,7 +2802,7 @@ mod tests {
                 let (owner, request) = upload(&pool, &wire);
                 let lease = pool.adopt(sealed(owner, &request), || false).unwrap();
                 if cache == "durable-available" {
-                    assert_eq!(lease.disposition(), "captured");
+                    assert_eq!(lease.disposition(), "adopted");
                     assert!(!Path::new(&request.toolchain_backing).exists());
                 } else {
                     assert_eq!(lease.disposition(), "adopted");
@@ -1662,7 +2813,7 @@ mod tests {
         }
 
         #[test]
-        fn durable_capture_rejects_a_refreshed_upload_generation_before_publication() {
+        fn durable_upload_rejects_a_refreshed_generation_after_reservation_before_publication() {
             use std::cell::Cell;
 
             let (_source, initial_pool, wire) = fixture(1024, false);
@@ -1689,6 +2840,17 @@ mod tests {
                         // reserved durable storage. A fresh source scan could now
                         // accept these restored bytes, but the sealed witness cannot.
                         changed.set(true);
+                        let compiler = if compiler.exists() {
+                            compiler.clone()
+                        } else {
+                            fs::read_dir(&objects)
+                                .unwrap()
+                                .next()
+                                .unwrap()
+                                .unwrap()
+                                .path()
+                                .join("tree/bin/compiler")
+                        };
                         fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755)).unwrap();
                         fs::write(&compiler, CONTENTS).unwrap();
                         fs::set_permissions(&compiler, fs::Permissions::from_mode(0o555)).unwrap();
@@ -1994,13 +3156,21 @@ mod tests {
                     assert_ne!(exchange(&mut task, &frame).unwrap()["kind"], "error");
                 }
                 let owner = task.take_prepared(&request).unwrap().unwrap();
-                let ToolchainBacking::Uploaded(upload) = &owner.backing else {
-                    panic!("full upload did not retain its verified receiver");
+                let prepared = match &owner.backing {
+                    ToolchainBacking::Uploaded(upload) => {
+                        let prepared = upload.prepared.as_ref().unwrap();
+                        prepared.verify(|| false).unwrap();
+                        prepared.root()
+                    }
+                    ToolchainBacking::UploadedRetained { lease, .. } => {
+                        assert!(reuse && budget != 0);
+                        lease.verify(|| false).unwrap();
+                        lease.root()
+                    }
+                    _ => panic!("full upload did not retain its verified image"),
                 };
-                let prepared = upload.prepared.as_ref().unwrap();
-                prepared.verify(|| false).unwrap();
-                assert_eq!(fs::read(prepared.root().join("rustc")).unwrap(), CONTENTS);
-                assert!(prepared.root().join("empty").is_dir());
+                assert_eq!(fs::read(prepared.join("rustc")).unwrap(), CONTENTS);
+                assert!(prepared.join("empty").is_dir());
             }
         }
 

@@ -19,12 +19,35 @@ use rch_common::admission_preview::{
     MAX_REQUEST_BYTES, PROTOCOL_VERSION, PreviewRequest, PreviewResponse, ROUTE,
 };
 use rch_common::{SelectedWorker, SelectionReason, SelectionRequest, SelectionResponse};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const MAX_CONCURRENT_PREVIEWS: usize = 8;
 const PREVIEW_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Answer on the daemon's Unix socket, the route `rch admit` queries. It keeps
+/// the HTTP route's concurrency budget and deadline. This connection has no
+/// status line to report either limit with, so both answer as a refusal, which
+/// admit shows as an unknown recommendation.
+pub(crate) async fn observe_on_socket(
+    ctx: &DaemonContext,
+    request: PreviewRequest,
+) -> PreviewResponse {
+    static LIMIT: LazyLock<Arc<Semaphore>> =
+        LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_PREVIEWS)));
+    let Ok(permit) = Arc::clone(&LIMIT).try_acquire_owned() else {
+        return refused("admission_preview_capacity_exhausted");
+    };
+    let Ok(request) = request.into_selection() else {
+        return refused("invalid_admission_preview_request");
+    };
+    match tokio::time::timeout(PREVIEW_TIMEOUT, observe(ctx, request, Arc::new(permit))).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(message)) => refused(message),
+        Err(_) => refused("admission_preview_timed_out"),
+    }
+}
 
 /// Merge BEFORE the parent router installs its bearer-token middleware.
 pub(super) fn router() -> Router<Arc<ApiState>> {
@@ -407,6 +430,69 @@ mod tests {
                 expected,
             );
         }
+    }
+
+    /// `rch admit` sends this exact line over the Unix socket and parses this
+    /// exact response. Before this route existed, the daemon closed the
+    /// connection and admit could only report "unknown".
+    #[tokio::test]
+    async fn unix_socket_answers_the_preview_without_admitting_a_build() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (ctx, _router) = fixture().await;
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::mpsc::channel(1);
+        let handler = tokio::spawn(crate::api::handle_connection(
+            server,
+            ctx.clone(),
+            shutdown_tx,
+        ));
+        client
+            .write_all(input().request_line().unwrap().as_bytes())
+            .await
+            .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        handler.await.unwrap().unwrap();
+
+        let (headers, body) = response.split_once("\r\n\r\n").expect("HTTP-like response");
+        assert!(headers.starts_with("HTTP/1.0 200"), "{headers}");
+        let preview: PreviewResponse = serde_json::from_str(body).unwrap();
+        preview.validate().unwrap();
+        assert_eq!(
+            preview.selection.worker.expect("worker").id.as_str(),
+            "requested"
+        );
+        assert!(ctx.history.active_builds().is_empty());
+        assert_eq!(
+            ctx.pool
+                .get(&WorkerId::new("requested"))
+                .await
+                .unwrap()
+                .available_slots()
+                .await,
+            4,
+        );
+    }
+
+    #[tokio::test]
+    async fn unix_socket_closes_on_a_malformed_preview_without_answering() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (ctx, _router) = fixture().await;
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::mpsc::channel(1);
+        let handler = tokio::spawn(crate::api::handle_connection(server, ctx, shutdown_tx));
+        client
+            .write_all(format!("GET {ROUTE}?request=not-json\n").as_bytes())
+            .await
+            .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+
+        let error = handler.await.unwrap().expect_err("malformed preview");
+        assert!(error.to_string().contains("admission-preview"), "{error}");
+        assert!(response.is_empty(), "{response}");
     }
 
     async fn start_lane_owner(

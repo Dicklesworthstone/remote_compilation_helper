@@ -134,7 +134,7 @@ impl Cursor {
 }
 
 #[derive(Debug)]
-enum Completion {
+pub(super) enum Completion {
     CancelledBeforeStart {
         status: Value,
     },
@@ -208,7 +208,7 @@ fn followed_owner(status: &Value, attempt: u64) -> io::Result<u64> {
     }
 }
 
-fn follow(
+pub(super) fn follow(
     id: &str,
     until: Instant,
     mut exchange: impl FnMut(&Value, Instant) -> io::Result<Value>,
@@ -318,7 +318,7 @@ fn follow(
     }
 }
 
-fn final_status(
+pub(super) fn final_status(
     observed: &Value,
     reply: &Value,
     id: &str,

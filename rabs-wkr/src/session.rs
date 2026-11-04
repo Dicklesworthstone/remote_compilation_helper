@@ -889,6 +889,7 @@ pub struct ExecutionResources<'a> {
     pub slots: u32,
     pub host_budget: Option<&'a crate::host_budget::HostBudget>,
     pub source_cache: Option<&'a crate::source_transfer::SourceCache>,
+    pub toolchain_file_cache: Option<&'a crate::toolchain_transfer::ToolchainFileCache>,
     pub runtime_pool: Option<&'a RuntimePool>,
     pub target_cache: Option<(
         &'a std::sync::Arc<crate::target_cache::TargetCache>,
@@ -903,6 +904,7 @@ impl ExecutionResources<'_> {
             slots,
             host_budget: None,
             source_cache: None,
+            toolchain_file_cache: None,
             runtime_pool: None,
             target_cache: None,
         }
@@ -1003,7 +1005,10 @@ pub fn execute_uploaded_canonical_controlled(
 /// Create an attempt-owned root before any compiler or runtime input is written.
 /// Empty search trees must remain private even with a permissive host umask.
 /// The caller keeps the returned owner through process cleanup and output drains.
-fn attempt_private_directory(prefix: &str) -> std::io::Result<tempfile::TempDir> {
+fn attempt_private_directory(
+    prefix: &str,
+    parent: &std::path::Path,
+) -> std::io::Result<tempfile::TempDir> {
     let mut builder = tempfile::Builder::new();
     builder.prefix(prefix);
     #[cfg(unix)]
@@ -1011,7 +1016,51 @@ fn attempt_private_directory(prefix: &str) -> std::io::Result<tempfile::TempDir>
         use std::os::unix::fs::PermissionsExt;
         builder.permissions(std::fs::Permissions::from_mode(0o700));
     }
-    builder.tempdir()
+    builder.tempdir_in(parent)
+}
+
+/// Runtime homes belong to the admitted command, independently of whether a
+/// target cache exists or accepts its inputs. A Cargo build script or program
+/// must not seed another command's HOME or unprojected CARGO_HOME. The source
+/// owner may later replace the empty Cargo home with its independently prepared
+/// registry projection; it never imports the shared worker home.
+///
+/// Keep this owner through process cleanup, output drains and artifact capture.
+/// All allocations use the already-owned output storage, never ambient TMPDIR.
+#[derive(Debug)]
+struct AttemptHomes {
+    home: Option<tempfile::TempDir>,
+    cargo_home: Option<tempfile::TempDir>,
+}
+
+impl AttemptHomes {
+    fn prepare(
+        cargo: Option<rabs_sandbox::cargo_artifacts::CargoArtifactMode>,
+        dependency: bool,
+        parent: &std::path::Path,
+    ) -> std::io::Result<Self> {
+        let home = (cargo.is_some() || dependency)
+            .then(|| attempt_private_directory("rabs-private-home-", parent))
+            .transpose()?;
+        let cargo_home = cargo
+            .map(|_| attempt_private_directory("rabs-cargo-home-", parent))
+            .transpose()?;
+        Ok(Self { home, cargo_home })
+    }
+
+    fn home<'a>(&'a self, original: &'a std::path::Path) -> &'a std::path::Path {
+        self.home.as_ref().map_or(original, tempfile::TempDir::path)
+    }
+
+    fn cargo_home<'a>(&'a self, original: &'a std::path::Path) -> &'a std::path::Path {
+        self.cargo_home
+            .as_ref()
+            .map_or(original, tempfile::TempDir::path)
+    }
+
+    fn cargo_private_home(&self) -> Option<&tempfile::TempDir> {
+        self.cargo_home.as_ref().and(self.home.as_ref())
+    }
 }
 
 /// Acquire the selected host ELF runtime in independently owned storage.
@@ -1088,9 +1137,7 @@ fn execute_canonical_inner(
     use rabs_asupersync::process_groups::ManagedProcessGroup;
     use rabs_asupersync::region_tree::Attribution;
     use rabs_sandbox::canonical_mounts::CanonicalMountPlan;
-    use rabs_sandbox::canonical_namespace::{
-        HostIsolationSupport, build_canonical_argv, command_for,
-    };
+    use rabs_sandbox::canonical_namespace::{HostIsolationSupport, command_for};
     use std::process::Stdio;
     let (source, uploaded_toolchain) = match inputs {
         Some(inputs) => (Some(inputs.source), inputs.toolchain),
@@ -1180,6 +1227,20 @@ fn execute_canonical_inner(
         let _ = control.retain_outputs(Err(error));
         return exec_error(request.request_id);
     }
+    // Snapshot storage belongs to the same worker-selected filesystem as the
+    // drain spools. Prepare it before execution, including fully resident output
+    // that will never cause a drain to create its lazy per-attempt spill path.
+    let capture_directory = match std::fs::create_dir_all(spill_root).and_then(|()| {
+        tempfile::Builder::new()
+            .prefix("rabs-output-")
+            .tempdir_in(spill_root)
+    }) {
+        Ok(directory) => directory,
+        Err(error) => {
+            let _ = control.retain_outputs(Err(format!("output storage preparation: {error}")));
+            return exec_error(request.request_id);
+        }
+    };
     let hot_inputs = if resources.target_cache.is_some()
         && request.dependency_context.is_none()
         && request.toolchain_identity.is_some()
@@ -1201,7 +1262,7 @@ fn execute_canonical_inner(
     };
     let mut artifacts = match artifact_plan
         .clone()
-        .map(PreparedArtifacts::new)
+        .map(|plan| PreparedArtifacts::new_in(plan, capture_directory.path()))
         .transpose()
     {
         Ok(artifacts) => artifacts,
@@ -1210,46 +1271,27 @@ fn execute_canonical_inner(
             return exec_error(request.request_id);
         }
     };
-    // A dependency execution must not inherit files written into the worker's
-    // persistent canonical HOME by a prior command. Only this fresh owner and
-    // its jobserver FIFO are visible at the runtime mount, until drains resolve.
-    // Hot Cargo state also uses an independent fresh HOME: a prior command's
-    // runtime files must not become unkeyed inputs of a later target clone.
-    let private_home = if request.dependency_context.is_some() || hot_inputs.is_some() {
-        match attempt_private_directory("rabs-private-home-") {
-            Ok(directory) => Some(directory),
-            Err(error) => {
-                let _ =
-                    control.retain_outputs(Err(format!("dependency runtime preparation: {error}")));
-                return exec_error(request.request_id);
-            }
+    // Isolation follows the admitted Cargo contract, not optional target-cache
+    // availability. Cache-disabled, cold and refused requests need the same
+    // fresh runtime inputs as a restored target. The source owner can still
+    // replace the empty Cargo home with its exact independent projection below.
+    let homes = match AttemptHomes::prepare(
+        artifact_plan.as_ref().and_then(ArtifactPlan::cargo_mode),
+        request.dependency_context.is_some(),
+        capture_directory.path(),
+    ) {
+        Ok(homes) => homes,
+        Err(error) => {
+            let _ = control.retain_outputs(Err(format!("runtime home preparation: {error}")));
+            return exec_error(request.request_id);
         }
-    } else {
-        None
     };
-    let execution_home = private_home
-        .as_ref()
-        .map_or(home_backing, |directory| directory.path());
-    let private_cargo_home = if hot_inputs.is_some() {
-        match attempt_private_directory("rabs-target-cargo-home-") {
-            Ok(directory) => Some(directory),
-            Err(error) => {
-                let _ = control.retain_outputs(Err(format!("Cargo runtime preparation: {error}")));
-                return exec_error(request.request_id);
-            }
-        }
-    } else {
-        None
-    };
-    // A captured Cargo-home projection replaces this empty backing through the
-    // source owner's existing validation; no persistent mutable home is seeded.
-    let execution_cargo_home = private_cargo_home
-        .as_ref()
-        .map_or(cargo_home_backing, |directory| directory.path());
+    let execution_home = homes.home(home_backing);
+    let execution_cargo_home = homes.cargo_home(cargo_home_backing);
     // This fresh empty tree is a separate owner: exposing it under writable
     // HOME as well would let a compiler populate a supposedly empty input.
     let dependency_empty = if request.dependency_context.is_some() {
-        match attempt_private_directory("rabs-dependency-empty-") {
+        match attempt_private_directory("rabs-dependency-empty-", capture_directory.path()) {
             Ok(directory) => Some(directory),
             Err(error) => {
                 let _ =
@@ -1400,11 +1442,8 @@ fn execute_canonical_inner(
     // may carry smuggled coordination keys, so replacement must see them.
     // One real FIFO budget is held until the process group and drains resolve.
     // Runtime coordination belongs in writable HOME, never in verified source.
-    let bridge = match if hot_inputs.is_some() {
-        crate::jobserver::JobserverBridge::mint_for_private_home(
-            grant,
-            private_home.as_ref().expect("hot Cargo has a private HOME"),
-        )
+    let bridge = match if let Some(home) = homes.cargo_private_home() {
+        crate::jobserver::JobserverBridge::mint_for_private_home(grant, home)
     } else {
         crate::jobserver::JobserverBridge::mint(grant, execution_home)
     } {
@@ -1441,7 +1480,7 @@ fn execute_canonical_inner(
                         key,
                         compatible,
                         inputs.clone(),
-                        || PreparedArtifacts::new(plan.clone()),
+                        || PreparedArtifacts::new_in(plan.clone(), capture_directory.path()),
                         request.request_id,
                         &|| control.reason().is_some(),
                     )
@@ -1483,6 +1522,16 @@ fn execute_canonical_inner(
             if let Err(error) = cache.validate_runtime_root(&bind.backing) {
                 let _ =
                     control.retain_outputs(Err(format!("source cache mount isolation: {error}")));
+                return exec_error(request.request_id);
+            }
+        }
+    }
+    if let Some(cache) = resources.toolchain_file_cache {
+        for bind in &spec.rw_binds {
+            if let Err(error) = cache.validate_runtime_root(&bind.backing) {
+                let _ = control.retain_outputs(Err(format!(
+                    "toolchain file cache mount isolation: {error}"
+                )));
                 return exec_error(request.request_id);
             }
         }
@@ -1547,7 +1596,7 @@ fn execute_canonical_inner(
             )
         }
     } else {
-        build_canonical_argv(
+        bridge.canonical_launch(
             &spec,
             canonical_support
                 .as_ref()
@@ -1769,7 +1818,11 @@ fn execute_canonical_inner(
             #[cfg(not(unix))]
             let exit_code = output.status.code().unwrap_or(-1);
             let (stdout_sha256, stderr_sha256) = if control.output_capture_requested() {
-                let capture = CapturedOutputs::from_lanes(&output.stdout, &output.stderr);
+                let capture = CapturedOutputs::from_lanes_in(
+                    &output.stdout,
+                    &output.stderr,
+                    capture_directory.path(),
+                );
                 let digests = capture.as_ref().ok().map(|outputs| {
                     (
                         outputs.stdout.sha256().to_owned(),
@@ -1967,13 +2020,16 @@ mod tests {
         use std::fs;
         use std::os::unix::fs::MetadataExt;
 
+        let storage = tempfile::tempdir().unwrap();
         let prefixes = [
             "rabs-private-home-",
             "rabs-target-cargo-home-",
             "rabs-dependency-empty-",
         ];
-        let previous = prefixes.map(|prefix| attempt_private_directory(prefix).unwrap());
-        let next = prefixes.map(|prefix| attempt_private_directory(prefix).unwrap());
+        let previous =
+            prefixes.map(|prefix| attempt_private_directory(prefix, storage.path()).unwrap());
+        let next =
+            prefixes.map(|prefix| attempt_private_directory(prefix, storage.path()).unwrap());
         for directory in previous.iter().chain(&next) {
             let metadata = fs::symlink_metadata(directory.path()).unwrap();
             assert!(metadata.is_dir());
@@ -2370,5 +2426,241 @@ mod tests {
         for thread in threads {
             assert_eq!(thread.join().unwrap(), expected);
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod attempt_home_tests {
+    use super::AttemptHomes;
+    use rabs_sandbox::canonical_mounts::CanonicalMountPlan;
+    use rabs_sandbox::cargo_artifacts::CargoArtifactMode;
+    use rabs_sandbox::cargo_home::CargoHomeProjection;
+    use rabs_sandbox::layout;
+    use rabs_sandbox::source_transfer::{SourceFile, SourceManifest, SourceReceiver};
+    use sha2::{Digest, Sha256};
+    use std::fs;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
+
+    fn empty_private(path: &Path, parent: &Path) {
+        assert!(path.starts_with(parent));
+        let metadata = fs::symlink_metadata(path).unwrap();
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.mode() & 0o777, 0o700);
+        assert_eq!(fs::read_dir(path).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn cargo_homes_are_independent_of_cache_availability_and_previous_commands() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = root.path().join("owned-output-storage");
+        let shared_home = root.path().join("shared-home");
+        let shared_cargo = root.path().join("shared-cargo-home");
+        let toolchain = root.path().join("toolchain");
+        let workspace = root.path().join("workspace");
+        for path in [
+            &storage,
+            &shared_home,
+            &shared_cargo,
+            &toolchain,
+            &workspace,
+        ] {
+            fs::create_dir(path).unwrap();
+        }
+        fs::write(shared_home.join("prior-program-input"), b"shared state").unwrap();
+        fs::write(shared_cargo.join("config.toml"), b"unselected config").unwrap();
+        // No cache handle, accepted source-cache inputs or toolchain cache hit
+        // participates in this production owner. Every declared Cargo mode
+        // gets the same fresh inputs when those optional accelerators refuse.
+        let previous =
+            AttemptHomes::prepare(Some(CargoArtifactMode::Compilation), false, &storage).unwrap();
+        fs::write(previous.home(&shared_home).join("program-input"), b"old").unwrap();
+        fs::write(
+            previous.cargo_home(&shared_cargo).join("config.toml"),
+            b"[build]\nrustflags = ['--cfg=stale_job']\n",
+        )
+        .unwrap();
+        for mode in [
+            CargoArtifactMode::Compilation,
+            CargoArtifactMode::TestExecution,
+            CargoArtifactMode::RunExecution,
+            CargoArtifactMode::BenchExecution,
+        ] {
+            let current = AttemptHomes::prepare(Some(mode), false, &storage).unwrap();
+            let home = current.home(&shared_home);
+            let cargo_home = current.cargo_home(&shared_cargo);
+            empty_private(home, &storage);
+            empty_private(cargo_home, &storage);
+            assert_ne!(home, cargo_home);
+            assert_ne!(home, previous.home(&shared_home));
+            assert_ne!(cargo_home, previous.cargo_home(&shared_cargo));
+            assert_eq!(current.cargo_private_home().unwrap().path(), home);
+            let spec = CanonicalMountPlan::new(&toolchain, &workspace, cargo_home, home)
+                .to_spec()
+                .unwrap();
+            for (visible, expected) in [(layout::HOME, home), (layout::CARGO_HOME, cargo_home)] {
+                let bound = spec
+                    .rw_binds
+                    .iter()
+                    .find(|bind| bind.visible == Path::new(visible))
+                    .unwrap();
+                assert_eq!(bound.backing, expected);
+            }
+            fs::write(home.join("this-program-input"), b"current").unwrap();
+            fs::write(cargo_home.join(".package-cache"), b"this Cargo lock").unwrap();
+            assert!(
+                !previous
+                    .home(&shared_home)
+                    .join("this-program-input")
+                    .exists()
+            );
+        }
+        assert_eq!(
+            fs::read(shared_home.join("prior-program-input")).unwrap(),
+            b"shared state"
+        );
+        assert_eq!(
+            fs::read(shared_cargo.join("config.toml")).unwrap(),
+            b"unselected config"
+        );
+        let active =
+            AttemptHomes::prepare(Some(CargoArtifactMode::Compilation), false, &storage).unwrap();
+        fs::write(active.home(&shared_home).join("retained"), b"active").unwrap();
+        let previous_home = previous.home(&shared_home).to_owned();
+        drop(previous);
+        assert!(!previous_home.exists());
+        assert_eq!(
+            fs::read(active.home(&shared_home).join("retained")).unwrap(),
+            b"active"
+        );
+    }
+
+    #[test]
+    fn captured_cargo_home_replaces_only_the_empty_attempt_binding() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = root.path().join("owned-output-storage");
+        let shared = root.path().join("shared");
+        let toolchain = root.path().join("toolchain");
+        for directory in [&storage, &shared, &toolchain] {
+            fs::create_dir(directory).unwrap();
+        }
+        fs::write(shared.join("credentials.toml"), b"unselected credentials").unwrap();
+        let bytes = b"retained registry archive";
+        let relative = "cache/registry/cache/example/dep-1.crate";
+        let digest = Sha256::digest(bytes).into();
+        let manifest = SourceManifest::new(vec![SourceFile {
+            path: relative.into(),
+            len: bytes.len() as u64,
+            sha256: digest,
+            executable: false,
+        }])
+        .unwrap();
+        let projection = CargoHomeProjection::new("cache", &manifest).unwrap();
+        let mut source = SourceReceiver::create(&root.path().join("source"), manifest).unwrap();
+        source.write_chunk(relative, 0, bytes, digest).unwrap();
+        source.seal().unwrap();
+        let prepared = projection
+            .prepare(&source, &root.path().join("prepared-cargo-home"), || false)
+            .unwrap();
+        let homes =
+            AttemptHomes::prepare(Some(CargoArtifactMode::Compilation), false, &storage).unwrap();
+        let mut spec = CanonicalMountPlan::new(
+            &toolchain,
+            source.sealed_root().unwrap(),
+            homes.cargo_home(&shared),
+            homes.home(&shared),
+        )
+        .to_spec()
+        .unwrap();
+        let environment = spec.env.clone();
+        prepared.apply_to(&mut spec).unwrap();
+        let mounted = |visible| {
+            &spec
+                .rw_binds
+                .iter()
+                .find(|bind| bind.visible == Path::new(visible))
+                .unwrap()
+                .backing
+        };
+        assert_eq!(mounted(layout::HOME), homes.home(&shared));
+        assert_eq!(mounted(layout::CARGO_HOME), prepared.root());
+        assert_eq!(spec.env, environment);
+        assert!(!prepared.root().join("credentials.toml").exists());
+        empty_private(homes.cargo_home(&shared), &storage);
+        let archive = prepared.root().join("registry/cache/example/dep-1.crate");
+        assert_eq!(fs::read(&archive).unwrap(), bytes);
+        fs::write(&archive, b"private runtime mutation").unwrap();
+        assert_eq!(
+            fs::read(source.sealed_root().unwrap().join(relative)).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            fs::read(shared.join("credentials.toml")).unwrap(),
+            b"unselected credentials"
+        );
+    }
+
+    #[test]
+    fn unavailable_owned_storage_refuses_without_shared_home_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing");
+        let file = root.path().join("file");
+        fs::write(&file, b"not a directory").unwrap();
+        for parent in [&missing, &file] {
+            assert!(
+                AttemptHomes::prepare(Some(CargoArtifactMode::Compilation), false, parent).is_err()
+            );
+        }
+        assert!(!missing.exists());
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn non_cargo_commands_preserve_their_original_home_contract() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("original-home");
+        let cargo = root.path().join("original-cargo");
+        let ordinary = AttemptHomes::prepare(None, false, &root.path().join("unused")).unwrap();
+        assert_eq!(ordinary.home(&home), home);
+        assert_eq!(ordinary.cargo_home(&cargo), cargo);
+        assert!(ordinary.cargo_private_home().is_none());
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+        let dependency = AttemptHomes::prepare(None, true, root.path()).unwrap();
+        empty_private(dependency.home(&home), root.path());
+        assert_eq!(dependency.cargo_home(&cargo), cargo);
+        assert!(dependency.cargo_private_home().is_none());
+    }
+
+    #[test]
+    fn cargo_homes_use_owned_storage_when_ambient_tmpdir_is_unavailable() {
+        const CHILD_PARENT: &str = "RABS_ATTEMPT_HOMES_TEST_PARENT";
+        if let Some(parent) = std::env::var_os(CHILD_PARENT) {
+            let parent = Path::new(&parent);
+            let homes =
+                AttemptHomes::prepare(Some(CargoArtifactMode::Compilation), false, parent).unwrap();
+            empty_private(homes.home(Path::new("/unused-home")), parent);
+            empty_private(homes.cargo_home(Path::new("/unused-cargo")), parent);
+            fs::write(parent.join("child-verified"), b"owned runtime storage").unwrap();
+            return;
+        }
+        let parent = tempfile::tempdir().unwrap();
+        let thread = std::thread::current();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", thread.name().unwrap(), "--nocapture"])
+            .env(CHILD_PARENT, parent.path())
+            .env("TMPDIR", parent.path().join("unavailable-ambient-storage"))
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(
+            fs::read(parent.path().join("child-verified")).unwrap(),
+            b"owned runtime storage"
+        );
+        assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 1);
     }
 }

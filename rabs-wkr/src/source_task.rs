@@ -108,18 +108,19 @@ impl SourceTransferTask {
         let thread = std::thread::Builder::new()
             .name("rabs-source-io".to_owned())
             .spawn(move || {
-                while let Ok(mut job) = receiver.recv() {
+                while let Ok(job) = receiver.recv() {
                     // An unwind cannot return partly mutated state to the
-                    // admission path. The session receives a fatal error.
+                    // admission path. Own the state inside the caught operation
+                    // so retained cache-writer guards drop during the unwind
+                    // and preserve their panic poison. The session fails closed.
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        handle(&mut job.source, &job.frame)
+                        let Job { mut source, frame } = job;
+                        let response = handle(&mut source, &frame);
+                        Completed { source, response }
                     }));
                     let fatal = outcome.is_err();
                     let result = match outcome {
-                        Ok(response) => Ok(Completed {
-                            source: job.source,
-                            response,
-                        }),
+                        Ok(completed) => Ok(completed),
                         Err(_) => Err("source filesystem worker panicked".to_owned()),
                     };
                     let wake = {
@@ -688,11 +689,37 @@ mod tests {
 
     #[test]
     fn worker_unwind_never_returns_source_authority_or_accepts_more_work() {
-        let mut task = SourceTransferTask::default();
-        task.start_worker(|_, _| panic!("injected source worker unwind"))
-            .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let cache = SourceCache::open(
+            parent.path(),
+            crate::source_transfer::DEFAULT_SOURCE_CACHE_BYTES,
+        )
+        .unwrap();
+        let mut task = SourceTransferTask::with_configuration(None, Some(cache.clone()));
+        task.start_worker(|source, frame| {
+            let response = source.handle(frame, true, false);
+            if frame["kind"] == "source-chunk" {
+                assert!(response.is_ok());
+                panic!("injected unwind after completed source checkpoint");
+            }
+            response
+        })
+        .unwrap();
         let request = request();
-        task.submit(&begin(&request), true, false).unwrap();
+        let mut start = begin(&request);
+        start["allow_cached_files"] = json!(true);
+        assert_eq!(exchange(&mut task, &start)["sealed"], false);
+        task.submit(
+            &json!({"kind":"source-chunk", "request_id":7,
+                "manifest_sha256":request["source_manifest"]["manifest_sha256"],
+                "path":"lib.rs", "offset":0, "data_hex":hex(BYTES),
+                "chunk_sha256":hex(&Sha256::digest(BYTES))}),
+            true,
+            false,
+        )
+        .unwrap();
         assert!(finish(&mut task).is_err());
         assert!(task.prepared_path(&request, true).is_err());
         assert!(task.take_prepared(&request).is_err());
@@ -701,6 +728,50 @@ mod tests {
             task.submit_owned(begin(&request), true, false).unwrap_err(),
             "source filesystem worker failed"
         );
+        drop(task);
+        assert_eq!(
+            std::fs::read(
+                parent
+                    .path()
+                    .join("source-files-v1")
+                    .join(format!("{}.src", hex(&Sha256::digest(BYTES))))
+            )
+            .unwrap(),
+            BYTES,
+            "the panic happened after a real completed-file cache admission"
+        );
+
+        // The production catch_unwind borrowed the state before this change:
+        // its checkpoint guard then dropped after the unwind and silently
+        // unpoisoned the shared writer. Exercise a later real session to prove
+        // the writer is fenced while optional cache failure still allows a
+        // freshly verified execution source.
+        let bytes = b"different source";
+        let next = request_for(bytes);
+        let mut task = SourceTransferTask::with_configuration(None, Some(cache));
+        let mut start = begin(&next);
+        start["allow_cached_files"] = json!(true);
+        exchange(&mut task, &start);
+        exchange(
+            &mut task,
+            &json!({"kind":"source-chunk", "request_id":7,
+                "manifest_sha256":next["source_manifest"]["manifest_sha256"],
+                "path":"lib.rs", "offset":0, "data_hex":hex(bytes),
+                "chunk_sha256":hex(&Sha256::digest(bytes))}),
+        );
+        let sealed = exchange(
+            &mut task,
+            &json!({"kind":"source-seal", "request_id":7,
+                "manifest_sha256":next["source_manifest"]["manifest_sha256"]}),
+        );
+        assert_eq!(sealed["sealed"], true);
+        assert!(
+            sealed["cache_write_error"]
+                .as_str()
+                .unwrap()
+                .contains("poisoned")
+        );
+        assert!(task.prepared_path(&next, true).is_ok());
     }
 
     #[test]

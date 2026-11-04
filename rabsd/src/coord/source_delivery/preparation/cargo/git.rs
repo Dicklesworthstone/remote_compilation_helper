@@ -18,6 +18,7 @@ use std::fs::{self, File, Metadata};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const MAX_DATABASES: usize = 64;
@@ -187,6 +188,10 @@ struct CapturedCommit {
 pub(super) struct GitCache {
     packages: BTreeSet<GitIdentity>,
     commits: BTreeMap<(String, String), CapturedCommit>,
+    /// Parsed Cargo manifests from verified Git blob objects, including virtual
+    /// workspace roots. Inherited versions are resolved through the selected
+    /// commit's paths: one blob can occur under different workspace roots.
+    manifests: BTreeMap<String, Arc<toml::Value>>,
     tool: GitTools,
     scratch: PathBuf,
 }
@@ -855,6 +860,7 @@ impl GitCache {
         let mut captured = Self {
             packages,
             commits: BTreeMap::new(),
+            manifests: BTreeMap::new(),
             tool,
             scratch,
         };
@@ -866,7 +872,7 @@ impl GitCache {
         let mut pending = revisions.clone();
         let mut selected_by_database = BTreeMap::<String, BTreeSet<String>>::new();
         let mut trees = BTreeMap::<String, CapturedCommit>::new();
-        let mut manifests = BTreeMap::<String, toml::Value>::new();
+        let mut manifests = BTreeMap::<String, Arc<toml::Value>>::new();
         // Bound raw unique tree inspection independently from the final checkout
         // layout. Flattening below charges each delivered member exactly once,
         // including separate occurrences of a commit mounted at multiple paths.
@@ -983,7 +989,7 @@ impl GitCache {
                                 // path dependency from its parent repository. Check
                                 // the completed pinned layout below, not a child
                                 // repository artificially treated as a source root.
-                                manifests.insert(member.object.clone(), value);
+                                manifests.insert(member.object.clone(), Arc::new(value));
                             }
                         }
                     }
@@ -1153,6 +1159,8 @@ impl GitCache {
                     .insert((name.clone(), revision.clone()), commit);
             }
         }
+        control.checkpoint()?;
+        captured.manifests = manifests;
         let files = files_by_database.into_values().flatten().collect();
         Ok((captured, files))
     }
@@ -1217,6 +1225,144 @@ impl GitCache {
                 invalid("resolved Git namespace was not captured from the approved object store")
             })?;
         Ok((checkouts.join(namespace).join(prefix), commit))
+    }
+
+    /// Unit IDs omit the precise Git commit. Recover it only from the retained
+    /// lock identity AND the selected private checkout's captured namespace and
+    /// revision prefix; never resolve a branch or trust the prefix in isolation.
+    pub(super) fn selected_package(
+        &self,
+        home: &Path,
+        id: &str,
+        sources: &[&str],
+        control: &PreparationControl<'_>,
+    ) -> io::Result<Value> {
+        let source = sources
+            .first()
+            .ok_or_else(|| invalid("selected Git package has no sources"))?;
+        let selector = id
+            .rsplit_once('#')
+            .map(|(selector, _)| selector)
+            .ok_or_else(|| invalid("selected Git unit lacks its source identity"))?;
+        let checkouts = home.join("git/checkouts");
+        let relative = Path::new(source)
+            .strip_prefix(&checkouts)
+            .map_err(|_| invalid("selected Git target escapes its private Cargo home"))?;
+        let parts = relative.components().collect::<Vec<_>>();
+        require(
+            parts.len() >= 3
+                && parts
+                    .iter()
+                    .all(|part| matches!(part, Component::Normal(_))),
+            "selected Git target has a noncanonical checkout path",
+        )?;
+        let namespace = parts[0]
+            .as_os_str()
+            .to_str()
+            .ok_or_else(|| invalid("selected Git namespace is not UTF-8"))?;
+        let prefix = parts[1]
+            .as_os_str()
+            .to_str()
+            .ok_or_else(|| invalid("selected Git revision prefix is not UTF-8"))?;
+        require(
+            (7..=40).contains(&prefix.len()) && prefix.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "selected Git revision prefix is invalid",
+        )?;
+        let mut owner = None;
+        for (name, version, identity, revision) in &self.packages {
+            control.checkpoint()?;
+            if !revision.starts_with(prefix)
+                || !super::selection::package_id_matches(id, selector, name, version)
+            {
+                continue;
+            }
+            let source = format!("{selector}#{revision}");
+            // Do not guess the semantics of an encoded selector. Ordinary
+            // literal selectors remain supported; a selector whose two
+            // encodings disagree is refused until that boundary is modeled.
+            let selected = GitSource::parse(&source)?;
+            require(
+                selected == GitSource::parse_encoded(&source)?,
+                "selected Cargo Git source uses an ambiguous encoded selector",
+            )?;
+            if &selected != identity {
+                continue;
+            }
+            let Some(commit) = self.commits.get(&(namespace.to_owned(), revision.clone())) else {
+                continue;
+            };
+            require(
+                owner.is_none(),
+                "selected Git unit has ambiguous retained owners",
+            )?;
+            owner = Some((name, version, source, commit));
+        }
+        let (name, version, source, commit) = owner
+            .ok_or_else(|| invalid("selected Git unit differs from its full locked commit"))?;
+        let checkout = checkouts.join(namespace).join(prefix);
+        let mut manifest = None;
+        for (path, member) in &commit.members {
+            control.checkpoint()?;
+            if Path::new(path)
+                .file_name()
+                .is_none_or(|name| name != "Cargo.toml")
+            {
+                continue;
+            }
+            let Some(value) = self.manifests.get(&member.object) else {
+                continue;
+            };
+            let declared_name = value
+                .get("package")
+                .or_else(|| value.get("project"))
+                .and_then(|package| package.get("name"))
+                .and_then(toml::Value::as_str);
+            if declared_name != Some(name.as_str()) {
+                continue;
+            }
+            // The claimed unit version cannot choose between same-named
+            // packages whose target files share this commit. This mode requires
+            // one manifest owner before deriving its retained version.
+            require(
+                manifest.is_none(),
+                "selected Git package name matches multiple captured manifests",
+            )?;
+            manifest = Some((path, value));
+        }
+        let (path, value) = manifest
+            .ok_or_else(|| invalid("selected Git package manifest is absent from its commit"))?;
+        let declared_version = super::graph::retained_package_version(
+            path,
+            value,
+            &mut |candidate| {
+                control.checkpoint()?;
+                let Some(member) = commit.members.get(candidate) else {
+                    return Ok(None);
+                };
+                self.manifests
+                    .get(&member.object)
+                    .cloned()
+                    .map(Some)
+                    .ok_or_else(|| {
+                        invalid("selected Git workspace manifest is not a retained parsed blob")
+                    })
+            },
+            control,
+        )?;
+        require(
+            &declared_version == version,
+            "selected Git package version differs from its retained manifest",
+        )?;
+        let package = serde_json::json!({
+            "id": id,
+            "source": source,
+            "name": name,
+            "version": version,
+            "manifest_path": checkout.join(path),
+            "targets": sources.iter().map(|source| serde_json::json!({"src_path":source})).collect::<Vec<_>>(),
+        });
+        self.check_package(home, &package)?;
+        Ok(package)
     }
 
     pub(super) fn check_package(&self, home: &Path, package: &Value) -> io::Result<()> {
@@ -1321,6 +1467,234 @@ impl GitCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SELECTED_GIT_NAMESPACE: &str = "dep-0123456789abcdef";
+    const SELECTED_GIT_REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
+    const SELECTED_GIT_SELECTOR: &str = "git+https://example.invalid/dep";
+    const SELECTED_GIT_HOME: &str = "/retained-cargo-home";
+
+    // Exercise the production selected-unit binding with retained object/tree
+    // declarations. No checkout files or Git subprocess can supply a version.
+    fn selected_git_version_fixture(entries: &[(&str, &str)], versions: &[&str]) -> GitCache {
+        let mut objects = BTreeMap::<&str, String>::new();
+        let mut manifests = BTreeMap::new();
+        let mut members = BTreeMap::new();
+        for &(path, text) in entries {
+            let next_object = format!("{:040x}", objects.len() + 1);
+            let object = objects.entry(text).or_insert(next_object).clone();
+            let value = Arc::new(toml::from_str::<toml::Value>(text).unwrap());
+            if value
+                .get("package")
+                .or_else(|| value.get("project"))
+                .is_some()
+            {
+                let source = Path::new(path).parent().unwrap().join("src/lib.rs");
+                members.insert(
+                    source.to_str().unwrap().to_owned(),
+                    GitMember {
+                        object: "e".repeat(40),
+                        size: 0,
+                        #[cfg(unix)]
+                        executable: false,
+                    },
+                );
+            }
+            manifests.insert(object.clone(), value);
+            members.insert(
+                path.to_owned(),
+                GitMember {
+                    object,
+                    size: text.len() as u64,
+                    #[cfg(unix)]
+                    executable: false,
+                },
+            );
+        }
+        let source = format!("{SELECTED_GIT_SELECTOR}#{SELECTED_GIT_REVISION}");
+        GitCache {
+            packages: versions
+                .iter()
+                .map(|version| {
+                    (
+                        "dep".to_owned(),
+                        (*version).to_owned(),
+                        GitSource::parse(&source).unwrap(),
+                        SELECTED_GIT_REVISION.to_owned(),
+                    )
+                })
+                .collect(),
+            commits: BTreeMap::from([(
+                (
+                    SELECTED_GIT_NAMESPACE.to_owned(),
+                    SELECTED_GIT_REVISION.to_owned(),
+                ),
+                CapturedCommit {
+                    members,
+                    submodules: BTreeMap::new(),
+                },
+            )]),
+            manifests,
+            tool: GitTools {
+                git: PathBuf::from("/unused-git"),
+                prlimit: PathBuf::from("/unused-prlimit"),
+            },
+            scratch: PathBuf::from("/unused-git-capture"),
+        }
+    }
+
+    fn selected_git_checkout() -> PathBuf {
+        Path::new(SELECTED_GIT_HOME)
+            .join("git/checkouts")
+            .join(SELECTED_GIT_NAMESPACE)
+            .join(&SELECTED_GIT_REVISION[..7])
+    }
+
+    fn select_git_version(cache: &GitCache, manifest: &str, version: &str) -> io::Result<Value> {
+        let source = selected_git_checkout()
+            .join(Path::new(manifest).parent().unwrap())
+            .join("src/lib.rs");
+        cache.selected_package(
+            Path::new(SELECTED_GIT_HOME),
+            &format!("{SELECTED_GIT_SELECTOR}#dep@{version}"),
+            &[source.to_str().unwrap()],
+            &PreparationControl::uncontrolled(),
+        )
+    }
+
+    #[test]
+    fn selected_git_inherited_version_comes_from_its_retained_workspace() {
+        for (workspace_path, workspace, package) in [
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers=['member']\n[workspace.package]\nversion='1.2.3'\n",
+                "[package]\nname='dep'\nversion.workspace=true\n",
+            ),
+            (
+                "declared/Cargo.toml",
+                "[workspace]\nmembers=['../member']\n[workspace.package]\nversion='1.2.3'\n",
+                "[package]\nname='dep'\nworkspace='../declared'\nversion.workspace=true\n",
+            ),
+        ] {
+            let mut entries = vec![(workspace_path, workspace), ("member/Cargo.toml", package)];
+            if workspace_path != "Cargo.toml" {
+                entries.push((
+                    "Cargo.toml",
+                    "[workspace]\nmembers=[]\n[workspace.package]\nversion='9.8.7'\n",
+                ));
+            }
+            let cache = selected_git_version_fixture(&entries, &["1.2.3", "9.8.7"]);
+            let selected = select_git_version(&cache, "member/Cargo.toml", "1.2.3").unwrap();
+            assert_eq!(selected["version"], "1.2.3");
+            assert_eq!(
+                selected["manifest_path"],
+                serde_json::json!(selected_git_checkout().join("member/Cargo.toml"))
+            );
+            // The wrong version is independently present in the retained lock
+            // identities. It still cannot replace this manifest's inheritance.
+            assert!(select_git_version(&cache, "member/Cargo.toml", "9.8.7").is_err());
+        }
+    }
+
+    #[test]
+    fn selected_git_shared_blob_cannot_alias_another_workspace_package() {
+        let package = "[package]\nname='dep'\nversion.workspace=true\n";
+        let cache = selected_git_version_fixture(
+            &[
+                (
+                    "left/Cargo.toml",
+                    "[workspace]\nmembers=['member']\n[workspace.package]\nversion='1.2.3'\n",
+                ),
+                ("left/member/Cargo.toml", package),
+                (
+                    "right/Cargo.toml",
+                    "[workspace]\nmembers=['member']\n[workspace.package]\nversion='4.5.6'\n",
+                ),
+                ("right/member/Cargo.toml", package),
+            ],
+            &["1.2.3", "4.5.6", "9.8.7"],
+        );
+        let commit = cache.commits.values().next().unwrap();
+        assert_eq!(
+            commit.members["left/member/Cargo.toml"].object,
+            commit.members["right/member/Cargo.toml"].object
+        );
+        // The same retained blob inherits a different version at each path.
+        // Selected preparation still refuses the duplicate name before a
+        // claimed unit version can choose which path owns its source files.
+        for (manifest, version) in [
+            ("left/member/Cargo.toml", "1.2.3"),
+            ("right/member/Cargo.toml", "4.5.6"),
+        ] {
+            let value = &cache.manifests[&commit.members[manifest].object];
+            let retained = super::super::graph::retained_package_version(
+                manifest,
+                value,
+                &mut |candidate| {
+                    Ok(commit
+                        .members
+                        .get(candidate)
+                        .and_then(|member| cache.manifests.get(&member.object))
+                        .cloned())
+                },
+                &PreparationControl::uncontrolled(),
+            )
+            .unwrap();
+            assert_eq!(retained, version);
+        }
+        for (manifest, claimed_version) in [
+            ("left/member/Cargo.toml", "4.5.6"),
+            ("right/member/Cargo.toml", "1.2.3"),
+            ("left/member/Cargo.toml", "1.2.3"),
+            ("right/member/Cargo.toml", "4.5.6"),
+        ] {
+            let error = select_git_version(&cache, manifest, claimed_version).unwrap_err();
+            assert!(
+                error.to_string().contains("multiple captured manifests"),
+                "{manifest} at {claimed_version}: {error}"
+            );
+        }
+        assert!(select_git_version(&cache, "left/member/Cargo.toml", "9.8.7").is_err());
+    }
+
+    #[test]
+    fn selected_git_inheritance_cannot_borrow_a_manifest_outside_its_commit() {
+        let mut cache = selected_git_version_fixture(
+            &[
+                (
+                    "Cargo.toml",
+                    "[workspace]\nmembers=['member']\n[workspace.package]\nversion='1.2.3'\n",
+                ),
+                (
+                    "member/Cargo.toml",
+                    "[package]\nname='dep'\nversion.workspace=true\n",
+                ),
+            ],
+            &["1.2.3"],
+        );
+        let root = cache
+            .commits
+            .values_mut()
+            .next()
+            .unwrap()
+            .members
+            .remove("Cargo.toml")
+            .unwrap();
+        // The blob remains retained, as it could for another captured commit.
+        // Only membership in this selected commit supplies workspace authority.
+        assert!(cache.manifests.contains_key(&root.object));
+        assert!(select_git_version(&cache, "member/Cargo.toml", "1.2.3").is_err());
+    }
+
+    #[test]
+    fn selected_git_omitted_version_is_exactly_cargos_zero_default() {
+        let cache = selected_git_version_fixture(
+            &[("Cargo.toml", "[package]\nname='dep'\n")],
+            &["0.0.0", "1.2.3"],
+        );
+        let selected = select_git_version(&cache, "Cargo.toml", "0.0.0").unwrap();
+        assert_eq!(selected["version"], "0.0.0");
+        assert!(select_git_version(&cache, "Cargo.toml", "1.2.3").is_err());
+    }
 
     #[test]
     fn git_selectors_keep_full_locked_commit_authority_without_resolving_refs() {

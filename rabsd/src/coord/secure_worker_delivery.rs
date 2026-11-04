@@ -522,7 +522,8 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
             require(
                 grant.get("source_transfer").is_none()
                     && grant.get("toolchain_transfer").is_none()
-                    && grant.get("toolchain_reuse").is_none(),
+                    && grant.get("toolchain_reuse").is_none()
+                    && grant.get("toolchain_file_reuse").is_none(),
                 "input transfer was not authorized by this operator session",
             )?;
             grant.clone()
@@ -636,6 +637,9 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
                 &self.expected_operation,
                 grant.get("toolchain_reuse").is_some_and(|value| {
                     value == rabs_sandbox::toolchain_transfer::TOOLCHAIN_REUSE_VERSION
+                }),
+                grant.get("toolchain_file_reuse").is_some_and(|value| {
+                    value == rabs_sandbox::toolchain_transfer::TOOLCHAIN_FILE_REUSE_VERSION
                 }),
             )?;
         }
@@ -1240,12 +1244,18 @@ impl<'a, S> RecordPeer<'a, S> {
                 self.phase = Phase::ToolchainUpload;
                 self.set_phase_deadline(TOOLCHAIN_UPLOAD_BUDGET);
             }
-            Some("toolchain-entry" | "toolchain-chunk" | "toolchain-seal") => {
+            Some(
+                "toolchain-file-manifest"
+                | "toolchain-file-manifest-seal"
+                | "toolchain-entry"
+                | "toolchain-chunk"
+                | "toolchain-seal",
+            ) => {
                 require(
                     self.phase == Phase::ToolchainUpload,
                     "toolchain frame outside upload",
                 )?;
-                // Directory declarations, all file chunks and final sealing
+                // File manifests, directory declarations, chunks and sealing
                 // share one absolute budget, independent of execution time.
             }
             Some("canonical-exec") => {
@@ -2992,6 +3002,41 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn file_reuse_toolchain_fixture(
+        root: &Path,
+        whole_warm: bool,
+        files_warm: bool,
+    ) -> (SourceUpload, Value, Script) {
+        use rabs_sandbox::toolchain_transfer::{
+            TOOLCHAIN_FILE_REUSE_VERSION, TOOLCHAIN_REUSE_VERSION,
+        };
+        let (upload, request, mut script) = toolchain_fixture(root, whole_warm);
+        script.replies[0]["toolchain_file_reuses"] = json!([TOOLCHAIN_FILE_REUSE_VERSION]);
+        if whole_warm {
+            script.replies[0]["toolchain_reuses"] = json!([TOOLCHAIN_REUSE_VERSION]);
+        } else {
+            if files_warm {
+                script
+                    .replies
+                    .retain(|reply| reply["kind"] != "toolchain-chunk-accepted");
+            }
+            let identity = &request["toolchain_identity"];
+            script.replies.insert(
+                7,
+                json!({"kind":"toolchain-file-manifest-accepted", "request_id":7,
+                "sha256":identity["sha256"], "next_offset":1,
+                "missing":if files_warm {json!([])} else {json!(["rustc"])}}),
+            );
+            script.replies.insert(
+                8,
+                json!({"kind":"toolchain-file-manifest-ready", "request_id":7,
+                "sha256":identity["sha256"], "files":identity["files"], "bytes":identity["bytes"]}),
+            );
+        }
+        (upload, request, script)
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn dependency_execution_requires_explicit_selection_before_live_admission_or_upload() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3221,6 +3266,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn unsolicited_toolchain_reuse_grants_require_retained_input_ownership_before_challenge() {
+        use rabs_sandbox::toolchain_transfer::{
+            TOOLCHAIN_FILE_REUSE_VERSION, TOOLCHAIN_REUSE_VERSION, TOOLCHAIN_TRANSFER_VERSION,
+        };
+        for (field, version) in [
+            ("toolchain_transfer", TOOLCHAIN_TRANSFER_VERSION),
+            ("toolchain_reuse", TOOLCHAIN_REUSE_VERSION),
+            ("toolchain_file_reuse", TOOLCHAIN_FILE_REUSE_VERSION),
+        ] {
+            let mut offered = hello();
+            offered["toolchain_transfers"] = json!([TOOLCHAIN_TRANSFER_VERSION]);
+            offered["toolchain_reuses"] = json!([TOOLCHAIN_REUSE_VERSION]);
+            offered["toolchain_file_reuses"] = json!([TOOLCHAIN_FILE_REUSE_VERSION]);
+            let mut peer = peer(offered, response());
+            let offered = peer.receive().unwrap();
+            let mut selected = grant();
+            selected[field] = json!(version);
+            assert!(peer.negotiate(&offered, &selected).is_err(), "{field}");
+            assert!(peer.inner.sent.is_empty());
+            assert!(peer.authentication().is_none());
+            assert!(peer.send(&request()).is_err());
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn authenticated_toolchain_reuse_uses_the_actual_grant_and_preserves_exact_execution() {
@@ -3286,6 +3356,120 @@ mod tests {
             changed["toolchain_identity"]["sha256"] = json!("ab".repeat(32));
             assert!(peer.send(&changed).is_err());
             assert_eq!(delivery.receipt["publication_authorized"], false);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn authenticated_file_reuse_keeps_manifest_exchange_inside_admission_and_exact_execution() {
+        use rabs_sandbox::toolchain_transfer::TOOLCHAIN_FILE_REUSE_VERSION;
+        use sha2::{Digest, Sha256};
+
+        // The trusted-transport fixture scripts worker ACKs; the sender tests
+        // separately exercise actual receiver checkpoint/import and final hash.
+        for (whole_warm, files_warm) in [(false, false), (false, true), (true, true)] {
+            let root = tempfile::tempdir().unwrap();
+            let (upload, request, script) =
+                file_reuse_toolchain_fixture(root.path(), whole_warm, files_warm);
+            let original = serde_json::to_vec(&request).unwrap();
+            let mut peer = source_admission(script, &request)
+                .with_source(&upload)
+                .unwrap();
+            let delivery = receive_operation(
+                &mut peer,
+                &request,
+                "worker",
+                &root.path().join("delivery"),
+                DeliveryMode::Execute,
+            )
+            .unwrap();
+            assert!(delivery.acknowledgments_confirmed);
+            assert!(peer.inner.replies.is_empty());
+            let sent = &peer.inner.sent;
+            assert_eq!(
+                sent[1]["toolchain_file_reuse"],
+                TOOLCHAIN_FILE_REUSE_VERSION
+            );
+            assert_eq!(
+                sent[1]["execution_lease"]["request_sha256"],
+                hex(&Sha256::digest(&original))
+            );
+            assert_eq!(sent[6]["kind"], "toolchain-begin");
+            let manifests = sent
+                .iter()
+                .filter(|frame| frame["kind"] == "toolchain-file-manifest")
+                .collect::<Vec<_>>();
+            if whole_warm {
+                assert!(manifests.is_empty());
+                assert_eq!(sent[7], request);
+            } else {
+                assert_eq!(manifests.len(), 1);
+                assert_eq!(manifests[0]["offset"], 0);
+                assert_eq!(
+                    manifests[0]["sha256"],
+                    request["toolchain_identity"]["sha256"]
+                );
+                assert_eq!(
+                    manifests[0]["files"],
+                    json!([{"path":"rustc", "bytes":23,
+                    "executable":true, "sha256":hex(&Sha256::digest(b"transport fixture bytes"))}])
+                );
+                assert_eq!(sent[8]["kind"], "toolchain-file-manifest-seal");
+                let execution = sent
+                    .iter()
+                    .position(|frame| frame["kind"] == "canonical-exec")
+                    .unwrap();
+                assert_eq!(sent[execution - 1]["kind"], "toolchain-seal");
+                assert_eq!(
+                    sent.iter().any(|frame| frame["kind"] == "toolchain-chunk"),
+                    !files_warm
+                );
+            }
+            assert_eq!(
+                sent.iter()
+                    .filter(|frame| frame["kind"] == "canonical-exec")
+                    .collect::<Vec<_>>(),
+                vec![&request]
+            );
+            assert_eq!(serde_json::to_vec(&request).unwrap(), original);
+            assert!(peer.send(&request).is_err());
+            assert_eq!(delivery.receipt["publication_authorized"], false);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_authenticated_file_manifest_exchange_never_dispatches_or_retries() {
+        for case in 0..6 {
+            let root = tempfile::tempdir().unwrap();
+            let (upload, request, mut script) =
+                file_reuse_toolchain_fixture(root.path(), false, false);
+            match case {
+                0 => script.replies[7]["sha256"] = json!("ab".repeat(32)),
+                1 => script.replies[7]["next_offset"] = json!(0),
+                2 => script.replies[7]["missing"] = json!(["foreign"]),
+                3 => script.replies[8]["files"] = json!(2),
+                4 => script.replies[8]["bytes"] = json!(0),
+                _ => script.replies.truncate(7),
+            }
+            let mut peer = source_admission(script, &request)
+                .with_source(&upload)
+                .unwrap();
+            let failure = receive_operation(
+                &mut peer,
+                &request,
+                "worker",
+                &root.path().join("delivery"),
+                DeliveryMode::Execute,
+            )
+            .unwrap_err();
+            assert!(!failure.execution_may_have_run, "case {case}: {failure}");
+            assert!(peer.authentication().is_none());
+            assert!(peer.inner.sent.iter().all(|frame| !matches!(
+                frame["kind"].as_str(),
+                Some("toolchain-entry" | "toolchain-chunk" | "toolchain-seal" | "canonical-exec")
+            )));
+            assert!(peer.send(&request).is_err());
         }
     }
 
@@ -3568,13 +3752,24 @@ mod tests {
         let mut peer = RecordPeer::new(&runtime, (), &request());
         let execution_budget = peer.execution_budget;
         assert!(peer.begin_frame(Some("toolchain-begin")).is_err());
+        assert!(peer.begin_frame(Some("toolchain-file-manifest")).is_err());
+        assert!(
+            peer.begin_frame(Some("toolchain-file-manifest-seal"))
+                .is_err()
+        );
         peer.begin_frame(Some("source-begin")).unwrap();
         peer.begin_frame(Some("source-seal")).unwrap();
         let before = Instant::now();
         peer.begin_frame(Some("toolchain-begin")).unwrap();
         let until = peer.until;
         assert!(until >= before + TOOLCHAIN_UPLOAD_BUDGET);
-        for kind in ["toolchain-entry", "toolchain-chunk", "toolchain-seal"] {
+        for kind in [
+            "toolchain-file-manifest",
+            "toolchain-file-manifest-seal",
+            "toolchain-entry",
+            "toolchain-chunk",
+            "toolchain-seal",
+        ] {
             peer.begin_frame(Some(kind)).unwrap();
             assert_eq!(peer.until, until);
         }
@@ -3590,6 +3785,8 @@ mod tests {
         assert_eq!(peer.execution_budget, execution_budget);
         peer.until = Instant::now() - Duration::from_millis(1);
         for kind in [
+            "toolchain-file-manifest",
+            "toolchain-file-manifest-seal",
             "toolchain-entry",
             "toolchain-chunk",
             "toolchain-seal",

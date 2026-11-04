@@ -91,6 +91,23 @@ impl ActionClass {
     }
 }
 
+/// Canonical component names and order for action-key assembly and inspection.
+/// Changing this order changes semantic key identity and requires a new epoch.
+pub const ACTION_KEY_COMPONENT_NAMES: [&str; 12] = [
+    "normalized_invocation",
+    "virtual_working_directory",
+    "action_inputs",
+    "negative_dependencies",
+    "dependency_inputs",
+    "toolchain",
+    "output_platform",
+    "environment",
+    "sandbox_semantic_policy",
+    "build_path_semantic_policy",
+    "execution_semantics",
+    "output_declarations",
+];
+
 /// The immutable semantic descriptor: its fields are EXACTLY the action-key
 /// inputs (plan §16/§17). No subscriber, priority, worker, or presentation
 /// field exists here — that absence is the boundary.
@@ -153,20 +170,24 @@ impl ActionDescriptor {
             execution_semantics,
             output_declarations,
         } = self;
-        vec![
-            ("normalized_invocation", normalized_invocation),
-            ("virtual_working_directory", virtual_working_directory),
-            ("action_inputs", action_inputs),
-            ("negative_dependencies", negative_dependencies),
-            ("dependency_inputs", dependency_inputs),
-            ("toolchain", toolchain),
-            ("output_platform", output_platform),
-            ("environment", environment),
-            ("sandbox_semantic_policy", sandbox_semantic_policy),
-            ("build_path_semantic_policy", build_path_semantic_policy),
-            ("execution_semantics", execution_semantics),
-            ("output_declarations", output_declarations),
-        ]
+        let components: [&TypedDigest; ACTION_KEY_COMPONENT_NAMES.len()] = [
+            normalized_invocation,
+            virtual_working_directory,
+            action_inputs,
+            negative_dependencies,
+            dependency_inputs,
+            toolchain,
+            output_platform,
+            environment,
+            sandbox_semantic_policy,
+            build_path_semantic_policy,
+            execution_semantics,
+            output_declarations,
+        ];
+        ACTION_KEY_COMPONENT_NAMES
+            .into_iter()
+            .zip(components)
+            .collect()
     }
 }
 

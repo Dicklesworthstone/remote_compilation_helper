@@ -401,6 +401,32 @@ fn actual_daemon_wait_refuses_damaged_results_without_printing_even_the_valid_fi
 }
 
 #[test]
+fn actual_daemon_live_stderr_refuses_rustc_jobs_without_exposing_or_reexecuting_their_result() {
+    let fixture = Fixture::new(Some(0), false);
+    let mut daemon = fixture.daemon();
+    let mut command = fixture.command();
+    command.args(["--job-wait", "--live-stderr", ID, "10"]);
+    let mut client = Process::start(&fixture.root, "live-refused", &mut command);
+    assert_eq!(client.wait().code(), Some(1));
+    assert!(read_log(&client.stdout).is_empty());
+    let failure: Value = serde_json::from_slice(&read_log(&client.stderr)).unwrap();
+    assert_eq!(failure["kind"], "prepared-client-error");
+    assert!(failure["detail"].as_str().unwrap().contains("whole-Cargo"));
+    assert_eq!(failure["diagnostics_may_have_been_exposed"], false);
+    assert_eq!(failure["reexecute"], false);
+    fixture.assert_unchanged();
+    assert!(!String::from_utf8_lossy(&read_log(&daemon.stderr)).contains("worker-exec-listening"));
+    // The new explicit presentation option does not change ordinary verified
+    // wait: that distinct mode still returns both exact streams for this job.
+    let mut ordinary = fixture.wait();
+    assert_eq!(ordinary.wait().code(), Some(0));
+    assert_eq!(read_log(&ordinary.stdout), fixture.stdout);
+    assert_eq!(read_log(&ordinary.stderr), fixture.stderr);
+    fixture.assert_unchanged();
+    daemon.shutdown();
+}
+
+#[test]
 fn actual_daemon_wait_never_reexecutes_uncertainty_or_reads_a_pre_start_cancelled_delivery() {
     for cancelled in [false, true] {
         let fixture = Fixture::new(None, cancelled);

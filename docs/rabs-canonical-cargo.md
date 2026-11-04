@@ -2,7 +2,7 @@
 
 `cargo rabs --rabs-canonical PROFILE.json -- build --workspace` connects ordinary
 Cargo workspace builds to RABS's existing canonical worker path. The same path
-supports `check`, `clippy`, `test`, `run`, and `bench`, with Cargo selecting the
+supports `check`, `clippy`, `doc`, `test`, `run`, and `bench`, with Cargo selecting the
 requested libraries, binaries, examples and test or benchmark executables.
 `test --no-run` and `bench --no-run` compile without running those executables.
 Execution commands run on the selected worker and return Cargo's final exit status:
@@ -55,6 +55,8 @@ For `clippy`, that same captured dataset must also contain ordinary executable
 Clippy program directly and binds its Cargo and rustc companions to the captured
 absolute paths, so dispatcher or worker PATH entries cannot select a different
 Clippy installation.
+For `doc`, the captured dataset also requires ordinary executable `bin/rustdoc`.
+Both `RUSTDOC` and `RUSTC` are bound to that dataset's canonical executables.
 
 For an installed Rustup toolchain, either canonical **launcher** profile can
 replace `"toolchain_root": "/absolute/toolchain"` with `"toolchain": "rustup"`.
@@ -200,13 +202,42 @@ RABS_SOCKET_PATH=/home/builder/.cache/rch/rabsd.sock rabsd --job-wait JOB_ID
 RABS_SOCKET_PATH=/home/builder/.cache/rch/rabsd.sock rabsd --job-cancel JOB_ID
 ```
 
+To see stderr progress while a daemon-backed canonical build runs, add this
+Boolean field to its profile:
+
+```json
+"live_stderr": true
+```
+
+The launcher selects `rabsd --job-build --live-stderr --prepare-from ...` for
+either a single worker or a worker pool. The native client displays a contiguous
+stderr prefix in bounded chunks, then verifies the bytes already shown against
+the final transcript before printing the remaining stderr. A gap in the live
+preview stops early presentation; the verified result supplies the unseen
+suffix. **Stdout remains behind verified completion and artifact installation**,
+because Cargo's stdout can announce artifact readiness. Early diagnostics do not
+establish build success or authorize another execution.
+
+`live_stderr` accepts only `true` or `false` and requires an explicit, valid
+`daemon_socket`, even when set to `false`. Direct worker profiles and local
+canonical profiles refuse this field before preparation. Omission or `false`
+retains ordinary completed-result replay. The selected mode is presentation
+intent in `operation.json`; it is not copied into the worker command, its
+environment or the Cargo artifact contract. An older daemon without the native
+whole-Cargo diagnostics capability refuses an explicit live request.
+
 The ordinary recovery frontend also recognizes a saved daemon operation:
 
 ```sh
 cargo rabs --rabs-recover /home/builder/.cache/rch/operations/cargo-JOB_ID
 ```
 
-It uses the saved job ID and private daemon socket to invoke `--job-wait` once.
+It uses the saved job ID and private daemon socket to invoke `--job-wait` once,
+including `--live-stderr` when the retained operation requested it. Recovery
+validates the saved mode against the fixed wait command and reconstructs the
+invocation using the installed driver. Status, cancellation and result-control
+commands keep their existing semantics and do not implicitly wait or show a
+diagnostic stream.
 The original profile, checkout, toolchain and captured bundle are not needed for
 this read-only wait/replay path. It does not resubmit the job. For a daemon-owned
 operation, `--status` and `--cancel` also address that same job. Result controls
@@ -215,6 +246,14 @@ operation, `--status` and `--cancel` also address that same job. Result controls
 recovery, and release commands. They preserve its selected worker and request
 identity. Wait on the original job afterward to replay a verified compiler
 result.
+
+Each later explicit recovery or `rabsd --job-wait --live-stderr JOB_ID` starts a
+new presentation cursor and may replay the whole retained diagnostic transcript.
+There is no durable console-position checkpoint across client processes.
+Within one waiting invocation, the native client retains its already displayed
+stderr prefix through result-only recovery and prints the verified suffix once.
+A lost or failed wait never causes the launcher to fall back to local compilation
+or submit another execution.
 
 Waiting again is a read-only operation and replays a verified completed result.
 If the initial submission response was lost, inspect the same job first. The
@@ -532,8 +571,9 @@ remote execution.
 Manifests, lockfiles and captured project configuration retain their original
 bytes; no source replacement is synthesized for this mode.
 
-The cache must contain the locked graph, including optional and target-specific
-dependencies needed by the planner's `--all-features` metadata check. A successful
+By default, the cache must contain the locked graph, including optional and
+target-specific dependencies needed by the planner's `--all-features` metadata
+check. A successful
 default-feature build alone may not populate it. Prepare that cache explicitly
 with stock `cargo fetch --locked` before using this offline mode; the RABS
 preparer does not perform that network operation for you.
@@ -565,6 +605,88 @@ authentication-dependent indexes, source replacement configurations and Git
 graphs outside the locked-commit cache profile still require the supported
 approved vendor route. Cache capture does not authorize action
 cache publication or a compiler skip.
+
+### Prepare the selected Cargo dependency graph
+
+For `build`, `check`, `clippy`, `doc`, `test`, `run` and `bench`, a `canonical-cargo-v1` launcher profile can opt into
+command-specific dependency preparation with this field:
+
+```json
+"source_selection": "cargo-unit-graph-v1"
+```
+
+This mode accepts local source anchors and an approved `cargo_home_source`.
+It cannot be combined with `vendor`; existing vendor profiles continue to use
+the default preparer.
+
+The launcher passes that local intent as `cargo_source.selection`. The native
+preparer binds it to the actual validated Cargo request and asks the captured
+Cargo for its nonexecuting `--unit-graph -Z unstable-options` plan. Package,
+feature, target and profile selection must describe the command that the worker
+will run. Planning includes selected host build dependencies and procedural
+macros as well as target units; a target-filtered metadata result alone is not
+the dependency closure.
+
+Test and benchmark planning preserves the selected targets, name filter,
+`--no-run`, `--doc` and `--no-fail-fast` where applicable. Harness and program
+arguments after `--` stay in the original execution request and are never
+passed to the graph query. Planning does not compile or run build scripts,
+tests, benchmarks or the requested program. For `run`, captured Cargo metadata
+and, when needed, `cargo pkgid` resolve the exact default binary; named binaries
+and examples retain their explicit selectors. The preparer queries a build
+graph for that one target because Cargo's run command may look for an executable
+even during graph-only planning. The worker still receives the original `run`
+command and its literal arguments. Ambiguous default binaries are refused.
+
+Clippy planning runs the captured `cargo-clippy` with its captured `cargo` and
+`rustc`, and requires the ordinary executable `clippy-driver` companion from
+the same toolchain image. It preserves `--no-deps` and the validated lint-level
+arguments after `--`; the preparer inserts every locked/offline and unit-graph
+control before that lint tail. `--no-deps` changes linting, not dependency input
+requirements: selected ordinary dependencies, build scripts and procedural
+macros still need their complete sources. A missing companion or an unsupported
+lint argument refuses preparation before Cargo planning. Neither graph planning
+nor a selected source archive is permission to reuse a Clippy result.
+
+Documentation planning preserves `--no-deps` and `--document-private-items` and
+requires captured rustdoc and rustc. The selected roots must be Cargo `doc`
+units; required dependency `check`/`build` units and project executors remain
+in the graph. `--no-deps` omits dependency documentation, not the compiler
+inputs needed to document the selected packages.
+
+Planning and execution use the same validated literal application environment.
+Overrides of Cargo, Rustup, compiler, loader, Git or RABS control variables are
+refused, apart from the existing explicit `CARGO_INCREMENTAL` control and
+Clippy's exact launcher-supplied canonical `CARGO`/`RUSTC` bindings and Doc's
+canonical `RUSTDOC`/`RUSTC` bindings. These
+are rebound only to their captured physical siblings during local planning;
+profile environment settings cannot replace them. The canonical Cargo or Clippy
+program and the selected manifest's parent working directory must agree with the
+launcher request. Remote canonical requests sent directly to `rabsd` have the
+same requirements. Captured compiler flags must also be independent of the planning
+machine: `-C target-cpu=native` is refused in this mode because it can change
+conditional dependency selection on a worker with different hardware. Explicit
+CPU and target-feature settings remain supported.
+
+With `cargo_home_source`, absent sparse-registry archives are permitted only
+when Cargo does not select those packages. For example, a disabled optional
+dependency or a Windows-only dependency need not be downloaded for a Linux
+check that does not use it. Locked sparse-index records remain required, and
+every selected package must resolve to retained, verified source bytes. A
+missing selected archive, changed checksum, unsupported graph or unsupported
+command refuses preparation. The preparer does not fetch missing inputs or
+fall back to a different selection. Pinned Git capture retains its existing
+complete locked-revision contract. Selected Git packages also require an
+unambiguous source selector and one retained manifest for each package name in
+the selected commit; duplicate same-name manifests are refused.
+
+This option still captures the complete approved source anchor and retains its
+original manifests, lockfile and configuration. It changes dependency
+preparation, not the worker's artifact or cache-authority contract. Profiles
+without `source_selection` keep the existing complete-graph preparation.
+Clippy retains its full captured source identity and separate private target
+families, including the ordered lint controls. This option does not relax its
+freshness or cache-authority boundary.
 
 ### Captured compiler configuration
 
@@ -618,7 +740,7 @@ add this Boolean field to the canonical JSON profile:
 "incremental": true
 ```
 
-The launcher supplies `CARGO_INCREMENTAL=1` for `build`, `check`, `clippy`, `test`,
+The launcher supplies `CARGO_INCREMENTAL=1` for `build`, `check`, `clippy`, `doc`, `test`,
 `run`, and `bench`, including both `--no-run` forms. Omitting the field or setting it to `false`
 keeps `CARGO_INCREMENTAL=0`. This is an explicit operation policy: it overrides
 the incremental settings of captured Cargo profiles, including release and
@@ -641,6 +763,10 @@ dependency closure and other compilation controls remain unchanged. Cargo checks
 the current feature fingerprints and build-script environment; unchanged
 dependencies can remain fresh as features are enabled, disabled or selected
 again. Clippy feature selections remain separate so lint coverage is rechecked.
+Doc keeps exact command arguments and the complete captured source identity.
+Its private incremental projection refuses a custom profile named `doc`, whose
+`doc/incremental` state root would overlap documentation for a crate named
+`incremental`; complete-tree Doc delivery has no such exclusion.
 
 Incremental compiler state remains on the worker and is excluded from delivered
 artifacts through the explicit contracts described below. It is never a shared
@@ -657,12 +783,13 @@ broader dependency or workspace action-cache serving.
 
 ## Supported command contract
 
-The first command must be `build`, `check`, `clippy`, `test`, `run`, or `bench`. For example:
+The first command must be `build`, `check`, `clippy`, `doc`, `test`, `run`, or `bench`. For example:
 
 ```sh
 cargo rabs --rabs-canonical PROFILE.json -- build --workspace
 cargo rabs --rabs-canonical PROFILE.json -- check --workspace --all-targets
 cargo rabs --rabs-canonical PROFILE.json -- clippy --workspace --all-targets --all-features -- -D warnings
+cargo rabs --rabs-canonical PROFILE.json -- doc --workspace --no-deps --document-private-items
 cargo rabs --rabs-canonical PROFILE.json -- test --workspace --no-run
 cargo rabs --rabs-canonical PROFILE.json -- test --workspace --no-fail-fast
 cargo rabs --rabs-canonical PROFILE.json -- test --test integration selected::case -- --exact --nocapture
@@ -677,7 +804,7 @@ cargo rabs --rabs-canonical PROFILE.json -- bench --bench measured selected -- -
 ```
 
 `--profile NAME` and `--profile=NAME` select a captured manifest or configuration
-profile for all six supported commands. Supply one profile, without
+profile for all seven supported commands. Supply one profile, without
 `--release` or `-r`. Names are 1–64 ASCII letters, digits, underscores or hyphens,
 starting with a letter or digit. The launcher preserves the exact arguments and
 lets Cargo resolve the profile. Warm target reuse keeps debug, release and named
@@ -685,6 +812,7 @@ custom profile families separate. The built-in `dev`/`test` profiles share the
 debug family; `release`/`bench` share the release family. Cargo rechecks each
 unit's actual compilation settings, and captured configuration remains exact.
 Clippy preserves its own profile selection in a separate lint family.
+Doc preserves its exact invocation and complete source identity.
 `bench` uses Cargo's bench/release profile by default. Cargo's benchmark command
 does not accept `--release` or `-r`; use `--profile` for another profile.
 
@@ -700,6 +828,14 @@ arguments are not interpreted as Cargo flags; required Cargo controls are
 inserted before the delimiter. Cargo remains responsible for selection,
 doctests, ignored tests, list/help modes and the final process exit. The captured
 toolchain must contain `rustdoc` when the selected command needs it.
+
+`doc` generates HTML documentation with package/workspace/features/profile/target
+selection and library, binary or example targets. It supports `--no-deps` and
+`--document-private-items`. Tests, benches, `--all-targets`, browser launching,
+alternate output formats and argument tails are refused. The complete verified
+target tree includes source pages, search data and static assets beyond the
+crate indexes reported by Cargo. The [documentation section](#generate-and-deliver-documentation)
+describes both canonical execution paths.
 
 `run` selects at most one package and one literal `--bin NAME` or `--example NAME`.
 With no target selector, Cargo resolves the package's default executable. Program
@@ -970,14 +1106,15 @@ performance gates and the required canary/soak are not completed by this fronten
 ## Local canonical Cargo commands with dependency caching
 
 `rabsd --canonical-compile-local PROFILE.json` runs the captured native Cargo as
-`cargo check`, `cargo build`, `cargo clippy`, `cargo test`, `cargo run` or
+`cargo check`, `cargo build`, `cargo clippy`, `cargo doc`, `cargo test`, `cargo run` or
 `cargo bench`, always offline and locked, with the selected packages, features and targets
 inside the canonical namespace and connects
 its rustc requests to an operation-owned coordinator. Eligible external registry,
 locked Git and verified directory-source libraries use the existing metadata
 cache or the isolated worker archive lane, including cold-result publication,
 differential verification and compiler-skip gates. Successful builds retain their
-completed target tree and report its usable host path. `test --no-run` and
+completed target tree and report its usable host path. Documentation commands
+retain their complete generated target tree too. `test --no-run` and
 `bench --no-run` deliver their compiled harnesses the same way. Tests, doctests,
 programs and benchmarks execute on every invocation and return their current
 result. Cargo plans the units at `/__rabs/workspace` with the captured
@@ -987,7 +1124,7 @@ arguments or metadata output.
 
 The local profile asks the captured Cargo to plan the **actual selected build
 units** with `--unit-graph -Z unstable-options` on the selected `check`, `build`,
-`clippy`, `test` or `bench`, using the same Cargo selection, captured configuration
+`clippy`, `doc`, `test` or `bench`, using the same Cargo selection, captured configuration
 and canonical paths as execution. For `run`, captured metadata and Cargo's own
 package resolution identify the selected binary or executable example; the
 driver plans that exact target with `cargo build --bin/--example`. This avoids
@@ -1014,11 +1151,18 @@ selection determines whether the harnesses execute. Unknown graph versions, mode
 cycles, unreachable units and sources outside the retained inputs also refuse.
 This requires a nightly Cargo supporting the unit-graph interface; an unsupported
 toolchain does not fall back to a guessed package graph.
+Doc also always requires isolated-worker dependency authority. Its `doc` units
+remain outside rustc result admission; ordinary dependency build/check units
+retain their independently qualified compiler paths.
 
-The earlier source preparation still captures the complete approved anchor and
+The default source preparation still captures the complete approved anchor and
 uses locked all-features metadata to validate its dependency closure. Selecting
 fewer compilation units does not reduce the authorized upload/capture scope or make
-missing locked dependencies available offline.
+missing locked dependencies available offline. The explicit `source_selection`
+option described above is also available on `canonical-compile-local-v1`
+profiles for `build`, `check`, `clippy`, `doc`, `test`, `run` and `bench`. It changes the preparation
+graph without narrowing the approved source anchor or granting compiler-result
+authority.
 Workspace members and primary packages use the separately qualified workspace
 worker profiles described below; unsupported requests compile normally inside
 the namespace. Their results never enter the external-dependency cache class.
@@ -1028,7 +1172,7 @@ archive actions with `dep-info` and `link`, optionally also `metadata`, require
 the worker's separately admitted closed archive namespace before they can publish
 or replay a cache result. With no suitable worker, Cargo still builds those
 archives in its own namespace, without granting those local archive results cache
-authority. Test, Run and Bench commands and graphs containing active build scripts or procedural macros also
+authority. Test, Clippy, Doc, Run and Bench commands and graphs containing active build scripts or procedural macros also
 require that isolated worker lane for metadata cache publication and replay.
 Project executors can access the operation's wrapper socket; they cannot turn a
 claimed local completion into trusted cache evidence. The retained graph policy
@@ -1087,10 +1231,10 @@ the effect on a particular workload.
 
 Install matching native `rabsd` and `rabs-wrap` binaries. The explicit nightly toolchain
 root must contain its real `bin/cargo`, `bin/rustc`, libraries and native sysroot.
-Selected doctests additionally require an ordinary executable `bin/rustdoc` in
-that captured toolchain. Test invocations bind `RUSTDOC` to
+Documentation and selected doctests additionally require an ordinary executable
+`bin/rustdoc` in that captured toolchain. Doc and Test invocations bind `RUSTDOC` to
 `/__rabs/toolchain/bin/rustdoc`; ambient PATH or configuration cannot select a
-different documentation-test compiler.
+different documentation compiler.
 The preparing host must pass the full production bubblewrap namespace probe,
 including private `/proc`, `/dev`, temporary storage and network isolation.
 Unsupported hosts return an error before compilation; there is no weaker local
@@ -1126,13 +1270,13 @@ For an already vendored project, save this profile with your actual absolute pat
 rabsd --canonical-compile-local ./canonical-compile.json
 ```
 
-`command` is `check` by default, `build`, `clippy`, `test`, `run` or `bench`.
+`command` is `check` by default, `build`, `clippy`, `doc`, `test`, `run` or `bench`.
 The profile and native entry point
 replace `canonical-check-local-v1` and `--canonical-check-local`; install matching
 tools and update saved local profiles. `manifest` defaults to `Cargo.toml`, `jobs`
 to 1 and `timeout_seconds` to 1800.
 Omitting `selection` for `check` retains the library-only `check --lib` behavior;
-omitting it for `build`, `clippy`, `test`, `run` or `bench` uses Cargo's ordinary
+omitting it for `build`, `clippy`, `doc`, `test`, `run` or `bench` uses Cargo's ordinary
 default members and targets. Setting
 `"selection": {}` uses Cargo's ordinary default members and targets. A selection
 can specify `workspace`, `packages`, `exclude`, `features`, `all_features`,
@@ -1144,6 +1288,8 @@ For `test` and `bench`, it also accepts `no_run`, `no_fail_fast`, an optional
 for `test`. These harness fields cannot change another command. Bench uses
 Cargo's optimized benchmark profile by default and accepts `profile`, but
 rejects `release`, matching Cargo's `bench` options.
+For the `doc` command, selection also accepts `no_deps` and
+`document_private_items`, while test/benchmark targets and harness fields are refused.
 For `run`, the selection accepts one package, one compilation target, and at
 most one named binary or example, with no workspace or plural target selectors.
 The literal `run_args` array supplies the program's arguments after `--`;
@@ -1184,7 +1330,7 @@ credentials or unrelated expanded sources. The source, toolchain, state,
 operation and optional Cargo-cache roots must be disjoint ordinary absolute
 directories. The wrapper must be an ordinary executable outside the captured
 source and mutable state/operation roots. Commands other than `check`, `build`,
-`clippy`, `test`, `run` and `bench` and arbitrary mount declarations are not
+`clippy`, `doc`, `test`, `run` and `bench` and arbitrary mount declarations are not
 profile fields.
 
 An optional `env` object supplies literal application inputs, for example
@@ -1215,12 +1361,50 @@ serving, prepared-job and administrative messages. Logical compiler paths are
 translated to backing files only through the coordinator's retained mount
 capability; a wrapper-supplied path or environment flag cannot construct one.
 
+### Select native source preparation
+
+For a native profile using an approved Cargo cache, replace `vendor` with these
+fields to prepare dependencies for the command you actually select:
+
+```json
+"cargo_home_source": "/home/builder/.cargo",
+"source_selection": "cargo-unit-graph-v1"
+```
+
+A purely local graph needs only `source_selection`. Both the native entry point
+and `cargo rabs --rabs-canonical-local` support this mode for `check`, `build`,
+`clippy`, `doc`, `test`, `run` and `bench`. The captured Cargo plans the actual package, feature,
+target and profile selection, including host build dependencies and procedural
+macros. The driver's fixed compiler paths, output directory and job count remain
+bound to that execution. The [selected preparation constraints](#prepare-the-selected-cargo-dependency-graph)
+apply; `vendor` cannot use this opt-in mode.
+
+For Clippy, preparation invokes the captured `cargo-clippy` and requires its
+ordinary executable `clippy-driver` companion. Its exact `CARGO` and `RUSTC`
+bindings resolve inside the captured toolchain during planning, while retained
+requests keep their canonical paths. Ordered lint controls follow Cargo's
+nonexecuting graph flags. Preparation neither compiles nor executes project code;
+the subsequent Clippy command still runs its current lint selection, without
+claiming a cached lint result.
+
+Final delivery includes only registry archives belonging to the validated
+selected units. The complete locked sparse-index records, registry configuration,
+lockfile and approved source anchor remain retained, and Git capture keeps its
+complete locked-revision contract. An inactive optional dependency, or an external
+dependency used only by an unselected workspace member, can lack its archive.
+Selecting that package requires its verified archive and fails if it is missing.
+
+Available locked archives are still captured and verified before Cargo selects
+the graph. Pruning reduces the final delivery and retained cache inputs; it does
+not reduce the initial capture work or its resource limits. This input-preparation
+option leaves compiler-cache admission and publication rules unchanged.
+
 ### Send canonical dependency compilations to workers
 
 The local Cargo driver also accepts the existing pinned dependency-worker
 configuration from its operator environment. With no worker configuration it
 keeps the local metadata lane only for compiler-only check/build graphs without
-project executors. Test, Clippy, Run and Bench commands and graphs with build scripts or procedural
+project executors. Test, Clippy, Doc, Run and Bench commands and graphs with build scripts or procedural
 macros compile without local action-cache authority.
 To use workers, install matching `rabsd`, `rabs-wrap` and
 `rabs-wkr` binaries and provision the mutual-TLS credentials described in
@@ -1809,6 +1993,42 @@ that rustc dep-info would not observe. An identical Clippy request can restore
 verified private Cargo state; it still starts the selected Cargo/Clippy command.
 Lint outcomes are never shared action-cache results or delivered build artifacts.
 
+### Generate and deliver documentation
+
+Both canonical profiles support HTML documentation generation:
+
+```sh
+cargo rabs --rabs-canonical-local ./canonical-compile.json -- doc --workspace --no-deps
+cargo rabs --rabs-canonical-local ./canonical-compile.json -- doc -p core --lib --document-private-items
+cargo rabs --rabs-canonical ./canonical-worker.json -- doc --workspace --no-deps --document-private-items
+```
+
+The captured toolchain must contain ordinary executable Cargo, rustc and rustdoc.
+Planning and execution bind both compilers to their captured canonical paths.
+A native local profile can express the same command as `"command":"doc"` and
+`"selection":{"no_deps":true,"document_private_items":true}`. Complete and
+selected source preparation both support Doc.
+
+The returned target directory contains `doc/<crate>/index.html`; an explicit
+compilation target uses `<target>/doc/<crate>/index.html`. The whole verified
+tree is delivered or retained, including private-item pages when selected,
+source views, search indexes, JavaScript, fonts and CSS. Cargo's JSON index
+filenames establish the required minimum, so they never filter out supporting
+files. Existing tree path, byte, file-count, mutation and writer-drain limits apply.
+
+Doc supports library, binary and example selectors, with the profile's existing
+package, feature, target and compilation-profile controls. It rejects test and
+benchmark targets, `--all-targets`, `--open`, custom output formats, arbitrary
+rustdoc arguments and compiler-environment overrides. `cargo test --doc` retains
+its separate doctest execution behavior.
+
+Every invocation starts the original Cargo documentation command and returns its
+current status and diagnostics. Cargo owns rustdoc freshness.
+Rustdoc units do not become rustc cache entries. Eligible dependency compilations
+retain the existing isolated-worker requirements. Optional private target reuse
+binds the full source, captured toolchain, exact arguments and environment;
+different documentation selections cannot borrow a Build/Check compatibility family.
+
 ### Run programs and benchmarks with reusable compilation
 
 The local profile also runs a selected binary or executable example and Cargo's
@@ -1836,7 +2056,7 @@ capture or coordinator startup because the managed Cargo process group does not
 own terminal foreground control. Redirect input, use `</dev/null`, or deliver a
 binary with `build` and run it outside this profile when it needs an interactive
 terminal. `bench --no-run` does not consume stdin or require this redirection.
-Existing Check, Build, Clippy and Test commands retain closed stdin. The source
+Existing Check, Build, Clippy, Doc and Test commands retain closed stdin. The source
 workspace and HOME remain read-only, temporary and target directories are
 private and writable, and external networking remains unavailable.
 
@@ -2067,7 +2287,7 @@ preparation with an independent 120-second cooperative deadline and cancels and
 joins it during shutdown. Images are private to this service lifetime; restart
 captures them again.
 
-The service supports `check`, `build`, `clippy`, `test`, `test --no-run` and
+The service supports `check`, `build`, `clippy`, `doc`, `test`, `test --no-run` and
 `bench --no-run`. It has closed stdin. `run` and executing `bench` commands retain
 the direct profile path because their inherited input is not forwarded through
 this protocol. The restriction is checked again after command-line selection
@@ -2239,7 +2459,7 @@ older command's smaller cache limits, that older command skips its optional save
 rather than discarding the newer families or exceeding its temporary byte bound.
 Cargo's completed result remains unchanged.
 
-Code-generating builds, all Test, Clippy, Run and Bench commands, and selected graphs with build scripts
+Code-generating builds, all Test, Clippy, Doc, Run and Bench commands, and selected graphs with build scripts
 or procedural macros use the **complete captured source identity** for private target reuse. An unchanged capture can
 reuse its verified target, but any captured file edit starts that graph with a
 cold target. Procedural macros may read data through ordinary filesystem calls
@@ -2661,7 +2881,7 @@ their presence does not establish a completed native qualification or speedup.
 ### Select local Cargo units from the Cargo command line
 
 The installed `cargo-rabs` launcher accepts the same local profile and turns
-ordinary Build, Check, Clippy, Test, Run and Bench selectors into the native
+ordinary Build, Check, Clippy, Doc, Test, Run and Bench selectors into the native
 driver's typed command and selection:
 
 ```sh
@@ -2676,6 +2896,7 @@ cargo rabs --rabs-canonical-local ./canonical-compile.json -- build --workspace 
 cargo rabs --rabs-canonical-local ./canonical-compile.json -- build -p core --tests --profile test
 cargo rabs --rabs-canonical-local ./canonical-compile.json -- clippy --workspace --all-targets --no-deps -- -D warnings
 cargo rabs --rabs-canonical-local ./canonical-compile.json -- clippy -p core --lib -- -Aclippy::needless_return
+cargo rabs --rabs-canonical-local ./canonical-compile.json -- doc --workspace --no-deps --document-private-items
 cargo rabs --rabs-canonical-local ./canonical-compile.json -- test --workspace
 cargo rabs --rabs-canonical-local ./canonical-compile.json -- test -p core --no-run
 cargo rabs --rabs-canonical-local ./canonical-compile.json -- test -p core --doc
@@ -2692,7 +2913,7 @@ Omitting the Cargo arguments selects `check`. Explicit command-line selection
 replaces the profile's `command` and entire `selection` object; it never merges with saved
 features or targets. An empty selection uses Cargo's ordinary default members
 and targets. Directly invoking `rabsd` with a check profile that omits `selection`
-retains the library-only `--lib` behavior; Build, Clippy, Test, Run and Bench
+retains the library-only `--lib` behavior; Build, Clippy, Doc, Test, Run and Bench
 profiles use Cargo's defaults.
 The profile still selects the manifest,
 source and toolchain roots, job budget, timeout, state directory and wrapper.
@@ -2709,6 +2930,7 @@ source and toolchain roots, job budget, timeout, state directory and wrapper.
 | Test/benchmark harness | `test` and `bench`: literal arguments after `--`, such as `--exact`, `--nocapture`, `--ignored` or `--test-threads=1` |
 | Program execution | `run`: at most one package, one compilation target, and one named `--bin` or `--example`; literal program arguments after `--` |
 | Clippy lint selection | `clippy` only: `--no-deps`, and the bounded lint controls after `--` described above |
+| Documentation | `doc`: `--no-deps`, `--document-private-items`, library/binary/example selectors; test/bench/all-target selectors are refused |
 
 Value options accept separate arguments and `--option=value`; `-pPACKAGE` and
 `-FFEATURES` are also accepted. Repeated array-valued options retain every literal
@@ -2726,7 +2948,7 @@ compilation from the same selection. Run resolves its one executable target
 through captured Cargo metadata/package identity and plans that target as a
 Build, then invokes the original Run command. It requires a captured nightly
 Cargo with unit-graph support and derives the worker-only cache policy from the
-Test, Clippy, Run or Bench command or required build-script/procedural-macro units
+Test, Clippy, Doc, Run or Bench command or required build-script/procedural-macro units
 before exposing the cache endpoint. Selecting
 a different target or feature set can therefore retain local metadata caching
 when those executors are inactive. Source

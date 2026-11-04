@@ -9,13 +9,15 @@
 mod git;
 mod graph;
 mod registry;
+mod selection;
 mod vendor;
 
 use super::super::control::PreparationRootGuard;
-use super::{PreparationControl, capture_error};
+use super::{PreparationContext, PreparationControl, capture_error};
 use rabs_asupersync::process_groups::ManagedProcessGroup;
 use rabs_asupersync::region_tree::Attribution;
 use rabs_asupersync::stream_drain::{DrainLimits, DrainedOutput};
+use rabs_sandbox::cargo_check::CompilationCommand;
 use rabs_sandbox::snapshot_capture::{
     MemberKind, SealedSourceSnapshot, capture_sealed_source_cancellable,
 };
@@ -52,18 +54,39 @@ pub(super) struct CargoSource {
     manifest: String,
     vendor: Option<String>,
     cargo_home_source: Option<PathBuf>,
+    selection: Option<selection::SelectedCommand>,
 }
 
 impl CargoSource {
+    #[cfg(test)]
     pub(super) fn parse(value: &Value) -> io::Result<Self> {
+        Self::parse_inner(value, None, PreparationContext::RemoteRequest)
+    }
+
+    pub(super) fn parse_request(
+        value: &Value,
+        request: &Value,
+        context: PreparationContext,
+    ) -> io::Result<Self> {
+        Self::parse_inner(value, Some(request), context)
+    }
+
+    fn parse_inner(
+        value: &Value,
+        request: Option<&Value>,
+        context: PreparationContext,
+    ) -> io::Result<Self> {
         require(
             value.as_object().is_some_and(|fields| {
                 fields.contains_key("manifest")
                     && fields.keys().all(|key| {
-                        matches!(key.as_str(), "manifest" | "vendor" | "cargo_home_source")
+                        matches!(
+                            key.as_str(),
+                            "manifest" | "vendor" | "cargo_home_source" | "selection"
+                        )
                     })
             }),
-            "cargo_source requires manifest and optional vendor or cargo_home_source",
+            "cargo_source requires manifest and optional vendor, cargo_home_source or selection",
         )?;
         let manifest = value["manifest"]
             .as_str()
@@ -80,6 +103,28 @@ impl CargoSource {
                     .is_some_and(|name| name == "Cargo.toml"),
             "cargo_source manifest must be a safe relative Cargo.toml path",
         )?;
+        // Bind the opt-in to the actual execution request before opening even
+        // the explicitly approved cache. There is no second feature selector.
+        let selection = value
+            .get("selection")
+            .map(|version| {
+                require(
+                    version.as_str() == Some(selection::VERSION),
+                    "unsupported Cargo source selection version",
+                )?;
+                require(
+                    value.get("vendor").is_none(),
+                    "selected Cargo preparation does not support vendor sources",
+                )?;
+                selection::SelectedCommand::parse(
+                    request.ok_or_else(|| {
+                        invalid("selected Cargo preparation requires its execution request")
+                    })?,
+                    manifest,
+                    context,
+                )
+            })
+            .transpose()?;
         let vendor = value
             .get("vendor")
             .map(|value| {
@@ -102,11 +147,16 @@ impl CargoSource {
             manifest: manifest.to_owned(),
             vendor,
             cargo_home_source,
+            selection,
         })
     }
 
     pub(super) fn manifest(&self) -> &str {
         &self.manifest
+    }
+
+    pub(super) fn requires_selected_toolchain(&self) -> bool {
+        self.selection.is_some()
     }
 
     pub(super) fn cargo_home_projection(&self) -> Option<Value> {
@@ -149,6 +199,10 @@ impl CargoSource {
         control: &PreparationControl<'_>,
     ) -> io::Result<(Arc<SealedSourceSnapshot>, Vec<String>)> {
         control.checkpoint()?;
+        require(
+            self.selection.is_none() || selected_toolchain.is_some(),
+            "selected Cargo preparation requires the captured execution toolchain",
+        )?;
         let vendor = self
             .vendor
             .as_deref()
@@ -161,6 +215,9 @@ impl CargoSource {
             self.cargo_home_source.is_some(),
             control,
         )?;
+        if self.selection.is_some() {
+            selection::validate_host_independent_config(&image, &self.manifest, control)?;
+        }
         control.checkpoint()?;
         // Planning starts only after a complete paired capture. Cargo never sees
         // a mutable original checkout or a mixture of pre/post-mutation files.
@@ -202,6 +259,11 @@ impl CargoSource {
             };
             (cargo, rustc)
         };
+        let graph_program = self
+            .selection
+            .as_ref()
+            .map(|selection| selection.graph_program(&cargo))
+            .transpose()?;
         let home = planning_root.join("home");
         fs::create_dir(&home)?;
         let cargo_home = planning_root.join("cargo-home");
@@ -218,6 +280,9 @@ impl CargoSource {
                     &planning_root,
                     selected_toolchain,
                 )?;
+                if let Some(selection) = &self.selection {
+                    selection.configure(&mut locate, &rustc, &planning_root);
+                }
                 locate
                     .args(["locate-project", "--workspace", "--message-format=json"])
                     .arg("--manifest-path")
@@ -238,7 +303,14 @@ impl CargoSource {
                     .strip_prefix(&root)
                     .map_err(|_| invalid("Cargo workspace lock escapes captured source"))?
                     .to_path_buf();
-                RegistryCache::capture_controlled(&image, &lock, approved, &cargo_home, control)
+                RegistryCache::capture_controlled(
+                    &image,
+                    &lock,
+                    approved,
+                    &cargo_home,
+                    self.selection.is_some(),
+                    control,
+                )
             })
             .transpose()?;
         let mut command = planning_command(
@@ -249,13 +321,20 @@ impl CargoSource {
             &planning_root,
             selected_toolchain,
         )?;
+        if let Some(selection) = &self.selection {
+            selection.configure(&mut command, &rustc, &planning_root);
+        }
         command
             .args([
                 "metadata",
                 "--format-version=1",
                 "--locked",
                 "--offline",
-                "--all-features",
+                if self.selection.is_some() {
+                    "--no-deps"
+                } else {
+                    "--all-features"
+                },
             ])
             .arg("--manifest-path")
             .arg(root.join(&self.manifest));
@@ -269,23 +348,115 @@ impl CargoSource {
         control.checkpoint()?;
         let metadata: Value = serde_json::from_slice(&output)
             .map_err(|error| invalid(&format!("invalid Cargo metadata JSON: {error}")))?;
-        validate_metadata_controlled(
-            &image,
-            &root,
-            &self.manifest,
-            &metadata,
-            vendor.as_ref(),
-            registry
-                .as_ref()
-                .map(|registry| (registry, cargo_home.as_path())),
-            control,
-        )?;
+        let selected_archives = if let Some(selection) = &self.selection {
+            let package_id = if let Some(package) = selection.run_package() {
+                let mut package_command = planning_command(
+                    &cargo,
+                    &rustc,
+                    &root,
+                    &self.manifest,
+                    &planning_root,
+                    selected_toolchain,
+                )?;
+                selection.configure(&mut package_command, &rustc, &planning_root);
+                package_command
+                    .args(["pkgid", "--locked", "--offline", "--package", package])
+                    .arg("--manifest-path")
+                    .arg(root.join(&self.manifest));
+                let output = bounded_command_controlled(
+                    package_command,
+                    &planning_root,
+                    METADATA_TIMEOUT,
+                    OUTPUT_LIMIT,
+                    control,
+                )?;
+                Some(
+                    std::str::from_utf8(&output)
+                        .map_err(|_| invalid("selected Cargo pkgid is not UTF-8"))?
+                        .trim_end_matches(['\n', '\r'])
+                        .to_owned(),
+                )
+            } else {
+                None
+            };
+            // Cargo's native unit graph contains both target units and host
+            // build-script/proc-macro units. Target-filtered metadata cannot
+            // stand in for that closure. Run planning resolves one exact
+            // binary/example without executing it; harness/program arguments
+            // remain exclusively in the original execution request. Clippy
+            // instead uses its captured executable and sibling lint driver,
+            // with the same lint tail after all nonexecuting Cargo controls.
+            let mut graph = planning_command(
+                graph_program
+                    .as_deref()
+                    .ok_or_else(|| invalid("selected Cargo graph executable missing"))?,
+                &rustc,
+                &root,
+                &self.manifest,
+                &planning_root,
+                selected_toolchain,
+            )?;
+            selection.configure(&mut graph, &rustc, &planning_root);
+            if selection.command == CompilationCommand::Clippy {
+                graph.env("CARGO", &cargo);
+            }
+            graph
+                .args(selection.graph_arguments(&metadata, package_id.as_deref())?)
+                .args([
+                    "--locked",
+                    "--offline",
+                    "--unit-graph",
+                    "-Zunstable-options",
+                ])
+                .arg("--manifest-path")
+                .arg(root.join(&self.manifest))
+                .arg("--target-dir")
+                .arg(planning_root.join("target"))
+                .args(selection.graph_tail_arguments()?);
+            let output = bounded_command_controlled(
+                graph,
+                &planning_root,
+                METADATA_TIMEOUT,
+                OUTPUT_LIMIT,
+                control,
+            )?;
+            let graph: Value = serde_json::from_slice(&output)
+                .map_err(|error| invalid(&format!("invalid Cargo unit graph JSON: {error}")))?;
+            Some(selection::validate_selected_graph(
+                &image,
+                &root,
+                selection,
+                &metadata,
+                &graph,
+                registry
+                    .as_ref()
+                    .map(|registry| (registry, cargo_home.as_path())),
+                control,
+            )?)
+        } else {
+            validate_metadata_controlled(
+                &image,
+                &root,
+                &self.manifest,
+                &metadata,
+                vendor.as_ref(),
+                registry
+                    .as_ref()
+                    .map(|registry| (registry, cargo_home.as_path())),
+                control,
+            )?;
+            None
+        };
         verify_planning_bytes_controlled(&image, &root, &files, control)?;
         if let Some(registry) = registry {
             let mut selected = files;
             selected.extend(
                 registry
-                    .materialize_controlled(&root.join(registry::CACHE_PREFIX), control)?
+                    .materialize_controlled(
+                        &root.join(registry::CACHE_PREFIX),
+                        selected_archives.as_ref(),
+                        control,
+                    )?
                     .into_iter()
                     .map(|path| format!("{}/{path}", registry::CACHE_PREFIX)),
             );
@@ -1206,7 +1377,7 @@ fn reject_ancestor_configuration(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(test)]
-fn local_tool(name: &str, scratch: &Path) -> io::Result<PathBuf> {
+pub(super) fn local_tool(name: &str, scratch: &Path) -> io::Result<PathBuf> {
     local_tool_controlled(name, scratch, &PreparationControl::uncontrolled())
 }
 
@@ -1401,7 +1572,7 @@ impl Drop for OwnedGroup {
 }
 
 #[cfg(test)]
-fn bounded_command(
+pub(super) fn bounded_command(
     command: Command,
     scratch: &Path,
     timeout: Duration,
@@ -1539,15 +1710,15 @@ fn captured_metadata_path<'a>(
     Ok(path)
 }
 
-fn validate_metadata_controlled(
+fn validate_metadata_packages_controlled<'a>(
     image: &SealedSourceSnapshot,
     root: &Path,
     manifest: &str,
-    value: &Value,
+    value: &'a Value,
     vendor: Option<&VendoredSources>,
     registry: Option<(&RegistryCache, &Path)>,
     control: &PreparationControl<'_>,
-) -> io::Result<()> {
+) -> io::Result<BTreeSet<&'a str>> {
     control.checkpoint()?;
     require(value["version"] == 1, "unsupported Cargo metadata format")?;
     let workspace = Path::new(
@@ -1635,6 +1806,21 @@ fn validate_metadata_controlled(
             )?;
         }
     }
+    Ok(ids)
+}
+
+fn validate_metadata_controlled(
+    image: &SealedSourceSnapshot,
+    root: &Path,
+    manifest: &str,
+    value: &Value,
+    vendor: Option<&VendoredSources>,
+    registry: Option<(&RegistryCache, &Path)>,
+    control: &PreparationControl<'_>,
+) -> io::Result<()> {
+    let ids = validate_metadata_packages_controlled(
+        image, root, manifest, value, vendor, registry, control,
+    )?;
     let nodes = value["resolve"]["nodes"]
         .as_array()
         .ok_or_else(|| invalid("Cargo dependency resolution missing"))?;
@@ -2335,7 +2521,8 @@ mod tests {
                 &control,
             );
             if cancel {
-                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+                let error = result.unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
             } else {
                 assert_eq!(result.unwrap(), b"complete");
             }

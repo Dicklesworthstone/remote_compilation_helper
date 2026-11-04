@@ -114,11 +114,15 @@ pub fn build_dependency_closure_plan_with_policy(
     entrypoint: &Path,
     policy: &PathTopologyPolicy,
 ) -> DependencyClosurePlan {
-    let graph = match resolve_cargo_path_dependency_graph_with_policy(entrypoint, policy) {
-        Ok(graph) => graph,
-        Err(error) => return fail_open_plan_from_resolver_error(entrypoint, &error),
-    };
-    let materialization_entrypoint = graph.workspace_root.as_deref().unwrap_or(entrypoint);
+    let graph = resolve_cargo_path_dependency_graph_with_policy(entrypoint, policy);
+    let materialization_entrypoint = graph
+        .as_ref()
+        .ok()
+        .and_then(|graph| graph.workspace_root.as_deref())
+        .unwrap_or(entrypoint);
+    // An active-graph failure must not bypass the materialization proof. A
+    // missing path or invalid workspace owner still requires local fallback;
+    // graph-only failures retain their existing policy if this closure is safe.
     let materialization = match resolve_cargo_path_materialization_closure_with_policy(
         materialization_entrypoint,
         policy,
@@ -154,6 +158,10 @@ pub fn build_dependency_closure_plan_with_policy(
         }
     };
 
+    let graph = match graph {
+        Ok(graph) => graph,
+        Err(error) => return fail_open_plan_from_resolver_error(entrypoint, &error),
+    };
     plan_dependency_closure_from_graph_and_materialization(&graph, Some(&materialization))
 }
 

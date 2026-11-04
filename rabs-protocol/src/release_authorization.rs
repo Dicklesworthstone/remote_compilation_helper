@@ -260,6 +260,59 @@ pub fn default_build_identity() -> String {
     format_build_identity(env!("CARGO_PKG_VERSION"), commit)
 }
 
+/// Report this binary's compiled build identity for an exact, standalone
+/// packaging probe.
+///
+/// This is independent of runtime configuration and environment overrides.
+/// Returning a string has no filesystem, process, network or daemon effects.
+/// Tool names are a closed set so every interpolated value is JSON-safe:
+/// package versions use Cargo's SemVer grammar and source stamps are validated
+/// by [`default_build_identity`].
+/// `compiled_source` is deliberately stricter: only an exact lowercase full
+/// 40-digit `RCH_BUILD_SOURCE` is reported, otherwise it is JSON null. Legacy
+/// commit aliases may still name the normal build identity but never supply
+/// this packaging field.
+#[must_use]
+pub fn build_info_for_args<I, A>(tool: &str, args: I) -> Option<String>
+where
+    I: IntoIterator<Item = A>,
+    A: AsRef<std::ffi::OsStr>,
+{
+    if !matches!(tool, "rabs-wrap" | "rabsd" | "rabs-wkr" | "rabs-cargo-root") {
+        return None;
+    }
+    let mut args = args.into_iter();
+    if !args
+        .next()
+        .is_some_and(|arg| arg.as_ref() == std::ffi::OsStr::new("--rabs-build-info"))
+        || args.next().is_some()
+    {
+        return None;
+    }
+    Some(build_info_record(
+        tool,
+        &default_build_identity(),
+        option_env!("RCH_BUILD_SOURCE"),
+    ))
+}
+
+fn build_info_record(tool: &str, build_identity: &str, primary_source: Option<&str>) -> String {
+    let compiled_source = primary_source
+        .filter(|source| {
+            source.len() == 40
+                && source
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        })
+        .map_or_else(|| "null".to_owned(), |source| format!("\"{source}\""));
+    format!(
+        "{{\"schema\":1,\"kind\":\"rabs-build-info\",\"tool\":\"{tool}\",\
+         \"version\":\"{}\",\"build_identity\":\"{build_identity}\",\
+         \"compiled_source\":{compiled_source}}}",
+        env!("CARGO_PKG_VERSION"),
+    )
+}
+
 // ============================================================================
 // Bead T013: Proof artifacts in the release process (evidence vocabulary)
 // ============================================================================
@@ -607,6 +660,76 @@ mod tests {
                 format_build_identity(env!("CARGO_PKG_VERSION"), Some(source))
             );
         }
+    }
+
+    #[test]
+    fn build_info_requires_one_exact_standalone_argument() {
+        assert!(build_info_for_args("rabs-wrap", ["--rabs-build-info"]).is_some());
+        for args in [
+            vec![],
+            vec!["--version"],
+            vec!["--rabs-build-info=1"],
+            vec!["--rabs-build-info", "--version"],
+            vec!["rustc", "--rabs-build-info"],
+            vec!["--", "--rabs-build-info"],
+        ] {
+            assert!(
+                build_info_for_args("rabs-wrap", &args).is_none(),
+                "{args:?}"
+            );
+        }
+        assert!(build_info_for_args("unknown-tool", ["--rabs-build-info"]).is_none());
+        assert!(build_info_for_args("rabsd\"", ["--rabs-build-info"]).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_info_never_lossily_interprets_non_utf8_arguments() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let argument = std::ffi::OsString::from_vec(b"--rabs-build-info\xff".to_vec());
+        assert!(build_info_for_args("rabs-wrap", [argument]).is_none());
+
+        let extra = std::ffi::OsString::from_vec(vec![0xff]);
+        assert!(
+            build_info_for_args(
+                "rabs-wrap",
+                [std::ffi::OsString::from("--rabs-build-info"), extra],
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn strict_compiled_source_never_promotes_an_alias_or_modified_primary() {
+        const SOURCE: &str = "0123456789abcdef0123456789abcdef01234567";
+        let alias_identity = format_build_identity(env!("CARGO_PKG_VERSION"), Some(SOURCE));
+        let expected = format!(
+            "{{\"schema\":1,\"kind\":\"rabs-build-info\",\"tool\":\"rabsd\",\
+             \"version\":\"{}\",\"build_identity\":\"{alias_identity}\",\
+             \"compiled_source\":null}}",
+            env!("CARGO_PKG_VERSION"),
+        );
+        assert_eq!(build_info_record("rabsd", &alias_identity, None), expected);
+        for primary in [
+            String::new(),
+            "deadbeef".to_owned(),
+            format!("{SOURCE}-dirty"),
+            format!("{SOURCE}-overlay-{}", "a".repeat(64)),
+            SOURCE.to_ascii_uppercase(),
+            format!(" {SOURCE}"),
+            format!("{SOURCE}\n"),
+            "z".repeat(40),
+            "\"untrusted-primary\":true".to_owned(),
+        ] {
+            assert_eq!(
+                build_info_record("rabsd", &alias_identity, Some(&primary)),
+                expected,
+                "primary {primary:?} must not expose bytes or inherit alias authority"
+            );
+        }
+        let clean = build_info_record("rabsd", &alias_identity, Some(SOURCE));
+        assert!(clean.ends_with(&format!("\"compiled_source\":\"{SOURCE}\"}}")));
     }
 
     #[test]

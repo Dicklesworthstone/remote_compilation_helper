@@ -32,7 +32,7 @@ assert len(sys.argv) == 3 and sys.argv[1] == "--canonical-compile-local", sys.ar
 path = pathlib.Path(sys.argv[2])
 profile = json.loads(path.read_bytes())
 assert profile["version"] == "canonical-compile-local-v1"
-assert profile["command"] in ("check", "build", "test", "clippy", "run", "bench")
+assert profile["command"] in ("check", "build", "test", "clippy", "doc", "run", "bench")
 assert "selection" in profile
 record = {"pid":os.getpid(), "argv":sys.argv, "profile":profile,
           "retained":str(path), "file_mode":stat.S_IMODE(path.stat().st_mode),
@@ -84,7 +84,7 @@ class CanonicalLocalCargo(unittest.TestCase):
         for directory in (self.source, self.tools / "bin", self.state, self.operations):
             directory.mkdir(parents=True, mode=0o700)
         self.forbidden = self.root / "unexpected-build"
-        for name in ("cargo", "rustc", "cargo-clippy", "clippy-driver", "rch"):
+        for name in ("cargo", "rustc", "rustdoc", "cargo-clippy", "clippy-driver", "rch"):
             tool = self.tools / "bin" / name
             tool.write_text("#!/bin/sh\nprintf unexpected >> '" + str(self.forbidden) + "'\nexit 98\n")
             tool.chmod(0o700)
@@ -192,6 +192,70 @@ class CanonicalLocalCargo(unittest.TestCase):
         self.assertNotIn("env", record["profile"])
         self.assertNotIn("AMBIENT_INPUT", retained.read_text())
 
+    def test_selected_source_mode_retains_actual_commands_and_literal_project_inputs(self):
+        cargo_home = self.root / "approved-cargo-home"
+        cargo_home.mkdir(mode=0o700)
+        self.profile.update(source_selection="cargo-unit-graph-v1",
+                            cargo_home_source=str(cargo_home),
+                            command="build", selection={"packages": ["saved"]},
+                            env={"APP_INPUT": "literal\nvalue", "EMPTY": ""})
+        self.save()
+        original = self.profile_path.read_bytes()
+        cases = (
+            (["check", "-p", "app", "--features=fast"],
+             {"packages": ["app"], "features": ["fast"]}),
+            (["build", "--release", "--bin", "server"],
+             {"release": True, "bin": ["server"]}),
+            (["clippy", "--workspace", "--all-targets", "--no-deps", "--", "-D", "warnings",
+              "-Aclippy::needless_return", "--cap-lints", "warn"],
+             {"workspace": True, "all_targets": True, "no_deps": True,
+              "lint_args": ["-D", "warnings", "-Aclippy::needless_return", "--cap-lints", "warn"]}),
+            (["test", "--doc", "--", "--nocapture"],
+             {"doc": True, "test_args": ["--nocapture"]}),
+            (["run", "--bin", "server", "--", "--literal"],
+             {"bin": ["server"], "run_args": ["--literal"]}),
+            (["bench", "--no-run"], {"no_run": True}),
+        )
+        for arguments, selection in cases:
+            with self.subTest(arguments=arguments):
+                status, _, stderr, _ = self.invoke(arguments)
+                self.assertEqual(status, 0, stderr)
+                record = self.records()[-1]
+                expected = dict(self.profile, command=arguments[0], selection=selection)
+                self.assertEqual(record["profile"], expected)
+                self.assertEqual(json.loads(Path(record["retained"]).read_bytes()), expected)
+                self.assertEqual(self.profile_path.read_bytes(), original)
+
+        self.profile.update(command="clippy", selection={"no_deps": True, "lint_args": ["-Dwarnings"]})
+        self.save()
+        original = self.profile_path.read_bytes()
+        for arguments, selection in ((["check"], {}), (["clippy", "--", "-Awarnings"],
+                                                       {"lint_args": ["-Awarnings"]})):
+            with self.subTest(saved_clippy=arguments):
+                status, _, stderr, _ = self.invoke(arguments)
+                self.assertEqual(status, 0, stderr)
+                expected = dict(self.profile, command=arguments[0], selection=selection)
+                self.assertEqual(self.records()[-1]["profile"], expected)
+                self.assertEqual(self.profile_path.read_bytes(), original)
+
+    def test_selected_source_mode_refuses_invalid_versions_and_vendor_before_handoff(self):
+        for version in (None, True, {}, "future", "Complete"):
+            with self.subTest(version=version):
+                self.profile["source_selection"] = version
+                self.save()
+                stderr = self.assert_refused(["check"])
+                self.assertIn(b"source_selection must be cargo-unit-graph-v1", stderr)
+        self.profile.update(source_selection="cargo-unit-graph-v1", vendor="vendor")
+        self.save()
+        stderr = self.assert_refused(["build"])
+        self.assertIn(b"source_selection cannot be combined with vendor", stderr)
+        stderr = self.assert_refused(["clippy", "--", "-Dwarnings"])
+        self.assertIn(b"source_selection cannot be combined with vendor", stderr)
+        self.profile["command"] = "clippy"
+        self.save()
+        stderr = self.assert_refused(["check"])
+        self.assertIn(b"source_selection cannot be combined with vendor", stderr)
+
     def test_rustup_selection_reaches_native_local_profile_as_one_physical_root(self):
         self.select_rustup()
         original = self.profile_path.read_bytes()
@@ -279,6 +343,15 @@ class CanonicalLocalCargo(unittest.TestCase):
         record, = self.records()
         self.assertEqual(record["profile"]["toolchain_root"], str(self.tools))
         self.assertEqual(record["profile"]["selection"]["run_args"], ["+nightly"])
+
+    def test_live_stderr_is_not_a_local_profile_field_and_refuses_before_discovery(self):
+        self.select_rustup()
+        for value in (True, False, None, 1):
+            with self.subTest(value=value):
+                self.profile["live_stderr"] = value
+                self.save()
+                self.assert_refused(["check"])
+                self.assertFalse(self.rustup_record.exists())
 
     def test_local_toolchain_selectors_are_exclusive_and_explicit_root_never_probes(self):
         env = dict(self.env, CARGO_RABS_RUSTUP="/absent/rustup", RUSTUP_TOOLCHAIN="not-installed")
@@ -544,21 +617,83 @@ class CanonicalLocalCargo(unittest.TestCase):
                 self.assertTrue(Path(record["retained"]).parent.name.startswith("clippy-"))
                 self.assertEqual(self.profile_path.read_bytes(), original)
 
+    def test_doc_selection_and_captured_compilers_reach_native_driver_once(self):
+        self.profile.update(command="doc", selection={"no_deps": True, "document_private_items": True})
+        for mode in (None, "cargo-unit-graph-v1"):
+            if mode is None:
+                self.profile.pop("source_selection", None)
+            else:
+                self.profile["source_selection"] = mode
+            self.save()
+            original = self.profile_path.read_bytes()
+            for args, expected in (
+                (["doc"], {}),
+                (["doc", "--workspace", "--exclude=other", "--lib", "--bins", "--examples",
+                  "--no-deps", "--document-private-items", "--target=host-tuple", "--profile=release"],
+                 {"workspace": True, "exclude": ["other"], "lib": True, "bins": True, "examples": True,
+                  "no_deps": True, "document_private_items": True, "target": ["host-tuple"], "profile": "release"}),
+                (["doc", "-papp", "--bin=tool", "--example=sample", "--features=app/fast"],
+                 {"packages": ["app"], "bin": ["tool"], "example": ["sample"], "features": ["app/fast"]}),
+            ):
+                with self.subTest(mode=mode, args=args):
+                    status, _, stderr, pid = self.invoke(args)
+                    self.assertEqual(status, 0, stderr.decode(errors="replace"))
+                    record = self.records()[-1]
+                    self.assertEqual(record["pid"], pid)
+                    self.assertEqual(record["profile"], dict(self.profile, command="doc", selection=expected))
+                    self.assertTrue(Path(record["retained"]).parent.name.startswith("doc-"))
+                    self.assertEqual(launcher.canonical_local_environment(record["profile"]), {
+                        "CARGO_INCREMENTAL": "0", "CARGO_TARGET_DIR": "/__rabs/out/cargo",
+                        "RUSTC": "/__rabs/toolchain/bin/rustc", "RUSTDOC": "/__rabs/toolchain/bin/rustdoc",
+                    })
+                    self.assertEqual(self.profile_path.read_bytes(), original)
+
+    def test_doc_requires_captured_rustdoc_before_retaining_operation(self):
+        tool = self.tools / "bin/rustdoc"
+        tool.chmod(0o600)
+        self.assert_refused(["doc"])
+        tool.chmod(0o700)
+        retained = self.tools / "bin/retained-rustdoc"
+        tool.rename(retained)
+        self.assert_refused(["doc", "--no-deps"])
+        tool.symlink_to(retained)
+        self.assert_refused(["doc"])
+
+    def test_doc_rejects_browser_custom_output_harnesses_and_rustdoc_tails(self):
+        for args in (
+            ["doc", "--open"], ["doc", "--output-format=json"], ["doc", "--config=other"],
+            ["doc", "--tests"], ["doc", "--test=integration"], ["doc", "--benches"],
+            ["doc", "--bench=timing"], ["doc", "--all-targets"], ["doc", "--doc"],
+            ["doc", "--no-run"], ["doc", "--no-fail-fast"], ["doc", "filter"],
+            ["doc", "--", "--document-hidden-items"], ["doc", "--document-private-items=true"],
+            ["check", "--document-private-items"], ["clippy", "--document-private-items"],
+        ):
+            with self.subTest(args=args):
+                self.assert_refused(args)
+
     def test_clippy_requires_captured_components_before_retaining_operation(self):
-        for name in ("cargo", "rustc", "cargo-clippy", "clippy-driver"):
-            with self.subTest(name=name):
-                tool = self.tools / "bin" / name
-                tool.chmod(0o600)
-                self.assert_refused(["clippy"])
-                tool.chmod(0o700)
         incomplete = self.root / "incomplete-toolchain"
         (incomplete / "bin").mkdir(parents=True)
-        self.profile["toolchain_root"] = str(incomplete)
-        self.save()
-        self.assert_refused(["clippy"])
+        for mode in (None, "cargo-unit-graph-v1"):
+            if mode is None:
+                self.profile.pop("source_selection", None)
+            else:
+                self.profile["source_selection"] = mode
+            self.profile["toolchain_root"] = str(self.tools)
+            self.save()
+            for name in ("cargo", "rustc", "cargo-clippy", "clippy-driver"):
+                with self.subTest(source_selection=mode, name=name):
+                    tool = self.tools / "bin" / name
+                    tool.chmod(0o600)
+                    self.assert_refused(["clippy"])
+                    tool.chmod(0o700)
+            self.profile["toolchain_root"] = str(incomplete)
+            self.save()
+            with self.subTest(source_selection=mode, incomplete=True):
+                self.assert_refused(["clippy"])
 
     def test_clippy_rejects_compiler_authority_test_execution_and_invalid_lint_tails(self):
-        for args in (
+        cases = (
             ["clippy", "--no-run"], ["clippy", "--doc"], ["clippy", "--no-fail-fast"],
             ["clippy", "test-filter"], ["clippy", "--config=other"],
             ["clippy", "--", "--emit=link"], ["clippy", "--", "--sysroot", "/other"],
@@ -569,9 +704,16 @@ class CanonicalLocalCargo(unittest.TestCase):
             ["clippy", "--", "--allow", "clippy::lint__CLIPPY_HACKERY__--sysroot"],
             ["clippy", "--", "--cap-lints", "force-warn"],
             ["check", "--no-deps"], ["build", "--no-deps"], ["test", "--no-deps"],
-        ):
-            with self.subTest(args=args):
-                self.assert_refused(args)
+        )
+        for mode in (None, "cargo-unit-graph-v1"):
+            if mode is None:
+                self.profile.pop("source_selection", None)
+            else:
+                self.profile["source_selection"] = mode
+            self.save()
+            for args in cases:
+                with self.subTest(source_selection=mode, args=args):
+                    self.assert_refused(args)
         exact = ["clippy", "--"] + ["-Awarnings"] * 128
         self.assertEqual(len(launcher.canonical_local_selection(exact)["lint_args"]), 128)
         for args in (exact + ["-Awarnings"], ["clippy", "-papp"] + exact[1:],
@@ -895,7 +1037,7 @@ class CanonicalLocalCargo(unittest.TestCase):
 
     def test_commands_authority_options_and_missing_values_refuse_before_handoff(self):
         rejected = [
-            ["doc"], ["rustc"], ["+nightly", "check"],
+            ["rustdoc"], ["rustc"], ["+nightly", "check"],
             ["check", "--config", "build.rustc=other"], ["check", "--config=other"],
             ["check", "--target-dir=/other"], ["check", "--manifest-path", "other/Cargo.toml"],
             ["check", "--message-format=json"], ["check", "-Zunstable-options"],

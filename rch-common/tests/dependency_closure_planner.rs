@@ -95,6 +95,418 @@ fn planner_single_repo_generates_ready_plan() {
     assert_eq!(plan.sync_order[0].order_index, 0);
 }
 
+// Keep registry/Git fixtures deterministic and offline without changing the
+// environment of other tests. Cargo may decline locked metadata here; the real
+// planner must then use its manifest fallback and still materialize local paths.
+fn run_with_offline_cargo(test_name: &str) -> bool {
+    const CHILD_ENV: &str = "RCH_PLANNER_OFFLINE_TEST";
+    if std::env::var(CHILD_ENV).as_deref() == Ok(test_name) {
+        return true;
+    }
+    let cargo_fixture = TopologyFixture::new("offline-cargo-home");
+    let cargo_home = cargo_fixture.root.join("cargo-home");
+    fs::create_dir_all(&cargo_home).unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test_name, "--nocapture"])
+        .current_dir(&cargo_fixture.root)
+        .env(CHILD_ENV, test_name)
+        .env("CARGO_HOME", &cargo_home)
+        .env("CARGO_NET_OFFLINE", "true")
+        .output()
+        .expect("run isolated offline planner test");
+    assert!(
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed;"),
+        "{test_name}:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
+}
+
+#[test]
+fn planner_root_workspace_inheritance_preserves_successful_locked_metadata() {
+    if !run_with_offline_cargo(
+        "planner_root_workspace_inheritance_preserves_successful_locked_metadata",
+    ) {
+        return;
+    }
+    let fixture = TopologyFixture::new("root-workspace-locked-metadata");
+    let app = fixture.canonical_root.join("app");
+    let upstream = fixture.root.join("git-upstream");
+    write_bin_crate(&app, "root_workspace_git", &[]);
+    write_lib_crate(&upstream, "git_dep", &[]);
+    for args in [
+        vec!["init", "--quiet", "--initial-branch=main"],
+        vec!["add", "Cargo.toml", "src/lib.rs"],
+        vec![
+            "-c",
+            "user.name=RCH fixture",
+            "-c",
+            "user.email=rch-fixture@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "-m",
+            "Local Git dependency fixture",
+        ],
+    ] {
+        let output = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&upstream)
+            .output()
+            .expect("create local Git dependency");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let git_url = format!("file://{}", upstream.canonicalize().unwrap().display());
+    fs::write(
+        app.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"root_workspace_git\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ngit_dep.workspace = true\n\n[workspace]\nmembers = [\".\"]\nresolver = \"2\"\n\n[workspace.dependencies]\ngit_dep = {{ git = {git_url:?} }}\n"
+        ),
+    )
+    .unwrap();
+    // Only a local file:// repository is fetched, into this test's isolated
+    // Cargo home outside the source topology. No public registry is needed.
+    let lock = std::process::Command::new("cargo")
+        .args(["generate-lockfile", "--manifest-path"])
+        .arg(app.join("Cargo.toml"))
+        .env("CARGO_NET_OFFLINE", "false")
+        .output()
+        .expect("bootstrap locked local Git dependency");
+    assert!(
+        lock.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lock.stderr)
+    );
+    let lock_path = app.join("Cargo.lock");
+    let lock_bytes = fs::read(&lock_path).unwrap();
+    let lock_modified = fs::metadata(&lock_path).unwrap().modified().unwrap();
+    let metadata = std::process::Command::new("cargo")
+        .args([
+            "metadata",
+            "--locked",
+            "--offline",
+            "--format-version",
+            "1",
+            "--manifest-path",
+        ])
+        .arg(app.join("Cargo.toml"))
+        .output()
+        .expect("real locked Cargo metadata");
+    assert!(
+        metadata.status.success(),
+        "{}",
+        String::from_utf8_lossy(&metadata.stderr)
+    );
+    let document: serde_json::Value = serde_json::from_slice(&metadata.stdout).unwrap();
+    assert!(
+        document["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|package| {
+                package["name"] == "git_dep"
+                    && package["source"]
+                        .as_str()
+                        .is_some_and(|source| source.starts_with("git+file://"))
+            })
+    );
+    let plan = build_dependency_closure_plan_with_policy(&app, &fixture.policy());
+    assert!(plan.is_ready(), "{plan:#?}");
+    assert_eq!(plan.sync_roots(), vec![app.canonicalize().unwrap()]);
+    assert_eq!(fs::read(&lock_path).unwrap(), lock_bytes);
+    assert_eq!(
+        fs::metadata(&lock_path).unwrap().modified().unwrap(),
+        lock_modified
+    );
+}
+
+#[test]
+fn planner_materializes_all_patch_sources_without_changing_locked_selection() {
+    if !run_with_offline_cargo(
+        "planner_materializes_all_patch_sources_without_changing_locked_selection",
+    ) {
+        return;
+    }
+    let fixture = TopologyFixture::new("patch-source-materialization");
+    let app = fixture.canonical_root.join("app");
+    write_bin_crate(&app, "patch_source_app", &[]);
+    let mut expected_roots = std::collections::BTreeSet::from([app.canonicalize().unwrap()]);
+    for (directory, version, leaf_name) in [
+        ("active", "0.1.0", "active_leaf"),
+        ("newer", "0.2.0", "newer_leaf"),
+        ("first_source", "0.3.0", "first_leaf"),
+        ("last_source", "0.4.0", "last_leaf"),
+    ] {
+        let patch = fixture.canonical_root.join(directory);
+        let leaf = fixture.canonical_root.join(leaf_name);
+        write_lib_crate(&patch, "patched", &[]);
+        write_lib_crate(&leaf, leaf_name, &[]);
+        fs::write(
+            patch.join("Cargo.toml"),
+            format!(
+                "[package]\nname='patched'\nversion='{version}'\nedition='2021'\n[dependencies]\n{leaf_name}={{path='../{leaf_name}'}}\n"
+            ),
+        )
+        .unwrap();
+        expected_roots.extend([patch.canonicalize().unwrap(), leaf.canonicalize().unwrap()]);
+    }
+    fs::write(
+        app.join("Cargo.toml"),
+        r#"[package]
+name = "patch_source_app"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+resolver = "2"
+
+[workspace.dependencies]
+renamed = { package = "patched", version = "=0.1.0" }
+
+[dependencies]
+renamed.workspace = true
+
+[patch.crates-io]
+patched = { path = "../active" }
+patched_v2 = { package = "patched", path = "../newer" }
+
+[patch.'https://example.invalid/first']
+patched = { path = "../first_source" }
+
+[patch.'https://example.invalid/last']
+patched = { path = "../last_source" }
+"#,
+    )
+    .unwrap();
+
+    // All sources are local patches. The empty, offline Cargo home proves
+    // version/source selection without downloading registry or Git packages.
+    let lock = std::process::Command::new("cargo")
+        .args(["generate-lockfile", "--offline", "--manifest-path"])
+        .arg(app.join("Cargo.toml"))
+        .current_dir(&app)
+        .output()
+        .expect("generate lockfile from local patches");
+    assert!(
+        lock.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lock.stderr)
+    );
+    let lock_path = app.join("Cargo.lock");
+    let lock_bytes = fs::read(&lock_path).unwrap();
+    let lock_modified = fs::metadata(&lock_path).unwrap().modified().unwrap();
+    let metadata = std::process::Command::new("cargo")
+        .args([
+            "metadata",
+            "--locked",
+            "--offline",
+            "--format-version",
+            "1",
+            "--manifest-path",
+        ])
+        .arg(app.join("Cargo.toml"))
+        .current_dir(&app)
+        .output()
+        .expect("resolve local patches with locked Cargo metadata");
+    assert!(
+        metadata.status.success(),
+        "{}",
+        String::from_utf8_lossy(&metadata.stderr)
+    );
+    let document: serde_json::Value = serde_json::from_slice(&metadata.stdout).unwrap();
+    let active_roots = std::collections::BTreeSet::from([
+        app.canonicalize().unwrap(),
+        fixture
+            .canonical_root
+            .join("active")
+            .canonicalize()
+            .unwrap(),
+        fixture
+            .canonical_root
+            .join("active_leaf")
+            .canonicalize()
+            .unwrap(),
+    ]);
+    let metadata_roots = document["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|package| {
+            Path::new(package["manifest_path"].as_str().unwrap())
+                .parent()
+                .unwrap()
+                .canonicalize()
+                .unwrap()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(metadata_roots, active_roots);
+
+    let graph =
+        rch_common::resolve_cargo_path_dependency_graph_with_policy(&app, &fixture.policy())
+            .expect("preserve Cargo's active package selection");
+    assert_eq!(
+        graph
+            .packages
+            .iter()
+            .map(|package| package.package_root.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
+        active_roots,
+        "the unused patched version must not enter the active metadata graph"
+    );
+    let plan = build_dependency_closure_plan_with_policy(&app, &fixture.policy());
+    assert!(plan.is_ready(), "{plan:#?}");
+    assert_eq!(plan.sync_order.len(), expected_roots.len());
+    assert_eq!(
+        plan.sync_roots()
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        expected_roots,
+        "every source's patch and its transitive paths must be synchronized"
+    );
+    for action in &plan.sync_order {
+        assert_eq!(
+            action
+                .metadata
+                .notes
+                .iter()
+                .any(|note| note == "materialization_only=true"),
+            !active_roots.contains(&action.package_root),
+            "{action:#?}"
+        );
+    }
+    assert_eq!(fs::read(&lock_path).unwrap(), lock_bytes);
+    assert_eq!(
+        fs::metadata(&lock_path).unwrap().modified().unwrap(),
+        lock_modified
+    );
+}
+
+#[test]
+fn planner_root_workspace_inherits_registry_git_and_optional_path_dependencies() {
+    if !run_with_offline_cargo(
+        "planner_root_workspace_inherits_registry_git_and_optional_path_dependencies",
+    ) {
+        return;
+    }
+    let fixture = TopologyFixture::new("root-workspace-inheritance");
+    let app = fixture.canonical_root.join("app");
+    let optional = fixture.canonical_root.join("optional");
+    write_bin_crate(&app, "root_workspace_app", &[]);
+    write_lib_crate(&optional, "optional_dep", &[]);
+    let workspace = r#"
+[workspace]
+members = ["."]
+resolver = "2"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+git_dep = { git = "https://example.invalid/rch-workspace-fixture.git" }
+optional_dep = { path = "../optional" }
+"#;
+
+    for dependencies in [
+        r#"serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+git_dep = { git = "https://example.invalid/rch-workspace-fixture.git" }
+optional_dep = { path = "../optional", optional = true }"#,
+        r#"serde.workspace = true
+tokio.workspace = true
+git_dep.workspace = true
+optional_dep = { workspace = true, optional = true }"#,
+    ] {
+        fs::write(
+            app.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"root_workspace_app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{dependencies}\n{workspace}"
+            ),
+        )
+        .unwrap();
+        let plan = build_dependency_closure_plan_with_policy(&app, &fixture.policy());
+        assert!(plan.is_ready(), "{dependencies}: {plan:#?}");
+        assert_eq!(
+            plan.sync_roots()
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([
+                app.canonicalize().unwrap(),
+                optional.canonicalize().unwrap(),
+            ]),
+            "only local packages belong in the source-sync closure"
+        );
+        let optional_action = plan
+            .sync_order
+            .iter()
+            .find(|action| action.package_name == "optional_dep")
+            .expect("inactive inherited path must be materialized");
+        assert!(
+            optional_action
+                .metadata
+                .notes
+                .iter()
+                .any(|note| note == "materialization_only=true")
+        );
+        assert!(
+            !app.join("Cargo.lock").exists(),
+            "planning must not create a lockfile when locked metadata is unavailable"
+        );
+    }
+}
+
+#[test]
+fn planner_root_workspace_still_refuses_missing_inherited_optional_paths() {
+    if !run_with_offline_cargo(
+        "planner_root_workspace_still_refuses_missing_inherited_optional_paths",
+    ) {
+        return;
+    }
+    let fixture = TopologyFixture::new("root-workspace-missing-inherited-path");
+    let app = fixture.canonical_root.join("app");
+    write_bin_crate(&app, "root_workspace_missing_path", &[]);
+    fs::write(
+        app.join("Cargo.toml"),
+        r#"[package]
+name = "root_workspace_missing_path"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde.workspace = true
+missing_dep = { workspace = true, optional = true }
+
+[workspace]
+members = ["."]
+resolver = "2"
+
+[workspace.dependencies]
+serde = "1"
+missing_dep = { path = "../missing" }
+"#,
+    )
+    .unwrap();
+
+    let plan = build_dependency_closure_plan_with_policy(&app, &fixture.policy());
+    assert_eq!(plan.state, DependencyClosurePlanState::FailOpen);
+    assert!(plan.fail_open);
+    assert!(plan.sync_order.is_empty());
+    assert!(
+        plan.issues
+            .iter()
+            .any(|issue| issue.code == "materialization-closure-unavailable"),
+        "the missing local path must retain its materialization refusal: {plan:#?}"
+    );
+    let reason = plan.fail_open_reason.as_deref().unwrap();
+    assert!(reason.contains("missing path dependency"), "{reason}");
+    assert!(reason.contains("missing"), "{reason}");
+}
+
 #[test]
 fn planner_keeps_excluded_fixture_bytes_inert_until_the_same_manifest_is_active() {
     let fixture = TopologyFixture::new("selected-fixture-members");
@@ -394,6 +806,61 @@ missing_optional = { path = "../missing_optional", optional = true }
             .as_deref()
             .is_some_and(|reason| reason.contains("materialization closure produced"))
     );
+}
+
+#[test]
+fn planner_checks_materialization_after_active_graph_failure() {
+    let fixture = TopologyFixture::new("graph-failure-materialization");
+    let app = fixture.canonical_root.join("app");
+    write_lib_crate(&app, "app", &[]);
+    for (dependencies, source_issue) in [
+        (
+            "[dependencies]\nmissing = { path = '../missing' }\n",
+            "missing-path-dependency",
+        ),
+        (
+            "[workspace.dependencies]\ninvalid = { path = 123 }\n",
+            "manifest-parse-failure",
+        ),
+    ] {
+        fs::write(
+            app.join("Cargo.toml"),
+            format!("[package]\nname = 'app'\nversion = '0.1.0'\nedition = '2021'\n{dependencies}"),
+        )
+        .unwrap();
+        let plan = build_dependency_closure_plan_with_policy(&app, &fixture.policy());
+        assert_eq!(plan.state, DependencyClosurePlanState::FailOpen);
+        assert!(plan.fail_open);
+        assert!(plan.sync_order.is_empty());
+        for expected in ["materialization-closure-unavailable", source_issue] {
+            assert!(
+                plan.issues.iter().any(|issue| issue.code == expected),
+                "{dependencies}: missing {expected}: {plan:#?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn planner_preserves_graph_failure_when_materialization_is_complete() {
+    let fixture = TopologyFixture::new("graph-failure-complete-materialization");
+    let first = fixture.canonical_root.join("first");
+    let second = fixture.canonical_root.join("second");
+    write_lib_crate(&first, "first", &[("second", "../second")]);
+    write_lib_crate(&second, "second", &[("first", "../first")]);
+
+    let materialization =
+        rch_common::cargo_path_deps::resolve_cargo_path_materialization_closure_with_policy(
+            &first,
+            &fixture.policy(),
+        )
+        .expect("cycles do not prevent source materialization");
+    assert_eq!(materialization.packages.len(), 2);
+    let plan = build_dependency_closure_plan_with_policy(&first, &fixture.policy());
+    assert_eq!(plan.state, DependencyClosurePlanState::FailOpen);
+    assert_eq!(plan.issues.len(), 1, "{plan:#?}");
+    assert_eq!(plan.issues[0].code, "cyclic-path-dependency");
+    assert!(plan.sync_order.is_empty());
 }
 
 #[test]

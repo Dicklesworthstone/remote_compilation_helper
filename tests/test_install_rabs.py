@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -611,6 +612,524 @@ esac
         self.assertNotIn("Installation Complete!", result.stdout)
         self.assertEqual((self.bin / installer.CURRENT).resolve(), previous)
         self.assertEqual((self.bin / "rabsd").read_bytes(), before)
+
+
+@unittest.skipUnless(sys.platform == "linux", "Linux archive/install contract")
+class PackageTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="rabs-package-test-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.bundle = self.root / "bundle"
+        self.bundle.mkdir()
+        self.bin = self.root / "bin"
+        self.output = self.root / "release.tar.gz"
+        self.target = next(target for target, machine in installer.TARGET_MACHINES.items()
+                           if machine == installer.host_machine())
+        executable = shutil.which("true")
+        self.assertIsNotNone(executable)
+        # Real ELF fixtures test distribution, not source identity or RABS execution.
+        for name in installer.TOOLS[1:]:
+            shutil.copyfile(executable, self.bundle / name)
+            (self.bundle / name).chmod(0o755)
+        (self.bundle / "cargo-rabs").write_text(
+            "#!/usr/bin/env python3\nprint('packaged launcher')\n", encoding="utf-8")
+        (self.bundle / "cargo-rabs").chmod(0o755)
+
+    def package(self, output=None, target=None):
+        return installer.package_archive(installer.source_files(self.bundle, None),
+                                         output or self.output, target or self.target)
+
+    def main(self, *arguments):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = installer.main(list(arguments))
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_exact_flat_archive_installs_and_verifies_without_executing_tools(self):
+        expected = installer.expected_toolset(installer.source_files(self.bundle, None))
+        with mock.patch.object(installer.subprocess, "Popen", side_effect=AssertionError("executed tool")):
+            result = self.package()
+            self.assertFalse(self.bin.exists())
+            code, _, error = self.main("--from-archive", str(self.output), "--bin-dir", str(self.bin))
+            self.assertEqual(code, 0, error)
+            code, stdout, error = self.main("--verify", "--from-archive", str(self.output),
+                                           "--bin-dir", str(self.bin))
+            self.assertEqual(code, 0, error)
+            self.assertEqual(json.loads(stdout)["state"], "verified")
+        self.assertEqual(result["toolset"], expected)
+        self.assertEqual(result["bytes"], self.output.stat().st_size)
+        self.assertEqual(result["sha256"], hashlib.sha256(self.output.read_bytes()).hexdigest())
+        self.assertFalse(result["services_started"])
+        self.assertFalse(result["cargo_config_changed"])
+        self.assertTrue(Path(result["staging_directory"]).is_dir())
+        with tarfile.open(self.output, "r:gz") as archive:
+            members = archive.getmembers()
+            self.assertEqual([member.name for member in members],
+                             list(installer.TOOLS) + ["install-rabs"])
+            for member in members:
+                self.assertTrue(member.isreg())
+                self.assertEqual(member.mode, 0o755)
+                self.assertEqual((member.uid, member.gid, member.mtime), (0, 0, 0))
+                self.assertEqual(member.pax_headers, {})
+                source = SCRIPT if member.name == "install-rabs" else self.bundle / member.name
+                self.assertEqual(archive.extractfile(member).read(), source.read_bytes())
+
+    def test_identical_inputs_produce_identical_archive_bytes(self):
+        first = self.package()
+        second_path = self.root / "different-filename.tar.gz"
+        second = self.package(output=second_path)
+        self.assertEqual(self.output.read_bytes(), second_path.read_bytes())
+        self.assertEqual(first["sha256"], second["sha256"])
+
+    def test_cross_architecture_packaging_does_not_execute_supplied_binaries(self):
+        target, machine = next((target, machine) for target, machine in installer.TARGET_MACHINES.items()
+                               if target != self.target)
+        for name in installer.TOOLS[1:]:
+            data = bytearray((self.bundle / name).read_bytes())
+            data[18:20] = machine.to_bytes(2, "little")
+            (self.bundle / name).write_bytes(data)
+        with mock.patch.object(installer.subprocess, "Popen", side_effect=AssertionError("executed tool")):
+            result = self.package(target=target)
+        self.assertEqual(result["toolset"]["machine"], machine)
+        self.assertEqual(result["target"], target)
+
+    def test_split_profiles_use_the_checkout_launcher_and_explicit_target(self):
+        build = self.root / "target"
+        for profile in ("wrapper-release", "daemon-release"):
+            (build / profile).mkdir(parents=True)
+        for name in installer.TOOLS[1:]:
+            profile = "wrapper-release" if name == "rabs-wrap" else "daemon-release"
+            shutil.copy2(self.bundle / name, build / profile / name)
+        code, stdout, error = self.main("--from-build", str(build), "--package", str(self.output),
+                                       "--target", self.target)
+        self.assertEqual(code, 0, error)
+        self.assertEqual(json.loads(stdout)["kind"], "rabs-packaged")
+        with tarfile.open(self.output, "r:gz") as archive:
+            self.assertEqual(archive.extractfile("cargo-rabs").read(),
+                             SCRIPT.with_name("cargo-rabs").read_bytes())
+        self.assertFalse(self.bin.exists())
+
+    def test_wrong_target_missing_or_mixed_tools_never_publish(self):
+        other = next(target for target in installer.TARGET_MACHINES if target != self.target)
+        with self.assertRaisesRegex(installer.InstallError, "match --target"):
+            self.package(target=other)
+        with self.assertRaisesRegex(installer.InstallError, "supported Linux GNU"):
+            installer.package_archive(installer.source_files(self.bundle, None), self.output, None)
+        (self.bundle / "rabsd").rename(self.bundle / "saved-rabsd")
+        with self.assertRaises(FileNotFoundError):
+            self.package()
+        (self.bundle / "saved-rabsd").rename(self.bundle / "rabsd")
+        data = bytearray((self.bundle / "rabsd").read_bytes())
+        data[18:20] = installer.TARGET_MACHINES[other].to_bytes(2, "little")
+        (self.bundle / "rabsd").write_bytes(data)
+        with self.assertRaisesRegex(installer.InstallError, "mixes executable architectures"):
+            self.package()
+        self.assertFalse(self.output.exists())
+        self.assertFalse(list(self.root.glob(".rabs-package-*")))
+
+    def test_symlink_and_invalid_launcher_inputs_are_refused(self):
+        saved = self.bundle / "saved-rabsd"
+        (self.bundle / "rabsd").rename(saved)
+        (self.bundle / "rabsd").symlink_to(saved)
+        with self.assertRaisesRegex(installer.InstallError, "regular executable"):
+            self.package()
+        (self.bundle / "rabsd").rename(self.bundle / "saved-link")
+        saved.rename(self.bundle / "rabsd")
+        (self.bundle / "cargo-rabs").write_text("#!/usr/bin/env python3\ninvalid (\n")
+        with self.assertRaises(SyntaxError):
+            self.package()
+        self.assertFalse(self.output.exists())
+
+    def test_late_input_change_is_detected_before_archive_publication(self):
+        original = installer.copy_transfer_file
+
+        def change_earlier_source(source, *args, **kwargs):
+            result = original(source, *args, **kwargs)
+            if Path(source).name == "rabs-cargo-root":
+                with (self.bundle / "rabs-wrap").open("ab") as writer:
+                    writer.write(b"changed after capture")
+            return result
+
+        with mock.patch.object(installer, "copy_transfer_file", side_effect=change_earlier_source):
+            with self.assertRaisesRegex(installer.InstallError, "changed during capture"):
+                self.package()
+        self.assertFalse(self.output.exists())
+        self.assertEqual(len(list(self.root.glob(".rabs-package-*"))), 1)
+
+    def test_consumer_rejection_prevents_publication(self):
+        with mock.patch.object(installer, "unpack_archive",
+                               side_effect=installer.InstallError("consumer rejected archive")):
+            with self.assertRaisesRegex(installer.InstallError, "consumer rejected archive"):
+                self.package()
+        self.assertFalse(self.output.exists())
+
+    def test_existing_files_and_dangling_symlinks_are_never_replaced(self):
+        self.output.write_bytes(b"existing release")
+        with self.assertRaisesRegex(installer.InstallError, "replace an existing archive"):
+            self.package()
+        self.assertEqual(self.output.read_bytes(), b"existing release")
+        link = self.root / "dangling.tar.gz"
+        link.symlink_to(self.root / "absent")
+        with self.assertRaisesRegex(installer.InstallError, "replace an existing archive"):
+            self.package(output=link)
+        self.assertEqual(os.readlink(link), str(self.root / "absent"))
+        self.assertFalse(list(self.root.glob(".rabs-package-*")))
+
+    def test_archive_changed_after_consumer_verification_is_not_published(self):
+        original = installer.unpack_archive
+
+        def replace_verified_archive(path, *args, **kwargs):
+            original(path, *args, **kwargs)
+            path.chmod(0o600)
+            path.write_bytes(b"not a gzip archive")
+
+        with mock.patch.object(installer, "unpack_archive", side_effect=replace_verified_archive):
+            with self.assertRaisesRegex(installer.InstallError, "archive changed"):
+                self.package()
+        self.assertFalse(self.output.exists())
+
+    def test_bundled_installer_bytes_are_verified_too(self):
+        original = installer.tarfile.TarFile.addfile
+
+        def corrupt_installer(archive, member, reader=None):
+            if member.name == "install-rabs":
+                data = reader.read()
+                reader = io.BytesIO(b"x" + data[1:])
+            return original(archive, member, reader)
+
+        with mock.patch.object(installer.tarfile.TarFile, "addfile", new=corrupt_installer):
+            with self.assertRaisesRegex(installer.InstallError, "installer digest differs"):
+                self.package()
+        self.assertFalse(self.output.exists())
+
+    def test_output_created_during_packaging_is_not_overwritten(self):
+        original = installer.os.link
+
+        def raced_publication(source, destination, **kwargs):
+            self.output.write_bytes(b"concurrent release")
+            return original(source, destination, **kwargs)
+
+        with mock.patch.object(installer.os, "link", side_effect=raced_publication):
+            with self.assertRaises(installer.InstallError):
+                self.package()
+        self.assertEqual(self.output.read_bytes(), b"concurrent release")
+
+    def test_compressed_output_limit_is_enforced_during_writes(self):
+        output = io.BytesIO()
+        writer = installer.ArchiveWriter(output)
+        with mock.patch.object(installer, "MAX_ARCHIVE_BYTES", 10):
+            writer.write(b"1234567890")
+            with self.assertRaisesRegex(installer.InstallError, "compressed byte limit"):
+                writer.write(b"x")
+        self.assertEqual(output.getvalue(), b"1234567890")
+
+    def test_package_cli_rejects_install_deploy_and_verification_options(self):
+        for extra in (["--verify"], ["--ssh", "worker.example"], ["--bin-dir", str(self.bin)],
+                      ["--ssh-jobs", "2"], ["--ssh-timeout", "42"],
+                      ["--from-archive", str(self.output)], ["--from-image", str(self.output)]):
+            with self.subTest(extra=extra):
+                code, _, error = self.main("--package", str(self.output), "--target", self.target, *extra)
+                self.assertEqual(code, 1)
+                self.assertIn("--package accepts only", error)
+        code, _, error = self.main("--target", self.target)
+        self.assertEqual(code, 1)
+        self.assertIn("--target requires --package", error)
+        self.assertFalse(self.output.exists())
+        self.assertFalse(self.bin.exists())
+
+    def test_empty_output_or_missing_target_cannot_fall_through_to_installation(self):
+        for arguments in (["--package", ""], ["--package", "", "--target", self.target],
+                          ["--package", str(self.output)]):
+            with self.subTest(arguments=arguments):
+                with mock.patch.object(installer, "install", side_effect=AssertionError("installed")), \
+                        mock.patch.object(installer, "source_files", side_effect=AssertionError("read inputs")):
+                    code, _, error = self.main(*arguments)
+                self.assertEqual(code, 1)
+                self.assertIn("nonempty output path and --target", error)
+        self.assertFalse(self.output.exists())
+
+
+@unittest.skipUnless(sys.platform == "linux", "native source-probe process contract")
+class PackageSourceTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="rabs-package-source-test-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.snapshot = self.root / "snapshot"
+        self.snapshot.mkdir()
+        self.repo = self.root / "source"
+        (self.repo / "scripts").mkdir(parents=True)
+        executable = shutil.which("true")
+        self.assertIsNotNone(executable)
+        for name in installer.TOOLS[1:]:
+            shutil.copyfile(executable, self.snapshot / name)
+            (self.snapshot / name).chmod(0o755)
+        for name in ("cargo-rabs", "install-rabs"):
+            data = ("#!/usr/bin/env python3\nprint(" + repr(name + " fixture") + ")\n").encode()
+            (self.snapshot / name).write_bytes(data)
+            (self.snapshot / name).chmod(0o755)
+            (self.repo / "scripts" / name).write_bytes(data)
+        self.git("init", "-q", "-b", "main", "--object-format=sha1")
+        self.git("add", "scripts")
+        self.git("commit", "-qm", "source fixture")
+        self.source = self.git("rev-parse", "HEAD").decode().strip()
+        self.refresh_expected()
+        self.reports = {name: {"schema": 1, "kind": "rabs-build-info", "tool": name,
+                               "version": "2.1.34", "compiled_source": self.source,
+                               "build_identity": "rabs-2.1.34+" + self.source}
+                        for name in installer.TOOLS[1:]}
+        self.raw_reports = {}
+        self.seen = []
+        self.run_probe = installer.package_probe_output
+
+    def git(self, *arguments):
+        return subprocess.run(
+            ["git", "--no-replace-objects", "-C", str(self.repo),
+             "-c", "user.name=RABS Fixture", "-c", "user.email=rabs@example.invalid",
+             "-c", "commit.gpgSign=false", "-c", "core.hooksPath=/dev/null", *arguments],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
+
+    def refresh_expected(self):
+        self.expected = installer.expected_toolset(installer.source_files(self.snapshot, None))
+        self.entries = {name: {"bytes": (self.snapshot / name).stat().st_size,
+                               "sha256": hashlib.sha256((self.snapshot / name).read_bytes()).hexdigest()}
+                        for name in installer.TOOLS + ("install-rabs",)}
+
+    def dispatch_probe(self, argv, limit, deadline):
+        if argv[0] == "git":
+            self.assertIn("--no-replace-objects", argv)
+            return self.run_probe(argv, limit, deadline)
+        name = Path(argv[0]).name
+        self.assertEqual(argv, [str(self.snapshot / name), "--rabs-build-info"])
+        self.seen.append(name)
+        data = self.raw_reports.get(name, json.dumps(self.reports[name]).encode())
+        # Explicit report producer double: real ELF files are hashed, while
+        # these Python children exercise process framing, not compiled Rust.
+        return self.run_probe(
+            [sys.executable, "-c", "import sys; sys.stdout.buffer.write(bytes.fromhex(sys.argv[1]))",
+             data.hex()], limit, deadline)
+
+    def verify(self, source=None):
+        with mock.patch.object(installer, "package_probe_output", side_effect=self.dispatch_probe):
+            return installer.verify_package_source(self.snapshot, self.expected, self.entries,
+                                                   self.source if source is None else source, self.repo)
+
+    def test_four_exact_snapshot_probes_and_git_blobs_bind_the_receipt(self):
+        self.assertEqual(self.verify(), {"commit": self.source, "version": "2.1.34",
+                                         "build_identity": "rabs-2.1.34+" + self.source})
+        self.assertEqual(self.seen, list(installer.TOOLS[1:]))
+
+    def test_strict_package_cli_binds_captured_tools_and_refuses_mixed_source(self):
+        # The producer ships its own installer. Pin those actual bytes in the
+        # fixture repository so the complete CLI exercises both script checks.
+        (self.repo / "scripts" / "install-rabs").write_bytes(SCRIPT.read_bytes())
+        self.git("add", "scripts")
+        self.git("commit", "-qm", "pin the actual archive producer")
+        self.source = self.git("rev-parse", "HEAD").decode().strip()
+        for report in self.reports.values():
+            report.update(compiled_source=self.source, build_identity="rabs-2.1.34+" + self.source)
+        target = next(target for target, machine in installer.TARGET_MACHINES.items()
+                      if machine == installer.host_machine())
+        captured_paths = []
+
+        def captured_probe(argv, limit, deadline):
+            if argv[0] == "git":
+                return self.run_probe(argv, limit, deadline)
+            path = Path(argv[0])
+            self.assertEqual(argv[1:], ["--rabs-build-info"])
+            self.assertEqual(path.parent.name, "inputs")
+            self.assertNotEqual(path.parent, self.snapshot)
+            self.assertEqual(path.read_bytes(), (self.snapshot / path.name).read_bytes())
+            captured_paths.append(path)
+            data = json.dumps(self.reports[path.name]).encode()
+            return self.run_probe(
+                [sys.executable, "-c", "import sys; sys.stdout.buffer.write(bytes.fromhex(sys.argv[1]))",
+                 data.hex()], limit, deadline)
+
+        for mixed in (False, True):
+            with self.subTest(mixed=mixed):
+                self.reports["rabsd"]["compiled_source"] = "f" * 40 if mixed else self.source
+                output = self.root / ("mixed.tar.gz" if mixed else "matched.tar.gz")
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with mock.patch.object(installer, "package_probe_output", side_effect=captured_probe), \
+                        contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    code = installer.main(["--from-bundle", str(self.snapshot), "--package", str(output),
+                                           "--target", target, "--require-source", self.source,
+                                           "--source-repository", str(self.repo)])
+                self.assertEqual(code, int(mixed), stderr.getvalue())
+                self.assertEqual(output.exists(), not mixed)
+                if mixed:
+                    self.assertIn("identity differs from required source", stderr.getvalue())
+                else:
+                    receipt = json.loads(stdout.getvalue())
+                    self.assertEqual(receipt["source_identity"], {
+                        "commit": self.source, "version": "2.1.34",
+                        "build_identity": "rabs-2.1.34+" + self.source})
+                    with tarfile.open(output, "r:gz") as archive:
+                        self.assertEqual(archive.extractfile("install-rabs").read(), SCRIPT.read_bytes())
+        self.assertGreaterEqual(len(captured_paths), 6)
+
+    def test_requested_commit_is_used_despite_dirty_worktree_and_new_head(self):
+        (self.repo / "scripts" / "cargo-rabs").write_bytes(b"dirty checkout bytes")
+        self.assertEqual(self.verify()["commit"], self.source)
+        self.git("add", "scripts")
+        self.git("commit", "-qm", "later source")
+        self.assertNotEqual(self.git("rev-parse", "HEAD").decode().strip(), self.source)
+        self.assertEqual(self.verify()["commit"], self.source)
+
+    def test_invalid_source_and_non_native_toolset_refuse_before_probing(self):
+        for source in ("", self.source[:12], self.source.upper(), self.source + "-dirty",
+                       self.source + "+overlay-123", "main"):
+            with self.subTest(source=source):
+                with mock.patch.object(installer, "package_probe_output", side_effect=AssertionError("probed")):
+                    with self.assertRaisesRegex(installer.InstallError, "full, clean, lowercase"):
+                        installer.verify_package_source(self.snapshot, self.expected, self.entries, source, self.repo)
+        self.expected["machine"] = next(machine for machine in installer.TARGET_MACHINES.values()
+                                         if machine != installer.host_machine())
+        with mock.patch.object(installer, "package_probe_output", side_effect=AssertionError("probed")):
+            with self.assertRaisesRegex(installer.InstallError, "native executable"):
+                installer.verify_package_source(self.snapshot, self.expected, self.entries, self.source, self.repo)
+
+    def test_missing_commit_and_tree_object_are_not_commits(self):
+        with self.assertRaisesRegex(installer.InstallError, "probe exit"):
+            self.verify("0" * 40)
+        tree = self.git("rev-parse", self.source + "^{tree}").decode().strip()
+        with self.assertRaisesRegex(installer.InstallError, "not a Git commit object"):
+            self.verify(tree)
+        self.assertEqual(self.seen, [])
+
+    def test_both_scripts_must_match_the_requested_git_blobs(self):
+        for name in ("cargo-rabs", "install-rabs"):
+            with self.subTest(name=name):
+                path = self.snapshot / name
+                original = path.read_bytes()
+                path.write_bytes(original + b"# wrong source\n")
+                self.refresh_expected()
+                with self.assertRaisesRegex(installer.InstallError, "script differs from required source"):
+                    self.verify()
+                path.write_bytes(original)
+                self.refresh_expected()
+        self.assertEqual(self.seen, [])
+
+    def test_wrong_missing_or_mixed_build_reports_are_refused(self):
+        name = "rabs-wrap"
+        valid = self.reports[name].copy()
+        for changes in ({"schema": True}, {"kind": "other"}, {"tool": "rabsd"},
+                        {"version": "invalid"}, {"version": "3.0.0"}, {"extra": True},
+                        {"build_identity": "rabs-2.1.34"},
+                        {"build_identity": "rabs-2.1.34+" + "f" * 40},
+                        {"build_identity": "rabs-2.1.34+" + self.source + "-dirty"},
+                        {"compiled_source": None}, {"compiled_source": self.source[:12]},
+                        {"compiled_source": self.source + "-dirty"},
+                        {"compiled_source": self.source + "+overlay-123"}):
+            with self.subTest(changes=changes):
+                self.reports[name] = {**valid, **changes}
+                with self.assertRaises(installer.InstallError):
+                    self.verify()
+        self.reports[name] = valid
+        self.reports["rabsd"].update(version="3.0.0", build_identity="rabs-3.0.0+" + self.source)
+        with self.assertRaisesRegex(installer.InstallError, "versions differ"):
+            self.verify()
+
+    def test_malformed_empty_duplicate_and_incomplete_reports_are_refused(self):
+        valid = json.dumps(self.reports["rabs-wrap"]).encode()
+        for data in (b"", b"not JSON", b"\xff", b"[]", b'{}',
+                     b'{"schema":1,' + valid[1:],
+                     json.dumps({key: value for key, value in self.reports["rabs-wrap"].items()
+                                 if key != "compiled_source"}).encode()):
+            with self.subTest(data=data[:40]):
+                self.raw_reports["rabs-wrap"] = data
+                with self.assertRaises(installer.InstallError):
+                    self.verify()
+
+    def test_snapshot_replacement_after_a_probe_is_refused(self):
+        dispatch = self.dispatch_probe
+
+        def change_snapshot(argv, limit, deadline):
+            output = dispatch(argv, limit, deadline)
+            if Path(argv[0]).name == "rabs-cargo-root":
+                with (self.snapshot / "install-rabs").open("ab") as writer:
+                    writer.write(b"# changed during probe\n")
+            return output
+
+        with mock.patch.object(installer, "package_probe_output", side_effect=change_snapshot):
+            with self.assertRaisesRegex(installer.InstallError, "snapshot changed"):
+                installer.verify_package_source(self.snapshot, self.expected, self.entries, self.source, self.repo)
+
+    def test_real_child_output_is_bounded_across_stdout_and_stderr(self):
+        command = [sys.executable, "-c", "import os; os.write(1,b'a'*80); os.write(2,b'b'*80)"]
+        with self.assertRaisesRegex(installer.InstallError, "output exceeded"):
+            self.run_probe(command, 128, time.monotonic() + 2)
+        command = [sys.executable, "-c", "import sys; sys.stderr.write('fixture failure'); sys.exit(23)"]
+        with self.assertRaisesRegex(installer.InstallError, "probe exit 23: fixture failure"):
+            self.run_probe(command, 128, time.monotonic() + 2)
+
+    def test_closed_output_does_not_remove_the_process_deadline(self):
+        command = [sys.executable, "-c", "import os,time; os.close(1); os.close(2); time.sleep(30)"]
+        started = time.monotonic()
+        with self.assertRaisesRegex(installer.InstallError, "deadline expired"):
+            self.run_probe(command, 128, started + 0.2)
+        self.assertLess(time.monotonic() - started, 3)
+
+    def test_process_group_is_retired_before_reaping_releases_its_identity(self):
+        original_signal = installer.os.killpg
+        original_wait = installer.subprocess.Popen.wait
+        events = []
+
+        def signal_group(pid, sig):
+            events.append("signal")
+            return original_signal(pid, sig)
+
+        def reap(child, timeout=None):
+            self.assertIn("signal", events, "reaping permits the process-group ID to be recycled")
+            events.append("reap")
+            return original_wait(child, timeout=timeout)
+
+        with mock.patch.object(installer.os, "killpg", side_effect=signal_group), \
+                mock.patch.object(installer.subprocess.Popen, "wait", new=reap):
+            output = self.run_probe([sys.executable, "-c", "print('complete')"],
+                                    128, time.monotonic() + 2)
+        self.assertEqual(output, b"complete\n")
+        self.assertEqual(events, ["signal", "reap"])
+
+    def test_reap_timeout_is_a_bounded_install_error(self):
+        original_wait = installer.subprocess.Popen.wait
+        children = []
+
+        def unreapable(child, timeout=None):
+            children.append(child)
+            raise subprocess.TimeoutExpired(child.args, timeout)
+
+        try:
+            with mock.patch.object(installer.subprocess.Popen, "wait", new=unreapable):
+                with self.assertRaisesRegex(installer.InstallError, "could not be reaped"):
+                    self.run_probe([sys.executable, "-c", "pass"], 128, time.monotonic() + 2)
+        finally:
+            for child in children:
+                original_wait(child, timeout=2)
+
+    def test_timeout_kills_descendants_that_keep_output_open(self):
+        pid_file = self.root / "descendant.pid"
+        descendant = ("import os,sys,time; from pathlib import Path; "
+                      "Path(sys.argv[1]).write_text(os.readlink('/proc/self')); time.sleep(30)")
+        script = ("import subprocess,sys; subprocess.Popen([sys.executable,'-c',"
+                  + repr(descendant) + ",sys.argv[1]])")
+        with self.assertRaisesRegex(installer.InstallError, "deadline expired"):
+            self.run_probe([sys.executable, "-c", script, str(pid_file)], 128, time.monotonic() + 0.3)
+        # /proc can expose the outer PID namespace in a build sandbox. The
+        # descendant records its own mounted-proc identity, not Popen's PID.
+        pid = int(pid_file.read_text())
+        for _ in range(20):
+            try:
+                state = Path("/proc/{}/stat".format(pid)).read_text().split(")", 1)[1].split()[0]
+            except FileNotFoundError:
+                break
+            if state == "Z":
+                break
+            time.sleep(0.01)
+        else:
+            self.fail("probe descendant is still running")
 
 
 if __name__ == "__main__":

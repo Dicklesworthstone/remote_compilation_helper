@@ -795,12 +795,74 @@ pub(super) struct RegistryCache {
     git: Option<git::GitCache>,
 }
 
+/// Decode only the bounded sparse-cache format consumed by the captured Cargo
+/// in selected mode. Keep name/version/checksum identity independently of the
+/// archive: an unused missing archive cannot excuse missing lock/index inputs.
+fn sparse_record_versions(
+    bytes: &[u8],
+    name: &str,
+    control: &PreparationControl<'_>,
+) -> io::Result<BTreeMap<String, [u8; 32]>> {
+    require(
+        bytes.starts_with(&[3, 2, 0, 0, 0]) && bytes.last() == Some(&0),
+        "selected Cargo requires a complete supported sparse index record",
+    )?;
+    let mut fields = bytes[5..].split(|byte| *byte == 0);
+    let header = fields.next().unwrap_or_default();
+    require(
+        !header.is_empty() && header.len() <= 4096 && std::str::from_utf8(header).is_ok(),
+        "selected sparse index cache header is invalid",
+    )?;
+    let mut versions = BTreeMap::new();
+    while let Some(version) = fields.next() {
+        control.checkpoint()?;
+        if version.is_empty() {
+            require(
+                fields.next().is_none(),
+                "selected sparse index record has an empty version",
+            )?;
+            break;
+        }
+        let version = std::str::from_utf8(version)
+            .map_err(|_| invalid("selected sparse index version is not UTF-8"))?;
+        require(
+            canonical_version(version),
+            "selected sparse index version is invalid",
+        )?;
+        let record = fields
+            .next()
+            .filter(|record| !record.is_empty())
+            .ok_or_else(|| invalid("selected sparse index version lacks its JSON record"))?;
+        let record: Value = serde_json::from_slice(record)
+            .map_err(|_| invalid("selected sparse index record is malformed"))?;
+        require(
+            record["name"].as_str() == Some(name) && record["vers"].as_str() == Some(version),
+            "selected sparse index record differs from its package identity",
+        )?;
+        let checksum = record["cksum"]
+            .as_str()
+            .ok_or_else(|| invalid("selected sparse index record lacks its checksum"))?;
+        let checksum = archive_checksum(checksum)?;
+        require(
+            versions.insert(version.to_owned(), checksum).is_none()
+                && versions.len() <= MAX_ARCHIVE_MEMBERS,
+            "selected sparse index repeats a version or exceeds its entry bound",
+        )?;
+    }
+    require(
+        !versions.is_empty(),
+        "selected sparse index record has no versions",
+    )?;
+    Ok(versions)
+}
+
 impl RegistryCache {
     pub(super) fn capture_controlled(
         image: &SealedSourceSnapshot,
         lock: &Path,
         approved: &Path,
         cargo_home: &Path,
+        selected_graph: bool,
         control: &PreparationControl<'_>,
     ) -> io::Result<Self> {
         control.checkpoint()?;
@@ -850,6 +912,8 @@ impl RegistryCache {
             git: None,
         };
         let mut found = BTreeSet::new();
+        let mut indexed = BTreeSet::new();
+        let mut index_versions = BTreeMap::new();
         let mut candidate_remaining = MAX_CANDIDATE_BYTES;
         let mut expanded_remaining = MAX_SOURCE_BYTES;
         let mut expanded_members = 0_usize;
@@ -857,10 +921,54 @@ impl RegistryCache {
             control.checkpoint()?;
             let config_path = format!("registry/index/{namespace}/config.json");
             let mut namespace_sources = BTreeSet::new();
+            let mut namespace_indexed = BTreeSet::new();
             // Group by the physical cache path before acquisition: many locked
             // source identities can share a host, package name and version.
             // Each candidate is read and hashed once, not once per identity.
             for (path, identities) in archive_candidates(&namespace, &locked)? {
+                // Resolution still consumes the complete bounded lock/index
+                // evidence. Only archives may be absent until Cargo selects
+                // its actual host and target units. Existing callers keep the
+                // complete-lock archive requirement below.
+                if selected_graph {
+                    for (identity @ (source, name, version), expected) in &identities {
+                        let record =
+                            format!("registry/index/{namespace}/.cache/{}", index_record(name));
+                        if !captured.files.contains_key(&record) {
+                            match read_selected_controlled(
+                                &root,
+                                &record,
+                                OUTPUT_LIMIT.min(remaining),
+                                control,
+                            ) {
+                                Ok(bytes) => {
+                                    let versions = sparse_record_versions(&bytes, name, control)?;
+                                    index_versions.insert(record.clone(), (name.clone(), versions));
+                                    captured.insert(
+                                        record.clone(),
+                                        bytes,
+                                        &mut remaining,
+                                        &mut file_count,
+                                    )?;
+                                }
+                                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        let (record_name, versions) =
+                            index_versions.get(&record).ok_or_else(|| {
+                                invalid("selected sparse index record was not validated")
+                            })?;
+                        require(
+                            record_name == name,
+                            "locked names alias one sparse index record",
+                        )?;
+                        if versions.get(version.as_str()) == Some(*expected) {
+                            namespace_indexed.insert((*identity).clone());
+                        }
+                        namespace_sources.insert(source.as_str());
+                    }
+                }
                 let Some(candidate) = read_archive_candidate_controlled(
                     &root,
                     &path,
@@ -919,10 +1027,15 @@ impl RegistryCache {
                 )?;
                 validate_index_config(&config, namespace_sources.contains(CRATES_IO))?;
                 captured.insert(config_path, config, &mut remaining, &mut file_count)?;
+                indexed.extend(namespace_indexed);
             }
         }
         require(
-            found.len() == locked.len(),
+            !selected_graph || indexed.len() == locked.len(),
+            "approved Cargo home is missing complete checksum-bound locked sparse index records",
+        )?;
+        require(
+            selected_graph || found.len() == locked.len(),
             "approved Cargo home is missing a checksum-matching locked registry archive; fetch the complete locked graph before preparing",
         )?;
         // Re-read the complete selected set. An index/cache replacement during
@@ -954,7 +1067,7 @@ impl RegistryCache {
             }
             captured.git = Some(git);
         }
-        captured.materialize_controlled(cargo_home, control)?;
+        captured.materialize_controlled(cargo_home, None, control)?;
         Ok(captured)
     }
 
@@ -983,13 +1096,36 @@ impl RegistryCache {
     pub(super) fn materialize_controlled(
         &self,
         destination: &Path,
+        selected_archives: Option<&BTreeSet<String>>,
         control: &PreparationControl<'_>,
     ) -> io::Result<Vec<String>> {
+        if let Some(selected) = selected_archives {
+            for path in selected {
+                control.checkpoint()?;
+                require(
+                    path.starts_with("registry/cache/")
+                        && path.ends_with(".crate")
+                        && self.files.contains_key(path),
+                    "selected Cargo archive is absent from the retained cache",
+                )?;
+            }
+        }
         // Both destinations are inside a private operation-owned directory.
         // create_new prevents overwriting any workspace or Cargo-created file.
         fs::create_dir_all(destination)?;
+        let mut installed = Vec::new();
         for (path, bytes) in &self.files {
             control.checkpoint()?;
+            // The planner needs every available locked archive before Cargo
+            // selects its units. The final input delivery needs only the
+            // archives owning those verified units. Keep the complete sparse
+            // index and Git object stores: Cargo still resolves the full lock
+            // even when an optional or foreign-target crate is not compiled.
+            if path.starts_with("registry/cache/")
+                && selected_archives.is_some_and(|selected| !selected.contains(path))
+            {
+                continue;
+            }
             let output = destination.join(path);
             fs::create_dir_all(
                 output
@@ -1001,8 +1137,9 @@ impl RegistryCache {
                 .create_new(true)
                 .open(output)?;
             control.write_all(&mut file, bytes)?;
+            installed.push(path.clone());
         }
-        Ok(self.files.keys().cloned().collect())
+        Ok(installed)
     }
 
     pub(super) fn check_lock(&self, lock: &Path) -> io::Result<()> {
@@ -1010,6 +1147,125 @@ impl RegistryCache {
             lock == self.lock,
             "resolved Cargo workspace uses a different lockfile than the captured registry graph",
         )
+    }
+
+    /// Recover an external unit's owner from the captured lock, its exact Cargo
+    /// source identity and Cargo's private extraction namespace. The unit's
+    /// package ID or target basename alone never supplies archive authority.
+    pub(super) fn selected_package(
+        &self,
+        home: &Path,
+        id: &str,
+        sources: &[&str],
+        control: &PreparationControl<'_>,
+    ) -> io::Result<Value> {
+        control.checkpoint()?;
+        require(
+            !sources.is_empty(),
+            "selected external package has no sources",
+        )?;
+        if id.starts_with("git+") {
+            let package = self
+                .git
+                .as_ref()
+                .ok_or_else(|| invalid("selected Git package has no captured object store"))?
+                .selected_package(home, id, sources, control)?;
+            self.check_package(home, &package, control)?;
+            return Ok(package);
+        }
+        let path = Path::new(sources[0])
+            .strip_prefix(home.join("registry/src"))
+            .map_err(|_| invalid("selected registry target escapes its private Cargo home"))?;
+        let parts = path.components().collect::<Vec<_>>();
+        require(
+            parts.len() >= 3
+                && parts
+                    .iter()
+                    .all(|part| matches!(part, Component::Normal(_))),
+            "selected registry target has a noncanonical extraction path",
+        )?;
+        let namespace = parts[0]
+            .as_os_str()
+            .to_str()
+            .ok_or_else(|| invalid("selected registry namespace is not UTF-8"))?;
+        let directory = parts[1]
+            .as_os_str()
+            .to_str()
+            .ok_or_else(|| invalid("selected registry package directory is not UTF-8"))?;
+        let mut owner = None;
+        for (source, captured_namespace, name, version) in &self.package_sources {
+            if namespace == captured_namespace
+                && directory == format!("{name}-{version}")
+                && super::selection::package_id_matches(id, source, name, version)
+            {
+                require(
+                    owner.is_none(),
+                    "selected registry unit has ambiguous captured owners",
+                )?;
+                owner = Some((source, name, version));
+            }
+        }
+        let (source, name, version) = owner.ok_or_else(|| {
+            invalid("selected registry unit lacks its checksum-bound captured archive")
+        })?;
+        let package = serde_json::json!({
+            "id": id,
+            "source": source,
+            "name": name,
+            "version": version,
+            "manifest_path": home.join("registry/src").join(namespace).join(directory).join("Cargo.toml"),
+            "targets": sources.iter().map(|source| serde_json::json!({"src_path":source})).collect::<Vec<_>>(),
+        });
+        self.check_package(home, &package, control)?;
+        Ok(package)
+    }
+
+    /// Recover final delivery paths only from packages whose source identity,
+    /// namespace and extracted inputs match this exact retained cache. Names
+    /// and versions alone cannot select among different registry owners.
+    pub(super) fn selected_archive_paths(
+        &self,
+        home: &Path,
+        packages: &[Value],
+        control: &PreparationControl<'_>,
+    ) -> io::Result<BTreeSet<String>> {
+        let mut archives = BTreeSet::new();
+        for package in packages {
+            control.checkpoint()?;
+            let source = package["source"]
+                .as_str()
+                .ok_or_else(|| invalid("selected archive requires an external package source"))?;
+            self.check_package(home, package, control)?;
+            if source.starts_with("git+") {
+                continue;
+            }
+            let manifest = Path::new(
+                package["manifest_path"]
+                    .as_str()
+                    .ok_or_else(|| invalid("selected registry manifest missing"))?,
+            );
+            let relative = manifest
+                .strip_prefix(home.join("registry/src"))
+                .map_err(|_| invalid("selected registry manifest escapes its private home"))?;
+            let mut components = relative.components();
+            let namespace = components
+                .next()
+                .and_then(|part| part.as_os_str().to_str())
+                .ok_or_else(|| invalid("selected registry namespace missing"))?;
+            let directory = components
+                .next()
+                .and_then(|part| part.as_os_str().to_str())
+                .ok_or_else(|| invalid("selected registry package directory missing"))?;
+            // check_package already proved this exact extraction namespace and
+            // package directory against the captured lock/checksum owner.
+            let archive = format!("registry/cache/{namespace}/{directory}.crate");
+            require(
+                self.files.contains_key(&archive),
+                "selected registry archive disappeared from its retained cache",
+            )?;
+            archives.insert(archive);
+        }
+        Ok(archives)
     }
 
     pub(super) fn check_package(

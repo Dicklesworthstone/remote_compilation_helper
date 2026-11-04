@@ -66,7 +66,9 @@ use rabs_sandbox::toolchain_dataset::capture_toolchain;
 use rabs_sandbox::toolchain_dataset::{
     PreparedToolchain, ToolchainIdentity, ToolchainLimits, capture_toolchain_with_cloner,
 };
-use rabs_sandbox::toolchain_transfer::TOOLCHAIN_TRANSFER_VERSION;
+use rabs_sandbox::toolchain_transfer::{
+    TOOLCHAIN_FILE_REUSE_VERSION, TOOLCHAIN_TRANSFER_VERSION,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -482,19 +484,34 @@ impl DependencyWorkerPool {
                 if attempted.contains(worker.worker()) {
                     return None;
                 }
-                worker
-                    .placement_load(generation, now)
-                    .map(|load| (position, (index, readiness), load))
+                worker.placement_load(generation, now).map(|load| {
+                    (
+                        position,
+                        (index, readiness),
+                        load,
+                        worker.placement_toolchain_file_reuse(generation),
+                    )
+                })
             })
             .collect();
         // Unknown/expired measurements keep their original round-robin
         // positions; they are neither idle scores nor exclusion evidence.
-        // Sort only the measured positions, stably, so equal normalized loads
-        // retain round-robin order. The saved connection generation is checked
-        // again when physical capacity is reserved.
-        let positions: Vec<_> = measured.iter().map(|(position, _, _)| *position).collect();
-        measured.sort_by(|(_, _, left), (_, _, right)| left.compare(*right));
-        for (position, (_, candidate, _)) in positions.into_iter().zip(measured) {
+        // Sort only the measured positions. Normalized load remains primary;
+        // when two authenticated workers are equally loaded, prefer the one
+        // that can reuse verified toolchain files and avoid redundant SDK
+        // transfer bytes. Equal hints still retain round-robin order.
+        let positions: Vec<_> = measured
+            .iter()
+            .map(|(position, _, _, _)| *position)
+            .collect();
+        measured.sort_by(
+            |(_, _, left_load, left_reuse), (_, _, right_load, right_reuse)| {
+                left_load
+                    .compare(*right_load)
+                    .then_with(|| right_reuse.cmp(left_reuse))
+            },
+        );
+        for (position, (_, candidate, _, _)) in positions.into_iter().zip(measured) {
             order[position] = candidate;
         }
         order
@@ -2921,6 +2938,37 @@ mod worker_pool_tests {
             second,
         ));
         assert!(pool.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn equal_pressure_prefers_authenticated_toolchain_file_reuse() {
+        let state = crate::test_util::private_tempdir();
+        let pool = pool(state.path(), 2);
+        let request = scheduling_request(true);
+        let mut ordinary = scheduling_hello();
+        ordinary["load_x100"] = json!(100);
+        let mut reusable = scheduling_hello();
+        reusable["load_x100"] = json!(100);
+        reusable["toolchain_file_reuses"] = json!([TOOLCHAIN_FILE_REUSE_VERSION]);
+        let first = pool.workers[0].advertise_for_test(&ordinary);
+        let second = pool.workers[1].advertise_for_test(&reusable);
+
+        // Equal normalized load would otherwise preserve round-robin and pick
+        // worker-1 first. Reuse is only an advisory tie-breaker; every ordinary
+        // request, capability and transfer verification still runs afterward.
+        let (preferred, preferred_claim) =
+            pool.try_reserve_for(&key(1), Some(&request)).unwrap();
+        assert_eq!(preferred.worker(), "worker-2");
+        let (other, other_claim) = pool.try_reserve_for(&key(2), Some(&request)).unwrap();
+        assert_eq!(other.worker(), "worker-1");
+        drop((
+            preferred,
+            preferred_claim,
+            other,
+            other_claim,
+            first,
+            second,
+        ));
     }
 
     #[test]

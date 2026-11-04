@@ -31,7 +31,9 @@ import argparse
 import ast
 from concurrent.futures import ThreadPoolExecutor
 import fcntl
+import gzip
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -39,6 +41,7 @@ import platform
 import re
 import selectors
 import shlex
+import signal
 import stat
 import subprocess
 import sys
@@ -535,6 +538,299 @@ def expected_from_image(path):
     if len(machines) != 1:
         raise InstallError("retained deployment image mixes executable architectures")
     return validate_toolset({"schema": 1, "machine": machines.pop(), "files": files}), header["bin_dir"]
+
+
+class ArchiveWriter:
+    """Bound compressed output as it is written, including gzip framing."""
+
+    def __init__(self, writer):
+        self.writer = writer
+        self.count = 0
+
+    def write(self, data):
+        if self.count + len(data) > MAX_ARCHIVE_BYTES:
+            raise InstallError("packaged archive exceeds its compressed byte limit")
+        written = self.writer.write(data)
+        self.count += written
+        return written
+
+    def flush(self):
+        self.writer.flush()
+
+
+def package_probe_output(argv, output_limit, deadline):
+    """Collect one owned process group within one time and combined-output bound."""
+    if time.monotonic() >= deadline:
+        raise InstallError("package source probe deadline expired")
+    child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, start_new_session=True, close_fds=True)
+    streams = [bytearray(), bytearray()]
+    count = 0
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(child.stdout, selectors.EVENT_READ, 0)
+            selector.register(child.stderr, selectors.EVENT_READ, 1)
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise InstallError("package source probe deadline expired")
+                for key, _ in selector.select(remaining):
+                    chunk = os.read(key.fileobj.fileno(), 4096)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    count += len(chunk)
+                    if count > output_limit:
+                        raise InstallError("package source probe output exceeded its byte limit")
+                    streams[key.data].extend(chunk)
+        # Observe exit without reaping: the reserved leader PID keeps group
+        # cleanup from signaling a recycled, unrelated process group.
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise InstallError("package source probe deadline expired")
+            exited = os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            if exited is not None:
+                status = exited.si_status if exited.si_code == os.CLD_EXITED else -exited.si_status
+                break
+            time.sleep(min(0.01, remaining))
+        if status != 0:
+            detail = bytes(streams[1]).decode("utf-8", errors="replace")[-2048:]
+            raise InstallError("package source probe exit {}: {}".format(status, detail))
+        return bytes(streams[0])
+    except subprocess.TimeoutExpired as error:
+        raise InstallError("package source probe deadline expired") from error
+    finally:
+        # A child can exit while a descendant retains its pipes, or close both
+        # pipes and continue running. Retire the whole owned group either way.
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            child.wait(timeout=2)
+        except subprocess.TimeoutExpired as error:
+            raise InstallError("package source probe could not be reaped after termination") from error
+        finally:
+            child.stdout.close()
+            child.stderr.close()
+
+
+def verify_package_source(snapshot, expected, entries, required_source, source_repository):
+    """Check trusted compiled stamps and exact Git script bytes, not provenance."""
+    if (not isinstance(required_source, str)
+            or re.fullmatch(r"[0-9a-f]{40}", required_source) is None):
+        raise InstallError("source verification requires a full, clean, lowercase commit ID")
+    validate_toolset(expected)
+    if expected["machine"] != host_machine():
+        raise InstallError("source verification requires native executable architecture")
+    names = TOOLS + ("install-rabs",)
+    if (set(entries) != set(names)
+            or {name: entries[name] for name in TOOLS} != expected["files"]):
+        raise InstallError("source verification requires the captured complete toolset")
+    snapshot = Path(snapshot).absolute()
+    observed = {name: signature((snapshot / name).lstat()) for name in names}
+
+    def unchanged():
+        for name in names:
+            if signature((snapshot / name).lstat()) != observed[name]:
+                raise InstallError("package snapshot changed during source verification: " + name)
+
+    def script_bytes(name, limit):
+        writer = io.BytesIO()
+        identity, _ = copy_transfer_file(snapshot / name, writer, limit,
+                                          observed[name], True)
+        if identity != entries[name]:
+            raise InstallError("package script differs from captured bytes: " + name)
+        return writer.getvalue()
+
+    if expected_toolset(source_files(snapshot, None)) != expected:
+        raise InstallError("package snapshot differs from captured toolset")
+    scripts = {"cargo-rabs": script_bytes("cargo-rabs", 1024 * 1024),
+               "install-rabs": script_bytes("install-rabs", MAX_INSTALLER_BYTES)}
+    unchanged()
+    git = ["git", "--no-replace-objects", "-C", str(Path(source_repository).absolute())]
+    deadline = time.monotonic() + 30
+
+    def probe(argv, limit):
+        return package_probe_output(argv, limit, min(deadline, time.monotonic() + 10))
+
+    # A tree hash also supports SHA:path. Require an actual commit object,
+    # without replacement refs, rather than inferring identity from HEAD/status.
+    if probe(git + ["cat-file", "-t", required_source], 4096) != b"commit\n":
+        raise InstallError("required source is not a Git commit object")
+    for name, data in scripts.items():
+        limit = MAX_INSTALLER_BYTES if name == "install-rabs" else 1024 * 1024
+        blob = probe(git + ["show", required_source + ":scripts/" + name], limit)
+        if blob != data:
+            raise InstallError("packaged script differs from required source commit: " + name)
+    version = None
+    identity = None
+    fields = {"schema", "kind", "tool", "version", "build_identity", "compiled_source"}
+    for name in TOOLS[1:]:
+        report = unique_json(probe([str(snapshot / name), "--rabs-build-info"], 64 * 1024))
+        if (not isinstance(report, dict) or set(report) != fields
+                or type(report["schema"]) is not int or report["schema"] != 1
+                or report["kind"] != "rabs-build-info" or report["tool"] != name
+                or not isinstance(report["version"], str) or len(report["version"]) > 128
+                or re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?"
+                                r"(?:\+[0-9A-Za-z.-]+)?", report["version"]) is None):
+            raise InstallError("invalid package build-info report: " + name)
+        if (report["compiled_source"] != required_source
+                or report["build_identity"] != "rabs-{}+{}".format(report["version"], required_source)):
+            raise InstallError("package build identity differs from required source: " + name)
+        if version is not None and report["version"] != version:
+            raise InstallError("package build-info versions differ")
+        version, identity = report["version"], report["build_identity"]
+    unchanged()
+    if expected_toolset(source_files(snapshot, None)) != expected:
+        raise InstallError("package snapshot differs after source probes")
+    for name, data in scripts.items():
+        limit = MAX_INSTALLER_BYTES if name == "install-rabs" else 1024 * 1024
+        if script_bytes(name, limit) != data:
+            raise InstallError("package script changed during source verification: " + name)
+    unchanged()
+    return {"commit": required_source, "version": version, "build_identity": identity}
+
+
+def package_archive(paths, output, target, required_source=None, source_repository=None):
+    """Produce the exact flat release format accepted by this installer.
+
+    Inputs are trusted build products; byte identities do not authenticate their
+    publisher. Optional native source checks compare compiled identity reports
+    and pinned Git script blobs before any archive can be published.
+    Capture once, validate the actual archive with the consumer, then publish
+    without replacing an existing pathname. Keep the private stage for recovery.
+    """
+    if target not in TARGET_MACHINES:
+        raise InstallError("packaging requires a supported Linux GNU --target")
+    if source_repository is not None and required_source is None:
+        raise InstallError("--source-repository requires --require-source")
+    if required_source is not None and re.fullmatch(r"[0-9a-f]{40}", required_source) is None:
+        raise InstallError("--require-source must be a full, clean, lowercase Git commit ID")
+    expected = expected_toolset(paths)
+    if expected["machine"] != TARGET_MACHINES[target]:
+        raise InstallError("packaged executables do not match --target")
+    if required_source is not None and expected["machine"] != host_machine():
+        raise InstallError("--require-source probes native binaries; run packaging on the target architecture")
+    sources = {**paths, "install-rabs": Path(__file__).resolve()}
+    observed = {name: signature(path.lstat()) for name, path in sources.items()}
+    total = sum(identity[2] for identity in observed.values())
+    if not 0 < total <= MAX_ARCHIVE_BYTES:
+        raise InstallError("package exceeds its expanded byte limit")
+    output = Path(output).absolute()
+    directory = open_directory(output.parent)
+    stage = None
+    try:
+        try:
+            os.stat(output.name, dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise InstallError("refusing to replace an existing archive: " + str(output))
+        # Snapshots, gzip output and consumer extraction coexist. This is only
+        # a preflight: every later write can still fail if capacity changes.
+        deployment_space(output.parent, total * 4 + MIN_DEPLOY_RESERVE)
+        stage = Path(tempfile.mkdtemp(prefix=".rabs-package-", dir=output.parent))
+        snapshot = stage / "inputs"
+        snapshot.mkdir(mode=0o700)
+        entries = {}
+        for name, source in sources.items():
+            limit = MAX_INSTALLER_BYTES if name == "install-rabs" else MAX_FILE_BYTES
+            with (snapshot / name).open("xb") as writer:
+                entry, _ = copy_transfer_file(source, writer, limit, observed[name],
+                                              name != "install-rabs")
+                writer.flush()
+                os.fchmod(writer.fileno(), 0o555)
+                os.fsync(writer.fileno())
+            if name in TOOLS and entry != expected["files"][name]:
+                raise InstallError("package input differs from captured toolset: " + name)
+            entries[name] = entry
+        for name, source in sources.items():
+            if signature(source.lstat()) != observed[name]:
+                raise InstallError("package input changed during capture: " + name)
+        if expected_toolset(source_files(snapshot, None)) != expected:
+            raise InstallError("package snapshot differs from captured toolset")
+        installer_source = (snapshot / "install-rabs").read_text(encoding="utf-8")
+        if not installer_source.startswith("#!/usr/bin/env python3\n"):
+            raise InstallError("invalid packaged installer")
+        ast.parse(installer_source, filename="install-rabs")
+        source_identity = None
+        if required_source is not None:
+            source_identity = verify_package_source(
+                snapshot, expected, entries, required_source,
+                Path(source_repository) if source_repository is not None else Path(__file__).resolve().parents[1])
+        archive_path = stage / "release.tar.gz"
+        with archive_path.open("xb") as raw:
+            with gzip.GzipFile(filename="", mode="wb", fileobj=ArchiveWriter(raw),
+                               mtime=0) as compressed:
+                with tarfile.open(fileobj=compressed, mode="w|",
+                                  format=tarfile.USTAR_FORMAT) as archive:
+                    for name in TOOLS + ("install-rabs",):
+                        member = tarfile.TarInfo(name)
+                        member.size = entries[name]["bytes"]
+                        member.mode = 0o755
+                        member.uid = member.gid = member.mtime = 0
+                        member.uname = member.gname = ""
+                        with (snapshot / name).open("rb") as reader:
+                            archive.addfile(member, reader)
+            raw.flush()
+            os.fchmod(raw.fileno(), 0o444)
+            os.fsync(raw.fileno())
+        archive_identity = signature(archive_path.lstat())
+        verification = stage / "verified"
+        verification.mkdir(mode=0o700)
+        unpack_archive(archive_path, verification)
+        if signature(archive_path.lstat()) != archive_identity:
+            raise InstallError("produced archive changed during verification")
+        if expected_toolset(source_files(verification, None)) != expected:
+            raise InstallError("produced archive failed installer round-trip verification")
+        # The consumer deliberately ignores the bundled installer. Check that
+        # sixth member separately so the published helper is also byte-bound.
+        with tarfile.open(archive_path, "r:gz", tarinfo=ReleaseMember) as archive:
+            member = archive.getmember("install-rabs")
+            if member.size != entries["install-rabs"]["bytes"]:
+                raise InstallError("produced archive installer size differs")
+            with archive.extractfile(member) as reader:
+                data = reader.read(MAX_INSTALLER_BYTES + 1)
+            if (len(data) != member.size
+                    or hashlib.sha256(data).hexdigest() != entries["install-rabs"]["sha256"]):
+                raise InstallError("produced archive installer digest differs")
+        digest = hashlib.sha256()
+        with archive_path.open("rb") as reader:
+            if signature(os.fstat(reader.fileno())) != archive_identity:
+                raise InstallError("produced archive changed during verification")
+            remaining = archive_identity[2]
+            if not 0 < remaining <= MAX_ARCHIVE_BYTES:
+                raise InstallError("invalid produced archive size")
+            while remaining:
+                chunk = reader.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    raise InstallError("produced archive was truncated")
+                digest.update(chunk)
+                remaining -= len(chunk)
+            if (reader.read(1) or signature(os.fstat(reader.fileno())) != archive_identity
+                    or signature(archive_path.lstat()) != archive_identity):
+                raise InstallError("produced archive changed during verification")
+        verify_directory(output.parent, directory)
+        if signature(archive_path.lstat()) != archive_identity:
+            raise InstallError("produced archive changed before publication")
+        # A hard link on the same filesystem publishes complete bytes atomically
+        # and refuses both existing files and dangling symlinks. Never replace().
+        os.link(archive_path, output.name, dst_dir_fd=directory, follow_symlinks=False)
+        os.fsync(directory)
+        return {"kind": "rabs-packaged", "archive": str(output), "target": target,
+                "bytes": archive_identity[2], "sha256": digest.hexdigest(),
+                "toolset": expected, "staging_directory": str(stage),
+                "source_identity": source_identity,
+                "services_started": False, "cargo_config_changed": False}
+    except (InstallError, OSError, SyntaxError, UnicodeError, RecursionError,
+            tarfile.TarError, EOFError, zlib.error) as error:
+        if stage is not None:
+            raise InstallError("{}; retained package stage: {}".format(error, stage)) from error
+        raise
+    finally:
+        os.close(directory)
 
 
 def existing_install_directory(path, private=False, parent=None):
@@ -1204,6 +1500,14 @@ def main(argv=None):
                         help="authenticated release archive per Linux GNU target; repeat for a mixed SSH fleet")
     source.add_argument("--from-image", metavar="TRANSFER_BIN",
                         help="retained transfer_image to inspect after a lost acknowledgment; requires --verify")
+    parser.add_argument("--package", metavar="TAR_GZ",
+                        help="produce and verify a new flat release archive from --from-build or --from-bundle")
+    parser.add_argument("--target", choices=tuple(TARGET_MACHINES),
+                        help="required archive target for --package")
+    parser.add_argument("--require-source", metavar="FULL_COMMIT",
+                        help="for --package, execute native build-info probes and require this clean source commit")
+    parser.add_argument("--source-repository", metavar="DIRECTORY",
+                        help="Git repository supplying pinned script blobs for --require-source; default is this checkout")
     parser.add_argument("--verify", action="store_true",
                         help="read-only comparison of the active generation with the selected expected toolset")
     parser.add_argument("--bin-dir", help="absolute destination; default is the destination user's ~/.local/bin")
@@ -1217,6 +1521,21 @@ def main(argv=None):
                         help="required deployment headroom, minimum 64 MiB; not a disk reservation")
     args = parser.parse_args(argv)
     try:
+        if args.package is not None:
+            if not args.package or args.target is None:
+                raise InstallError("--package requires a nonempty output path and --target")
+            if (args.verify or args.from_image or args.from_target or args.from_archive
+                    or args.bin_dir is not None or args.ssh or args.ssh_jobs != 1
+                    or args.ssh_timeout != 600 or args.ssh_reserve_mib != 1024):
+                raise InstallError("--package accepts only build/bundle inputs, target and source-check options")
+            result = package_archive(source_files(args.from_bundle, args.from_build),
+                                     args.package, args.target, args.require_source, args.source_repository)
+            print(json.dumps(result, sort_keys=True))
+            return 0
+        if args.target is not None:
+            raise InstallError("--target requires --package")
+        if args.require_source is not None or args.source_repository is not None:
+            raise InstallError("source-check options require --package")
         validate_parallelism(args.ssh_jobs)
         if not args.ssh and args.ssh_jobs != 1:
             raise InstallError("--ssh-jobs requires at least one --ssh worker")

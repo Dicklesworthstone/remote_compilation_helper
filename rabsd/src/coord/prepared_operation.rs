@@ -41,6 +41,10 @@ const MAX_PREPARED_WORKERS: usize = 32;
 /// Ignore cold archives and executions older than this many queue admissions.
 const CARGO_LOCALITY_WINDOW: u64 = 128;
 
+/// Whole-Cargo stderr is presentation, while its stdout may declare artifacts
+/// ready. This capability never permits early stdout or result publication.
+pub const CARGO_STDERR_PREVIEW_VERSION: &str = "cargo-diagnostics-v1";
+
 /// One process-wide bound shared by execution, local recovery and previews.
 /// The upper bound permits a full configured worker pool without allowing
 /// unbounded executor threads, TLS sessions or retained diagnostic tails.
@@ -205,6 +209,10 @@ pub struct OperationStatus {
     /// The observed compiler completed successfully and its outputs were installed.
     pub succeeded: bool,
     pub detail: Option<String>,
+    /// Explicit permission to present only this Cargo command's live stderr.
+    /// Derived from the immutable request's native Cargo artifact contract.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_stderr: Option<&'static str>,
     /// Optional lossy tail from this exact live execution attempt. Never persisted
     /// and never a substitute for the independently verified terminal diagnostics.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -310,6 +318,10 @@ impl Record {
                 && self.stop_reason.is_none()
                 && self.outputs_installed,
             detail: self.detail.clone(),
+            live_stderr: rabs_sandbox::cargo_artifacts::requested(&self.request)
+                .ok()
+                .flatten()
+                .map(|_| CARGO_STDERR_PREVIEW_VERSION),
             live_diagnostics: None,
         }
     }

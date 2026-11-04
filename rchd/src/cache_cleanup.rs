@@ -104,6 +104,31 @@ rch_cleanup_bound_process_cwd() {
     if [ "$rch_process_opened" -eq 1 ]; then return "$rch_process_status"; fi
     return 2
 }
+# A non-root ssh user cannot read the CWD of another user's process, and on a
+# shared worker nearly every process is one. Rescan every process as root: 0 only
+# for a completed scan, 3 for an observed CWD. Anything else, including sudo
+# refusing or being absent, proves nothing. One find, because this runs per
+# candidate against a 300 s command budget: a readlink per process cost 3 s on a
+# worker with 900 processes. An unreadable CWD prints an empty link.
+rch_cleanup_cwds_as_root() {
+    sudo -n sh -c '
+        find /proc/[0-9]*/cwd -maxdepth 0 -printf "%h %l\n" 2>/dev/null | {
+            rch_seen_process=0
+            while read -r rch_proc_dir rch_process_cwd; do
+                rch_seen_process=1
+                if [ -n "$rch_process_cwd" ]; then
+                    case "$rch_process_cwd" in "$1"|"$1"/*) exit 3;; esac
+                    continue
+                fi
+                rch_process_state=$(awk "/^State:/ { print \$2; exit }" "$rch_proc_dir/status" 2>/dev/null)
+                case "$rch_process_state" in Z|X) continue;; esac
+                [ -d "$rch_proc_dir" ] || continue
+                exit 4
+            done
+            [ "$rch_seen_process" -eq 1 ] || exit 4
+        }
+    ' rch-cleanup-cwds "$1" 2>/dev/null
+}
 rch_cleanup_source_activity() {
     if rch_recent_active=$(find "$1" -type f -mmin -"$2" -print -quit); then
         if [ -n "$rch_recent_active" ]; then
@@ -131,6 +156,11 @@ rch_cleanup_source_activity() {
                 return 1
             fi
             [ -d "$rch_proc_dir" ] || continue
+            if rch_cleanup_cwds_as_root "$1"; then return 0; else rch_process_status=$?; fi
+            if [ "$rch_process_status" -eq 3 ]; then
+                printf 'RCH_CLEANUP_ACTIVITY_HOLD dir=%s reason=cwd\n' "$1" >&2
+                return 1
+            fi
             printf 'RCH_CLEANUP_ACTIVITY_UNKNOWN dir=%s reason=cwds\n' "$1" >&2
             return 2
         fi
@@ -1854,6 +1884,178 @@ flock -n "$__gc_source_registry/metadata.lock" true;
         assert_eq!(ready, "ready\n");
         assert_eq!(output.status.code(), Some(1), "{output:?}");
         assert_eq!(std::fs::read(&original).unwrap(), b"original process input");
+    }
+
+    /// Put stub executables first on PATH, so the guard meets the sudo (and
+    /// readlink) of a worker where the ssh user is not root, on any test host.
+    #[cfg(target_os = "linux")]
+    fn activity_guard_stubs(stubs: &[(&str, &str)]) -> (std::path::PathBuf, String) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bin = tempfile::Builder::new()
+            .prefix("cleanup-stub-bin-")
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap()
+            .keep();
+        for (name, body) in stubs {
+            let path = bin.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        (bin, path)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_activity_rests_an_unreadable_cwd_on_the_root_scan_verdict() {
+        let candidate = tempfile::Builder::new()
+            .prefix("cleanup-unreadable-cwd-")
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap()
+            .keep()
+            .canonicalize()
+            .unwrap();
+        // Every process reads as another user's, whatever user runs this test.
+        let script = format!(
+            "{CLEANUP_SOURCE_ACTIVITY_GUARD}\n\
+             rch_cleanup_bound_process_cwd() {{ return 2; }}\n\
+             rch_cleanup_source_activity \"$1\" 5"
+        );
+        for (sudo_status, expected, diagnostic) in [
+            (0, 0, None),
+            (3, 1, Some("RCH_CLEANUP_ACTIVITY_HOLD")),
+            // sudo refused, absent, or a scan that could not finish.
+            (1, 2, Some("RCH_CLEANUP_ACTIVITY_UNKNOWN")),
+            (127, 2, Some("RCH_CLEANUP_ACTIVITY_UNKNOWN")),
+            (4, 2, Some("RCH_CLEANUP_ACTIVITY_UNKNOWN")),
+        ] {
+            let (bin, path) = activity_guard_stubs(&[(
+                "sudo",
+                &format!(
+                    "printf '%s\\n' \"$1\" \"$#\" \"${{6}}\" >> \"$(dirname \"$0\")/calls\"\nexit {sudo_status}"
+                ),
+            )]);
+            let output = std::process::Command::new("sh")
+                .args(["-c", &script, "activity-guard"])
+                .arg(&candidate)
+                .env("PATH", path)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(expected), "{output:?}");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            match diagnostic {
+                Some(line) => assert!(stderr.contains(line), "{output:?}"),
+                None => assert!(!stderr.contains("RCH_CLEANUP_ACTIVITY"), "{output:?}"),
+            }
+            // One non-interactive scan per candidate, handed the path as data.
+            assert_eq!(
+                std::fs::read_to_string(bin.join("calls")).unwrap(),
+                format!("-n\n6\n{}\n", candidate.display())
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_root_scan_finds_a_live_cwd_and_never_calls_an_unreadable_process_idle() {
+        use std::process::{Command, Stdio};
+
+        const SUDO: &str = "[ \"$1\" = -n ] || exit 64\nshift\nexec \"$@\"";
+        let parent = tempfile::Builder::new()
+            .prefix("cleanup-root-scan-")
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap()
+            .keep()
+            .canonicalize()
+            .unwrap();
+        // Quoting matters: this path must match only as a literal.
+        let candidate = parent.join("mirror [a] *");
+        let nested = candidate.join("src");
+        let neighbour = parent.join("mirror [a] *-next");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&neighbour).unwrap();
+        let script = format!("{CLEANUP_SOURCE_ACTIVITY_GUARD}\nrch_cleanup_cwds_as_root \"$1\"");
+        let scan = |path: &str| {
+            Command::new("sh")
+                .args(["-c", &script, "root-scan"])
+                .arg(&candidate)
+                .env("PATH", path)
+                .output()
+                .unwrap()
+                .status
+                .code()
+        };
+        let sleeper = |cwd: &std::path::Path| {
+            Command::new("sleep")
+                .arg("120")
+                .current_dir(cwd)
+                .stdin(Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+        // As root, a readable CWD is real and every other process reads clean.
+        let (_, as_root) = activity_guard_stubs(&[
+            ("sudo", SUDO),
+            (
+                "find",
+                "/usr/bin/find \"$@\" 2>/dev/null | while read -r p c; do\n\
+                 printf '%s %s\\n' \"$p\" \"${c:-/}\"\n\
+                 done",
+            ),
+        ]);
+        assert_eq!(scan(as_root.as_str()), Some(0));
+        for (cwd, expected) in [(&candidate, 3), (&nested, 3), (&neighbour, 0)] {
+            let mut planted = sleeper(cwd);
+            let verdict = scan(as_root.as_str());
+            planted.kill().unwrap();
+            planted.wait().unwrap();
+            assert_eq!(verdict, Some(expected), "{cwd:?}");
+        }
+
+        // A live process root still cannot read is not idle; once it is a
+        // kernel zombie the same failed read is no evidence of activity.
+        let mut unreadable = sleeper(&parent);
+        let (_, fails_for_one) = activity_guard_stubs(&[
+            ("sudo", SUDO),
+            (
+                "find",
+                &format!(
+                    "/usr/bin/find \"$@\" 2>/dev/null | while read -r p c; do\n\
+                     case \"$p\" in /proc/{}) c=;; *) c=${{c:-/}};; esac\n\
+                     printf '%s %s\\n' \"$p\" \"$c\"\n\
+                     done",
+                    unreadable.id()
+                ),
+            ),
+        ]);
+        let live_verdict = scan(fails_for_one.as_str());
+        unreadable.kill().unwrap();
+        let status = format!("/proc/{}/status", unreadable.id());
+        for _ in 0..200 {
+            let state = std::fs::read_to_string(&status).unwrap();
+            if state.lines().any(|line| {
+                line.starts_with("State:") && line.split_whitespace().nth(1) == Some("Z")
+            }) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let zombie_verdict = scan(fails_for_one.as_str());
+        unreadable.wait().unwrap();
+        assert_eq!(live_verdict, Some(4));
+        assert_eq!(zombie_verdict, Some(0));
+
+        // A find that lists nothing did not scan anything.
+        let (_, no_listing) = activity_guard_stubs(&[("sudo", SUDO), ("find", "exit 1")]);
+        assert_eq!(scan(no_listing.as_str()), Some(4));
     }
 
     #[cfg(target_os = "linux")]

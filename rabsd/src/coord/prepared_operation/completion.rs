@@ -2,8 +2,9 @@
 //!
 //! A terminal status is not permission to print arbitrary files. The daemon
 //! first revalidates the entire delivery against its saved request and worker
-//! pin. The local client then snapshots and hashes BOTH diagnostic streams
-//! before exposing either. This grants no execution, release or cache authority.
+//! pin. The local client snapshots and hashes BOTH diagnostic streams before
+//! final replay. Explicit live-stderr clients also bind their previously shown
+//! prefix to that snapshot. This grants no execution, release or cache authority.
 //! Directories remain exclusively operator-owned; this is not a hostile
 //! same-credential, race-proof filesystem API.
 
@@ -402,6 +403,42 @@ pub struct DiagnosticSnapshot {
     stderr: File,
 }
 impl DiagnosticSnapshot {
+    /// Confirm the exact stderr prefix already presented by an explicit live
+    /// client, then retain only its unseen suffix for emission. Both complete
+    /// streams were verified when this private snapshot was created. A length
+    /// alone is not evidence that preview bytes match the final delivery.
+    ///
+    /// No stdout or remaining stderr may be exposed until this succeeds. This
+    /// consumes the snapshot on failure; neither stream is implicitly retried.
+    pub fn after_stderr_prefix(
+        mut self,
+        prefix: &DiagnosticStream,
+        until: Instant,
+    ) -> io::Result<Self> {
+        checkpoint(until)?;
+        require(
+            canonical_hash(&prefix.sha256) && prefix.bytes <= self.stderr.metadata()?.len(),
+            "live stderr prefix exceeds the verified diagnostic stream",
+        )?;
+        self.stderr.seek(SeekFrom::Start(0))?;
+        let mut remaining = prefix.bytes;
+        let mut hasher = Sha256::new();
+        let mut bytes = [0_u8; COPY_BYTES];
+        while remaining != 0 {
+            checkpoint(until)?;
+            let count = remaining.min(COPY_BYTES as u64) as usize;
+            self.stderr.read_exact(&mut bytes[..count])?;
+            hasher.update(&bytes[..count]);
+            remaining -= count as u64;
+        }
+        require(
+            rabs_protocol::raw_bytes::encode_hex(&hasher.finalize()) == prefix.sha256,
+            "live stderr prefix differs from the verified diagnostic stream",
+        )?;
+        checkpoint(until)?;
+        Ok(self)
+    }
+
     /// Snapshot the diagnostics of an already verified synchronous delivery.
     ///
     /// The caller must obtain `delivery` from the live receiver or full local
@@ -688,6 +725,91 @@ mod tests {
         )
         .unwrap()
         .unwrap()
+    }
+
+    #[test]
+    fn verified_stderr_prefix_replays_only_the_unseen_suffix_for_all_terminal_outcomes() {
+        for (exit, stop) in [(0, None), (101, None), (130, Some("cancelled"))] {
+            let fixture = Fixture::new();
+            fixture.complete(exit, stop);
+            let proof = fixture.proof();
+            for length in [0, 2, STDERR.len()] {
+                let prefix = DiagnosticStream {
+                    bytes: length as u64,
+                    sha256: hash(&STDERR[..length]),
+                };
+                let snapshot = proof
+                    .snapshot(deadline())
+                    .unwrap()
+                    .after_stderr_prefix(&prefix, deadline())
+                    .unwrap();
+                let mut stdout = Vec::new();
+                let mut stderr = STDERR[..length].to_vec();
+                snapshot.emit(&mut stdout, &mut stderr, deadline()).unwrap();
+                assert_eq!(stdout, STDOUT);
+                assert_eq!(stderr, STDERR, "stderr must appear exactly once");
+                assert_eq!(proof.exit_code, exit);
+                assert_eq!(fixture.spec.output.exists(), exit == 0);
+            }
+        }
+    }
+
+    #[test]
+    fn wrong_live_prefix_refuses_before_stdout_or_suffix_exposure() {
+        let fixture = Fixture::new();
+        fixture.complete(0, None);
+        let proof = fixture.proof();
+        for prefix in [
+            DiagnosticStream {
+                bytes: 2,
+                sha256: hash(b"xx"),
+            },
+            DiagnosticStream {
+                bytes: STDERR.len() as u64 + 1,
+                sha256: hash(STDERR),
+            },
+            DiagnosticStream {
+                bytes: 0,
+                sha256: hash(b"not empty"),
+            },
+        ] {
+            let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+            let result = proof
+                .snapshot(deadline())
+                .unwrap()
+                .after_stderr_prefix(&prefix, deadline())
+                .and_then(|snapshot| snapshot.emit(&mut stdout, &mut stderr, deadline()));
+            assert!(result.is_err());
+            assert!(stdout.is_empty(), "Cargo readiness must remain withheld");
+            assert!(stderr.is_empty());
+        }
+    }
+
+    #[test]
+    fn live_prefix_verification_uses_the_private_snapshot_and_keeps_its_deadline() {
+        let fixture = Fixture::new();
+        fixture.complete(0, None);
+        let proof = fixture.proof();
+        let snapshot = proof.snapshot(deadline()).unwrap();
+        let expired = proof.snapshot(deadline()).unwrap();
+        let prefix = DiagnosticStream {
+            bytes: 2,
+            sha256: hash(&STDERR[..2]),
+        };
+        fs::write(fixture.spec.delivery.join("diagnostics/stderr"), b"changed").unwrap();
+        assert!(proof.snapshot(deadline()).is_err());
+        let snapshot = snapshot.after_stderr_prefix(&prefix, deadline()).unwrap();
+        let (mut stdout, mut stderr) = (Vec::new(), STDERR[..2].to_vec());
+        snapshot.emit(&mut stdout, &mut stderr, deadline()).unwrap();
+        assert_eq!(stdout, STDOUT);
+        assert_eq!(stderr, STDERR);
+        assert_eq!(
+            expired
+                .after_stderr_prefix(&prefix, Instant::now())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
     }
 
     #[test]

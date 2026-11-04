@@ -208,6 +208,23 @@ fn bind_retrieval_source_authority(
     }
 }
 
+/// Whether delivery reached a final decision, so the invocation may record its
+/// return, retire the source tree and release the source pair. A transient
+/// transfer failure may not: recovery must finish that delivery first.
+///
+/// An E327 platform rejection is final. Recovery repeats the same rejection and
+/// then retires and releases (`recover_owned_job_until_retired`), so waiting only kept
+/// the pair claimed: that worker then refused every later job of the project as
+/// an "unfinished overlapping physical source owner" (bd-dxsx5).
+fn retrieval_reached_terminal_decision(
+    artifacts_failed: bool,
+    cargo_evidence_terminal: bool,
+    platform_rejected: bool,
+    all_result_dirs_retrieved: bool,
+) -> bool {
+    (!artifacts_failed || cargo_evidence_terminal || platform_rejected) && all_result_dirs_retrieved
+}
+
 /// A recovery request can interrupt collection, never execution. Keep the same
 /// session and authority guards outside this boundary across the one explicit
 /// retry, and wait for transport cancellation to reap its receiver first.
@@ -3674,8 +3691,8 @@ async fn execute_remote_compilation_inner(
         );
         EXIT_ARTIFACT_TRANSFER_FAILED
     } else if result.success() && platform_rejected {
-        // The preflight already reported E327 and preserved the remote output
-        // and durable lease. Do not replace it with a connectivity diagnosis.
+        // The preflight already reported E327 and left local outputs untouched.
+        // Do not replace it with a connectivity diagnosis.
         EXIT_ARTIFACT_TRANSFER_FAILED
     } else if result.success()
         && artifacts_failed
@@ -3792,8 +3809,12 @@ async fn execute_remote_compilation_inner(
     } else {
         result.exit_code
     };
-    let retrieval_complete =
-        (!artifacts_failed || cargo_evidence_terminal) && result_dir_failures.is_empty();
+    let retrieval_complete = retrieval_reached_terminal_decision(
+        artifacts_failed,
+        cargo_evidence_terminal,
+        platform_rejected,
+        result_dir_failures.is_empty(),
+    );
     if retrieval_complete && let Some(session) = recovery_session.as_mut() {
         session.returned(exit_code)?;
     }
@@ -3914,6 +3935,31 @@ async fn execute_remote_compilation_inner(
 
 #[cfg(test)]
 mod tests {
+    /// bd-dxsx5: an E327 rejection must not leave the source pair waiting for a
+    /// recovery that can only repeat the rejection. A transient transfer failure
+    /// (the planted negative) must still hold it, or a live transfer could lose
+    /// its source.
+    #[test]
+    fn only_final_delivery_decisions_release_the_source_pair() {
+        let decide = super::retrieval_reached_terminal_decision;
+        // (artifacts_failed, cargo_evidence_terminal, platform_rejected, result dirs ok)
+        assert!(decide(false, false, false, true), "clean delivery");
+        assert!(decide(true, false, true, true), "E327 is final");
+        assert!(decide(true, true, false, true), "terminal Cargo evidence");
+        assert!(
+            !decide(true, false, false, true),
+            "a transient transfer failure stays recoverable"
+        );
+        assert!(
+            !decide(true, false, true, false),
+            "missing result dirs still need recovery after E327"
+        );
+        assert!(
+            !decide(false, false, false, false),
+            "missing result dirs need recovery"
+        );
+    }
+
     #[test]
     fn concurrent_source_errors_retain_every_worker_fault() {
         use crate::transfer::{

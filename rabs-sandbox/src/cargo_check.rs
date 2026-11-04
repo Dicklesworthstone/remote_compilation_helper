@@ -1,4 +1,4 @@
-//! Admission of the units Cargo selected for check, build, Clippy, test, run or bench.
+//! Admission of the units Cargo selected for check, build, Clippy, doc, test, run or bench.
 //!
 //! `cargo metadata` describes packages, including optional and development
 //! dependencies that a particular command will never execute. Cargo's nightly
@@ -364,6 +364,9 @@ fn index(value: &Value, units: usize) -> io::Result<usize> {
 /// the entire operation as executing project code, including a `--no-run` selection. The command's
 /// no-run behavior remains Cargo's responsibility; it cannot restore local
 /// compiler-result authority through a graph that happens to have no executors.
+/// `Doc` admits doc/check/build units and always requires the same closed-worker
+/// boundary. Rustdoc units retain their source closure but never enter the
+/// ordinary workspace rustc inventory or grant compiler-result authority.
 ///
 /// The parser deliberately does not reconstruct Cargo's feature resolver or
 /// package selection from `cargo metadata`. Multiple units for the same package
@@ -416,6 +419,12 @@ pub fn validate_compilation_unit_graph(
             "cargo run graph root must be its selected binary or executable example",
         )?;
     }
+    if command == CompilationCommand::Doc {
+        require(
+            selected.iter().all(|&root| units[root]["mode"] == "doc"),
+            "cargo doc graph roots must be selected documentation targets",
+        )?;
+    }
 
     let mut packages = BTreeSet::new();
     let mut source_paths = BTreeSet::new();
@@ -428,6 +437,7 @@ pub fn validate_compilation_unit_graph(
         command,
         CompilationCommand::Test
             | CompilationCommand::Clippy
+            | CompilationCommand::Doc
             | CompilationCommand::Run
             | CompilationCommand::Bench
     );
@@ -451,6 +461,7 @@ pub fn validate_compilation_unit_graph(
                     matches!(mode, "build" | "test")
                 }
                 CompilationCommand::Test => matches!(mode, "build" | "test" | "doctest"),
+                CompilationCommand::Doc => matches!(mode, "doc" | "check" | "build"),
                 CompilationCommand::Run => mode == "build",
             },
         };
@@ -458,6 +469,20 @@ pub fn validate_compilation_unit_graph(
             allowed_mode,
             "selected Cargo compilation contains an unsupported execution mode for its command",
         )?;
+        if mode == "doc" {
+            let kinds = unit["target"]["kind"]
+                .as_array()
+                .expect("validated target kinds");
+            require(
+                kinds.iter().all(|kind| {
+                    kind.as_str().is_some_and(|kind| {
+                        LIBRARY_TYPES.contains(&kind)
+                            || matches!(kind, "proc-macro" | "bin" | "example")
+                    })
+                }),
+                "Cargo doc mode requires a library, binary or example target",
+            )?;
+        }
         if mode == "doctest" {
             // Cargo's documentation tests operate on library targets, including
             // procedural macro libraries. A binary/test/example source cannot
@@ -1175,6 +1200,65 @@ mod tests {
             graph["units"][0]["mode"] = json!(mode);
             assert!(
                 validate_compilation_unit_graph(&graph, CompilationCommand::Clippy).is_err(),
+                "{mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn documentation_graphs_keep_rustdoc_out_of_workspace_compiler_authority() {
+        let mut graph = graph();
+        graph["units"][0]["mode"] = json!("doc");
+        for kind in ["lib", "rlib", "proc-macro", "bin", "example"] {
+            graph["units"][0]["target"]["kind"] = json!([kind]);
+            graph["units"][0]["target"]["crate_types"] =
+                json!([if kind == "example" { "bin" } else { kind }]);
+            let report = validate_compilation_unit_graph(&graph, CompilationCommand::Doc).unwrap();
+            assert!(report.requires_closed_dependency_execution());
+            assert!(!report.contains_doctests());
+            assert_eq!((report.units, report.packages, report.roots), (2, 2, 1));
+            assert_eq!(report.source_paths().len(), 2);
+            assert_eq!(report.workspace_units().len(), 1);
+            assert_eq!(
+                report.workspace_units()[0].source_path(),
+                "/__rabs/workspace/dependency/src/lib.rs"
+            );
+            for command in [
+                CompilationCommand::Check,
+                CompilationCommand::Build,
+                CompilationCommand::Clippy,
+                CompilationCommand::Test,
+                CompilationCommand::Run,
+                CompilationCommand::Bench,
+            ] {
+                assert!(
+                    validate_compilation_unit_graph(&graph, command).is_err(),
+                    "{command:?}"
+                );
+            }
+        }
+        graph["units"][0]["target"]["crate_types"] = json!(["bin"]);
+        for kind in ["test", "bench", "custom-build"] {
+            graph["units"][0]["target"]["kind"] = json!([kind]);
+            assert!(
+                validate_compilation_unit_graph(&graph, CompilationCommand::Doc).is_err(),
+                "{kind}"
+            );
+        }
+        graph["units"][0]["target"]["kind"] = json!(["lib"]);
+        graph["units"][0]["target"]["crate_types"] = json!(["lib"]);
+        for mode in [
+            "check",
+            "build",
+            "test",
+            "doctest",
+            "run",
+            "run-custom-build",
+            "future-mode",
+        ] {
+            graph["units"][0]["mode"] = json!(mode);
+            assert!(
+                validate_compilation_unit_graph(&graph, CompilationCommand::Doc).is_err(),
                 "{mode}"
             );
         }

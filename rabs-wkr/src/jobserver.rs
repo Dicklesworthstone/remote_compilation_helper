@@ -18,12 +18,13 @@
 //! worker — not some inherited descriptor — the authority for how many
 //! parallel jobs the action believes it may run.
 //!
-//! Descriptor-level injection is impossible (bwrap offers no fd
-//! passthrough), but a bare `MAKEFLAGS=-jN` lets every PLAIN `make`
-//! invoked in a recipe mint its OWN full-size pool — tree-depth
-//! multiplication. [`JobserverBridge`] closes that with a real fifo
-//! jobserver carried through the canonical HOME bind by PATH: one budget,
-//! shared by every descendant, sized from the execution grant.
+//! A bare `MAKEFLAGS=-jN` lets every PLAIN `make` invoked in a recipe mint
+//! its OWN full-size pool — tree-depth multiplication. [`JobserverBridge`]
+//! instead carries one real FIFO through the canonical HOME bind. Whole
+//! commands open it AFTER namespace creation and inherit ordinary pipe-style
+//! jobserver descriptors: GNU make 4.3 rejects FIFO-style authentication.
+//! Both protocols address the SAME C-1 transferable tokens, never a second
+//! pool. Closed direct-rustc actions retain their shell-free FIFO protocol.
 
 /// Env var names that carry make/cargo coordination state — including
 /// descriptor/auth material that is NEVER valid from a client (bead
@@ -43,6 +44,37 @@ const BRIDGE_PREFIX: &str = ".rabs-jobserver-";
 // that write within PIPE_BUF rather than allocating or blocking on an
 // arbitrarily large caller-provided grant.
 const MAX_BRIDGE_TOKENS: u32 = 4096;
+
+// No request text is interpolated into this program. The first argument is
+// the owned FIFO; every remaining argument belongs to env's exact exec argv.
+// The worker's holding writer makes the read open nonblocking with respect to
+// peer startup; that reader then makes the write open immediately available.
+const COMMAND_BRIDGE: &str = "exec 3<\"$1\" 4>\"$1\" || exit 125\nshift\nexec \"$@\"";
+
+fn command_bridge_arguments(
+    fifo: &str,
+    environment: &[(String, String)],
+    program: &str,
+    args: &[String],
+) -> Vec<String> {
+    let mut launch = vec![
+        "-c".to_owned(),
+        COMMAND_BRIDGE.to_owned(),
+        "rabs-jobserver".to_owned(),
+        fifo.to_owned(),
+        "/usr/bin/env".to_owned(),
+        "-i".to_owned(),
+        "--".to_owned(),
+    ];
+    launch.extend(
+        environment
+            .iter()
+            .map(|(name, value)| format!("{name}={value}")),
+    );
+    launch.push(program.to_owned());
+    launch.extend_from_slice(args);
+    launch
+}
 
 /// Whether `name` is a coordination variable (exact, case-sensitive:
 /// canonical env keys are uppercase by construction and I21 forbids
@@ -125,6 +157,8 @@ pub struct JobserverBridge {
     _directory: Option<tempfile::TempDir>,
     /// Total admitted slots, including the command's implicit slot.
     slots: u32,
+    /// The same FIFO after HOME is mounted into the canonical namespace.
+    visible_path: String,
     /// The full MAKEFLAGS value to install (budget + fifo auth with the
     /// IN-SANDBOX path).
     makeflags: String,
@@ -171,16 +205,14 @@ impl JobserverBridge {
         };
         let dir_name = component(directory.path())?;
         let name = component(&host_path)?;
-        let makeflags = format!(
-            "-j{slots} --jobserver-auth=fifo:{}/{dir_name}/{}",
-            rabs_sandbox::layout::HOME,
-            name
-        );
+        let visible_path = format!("{}/{dir_name}/{}", rabs_sandbox::layout::HOME, name);
+        let makeflags = format!("-j{slots} --jobserver-auth=fifo:{visible_path}");
         Ok(Self {
             host_path,
             _writer: writer,
             _directory: Some(directory),
             slots,
+            visible_path,
             makeflags,
         })
     }
@@ -213,10 +245,10 @@ impl JobserverBridge {
         // The randomized mint directory is now empty. It must not remain
         // visible in the otherwise fresh HOME of an exact-input Cargo run.
         drop(bridge._directory.take());
+        bridge.visible_path = format!("{}/.rabs-cargo-jobserver.fifo", rabs_sandbox::layout::HOME);
         bridge.makeflags = format!(
-            "-j{} --jobserver-auth=fifo:{}/.rabs-cargo-jobserver.fifo",
-            bridge.slots,
-            rabs_sandbox::layout::HOME,
+            "-j{} --jobserver-auth=fifo:{}",
+            bridge.slots, bridge.visible_path,
         );
         Ok(bridge)
     }
@@ -232,18 +264,84 @@ impl JobserverBridge {
         ))
     }
 
-    /// Install one authority for Cargo and make on the FINAL environment.
-    /// Stale descriptors, duplicate coordination keys and capacity claims are
-    /// replaced together, so CARGO_MAKEFLAGS cannot shadow the valid MAKEFLAGS.
+    fn command_makeflags(&self) -> String {
+        format!("-j{} --jobserver-auth=3,4", self.slots)
+    }
+
+    /// Install the exact environment used after [`Self::canonical_launch`]
+    /// opens this FIFO inside the namespace. Standard descriptor authentication
+    /// works with GNU make 4.3 as well as newer make and Cargo. Calling this
+    /// without the paired launch would advertise nonexistent descriptors.
     pub fn apply(env: &mut Vec<(String, String)>, bridge: &Self) {
+        Self::apply_auth(env, bridge, &bridge.command_makeflags());
+    }
+
+    fn apply_auth(env: &mut Vec<(String, String)>, bridge: &Self, auth: &str) {
         replace_with_worker_local(env, bridge.slots);
         for (k, v) in env.iter_mut() {
             if k == "MAKEFLAGS" {
-                *v = bridge.makeflags.clone();
+                *v = auth.to_owned();
             }
         }
-        env.push(("CARGO_MAKEFLAGS".to_string(), bridge.makeflags.clone()));
+        env.push(("CARGO_MAKEFLAGS".to_string(), auth.to_owned()));
         env.sort_by(|a, b| a.0.cmp(&b.0));
+    }
+
+    /// Open the already-funded FIFO after bubblewrap has closed host
+    /// descriptors, then replace the launcher with the requested process.
+    /// There is no extra implicit slot, intermediary supervisor or token mint.
+    ///
+    /// The fixed shell receives no project environment. `env -i` restores
+    /// exactly `spec.env` for the actual command, including absent/empty values;
+    /// shell-added PWD/SHLVL and startup controls cannot change the keyed inputs.
+    /// Program, arguments, environment values and FIFO path are separate argv
+    /// entries, never shell program text. This is only for the existing host-/usr
+    /// canonical profile; direct compiler closed views must not acquire a shell.
+    pub(crate) fn canonical_launch(
+        &self,
+        spec: &rabs_sandbox::canonical_namespace::CanonicalNamespaceSpec,
+        support: &rabs_sandbox::canonical_namespace::HostIsolationSupport,
+        program: &str,
+        args: &[String],
+    ) -> Result<
+        rabs_sandbox::canonical_namespace::NamespaceLaunch,
+        rabs_sandbox::canonical_namespace::IsolationError,
+    > {
+        use rabs_sandbox::canonical_namespace::{IsolationError, build_canonical_argv};
+
+        let auth = self.command_makeflags();
+        let jobs = worker_num_jobs(self.slots);
+        for (name, value) in [
+            ("MAKEFLAGS", auth.as_str()),
+            ("CARGO_MAKEFLAGS", auth.as_str()),
+            ("NUM_JOBS", jobs.as_str()),
+        ] {
+            let mut supplied = spec.env.iter().filter(|(key, _)| key == name);
+            if supplied.next().map(|(_, value)| value.as_str()) != Some(value)
+                || supplied.next().is_some()
+            {
+                return Err(IsolationError::InvalidSpec {
+                    reason: "canonical command lacks its exact worker jobserver environment".into(),
+                });
+            }
+        }
+        if spec.env.iter().any(|(name, _)| name == "MFLAGS") {
+            return Err(IsolationError::InvalidSpec {
+                reason: "canonical command retains a stale MFLAGS authority".into(),
+            });
+        }
+        // env treats any argument containing '=' as another assignment, even
+        // after '--'. Refuse an unrepresentable executable instead of silently
+        // running a different command or printing a successful environment.
+        if program.is_empty() || program.contains('=') {
+            return Err(IsolationError::InvalidSpec {
+                reason: "canonical command executable is not representable by env".into(),
+            });
+        }
+        let args = command_bridge_arguments(&self.visible_path, &spec.env, program, args);
+        let mut launcher = spec.clone();
+        launcher.env.clear();
+        build_canonical_argv(&launcher, support, "/bin/sh", &args)
     }
 
     /// A direct rustc dependency has no child build tools whose logical
@@ -253,7 +351,7 @@ impl JobserverBridge {
     /// replaced coordination variable (even an originally absent variable).
     pub fn apply_dependency(env: &mut Vec<(String, String)>, bridge: &Self) {
         let original = env.iter().find(|(name, _)| name == "NUM_JOBS").cloned();
-        Self::apply(env, bridge);
+        Self::apply_auth(env, bridge, bridge.makeflags());
         env.retain(|(name, _)| name != "NUM_JOBS");
         if let Some(original) = original {
             env.push(original);
@@ -267,6 +365,10 @@ impl Drop for JobserverBridge {
         let _ = std::fs::remove_file(&self.host_path);
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "jobserver/command_tests.rs"]
+mod command_tests;
 
 #[cfg(test)]
 mod tests {
@@ -480,8 +582,8 @@ mod tests {
         assert_eq!(env, once);
         assert_eq!(env.len(), 4);
         let map: std::collections::BTreeMap<_, _> = env.into_iter().collect();
-        assert_eq!(map["MAKEFLAGS"], bridge.makeflags());
-        assert_eq!(map["CARGO_MAKEFLAGS"], bridge.makeflags());
+        assert_eq!(map["MAKEFLAGS"], "-j2 --jobserver-auth=3,4");
+        assert_eq!(map["CARGO_MAKEFLAGS"], map["MAKEFLAGS"]);
         assert_eq!(map["NUM_JOBS"], "2");
         assert_eq!(map["PATH"], "/bin");
     }

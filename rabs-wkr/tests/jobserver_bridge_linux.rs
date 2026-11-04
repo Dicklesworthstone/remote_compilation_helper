@@ -1,13 +1,11 @@
 //! I004 acceptance (Linux): THE WORKER-SIDE JOBSERVER BRIDGE. A real
 //! nested-make tree runs INSIDE the canonical namespace through a real
-//! `rabs-wkr` TCP session. The tree deliberately uses PLAIN `make` in
-//! recipes (not `$(MAKE)`), which without the bridge lets every
-//! sub-master mint its OWN full-size pool — parallelism multiplying by
-//! tree depth. With [`JobserverBridge`](rabs_wkr::jobserver::JobserverBridge)
-//! all descendants share ONE fifo budget carried through the HOME
-//! bind by PATH, sized by the coordinator's `jobserver_grant`: observed
-//! leaf concurrency never exceeds the grant. Skips loudly where the
-//! canonical namespace is unavailable.
+//! `rabs-wkr` TCP session. GNU make 4.3 must run native compilation with
+//! inherited descriptor authentication; it rejects FIFO-path authentication.
+//! Recursive `$(MAKE)` recipes keep the descriptors open and share ONE FIFO
+//! budget carried through HOME, sized by the coordinator's `jobserver_grant`.
+//! Observed leaf concurrency never exceeds that grant. Skips loudly where
+//! the canonical namespace is unavailable.
 #![cfg(target_os = "linux")]
 
 use std::io::{BufRead, BufReader, Write};
@@ -134,7 +132,7 @@ fn nested_make_tree_respects_the_worker_grant() {
     assert!(hello.contains("worker-hello"), "{hello}");
     writeln!(writer, "{{\"kind\":\"session-ok\",\"session_id\":9}}").unwrap();
 
-    // The nested tree: three PLAIN sub-makes x three leaves each. Every
+    // The nested tree: three recursive sub-makes x three native compiles. Every
     // leaf stamps ONE atomic "start end" line at exit into the shared
     // file, so cross-sub-make concurrency is measurable host-side
     // without interleaved-append corruption.
@@ -144,8 +142,25 @@ fn nested_make_tree_respects_the_worker_grant() {
     // Previously it prevented the actual executor from starting at all.
     std::fs::write(workspace.path().join(".rabs-jobserver"), b"source-owned").unwrap();
     std::fs::write(
+        workspace.path().join("answer.c"),
+        "int answer(void) { return 42; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.path().join("main.c"),
+        "#include <stdio.h>\nint answer(void);\nint main(void) { printf(\"%d\\n\", answer()); return 0; }\n",
+    )
+    .unwrap();
+    std::fs::write(
         workspace.path().join("top.mk"),
-        "all: s1 s2 s3\ns%:\n\t@make -s -f sub.mk job=$@\n",
+        concat!(
+            "all: s1 s2 s3\n",
+            "\t@ar crs libanswer.a s1-j1.o\n",
+            "\t@cc main.c libanswer.a -o answer\n",
+            "\t@./answer > answer.txt\n",
+            "s%:\n",
+            "\t+@$(MAKE) -s -f sub.mk job=$@\n",
+        ),
     )
     .expect("top makefile");
     std::fs::write(
@@ -154,7 +169,7 @@ fn nested_make_tree_respects_the_worker_grant() {
             "job ?= x\n",
             "all: j1 j2 j3\n",
             "j%:\n",
-            "\t@sh -c 's=$$(date +%s%N); sleep 0.5; e=$$(date +%s%N); ",
+            "\t@sh -ec 's=$$(date +%s%N); sleep 0.05; cc -c answer.c -o $(job)-$@.o; e=$$(date +%s%N); ",
             "echo \"$$s $$e\" >> /__rabs/workspace/intervals.txt'\n",
         ),
     )
@@ -210,9 +225,18 @@ fn nested_make_tree_respects_the_worker_grant() {
         peak <= GRANT,
         "worker capacity violated: {peak} concurrent leaves under a grant of {GRANT}"
     );
+    assert!(
+        peak > 1,
+        "recursive make silently fell back to serial execution"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("answer.txt")).unwrap(),
+        "42\n",
+        "the native archive must link and execute inside the worker namespace"
+    );
 
     // The source-owned name is unchanged; all coordination is outside
-    // the workspace. The only added file is the declared test observation.
+    // the workspace. Added files are the declared native outputs/observations.
     assert_eq!(
         std::fs::read(workspace.path().join(".rabs-jobserver")).unwrap(),
         b"source-owned"
@@ -224,7 +248,26 @@ fn nested_make_tree_respects_the_worker_grant() {
     names.sort();
     assert_eq!(
         names,
-        [".rabs-jobserver", "intervals.txt", "sub.mk", "top.mk"]
+        [
+            ".rabs-jobserver",
+            "answer",
+            "answer.c",
+            "answer.txt",
+            "intervals.txt",
+            "libanswer.a",
+            "main.c",
+            "s1-j1.o",
+            "s1-j2.o",
+            "s1-j3.o",
+            "s2-j1.o",
+            "s2-j2.o",
+            "s2-j3.o",
+            "s3-j1.o",
+            "s3-j2.o",
+            "s3-j3.o",
+            "sub.mk",
+            "top.mk",
+        ]
     );
 
     let status = worker.wait();

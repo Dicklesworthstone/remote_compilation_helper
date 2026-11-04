@@ -6,16 +6,19 @@
 
 use super::{digest, hex, invalid, require};
 use crate::coord::worker_delivery::{
-    WorkerPeer, toolchain_identity, toolchain_identity_value, toolchain_transfer,
+    EncodedWorkerFrame, WorkerPeer, toolchain_identity, toolchain_identity_value,
+    toolchain_transfer,
 };
 use rabs_sandbox::toolchain_cache::RetainedToolchain;
 use rabs_sandbox::toolchain_dataset::PreparedToolchain;
 use rabs_sandbox::toolchain_transfer::{
-    MAX_TOOLCHAIN_CHUNK, TOOLCHAIN_REUSE_VERSION, TOOLCHAIN_TRANSFER_VERSION, ToolchainEntry,
-    ToolchainEntryKind,
+    MAX_TOOLCHAIN_CHUNK, MAX_TOOLCHAIN_FILE_PAGE_BYTES, MAX_TOOLCHAIN_FILE_PAGE_ENTRIES,
+    MAX_TOOLCHAIN_METADATA_BYTES, TOOLCHAIN_FILE_REUSE_VERSION, TOOLCHAIN_REUSE_VERSION,
+    TOOLCHAIN_TRANSFER_VERSION, ToolchainEntry, ToolchainEntryKind,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::io;
 use std::sync::Arc;
 
@@ -25,6 +28,64 @@ mod pipeline;
 // The shared window spans entries and chunks, including small and empty files.
 // Only acknowledgment descriptors are retained, never queued payload buffers.
 const CHUNK_WINDOW: usize = 4;
+
+fn check_reply(
+    reply: &Value,
+    request_id: u64,
+    identity: &[u8; 32],
+    kind: &str,
+    fields: usize,
+) -> io::Result<()> {
+    require(
+        reply
+            .as_object()
+            .is_some_and(|object| object.len() == fields)
+            && reply["kind"] == kind
+            && reply["request_id"].as_u64() == Some(request_id)
+            && digest(&reply["sha256"])? == *identity,
+        "toolchain acknowledgment kind, shape or identity mismatch",
+    )
+}
+
+/// Optional file reuse has a larger metadata charge than the ordinary tree.
+/// Decide eligibility from the immutable entry inventory without opening or
+/// hashing files; an otherwise valid SDK must retain its ordinary cold route.
+fn select_file_reuse<'a>(
+    hello: &Value,
+    grant: &mut Value,
+    entries: impl IntoIterator<Item = &'a ToolchainEntry>,
+) -> io::Result<()> {
+    let offered = hello["toolchain_file_reuses"]
+        .as_array()
+        .is_some_and(|versions| {
+            versions
+                .iter()
+                .any(|version| version == TOOLCHAIN_FILE_REUSE_VERSION)
+        });
+    let selected = offered
+        && entries
+            .into_iter()
+            .try_fold(0_usize, |metadata, entry| {
+                if matches!(&entry.kind, ToolchainEntryKind::File { .. }) {
+                    metadata
+                        .checked_add(256 + 2 * entry.path.len())
+                        .filter(|total| *total <= MAX_TOOLCHAIN_METADATA_BYTES)
+                } else {
+                    Some(metadata)
+                }
+            })
+            .is_some();
+    require(
+        grant
+            .get("toolchain_file_reuse")
+            .is_none_or(|value| selected && value == TOOLCHAIN_FILE_REUSE_VERSION),
+        "conflicting, unsupported or excessive toolchain file reuse selection",
+    )?;
+    if selected {
+        grant["toolchain_file_reuse"] = json!(TOOLCHAIN_FILE_REUSE_VERSION);
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 enum ToolchainOwner {
@@ -131,7 +192,115 @@ impl ToolchainUpload {
         if reuse {
             grant["toolchain_reuse"] = json!(TOOLCHAIN_REUSE_VERSION);
         }
-        Ok(())
+        select_file_reuse(hello, grant, self.entries.iter())
+    }
+
+    /// Exchange the retained file identities in bounded pages before any tree
+    /// entry. Hints select payload bytes only; every namespace entry and the
+    /// final complete-dataset seal remain mandatory, including an all-hit tree.
+    fn transmit_file_manifest<P: WorkerPeer + ?Sized>(
+        &self,
+        peer: &mut P,
+        request_id: u64,
+    ) -> io::Result<BTreeSet<String>> {
+        peer.checkpoint()?;
+        let identity = self.prepared.identity();
+        let files = self.prepared.files()?;
+        let (bytes, _) = files
+            .iter()
+            .try_fold((0_u64, 0_usize), |(bytes, metadata), file| {
+                let bytes = bytes
+                    .checked_add(file.bytes)
+                    .ok_or_else(|| invalid("toolchain file byte total overflow"))?;
+                let metadata = metadata
+                    .checked_add(256 + 2 * file.path.len())
+                    .filter(|total| *total <= MAX_TOOLCHAIN_METADATA_BYTES)
+                    .ok_or_else(|| invalid("toolchain file manifest metadata limit exceeded"))?;
+                Ok::<_, io::Error>((bytes, metadata))
+            })?;
+        require(
+            files.len() as u64 == identity.files && bytes == identity.bytes,
+            "toolchain file manifest differs from the retained dataset totals",
+        )?;
+        let sha256 = hex(&identity.sha256);
+        let mut missing = BTreeSet::new();
+        let mut offset = 0;
+        while offset < files.len() {
+            peer.checkpoint()?;
+            let mut frame = json!({"kind":"toolchain-file-manifest", "request_id":request_id,
+                "sha256":sha256, "offset":offset, "files":[]});
+            let mut encoded_bytes = serde_json::to_vec(&frame)?.len();
+            let page = frame["files"].as_array_mut().unwrap();
+            while offset + page.len() < files.len() && page.len() < MAX_TOOLCHAIN_FILE_PAGE_ENTRIES
+            {
+                let file = &files[offset + page.len()];
+                let value = json!({"path":file.path, "bytes":file.bytes,
+                    "executable":file.executable, "sha256":hex(&file.sha256)});
+                let next = encoded_bytes
+                    + serde_json::to_vec(&value)?.len()
+                    + usize::from(!page.is_empty());
+                if next > MAX_TOOLCHAIN_FILE_PAGE_BYTES {
+                    break;
+                }
+                page.push(value);
+                encoded_bytes = next;
+            }
+            require(
+                !page.is_empty(),
+                "toolchain file exceeds its manifest page bound",
+            )?;
+            let next = offset + page.len();
+            peer.send_encoded(EncodedWorkerFrame::new(&frame)?)?;
+            let reply = peer.receive()?;
+            check_reply(
+                &reply,
+                request_id,
+                &identity.sha256,
+                "toolchain-file-manifest-accepted",
+                5,
+            )?;
+            require(
+                reply["next_offset"].as_u64() == Some(next as u64),
+                "toolchain file manifest acknowledgment does not cover its exact page",
+            )?;
+            let paths = reply["missing"]
+                .as_array()
+                .filter(|paths| paths.len() <= next - offset)
+                .ok_or_else(|| {
+                    invalid("toolchain file manifest missing set is absent or excessive")
+                })?;
+            for path in paths {
+                let path = path
+                    .as_str()
+                    .ok_or_else(|| invalid("toolchain missing file is not a path"))?;
+                require(
+                    files[offset..next]
+                        .binary_search_by(|file| file.path.as_str().cmp(path))
+                        .is_ok()
+                        && missing.insert(path.to_owned()),
+                    "toolchain file manifest missing set contains a duplicate or foreign path",
+                )?;
+            }
+            offset = next;
+        }
+        peer.send(
+            &json!({"kind":"toolchain-file-manifest-seal", "request_id":request_id,
+            "sha256":sha256}),
+        )?;
+        let reply = peer.receive()?;
+        check_reply(
+            &reply,
+            request_id,
+            &identity.sha256,
+            "toolchain-file-manifest-ready",
+            5,
+        )?;
+        require(
+            reply["files"].as_u64() == Some(identity.files)
+                && reply["bytes"].as_u64() == Some(identity.bytes),
+            "worker accepted different toolchain file manifest totals",
+        )?;
+        Ok(missing)
     }
 
     pub(super) fn transmit<P: WorkerPeer + ?Sized>(
@@ -139,6 +308,7 @@ impl ToolchainUpload {
         peer: &mut P,
         request: &Value,
         reuse_selected: bool,
+        file_reuse_selected: bool,
     ) -> io::Result<()> {
         self.validate_request(request)?;
         let id = request["request_id"]
@@ -146,21 +316,10 @@ impl ToolchainUpload {
             .ok_or_else(|| invalid("toolchain request identity"))?;
         let identity = self.prepared.identity();
         let sha256 = hex(&identity.sha256);
-        let check = |reply: &Value, kind: &str, fields: usize| -> io::Result<()> {
-            require(
-                reply
-                    .as_object()
-                    .is_some_and(|object| object.len() == fields)
-                    && reply["kind"] == kind
-                    && reply["request_id"].as_u64() == Some(id)
-                    && digest(&reply["sha256"])? == identity.sha256,
-                "toolchain acknowledgment kind, shape or identity mismatch",
-            )
-        };
         peer.send(&json!({"kind":"toolchain-begin", "request_id":id,
             "identity":toolchain_identity_value(identity), "entries":self.entries.len()}))?;
         let reply = peer.receive()?;
-        check(&reply, "toolchain-ready", 4)?;
+        check_reply(&reply, id, &identity.sha256, "toolchain-ready", 4)?;
         match reply["sealed"].as_bool() {
             Some(true) => {
                 require(reuse_selected, "toolchain reuse was not negotiated")?;
@@ -169,6 +328,11 @@ impl ToolchainUpload {
             Some(false) => {}
             None => return Err(invalid("toolchain ready seal must be a boolean")),
         }
+        let missing = if file_reuse_selected {
+            Some(self.transmit_file_manifest(peer, id)?)
+        } else {
+            None
+        };
         let mut window = pipeline::UploadWindow::new(peer, id, identity.sha256);
         for entry in self.entries.iter() {
             let value = match &entry.kind {
@@ -186,6 +350,12 @@ impl ToolchainUpload {
                 pipeline::ExpectedAck::Entry { path: &entry.path },
             )?;
             if let ToolchainEntryKind::File { bytes, .. } = &entry.kind {
+                if missing
+                    .as_ref()
+                    .is_some_and(|paths| !paths.contains(&entry.path))
+                {
+                    continue;
+                }
                 let mut offset = 0_u64;
                 while offset < *bytes {
                     // The retained inventory checks the opened file's identity
@@ -220,7 +390,7 @@ impl ToolchainUpload {
         window.finish()?;
         peer.send(&json!({"kind":"toolchain-seal", "request_id":id, "sha256":sha256}))?;
         let reply = peer.receive()?;
-        check(&reply, "toolchain-ready", 4)?;
+        check_reply(&reply, id, &identity.sha256, "toolchain-ready", 4)?;
         require(
             reply["sealed"] == true,
             "worker did not seal the complete toolchain",
@@ -232,9 +402,11 @@ impl ToolchainUpload {
 mod tests {
     use super::*;
     mod pipeline_tests;
-    use rabs_sandbox::toolchain_dataset::{ToolchainLimits, capture_toolchain};
-    use rabs_sandbox::toolchain_transfer::ToolchainReceiver;
-    use std::collections::VecDeque;
+    use rabs_sandbox::toolchain_dataset::{ToolchainIdentity, ToolchainLimits, capture_toolchain};
+    use rabs_sandbox::toolchain_transfer::{
+        ToolchainCheckpointError, ToolchainFile, ToolchainReceiver,
+    };
+    use std::collections::{BTreeMap, VecDeque};
     use std::fs;
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::Path;
@@ -282,6 +454,12 @@ mod tests {
         maximum_pending: usize,
         fault: Option<&'static str>,
         reuse_enabled: bool,
+        file_reuse_enabled: bool,
+        expected: Option<ToolchainIdentity>,
+        file_manifest: BTreeMap<String, ToolchainFile>,
+        file_hits: BTreeSet<String>,
+        manifest_sealed: bool,
+        cached_files: BTreeMap<[u8; 32], fs::File>,
         stopped: bool,
     }
 
@@ -298,8 +476,34 @@ mod tests {
                 maximum_pending: 0,
                 fault: None,
                 reuse_enabled: false,
+                file_reuse_enabled: false,
+                expected: None,
+                file_manifest: BTreeMap::new(),
+                file_hits: BTreeSet::new(),
+                manifest_sealed: false,
+                cached_files: BTreeMap::new(),
                 stopped: false,
             }
+        }
+
+        fn checkpoint_completed_file(&mut self, path: &str) -> io::Result<()> {
+            if let Some(expected) = self.file_manifest.get(path) {
+                let destination = tempfile::NamedTempFile::new_in(self.owner.path())?;
+                let verified = self
+                    .receiver
+                    .as_mut()
+                    .unwrap()
+                    .checkpoint_file(expected, destination.as_file().try_clone()?, || {
+                        self.stopped
+                    })
+                    .map_err(|error| match error {
+                        ToolchainCheckpointError::Source(error)
+                        | ToolchainCheckpointError::Destination(error) => error,
+                    })?;
+                self.cached_files
+                    .insert(expected.sha256, verified.into_file());
+            }
+            Ok(())
         }
     }
 
@@ -330,6 +534,10 @@ mod tests {
                         return Ok(());
                     }
                     self.sealed = None;
+                    self.expected = Some(expected);
+                    self.file_manifest.clear();
+                    self.file_hits.clear();
+                    self.manifest_sealed = false;
                     self.receiver = Some(ToolchainReceiver::create(
                         &self
                             .owner
@@ -339,6 +547,66 @@ mod tests {
                         ToolchainLimits::default(),
                     )?);
                     json!({"kind":"toolchain-ready", "request_id":id, "sha256":hex(&expected.sha256), "sealed":false})
+                }
+                "toolchain-file-manifest" => {
+                    require(
+                        self.file_reuse_enabled && !self.manifest_sealed,
+                        "file manifest was not selected",
+                    )?;
+                    require(
+                        frame["offset"].as_u64() == Some(self.file_manifest.len() as u64),
+                        "file page offset mismatch",
+                    )?;
+                    let files = frame["files"]
+                        .as_array()
+                        .ok_or_else(|| invalid("file page missing"))?;
+                    require(
+                        !files.is_empty()
+                            && files.len() <= MAX_TOOLCHAIN_FILE_PAGE_ENTRIES
+                            && serde_json::to_vec(frame)?.len() <= MAX_TOOLCHAIN_FILE_PAGE_BYTES,
+                        "file page exceeds bound",
+                    )?;
+                    let mut missing = Vec::new();
+                    for file in files {
+                        let file = ToolchainFile {
+                            path: file["path"].as_str().unwrap().to_owned(),
+                            bytes: file["bytes"].as_u64().unwrap(),
+                            executable: file["executable"].as_bool().unwrap(),
+                            sha256: digest(&file["sha256"])?,
+                        };
+                        require(
+                            self.file_manifest
+                                .last_key_value()
+                                .is_none_or(|(path, _)| path < &file.path),
+                            "file page paths are not strictly ordered",
+                        )?;
+                        if !self.cached_files.contains_key(&file.sha256) {
+                            missing.push(file.path.clone());
+                        } else {
+                            self.file_hits.insert(file.path.clone());
+                        }
+                        self.file_manifest.insert(file.path.clone(), file);
+                    }
+                    json!({"kind":"toolchain-file-manifest-accepted", "request_id":id,
+                        "sha256":identity, "next_offset":self.file_manifest.len(), "missing":missing})
+                }
+                "toolchain-file-manifest-seal" => {
+                    let expected = self.expected.unwrap();
+                    let bytes = self
+                        .file_manifest
+                        .values()
+                        .map(|file| file.bytes)
+                        .sum::<u64>();
+                    require(
+                        self.file_reuse_enabled
+                            && !self.manifest_sealed
+                            && expected.files == self.file_manifest.len() as u64
+                            && expected.bytes == bytes,
+                        "file manifest totals differ",
+                    )?;
+                    self.manifest_sealed = true;
+                    json!({"kind":"toolchain-file-manifest-ready", "request_id":id, "sha256":identity,
+                        "files":expected.files, "bytes":bytes})
                 }
                 "toolchain-entry" => {
                     let entry = &frame["entry"];
@@ -357,6 +625,24 @@ mod tests {
                         path: frame["path"].as_str().unwrap().to_owned(),
                         kind,
                     })?;
+                    if self.file_reuse_enabled {
+                        require(
+                            self.manifest_sealed,
+                            "file manifest was not accepted before entries",
+                        )?;
+                        let path = frame["path"].as_str().unwrap();
+                        if let Some(file) = self.file_manifest.get(path) {
+                            if self.file_hits.contains(path) {
+                                let input = self.cached_files.get_mut(&file.sha256).unwrap();
+                                self.receiver
+                                    .as_mut()
+                                    .unwrap()
+                                    .import_file(file, input, || self.stopped)?;
+                            } else if file.bytes == 0 {
+                                self.checkpoint_completed_file(path)?;
+                            }
+                        }
+                    }
                     json!({"kind":"toolchain-entry-accepted", "request_id":id, "sha256":identity, "path":frame["path"]})
                 }
                 "toolchain-chunk" => {
@@ -372,6 +658,14 @@ mod tests {
                         &bytes,
                         digest(&frame["chunk_sha256"])?,
                     )?;
+                    let path = frame["path"].as_str().unwrap();
+                    if self
+                        .file_manifest
+                        .get(path)
+                        .is_some_and(|file| file.bytes == offset + bytes.len() as u64)
+                    {
+                        self.checkpoint_completed_file(path)?;
+                    }
                     json!({"kind":"toolchain-chunk-accepted", "request_id":id, "sha256":identity,
                         "path":frame["path"], "next_offset":offset + bytes.len() as u64})
                 }
@@ -401,6 +695,40 @@ mod tests {
                     reply.as_object_mut().unwrap().remove("sha256");
                 }
                 Some("kind") => reply["kind"] = json!("source-ready"),
+                Some("file-offset") if reply["kind"] == "toolchain-file-manifest-accepted" => {
+                    reply["next_offset"] = json!(0)
+                }
+                Some("file-foreign") if reply["kind"] == "toolchain-file-manifest-accepted" => {
+                    reply["missing"] = json!(["foreign"])
+                }
+                Some("file-duplicate") if reply["kind"] == "toolchain-file-manifest-accepted" => {
+                    let first = reply["missing"][0].clone();
+                    reply["missing"] = json!([first, first]);
+                }
+                Some("file-type") if reply["kind"] == "toolchain-file-manifest-accepted" => {
+                    reply["missing"] = json!([true])
+                }
+                Some("file-extra") if reply["kind"] == "toolchain-file-manifest-accepted" => {
+                    reply["extra"] = json!(true)
+                }
+                Some("file-identity") if reply["kind"] == "toolchain-file-manifest-accepted" => {
+                    reply["sha256"] = json!("ab".repeat(32))
+                }
+                Some("file-request") if reply["kind"] == "toolchain-file-manifest-accepted" => {
+                    reply["request_id"] = json!(999)
+                }
+                Some("file-count") if reply["kind"] == "toolchain-file-manifest-ready" => {
+                    reply["files"] = json!(0)
+                }
+                Some("file-bytes") if reply["kind"] == "toolchain-file-manifest-ready" => {
+                    reply["bytes"] = json!(0)
+                }
+                Some("file-lost") if reply["kind"] == "toolchain-file-manifest-accepted" => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "lost file page ACK",
+                    ));
+                }
                 Some("lost-ready") if reply["kind"] == "toolchain-ready" => {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
@@ -417,6 +745,19 @@ mod tests {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "lost chunk ACK",
+                    ));
+                }
+                Some("lost-completed-file")
+                    if reply["kind"] == "toolchain-chunk-accepted"
+                        && reply["next_offset"].as_u64()
+                            == self
+                                .file_manifest
+                                .get(reply["path"].as_str().unwrap())
+                                .map(|file| file.bytes) =>
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "lost completed-file ACK",
                     ));
                 }
                 Some("seal") if reply["sealed"] == true => reply["sealed"] = json!(false),
@@ -436,7 +777,7 @@ mod tests {
         )
         .unwrap();
         let mut peer = ReceiverPeer::new();
-        upload.transmit(&mut peer, &request, false).unwrap();
+        upload.transmit(&mut peer, &request, false, false).unwrap();
         let received = peer.sealed.as_ref().unwrap();
         received.verify(|| false).unwrap();
         assert_eq!(received.identity(), upload.prepared.identity());
@@ -510,7 +851,7 @@ mod tests {
         fs::write(&original, &changed).unwrap();
         assert_eq!(fs::read(&original).unwrap(), changed);
         let mut peer = ReceiverPeer::new();
-        upload.transmit(&mut peer, &request, false).unwrap();
+        upload.transmit(&mut peer, &request, false, false).unwrap();
         let received = peer.sealed.as_ref().unwrap();
         received.verify(|| false).unwrap();
         assert_eq!(received.identity(), &identity);
@@ -578,13 +919,288 @@ mod tests {
     }
 
     #[test]
+    fn file_reuse_requires_its_advertised_version_and_remains_independent_of_whole_reuse() {
+        let root = tempfile::tempdir().unwrap();
+        let (upload, _, _) = fixture(root.path());
+        for offered in [
+            None,
+            Some(Value::Null),
+            Some(json!([])),
+            Some(json!(["toolchain-file-reuse-v2"])),
+            Some(json!([TOOLCHAIN_FILE_REUSE_VERSION])),
+        ] {
+            let selected = offered.as_ref() == Some(&json!([TOOLCHAIN_FILE_REUSE_VERSION]));
+            let mut hello = json!({"toolchain_transfers":[TOOLCHAIN_TRANSFER_VERSION]});
+            if let Some(value) = offered {
+                hello["toolchain_file_reuses"] = value;
+            }
+            let mut grant = json!({"kind":"session-ok"});
+            upload.select(&hello, &mut grant).unwrap();
+            assert_eq!(grant["toolchain_transfer"], TOOLCHAIN_TRANSFER_VERSION);
+            assert_eq!(grant.get("toolchain_file_reuse").is_some(), selected);
+            assert!(grant.get("toolchain_reuse").is_none());
+            for value in [Value::Null, json!(true), json!("toolchain-file-reuse-v2")] {
+                let mut invalid = json!({"kind":"session-ok", "toolchain_file_reuse":value});
+                assert!(upload.select(&hello, &mut invalid).is_err());
+            }
+            if !selected {
+                let mut unsolicited = json!({"kind":"session-ok", "toolchain_file_reuse":TOOLCHAIN_FILE_REUSE_VERSION});
+                assert!(upload.select(&hello, &mut unsolicited).is_err());
+            }
+        }
+        assert!(
+            upload
+                .select(
+                    &json!({"toolchain_file_reuses":[TOOLCHAIN_FILE_REUSE_VERSION]}),
+                    &mut json!({"kind":"session-ok"})
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn file_reuse_metadata_capacity_preserves_ordinary_transfer_at_its_boundary() {
+        // One long, ordinary relative path and repeated references exercise the
+        // aggregate budget without allocating a large synthetic SDK inventory.
+        let entry = ToolchainEntry {
+            path: format!("{}compiler", format!("{}/", "d".repeat(200)).repeat(19)),
+            kind: ToolchainEntryKind::File {
+                bytes: 1,
+                executable: true,
+            },
+        };
+        let charge = 256 + 2 * entry.path.len();
+        let last_fitting = MAX_TOOLCHAIN_METADATA_BYTES / charge;
+        let hello = json!({"toolchain_file_reuses":[TOOLCHAIN_FILE_REUSE_VERSION]});
+        for count in [last_fitting, last_fitting + 1] {
+            assert!(
+                count * (128 + entry.path.len()) <= MAX_TOOLCHAIN_METADATA_BYTES,
+                "the ordinary tree protocol still fits this inventory"
+            );
+            let mut grant =
+                json!({"kind":"session-ok", "toolchain_transfer":TOOLCHAIN_TRANSFER_VERSION});
+            select_file_reuse(&hello, &mut grant, std::iter::repeat_n(&entry, count)).unwrap();
+            assert_eq!(grant["toolchain_transfer"], TOOLCHAIN_TRANSFER_VERSION);
+            assert_eq!(
+                grant.get("toolchain_file_reuse").is_some(),
+                count == last_fitting
+            );
+        }
+        let mut forced =
+            json!({"kind":"session-ok", "toolchain_file_reuse":TOOLCHAIN_FILE_REUSE_VERSION});
+        assert!(
+            select_file_reuse(
+                &hello,
+                &mut forced,
+                std::iter::repeat_n(&entry, last_fitting + 1)
+            )
+            .is_err()
+        );
+
+        let directory = ToolchainEntry {
+            path: entry.path.clone(),
+            kind: ToolchainEntryKind::Directory,
+        };
+        let mut grant = json!({"kind":"session-ok"});
+        select_file_reuse(
+            &hello,
+            &mut grant,
+            std::iter::repeat_n(&directory, last_fitting + 1),
+        )
+        .unwrap();
+        assert_eq!(
+            grant["toolchain_file_reuse"], TOOLCHAIN_FILE_REUSE_VERSION,
+            "directories are not file-manifest records"
+        );
+    }
+
+    #[test]
+    fn completed_files_reuse_real_bytes_but_keep_all_entries_and_the_final_dataset_seal() {
+        let root = tempfile::tempdir().unwrap();
+        let (upload, mut request, bytes) = fixture(root.path());
+        let mut peer = ReceiverPeer::new();
+        peer.file_reuse_enabled = true;
+        upload.transmit(&mut peer, &request, false, true).unwrap();
+        assert_eq!(peer.cached_files.len(), 2);
+        assert!(
+            peer.sent
+                .iter()
+                .any(|frame| frame["kind"] == "toolchain-chunk")
+        );
+        let cold_end = peer.sent.len();
+        request["request_id"] = json!(1);
+        upload.transmit(&mut peer, &request, false, true).unwrap();
+        let warm = &peer.sent[cold_end..];
+        assert_eq!(warm[0]["kind"], "toolchain-begin");
+        assert_eq!(warm[1]["kind"], "toolchain-file-manifest");
+        assert_eq!(warm[2]["kind"], "toolchain-file-manifest-seal");
+        assert_eq!(
+            warm.iter()
+                .filter(|frame| frame["kind"] == "toolchain-entry")
+                .count(),
+            upload.entries.len()
+        );
+        assert!(warm.iter().all(|frame| frame["kind"] != "toolchain-chunk"));
+        assert_eq!(warm.last().unwrap()["kind"], "toolchain-seal");
+        let received = peer.sealed.as_ref().unwrap();
+        received.verify(|| false).unwrap();
+        assert_eq!(received.identity(), upload.prepared.identity());
+        assert_eq!(fs::read(received.root().join("rustc")).unwrap(), bytes);
+        assert!(received.root().join("empty-directory").is_dir());
+        assert!(peer.replies.is_empty());
+
+        // Whole-image readiness takes precedence, including when both optional
+        // protocols were negotiated. It must not start file-manifest traffic.
+        peer.reuse_enabled = true;
+        let before = peer.sent.len();
+        request["request_id"] = json!(2);
+        upload.transmit(&mut peer, &request, true, true).unwrap();
+        assert_eq!(peer.sent.len(), before + 1);
+        assert_eq!(peer.sent[before]["kind"], "toolchain-begin");
+    }
+
+    #[test]
+    fn completed_file_checkpoints_survive_lost_ack_without_reusing_an_incomplete_tree() {
+        let root = tempfile::tempdir().unwrap();
+        let (upload, mut request, bytes) = fixture(root.path());
+        let mut first = ReceiverPeer::new();
+        first.file_reuse_enabled = true;
+        first.fault = Some("lost-completed-file");
+        assert_eq!(
+            upload
+                .transmit(&mut first, &request, false, true)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert!(first.sealed.is_none());
+        assert!(
+            first
+                .sent
+                .iter()
+                .all(|frame| frame["kind"] != "toolchain-seal")
+        );
+        let completed_digest: [u8; 32] = Sha256::digest(&bytes).into();
+        assert!(first.cached_files.contains_key(&completed_digest));
+
+        let mut resumed = ReceiverPeer::new();
+        resumed.file_reuse_enabled = true;
+        resumed.cached_files = std::mem::take(&mut first.cached_files);
+        drop(first);
+        request["request_id"] = json!(3);
+        upload
+            .transmit(&mut resumed, &request, false, true)
+            .unwrap();
+        assert!(
+            resumed
+                .sent
+                .iter()
+                .all(|frame| frame["kind"] != "toolchain-chunk")
+        );
+        assert_eq!(resumed.sent.last().unwrap()["kind"], "toolchain-seal");
+        let received = resumed.sealed.as_ref().unwrap();
+        received.verify(|| false).unwrap();
+        assert_eq!(received.identity(), upload.prepared.identity());
+        assert_eq!(fs::read(received.root().join("rustc")).unwrap(), bytes);
+    }
+
+    #[test]
+    fn changed_sdk_reuses_only_identical_file_bytes_and_restores_new_executable_modes() {
+        let root = tempfile::tempdir().unwrap();
+        let (upload, mut request, bytes) = fixture(root.path());
+        let mut peer = ReceiverPeer::new();
+        peer.file_reuse_enabled = true;
+        upload.transmit(&mut peer, &request, false, true).unwrap();
+        let before = peer.sent.len();
+        let original = root.path().join("original");
+        fs::write(original.join("empty-file"), b"new SDK payload").unwrap();
+        fs::set_permissions(
+            original.join("bin/compiler"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let changed = capture_toolchain(
+            &original,
+            &root.path().join("retained-next"),
+            None,
+            &ToolchainLimits::default(),
+            || false,
+        )
+        .unwrap();
+        assert_ne!(changed.identity(), upload.prepared.identity());
+        request["request_id"] = json!(4);
+        request["toolchain_identity"] = toolchain_identity_value(changed.identity());
+        let changed = ToolchainUpload::new(changed, &request).unwrap();
+        changed.transmit(&mut peer, &request, false, true).unwrap();
+        let chunks = peer.sent[before..]
+            .iter()
+            .filter(|frame| frame["kind"] == "toolchain-chunk")
+            .collect::<Vec<_>>();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0]["path"], "empty-file");
+        let received = peer.sealed.as_ref().unwrap();
+        received.verify(|| false).unwrap();
+        assert_eq!(received.identity(), changed.prepared.identity());
+        assert_eq!(fs::read(received.root().join("rustc")).unwrap(), bytes);
+        assert_eq!(
+            fs::read(received.root().join("empty-file")).unwrap(),
+            b"new SDK payload"
+        );
+        assert_eq!(
+            fs::metadata(received.root().join("bin/compiler"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+        assert_eq!(peer.sent.last().unwrap()["kind"], "toolchain-seal");
+    }
+
+    #[test]
+    fn malformed_or_lost_file_manifest_acknowledgments_never_send_tree_entries_or_a_seal() {
+        let root = tempfile::tempdir().unwrap();
+        let (upload, request, _) = fixture(root.path());
+        for fault in [
+            "file-offset",
+            "file-foreign",
+            "file-duplicate",
+            "file-type",
+            "file-extra",
+            "file-identity",
+            "file-request",
+            "file-count",
+            "file-bytes",
+            "file-lost",
+        ] {
+            let mut peer = ReceiverPeer::new();
+            peer.file_reuse_enabled = true;
+            peer.fault = Some(fault);
+            assert!(
+                upload.transmit(&mut peer, &request, false, true).is_err(),
+                "{fault}"
+            );
+            assert!(peer.sealed.is_none());
+            assert!(
+                peer.sent.iter().all(|frame| !matches!(
+                    frame["kind"].as_str(),
+                    Some(
+                        "toolchain-entry" | "toolchain-chunk" | "toolchain-seal" | "canonical-exec"
+                    )
+                )),
+                "{fault}"
+            );
+        }
+    }
+
+    #[test]
     fn negotiated_receiver_warmth_skips_every_entry_chunk_and_seal() {
         let root = tempfile::tempdir().unwrap();
         let (upload, mut request, bytes) = fixture(root.path());
         let mut peer = ReceiverPeer::new();
         peer.reuse_enabled = true;
         // A selected miss follows the complete bounded transfer protocol.
-        upload.transmit(&mut peer, &request, true).unwrap();
+        upload.transmit(&mut peer, &request, true, false).unwrap();
         assert_eq!(peer.maximum_pending, CHUNK_WINDOW);
         assert!(
             peer.sent
@@ -595,7 +1211,7 @@ mod tests {
         let cold_end = peer.sent.len();
         request["request_id"] = json!(1);
         let original = serde_json::to_vec(&request).unwrap();
-        upload.transmit(&mut peer, &request, true).unwrap();
+        upload.transmit(&mut peer, &request, true, false).unwrap();
         assert_eq!(peer.sent.len(), cold_end + 1);
         assert_eq!(
             peer.sent[cold_end],
@@ -615,7 +1231,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (upload, request, _) = fixture(root.path());
         let mut peer = ReceiverPeer::new();
-        upload.transmit(&mut peer, &request, false).unwrap();
+        upload.transmit(&mut peer, &request, false, false).unwrap();
         peer.reuse_enabled = true;
         for fault in [
             None,
@@ -633,7 +1249,7 @@ mod tests {
             // The unfaulted warm reply is still refused without selection.
             assert!(
                 upload
-                    .transmit(&mut peer, &request, fault.is_some())
+                    .transmit(&mut peer, &request, fault.is_some(), false)
                     .is_err(),
                 "{fault:?}"
             );
@@ -647,13 +1263,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (upload, request, _) = fixture(root.path());
         let mut peer = ReceiverPeer::new();
-        upload.transmit(&mut peer, &request, false).unwrap();
+        upload.transmit(&mut peer, &request, false, false).unwrap();
         peer.reuse_enabled = true;
         peer.stopped = true;
         let before = peer.sent.len();
         assert_eq!(
             upload
-                .transmit(&mut peer, &request, true)
+                .transmit(&mut peer, &request, true, false)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::Interrupted
@@ -664,7 +1280,7 @@ mod tests {
         let compiler = peer.sealed.as_ref().unwrap().root().join("bin/compiler");
         fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755)).unwrap();
         fs::write(&compiler, b"changed cached bytes").unwrap();
-        assert!(upload.transmit(&mut peer, &request, true).is_err());
+        assert!(upload.transmit(&mut peer, &request, true, false).is_err());
         assert_eq!(peer.sent.len(), before + 2);
         assert!(peer.replies.is_empty());
     }
@@ -677,7 +1293,7 @@ mod tests {
             let mut peer = ReceiverPeer::new();
             peer.fault = Some(fault);
             assert!(
-                upload.transmit(&mut peer, &request, false).is_err(),
+                upload.transmit(&mut peer, &request, false, false).is_err(),
                 "{fault}"
             );
             if fault != "seal" {
@@ -705,7 +1321,7 @@ mod tests {
         bytes[0] ^= 0xff;
         fs::write(&compiler, bytes).unwrap();
         let mut peer = ReceiverPeer::new();
-        assert!(upload.transmit(&mut peer, &request, false).is_err());
+        assert!(upload.transmit(&mut peer, &request, false, false).is_err());
         assert!(peer.sealed.is_none());
         assert!(
             peer.sent

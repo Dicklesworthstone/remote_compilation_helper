@@ -30,6 +30,50 @@ fn run_capture(args: &[&str], envs: &[(&str, &str)]) -> (String, String, i32, Du
 }
 
 #[test]
+fn build_info_ignores_runtime_configuration_and_creates_no_daemon_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("invalid.toml");
+    std::fs::write(&config, "this is not TOML").unwrap();
+    let socket = dir.path().join("daemon.sock");
+
+    let output = rabsd()
+        .arg("--rabs-build-info")
+        .env("RABS_CONFIG", &config)
+        .env("RABS_SOCKET_PATH", &socket)
+        .env("RABS_BUILD_IDENTITY", "runtime-value-must-not-win")
+        .env("RCH_BUILD_SOURCE", "runtime-value-must-not-win")
+        .env("RABS_PREPARED_CONCURRENCY", "invalid")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert!(output.stderr.is_empty());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["schema"], 1);
+    assert_eq!(report["kind"], "rabs-build-info");
+    assert_eq!(report["tool"], "rabsd");
+    assert_eq!(report["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        report["build_identity"],
+        rabs_protocol::release_authorization::default_build_identity()
+    );
+    let expected_source = option_env!("RCH_BUILD_SOURCE").filter(|source| {
+        source.len() == 40
+            && source
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    });
+    assert_eq!(
+        report.get("compiled_source"),
+        Some(&serde_json::json!(expected_source))
+    );
+    assert_eq!(report.as_object().unwrap().len(), 6);
+    assert!(!socket.exists());
+    assert_eq!(std::fs::read_to_string(config).unwrap(), "this is not TOML");
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+}
+
+#[test]
 fn version_help_and_check_config_meet_the_10ms_budget() {
     // First call warms fs caches; budget measured on the second.
     let _ = run_capture(&["--version"], &[]);

@@ -11,7 +11,10 @@
 mod cargo;
 
 use super::control::PreparationControl;
-use super::{MAX_SOURCE_ROOTS, SourceUpload, invalid, manifest_value, require, valid_closure_root};
+use super::{
+    MAX_SOURCE_ROOTS, PreparationContext, SourceUpload, invalid, manifest_value, require,
+    valid_closure_root,
+};
 use rabs_sandbox::snapshot_capture::{
     CaptureError, MemberDisposition, capture_sealed_source_cancellable, member_disposition,
 };
@@ -70,7 +73,11 @@ fn local_root(base: &Path, value: &Value) -> io::Result<PathBuf> {
 }
 
 impl SourcePreparation {
-    pub(super) fn parse(base: &Path, specification: &Value) -> io::Result<Self> {
+    pub(super) fn parse(
+        base: &Path,
+        specification: &Value,
+        context: PreparationContext,
+    ) -> io::Result<Self> {
         require(base.is_absolute(), "source root must be absolute")?;
         require(
             specification.is_object(),
@@ -96,7 +103,7 @@ impl SourcePreparation {
         let mut selections = Vec::new();
         let cargo = specification
             .get("cargo_source")
-            .map(cargo::CargoSource::parse)
+            .map(|value| cargo::CargoSource::parse_request(value, specification, context))
             .transpose()?;
         let closure = specification.get("source_roots").is_some();
         if let Some(cargo) = &cargo {
@@ -221,6 +228,12 @@ impl SourcePreparation {
         self.cargo
             .as_ref()
             .and_then(cargo::CargoSource::cargo_home_projection)
+    }
+
+    pub(super) fn requires_selected_toolchain(&self) -> bool {
+        self.cargo
+            .as_ref()
+            .is_some_and(cargo::CargoSource::requires_selected_toolchain)
     }
 
     pub(super) fn capture_controlled(
@@ -392,11 +405,14 @@ mod tests {
             bad.push(spec);
         }
         for spec in bad {
-            assert!(SourcePreparation::parse(base, &spec).is_err(), "{spec}");
+            assert!(
+                SourcePreparation::parse(base, &spec, PreparationContext::RemoteRequest).is_err(),
+                "{spec}"
+            );
         }
         let mut spec = good;
         spec["command_context"]["env"]["HOME"] = json!("never-echo-secret-value");
-        let error = SourcePreparation::parse(base, &spec)
+        let error = SourcePreparation::parse(base, &spec, PreparationContext::RemoteRequest)
             .unwrap_err()
             .to_string();
         assert!(error.contains("worker-owned"));
@@ -407,7 +423,8 @@ mod tests {
     fn relative_roots_and_root_and_file_count_limits_are_explicit() {
         let base = Path::new("/source-base");
         let mut spec = specification(Path::new("libs/dep"));
-        let plan = SourcePreparation::parse(base, &spec).unwrap();
+        let plan =
+            SourcePreparation::parse(base, &spec, PreparationContext::RemoteRequest).unwrap();
         assert_eq!(
             plan.roots,
             vec![
@@ -420,22 +437,24 @@ mod tests {
             .collect();
         spec["source_roots"] = Value::Object(roots);
         assert_eq!(
-            SourcePreparation::parse(base, &spec).unwrap().root_count(),
+            SourcePreparation::parse(base, &spec, PreparationContext::RemoteRequest)
+                .unwrap()
+                .root_count(),
             MAX_SOURCE_ROOTS
         );
         spec["source_roots"]["overflow"] = json!({"path":".", "files":["lib.rs"]});
-        assert!(SourcePreparation::parse(base, &spec).is_err());
+        assert!(SourcePreparation::parse(base, &spec, PreparationContext::RemoteRequest).is_err());
         let files: Vec<_> = (0..MAX_SOURCE_FILES / 2)
             .map(|index| format!("f{index}"))
             .collect();
         spec["source_roots"] =
             json!({"app":{"path":".","files":files}, "dep":{"path":"libs/dep","files":files}});
-        SourcePreparation::parse(base, &spec).unwrap();
+        SourcePreparation::parse(base, &spec, PreparationContext::RemoteRequest).unwrap();
         spec["source_roots"]["dep"]["files"]
             .as_array_mut()
             .unwrap()
             .push(json!("one-more"));
-        assert!(SourcePreparation::parse(base, &spec).is_err());
+        assert!(SourcePreparation::parse(base, &spec, PreparationContext::RemoteRequest).is_err());
     }
 
     #[test]
@@ -509,5 +528,179 @@ mod tests {
             fs::read(first.join("source/dep/src/lib.rs")).unwrap(),
             b"pub fn answer() -> u32 { 42 }\n"
         );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod selected_route_tests {
+    use super::*;
+    use crate::coord::source_delivery::{prepare_source_template, request_manifest};
+    use rabs_sandbox::cargo_home::{CargoHomeProjection, ISOLATED_CARGO_HOME_SOURCE_VERSION};
+    use rabs_sandbox::source_transfer::{MAX_SOURCE_CHUNK, SourceReceiver};
+    use serde_json::json;
+    use std::fs;
+    use std::process::Command;
+    use std::time::Duration;
+
+    #[test]
+    fn allocated_selected_preparation_uses_captured_sdk_and_replays_through_worker_projection() {
+        let owner = tempfile::tempdir().unwrap();
+        let root = owner.path();
+        let tools = root.join("tools");
+        let source = root.join("source");
+        let approved = root.join("approved");
+        let namespace = "index.crates.io-1949cf8c6b5b557f";
+        let index = approved.join("registry/index").join(namespace);
+        for directory in [
+            tools.clone(),
+            source.join("src"),
+            index.join(".cache/ro/ut"),
+            root.join("home"),
+        ] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        // Resolve an actually installed compiler; the shipping entrypoint below
+        // must capture this SDK before it runs Cargo's selected source planner.
+        let cargo = cargo::local_tool("cargo", &tools).unwrap();
+        let sdk = cargo.parent().unwrap().parent().unwrap();
+        assert!(sdk.join("bin/rustc").is_file());
+        fs::write(
+            source.join("Cargo.toml"),
+            "[package]\nname='selected-route'\nversion='0.1.0'\nedition='2021'\n\
+             [dependencies]\nroute-unused={version='=1.0.0',optional=true}\n",
+        )
+        .unwrap();
+        fs::write(source.join("src/lib.rs"), "pub fn answer() -> u32 { 42 }\n").unwrap();
+        let checksum = "0".repeat(64);
+        fs::write(source.join("Cargo.lock"), format!(
+            "version=4\n[[package]]\nname='selected-route'\nversion='0.1.0'\ndependencies=['route-unused']\n\
+             [[package]]\nname='route-unused'\nversion='1.0.0'\n\
+             source='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='{checksum}'\n",
+        )).unwrap();
+        fs::write(
+            index.join("config.json"),
+            br#"{"dl":"https://static.crates.io/crates","api":"https://crates.io"}"#,
+        )
+        .unwrap();
+        let mut record = vec![3, 2, 0, 0, 0];
+        record.extend_from_slice(b"etag: \"selected-route\"\0");
+        record.extend_from_slice(b"1.0.0\0");
+        record.extend_from_slice(&serde_json::to_vec(&json!({
+            "name":"route-unused","vers":"1.0.0","deps":[],"cksum":checksum,"features":{},"yanked":false,
+        })).unwrap());
+        record.push(0);
+        let record_path = index.join(".cache/ro/ut/route-unused");
+        fs::write(&record_path, record).unwrap();
+        // No .crate exists: its checksum is resolution data only because this
+        // package is optional and absent from the requested compilation graph.
+        let specification = json!({
+            "kind":"canonical-exec","request_id":"allocate",
+            "program":"/__rabs/toolchain/bin/cargo",
+            "args":["check","--locked","--offline","--message-format=json",
+                "--manifest-path","/__rabs/workspace/Cargo.toml","--target-dir","/__rabs/out/cargo"],
+            "command_context":{"version":"env-cwd-v1","cwd":"/__rabs/workspace",
+                "env":{"CARGO_INCREMENTAL":"0"}},
+            "toolchain_source":sdk,
+            "cargo_source":{"manifest":"Cargo.toml","cargo_home_source":approved,
+                "selection":"cargo-unit-graph-v1"},
+            "artifacts":{"unit":"cargo","tree":"tree-files-v1","files":[],"cargo":"cargo-json-v1"},
+        });
+        let bundle = root.join("bundle");
+        let prepared = prepare_source_template(&source, &specification, &bundle).unwrap();
+        assert_eq!(prepared["kind"], "prepared-source-template");
+        assert_eq!(prepared["request_id"], "allocate");
+        assert_eq!(prepared["executed"], false);
+        let request: Value =
+            serde_json::from_slice(&fs::read(bundle.join("request.json")).unwrap()).unwrap();
+        assert_eq!(request["args"], specification["args"]);
+        assert_eq!(request["command_context"], specification["command_context"]);
+        assert_eq!(
+            request["cargo_home"]["version"],
+            ISOLATED_CARGO_HOME_SOURCE_VERSION
+        );
+        assert!(request.get("cargo_source").is_none());
+        assert!(request.get("toolchain_source").is_none());
+        assert!(request.get("toolchain_identity").is_some());
+        let manifest = request_manifest(&request).unwrap().unwrap();
+        assert!(
+            manifest
+                .files()
+                .iter()
+                .all(|file| !file.path.ends_with(".crate"))
+        );
+        assert!(
+            manifest
+                .files()
+                .iter()
+                .any(|file| file.path.ends_with(".cache/ro/ut/route-unused"))
+        );
+        let projection = CargoHomeProjection::for_version(
+            request["cargo_home"]["version"].as_str().unwrap(),
+            request["cargo_home"]["prefix"].as_str().unwrap(),
+            &manifest,
+        )
+        .unwrap();
+        let mut receiver =
+            SourceReceiver::create(&root.join("received"), manifest.clone()).unwrap();
+        for file in manifest.files() {
+            let bytes = fs::read(bundle.join("source").join(&file.path)).unwrap();
+            for (index, chunk) in bytes.chunks(MAX_SOURCE_CHUNK).enumerate() {
+                receiver
+                    .write_chunk(
+                        &file.path,
+                        (index * MAX_SOURCE_CHUNK) as u64,
+                        chunk,
+                        Sha256::digest(chunk).into(),
+                    )
+                    .unwrap();
+            }
+        }
+        receiver.seal().unwrap();
+        let projected = projection
+            .prepare(&receiver, &root.join("worker-inputs"), || false)
+            .unwrap();
+        let workspace = projected.projected_workspace().unwrap();
+        assert!(!workspace.join("rabs-cargo-home").exists());
+        assert!(!projected.root().join("registry/cache").exists());
+        // The exact saved selection now owns source and sparse-index bytes.
+        // Replaying it cannot fall through to the original workspace/home.
+        fs::write(
+            source.join("src/lib.rs"),
+            "compile_error!(\"mutable original\");\n",
+        )
+        .unwrap();
+        fs::write(&record_path, b"mutated original index").unwrap();
+        let captured_sdk = PathBuf::from(prepared["toolchain_root"].as_str().unwrap());
+        assert_ne!(captured_sdk, sdk);
+        let mut replay = Command::new(captured_sdk.join("bin/cargo"));
+        replay
+            .env_clear()
+            .current_dir(workspace)
+            .env("HOME", root.join("home"))
+            .env("CARGO_HOME", projected.root())
+            .env("RUSTC", captured_sdk.join("bin/rustc"))
+            .env(
+                "PATH",
+                format!("{}/bin:/usr/bin:/bin", captured_sdk.display()),
+            )
+            .env("LD_LIBRARY_PATH", captured_sdk.join("lib"))
+            .env("CARGO_INCREMENTAL", "0")
+            .args([
+                "check",
+                "--locked",
+                "--offline",
+                "--message-format=json",
+                "--manifest-path",
+            ])
+            .arg(workspace.join("Cargo.toml"))
+            .arg("--target-dir")
+            .arg(root.join("worker-target"));
+        let output =
+            cargo::bounded_command(replay, root, Duration::from_secs(30), 8 * 1024 * 1024).unwrap();
+        assert!(String::from_utf8_lossy(&output).lines().any(|line| {
+            serde_json::from_str::<Value>(line).is_ok_and(|message| {
+                message["reason"] == "build-finished" && message["success"] == true
+            })
+        }));
     }
 }
