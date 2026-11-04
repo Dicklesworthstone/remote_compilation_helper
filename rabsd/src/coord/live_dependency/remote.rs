@@ -66,7 +66,7 @@ use rabs_sandbox::toolchain_dataset::capture_toolchain;
 use rabs_sandbox::toolchain_dataset::{
     PreparedToolchain, ToolchainIdentity, ToolchainLimits, capture_toolchain_with_cloner,
 };
-use rabs_sandbox::toolchain_transfer::{TOOLCHAIN_FILE_REUSE_VERSION, TOOLCHAIN_TRANSFER_VERSION};
+use rabs_sandbox::toolchain_transfer::TOOLCHAIN_TRANSFER_VERSION;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -2732,6 +2732,7 @@ mod worker_pool_tests {
     use super::*;
     use rabs_asupersync::worker_transport::TlsFiles;
     use rabs_key::typed_digest::compute;
+    use rabs_sandbox::toolchain_transfer::TOOLCHAIN_FILE_REUSE_VERSION;
 
     #[cfg(target_os = "linux")]
     #[test]
