@@ -192,6 +192,56 @@ class CanonicalLocalCargo(unittest.TestCase):
         self.assertNotIn("env", record["profile"])
         self.assertNotIn("AMBIENT_INPUT", retained.read_text())
 
+    def test_selected_source_mode_retains_actual_commands_and_literal_project_inputs(self):
+        cargo_home = self.root / "approved-cargo-home"
+        cargo_home.mkdir(mode=0o700)
+        self.profile.update(source_selection="cargo-unit-graph-v1",
+                            cargo_home_source=str(cargo_home),
+                            command="build", selection={"packages": ["saved"]},
+                            env={"APP_INPUT": "literal\nvalue", "EMPTY": ""})
+        self.save()
+        original = self.profile_path.read_bytes()
+        cases = (
+            (["check", "-p", "app", "--features=fast"],
+             {"packages": ["app"], "features": ["fast"]}),
+            (["build", "--release", "--bin", "server"],
+             {"release": True, "bin": ["server"]}),
+            (["test", "--doc", "--", "--nocapture"],
+             {"doc": True, "test_args": ["--nocapture"]}),
+            (["run", "--bin", "server", "--", "--literal"],
+             {"bin": ["server"], "run_args": ["--literal"]}),
+            (["bench", "--no-run"], {"no_run": True}),
+        )
+        for arguments, selection in cases:
+            with self.subTest(arguments=arguments):
+                status, _, stderr, _ = self.invoke(arguments)
+                self.assertEqual(status, 0, stderr)
+                record = self.records()[-1]
+                expected = dict(self.profile, command=arguments[0], selection=selection)
+                self.assertEqual(record["profile"], expected)
+                self.assertEqual(json.loads(Path(record["retained"]).read_bytes()), expected)
+                self.assertEqual(self.profile_path.read_bytes(), original)
+
+    def test_selected_source_mode_refuses_invalid_versions_vendor_and_clippy_before_handoff(self):
+        for version in (None, True, {}, "future", "Complete"):
+            with self.subTest(version=version):
+                self.profile["source_selection"] = version
+                self.save()
+                stderr = self.assert_refused(["check"])
+                self.assertIn(b"source_selection must be cargo-unit-graph-v1", stderr)
+        self.profile.update(source_selection="cargo-unit-graph-v1", vendor="vendor")
+        self.save()
+        stderr = self.assert_refused(["build"])
+        self.assertIn(b"source_selection cannot be combined with vendor", stderr)
+        self.profile.pop("vendor")
+        self.save()
+        stderr = self.assert_refused(["clippy", "--", "-Dwarnings"])
+        self.assertIn(b"source_selection does not support Clippy", stderr)
+        self.profile["command"] = "clippy"
+        self.save()
+        stderr = self.assert_refused(["check"])
+        self.assertIn(b"source_selection does not support Clippy", stderr)
+
     def test_rustup_selection_reaches_native_local_profile_as_one_physical_root(self):
         self.select_rustup()
         original = self.profile_path.read_bytes()

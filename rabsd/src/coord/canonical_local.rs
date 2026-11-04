@@ -75,6 +75,15 @@ const WRAPPER: &str = "/__rabs/home/control/rabs-wrap";
 const SOCKET: &str = "/__rabs/home/control/rustc.sock";
 const MAX_GRAPH_BYTES: u64 = 16 * 1024 * 1024;
 
+#[derive(Debug, Default, Deserialize, Eq, PartialEq)]
+enum SourceSelection {
+    #[default]
+    #[serde(skip)]
+    Complete,
+    #[serde(rename = "cargo-unit-graph-v1")]
+    UnitGraph,
+}
+
 /// All host locations are selected by the operator, not by Cargo or a wrapper
 /// request. State and operation parents must be owned, private directories.
 /// `vendor` is relative to `source_root`; `cargo_home_source` is absolute.
@@ -96,6 +105,10 @@ struct Profile {
     manifest: String,
     vendor: Option<String>,
     cargo_home_source: Option<PathBuf>,
+    /// Resolve external inputs from this command's actual Cargo unit graph.
+    /// An omitted field retains complete locked-graph preparation.
+    #[serde(default)]
+    source_selection: SourceSelection,
     /// An absent check selection retains the library-only default. An explicit
     /// empty selection and builds use Cargo's ordinary default members/targets.
     selection: Option<CompilationSelection>,
@@ -702,6 +715,7 @@ impl Profile {
         }
         self.compilation_args()?;
         self.command_environment()?;
+        self.source_selection_version()?;
         require(
             relative_member(&self.manifest),
             "manifest must be an ordinary relative path",
@@ -934,6 +948,9 @@ impl Profile {
 
     fn source_specification(&self) -> io::Result<Value> {
         let mut source = json!({"manifest":self.manifest});
+        if let Some(version) = self.source_selection_version()? {
+            source["selection"] = json!(version);
+        }
         if let Some(vendor) = &self.vendor {
             source["vendor"] = json!(vendor);
         }
@@ -949,6 +966,28 @@ impl Profile {
                 "env":environment}
         }))
     }
+
+    fn source_selection_version(&self) -> io::Result<Option<&'static str>> {
+        if self.source_selection == SourceSelection::Complete {
+            return Ok(None);
+        }
+        require(
+            self.vendor.is_none(),
+            "selected Cargo preparation does not support vendor sources",
+        )?;
+        require(
+            self.command != CompilationCommand::Clippy,
+            "selected Cargo preparation does not support Clippy",
+        )?;
+        Ok(Some("cargo-unit-graph-v1"))
+    }
+}
+
+#[cfg(test)]
+pub(super) fn source_specification_for_test(profile: Value) -> io::Result<Value> {
+    let profile: Profile = serde_json::from_value(profile)
+        .map_err(|error| invalid(format!("invalid native test profile: {error}")))?;
+    profile.source_specification()
 }
 
 /// Resolve only the graph query's run target. Every probe runs the captured
@@ -2328,6 +2367,87 @@ mod tests {
             "state_root":"/state", "operation_root":"/operations", "wrapper":"/bin/rabs-wrap"
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn source_selection_is_typed_and_retains_the_exact_native_execution_request() {
+        let mut profile = application_environment_profile();
+        assert!(
+            profile.source_specification().unwrap()["cargo_source"]
+                .get("selection")
+                .is_none()
+        );
+        profile.source_selection = SourceSelection::UnitGraph;
+        profile.manifest = "member/Cargo.toml".into();
+        profile.cargo_home_source = Some(PathBuf::from("/approved-cargo-home"));
+        profile.jobs = 7;
+        profile
+            .env
+            .insert("APP_INPUT".into(), "literal\nvalue".into());
+        for command in [
+            CompilationCommand::Check,
+            CompilationCommand::Build,
+            CompilationCommand::Test,
+            CompilationCommand::Run,
+            CompilationCommand::Bench,
+        ] {
+            profile.command = command;
+            let request = profile.source_specification().unwrap();
+            assert_eq!(
+                request["cargo_source"],
+                json!({"manifest":"member/Cargo.toml", "cargo_home_source":"/approved-cargo-home",
+                    "selection":"cargo-unit-graph-v1"})
+            );
+            assert_eq!(request["args"], json!(profile.compilation_args().unwrap()));
+            assert_eq!(request["program"], CARGO);
+            assert_eq!(
+                request["command_context"]["cwd"],
+                "/__rabs/workspace/member"
+            );
+            let expected: BTreeMap<_, _> =
+                profile.command_environment().unwrap().into_iter().collect();
+            assert_eq!(request["command_context"]["env"], json!(expected));
+            assert!(
+                !profile
+                    .compilation_args()
+                    .unwrap()
+                    .iter()
+                    .any(|argument| argument == "--target-dir")
+            );
+        }
+        for selection in [
+            Value::Null,
+            json!(true),
+            json!({}),
+            json!("future"),
+            json!("Complete"),
+        ] {
+            let invalid = json!({
+                "version":PROFILE_VERSION, "source_root":"/source", "toolchain_root":"/toolchain",
+                "state_root":"/state", "operation_root":"/operations", "wrapper":"/bin/rabs-wrap",
+                "source_selection":selection,
+            });
+            assert!(serde_json::from_value::<Profile>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn source_selection_rejects_vendor_and_clippy_before_opening_profile_roots() {
+        let mut profile = application_environment_profile();
+        profile.source_selection = SourceSelection::UnitGraph;
+        profile.vendor = Some("vendor".into());
+        let error = profile.validate().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not support vendor sources")
+        );
+        assert!(profile.source_specification().is_err());
+        profile.vendor = None;
+        profile.command = CompilationCommand::Clippy;
+        let error = profile.validate().unwrap_err();
+        assert!(error.to_string().contains("does not support Clippy"));
+        assert!(profile.source_specification().is_err());
     }
 
     #[test]

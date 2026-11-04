@@ -13,7 +13,7 @@ mod selection;
 mod vendor;
 
 use super::super::control::PreparationRootGuard;
-use super::{PreparationControl, capture_error};
+use super::{PreparationContext, PreparationControl, capture_error};
 use rabs_asupersync::process_groups::ManagedProcessGroup;
 use rabs_asupersync::region_tree::Attribution;
 use rabs_asupersync::stream_drain::{DrainLimits, DrainedOutput};
@@ -59,14 +59,22 @@ pub(super) struct CargoSource {
 impl CargoSource {
     #[cfg(test)]
     pub(super) fn parse(value: &Value) -> io::Result<Self> {
-        Self::parse_inner(value, None)
+        Self::parse_inner(value, None, PreparationContext::RemoteRequest)
     }
 
-    pub(super) fn parse_request(value: &Value, request: &Value) -> io::Result<Self> {
-        Self::parse_inner(value, Some(request))
+    pub(super) fn parse_request(
+        value: &Value,
+        request: &Value,
+        context: PreparationContext,
+    ) -> io::Result<Self> {
+        Self::parse_inner(value, Some(request), context)
     }
 
-    fn parse_inner(value: &Value, request: Option<&Value>) -> io::Result<Self> {
+    fn parse_inner(
+        value: &Value,
+        request: Option<&Value>,
+        context: PreparationContext,
+    ) -> io::Result<Self> {
         require(
             value.as_object().is_some_and(|fields| {
                 fields.contains_key("manifest")
@@ -112,6 +120,7 @@ impl CargoSource {
                         invalid("selected Cargo preparation requires its execution request")
                     })?,
                     manifest,
+                    context,
                 )
             })
             .transpose()?;
@@ -266,7 +275,7 @@ impl CargoSource {
                     selected_toolchain,
                 )?;
                 if let Some(selection) = &self.selection {
-                    selection.configure(&mut locate);
+                    selection.configure(&mut locate, &rustc, &planning_root);
                 }
                 locate
                     .args(["locate-project", "--workspace", "--message-format=json"])
@@ -307,7 +316,7 @@ impl CargoSource {
             selected_toolchain,
         )?;
         if let Some(selection) = &self.selection {
-            selection.configure(&mut command);
+            selection.configure(&mut command, &rustc, &planning_root);
         }
         command
             .args([
@@ -333,7 +342,7 @@ impl CargoSource {
         control.checkpoint()?;
         let metadata: Value = serde_json::from_slice(&output)
             .map_err(|error| invalid(&format!("invalid Cargo metadata JSON: {error}")))?;
-        if let Some(selection) = &self.selection {
+        let selected_archives = if let Some(selection) = &self.selection {
             let package_id = if let Some(package) = selection.run_package() {
                 let mut package_command = planning_command(
                     &cargo,
@@ -343,7 +352,7 @@ impl CargoSource {
                     &planning_root,
                     selected_toolchain,
                 )?;
-                selection.configure(&mut package_command);
+                selection.configure(&mut package_command, &rustc, &planning_root);
                 package_command
                     .args(["pkgid", "--locked", "--offline", "--package", package])
                     .arg("--manifest-path")
@@ -377,7 +386,7 @@ impl CargoSource {
                 &planning_root,
                 selected_toolchain,
             )?;
-            selection.configure(&mut graph);
+            selection.configure(&mut graph, &rustc, &planning_root);
             graph
                 .args(selection.graph_arguments(&metadata, package_id.as_deref())?)
                 .args([
@@ -399,7 +408,7 @@ impl CargoSource {
             )?;
             let graph: Value = serde_json::from_slice(&output)
                 .map_err(|error| invalid(&format!("invalid Cargo unit graph JSON: {error}")))?;
-            selection::validate_selected_graph(
+            Some(selection::validate_selected_graph(
                 &image,
                 &root,
                 selection,
@@ -409,7 +418,7 @@ impl CargoSource {
                     .as_ref()
                     .map(|registry| (registry, cargo_home.as_path())),
                 control,
-            )?;
+            )?)
         } else {
             validate_metadata_controlled(
                 &image,
@@ -422,13 +431,18 @@ impl CargoSource {
                     .map(|registry| (registry, cargo_home.as_path())),
                 control,
             )?;
-        }
+            None
+        };
         verify_planning_bytes_controlled(&image, &root, &files, control)?;
         if let Some(registry) = registry {
             let mut selected = files;
             selected.extend(
                 registry
-                    .materialize_controlled(&root.join(registry::CACHE_PREFIX), control)?
+                    .materialize_controlled(
+                        &root.join(registry::CACHE_PREFIX),
+                        selected_archives.as_ref(),
+                        control,
+                    )?
                     .into_iter()
                     .map(|path| format!("{}/{path}", registry::CACHE_PREFIX)),
             );

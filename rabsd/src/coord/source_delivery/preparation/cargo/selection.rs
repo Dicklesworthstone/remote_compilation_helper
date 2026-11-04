@@ -6,8 +6,8 @@
 //! preparation only; it grants no execution or action-cache authority.
 
 use super::{
-    MAX_PACKAGES, OUTPUT_LIMIT, PreparationControl, captured_metadata_path, graph, invalid,
-    registry::RegistryCache, require, validate_metadata_packages_controlled,
+    MAX_PACKAGES, OUTPUT_LIMIT, PreparationContext, PreparationControl, captured_metadata_path,
+    graph, invalid, registry::RegistryCache, require, validate_metadata_packages_controlled,
 };
 use rabs_sandbox::cargo_check::{CompilationCommand, CompilationSelection, run_build_selection};
 use rabs_sandbox::process_context::{COMMAND_CONTEXT_VERSION, CommandContext};
@@ -26,57 +26,22 @@ pub(super) struct SelectedCommand {
     pub(super) command: CompilationCommand,
     selection: CompilationSelection,
     environment: Vec<(String, String)>,
+    jobs: Option<u32>,
 }
 
 impl SelectedCommand {
     /// Derive the selection from the actual request, never from a second caller
     /// supplied feature/target declaration. Refuse mismatched execution context
     /// before any source, cache or toolchain is opened for this new mode.
-    pub(super) fn parse(request: &Value, manifest: &str) -> io::Result<Self> {
+    pub(super) fn parse(
+        request: &Value,
+        manifest: &str,
+        preparation: PreparationContext,
+    ) -> io::Result<Self> {
         require(
             request["program"] == "/__rabs/toolchain/bin/cargo",
             "selected Cargo preparation requires the canonical Cargo executable",
         )?;
-        let canonical_manifest = format!("/__rabs/workspace/{manifest}");
-        let cwd = Path::new(&canonical_manifest)
-            .parent()
-            .and_then(Path::to_str)
-            .ok_or_else(|| invalid("selected Cargo manifest parent missing"))?;
-        let context = request["command_context"]
-            .as_object()
-            .filter(|fields| {
-                fields.len() == 3
-                    && fields.get("version").and_then(Value::as_str)
-                        == Some(COMMAND_CONTEXT_VERSION)
-                    && fields.get("cwd").and_then(Value::as_str) == Some(cwd)
-            })
-            .ok_or_else(|| {
-                invalid("selected Cargo preparation requires its manifest-parent context")
-            })?;
-        let environment = context.get("env")
-            .and_then(Value::as_object)
-            .ok_or_else(|| invalid("selected Cargo preparation requires an explicit environment"))?
-            .iter()
-            .map(|(name, value)| {
-                let value = value
-                    .as_str()
-                    .ok_or_else(|| invalid("selected Cargo environment values must be strings"))?;
-                if name == "CARGO_INCREMENTAL" {
-                    require(matches!(value, "0" | "1"), "invalid selected Cargo incremental policy")?;
-                } else {
-                    require(
-                        !matches!(name.as_str(), "CARGO" | "RUSTC" | "RUSTDOC" | "RUSTFLAGS" | "RUSTDOCFLAGS" | "GLIBC_TUNABLES")
-                            && !["CARGO_", "RUSTUP_", "RUSTC_", "RUSTDOC_", "CLIPPY_", "LD_", "DYLD_", "GIT_", "RABS_", "RCH_"]
-                                .iter().any(|prefix| name.starts_with(prefix)),
-                        "selected Cargo preparation refuses compiler and resolution environment overrides",
-                    )?;
-                }
-                Ok((name.clone(), value.to_owned()))
-            })
-            .collect::<io::Result<Vec<_>>>()?;
-        let context = CommandContext::new(cwd, environment)
-            .map_err(|_| invalid("invalid selected Cargo command context"))?;
-
         let args = request["args"]
             .as_array()
             .filter(|args| !args.is_empty() && args.len() <= 256)
@@ -101,8 +66,72 @@ impl SelectedCommand {
                 ));
             }
         };
+        let canonical_manifest = format!("/__rabs/workspace/{manifest}");
+        let cwd = Path::new(&canonical_manifest)
+            .parent()
+            .and_then(Path::to_str)
+            .ok_or_else(|| invalid("selected Cargo manifest parent missing"))?;
+        let context = request["command_context"]
+            .as_object()
+            .filter(|fields| {
+                fields.len() == 3
+                    && fields.get("version").and_then(Value::as_str)
+                        == Some(COMMAND_CONTEXT_VERSION)
+                    && fields.get("cwd").and_then(Value::as_str) == Some(cwd)
+            })
+            .ok_or_else(|| {
+                invalid("selected Cargo preparation requires its manifest-parent context")
+            })?;
+        let native = preparation == PreparationContext::CanonicalLocal;
+        let inputs = context
+            .get("env")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                invalid("selected Cargo preparation requires an explicit environment")
+            })?;
+        if native {
+            require(
+                inputs.get("CARGO_INCREMENTAL").and_then(Value::as_str) == Some("0")
+                    && inputs.get("CARGO_TARGET_DIR").and_then(Value::as_str)
+                        == Some("/__rabs/out/cargo")
+                    && inputs.get("RUSTC").and_then(Value::as_str)
+                        == Some("/__rabs/toolchain/bin/rustc")
+                    && if command == CompilationCommand::Test {
+                        inputs.get("RUSTDOC").and_then(Value::as_str)
+                            == Some("/__rabs/toolchain/bin/rustdoc")
+                    } else {
+                        !inputs.contains_key("RUSTDOC")
+                    },
+                "selected native Cargo preparation requires the driver's exact compiler controls",
+            )?;
+        }
+        let environment = inputs
+            .iter()
+            .map(|(name, value)| {
+                let value = value
+                    .as_str()
+                    .ok_or_else(|| invalid("selected Cargo environment values must be strings"))?;
+                if name == "CARGO_INCREMENTAL" {
+                    require(matches!(value, "0" | "1"), "invalid selected Cargo incremental policy")?;
+                } else if !native || !matches!(name.as_str(), "CARGO_TARGET_DIR" | "RUSTC" | "RUSTDOC") {
+                    // Only the complete fixed native control set checked above
+                    // bypasses this rule. Public requests retain the same boundary.
+                    require(
+                        !matches!(name.as_str(), "CARGO" | "RUSTC" | "RUSTDOC" | "RUSTFLAGS" | "RUSTDOCFLAGS" | "GLIBC_TUNABLES")
+                            && !["CARGO_", "RUSTUP_", "RUSTC_", "RUSTDOC_", "CLIPPY_", "LD_", "DYLD_", "GIT_", "RABS_", "RCH_"]
+                                .iter().any(|prefix| name.starts_with(prefix)),
+                        "selected Cargo preparation refuses compiler and resolution environment overrides",
+                    )?;
+                }
+                Ok((name.clone(), value.to_owned()))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let context = CommandContext::new(cwd, environment)
+            .map_err(|_| invalid("invalid selected Cargo command context"))?;
+
         let mut selection = CompilationSelection::default();
         let mut controls = BTreeSet::new();
+        let mut jobs = None;
         let mut at = 1;
         while at < args.len() {
             if args[at] == "--" {
@@ -141,7 +170,7 @@ impl SelectedCommand {
             match option {
                 "--package" | "-p" | "--exclude" | "--features" | "-F" | "--bin" | "--test"
                 | "--example" | "--bench" | "--target" | "--profile" | "--manifest-path"
-                | "--target-dir" | "--message-format" | "--color" => {
+                | "--target-dir" | "--message-format" | "--color" | "--jobs" => {
                     let value = match inline {
                         Some(value) => value,
                         None => {
@@ -184,6 +213,16 @@ impl SelectedCommand {
                             )?;
                             selection.profile = Some(value.to_owned());
                         }
+                        "--jobs" => {
+                            let count = value.parse::<u32>().ok().filter(|count| {
+                                (1..=4096).contains(count) && count.to_string() == value
+                            });
+                            require(
+                                native && jobs.is_none() && count.is_some(),
+                                "selected native Cargo jobs must be one integer between 1 and 4096",
+                            )?;
+                            jobs = count;
+                        }
                         "--color" => require(
                             matches!(value, "auto" | "always" | "never"),
                             "invalid Cargo color",
@@ -196,7 +235,9 @@ impl SelectedCommand {
                                 _ => unreachable!(),
                             };
                             require(
-                                value == expected && controls.insert(option),
+                                value == expected
+                                    && controls.insert(option)
+                                    && (!native || option != "--target-dir"),
                                 "selected Cargo transport controls differ from execution",
                             )?;
                         }
@@ -234,9 +275,14 @@ impl SelectedCommand {
             at += 1;
         }
         require(
-            ["--manifest-path", "--target-dir", "--message-format"]
+            ["--manifest-path", "--message-format"]
                 .iter()
                 .all(|name| controls.contains(name))
+                && if native {
+                    jobs.is_some()
+                } else {
+                    controls.contains("--target-dir")
+                }
                 && (controls.contains("--frozen")
                     || (controls.contains("--locked") && controls.contains("--offline"))),
             "selected Cargo requires its exact locked offline transport controls",
@@ -251,11 +297,21 @@ impl SelectedCommand {
             command,
             selection,
             environment: context.environment().to_vec(),
+            jobs,
         })
     }
 
-    pub(super) fn configure(&self, command: &mut Command) {
-        command.envs(self.environment.iter().map(|(name, value)| (name, value)));
+    /// The retained request keeps canonical paths. Only the private planner
+    /// receives their counterparts inside the captured toolchain and scratch.
+    pub(super) fn configure(&self, command: &mut Command, rustc: &Path, planning: &Path) {
+        for (name, value) in &self.environment {
+            match name.as_str() {
+                "RUSTC" => command.env(name, rustc),
+                "RUSTDOC" => command.env(name, rustc.with_file_name("rustdoc")),
+                "CARGO_TARGET_DIR" => command.env(name, planning.join("target")),
+                _ => command.env(name, value),
+            };
+        }
     }
 
     /// `cargo run` does not reliably return a graph without looking for its
@@ -267,12 +323,16 @@ impl SelectedCommand {
         metadata: &Value,
         package_id: Option<&str>,
     ) -> io::Result<Vec<String>> {
-        if self.command == CompilationCommand::Run {
+        let mut arguments = if self.command == CompilationCommand::Run {
             run_build_selection(&self.selection, metadata, package_id)?
-                .cargo_arguments(CompilationCommand::Build)
+                .cargo_arguments(CompilationCommand::Build)?
         } else {
-            self.selection.cargo_arguments(self.command)
+            self.selection.cargo_arguments(self.command)?
+        };
+        if let Some(jobs) = self.jobs {
+            arguments.extend(["--jobs".into(), jobs.to_string()]);
         }
+        Ok(arguments)
     }
 
     /// An explicit target already lets Cargo resolve its ordinary package
@@ -424,7 +484,7 @@ pub(super) fn validate_selected_graph(
     units: &Value,
     registry: Option<(&RegistryCache, &Path)>,
     control: &PreparationControl<'_>,
-) -> io::Result<()> {
+) -> io::Result<BTreeSet<String>> {
     let manifest = selection.manifest.as_str();
     require(
         metadata.get("resolve").is_some_and(Value::is_null),
@@ -602,8 +662,9 @@ pub(super) fn validate_selected_graph(
         // The existing complete checkout comparison still covers Git package
         // data, include! inputs and executable modes, not just target entrypoints.
         registry.verify_git_checkouts(home, &external, control)?;
+        return registry.selected_archive_paths(home, &external, control);
     }
-    Ok(())
+    Ok(BTreeSet::new())
 }
 
 #[cfg(test)]

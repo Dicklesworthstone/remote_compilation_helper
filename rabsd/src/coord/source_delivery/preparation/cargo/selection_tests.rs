@@ -55,6 +55,7 @@ fn selected_local_inheritance_skips_retained_excluding_ancestors() {
         command: CompilationCommand::Check,
         selection: CompilationSelection::default(),
         environment: Vec::new(),
+        jobs: None,
     };
     validate_selected_graph(&image, root, &selection, &metadata, &graph, None, &control).unwrap();
 }
@@ -109,6 +110,402 @@ fn source(approved: &Path, selected: bool) -> Value {
     source
 }
 
+#[cfg(target_os = "linux")]
+fn native_profile(command: &str, selection: Value) -> Value {
+    json!({
+        "version":"canonical-compile-local-v1", "source_root":"/source",
+        "toolchain_root":"/toolchain", "state_root":"/state", "operation_root":"/operations",
+        "wrapper":"/bin/rabs-wrap", "source_selection":VERSION, "command":command,
+        "selection":selection, "jobs":2, "env":{"APP_INPUT":"literal\nvalue"},
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn native_specification(profile: Value) -> Value {
+    crate::coord::canonical_local::source_specification_for_test(profile).unwrap()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn selected_native_commands_map_driver_controls_without_widening_public_requests() {
+    for command in ["check", "build", "test", "run", "bench"] {
+        let selection = if command == "run" {
+            json!({"bin":["app"], "run_args":["--unit-graph", "--jobs=100"]})
+        } else {
+            json!({})
+        };
+        let input = native_specification(native_profile(command, selection));
+        let original = input.clone();
+        let selected =
+            SelectedCommand::parse(&input, "Cargo.toml", PreparationContext::CanonicalLocal)
+                .unwrap();
+        let arguments = selected.graph_arguments(&Value::Null, None).unwrap();
+        assert_eq!(
+            arguments[0],
+            if command == "run" { "build" } else { command }
+        );
+        assert_eq!(&arguments[arguments.len() - 2..], ["--jobs", "2"]);
+        assert!(!arguments.iter().any(|argument| argument == "--unit-graph"));
+        let mut process = Command::new("/captured/toolchain/bin/cargo");
+        selected.configure(
+            &mut process,
+            Path::new("/captured/toolchain/bin/rustc"),
+            Path::new("/private/planning"),
+        );
+        let mut expected = BTreeMap::from([
+            ("APP_INPUT".to_owned(), "literal\nvalue".to_owned()),
+            ("CARGO_INCREMENTAL".into(), "0".into()),
+            ("CARGO_TARGET_DIR".into(), "/private/planning/target".into()),
+            ("RUSTC".into(), "/captured/toolchain/bin/rustc".into()),
+        ]);
+        if command == "test" {
+            expected.insert("RUSTDOC".into(), "/captured/toolchain/bin/rustdoc".into());
+        }
+        let actual = process
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_str().unwrap().to_owned(),
+                    value.unwrap().to_str().unwrap().to_owned(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            input, original,
+            "planning must not rewrite retained execution intent"
+        );
+        super::super::super::SourcePreparation::parse(
+            Path::new("/not-opened-native-source"),
+            &input,
+            PreparationContext::CanonicalLocal,
+        )
+        .unwrap();
+        assert!(
+            super::super::super::SourcePreparation::parse(
+                Path::new("/not-opened-native-source"),
+                &input,
+                PreparationContext::RemoteRequest,
+            )
+            .is_err()
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn selected_native_commands_refuse_mutated_controls_and_unbounded_jobs() {
+    let input = native_specification(native_profile("check", json!({})));
+    for (name, value) in [
+        ("RUSTC", "/host/rustc"),
+        ("RUSTDOC", "/__rabs/toolchain/bin/rustdoc"),
+        ("CARGO_TARGET_DIR", "/outside/target"),
+        ("CARGO_INCREMENTAL", "1"),
+        ("CARGO", "/__rabs/toolchain/bin/cargo"),
+        ("RUSTC_WRAPPER", "/host/wrapper"),
+        ("CARGO_BUILD_JOBS", "3"),
+        ("GIT_CONFIG_COUNT", "1"),
+        ("HOME", "/host/home"),
+    ] {
+        let mut changed = input.clone();
+        changed["command_context"]["env"][name] = json!(value);
+        assert!(
+            SelectedCommand::parse(&changed, "Cargo.toml", PreparationContext::CanonicalLocal,)
+                .is_err(),
+            "{name}"
+        );
+    }
+    for name in ["RUSTC", "CARGO_TARGET_DIR", "CARGO_INCREMENTAL"] {
+        let mut changed = input.clone();
+        changed["command_context"]["env"]
+            .as_object_mut()
+            .unwrap()
+            .remove(name);
+        assert!(
+            SelectedCommand::parse(&changed, "Cargo.toml", PreparationContext::CanonicalLocal,)
+                .is_err(),
+            "missing {name}"
+        );
+    }
+    let mut missing_rustdoc = native_specification(native_profile("test", json!({"doc":true})));
+    missing_rustdoc["command_context"]["env"]
+        .as_object_mut()
+        .unwrap()
+        .remove("RUSTDOC");
+    assert!(
+        SelectedCommand::parse(
+            &missing_rustdoc,
+            "Cargo.toml",
+            PreparationContext::CanonicalLocal,
+        )
+        .is_err()
+    );
+    for value in ["0", "4097", "-1", "2.5", "02", "all"] {
+        let mut changed = input.clone();
+        *changed["args"].as_array_mut().unwrap().last_mut().unwrap() = json!(value);
+        assert!(
+            SelectedCommand::parse(&changed, "Cargo.toml", PreparationContext::CanonicalLocal,)
+                .is_err(),
+            "jobs {value}"
+        );
+    }
+    for extra in [
+        vec!["--jobs", "2"],
+        vec!["--target-dir", "/__rabs/out/cargo"],
+    ] {
+        let mut changed = input.clone();
+        changed["args"]
+            .as_array_mut()
+            .unwrap()
+            .extend(extra.into_iter().map(|arg| json!(arg)));
+        assert!(
+            SelectedCommand::parse(&changed, "Cargo.toml", PreparationContext::CanonicalLocal,)
+                .is_err()
+        );
+    }
+    let mut missing_jobs = input;
+    let arguments = missing_jobs["args"].as_array_mut().unwrap();
+    arguments.truncate(arguments.len() - 2);
+    assert!(
+        SelectedCommand::parse(
+            &missing_jobs,
+            "Cargo.toml",
+            PreparationContext::CanonicalLocal,
+        )
+        .is_err()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cargo_native_source_specification_prepares_and_replays_selected_commands() {
+    let fixture = tempfile::tempdir().unwrap();
+    let workspace = fixture.path().join("workspace");
+    let seed = fixture.path().join("seed");
+    let tools = fixture.path().join("tools");
+    for directory in [
+        workspace.join("app/src"),
+        workspace.join("other/src"),
+        workspace.join("host-helper/src"),
+        seed.join("home"),
+        seed.join("cargo-home"),
+        tools.clone(),
+    ] {
+        fs::create_dir_all(directory).unwrap();
+    }
+    let cargo = super::super::local_tool("cargo", &tools).unwrap();
+    let toolchain = cargo.parent().unwrap().parent().unwrap();
+    fs::write(workspace.join("Cargo.toml"),
+        "[workspace]\nmembers=['app','other','host-helper']\ndefault-members=['app']\nresolver='2'\n").unwrap();
+    fs::write(
+        workspace.join("app/Cargo.toml"),
+        "[package]\nname='selected-native'\nversion='0.1.0'\nedition='2021'\n\
+         [dependencies]\nrabs-selection-missing={version='=1.0.0',optional=true}\n\
+         [build-dependencies]\nhost-helper={path='../host-helper'}\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("app/src/lib.rs"),
+        "/// ```\n/// assert_eq!(selected_native::ready(), 42);\n/// ```\n\
+         pub fn ready() -> u32 { env!(\"HOST_ANSWER\").parse().unwrap() }\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("app/src/main.rs"),
+        "fn main() { println!(\"{}\", selected_native::ready()); }\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("app/build.rs"),
+        "fn main() { println!(\"cargo:rustc-env=HOST_ANSWER={}\", host_helper::answer()); }\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("host-helper/Cargo.toml"),
+        "[package]\nname='host-helper'\nversion='0.1.0'\nedition='2021'\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("host-helper/src/lib.rs"),
+        "pub fn answer() -> u32 { 42 }\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("other/Cargo.toml"),
+        "[package]\nname='unselected-native'\nversion='0.1.0'\nedition='2021'\n\
+         [dependencies]\nrabs-selection-missing='=1.0.0'\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("other/src/lib.rs"),
+        "pub fn answer() -> u32 { rabs_selection_missing::answer() }\n",
+    )
+    .unwrap();
+    let approved = seed.join("cargo-home");
+    seed_index(&approved, &archive());
+    cargo_output(
+        &cargo,
+        toolchain,
+        &workspace,
+        &seed,
+        &["generate-lockfile", "--offline"],
+    )
+    .unwrap();
+    assert!(!approved.join("registry/cache").exists());
+    let control = PreparationControl::uncontrolled();
+    for command in ["check", "build", "test"] {
+        let mut selection = json!({"packages":["selected-native"]});
+        let mut baseline = vec![
+            command,
+            "--locked",
+            "--offline",
+            "--package",
+            "selected-native",
+        ];
+        if command == "test" {
+            selection["doc"] = json!(true);
+            baseline.push("--doc");
+        }
+        cargo_output(&cargo, toolchain, &workspace, &seed, &baseline).unwrap();
+        let mut profile = native_profile(command, selection);
+        profile["source_root"] = json!(workspace);
+        profile["toolchain_root"] = json!(toolchain);
+        profile["cargo_home_source"] = json!(approved);
+        let specification = native_specification(profile.clone());
+        let original = specification.clone();
+        let inputs = super::super::super::SourcePreparation::parse(
+            &workspace,
+            &specification,
+            PreparationContext::CanonicalLocal,
+        )
+        .unwrap();
+        assert!(inputs.requires_selected_toolchain());
+        let upload = inputs
+            .capture_controlled(Some(toolchain), &control)
+            .unwrap();
+        assert_eq!(specification, original);
+        assert!(
+            upload
+                .manifest
+                .files()
+                .iter()
+                .all(|file| !file.path.ends_with(".crate"))
+        );
+        for member in [
+            "Cargo.lock",
+            "app/build.rs",
+            "host-helper/src/lib.rs",
+            "other/src/lib.rs",
+        ] {
+            assert_eq!(
+                upload.image.file_bytes("workspace", member).unwrap(),
+                fs::read(workspace.join(member)).unwrap()
+            );
+        }
+
+        // Exercise the exact native argv and mapped compiler controls with
+        // delivered bytes, an empty target and only the projected Cargo home.
+        // This proves native preparation/replay, not a compiler-cache hit.
+        let delivered = fixture.path().join(format!("delivered-native-{command}"));
+        upload.image.materialize_into(&delivered).unwrap();
+        let replay = fixture.path().join(format!("replay-native-{command}"));
+        fs::create_dir_all(replay.join("home")).unwrap();
+        let replay_workspace = delivered.join("workspace");
+        let mut process = super::super::planning_command(
+            &cargo,
+            &toolchain.join("bin/rustc"),
+            &replay_workspace,
+            "Cargo.toml",
+            &replay,
+            Some(toolchain),
+        )
+        .unwrap();
+        let selected = SelectedCommand::parse(
+            &specification,
+            "Cargo.toml",
+            PreparationContext::CanonicalLocal,
+        )
+        .unwrap();
+        selected.configure(&mut process, &toolchain.join("bin/rustc"), &replay);
+        process
+            .args(
+                specification["args"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|argument| {
+                        let argument = argument.as_str().unwrap();
+                        if argument == "/__rabs/workspace/Cargo.toml" {
+                            replay_workspace
+                                .join("Cargo.toml")
+                                .to_str()
+                                .unwrap()
+                                .to_owned()
+                        } else {
+                            argument.to_owned()
+                        }
+                    }),
+            )
+            .env("CARGO_HOME", replay_workspace.join("rabs-cargo-home"));
+        super::super::bounded_command(
+            process,
+            &replay,
+            std::time::Duration::from_secs(30),
+            OUTPUT_LIMIT,
+        )
+        .unwrap();
+        if command == "build" {
+            let stock = Command::new(seed.join("target/debug/selected-native"))
+                .output()
+                .unwrap();
+            let prepared = Command::new(replay.join("target/debug/selected-native"))
+                .output()
+                .unwrap();
+            assert!(stock.status.success() && prepared.status.success());
+            assert_eq!(prepared.stdout, b"42\n");
+            assert_eq!(prepared.stdout, stock.stdout);
+            assert_eq!(prepared.stderr, stock.stderr);
+        }
+        if command == "check" {
+            profile.as_object_mut().unwrap().remove("source_selection");
+            let complete = native_specification(profile.clone());
+            let inputs = super::super::super::SourcePreparation::parse(
+                &workspace,
+                &complete,
+                PreparationContext::CanonicalLocal,
+            )
+            .unwrap();
+            assert!(
+                inputs
+                    .capture_controlled(Some(toolchain), &control)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("checksum-matching locked registry archive")
+            );
+            profile["source_selection"] = json!(VERSION);
+            for selection in [
+                json!({"packages":["selected-native"],"all_features":true}),
+                json!({"packages":["unselected-native"]}),
+            ] {
+                profile["selection"] = selection;
+                let required = native_specification(profile.clone());
+                let inputs = super::super::super::SourcePreparation::parse(
+                    &workspace,
+                    &required,
+                    PreparationContext::CanonicalLocal,
+                )
+                .unwrap();
+                assert!(
+                    inputs
+                        .capture_controlled(Some(toolchain), &control)
+                        .is_err()
+                );
+            }
+        }
+    }
+    assert!(!approved.join("registry/cache").exists());
+}
+
 #[test]
 fn selected_command_binds_build_check_features_profiles_and_target_to_actual_argv() {
     for command in ["build", "check"] {
@@ -131,7 +528,9 @@ fn selected_command_binds_build_check_features_profiles_and_target_to_actual_arg
         );
         input["command_context"]["env"] =
             json!({"PROJECT_SETTING":"literal value","CARGO_INCREMENTAL":"0"});
-        let selected = SelectedCommand::parse(&input, "Cargo.toml").unwrap();
+        let selected =
+            SelectedCommand::parse(&input, "Cargo.toml", PreparationContext::RemoteRequest)
+                .unwrap();
         assert_eq!(
             selected.graph_arguments(&Value::Null, None).unwrap(),
             [
@@ -152,7 +551,11 @@ fn selected_command_binds_build_check_features_profiles_and_target_to_actual_arg
             ]
         );
         let mut process = Command::new("/unused");
-        selected.configure(&mut process);
+        selected.configure(
+            &mut process,
+            Path::new("/captured/toolchain/bin/rustc"),
+            Path::new("/private/planning"),
+        );
         let environment = process
             .get_envs()
             .map(|(name, value)| {
@@ -196,7 +599,9 @@ fn selected_harness_commands_preserve_selection_without_interpreting_runtime_arg
             ],
         );
         let original = input.clone();
-        let selected = SelectedCommand::parse(&input, "Cargo.toml").unwrap();
+        let selected =
+            SelectedCommand::parse(&input, "Cargo.toml", PreparationContext::RemoteRequest)
+                .unwrap();
         assert_eq!(
             selected.graph_arguments(&Value::Null, None).unwrap(),
             [
@@ -216,14 +621,23 @@ fn selected_harness_commands_preserve_selection_without_interpreting_runtime_arg
         );
         assert_eq!(input, original);
         assert!(selected.run_package().is_none());
-        let no_run =
-            SelectedCommand::parse(&request(command, &["--no-run"]), "Cargo.toml").unwrap();
+        let no_run = SelectedCommand::parse(
+            &request(command, &["--no-run"]),
+            "Cargo.toml",
+            PreparationContext::RemoteRequest,
+        )
+        .unwrap();
         assert_eq!(
             no_run.graph_arguments(&Value::Null, None).unwrap(),
             [command, "--no-run"]
         );
     }
-    let docs = SelectedCommand::parse(&request("test", &["--doc"]), "Cargo.toml").unwrap();
+    let docs = SelectedCommand::parse(
+        &request("test", &["--doc"]),
+        "Cargo.toml",
+        PreparationContext::RemoteRequest,
+    )
+    .unwrap();
     assert_eq!(
         docs.graph_arguments(&Value::Null, None).unwrap(),
         ["test", "--doc"]
@@ -248,7 +662,9 @@ fn selected_run_queries_one_build_target_and_leaves_the_execution_request_intact
             ],
         );
         let original = input.clone();
-        let selected = SelectedCommand::parse(&input, "Cargo.toml").unwrap();
+        let selected =
+            SelectedCommand::parse(&input, "Cargo.toml", PreparationContext::RemoteRequest)
+                .unwrap();
         assert_eq!(selected.command, CompilationCommand::Run);
         assert!(selected.run_package().is_none());
         assert_eq!(
@@ -264,8 +680,12 @@ fn selected_run_queries_one_build_target_and_leaves_the_execution_request_intact
         );
         assert_eq!(input, original);
     }
-    let selected =
-        SelectedCommand::parse(&request("run", &["--package=app@0.1.0"]), "Cargo.toml").unwrap();
+    let selected = SelectedCommand::parse(
+        &request("run", &["--package=app@0.1.0"]),
+        "Cargo.toml",
+        PreparationContext::RemoteRequest,
+    )
+    .unwrap();
     assert_eq!(selected.run_package(), Some("app@0.1.0"));
     assert!(selected.graph_arguments(&Value::Null, None).is_err());
 }
@@ -288,13 +708,20 @@ fn selected_execution_refuses_conflicting_modes_and_transport_controls_hidden_in
         ("run", vec!["--", "NUL\0value"]),
     ] {
         assert!(
-            SelectedCommand::parse(&request(command, &extra), "Cargo.toml").is_err(),
+            SelectedCommand::parse(
+                &request(command, &extra),
+                "Cargo.toml",
+                PreparationContext::RemoteRequest,
+            )
+            .is_err(),
             "{command} {extra:?}"
         );
     }
     let mut input = request("test", &[]);
     input["args"].as_array_mut().unwrap().insert(1, json!("--"));
-    assert!(SelectedCommand::parse(&input, "Cargo.toml").is_err());
+    assert!(
+        SelectedCommand::parse(&input, "Cargo.toml", PreparationContext::RemoteRequest).is_err()
+    );
 }
 
 #[test]
@@ -321,19 +748,35 @@ fn selected_command_refuses_independent_resolution_and_execution_controls() {
         vec!["--unknown-selection"],
     ] {
         assert!(
-            SelectedCommand::parse(&request("check", &extra), "Cargo.toml").is_err(),
+            SelectedCommand::parse(
+                &request("check", &extra),
+                "Cargo.toml",
+                PreparationContext::RemoteRequest,
+            )
+            .is_err(),
             "{extra:?}"
         );
     }
     for command in ["clippy", "metadata", "install", "publish", "clean"] {
-        assert!(SelectedCommand::parse(&request(command, &[]), "Cargo.toml").is_err());
+        assert!(
+            SelectedCommand::parse(
+                &request(command, &[]),
+                "Cargo.toml",
+                PreparationContext::RemoteRequest,
+            )
+            .is_err()
+        );
     }
     let mut missing = request("check", &[]);
     missing["args"] = json!(["check"]);
-    assert!(SelectedCommand::parse(&missing, "Cargo.toml").is_err());
+    assert!(
+        SelectedCommand::parse(&missing, "Cargo.toml", PreparationContext::RemoteRequest).is_err()
+    );
     let mut changed = request("check", &[]);
     changed["program"] = json!("/host/cargo");
-    assert!(SelectedCommand::parse(&changed, "Cargo.toml").is_err());
+    assert!(
+        SelectedCommand::parse(&changed, "Cargo.toml", PreparationContext::RemoteRequest).is_err()
+    );
 }
 
 #[test]
@@ -347,7 +790,10 @@ fn selected_context_refuses_cwd_version_ambient_control_and_missing_environment(
     ] {
         let mut input = request("check", &[]);
         input["command_context"] = context;
-        assert!(SelectedCommand::parse(&input, "Cargo.toml").is_err());
+        assert!(
+            SelectedCommand::parse(&input, "Cargo.toml", PreparationContext::RemoteRequest)
+                .is_err()
+        );
     }
     for name in [
         "CARGO_BUILD_TARGET",
@@ -367,35 +813,53 @@ fn selected_context_refuses_cwd_version_ambient_control_and_missing_environment(
         let mut input = request("check", &[]);
         input["command_context"]["env"] = json!({name:"untrusted"});
         assert!(
-            SelectedCommand::parse(&input, "Cargo.toml").is_err(),
+            SelectedCommand::parse(&input, "Cargo.toml", PreparationContext::RemoteRequest)
+                .is_err(),
             "{name}"
         );
     }
     let mut invalid = request("check", &[]);
     invalid["command_context"]["env"] = json!({"CARGO_INCREMENTAL":"2"});
-    assert!(SelectedCommand::parse(&invalid, "Cargo.toml").is_err());
+    assert!(
+        SelectedCommand::parse(&invalid, "Cargo.toml", PreparationContext::RemoteRequest).is_err()
+    );
     invalid["command_context"]["env"] = json!({"PROJECT_SETTING":"bad\0value"});
-    assert!(SelectedCommand::parse(&invalid, "Cargo.toml").is_err());
+    assert!(
+        SelectedCommand::parse(&invalid, "Cargo.toml", PreparationContext::RemoteRequest).is_err()
+    );
 }
 
 #[test]
 fn selection_is_explicit_and_invalid_request_refuses_before_cache_access() {
     let legacy = json!({"manifest":"Cargo.toml"});
     CargoSource::parse(&legacy).unwrap();
-    CargoSource::parse_request(&legacy, &json!({})).unwrap();
+    CargoSource::parse_request(&legacy, &json!({}), PreparationContext::RemoteRequest).unwrap();
     for version in [Value::Null, json!("future"), json!(true), json!({})] {
         let source = json!({"manifest":"Cargo.toml","selection":version,"cargo_home_source":"/missing-selected-cache"});
-        let error = CargoSource::parse_request(&source, &request("check", &[])).unwrap_err();
+        let error = CargoSource::parse_request(
+            &source,
+            &request("check", &[]),
+            PreparationContext::RemoteRequest,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("selection version"));
     }
     let selected = json!({"manifest":"Cargo.toml","selection":VERSION,"cargo_home_source":"/missing-selected-cache"});
     assert!(CargoSource::parse(&selected).is_err());
     let mut input = request("check", &[]);
     input["command_context"]["cwd"] = json!("/__rabs/workspace/other");
-    let error = CargoSource::parse_request(&selected, &input).unwrap_err();
+    let error = CargoSource::parse_request(&selected, &input, PreparationContext::RemoteRequest)
+        .unwrap_err();
     assert!(error.to_string().contains("manifest-parent context"));
     let selected_vendor = json!({"manifest":"Cargo.toml","selection":VERSION,"vendor":"vendor"});
-    assert!(CargoSource::parse_request(&selected_vendor, &request("check", &[])).is_err());
+    assert!(
+        CargoSource::parse_request(
+            &selected_vendor,
+            &request("check", &[]),
+            PreparationContext::RemoteRequest,
+        )
+        .is_err()
+    );
     CargoSource::parse(&json!({"manifest":"Cargo.toml","vendor":"vendor"})).unwrap();
 }
 
@@ -598,7 +1062,7 @@ fn selected_registry_capture_defers_only_absent_archives_and_checks_selected_own
     fs::write(expanded.join("Cargo.toml"), DEPENDENCY_MANIFEST).unwrap();
     fs::write(expanded.join("src/lib.rs"), DEPENDENCY_LIB).unwrap();
     let target = expanded.join("src/lib.rs");
-    selected
+    let package = selected
         .selected_package(
             &private,
             &id,
@@ -606,6 +1070,62 @@ fn selected_registry_capture_defers_only_absent_archives_and_checks_selected_own
             &PreparationControl::uncontrolled(),
         )
         .unwrap();
+    let delivered = selected
+        .selected_archive_paths(
+            &private,
+            std::slice::from_ref(&package),
+            &PreparationControl::uncontrolled(),
+        )
+        .unwrap();
+    assert_eq!(
+        delivered,
+        BTreeSet::from([format!(
+            "registry/cache/{NAMESPACE}/{DEPENDENCY}-1.0.0.crate",
+        )])
+    );
+    for (field, value) in [
+        ("source", Value::Null),
+        ("source", json!("sparse+https://other.invalid/index/")),
+        ("name", json!("other")),
+        ("version", json!("2.0.0")),
+        (
+            "manifest_path",
+            json!(
+                private
+                    .join("registry/src/other-0123456789abcdef")
+                    .join(format!("{DEPENDENCY}-1.0.0/Cargo.toml"))
+            ),
+        ),
+    ] {
+        let mut substituted = package.clone();
+        substituted[field] = value;
+        assert!(
+            selected
+                .selected_archive_paths(
+                    &private,
+                    &[substituted],
+                    &PreparationControl::uncontrolled(),
+                )
+                .is_err(),
+            "{field} cannot redirect archive selection"
+        );
+    }
+    let unknown = scratch.path().join("unknown-selected-archive");
+    assert!(
+        selected
+            .materialize_controlled(
+                &unknown,
+                Some(&BTreeSet::from([
+                    "registry/cache/unknown/missing-1.0.0.crate".into()
+                ])),
+                &PreparationControl::uncontrolled(),
+            )
+            .is_err()
+    );
+    assert!(
+        !unknown.exists(),
+        "invalid selection must refuse before writing"
+    );
     for bad_id in [
         "registry+https://github.com/rust-lang/crates.io-index#other@1.0.0".to_owned(),
         format!("registry+https://github.com/rust-lang/crates.io-index#{DEPENDENCY}@2.0.0"),
@@ -711,6 +1231,7 @@ fn selected_graph_checks_host_sources_and_reached_manifests_inside_the_complete_
         command: CompilationCommand::Check,
         selection: CompilationSelection::default(),
         environment: Vec::new(),
+        jobs: None,
     };
     let app = unit(root, "app", "app", &[1]);
     let mut helper = unit(root, "helper", "helper", &[]);
@@ -1036,7 +1557,12 @@ fn installed_cargo_prepares_with_absent_unselected_archives_and_keeps_host_build
         for target in [None, Some("x86_64-unknown-linux-gnu")] {
             let extra = target.map_or_else(Vec::new, |target| vec!["--target", target]);
             let input = request("check", &extra);
-            let selected = CargoSource::parse_request(&source(&approved, true), &input).unwrap();
+            let selected = CargoSource::parse_request(
+                &source(&approved, true),
+                &input,
+                PreparationContext::RemoteRequest,
+            )
+            .unwrap();
             let (retained, files) = selected
                 .prepare(Arc::clone(&image), Some(toolchain))
                 .unwrap();
@@ -1101,7 +1627,12 @@ fn installed_cargo_prepares_with_absent_unselected_archives_and_keeps_host_build
             );
         }
         let input = request("check", &["--all-features"]);
-        let selected = CargoSource::parse_request(&source(&approved, true), &input).unwrap();
+        let selected = CargoSource::parse_request(
+            &source(&approved, true),
+            &input,
+            PreparationContext::RemoteRequest,
+        )
+        .unwrap();
         if conditional == "optional" {
             assert!(
                 selected
@@ -1123,8 +1654,12 @@ fn installed_cargo_prepares_with_absent_unselected_archives_and_keeps_host_build
             .unwrap();
             for command in ["check", "build"] {
                 let input = request(command, &["--all-features"]);
-                let selected =
-                    CargoSource::parse_request(&source(&approved, true), &input).unwrap();
+                let selected = CargoSource::parse_request(
+                    &source(&approved, true),
+                    &input,
+                    PreparationContext::RemoteRequest,
+                )
+                .unwrap();
                 let (_, files) = selected
                     .prepare(Arc::clone(&image), Some(toolchain))
                     .unwrap();
@@ -1140,6 +1675,229 @@ fn installed_cargo_prepares_with_absent_unselected_archives_and_keeps_host_build
                 .unwrap();
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cargo_replays_only_selected_registry_archives_from_a_fresh_home() {
+    let fixture = tempfile::tempdir().unwrap();
+    let tools = fixture.path().join("tools");
+    fs::create_dir(&tools).unwrap();
+    let cargo = super::super::local_tool("cargo", &tools).unwrap();
+    let toolchain = cargo.parent().unwrap().parent().unwrap();
+    let workspace = fixture.path().join("workspace");
+    let seed = fixture.path().join("seed");
+    let approved = seed.join("cargo-home");
+    let index = approved.join("registry/index").join(NAMESPACE);
+    let cache = approved.join("registry/cache").join(NAMESPACE);
+    for directory in [
+        workspace.join("src"),
+        seed.join("home"),
+        index.join(".cache/ra/bs"),
+        cache.clone(),
+    ] {
+        fs::create_dir_all(directory).unwrap();
+    }
+    fs::write(
+        index.join("config.json"),
+        br#"{"dl":"https://static.crates.io/crates","api":"https://crates.io"}"#,
+    )
+    .unwrap();
+    let mut archives = BTreeMap::new();
+    for (name, answer) in [
+        ("rabs-selection-runtime", 35),
+        ("rabs-selection-host", 7),
+        ("rabs-selection-extra", 1),
+        ("rabs-selection-windows", 99),
+    ] {
+        let manifest = format!("[package]\nname='{name}'\nversion='1.0.0'\nedition='2021'\n");
+        let code = format!("pub fn answer() -> u32 {{ {answer} }}\n");
+        let mut archive = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::fast()));
+        for (path, bytes) in [
+            ("Cargo.toml", manifest.as_bytes()),
+            ("src/lib.rs", code.as_bytes()),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o644);
+            header.set_size(bytes.len() as u64);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, format!("{name}-1.0.0/{path}"), bytes)
+                .unwrap();
+        }
+        let archive = archive.into_inner().unwrap().finish().unwrap();
+        let checksum = rabs_protocol::raw_bytes::encode_hex(Sha256::digest(&archive).as_ref());
+        let record = json!({
+            "name":name,"vers":"1.0.0","deps":[],"cksum":checksum,
+            "features":{},"yanked":false,
+        });
+        let mut bytes = vec![3, 2, 0, 0, 0];
+        bytes.extend_from_slice(b"etag: \"rabs-selected-archive-fixture\"\0");
+        bytes.extend_from_slice(b"1.0.0\0");
+        bytes.extend_from_slice(&serde_json::to_vec(&record).unwrap());
+        bytes.push(0);
+        fs::write(index.join(".cache/ra/bs").join(name), bytes).unwrap();
+        fs::write(cache.join(format!("{name}-1.0.0.crate")), &archive).unwrap();
+        archives.insert(name, archive);
+    }
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[package]\nname='selected-archives'\nversion='0.1.0'\nedition='2021'\n\
+         [dependencies]\nrabs-selection-runtime='=1.0.0'\n\
+         rabs-selection-extra={version='=1.0.0',optional=true}\n\
+         [features]\nextra=['dep:rabs-selection-extra']\n\
+         [build-dependencies]\nrabs-selection-host='=1.0.0'\n\
+         [target.'cfg(windows)'.dependencies]\nrabs-selection-windows='=1.0.0'\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("build.rs"),
+        "fn main() { assert_eq!(rabs_selection_host::answer(), 7); println!(\"cargo:rustc-env=HOST_ANSWER=7\"); }\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("src/main.rs"),
+        "#[cfg(feature=\"extra\")] fn extra() -> u32 { rabs_selection_extra::answer() }\n\
+         #[cfg(not(feature=\"extra\"))] fn extra() -> u32 { 0 }\n\
+         fn main() { println!(\"{}\", rabs_selection_runtime::answer() + env!(\"HOST_ANSWER\").parse::<u32>().unwrap() + extra()); }\n",
+    )
+    .unwrap();
+    cargo_output(
+        &cargo,
+        toolchain,
+        &workspace,
+        &seed,
+        &["generate-lockfile", "--offline"],
+    )
+    .unwrap();
+    let image = capture(&workspace);
+    let mut default_digest = None;
+    for (mode, extra, expected) in [
+        ("default", Vec::new(), b"42\n".as_slice()),
+        ("feature", vec!["--features=extra"], b"43\n".as_slice()),
+    ] {
+        let mut args = vec!["build", "--locked", "--offline"];
+        args.extend(extra.iter().copied());
+        cargo_output(&cargo, toolchain, &workspace, &seed, &args).unwrap();
+        let stock = Command::new(seed.join("target/debug/selected-archives"))
+            .output()
+            .unwrap();
+        assert!(stock.status.success());
+        assert_eq!(stock.stdout, expected);
+        let selected = CargoSource::parse_request(
+            &source(&approved, true),
+            &request("build", &extra),
+            super::super::super::PreparationContext::RemoteRequest,
+        )
+        .unwrap();
+        let (retained, files) = selected
+            .prepare(Arc::clone(&image), Some(toolchain))
+            .unwrap();
+        let prefix = format!("rabs-cargo-home/registry/cache/{NAMESPACE}");
+        let delivered_archives = files
+            .iter()
+            .filter(|path| path.starts_with(&prefix))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let mut expected_archives = BTreeSet::from([
+            format!("{prefix}/rabs-selection-runtime-1.0.0.crate"),
+            format!("{prefix}/rabs-selection-host-1.0.0.crate"),
+        ]);
+        if mode == "feature" {
+            expected_archives.insert(format!("{prefix}/rabs-selection-extra-1.0.0.crate"));
+        } else {
+            default_digest = Some(retained.closure_digest());
+        }
+        assert_eq!(delivered_archives, expected_archives);
+        for (name, bytes) in &archives {
+            let archive = format!("{prefix}/{name}-1.0.0.crate");
+            assert_eq!(
+                retained.file_bytes("workspace", &archive),
+                expected_archives
+                    .contains(&archive)
+                    .then_some(bytes.as_slice()),
+            );
+            assert!(
+                retained
+                    .file_bytes(
+                        "workspace",
+                        &format!("rabs-cargo-home/registry/index/{NAMESPACE}/.cache/ra/bs/{name}",)
+                    )
+                    .is_some(),
+                "the full locked sparse index must remain available"
+            );
+        }
+        for path in ["Cargo.toml", "Cargo.lock", "src/main.rs", "build.rs"] {
+            assert_eq!(
+                retained.file_bytes("workspace", path),
+                image.file_bytes("workspace", path)
+            );
+        }
+        assert!(files.iter().all(|path| !path.contains("registry/src/")));
+
+        // Replay the exact delivered bytes into an empty Cargo home and a new
+        // target directory. The original home and its expanded sources cannot
+        // supply a missing archive. Build.rs genuinely compiles its host input,
+        // and the delivered native executable must agree with stock Cargo.
+        let delivered = fixture.path().join(format!("delivered-{mode}"));
+        retained.materialize_into(&delivered).unwrap();
+        let replay = fixture.path().join(format!("replay-{mode}"));
+        fs::create_dir_all(replay.join("home")).unwrap();
+        let replay_workspace = delivered.join("workspace");
+        let mut command = super::super::planning_command(
+            &cargo,
+            &toolchain.join("bin/rustc"),
+            &replay_workspace,
+            "Cargo.toml",
+            &replay,
+            Some(toolchain),
+        )
+        .unwrap();
+        command
+            .args(&args)
+            .arg("--manifest-path")
+            .arg(replay_workspace.join("Cargo.toml"))
+            .env("CARGO_HOME", replay_workspace.join("rabs-cargo-home"));
+        super::super::bounded_command(
+            command,
+            &replay,
+            std::time::Duration::from_secs(30),
+            OUTPUT_LIMIT,
+        )
+        .unwrap();
+        let built = Command::new(replay.join("target/debug/selected-archives"))
+            .output()
+            .unwrap();
+        assert!(built.status.success());
+        assert_eq!(built.stdout, stock.stdout);
+        assert_eq!(built.stderr, stock.stderr);
+    }
+
+    // An unused available archive must not perturb delivered source identity.
+    // Keep its bytes, but make it unavailable to the next capture; the same
+    // default request still produces exactly the same complete input closure.
+    fs::rename(
+        cache.join("rabs-selection-extra-1.0.0.crate"),
+        fixture.path().join("retained-unused.crate"),
+    )
+    .unwrap();
+    let selected = CargoSource::parse_request(
+        &source(&approved, true),
+        &request("build", &[]),
+        super::super::super::PreparationContext::RemoteRequest,
+    )
+    .unwrap();
+    let (retained, _) = selected
+        .prepare(Arc::clone(&image), Some(toolchain))
+        .unwrap();
+    assert_eq!(Some(retained.closure_digest()), default_digest);
+    let selected = CargoSource::parse_request(
+        &source(&approved, true),
+        &request("build", &["--features=extra"]),
+        super::super::super::PreparationContext::RemoteRequest,
+    )
+    .unwrap();
+    assert!(selected.prepare(image, Some(toolchain)).is_err());
 }
 
 #[cfg(target_os = "linux")]
@@ -1322,7 +2080,12 @@ fn installed_cargo_prepares_execution_commands_without_running_project_code() {
         ),
     ] {
         let input = request(command, &extra);
-        let selected = CargoSource::parse_request(&source(&approved, true), &input).unwrap();
+        let selected = CargoSource::parse_request(
+            &source(&approved, true),
+            &input,
+            PreparationContext::RemoteRequest,
+        )
+        .unwrap();
         let (retained, files) = selected
             .prepare(Arc::clone(&image), Some(toolchain))
             .unwrap_or_else(|error| panic!("{command} {extra:?}: {error}"));
@@ -1347,7 +2110,9 @@ fn installed_cargo_prepares_execution_commands_without_running_project_code() {
                 image.file_bytes("workspace", path)
             );
         }
-        let selection = SelectedCommand::parse(&input, "Cargo.toml").unwrap();
+        let selection =
+            SelectedCommand::parse(&input, "Cargo.toml", PreparationContext::RemoteRequest)
+                .unwrap();
         let package_id = selection.run_package().map(|package| {
             String::from_utf8(
                 cargo_output(
@@ -1432,8 +2197,12 @@ fn installed_cargo_prepares_execution_commands_without_running_project_code() {
         ),
     ];
     for (command, extra) in &selected_missing {
-        let selected =
-            CargoSource::parse_request(&source(&approved, true), &request(command, extra)).unwrap();
+        let selected = CargoSource::parse_request(
+            &source(&approved, true),
+            &request(command, extra),
+            PreparationContext::RemoteRequest,
+        )
+        .unwrap();
         assert!(
             selected
                 .prepare(Arc::clone(&image), Some(toolchain))
@@ -1445,8 +2214,12 @@ fn installed_cargo_prepares_execution_commands_without_running_project_code() {
     fs::create_dir_all(&cache).unwrap();
     fs::write(cache.join(format!("{DEPENDENCY}-1.0.0.crate")), archive).unwrap();
     for (command, extra) in &selected_missing {
-        let selected =
-            CargoSource::parse_request(&source(&approved, true), &request(command, extra)).unwrap();
+        let selected = CargoSource::parse_request(
+            &source(&approved, true),
+            &request(command, extra),
+            PreparationContext::RemoteRequest,
+        )
+        .unwrap();
         let (_, files) = selected
             .prepare(Arc::clone(&image), Some(toolchain))
             .unwrap();
@@ -1459,6 +2232,7 @@ fn installed_cargo_prepares_execution_commands_without_running_project_code() {
     let ambiguous = CargoSource::parse_request(
         &source(&approved, true),
         &request("run", &["--package", "unselected"]),
+        PreparationContext::RemoteRequest,
     )
     .unwrap();
     assert!(
@@ -1573,8 +2347,12 @@ fn installed_cargo_selected_graph_retains_full_git_owners_and_checkouts() {
         )
         .unwrap();
         let image = capture(&workspace);
-        let selected =
-            CargoSource::parse_request(&source(&approved, true), &request("check", &[])).unwrap();
+        let selected = CargoSource::parse_request(
+            &source(&approved, true),
+            &request("check", &[]),
+            PreparationContext::RemoteRequest,
+        )
+        .unwrap();
         let result = selected.prepare(Arc::clone(&image), Some(toolchain));
         if refused {
             assert!(
@@ -1595,9 +2373,12 @@ fn installed_cargo_selected_graph_retains_full_git_owners_and_checkouts() {
                     .iter()
                     .all(|path| !path.contains("git/checkouts/") && !path.ends_with(".crate"))
             );
-            let selected =
-                CargoSource::parse_request(&source(&approved, true), &request("build", &[]))
-                    .unwrap();
+            let selected = CargoSource::parse_request(
+                &source(&approved, true),
+                &request("build", &[]),
+                PreparationContext::RemoteRequest,
+            )
+            .unwrap();
             selected
                 .prepare(Arc::clone(&image), Some(toolchain))
                 .unwrap();
@@ -1649,6 +2430,7 @@ fn selected_local_versions_bind_declared_inherited_and_default_manifest_identity
             command: CompilationCommand::Check,
             selection: CompilationSelection::default(),
             environment: Vec::new(),
+            jobs: None,
         };
         let app = unit(&root, "app", "app", &[1, 2]);
         let mut old = unit(&root, "helper", "helper-old", &[]);

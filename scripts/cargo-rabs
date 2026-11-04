@@ -1995,12 +1995,13 @@ def canonical_local_profile(path, env=None, toolchain=None):
     """Validate retained intent before writing; the native driver checks it again."""
     profile = canonical_profile_object(path)
     required = {"version", "source_root", "state_root", "operation_root", "wrapper"}
-    optional = {"manifest", "vendor", "cargo_home_source", "jobs", "timeout_seconds", "command", "selection", "target_cache", "service_socket", "env", "toolchain_root", "toolchain"}
+    optional = {"manifest", "vendor", "cargo_home_source", "source_selection", "jobs", "timeout_seconds", "command", "selection", "target_cache", "service_socket", "env", "toolchain_root", "toolchain"}
     if (not required <= profile.keys() or profile.keys() - required - optional
             or profile["version"] != "canonical-compile-local-v1"):
         raise SetupError("invalid canonical-compile-local-v1 profile fields")
     if profile.get("command", "check") not in ("check", "build", "test", "clippy", "run", "bench"):
         raise SetupError("local canonical command must be check, build, clippy, test, run or bench")
+    canonical_local_source_selection(profile)
     canonical_local_environment(profile)
     for name, maximum in (("jobs", 4096), ("timeout_seconds", 7200)):
         if name in profile and (type(profile[name]) is not int or not 1 <= profile[name] <= maximum):
@@ -2103,6 +2104,18 @@ def canonical_local_profile(path, env=None, toolchain=None):
     return profile
 
 
+def canonical_local_source_selection(profile):
+    """Keep the native adapter's input mode explicit and command-bound."""
+    if "source_selection" not in profile:
+        return
+    if profile["source_selection"] != "cargo-unit-graph-v1":
+        raise SetupError("local canonical source_selection must be cargo-unit-graph-v1")
+    if profile.get("vendor") is not None:
+        raise SetupError("local canonical source_selection cannot be combined with vendor")
+    if profile.get("command", "check") == "clippy":
+        raise SetupError("local canonical source_selection does not support Clippy")
+
+
 def canonical_local_environment(profile):
     """Match the native driver's complete explicit environment and count budget."""
     controls = {
@@ -2143,6 +2156,7 @@ def canonical_local_invocation(profile_path, args, env):
     # empty selection is written, preserving Cargo's ordinary default targets.
     profile["command"] = args[0] if args else "check"
     profile["selection"] = selection
+    canonical_local_source_selection(profile)
     canonical_local_environment(profile)
     canonical_local_service_command(profile)
     if profile["command"] == "clippy":

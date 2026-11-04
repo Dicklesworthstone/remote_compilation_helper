@@ -1118,10 +1118,11 @@ toolchain does not fall back to a guessed package graph.
 The default source preparation still captures the complete approved anchor and
 uses locked all-features metadata to validate its dependency closure. Selecting
 fewer compilation units does not reduce the authorized upload/capture scope or make
-missing locked dependencies available offline. The `canonical-cargo-v1`
-launcher's explicit `source_selection` option described above changes the
-preparation graph for `build` and `check`; it does not narrow the approved source
-anchor or grant compiler-result authority.
+missing locked dependencies available offline. The explicit `source_selection`
+option described above is also available on `canonical-compile-local-v1`
+profiles for `build`, `check`, `test`, `run` and `bench`. It changes the preparation
+graph without narrowing the approved source anchor or granting compiler-result
+authority.
 Workspace members and primary packages use the separately qualified workspace
 worker profiles described below; unsupported requests compile normally inside
 the namespace. Their results never enter the external-dependency cache class.
@@ -1317,6 +1318,36 @@ Its scoped endpoint accepts rustc requests only and refuses status, generic
 serving, prepared-job and administrative messages. Logical compiler paths are
 translated to backing files only through the coordinator's retained mount
 capability; a wrapper-supplied path or environment flag cannot construct one.
+
+### Select native source preparation
+
+For a native profile using an approved Cargo cache, replace `vendor` with these
+fields to prepare dependencies for the command you actually select:
+
+```json
+"cargo_home_source": "/home/builder/.cargo",
+"source_selection": "cargo-unit-graph-v1"
+```
+
+A purely local graph needs only `source_selection`. Both the native entry point
+and `cargo rabs --rabs-canonical-local` support this mode for `check`, `build`,
+`test`, `run` and `bench`. The captured Cargo plans the actual package, feature,
+target and profile selection, including host build dependencies and procedural
+macros. The driver's fixed compiler paths, output directory and job count remain
+bound to that execution. The [selected preparation constraints](#prepare-the-selected-cargo-dependency-graph)
+apply; `vendor` and `clippy` currently cannot use this opt-in mode.
+
+Final delivery includes only registry archives belonging to the validated
+selected units. The complete locked sparse-index records, registry configuration,
+lockfile and approved source anchor remain retained, and Git capture keeps its
+complete locked-revision contract. An inactive optional dependency, or an external
+dependency used only by an unselected workspace member, can lack its archive.
+Selecting that package requires its verified archive and fails if it is missing.
+
+Available locked archives are still captured and verified before Cargo selects
+the graph. Pruning reduces the final delivery and retained cache inputs; it does
+not reduce the initial capture work or its resource limits. This input-preparation
+option leaves compiler-cache admission and publication rules unchanged.
 
 ### Send canonical dependency compilations to workers
 

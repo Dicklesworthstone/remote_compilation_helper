@@ -1067,7 +1067,7 @@ impl RegistryCache {
             }
             captured.git = Some(git);
         }
-        captured.materialize_controlled(cargo_home, control)?;
+        captured.materialize_controlled(cargo_home, None, control)?;
         Ok(captured)
     }
 
@@ -1096,13 +1096,36 @@ impl RegistryCache {
     pub(super) fn materialize_controlled(
         &self,
         destination: &Path,
+        selected_archives: Option<&BTreeSet<String>>,
         control: &PreparationControl<'_>,
     ) -> io::Result<Vec<String>> {
+        if let Some(selected) = selected_archives {
+            for path in selected {
+                control.checkpoint()?;
+                require(
+                    path.starts_with("registry/cache/")
+                        && path.ends_with(".crate")
+                        && self.files.contains_key(path),
+                    "selected Cargo archive is absent from the retained cache",
+                )?;
+            }
+        }
         // Both destinations are inside a private operation-owned directory.
         // create_new prevents overwriting any workspace or Cargo-created file.
         fs::create_dir_all(destination)?;
+        let mut installed = Vec::new();
         for (path, bytes) in &self.files {
             control.checkpoint()?;
+            // The planner needs every available locked archive before Cargo
+            // selects its units. The final input delivery needs only the
+            // archives owning those verified units. Keep the complete sparse
+            // index and Git object stores: Cargo still resolves the full lock
+            // even when an optional or foreign-target crate is not compiled.
+            if path.starts_with("registry/cache/")
+                && selected_archives.is_some_and(|selected| !selected.contains(path))
+            {
+                continue;
+            }
             let output = destination.join(path);
             fs::create_dir_all(
                 output
@@ -1114,8 +1137,9 @@ impl RegistryCache {
                 .create_new(true)
                 .open(output)?;
             control.write_all(&mut file, bytes)?;
+            installed.push(path.clone());
         }
-        Ok(self.files.keys().cloned().collect())
+        Ok(installed)
     }
 
     pub(super) fn check_lock(&self, lock: &Path) -> io::Result<()> {
@@ -1194,6 +1218,54 @@ impl RegistryCache {
         });
         self.check_package(home, &package, control)?;
         Ok(package)
+    }
+
+    /// Recover final delivery paths only from packages whose source identity,
+    /// namespace and extracted inputs match this exact retained cache. Names
+    /// and versions alone cannot select among different registry owners.
+    pub(super) fn selected_archive_paths(
+        &self,
+        home: &Path,
+        packages: &[Value],
+        control: &PreparationControl<'_>,
+    ) -> io::Result<BTreeSet<String>> {
+        let mut archives = BTreeSet::new();
+        for package in packages {
+            control.checkpoint()?;
+            let source = package["source"]
+                .as_str()
+                .ok_or_else(|| invalid("selected archive requires an external package source"))?;
+            self.check_package(home, package, control)?;
+            if source.starts_with("git+") {
+                continue;
+            }
+            let manifest = Path::new(
+                package["manifest_path"]
+                    .as_str()
+                    .ok_or_else(|| invalid("selected registry manifest missing"))?,
+            );
+            let relative = manifest
+                .strip_prefix(home.join("registry/src"))
+                .map_err(|_| invalid("selected registry manifest escapes its private home"))?;
+            let mut components = relative.components();
+            let namespace = components
+                .next()
+                .and_then(|part| part.as_os_str().to_str())
+                .ok_or_else(|| invalid("selected registry namespace missing"))?;
+            let directory = components
+                .next()
+                .and_then(|part| part.as_os_str().to_str())
+                .ok_or_else(|| invalid("selected registry package directory missing"))?;
+            // check_package already proved this exact extraction namespace and
+            // package directory against the captured lock/checksum owner.
+            let archive = format!("registry/cache/{namespace}/{directory}.crate");
+            require(
+                self.files.contains_key(&archive),
+                "selected registry archive disappeared from its retained cache",
+            )?;
+            archives.insert(archive);
+        }
+        Ok(archives)
     }
 
     pub(super) fn check_package(

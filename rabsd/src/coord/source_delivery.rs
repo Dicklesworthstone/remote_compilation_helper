@@ -41,6 +41,15 @@ use std::sync::Arc;
 
 use control::PreparationControl;
 
+/// The native driver owns fixed compiler controls that public preparation
+/// requests cannot supply. This context is selected by the Rust entry point,
+/// never decoded from a profile or execution request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PreparationContext {
+    RemoteRequest,
+    CanonicalLocal,
+}
+
 enum PreparationToolchain {
     Captured(Arc<PreparedToolchain>),
     Retained(Arc<RetainedToolchain>),
@@ -137,7 +146,7 @@ pub fn prepare_source_bundle(
         specification,
         destination,
         false,
-        false,
+        PreparationContext::RemoteRequest,
         None,
         &PreparationControl::uncontrolled(),
     )
@@ -160,7 +169,7 @@ pub(crate) fn prepare_local_bundle_controlled(
         specification,
         destination,
         false,
-        true,
+        PreparationContext::CanonicalLocal,
         toolchain,
         control,
     )
@@ -193,7 +202,7 @@ pub fn prepare_source_template(
         &probe,
         destination,
         true,
-        false,
+        PreparationContext::RemoteRequest,
         None,
         &PreparationControl::uncontrolled(),
     )
@@ -205,17 +214,17 @@ fn prepare_source_bundle_inner(
     specification: &Value,
     destination: &Path,
     allocation_intent: bool,
-    selected_planning_toolchain: bool,
+    context: PreparationContext,
     retained_toolchain: Option<Arc<RetainedToolchain>>,
     control: &PreparationControl<'_>,
 ) -> io::Result<PreparedLocalBundle> {
     control.checkpoint()?;
-    let inputs = preparation::SourcePreparation::parse(source_root, specification)?;
+    let inputs = preparation::SourcePreparation::parse(source_root, specification, context)?;
     // Selected graph preparation must query the same captured Cargo/rustc that
     // execution will receive, including public allocated-template preparation.
     // The already parsed mode decides this; legacy preparation keeps its order.
     let selected_planning_toolchain =
-        selected_planning_toolchain || inputs.requires_selected_toolchain();
+        context == PreparationContext::CanonicalLocal || inputs.requires_selected_toolchain();
     require(
         destination.is_absolute()
             && destination.file_name().is_some()

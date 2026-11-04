@@ -11,7 +11,10 @@
 mod cargo;
 
 use super::control::PreparationControl;
-use super::{MAX_SOURCE_ROOTS, SourceUpload, invalid, manifest_value, require, valid_closure_root};
+use super::{
+    MAX_SOURCE_ROOTS, PreparationContext, SourceUpload, invalid, manifest_value, require,
+    valid_closure_root,
+};
 use rabs_sandbox::snapshot_capture::{
     CaptureError, MemberDisposition, capture_sealed_source_cancellable, member_disposition,
 };
@@ -70,7 +73,11 @@ fn local_root(base: &Path, value: &Value) -> io::Result<PathBuf> {
 }
 
 impl SourcePreparation {
-    pub(super) fn parse(base: &Path, specification: &Value) -> io::Result<Self> {
+    pub(super) fn parse(
+        base: &Path,
+        specification: &Value,
+        context: PreparationContext,
+    ) -> io::Result<Self> {
         require(base.is_absolute(), "source root must be absolute")?;
         require(
             specification.is_object(),
@@ -96,7 +103,7 @@ impl SourcePreparation {
         let mut selections = Vec::new();
         let cargo = specification
             .get("cargo_source")
-            .map(|value| cargo::CargoSource::parse_request(value, specification))
+            .map(|value| cargo::CargoSource::parse_request(value, specification, context))
             .transpose()?;
         let closure = specification.get("source_roots").is_some();
         if let Some(cargo) = &cargo {
@@ -398,11 +405,14 @@ mod tests {
             bad.push(spec);
         }
         for spec in bad {
-            assert!(SourcePreparation::parse(base, &spec).is_err(), "{spec}");
+            assert!(
+                SourcePreparation::parse(base, &spec, PreparationContext::RemoteRequest).is_err(),
+                "{spec}"
+            );
         }
         let mut spec = good;
         spec["command_context"]["env"]["HOME"] = json!("never-echo-secret-value");
-        let error = SourcePreparation::parse(base, &spec)
+        let error = SourcePreparation::parse(base, &spec, PreparationContext::RemoteRequest)
             .unwrap_err()
             .to_string();
         assert!(error.contains("worker-owned"));
@@ -413,7 +423,8 @@ mod tests {
     fn relative_roots_and_root_and_file_count_limits_are_explicit() {
         let base = Path::new("/source-base");
         let mut spec = specification(Path::new("libs/dep"));
-        let plan = SourcePreparation::parse(base, &spec).unwrap();
+        let plan =
+            SourcePreparation::parse(base, &spec, PreparationContext::RemoteRequest).unwrap();
         assert_eq!(
             plan.roots,
             vec![
@@ -426,22 +437,24 @@ mod tests {
             .collect();
         spec["source_roots"] = Value::Object(roots);
         assert_eq!(
-            SourcePreparation::parse(base, &spec).unwrap().root_count(),
+            SourcePreparation::parse(base, &spec, PreparationContext::RemoteRequest)
+                .unwrap()
+                .root_count(),
             MAX_SOURCE_ROOTS
         );
         spec["source_roots"]["overflow"] = json!({"path":".", "files":["lib.rs"]});
-        assert!(SourcePreparation::parse(base, &spec).is_err());
+        assert!(SourcePreparation::parse(base, &spec, PreparationContext::RemoteRequest).is_err());
         let files: Vec<_> = (0..MAX_SOURCE_FILES / 2)
             .map(|index| format!("f{index}"))
             .collect();
         spec["source_roots"] =
             json!({"app":{"path":".","files":files}, "dep":{"path":"libs/dep","files":files}});
-        SourcePreparation::parse(base, &spec).unwrap();
+        SourcePreparation::parse(base, &spec, PreparationContext::RemoteRequest).unwrap();
         spec["source_roots"]["dep"]["files"]
             .as_array_mut()
             .unwrap()
             .push(json!("one-more"));
-        assert!(SourcePreparation::parse(base, &spec).is_err());
+        assert!(SourcePreparation::parse(base, &spec, PreparationContext::RemoteRequest).is_err());
     }
 
     #[test]
