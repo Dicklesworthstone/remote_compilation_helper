@@ -164,7 +164,8 @@ fn canonical_action_observes_only_worker_authored_jobserver_env() {
             program: "sh".to_string(),
             args: vec![
                 "-c".to_string(),
-                "auth=${MAKEFLAGS##*--jobserver-auth=fifo:}; test -p \"$auth\" || exit 71; \
+                "test -p /proc/self/fd/3 && test /proc/self/fd/3 -ef /proc/self/fd/4 || exit 71; \
+             readlink /proc/self/fd/3 > /__rabs/workspace/bridge-path.txt; \
              env | grep -E '^(MAKEFLAGS|MFLAGS|CARGO_MAKEFLAGS|NUM_JOBS)=' \
              > /__rabs/workspace/coord.txt"
                     .to_string(),
@@ -194,7 +195,7 @@ fn canonical_action_observes_only_worker_authored_jobserver_env() {
         assert!(result.executed, "namespace host must execute, not refuse");
         assert_eq!(
             result.exit_code, 0,
-            "advertised fifo must exist inside the namespace and coordination env must be present"
+            "advertised descriptors must share one FIFO and coordination env must be present"
         );
         assert_eq!(
             result.residual_group_members, 0,
@@ -219,10 +220,15 @@ fn canonical_action_observes_only_worker_authored_jobserver_env() {
             expected_grant.to_string(),
             "effective grant replaces host slots"
         );
-        let expected_auth = format!("-j{expected_grant} --jobserver-auth=fifo:/__rabs/home/");
-        let relative = observed["MAKEFLAGS"]
-            .strip_prefix(expected_auth.as_str())
-            .expect("worker auth points into the bound bridge directory");
+        assert_eq!(
+            observed["MAKEFLAGS"],
+            format!("-j{expected_grant} --jobserver-auth=3,4")
+        );
+        let fifo = std::fs::read_to_string(workspace.path().join("bridge-path.txt")).unwrap();
+        let relative = fifo
+            .trim_end()
+            .strip_prefix("/__rabs/home/")
+            .expect("worker descriptors point into the bound bridge directory");
         let (directory, fifo_name) = relative
             .split_once('/')
             .expect("private directory and FIFO");

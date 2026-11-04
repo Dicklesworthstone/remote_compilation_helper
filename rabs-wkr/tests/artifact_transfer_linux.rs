@@ -540,7 +540,10 @@ if mv input.txt moved.txt; then echo 'source rename unexpectedly succeeded' >&2;
 test "$(cat input.txt)" = 'exact input'
 test "$MAKEFLAGS" = "$CARGO_MAKEFLAGS"
 test "$NUM_JOBS" = 1
-fifo="${MAKEFLAGS##*--jobserver-auth=fifo:}"
+test "$MAKEFLAGS" = '-j1 --jobserver-auth=3,4'
+test -p /proc/self/fd/3
+test /proc/self/fd/3 -ef /proc/self/fd/4
+fifo="$(readlink /proc/self/fd/3)"
 case "$fifo" in /__rabs/home/.rabs-jobserver-*/*.fifo) ;; *) exit 84 ;; esac
 test -p "$fifo"
 printf runtime > "$HOME/runtime.txt"

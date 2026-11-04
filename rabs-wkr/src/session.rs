@@ -1137,9 +1137,7 @@ fn execute_canonical_inner(
     use rabs_asupersync::process_groups::ManagedProcessGroup;
     use rabs_asupersync::region_tree::Attribution;
     use rabs_sandbox::canonical_mounts::CanonicalMountPlan;
-    use rabs_sandbox::canonical_namespace::{
-        HostIsolationSupport, build_canonical_argv, command_for,
-    };
+    use rabs_sandbox::canonical_namespace::{HostIsolationSupport, command_for};
     use std::process::Stdio;
     let (source, uploaded_toolchain) = match inputs {
         Some(inputs) => (Some(inputs.source), inputs.toolchain),
@@ -1598,7 +1596,7 @@ fn execute_canonical_inner(
             )
         }
     } else {
-        build_canonical_argv(
+        bridge.canonical_launch(
             &spec,
             canonical_support
                 .as_ref()
