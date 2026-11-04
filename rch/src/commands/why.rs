@@ -3,8 +3,8 @@
 //!
 //! A miss explanation is the structured diff of two key breakdowns
 //! (`rabs_key::diff_breakdowns`, bead F013) surfaced with STABLE reason
-//! codes; index-level refusals render `LookupOutcome` codes. This is an
-//! offline input path remains available. `why action` reads one consistent
+//! codes; index-level refusals render `LookupOutcome` codes. Both file inputs
+//! and explicitly selected persisted keys are supported. `why action` reads one consistent
 //! snapshot of the daemon's existing metadata without creating or migrating
 //! it. Recorded serving state is not current coordinator authorization.
 //!
@@ -16,9 +16,11 @@ use std::path::{Path, PathBuf};
 
 use clap::Subcommand;
 use rabs_cas::action_inspection::{self, ActionInspection};
-use rabs_key::action_key::{ActionKeyBreakdown, BreakdownComponent};
-use rabs_key::key_diff::{LookupOutcome, diff_breakdowns};
-use rabs_protocol::result_identity::{DigestAlgorithm, TypedDigest};
+use rabs_key::action_key::{ActionKeyHeader, BorrowedKeyComponent, recompute_action_key};
+use rabs_key::key_diff::{LookupOutcome, diff_key_inputs};
+use rabs_key::typed_digest::DOMAIN_ACTION_KEY;
+use rabs_protocol::descriptor::ACTION_KEY_COMPONENT_NAMES;
+use rabs_protocol::result_identity::TypedDigest;
 use serde::Deserialize;
 
 use crate::ui::context::OutputContext;
@@ -38,17 +40,27 @@ pub enum WhyAction {
         #[arg(long)]
         cas_root: Option<PathBuf>,
     },
-    /// Explain a miss: structured diff of prior vs current key breakdowns
+    /// Compare verified key inputs from JSON files or two recorded action keys
     #[command(
-        after_help = "EXAMPLES:\n    rch why miss --prior prior.json --current current.json\n    cat current.json | rch why miss --prior prior.json --current -"
+        after_help = "EXAMPLES:\n    rch why miss --prior-key PRIOR --current-key CURRENT --cas-root /path/to/cas\n    rch why miss --prior prior.json --current current.json\n    cat current.json | rch why miss --prior prior.json --current -",
+        group(clap::ArgGroup::new("miss_input").required(true).args(["prior", "prior_key"]))
     )]
     Miss {
         /// Prior breakdown JSON path, or `-` for stdin
-        #[arg(long)]
-        prior: String,
+        #[arg(long, requires = "current")]
+        prior: Option<String>,
         /// Current breakdown JSON path, or `-` for stdin
-        #[arg(long)]
-        current: String,
+        #[arg(long, requires = "prior", conflicts_with_all = ["prior_key", "current_key"])]
+        current: Option<String>,
+        /// Prior persisted action key, bare or domain-prefixed
+        #[arg(long, requires = "current_key", conflicts_with_all = ["prior", "current"])]
+        prior_key: Option<String>,
+        /// Current persisted action key, bare or domain-prefixed
+        #[arg(long, requires = "prior_key", conflicts_with_all = ["prior", "current"])]
+        current_key: Option<String>,
+        /// Existing CAS root for recorded keys; uses the same default as why action
+        #[arg(long, requires_all = ["prior_key", "current_key"], conflicts_with_all = ["prior", "current"])]
+        cas_root: Option<PathBuf>,
     },
     /// Explain an index-level refusal with its stable reason code
     #[command(
@@ -74,10 +86,78 @@ pub struct CauseExplanation {
 /// The full miss explanation payload (JSON-envelope data field).
 #[derive(Debug, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct MissExplanation {
-    /// True when prior and current breakdowns agree (expected HIT).
+    /// True when both complete verified key identities agree; not a serving decision.
     pub identical: bool,
+    /// Always true: neither a lookup decision nor serving authorization is evaluated.
+    pub key_identity_only: bool,
     /// Every cause, canonical order (epoch/class first).
     pub causes: Vec<CauseExplanation>,
+    /// Exact changed scalar or digest inputs in canonical order.
+    pub changed_inputs: Vec<KeyInputDifference>,
+}
+
+/// One value from a verified key header or component digest.
+#[derive(Debug, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum KeyInputValue {
+    /// An epoch or canonical numeric action class.
+    Number(u32),
+    /// A complete typed component digest.
+    Digest {
+        /// Authoritative digest algorithm.
+        algorithm: &'static str,
+        /// Semantic domain preserved verbatim.
+        domain: String,
+        /// Complete lowercase digest bytes.
+        hex: String,
+    },
+}
+
+/// Exact values behind one reported key difference.
+#[derive(Debug, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+pub struct KeyInputDifference {
+    /// Canonical component or header-field name.
+    pub input: &'static str,
+    /// Recorded value in the prior key.
+    pub prior: KeyInputValue,
+    /// Recorded value in the current key.
+    pub current: KeyInputValue,
+}
+
+/// Missing historical provenance; no causes can be inferred from this absence.
+#[derive(Debug, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+pub struct KeyProvenanceUnavailable {
+    /// Which supplied key lacks complete evidence: prior or current.
+    pub side: &'static str,
+    /// Normalized requested action key.
+    pub action_key: String,
+    /// Stable missing-evidence code.
+    pub code: &'static str,
+    /// Missing canonical component names, if any.
+    pub missing_components: Vec<&'static str>,
+}
+
+/// Comparison of two explicit keys from one read-only metadata snapshot.
+#[derive(Debug, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+pub struct StoredMissExplanation {
+    /// Existing metadata database read by the command.
+    pub metadata_path: String,
+    /// Normalized prior action key.
+    pub prior_action_key: String,
+    /// Normalized current action key.
+    pub current_action_key: String,
+    /// Either compared or incomplete-key-provenance.
+    pub status: &'static str,
+    /// Always explicit-key-pair: no historical candidate relationship is inferred.
+    pub comparison_basis: &'static str,
+    /// Always false: no request's actual lookup decision is reconstructed.
+    pub lookup_decision_evaluated: bool,
+    /// Always false: equality does not establish permission to serve.
+    pub serving_authorization_evaluated: bool,
+    /// Present only when both complete breakdowns recompute to their requested keys.
+    pub comparison: Option<MissExplanation>,
+    /// Missing evidence for either supplied key.
+    pub unavailable: Vec<KeyProvenanceUnavailable>,
 }
 
 /// The refusal explanation payload.
@@ -476,6 +556,7 @@ fn format_action(explanation: &ActionExplanation) -> String {
 /// JSON input for one typed digest: domain + hex bytes. V1 SHA-256 is
 /// the only authoritative algorithm, so none is accepted on input.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DigestDto {
     domain: String,
     /// 64 hex chars (32 bytes).
@@ -484,6 +565,7 @@ struct DigestDto {
 
 /// JSON input for one breakdown component.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ComponentDto {
     name: String,
     digest: DigestDto,
@@ -491,6 +573,7 @@ struct ComponentDto {
 
 /// JSON input mirroring `ActionKeyBreakdown`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BreakdownDto {
     key_epoch: u32,
     projection_epoch: u32,
@@ -500,61 +583,158 @@ struct BreakdownDto {
 }
 
 impl DigestDto {
-    fn into_typed(self) -> Result<TypedDigest, String> {
-        let hex = self.hex.trim();
-        let bytes = (0..32)
-            .map(|i| {
-                u8::from_str_radix(hex.get(i * 2..i * 2 + 2).ok_or("digest hex too short")?, 16)
-                    .map_err(|e| format!("bad digest hex: {e}"))
+    fn bytes(&self) -> Result<[u8; 32], String> {
+        if self.hex.len() != 64 || !self.hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("digest must contain exactly 64 hexadecimal digits".to_owned());
+        }
+        let mut bytes = [0; 32];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&self.hex[index * 2..index * 2 + 2], 16)
+                .map_err(|error| format!("invalid digest: {error}"))?;
+        }
+        Ok(bytes)
+    }
+}
+
+struct OwnedKeyComponent {
+    name: &'static str,
+    domain: String,
+    bytes: [u8; 32],
+}
+
+struct VerifiedBreakdown {
+    header: ActionKeyHeader,
+    components: Vec<OwnedKeyComponent>,
+    key: TypedDigest,
+}
+
+impl VerifiedBreakdown {
+    fn borrowed(&self) -> Vec<BorrowedKeyComponent<'_>> {
+        self.components
+            .iter()
+            .map(|component| BorrowedKeyComponent {
+                name: component.name,
+                domain: &component.domain,
+                bytes: &component.bytes,
             })
-            .collect::<Result<Vec<u8>, _>>()?;
-        let bytes: [u8; 32] = bytes.try_into().map_err(|_| "digest hex wrong length")?;
-        // The CLI process is short-lived; leaking input domains keeps
-        // TypedDigest's 'static domain without a registry here (the
-        // coordinator's intern table is the long-lived authority).
-        let domain: &'static str = Box::leak(self.domain.into_boxed_str());
-        Ok(TypedDigest {
-            algorithm: DigestAlgorithm::Sha256V1,
-            domain,
-            bytes,
-        })
+            .collect()
     }
 }
 
 impl BreakdownDto {
-    fn into_breakdown(self) -> Result<ActionKeyBreakdown, String> {
-        let components = self
-            .components
-            .into_iter()
-            .map(|c| {
-                Ok(BreakdownComponent {
-                    name: Box::leak(c.name.into_boxed_str()),
-                    digest: c.digest.into_typed()?,
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        Ok(ActionKeyBreakdown {
+    fn into_breakdown(mut self) -> Result<VerifiedBreakdown, String> {
+        if self.components.len() != ACTION_KEY_COMPONENT_NAMES.len() {
+            return Err("a complete set of twelve key components is required".to_owned());
+        }
+        if self.final_key.domain != DOMAIN_ACTION_KEY {
+            return Err("final key must use the action-key digest domain".to_owned());
+        }
+        let claimed = self.final_key.bytes()?;
+        let header = ActionKeyHeader {
             key_epoch: self.key_epoch,
             projection_epoch: self.projection_epoch,
             action_class_tag: self.action_class_tag,
+        };
+        let mut components = Vec::with_capacity(ACTION_KEY_COMPONENT_NAMES.len());
+        for name in ACTION_KEY_COMPONENT_NAMES {
+            let index = self
+                .components
+                .iter()
+                .position(|component| component.name == name)
+                .ok_or_else(|| format!("missing or duplicated canonical component {name}"))?;
+            let component = self.components.remove(index);
+            if component.digest.domain.is_empty() || component.digest.domain.len() > 4096 {
+                return Err(format!("invalid semantic domain for {name}"));
+            }
+            components.push(OwnedKeyComponent {
+                name,
+                bytes: component.digest.bytes()?,
+                domain: component.digest.domain,
+            });
+        }
+        let borrowed: Vec<_> = components
+            .iter()
+            .map(|component| BorrowedKeyComponent {
+                name: component.name,
+                domain: &component.domain,
+                bytes: &component.bytes,
+            })
+            .collect();
+        let key = recompute_action_key(header, &borrowed).map_err(|error| error.to_string())?;
+        if key.bytes != claimed {
+            return Err(
+                "recorded key inputs do not recompute to the claimed action key".to_owned(),
+            );
+        }
+        Ok(VerifiedBreakdown {
+            header,
             components,
-            final_key: self.final_key.into_typed()?,
+            key,
         })
     }
 }
 
-/// Diff two seeded breakdowns into the wire explanation.
-///
-/// # Errors
-/// Malformed breakdown JSON (shape, hex, missing fields).
-pub fn explain_miss(prior_json: &str, current_json: &str) -> Result<MissExplanation, String> {
-    let prior: BreakdownDto =
-        serde_json::from_str(prior_json).map_err(|e| format!("prior breakdown: {e}"))?;
-    let current: BreakdownDto =
-        serde_json::from_str(current_json).map_err(|e| format!("current breakdown: {e}"))?;
-    let causes = diff_breakdowns(&prior.into_breakdown()?, &current.into_breakdown()?);
+fn digest_value(component: &OwnedKeyComponent) -> KeyInputValue {
+    KeyInputValue::Digest {
+        algorithm: "sha256-v1",
+        domain: component.domain.clone(),
+        hex: rabs_protocol::raw_bytes::encode_hex(&component.bytes),
+    }
+}
+
+fn compare_verified(
+    prior: &VerifiedBreakdown,
+    current: &VerifiedBreakdown,
+) -> Result<MissExplanation, String> {
+    let causes = diff_key_inputs(
+        prior.header,
+        &prior.borrowed(),
+        current.header,
+        &current.borrowed(),
+    )
+    .map_err(|error| error.to_string())?;
+    let identical = prior.key == current.key;
+    if identical != causes.is_empty() {
+        return Err("verified key identity disagrees with its input differences".to_owned());
+    }
+    let mut changed_inputs = Vec::new();
+    for (input, before, after) in [
+        (
+            "key_epoch",
+            prior.header.key_epoch,
+            current.header.key_epoch,
+        ),
+        (
+            "projection_epoch",
+            prior.header.projection_epoch,
+            current.header.projection_epoch,
+        ),
+        (
+            "action_class_tag",
+            prior.header.action_class_tag,
+            current.header.action_class_tag,
+        ),
+    ] {
+        if before != after {
+            changed_inputs.push(KeyInputDifference {
+                input,
+                prior: KeyInputValue::Number(before),
+                current: KeyInputValue::Number(after),
+            });
+        }
+    }
+    for (before, after) in prior.components.iter().zip(&current.components) {
+        if before.domain != after.domain || before.bytes != after.bytes {
+            changed_inputs.push(KeyInputDifference {
+                input: before.name,
+                prior: digest_value(before),
+                current: digest_value(after),
+            });
+        }
+    }
     Ok(MissExplanation {
-        identical: causes.is_empty(),
+        identical,
+        key_identity_only: true,
         causes: causes
             .into_iter()
             .map(|cause| CauseExplanation {
@@ -562,7 +742,156 @@ pub fn explain_miss(prior_json: &str, current_json: &str) -> Result<MissExplanat
                 explanation: cause.explain(),
             })
             .collect(),
+        changed_inputs,
     })
+}
+
+const MAX_BREAKDOWN_BYTES: usize = 1024 * 1024;
+
+/// Verify and compare two complete JSON breakdowns without leaking input strings.
+///
+/// # Errors
+/// Excessive or malformed JSON, incomplete components, unsupported header values,
+/// or any claimed key that does not match the canonical encoding of its inputs.
+pub fn explain_miss(prior_json: &str, current_json: &str) -> Result<MissExplanation, String> {
+    if prior_json.len() > MAX_BREAKDOWN_BYTES || current_json.len() > MAX_BREAKDOWN_BYTES {
+        return Err("key breakdown exceeds the one MiB input limit".to_owned());
+    }
+    let prior: BreakdownDto =
+        serde_json::from_str(prior_json).map_err(|e| format!("prior breakdown: {e}"))?;
+    let current: BreakdownDto =
+        serde_json::from_str(current_json).map_err(|e| format!("current breakdown: {e}"))?;
+    let prior = prior
+        .into_breakdown()
+        .map_err(|error| format!("prior breakdown: {error}"))?;
+    let current = current
+        .into_breakdown()
+        .map_err(|error| format!("current breakdown: {error}"))?;
+    compare_verified(&prior, &current)
+}
+
+fn stored_breakdown(
+    side: &'static str,
+    action: &ActionInspection,
+    unavailable: &mut Vec<KeyProvenanceUnavailable>,
+) -> Result<Option<VerifiedBreakdown>, String> {
+    if action.breakdown.truncated {
+        return Err(format!("{side} key has truncated component evidence"));
+    }
+    let mut names = std::collections::BTreeSet::new();
+    for component in &action.breakdown.items {
+        if !ACTION_KEY_COMPONENT_NAMES.contains(&component.component.as_str())
+            || !names.insert(component.component.as_str())
+        {
+            return Err(format!(
+                "{side} key has unknown or duplicate component names"
+            ));
+        }
+        if component.algorithm != "sha256-v1" {
+            return Err(format!("{side} key has an unsupported component algorithm"));
+        }
+    }
+    let missing_components: Vec<_> = ACTION_KEY_COMPONENT_NAMES
+        .into_iter()
+        .filter(|name| !names.contains(name))
+        .collect();
+    let code = if action.breakdown_header.is_none() {
+        Some("key-header-not-recorded")
+    } else if !missing_components.is_empty() {
+        Some("key-components-incomplete")
+    } else {
+        None
+    };
+    if let Some(code) = code {
+        unavailable.push(KeyProvenanceUnavailable {
+            side,
+            action_key: action.action_key.clone(),
+            code,
+            missing_components,
+        });
+        return Ok(None);
+    }
+    let header = action
+        .breakdown_header
+        .as_ref()
+        .ok_or("key header missing")?;
+    let hex = action
+        .action_key
+        .strip_prefix(DOMAIN_ACTION_KEY)
+        .and_then(|tail| tail.strip_prefix(':'))
+        .ok_or("invalid recorded action-key domain")?;
+    let dto = BreakdownDto {
+        key_epoch: header.key_epoch,
+        projection_epoch: header.projection_epoch,
+        action_class_tag: header.action_class_tag,
+        components: action
+            .breakdown
+            .items
+            .iter()
+            .map(|component| ComponentDto {
+                name: component.component.clone(),
+                digest: DigestDto {
+                    domain: component.domain.clone(),
+                    hex: component.digest_hex.clone(),
+                },
+            })
+            .collect(),
+        final_key: DigestDto {
+            domain: DOMAIN_ACTION_KEY.to_owned(),
+            hex: hex.to_owned(),
+        },
+    };
+    dto.into_breakdown()
+        .map(Some)
+        .map_err(|error| format!("{side} key provenance: {error}"))
+}
+
+fn compare_stored(
+    database: &Path,
+    prior: &ActionInspection,
+    current: &ActionInspection,
+) -> anyhow::Result<StoredMissExplanation> {
+    let mut unavailable = Vec::new();
+    let before = stored_breakdown("prior", prior, &mut unavailable).map_err(anyhow::Error::msg)?;
+    let after =
+        stored_breakdown("current", current, &mut unavailable).map_err(anyhow::Error::msg)?;
+    let comparison = match (before, after) {
+        (Some(before), Some(after)) => {
+            Some(compare_verified(&before, &after).map_err(anyhow::Error::msg)?)
+        }
+        _ => None,
+    };
+    Ok(StoredMissExplanation {
+        metadata_path: database.display().to_string(),
+        prior_action_key: prior.action_key.clone(),
+        current_action_key: current.action_key.clone(),
+        status: if comparison.is_some() {
+            "compared"
+        } else {
+            "incomplete-key-provenance"
+        },
+        comparison_basis: "explicit-key-pair",
+        lookup_decision_evaluated: false,
+        serving_authorization_evaluated: false,
+        comparison,
+        unavailable,
+    })
+}
+
+/// Compare complete persisted action-key inputs from one SQLite snapshot.
+/// Supplied keys do not prove the prior key was a request's actual cache candidate.
+///
+/// # Errors
+/// Missing/incompatible stores, invalid keys, or corrupt/mismatched key evidence.
+pub fn explain_stored_miss(
+    prior: &str,
+    current: &str,
+    cas_root: &Path,
+) -> anyhow::Result<StoredMissExplanation> {
+    let database = cas_root.join("meta.sqlite");
+    let (prior, current) = action_inspection::inspect_action_pair(&database, prior, current)
+        .map_err(|error| anyhow::anyhow!("{}: {error}", database.display()))?;
+    compare_stored(&database, &prior, &current)
 }
 
 /// Explain an index-level refusal from its stable code.
@@ -600,14 +929,83 @@ pub fn explain_refusal(code: &str) -> Result<RefusalExplanation, String> {
 
 fn read_input(path: &str) -> anyhow::Result<String> {
     if path == "-" {
-        let mut buf = String::new();
-        std::io::stdin()
-            .read_to_string(&mut buf)
-            .map_err(|e| anyhow::anyhow!("stdin: {e}"))?;
-        Ok(buf)
+        read_bounded(std::io::stdin(), "stdin")
     } else {
-        std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("{path}: {e}"))
+        let file = std::fs::File::open(path).map_err(|error| anyhow::anyhow!("{path}: {error}"))?;
+        read_bounded(file, path)
     }
+}
+
+fn read_bounded(input: impl std::io::Read, label: &str) -> anyhow::Result<String> {
+    let mut text = String::new();
+    input
+        .take(MAX_BREAKDOWN_BYTES as u64 + 1)
+        .read_to_string(&mut text)
+        .map_err(|error| anyhow::anyhow!("{label}: {error}"))?;
+    anyhow::ensure!(
+        text.len() <= MAX_BREAKDOWN_BYTES,
+        "{label}: key breakdown exceeds one MiB"
+    );
+    Ok(text)
+}
+
+fn format_key_value(value: &KeyInputValue) -> String {
+    match value {
+        KeyInputValue::Number(value) => value.to_string(),
+        KeyInputValue::Digest {
+            algorithm,
+            domain,
+            hex,
+        } => format!("{domain:?}:{hex} ({algorithm})"),
+    }
+}
+
+fn format_miss(explanation: &MissExplanation) -> String {
+    let mut lines = vec![if explanation.identical {
+        "same-key: complete verified key inputs agree".to_owned()
+    } else {
+        format!("key-differences: {} cause(s)", explanation.causes.len())
+    }];
+    for cause in &explanation.causes {
+        lines.push(format!("{}: {}", cause.code, cause.explanation));
+    }
+    for difference in &explanation.changed_inputs {
+        lines.push(format!(
+            "{}: {} -> {}",
+            difference.input,
+            format_key_value(&difference.prior),
+            format_key_value(&difference.current)
+        ));
+    }
+    lines.push("scope: verified key identity; serving authorization was not evaluated".to_owned());
+    lines.join("\n")
+}
+
+fn format_stored_miss(explanation: &StoredMissExplanation) -> String {
+    let mut lines = vec![
+        format!("status: {}", explanation.status),
+        format!("prior: {}", explanation.prior_action_key),
+        format!("current: {}", explanation.current_action_key),
+        format!("metadata: {:?}", explanation.metadata_path),
+        "comparison basis: explicit key pair; no lookup decision was evaluated".to_owned(),
+    ];
+    if let Some(comparison) = &explanation.comparison {
+        lines.push(format_miss(comparison));
+    } else {
+        for missing in &explanation.unavailable {
+            lines.push(format!("{}: {}", missing.side, missing.code));
+            if !missing.missing_components.is_empty() {
+                lines.push(format!(
+                    "missing components: {}",
+                    missing.missing_components.join(", ")
+                ));
+            }
+        }
+        lines.push(
+            "key differences are unavailable; serving authorization was not evaluated".to_owned(),
+        );
+    }
+    lines.join("\n")
 }
 
 /// Entry point for `rch why <action>`.
@@ -626,20 +1024,39 @@ pub async fn run(action: WhyAction, ctx: &OutputContext) -> anyhow::Result<()> {
                 println!("{}", format_action(&explanation));
             }
         }
-        WhyAction::Miss { prior, current } => {
-            let explanation = explain_miss(&read_input(&prior)?, &read_input(&current)?)
-                .map_err(anyhow::Error::msg)?;
-            if ctx.is_json() {
-                ctx.json(&ApiResponse::ok("why miss", &explanation))?;
-            } else if explanation.identical {
-                println!("identical: no component differs (expected hit)");
-            } else {
-                println!("miss: {} cause(s)", explanation.causes.len());
-                for cause in &explanation.causes {
-                    println!("{}: {}", cause.code, cause.explanation);
+        WhyAction::Miss {
+            prior,
+            current,
+            prior_key,
+            current_key,
+            cas_root,
+        } => match (prior, current, prior_key, current_key) {
+            (Some(prior), Some(current), None, None) if cas_root.is_none() => {
+                anyhow::ensure!(
+                    prior != "-" || current != "-",
+                    "only one breakdown can be read from stdin"
+                );
+                let explanation = explain_miss(&read_input(&prior)?, &read_input(&current)?)
+                    .map_err(anyhow::Error::msg)?;
+                if ctx.is_json() {
+                    ctx.json(&ApiResponse::ok("why miss", &explanation))?;
+                } else {
+                    println!("{}", format_miss(&explanation));
                 }
             }
-        }
+            (None, None, Some(prior), Some(current)) => {
+                let root = super::rabs_gc::resolve_cas_root(cas_root.as_deref())?;
+                let explanation = explain_stored_miss(&prior, &current, &root)?;
+                if ctx.is_json() {
+                    ctx.json(&ApiResponse::ok("why miss", &explanation))?;
+                } else {
+                    println!("{}", format_stored_miss(&explanation));
+                }
+            }
+            _ => anyhow::bail!(
+                "provide both --prior/--current files or both --prior-key/--current-key keys"
+            ),
+        },
         WhyAction::Refusal { outcome } => {
             let explanation = explain_refusal(&outcome).map_err(anyhow::Error::msg)?;
             if ctx.is_json() {
@@ -859,49 +1276,61 @@ mod tests {
         assert!(human.contains("legacy trust state:"));
     }
 
-    /// The twelve canonical component slots (A014 order).
-    const COMPONENTS: [&str; 12] = [
-        "normalized_invocation",
-        "virtual_working_directory",
-        "action_inputs",
-        "negative_dependencies",
-        "dependency_inputs",
-        "toolchain",
-        "output_platform",
-        "environment",
-        "sandbox_semantic_policy",
-        "build_path_semantic_policy",
-        "execution_semantics",
-        "output_declarations",
-    ];
+    const COMPONENTS: [&str; 12] = ACTION_KEY_COMPONENT_NAMES;
 
     fn digest_hex(tag: u8) -> String {
         format!("{tag:064x}")
     }
 
     fn seeded_breakdown(tag: u8, differing_component: Option<&str>) -> String {
-        let components: Vec<String> = COMPONENTS
+        seeded_with_header(
+            tag,
+            differing_component,
+            ActionKeyHeader {
+                key_epoch: 1,
+                projection_epoch: 1,
+                action_class_tag: 3,
+            },
+        )
+    }
+
+    fn seeded_with_header(
+        tag: u8,
+        differing_component: Option<&str>,
+        header: ActionKeyHeader,
+    ) -> String {
+        let bytes: Vec<[u8; 32]> = COMPONENTS
             .iter()
             .map(|name| {
-                let t = if Some(*name) == differing_component {
+                let mut bytes = [0; 32];
+                bytes[31] = if Some(*name) == differing_component {
                     tag.wrapping_add(0x40)
                 } else {
                     tag
                 };
-                format!(
-                    "{{\"name\": \"{name}\", \"digest\": {{\"domain\": \"rabs.test.v1\", \
-                     \"hex\": \"{}\"}}}}",
-                    digest_hex(t)
-                )
+                bytes
             })
             .collect();
-        format!(
-            "{{\"key_epoch\": 1, \"projection_epoch\": 1, \"action_class_tag\": 3, \
-             \"components\": [{}], \"final_key\": {{\"domain\": \"rabs.test.v1\", \
-             \"hex\": \"{}\"}}}}",
-            components.join(", "),
-            digest_hex(tag)
-        )
+        let components: Vec<_> = COMPONENTS
+            .iter()
+            .zip(&bytes)
+            .map(|(name, bytes)| BorrowedKeyComponent {
+                name,
+                domain: "rabs.test.v1",
+                bytes,
+            })
+            .collect();
+        let key = recompute_action_key(header, &components).unwrap();
+        serde_json::json!({
+            "key_epoch": header.key_epoch,
+            "projection_epoch": header.projection_epoch,
+            "action_class_tag": header.action_class_tag,
+            "components": components.iter().map(|component| serde_json::json!({
+                "name": component.name,
+                "digest": {"domain": component.domain, "hex": rabs_protocol::raw_bytes::encode_hex(component.bytes)},
+            })).collect::<Vec<_>>(),
+            "final_key": {"domain": key.domain, "hex": rabs_protocol::raw_bytes::encode_hex(&key.bytes)},
+        }).to_string()
     }
 
     #[test]
@@ -939,23 +1368,40 @@ mod tests {
 
     #[test]
     fn k009_explains_seeded_epoch_and_class_causes() {
-        let epoch_current =
-            seeded_breakdown(1, None).replace("\"key_epoch\": 1", "\"key_epoch\": 2");
+        let epoch_current = seeded_with_header(
+            1,
+            None,
+            ActionKeyHeader {
+                key_epoch: 2,
+                projection_epoch: 1,
+                action_class_tag: 3,
+            },
+        );
         let explanation = explain_miss(&seeded_breakdown(1, None), &epoch_current).unwrap();
         assert_eq!(explanation.causes[0].code, "epoch-mismatch");
 
-        let class_current =
-            seeded_breakdown(1, None).replace("\"action_class_tag\": 3", "\"action_class_tag\": 4");
+        let class_current = seeded_with_header(
+            1,
+            None,
+            ActionKeyHeader {
+                key_epoch: 1,
+                projection_epoch: 1,
+                action_class_tag: 4,
+            },
+        );
         let explanation = explain_miss(&seeded_breakdown(1, None), &class_current).unwrap();
         assert_eq!(explanation.causes[0].code, "action-class-changed");
     }
 
     #[test]
-    fn k009_identical_breakdowns_report_expected_hit() {
+    fn k009_identical_breakdowns_report_only_verified_key_identity() {
         let explanation =
             explain_miss(&seeded_breakdown(7, None), &seeded_breakdown(7, None)).unwrap();
         assert!(explanation.identical);
         assert!(explanation.causes.is_empty());
+        assert!(explanation.key_identity_only);
+        assert!(explanation.changed_inputs.is_empty());
+        assert!(!format_miss(&explanation).contains("expected hit"));
     }
 
     #[test]
@@ -980,5 +1426,348 @@ mod tests {
     fn k009_malformed_input_is_a_typed_string_error() {
         assert!(explain_miss("not json", "{}").is_err());
         assert!(explain_miss(&seeded_breakdown(1, None), "{\"components\": []}").is_err());
+    }
+
+    fn recorded_breakdown(json: &str) -> ActionInspection {
+        let dto: BreakdownDto = serde_json::from_str(json).unwrap();
+        let mut action = inspection_fixture();
+        action.observed = true;
+        action.action_key = format!("{}:{}", dto.final_key.domain, dto.final_key.hex);
+        action.breakdown_header = Some(action_inspection::BreakdownHeaderInspection {
+            key_epoch: dto.key_epoch,
+            projection_epoch: dto.projection_epoch,
+            action_class_tag: dto.action_class_tag,
+        });
+        action.breakdown.items = dto
+            .components
+            .into_iter()
+            .map(|component| action_inspection::BreakdownInspection {
+                component: component.name,
+                algorithm: "sha256-v1".to_owned(),
+                domain: component.digest.domain,
+                digest_hex: component.digest.hex,
+            })
+            .collect();
+        action
+            .breakdown
+            .items
+            .sort_by(|a, b| a.component.cmp(&b.component));
+        action
+    }
+
+    #[test]
+    fn file_comparison_rejects_forged_keys_and_incomplete_or_mistyped_components() {
+        let valid = seeded_breakdown(1, None);
+        for case in [
+            "missing",
+            "duplicate",
+            "unknown",
+            "key-domain",
+            "key-bytes",
+            "key-short",
+            "key-long",
+            "component-long",
+            "component-domain",
+            "component-algorithm",
+            "key-algorithm",
+            "header",
+            "class",
+        ] {
+            let mut value: serde_json::Value = serde_json::from_str(&valid).unwrap();
+            match case {
+                "missing" => {
+                    value["components"].as_array_mut().unwrap().pop();
+                }
+                "duplicate" => value["components"][1] = value["components"][0].clone(),
+                "unknown" => value["components"][0]["name"] = "unknown".into(),
+                "key-domain" => value["final_key"]["domain"] = "wrong-domain".into(),
+                "key-bytes" => value["final_key"]["hex"] = digest_hex(1).into(),
+                "key-short" => value["final_key"]["hex"] = "ab".into(),
+                "key-long" => value["final_key"]["hex"] = "ab".repeat(33).into(),
+                "component-long" => {
+                    value["components"][0]["digest"]["hex"] = "ab".repeat(33).into()
+                }
+                "component-domain" => {
+                    value["components"][0]["digest"]["domain"] = "changed-domain".into()
+                }
+                "component-algorithm" => {
+                    value["components"][0]["digest"]["algorithm"] = "blake3".into()
+                }
+                "key-algorithm" => value["final_key"]["algorithm"] = "blake3".into(),
+                "header" => value["projection_epoch"] = 2.into(),
+                _ => value["action_class_tag"] = 0.into(),
+            }
+            let changed = value.to_string();
+            assert!(explain_miss(&valid, &changed).is_err(), "current {case}");
+            assert!(explain_miss(&changed, &valid).is_err(), "prior {case}");
+        }
+    }
+
+    #[test]
+    fn file_component_order_is_canonicalized_and_changed_values_are_explicit() {
+        let valid = seeded_breakdown(1, None);
+        let mut reordered: serde_json::Value = serde_json::from_str(&valid).unwrap();
+        reordered["components"].as_array_mut().unwrap().reverse();
+        assert!(
+            explain_miss(&valid, &reordered.to_string())
+                .unwrap()
+                .identical
+        );
+        let comparison = explain_miss(&valid, &seeded_breakdown(1, Some("toolchain"))).unwrap();
+        assert_eq!(comparison.changed_inputs.len(), 1);
+        assert_eq!(comparison.changed_inputs[0].input, "toolchain");
+        assert_ne!(
+            comparison.changed_inputs[0].prior,
+            comparison.changed_inputs[0].current
+        );
+    }
+
+    #[test]
+    fn stored_comparison_attributes_exact_components_and_header_values() {
+        let prior = recorded_breakdown(&seeded_breakdown(1, None));
+        let current = recorded_breakdown(&seeded_with_header(
+            1,
+            Some("toolchain"),
+            ActionKeyHeader {
+                key_epoch: 2,
+                projection_epoch: 3,
+                action_class_tag: 4,
+            },
+        ));
+        let explanation = compare_stored(Path::new("cas/meta.sqlite"), &prior, &current).unwrap();
+        assert_eq!(explanation.status, "compared");
+        assert_eq!(explanation.comparison_basis, "explicit-key-pair");
+        assert!(!explanation.lookup_decision_evaluated);
+        assert!(!explanation.serving_authorization_evaluated);
+        let comparison = explanation.comparison.unwrap();
+        assert_eq!(
+            comparison
+                .causes
+                .iter()
+                .map(|cause| cause.code)
+                .collect::<Vec<_>>(),
+            [
+                "epoch-mismatch",
+                "action-class-changed",
+                "toolchain-changed"
+            ]
+        );
+        assert_eq!(
+            comparison
+                .changed_inputs
+                .iter()
+                .map(|change| change.input)
+                .collect::<Vec<_>>(),
+            [
+                "key_epoch",
+                "projection_epoch",
+                "action_class_tag",
+                "toolchain"
+            ]
+        );
+        assert_eq!(comparison.changed_inputs[0].prior, KeyInputValue::Number(1));
+        assert_eq!(
+            comparison.changed_inputs[0].current,
+            KeyInputValue::Number(2)
+        );
+    }
+
+    #[test]
+    fn historical_headers_and_missing_components_are_not_inferred() {
+        let mut prior = recorded_breakdown(&seeded_breakdown(1, None));
+        prior.breakdown_header = None;
+        prior.entry = Some(action_inspection::ActionEntryInspection {
+            key_epoch: 1,
+            projection_epoch: 1,
+        });
+        prior.runtime_class = Some("rustc-dependency-compile".to_owned());
+        let mut current = recorded_breakdown(&seeded_breakdown(1, Some("toolchain")));
+        current
+            .breakdown
+            .items
+            .retain(|row| row.component != "toolchain");
+        let explanation = compare_stored(Path::new("cas/meta.sqlite"), &prior, &current).unwrap();
+        assert_eq!(explanation.status, "incomplete-key-provenance");
+        assert!(explanation.comparison.is_none());
+        assert_eq!(explanation.unavailable.len(), 2);
+        assert_eq!(explanation.unavailable[0].code, "key-header-not-recorded");
+        assert_eq!(explanation.unavailable[1].code, "key-components-incomplete");
+        assert_eq!(explanation.unavailable[1].missing_components, ["toolchain"]);
+        assert!(format_stored_miss(&explanation).contains("key differences are unavailable"));
+    }
+
+    #[test]
+    fn corrupt_recorded_evidence_is_rejected_even_if_the_other_key_is_incomplete() {
+        let mut prior = recorded_breakdown(&seeded_breakdown(1, None));
+        prior.breakdown_header = None;
+        for case in ["key", "domain", "algorithm", "truncated", "extra"] {
+            let mut current = recorded_breakdown(&seeded_breakdown(1, Some("toolchain")));
+            match case {
+                "key" => current.action_key = prior.action_key.clone(),
+                "domain" => current.breakdown.items[0].domain.push('!'),
+                "algorithm" => current.breakdown.items[0].algorithm = "blake3".to_owned(),
+                "truncated" => current.breakdown.truncated = true,
+                _ => current
+                    .breakdown
+                    .items
+                    .push(current.breakdown.items[0].clone()),
+            }
+            assert!(
+                compare_stored(Path::new("cas/meta.sqlite"), &prior, &current).is_err(),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn identical_recorded_keys_do_not_imply_a_hit_under_quarantine() {
+        let mut action = recorded_breakdown(&seeded_breakdown(1, None));
+        action.action_quarantine = Some("retained blocker".to_owned());
+        let explanation = compare_stored(Path::new("cas/meta.sqlite"), &action, &action).unwrap();
+        assert!(explanation.comparison.as_ref().unwrap().identical);
+        assert!(!explanation.serving_authorization_evaluated);
+        let json = serde_json::to_value(&explanation).unwrap();
+        assert_eq!(json["lookup_decision_evaluated"], false);
+        assert_eq!(json["comparison"]["key_identity_only"], true);
+        assert!(!format_stored_miss(&explanation).contains("expected hit"));
+    }
+
+    #[test]
+    fn miss_input_modes_require_complete_exclusive_pairs() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Arguments {
+            #[command(subcommand)]
+            action: WhyAction,
+        }
+        for args in [
+            vec!["why", "miss", "--prior", "a.json", "--current", "b.json"],
+            vec!["why", "miss", "--prior-key", "a", "--current-key", "b"],
+            vec![
+                "why",
+                "miss",
+                "--prior-key",
+                "a",
+                "--current-key",
+                "b",
+                "--cas-root",
+                "/tmp/cas",
+            ],
+        ] {
+            assert!(Arguments::try_parse_from(args).is_ok());
+        }
+        for args in [
+            vec!["why", "miss"],
+            vec!["why", "miss", "--prior", "a.json"],
+            vec!["why", "miss", "--current-key", "b"],
+            vec!["why", "miss", "--prior", "a.json", "--current-key", "b"],
+            vec![
+                "why",
+                "miss",
+                "--prior",
+                "a.json",
+                "--current",
+                "b.json",
+                "--cas-root",
+                "/tmp/cas",
+            ],
+            vec![
+                "why",
+                "miss",
+                "--prior",
+                "a.json",
+                "--current",
+                "b.json",
+                "--prior-key",
+                "a",
+                "--current-key",
+                "b",
+            ],
+        ] {
+            assert!(Arguments::try_parse_from(&args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn breakdown_reads_and_parsing_are_bounded() {
+        let oversized = vec![b'x'; MAX_BREAKDOWN_BYTES + 1];
+        assert!(read_bounded(oversized.as_slice(), "fixture").is_err());
+        assert!(explain_miss(std::str::from_utf8(&oversized).unwrap(), "{}").is_err());
+        assert_eq!(
+            read_bounded(&oversized[..MAX_BREAKDOWN_BYTES], "fixture")
+                .unwrap()
+                .len(),
+            MAX_BREAKDOWN_BYTES
+        );
+    }
+
+    #[test]
+    fn actual_writer_to_store_lookup_compares_both_actions_and_refuses_missing_stores() {
+        use rabs_cas::metadata_store::{
+            AuthorityRow, RabsMetadataStore, RusqliteEngine, SqlMetadataStore,
+        };
+        use rabs_protocol::descriptor::{ActionClass, ActionDescriptor};
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("meta.sqlite");
+        let mut store = SqlMetadataStore::open(RusqliteEngine::open(&database).unwrap()).unwrap();
+        let digest = rabs_key::typed_digest::compute("rabs.why-test.v1", b"input");
+        let authority = AuthorityRow {
+            digest: rabs_key::typed_digest::compute("rabs.why-authority.v1", b"active"),
+            cluster_id: "why-test".to_owned(),
+            incarnation: 1,
+            term: 1,
+            acquired_seq: 1,
+        };
+        store.acquire_authority(&authority).unwrap();
+        let mut descriptor = ActionDescriptor {
+            key_epoch: 1,
+            projection_epoch: 1,
+            action_class: ActionClass::RustcDependencyCompile,
+            normalized_invocation: digest.clone(),
+            virtual_working_directory: digest.clone(),
+            action_inputs: digest.clone(),
+            negative_dependencies: digest.clone(),
+            dependency_inputs: digest.clone(),
+            toolchain: digest.clone(),
+            output_platform: digest.clone(),
+            environment: digest.clone(),
+            sandbox_semantic_policy: digest.clone(),
+            build_path_semantic_policy: digest.clone(),
+            execution_semantics: digest.clone(),
+            output_declarations: digest,
+        };
+        store
+            .record_action_key_provenance(
+                &authority.digest,
+                &descriptor,
+                "rustc-dependency-compile",
+            )
+            .unwrap();
+        let prior = rabs_cas::metadata_store::digest_key(
+            &rabs_key::action_key::compute_action_key(&descriptor).final_key,
+        );
+        descriptor.toolchain = rabs_key::typed_digest::compute("rabs.why-test.v1", b"new compiler");
+        store
+            .record_action_key_provenance(
+                &authority.digest,
+                &descriptor,
+                "rustc-dependency-compile",
+            )
+            .unwrap();
+        let current = rabs_cas::metadata_store::digest_key(
+            &rabs_key::action_key::compute_action_key(&descriptor).final_key,
+        );
+        drop(store);
+        let explanation = explain_stored_miss(&prior, &current, directory.path()).unwrap();
+        assert_eq!(
+            explanation.comparison.unwrap().causes[0].code,
+            "toolchain-changed"
+        );
+        let unknown = explain_stored_miss(&prior, &"ab".repeat(32), directory.path()).unwrap();
+        assert_eq!(unknown.unavailable.len(), 1);
+        assert_eq!(unknown.unavailable[0].side, "current");
+        let absent = directory.path().join("absent");
+        assert!(explain_stored_miss(&prior, &current, &absent).is_err());
+        assert!(!absent.exists());
     }
 }

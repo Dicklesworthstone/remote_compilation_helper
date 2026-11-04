@@ -17,7 +17,7 @@
 //! decision is unrepresentable, and any serialization drift trips the
 //! F001 goldens.
 
-use rabs_protocol::descriptor::{ActionClass, ActionDescriptor};
+use rabs_protocol::descriptor::{ACTION_KEY_COMPONENT_NAMES, ActionClass, ActionDescriptor};
 use rabs_protocol::input_evidence::{
     ActionInputManifest, INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType, NegativeDependency,
     NegativeDependencySet,
@@ -275,6 +275,119 @@ pub struct BreakdownComponent {
     pub digest: TypedDigest,
 }
 
+/// Scalar inputs that precede the component digests in canonical key encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActionKeyHeader {
+    /// Key namespace epoch.
+    pub key_epoch: u32,
+    /// Result-projection namespace epoch.
+    pub projection_epoch: u32,
+    /// Stable canonical action-class tag, not a Rust enum discriminant.
+    pub action_class_tag: u32,
+}
+
+/// Borrowed SHA-256 component facts, including domains read from durable storage.
+/// No input string must be leaked or assigned a fabricated static lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BorrowedKeyComponent<'a> {
+    /// Canonical component name.
+    pub name: &'a str,
+    /// Semantic domain exactly as it entered the key.
+    pub domain: &'a str,
+    /// SHA-256 digest bytes.
+    pub bytes: &'a [u8; 32],
+}
+
+/// A recorded breakdown cannot be interpreted as this key schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyReconstructionError {
+    /// The numeric action class is not supported by this version.
+    UnsupportedActionClass(u32),
+    /// The complete component set is required, including unchanged components.
+    ComponentCount(usize),
+    /// Names must match canonical order without missing or duplicate slots.
+    ComponentName(usize),
+    /// A component has no semantic domain.
+    EmptyDomain(usize),
+}
+
+impl std::fmt::Display for KeyReconstructionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedActionClass(tag) => write!(f, "unsupported action class tag {tag}"),
+            Self::ComponentCount(count) => {
+                write!(f, "expected twelve key components, found {count}")
+            }
+            Self::ComponentName(index) => write!(f, "unexpected key component at position {index}"),
+            Self::EmptyDomain(index) => write!(f, "empty component domain at position {index}"),
+        }
+    }
+}
+
+impl std::error::Error for KeyReconstructionError {}
+
+pub(crate) fn validate_key_inputs(
+    header: ActionKeyHeader,
+    components: &[BorrowedKeyComponent<'_>],
+) -> Result<(), KeyReconstructionError> {
+    // V1's wire-stable class vocabulary is contiguous from 1 through 21.
+    // Future classes require an explicit reconstruction-schema decision.
+    if !(1..=21).contains(&header.action_class_tag) {
+        return Err(KeyReconstructionError::UnsupportedActionClass(
+            header.action_class_tag,
+        ));
+    }
+    if components.len() != ACTION_KEY_COMPONENT_NAMES.len() {
+        return Err(KeyReconstructionError::ComponentCount(components.len()));
+    }
+    for (index, (component, name)) in components
+        .iter()
+        .zip(ACTION_KEY_COMPONENT_NAMES)
+        .enumerate()
+    {
+        if component.name != name {
+            return Err(KeyReconstructionError::ComponentName(index));
+        }
+        if component.domain.is_empty() {
+            return Err(KeyReconstructionError::EmptyDomain(index));
+        }
+    }
+    Ok(())
+}
+
+fn assemble_action_key<'a>(
+    header: ActionKeyHeader,
+    components: impl Iterator<Item = (&'a str, &'a [u8; 32])>,
+) -> TypedDigest {
+    let mut enc = CanonicalEncoder::new();
+    enc.u32(header.key_epoch)
+        .u32(header.projection_epoch)
+        .u32(header.action_class_tag);
+    for (domain, bytes) in components {
+        // The domain participates in identity; matching raw bytes alone do not.
+        enc.str(domain);
+        enc.bytes(bytes);
+    }
+    compute(DOMAIN_ACTION_KEY, &enc.finish())
+}
+
+/// Recompute a key from a complete canonical breakdown, using the same encoder
+/// as live descriptor admission. The caller must separately compare the result
+/// with its requested key and validate any serialized algorithm identifiers.
+///
+/// # Errors
+/// Unsupported action classes, incomplete/reordered names, or empty domains.
+pub fn recompute_action_key(
+    header: ActionKeyHeader,
+    components: &[BorrowedKeyComponent<'_>],
+) -> Result<TypedDigest, KeyReconstructionError> {
+    validate_key_inputs(header, components)?;
+    Ok(assemble_action_key(
+        header,
+        components.iter().map(|c| (c.domain, c.bytes)),
+    ))
+}
+
 /// The structured, redaction-safe key breakdown returned WITH every key.
 /// Digests only — raw component values never appear here, so breakdowns
 /// are safe to persist in receipts and logs.
@@ -303,18 +416,16 @@ pub fn compute_action_key(descriptor: &ActionDescriptor) -> ActionKeyBreakdown {
             digest: digest.clone(),
         })
         .collect();
-    let mut enc = CanonicalEncoder::new();
-    enc.u32(descriptor.key_epoch)
-        .u32(descriptor.projection_epoch)
-        .u32(action_class_tag(descriptor.action_class));
-    for c in &components {
-        // Component digests enter as (domain, bytes): the domain string
-        // participates so a digest can never be replayed across component
-        // slots that happen to share bytes.
-        enc.str(c.digest.domain);
-        enc.bytes(&c.digest.bytes);
-    }
-    let final_key = compute(DOMAIN_ACTION_KEY, &enc.finish());
+    let final_key = assemble_action_key(
+        ActionKeyHeader {
+            key_epoch: descriptor.key_epoch,
+            projection_epoch: descriptor.projection_epoch,
+            action_class_tag: action_class_tag(descriptor.action_class),
+        },
+        components
+            .iter()
+            .map(|c| (c.digest.domain, &c.digest.bytes)),
+    );
     ActionKeyBreakdown {
         key_epoch: descriptor.key_epoch,
         projection_epoch: descriptor.projection_epoch,
@@ -494,6 +605,224 @@ mod tests {
         }
     }
 
+    fn all_action_classes() -> [ActionClass; 21] {
+        [
+            ActionClass::CargoWholeCommandBounded,
+            ActionClass::RustcDependencyCompile,
+            ActionClass::RustcWorkspaceCompile,
+            ActionClass::RustdocCompile,
+            ActionClass::Link,
+            ActionClass::BuildScriptCompile,
+            ActionClass::BuildScriptRun,
+            ActionClass::NativeCompileC,
+            ActionClass::NativeCompileCxx,
+            ActionClass::NativeArchive,
+            ActionClass::BindgenGeneration,
+            ActionClass::CodeGeneratorRun,
+            ActionClass::NextestTestCase,
+            ActionClass::TestBinaryBatch,
+            ActionClass::DoctestCompile,
+            ActionClass::DoctestRun,
+            ActionClass::ClippyCompile,
+            ActionClass::BenchmarkCompile,
+            ActionClass::BenchmarkRun,
+            ActionClass::ToolchainProbe,
+            ActionClass::WorkerProbe,
+        ]
+    }
+
+    fn borrowed_inputs(
+        breakdown: &ActionKeyBreakdown,
+    ) -> (ActionKeyHeader, Vec<BorrowedKeyComponent<'_>>) {
+        (
+            ActionKeyHeader {
+                key_epoch: breakdown.key_epoch,
+                projection_epoch: breakdown.projection_epoch,
+                action_class_tag: breakdown.action_class_tag,
+            },
+            breakdown
+                .components
+                .iter()
+                .map(|component| BorrowedKeyComponent {
+                    name: component.name,
+                    domain: component.digest.domain,
+                    bytes: &component.digest.bytes,
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn descriptor_and_reconstruction_preserve_pre_refactor_key_goldens() {
+        // Captured by executing the original compute_action_key implementation
+        // before the borrowed encoder refactor (source SHA-256 ef331d526e5976f1
+        // e2b50791d24953d42d98ab94b99dad94c93b7b83f11522ab). These expectations
+        // are independent of both current entry points and must not be updated
+        // merely to accommodate an encoding change.
+        let baseline = descriptor();
+        let mut edge = descriptor();
+        edge.key_epoch = u32::MAX;
+        edge.projection_epoch = u32::MAX - 1;
+        edge.action_class = ActionClass::WorkerProbe;
+        for (descriptor, expected_hex) in [
+            (
+                baseline,
+                "7dd7ff678ea1f5e1af4afba1253095e8ed455fc6f571ea65c3aed5b9c4b32b4e",
+            ),
+            (
+                edge,
+                "6a0c65105850fbfb1dbc74c45def9f75e756de4260647c4214009a8b08b942e1",
+            ),
+        ] {
+            let breakdown = compute_action_key(&descriptor);
+            assert_eq!(breakdown.final_key.algorithm, DigestAlgorithm::Sha256V1);
+            assert_eq!(breakdown.final_key.domain, "rabs.action-key.sha256.v1");
+            assert_eq!(
+                rabs_protocol::raw_bytes::encode_hex(&breakdown.final_key.bytes),
+                expected_hex
+            );
+            let (header, components) = borrowed_inputs(&breakdown);
+            let reconstructed = recompute_action_key(header, &components).unwrap();
+            assert_eq!(
+                rabs_protocol::raw_bytes::encode_hex(&reconstructed.bytes),
+                expected_hex
+            );
+        }
+    }
+
+    #[test]
+    fn borrowed_owned_names_and_domains_roundtrip_all_classes_and_epoch_edges() {
+        for class in all_action_classes() {
+            for (key_epoch, projection_epoch) in [
+                (0, 0),
+                (1, 1),
+                (u32::MAX, 0),
+                (0, u32::MAX),
+                (u32::MAX, u32::MAX),
+            ] {
+                let mut descriptor = descriptor();
+                descriptor.action_class = class;
+                descriptor.key_epoch = key_epoch;
+                descriptor.projection_epoch = projection_epoch;
+                let breakdown = compute_action_key(&descriptor);
+                let expected_key = breakdown.final_key.clone();
+                let header = ActionKeyHeader {
+                    key_epoch,
+                    projection_epoch,
+                    action_class_tag: breakdown.action_class_tag,
+                };
+                let owned: Vec<_> = breakdown
+                    .components
+                    .iter()
+                    .map(|component| {
+                        (
+                            component.name.to_owned(),
+                            component.digest.domain.to_owned(),
+                            component.digest.bytes,
+                        )
+                    })
+                    .collect();
+                drop(breakdown);
+                // Reconstruct from independently owned rows, as a metadata
+                // reader does, after the original breakdown is gone.
+                let borrowed: Vec<_> = owned
+                    .iter()
+                    .map(|(name, domain, bytes)| BorrowedKeyComponent {
+                        name,
+                        domain,
+                        bytes,
+                    })
+                    .collect();
+                assert_eq!(
+                    recompute_action_key(header, &borrowed),
+                    Ok(expected_key),
+                    "class {class:?}, key epoch {key_epoch}, projection epoch {projection_epoch}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reconstruction_rejects_incomplete_duplicate_reordered_and_unknown_components() {
+        let breakdown = compute_action_key(&descriptor());
+        let (header, components) = borrowed_inputs(&breakdown);
+        for count in [0, 1, 11] {
+            assert_eq!(
+                recompute_action_key(header, &components[..count]),
+                Err(KeyReconstructionError::ComponentCount(count))
+            );
+        }
+        let mut excess = components.clone();
+        excess.push(components[0]);
+        assert_eq!(
+            recompute_action_key(header, &excess),
+            Err(KeyReconstructionError::ComponentCount(13))
+        );
+
+        let mut duplicate = components.clone();
+        duplicate[1].name = duplicate[0].name;
+        assert_eq!(
+            recompute_action_key(header, &duplicate),
+            Err(KeyReconstructionError::ComponentName(1))
+        );
+        let mut reordered = components.clone();
+        reordered.swap(0, 1);
+        assert_eq!(
+            recompute_action_key(header, &reordered),
+            Err(KeyReconstructionError::ComponentName(0))
+        );
+        let mut unknown = components;
+        unknown[4].name = "future_component";
+        assert_eq!(
+            recompute_action_key(header, &unknown),
+            Err(KeyReconstructionError::ComponentName(4))
+        );
+    }
+
+    #[test]
+    fn reconstruction_rejects_unsupported_classes_and_empty_domains() {
+        let breakdown = compute_action_key(&descriptor());
+        let (header, components) = borrowed_inputs(&breakdown);
+        for tag in [0, 22, u32::MAX] {
+            assert_eq!(
+                recompute_action_key(
+                    ActionKeyHeader {
+                        action_class_tag: tag,
+                        ..header
+                    },
+                    &components,
+                ),
+                Err(KeyReconstructionError::UnsupportedActionClass(tag))
+            );
+        }
+        for index in 0..components.len() {
+            let mut missing_domain = components.clone();
+            missing_domain[index].domain = "";
+            assert_eq!(
+                recompute_action_key(header, &missing_domain),
+                Err(KeyReconstructionError::EmptyDomain(index))
+            );
+        }
+    }
+
+    #[test]
+    fn reconstruction_binds_each_owned_domain_even_when_digest_bytes_match() {
+        let breakdown = compute_action_key(&descriptor());
+        let (header, components) = borrowed_inputs(&breakdown);
+        for index in 0..components.len() {
+            let changed_domain = format!("{}.changed", components[index].domain);
+            let mut changed = components.clone();
+            changed[index].domain = &changed_domain;
+            assert_eq!(changed[index].bytes, components[index].bytes);
+            assert_ne!(
+                recompute_action_key(header, &changed).unwrap(),
+                breakdown.final_key,
+                "domain change for {} must affect identity",
+                components[index].name,
+            );
+        }
+    }
+
     #[test]
     fn identical_descriptors_yield_identical_keys_and_breakdowns() {
         let a = compute_action_key(&descriptor());
@@ -555,29 +884,7 @@ mod tests {
     #[test]
     fn class_tags_are_wire_stable_and_unique() {
         // The tag table, not the Rust discriminant, is the wire identity.
-        let all = [
-            ActionClass::CargoWholeCommandBounded,
-            ActionClass::RustcDependencyCompile,
-            ActionClass::RustcWorkspaceCompile,
-            ActionClass::RustdocCompile,
-            ActionClass::Link,
-            ActionClass::BuildScriptCompile,
-            ActionClass::BuildScriptRun,
-            ActionClass::NativeCompileC,
-            ActionClass::NativeCompileCxx,
-            ActionClass::NativeArchive,
-            ActionClass::BindgenGeneration,
-            ActionClass::CodeGeneratorRun,
-            ActionClass::NextestTestCase,
-            ActionClass::TestBinaryBatch,
-            ActionClass::DoctestCompile,
-            ActionClass::DoctestRun,
-            ActionClass::ClippyCompile,
-            ActionClass::BenchmarkCompile,
-            ActionClass::BenchmarkRun,
-            ActionClass::ToolchainProbe,
-            ActionClass::WorkerProbe,
-        ];
+        let all = all_action_classes();
         let mut tags: Vec<u32> = all.iter().map(|c| action_class_tag(*c)).collect();
         let len = tags.len();
         tags.sort_unstable();

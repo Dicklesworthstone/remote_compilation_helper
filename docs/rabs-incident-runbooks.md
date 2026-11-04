@@ -56,6 +56,44 @@ does not evaluate the coordinator's current authority, clock epoch, requested
 trust tier or class-wide gates. Successful inspection does not repair,
 un-quarantine, run a compiler, or start a service.
 
+**Compare recorded action keys**
+
+To identify which key inputs changed between two explicitly selected actions:
+
+```sh
+rch why miss --prior-key PRIOR --current-key CURRENT --cas-root /path/to/rabs-state/cas
+rch --json why miss --prior-key PRIOR --current-key CURRENT --cas-root /path/to/rabs-state/cas
+```
+
+Both records come from one read-only snapshot. Each needs its recorded key
+header and all twelve component digests. The command recomputes each key using
+the live admission encoder and verifies that it matches the requested identity
+before reporting causes. Reports include stable reason codes and exact changed
+header or digest values in canonical order. Equal identities report `identical`
+with `key_identity_only: true`; current serving permission still requires the
+coordinator.
+
+The JSON envelope's data identifies `comparison_basis: "explicit-key-pair"`,
+`lookup_decision_evaluated: false`, and `serving_authorization_evaluated: false`.
+An explicitly supplied prior key does not establish which candidate a past
+request actually considered. If either historical record lacks a header or
+component, `status` is `incomplete-key-provenance`, `comparison` is `null`, and
+`unavailable` identifies the missing evidence. Corrupt digests, unknown or
+extra components, truncation, and keys that fail recomputation are errors.
+
+The file-input form remains available:
+
+```sh
+rch why miss --prior prior.json --current current.json
+```
+
+Each file is limited to one MiB and must contain a complete, correctly keyed
+breakdown. Component order in JSON may vary; canonical names remain exact and
+unique. Digests require exactly 64 hexadecimal digits, and `final_key.domain`
+must be `rabs.action-key.sha256.v1`. Unknown fields, including an asserted
+alternative digest algorithm, are refused. One file may be `-` for stdin;
+the two input modes cannot be mixed.
+
 ## incorrect-result-divergence
 
 - **Detect:** F022/J016 differential mismatch, or a same-key

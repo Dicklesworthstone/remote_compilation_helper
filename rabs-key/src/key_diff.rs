@@ -14,7 +14,10 @@
 //!   materialization-unavailable) — those come from the index, not the
 //!   key.
 
-use crate::action_key::ActionKeyBreakdown;
+use crate::action_key::{
+    ActionKeyBreakdown, ActionKeyHeader, BorrowedKeyComponent, KeyReconstructionError,
+    validate_key_inputs,
+};
 
 /// The stable miss-cause taxonomy (plan §102's list, component-attributed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -111,6 +114,40 @@ pub fn diff_breakdowns(prior: &ActionKeyBreakdown, current: &ActionKeyBreakdown)
         }
     }
     causes
+}
+
+/// Compare complete borrowed key inputs without inventing missing components
+/// or requiring static lifetimes for persisted domains. A caller explaining
+/// supplied action keys must also recompute and match each key first. These
+/// differences do not establish a lookup decision or authorize serving.
+///
+/// # Errors
+/// Either header or ordered component set is unsupported or incomplete.
+pub fn diff_key_inputs(
+    prior_header: ActionKeyHeader,
+    prior: &[BorrowedKeyComponent<'_>],
+    current_header: ActionKeyHeader,
+    current: &[BorrowedKeyComponent<'_>],
+) -> Result<Vec<MissCause>, KeyReconstructionError> {
+    validate_key_inputs(prior_header, prior)?;
+    validate_key_inputs(current_header, current)?;
+    let mut causes = Vec::new();
+    if prior_header.key_epoch != current_header.key_epoch
+        || prior_header.projection_epoch != current_header.projection_epoch
+    {
+        causes.push(MissCause::EpochMismatch);
+    }
+    if prior_header.action_class_tag != current_header.action_class_tag {
+        causes.push(MissCause::ActionClassChanged);
+    }
+    for (p, c) in prior.iter().zip(current) {
+        if (p.domain != c.domain || p.bytes != c.bytes)
+            && let Some(cause) = cause_for_component(p.name)
+        {
+            causes.push(cause);
+        }
+    }
+    Ok(causes)
 }
 
 impl MissCause {
@@ -219,6 +256,151 @@ mod tests {
             build_path_semantic_policy: d("rabs.path-policy.v1", 10),
             execution_semantics: d("rabs.exec-semantics.v1", 11),
             output_declarations: d("rabs.outputs.v1", 12),
+        }
+    }
+
+    fn borrowed_inputs(
+        breakdown: &ActionKeyBreakdown,
+    ) -> (ActionKeyHeader, Vec<BorrowedKeyComponent<'_>>) {
+        (
+            ActionKeyHeader {
+                key_epoch: breakdown.key_epoch,
+                projection_epoch: breakdown.projection_epoch,
+                action_class_tag: breakdown.action_class_tag,
+            },
+            breakdown
+                .components
+                .iter()
+                .map(|component| BorrowedKeyComponent {
+                    name: component.name,
+                    domain: component.digest.domain,
+                    bytes: &component.digest.bytes,
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn borrowed_diff_attributes_each_byte_or_domain_change_like_descriptor_breakdowns() {
+        let prior = compute_action_key(&descriptor());
+        let (prior_header, prior_inputs) = borrowed_inputs(&prior);
+        assert_eq!(
+            diff_key_inputs(prior_header, &prior_inputs, prior_header, &prior_inputs),
+            Ok(vec![])
+        );
+        let expected_causes = [
+            MissCause::InvocationChanged,
+            MissCause::WorkingDirectoryChanged,
+            MissCause::SourceChanged,
+            MissCause::NegativeDependencyChanged,
+            MissCause::DependencyArtifactChanged,
+            MissCause::ToolchainChanged,
+            MissCause::PlatformChanged,
+            MissCause::EnvironmentChanged,
+            MissCause::SandboxPolicyChanged,
+            MissCause::BuildPathPolicyChanged,
+            MissCause::ExecutionSemanticsChanged,
+            MissCause::OutputDeclarationsChanged,
+        ];
+        for (index, expected) in expected_causes.into_iter().enumerate() {
+            for change_domain in [false, true] {
+                let mut current = prior.clone();
+                if change_domain {
+                    current.components[index].digest.domain = "rabs.alternate-component.v1";
+                    assert_eq!(
+                        current.components[index].digest.bytes,
+                        prior.components[index].digest.bytes,
+                    );
+                } else {
+                    current.components[index].digest.bytes[0] ^= 0x40;
+                }
+                let owned_domain = current.components[index].digest.domain.to_owned();
+                let (current_header, mut current_inputs) = borrowed_inputs(&current);
+                current_inputs[index].domain = &owned_domain;
+                let causes =
+                    diff_key_inputs(prior_header, &prior_inputs, current_header, &current_inputs)
+                        .unwrap();
+                assert_eq!(
+                    causes,
+                    vec![expected],
+                    "component {index}, domain-only change {change_domain}"
+                );
+                assert_eq!(causes, diff_breakdowns(&prior, &current));
+            }
+        }
+    }
+
+    #[test]
+    fn borrowed_diff_reports_epochs_then_class_then_components_in_canonical_order() {
+        let prior = compute_action_key(&descriptor());
+        let (prior_header, prior_inputs) = borrowed_inputs(&prior);
+        for change_projection in [false, true] {
+            let mut changed = descriptor();
+            if change_projection {
+                changed.projection_epoch = u32::MAX;
+            } else {
+                changed.key_epoch = u32::MAX;
+            }
+            changed.action_class = ActionClass::ClippyCompile;
+            changed.toolchain.bytes[0] ^= 1;
+            changed.action_inputs.bytes[0] ^= 1;
+            let current = compute_action_key(&changed);
+            let (current_header, current_inputs) = borrowed_inputs(&current);
+            let causes =
+                diff_key_inputs(prior_header, &prior_inputs, current_header, &current_inputs)
+                    .unwrap();
+            assert_eq!(
+                causes,
+                vec![
+                    MissCause::EpochMismatch,
+                    MissCause::ActionClassChanged,
+                    MissCause::SourceChanged,
+                    MissCause::ToolchainChanged,
+                ]
+            );
+            assert_eq!(causes, diff_breakdowns(&prior, &current));
+        }
+    }
+
+    #[test]
+    fn borrowed_diff_rejects_incomplete_or_malformed_inputs_on_either_side() {
+        let breakdown = compute_action_key(&descriptor());
+        let (header, valid) = borrowed_inputs(&breakdown);
+        let reject = |invalid: &[BorrowedKeyComponent<'_>], error| {
+            assert_eq!(diff_key_inputs(header, invalid, header, &valid), Err(error));
+            assert_eq!(diff_key_inputs(header, &valid, header, invalid), Err(error));
+        };
+        reject(&[], KeyReconstructionError::ComponentCount(0));
+        reject(&valid[..11], KeyReconstructionError::ComponentCount(11));
+        let mut excess = valid.clone();
+        excess.push(valid[0]);
+        reject(&excess, KeyReconstructionError::ComponentCount(13));
+        let mut duplicate = valid.clone();
+        duplicate[1].name = duplicate[0].name;
+        reject(&duplicate, KeyReconstructionError::ComponentName(1));
+        let mut reordered = valid.clone();
+        reordered.swap(0, 1);
+        reject(&reordered, KeyReconstructionError::ComponentName(0));
+        let mut unknown = valid.clone();
+        unknown[4].name = "future_component";
+        reject(&unknown, KeyReconstructionError::ComponentName(4));
+        let mut empty_domain = valid.clone();
+        empty_domain[5].domain = "";
+        reject(&empty_domain, KeyReconstructionError::EmptyDomain(5));
+
+        for tag in [0, 22, u32::MAX] {
+            let invalid_header = ActionKeyHeader {
+                action_class_tag: tag,
+                ..header
+            };
+            assert_eq!(
+                diff_key_inputs(invalid_header, &valid, header, &valid),
+                Err(KeyReconstructionError::UnsupportedActionClass(tag))
+            );
+            assert_eq!(
+                diff_key_inputs(header, &valid, invalid_header, &valid),
+                Err(KeyReconstructionError::UnsupportedActionClass(tag))
+            );
         }
     }
 

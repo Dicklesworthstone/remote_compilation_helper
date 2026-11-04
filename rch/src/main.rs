@@ -545,10 +545,11 @@ wiped. Without --force (or with --dry-run) it only previews the plan."#)]
     /// Inspect recorded actions or explain cache misses and refusals
     ///
     /// Read an action's existing CAS metadata without changing the store,
-    /// compare supplied key breakdowns, or explain a refusal code.
+    /// compare recorded keys or supplied complete breakdowns, or explain a refusal code.
     /// Use `--json` for the machine-readable envelope.
     #[command(after_help = r#"EXAMPLES:
     rch why action <64-hex-action-key> --cas-root /path/to/rabs-state/cas
+    rch why miss --prior-key PRIOR --current-key CURRENT --cas-root /path/to/rabs-state/cas
     rch why miss --prior prior.json --current current.json
     cat current.json | rch why miss --prior prior.json --current -
     rch why refusal --outcome first-seen
@@ -2916,6 +2917,17 @@ fn schema_json_for_command(command: &Option<Commands>) -> Result<String> {
             let schema = SchemaSettings::draft07()
                 .into_generator()
                 .into_root_schema_for::<commands::why::ActionExplanation>();
+            serde_json::to_string_pretty(&schema)?
+        }
+        Some(Commands::Why {
+            action:
+                commands::why::WhyAction::Miss {
+                    prior_key: Some(_), ..
+                },
+        }) => {
+            let schema = SchemaSettings::draft07()
+                .into_generator()
+                .into_root_schema_for::<commands::why::StoredMissExplanation>();
             serde_json::to_string_pretty(&schema)?
         }
         Some(Commands::Why {
@@ -8596,12 +8608,41 @@ mod tests {
         .unwrap();
         match cli.command {
             Some(Commands::Why {
-                action: commands::why::WhyAction::Miss { prior, current },
+                action: commands::why::WhyAction::Miss { prior, current, .. },
             }) => {
-                assert_eq!(prior, "p.json");
-                assert_eq!(current, "c.json");
+                assert_eq!(prior.as_deref(), Some("p.json"));
+                assert_eq!(current.as_deref(), Some("c.json"));
             }
             _ => fail_expected("Expected why miss command"),
+        }
+        let cli = Cli::try_parse_from([
+            "rch",
+            "--json",
+            "why",
+            "miss",
+            "--prior-key",
+            &action_key,
+            "--current-key",
+            &action_key,
+            "--cas-root",
+            "/tmp/rabs-cas",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Why {
+                action:
+                    commands::why::WhyAction::Miss {
+                        prior_key,
+                        current_key,
+                        cas_root,
+                        ..
+                    },
+            }) => {
+                assert_eq!(prior_key.as_deref(), Some(action_key.as_str()));
+                assert_eq!(current_key.as_deref(), Some(action_key.as_str()));
+                assert_eq!(cas_root, Some(std::path::PathBuf::from("/tmp/rabs-cas")));
+            }
+            _ => fail_expected("Expected recorded why miss command"),
         }
         let cli =
             Cli::try_parse_from(["rch", "why", "refusal", "--outcome", "first-seen"]).unwrap();
