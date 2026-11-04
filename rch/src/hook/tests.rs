@@ -995,7 +995,15 @@ async fn clean_overlay_subdirectory_real_git_archive_and_cargo_preserve_selected
         TransferPipeline::create_selected_git_archive(&root, spec.base_commit(), &[], &[])
             .await
             .unwrap();
-    let storage = tempfile::tempdir().unwrap().keep();
+    // The Cargo configuration guard below refuses a `.cargo/config*` in any
+    // ancestor of the selected root. rch points TMPDIR inside the project it
+    // builds, and this repository has a `.cargo/config.toml`, so a default temp
+    // dir fails every case with RCH-E413 when this test runs through rch.
+    let storage = tempfile::Builder::new()
+        .prefix("rch-clean-overlay-subdirectory-")
+        .tempdir_in("/tmp")
+        .unwrap()
+        .keep();
     let selected_root = storage.join("selected source");
     std::fs::create_dir(&selected_root).unwrap();
     tar::Archive::new(archive.reopen().unwrap())
@@ -1169,6 +1177,9 @@ async fn clean_overlay_subdirectory_real_git_archive_and_cargo_preserve_selected
         target.display()
     );
     assert!(!selected_root.join("returned-target").exists());
+    // Both trees are kept only for a failing run, whose messages name them.
+    let _ = std::fs::remove_dir_all(&storage);
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[tokio::test]
