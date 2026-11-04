@@ -506,7 +506,7 @@ def bounded_result(future, deadline, heartbeat):
 
 
 def finish_descendants(monitor, heartbeat):
-    deadline = time.monotonic() + 2
+    deadline = None
     while True:
         heartbeat()
         monitor.check_owner()
@@ -516,6 +516,12 @@ def finish_descendants(monitor, heartbeat):
                        and record["state"] not in ("Z", "X")]
         if not descendants:
             return
+        # A progressing first census can be slow on a busy worker. Give the
+        # writers their bounded exit window after discovering them, rather
+        # than expiring it before the first signal. The guardian still fences
+        # a stalled census, and completion still requires an empty census.
+        if deadline is None:
+            deadline = time.monotonic() + 2
         for record in descendants:
             # Pin the process on Linux so a recycled numeric PID cannot receive
             # a signal between membership inspection and signal delivery.

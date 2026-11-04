@@ -797,6 +797,35 @@ m.finish_descendants=finish"""
         self.assertTrue(usage["complete"])
         self.assertEqual(usage["exit_code"], 0)
 
+    def test_slow_terminal_census_still_verifies_killed_background_writer(self):
+        if not sys.platform.startswith("linux"):
+            self.skipTest("procfs record scheduling probe")
+        inject = """original_finish=m.finish_descendants
+original_snapshot=m.process_snapshot
+def finish(value, heartbeat):
+    first=True
+    def slow_snapshot(beat=lambda: None):
+        nonlocal first
+        result=original_snapshot(beat)
+        if first:
+            first=False
+            for _ in range(12):
+                beat()
+                time.sleep(0.2)
+        return result
+    m.process_snapshot=slow_snapshot
+    return original_finish(value, heartbeat)
+m.finish_descendants=finish"""
+        process, receipt = self.spawn(
+            "import subprocess,sys; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); print('foreground-finished')",
+            inject=inject)
+        status, stdout, stderr = self.complete(process, timeout=20)
+        self.assertEqual(status, 0, stderr)
+        self.assertIn("foreground-finished", stdout)
+        usage = json.loads(receipt.read_text().split("_DISK_USAGE:", 1)[1])
+        self.assertTrue(usage["complete"])
+        self.assertEqual(usage["exit_code"], 0)
+
     def test_terminal_census_stalled_read_still_stops_group(self):
         inject = """original_finish=m.finish_descendants
 original_process=m.linux_process
